@@ -26,7 +26,6 @@ use comet_proto::{TerminalEvent, TerminalSession};
 use comet_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
-use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -56,15 +55,6 @@ pub fn init(cx: &mut App) {
 // Pure logic (unit-tested)
 // ---------------------------------------------------------------------------
 
-/// Panel height clamp: 160 px … 55 % of the viewport (§1.10).
-pub fn clamp_terminal_height(height: f32, viewport_h: f32) -> f32 {
-    let max = (viewport_h * TERMINAL_MAX_VH).max(TERMINAL_MIN_HEIGHT);
-    if height.is_finite() {
-        height.clamp(TERMINAL_MIN_HEIGHT, max)
-    } else {
-        TERMINAL_MIN_HEIGHT
-    }
-}
 
 /// Reconnect backoff: 500 ms doubling to an 8 s ceiling.
 pub fn backoff_ms(attempt: u32) -> u64 {
@@ -1128,15 +1118,6 @@ impl Render for TerminalPanel {
 mod tests {
     use super::*;
 
-    #[test]
-    fn height_clamps_between_160_and_55vh() {
-        assert_eq!(clamp_terminal_height(300.0, 900.0), 300.0);
-        assert_eq!(clamp_terminal_height(10.0, 900.0), 160.0);
-        assert_eq!(clamp_terminal_height(4000.0, 900.0), 900.0 * 0.55);
-        // Tiny windows: min wins over the 55vh cap.
-        assert_eq!(clamp_terminal_height(200.0, 100.0), 160.0);
-        assert_eq!(clamp_terminal_height(f32::NAN, 900.0), 160.0);
-    }
 
     #[test]
     fn backoff_doubles_and_caps() {

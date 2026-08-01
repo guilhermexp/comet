@@ -27,13 +27,6 @@ pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 
-/// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
-/// viewport-relative cap applies at runtime; the absolute cap here only heals
-/// hand-edited files.
-pub const TERMINAL_MIN_HEIGHT: f32 = 160.0;
-pub const TERMINAL_MAX_VH: f32 = 0.55;
-pub const TERMINAL_ABS_MAX_HEIGHT: f32 = 2000.0;
-pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
@@ -67,9 +60,6 @@ pub struct UiSettings {
     /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
     pub right_pane_open: bool,
-    pub terminal_height: f32,
-    /// Legacy — see [`Self::right_pane_open`].
-    pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
 }
@@ -86,8 +76,6 @@ impl Default for UiSettings {
             sound_enabled: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
-            terminal_height: TERMINAL_DEFAULT_HEIGHT,
-            terminal_open: false,
             keymap: KeymapConfig::default(),
         }
     }
@@ -274,12 +262,6 @@ impl UiSettings {
             RIGHT_PANE_MAX,
             RIGHT_PANE_DEFAULT,
         );
-        self.terminal_height = clamp_or(
-            self.terminal_height,
-            TERMINAL_MIN_HEIGHT,
-            TERMINAL_ABS_MAX_HEIGHT,
-            TERMINAL_DEFAULT_HEIGHT,
-        );
         self
     }
 
@@ -341,8 +323,6 @@ mod tests {
             sound_enabled: false,
             right_pane_width: 700.0,
             right_pane_open: true,
-            terminal_height: 320.0,
-            terminal_open: true,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
@@ -374,6 +354,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_terminal_layout_fields_are_not_reserialized() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"terminalHeight":420,"terminalOpen":true,"rightPaneWidth":640}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.right_pane_width, 640.0);
+        loaded.save(dir.path()).unwrap();
+
+        let saved = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(!saved.contains("terminalHeight"));
+        assert!(!saved.contains("terminalOpen"));
+    }
+
+    #[test]
     fn nan_heals_to_default() {
         let healed = UiSettings {
             sidebar_width: f32::NAN,
@@ -388,8 +386,7 @@ mod tests {
         let d = UiSettings::default();
         assert_eq!(d.sidebar_width, 256.0);
         assert_eq!(d.right_pane_width, 520.0);
-        assert_eq!(d.terminal_height, 280.0);
-        assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert!(!d.sidebar_collapsed && !d.right_pane_open);
     }
 
     #[test]
@@ -480,18 +477,4 @@ mod tests {
         assert!(!loaded.sidebar_grouped);
     }
 
-    #[test]
-    fn terminal_height_clamps_on_load() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(UiSettings::path(dir.path()), r#"{"terminalHeight": 5}"#).unwrap();
-        assert_eq!(
-            UiSettings::load(dir.path()).terminal_height,
-            TERMINAL_MIN_HEIGHT
-        );
-        std::fs::write(UiSettings::path(dir.path()), r#"{"terminalHeight": 99999}"#).unwrap();
-        assert_eq!(
-            UiSettings::load(dir.path()).terminal_height,
-            TERMINAL_ABS_MAX_HEIGHT
-        );
-    }
 }
