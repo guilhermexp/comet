@@ -553,9 +553,7 @@ impl Shell {
         // cluster.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
-        let launcher_menu = (has_space
-            && active_utility.is_none()
-            && self.utility_add_menu_open)
+        let launcher_menu = (has_space && active_utility.is_none() && self.utility_add_menu_open)
             .then(|| self.render_utility_menu(true, cx));
         let inner = div()
             .size_full()
@@ -594,10 +592,8 @@ impl Shell {
                             }),
                         ))
                         .when_some(launcher_menu, |button, menu| {
-                            button.child(popover::anchored_menu(
-                                "utility-launcher-menu-anchor",
-                                menu,
-                            ))
+                            button
+                                .child(popover::anchored_menu("utility-launcher-menu-anchor", menu))
                         }),
                 )
             });

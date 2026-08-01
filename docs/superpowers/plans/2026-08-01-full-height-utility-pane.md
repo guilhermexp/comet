@@ -3,6 +3,10 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: use
 > `superpowers:executing-plans` and execute each checkbox in order.
 
+> **Shipped.** The conversation-titlebar contract in this plan is superseded by
+> `2026-08-01-utility-panel-toggle.md`: the Changes button is now the
+> utility-panel toggle.
+
 **Goal:** Replace the duplicated utility-pane header and nested Terminal tab
 bar with one top strip containing Terminal sessions and Changes as sibling
 tabs.
