@@ -37,13 +37,13 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
     org_name_valid, parse_orgs, sort_memberships,
 };
-use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
+use crate::terminal::panel::{TerminalPanel, ToggleTerminal};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
@@ -173,39 +173,34 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// Per-chat panel open flags (comet parity: `sessionPanels` — the terminal and
-/// changes panels open *per session*, in memory only; heights and every other
-/// persisted setting stay global). New/unknown chats default to closed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ChatPanels {
-    pub terminal_open: bool,
-    pub changes_open: bool,
+/// The one utility pane that can occupy the right side of a chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilityPane {
+    Terminal,
+    Changes,
 }
 
-/// The session-scoped panel map. Keys are chat ids; the new-chat canvas uses
-/// the empty key. Not persisted — a fresh app starts with everything closed.
+/// Session-scoped utility panes. Missing keys are closed; the new-chat canvas
+/// uses a space-specific key. State is intentionally in memory only.
 #[derive(Debug, Default)]
 pub struct SessionPanels {
-    map: std::collections::HashMap<String, ChatPanels>,
+    map: std::collections::HashMap<String, UtilityPane>,
 }
 
 impl SessionPanels {
-    pub fn get(&self, key: &str) -> ChatPanels {
-        self.map.get(key).copied().unwrap_or_default()
+    pub fn active(&self, key: &str) -> Option<UtilityPane> {
+        self.map.get(key).copied()
     }
 
-    /// Flip the terminal flag for `key`; returns the new value.
-    pub fn toggle_terminal(&mut self, key: &str) -> bool {
-        let entry = self.map.entry(key.to_string()).or_default();
-        entry.terminal_open = !entry.terminal_open;
-        entry.terminal_open
-    }
-
-    /// Flip the changes flag for `key`; returns the new value.
-    pub fn toggle_changes(&mut self, key: &str) -> bool {
-        let entry = self.map.entry(key.to_string()).or_default();
-        entry.changes_open = !entry.changes_open;
-        entry.changes_open
+    /// Select `pane`, or close it when it is already selected.
+    pub fn toggle(&mut self, key: &str, pane: UtilityPane) -> bool {
+        if self.active(key) == Some(pane) {
+            self.map.remove(key);
+            false
+        } else {
+            self.map.insert(key.to_string(), pane);
+            true
+        }
     }
 }
 
@@ -341,8 +336,6 @@ const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 struct SidebarResize;
 /// Drag marker for the right-pane resize handle.
 struct RightPaneResize;
-/// Drag marker for the terminal-panel height handle.
-struct TerminalResize;
 
 /// Invisible drag ghost — resize drags render nothing at the cursor.
 struct DragGhost;
@@ -491,8 +484,7 @@ pub struct Shell {
     boot: EngineBootConfig,
     data_dir: PathBuf,
     settings: UiSettings,
-    /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
-    /// parity — heights stay in [`UiSettings`]).
+    /// Session-scoped right utility pane (Terminal or Changes).
     panels: SessionPanels,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
@@ -511,7 +503,6 @@ pub struct Shell {
     debug_gate: Option<GatePhase>,
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
-    terminal_tween: Option<WidthTween>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
     /// flips key the traffic-light inset tween.
     fullscreen: Option<bool>,
@@ -520,10 +511,6 @@ pub struct Shell {
     /// Armed by mouse-down on a titlebar strip; the next mouse-move hands the
     /// drag to the compositor (zed's platform-titlebar pattern).
     titlebar_should_move: bool,
-    /// Clears the height tween once it completes (so a closed panel unmounts).
-    terminal_tween_task: Option<Task<()>>,
-    /// Height-drag anchor: (pointer y, height) at mouse-down on the handle.
-    terminal_drag_anchor: Option<(f32, f32)>,
     /// `motion::reduced_motion` snapshot, refreshed at the top of each render
     /// pass so [`Shell::eval_tween`] (called from `&self` render helpers) can
     /// snap without a `cx`.
@@ -675,12 +662,9 @@ impl Shell {
             debug_gate,
             sidebar_tween: None,
             right_tween: None,
-            terminal_tween: None,
             fullscreen: None,
             titlebar_tween: None,
             titlebar_should_move: false,
-            terminal_tween_task: None,
-            terminal_drag_anchor: None,
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             splash: SplashPhase::Visible,
@@ -787,8 +771,8 @@ impl Shell {
                 self.schedule_save(cx);
             }
         }
-        // Chat switch: restore THAT chat's panel state (per-session open flags;
-        // snap, no tween — the panels belong to the destination chat).
+        // Chat switch: restore that chat's utility pane without replaying the
+        // width transition; panes belong to the destination chat.
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if selected != self.active_chat {
             self.active_chat = selected;
@@ -806,12 +790,13 @@ impl Shell {
                 }
             }
             self.right_tween = None;
-            self.terminal_tween = None;
-            let panels = self.panels.get(&self.panel_key(cx));
+            let active = self.active_utility_pane(cx);
             if let Some(panel) = self.terminal.clone() {
-                panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.set_open(active == Some(UtilityPane::Terminal), cx)
+                });
             }
-            if panels.changes_open {
+            if active == Some(UtilityPane::Changes) {
                 let changes = self.changes_pane(cx);
                 changes.update(cx, |changes, cx| changes.ensure_watch(cx));
             }
@@ -854,12 +839,8 @@ impl Shell {
         self.state.read(cx).selected_space_git()
     }
 
-    /// The current chat's changes-pane flag (per-session, in-memory), gated on
-    /// the space having git at all: a stale per-chat open flag must not reopen
-    /// the pane after switching into a non-git space.
     /// The per-session panel key. The new-chat canvas (no selection) keys per
-    /// SPACE — one shared "" key made a canvas toggle read as global state
-    /// (user report).
+    /// space so its state is not shared across workspaces.
     fn panel_key(&self, cx: &App) -> String {
         if self.active_chat.is_empty() {
             let space = self
@@ -874,13 +855,15 @@ impl Shell {
         }
     }
 
-    fn right_pane_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.panel_key(cx)).changes_open && self.space_git_detected(cx)
+    fn active_utility_pane(&self, cx: &App) -> Option<UtilityPane> {
+        match self.panels.active(&self.panel_key(cx)) {
+            Some(UtilityPane::Changes) if !self.space_git_detected(cx) => None,
+            active => active,
+        }
     }
 
-    /// The current chat's terminal flag (per-session, in-memory).
-    fn terminal_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.panel_key(cx)).terminal_open
+    fn right_pane_open(&self, cx: &App) -> bool {
+        self.active_utility_pane(cx).is_some()
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -900,17 +883,17 @@ impl Shell {
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
-        // No git in this space → no diff pane, Cmd-B goes dead.
         if !self.space_git_detected(cx) {
             return;
         }
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        let open = self.panels.toggle_changes(&key);
+        let open = self.panels.toggle(&key, UtilityPane::Changes);
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        if let Some(terminal) = self.terminal.clone() {
+            terminal.update(cx, |panel, cx| panel.set_open(false, cx));
+        }
         if open {
-            // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
-            // once the pane has been opened.
             let changes = self.changes_pane(cx);
             changes.update(cx, |changes, cx| changes.ensure_watch(cx));
         }
@@ -935,66 +918,19 @@ impl Shell {
         terminal
     }
 
-    fn terminal_target(&self, cx: &App) -> f32 {
-        if self.terminal_open(cx) {
-            self.settings.terminal_height
-        } else {
-            0.0
-        }
-    }
-
-    /// Cmd/Ctrl+J and the header button (feature-inventory §1.10). Height
-    /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
-    /// The flag is per chat (comet `sessionPanels`).
+    /// Toggle the session's terminal in the shared right-side utility card.
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.terminal_target(cx);
+        let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        let open = self.panels.toggle_terminal(&key);
-        self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
+        let open = self.panels.toggle(&key, UtilityPane::Terminal);
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
-            // Opening lands keyboard focus IN the shell — typing goes straight
-            // to the prompt, no click needed (comet terminal-panel.tsx: the
-            // visible+active effect calls `terminal.focus()` on every open).
-            // The handle is focusable before the panel's first paint; once the
-            // terminal body mounts with `track_focus` it receives the keys.
             window.focus(&panel.read(cx).focus_handle(), cx);
         } else {
-            // Hiding the panel removes the (likely focused) terminal view;
-            // with nothing focused, window key bindings stop dispatching, so
-            // hand focus to the composer. (Cmd+J is a pure toggle — a second
-            // press closes even while the terminal is focused, as in comet's
-            // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
             window.focus(&self.composer.focus_handle(cx), cx);
         }
-        self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(RESIZE.total().mul_f32(motion::speed_scale()) + Duration::from_millis(30))
-                .await;
-            this.update(cx, |shell, cx| {
-                shell.terminal_tween = None;
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn on_terminal_drag(
-        &mut self,
-        event: &gpui::DragMoveEvent<TerminalResize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((anchor_y, anchor_h)) = self.terminal_drag_anchor else {
-            return;
-        };
-        let dy = anchor_y - f32::from(event.event.position.y);
-        let viewport_h = f32::from(window.viewport_size().height);
-        self.settings.terminal_height = clamp_terminal_height(anchor_h + dy, viewport_h);
-        self.terminal_tween = None; // live drag tracks the pointer
-        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -2774,13 +2710,10 @@ impl Shell {
                     )
                     .children(self.render_jump_to_bottom(cx)),
             )
-            // Reserved status strip (h-6) — the WorkingIndicator lives here so
-            // the composer below never shifts. Both live INSIDE the
-            // conversation region, ABOVE the terminal dock (comet __root.tsx:
-            // the terminal panel sits below the whole conversation column).
+            // Reserved status strip (h-6) keeps the composer fixed while the
+            // session status changes.
             .child(status)
             .when(has_spaces, |el| el.child(self.composer.clone()))
-            .child(self.render_terminal_container(cx))
             .when(file_drag_active, |el| {
                 el.child(
                     div()
@@ -2864,76 +2797,6 @@ impl Shell {
         )
     }
 
-    /// Terminal panel dock at the main-column bottom: a 5px height-drag handle
-    /// over the panel, the whole container height-animated 200 ms on toggle.
-    fn render_terminal_container(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let target = self.terminal_target(cx);
-        let tween = self.terminal_tween;
-        if target <= 0.0 && tween.is_none() {
-            return gpui::Empty.into_any_element();
-        }
-        // Defensive: an open flag needs its entity (and set_open) even if
-        // toggle_terminal never created one.
-        if self.terminal_open(cx) && self.terminal.is_none() {
-            let panel = self.terminal_panel(cx);
-            panel.update(cx, |panel, cx| panel.set_open(true, cx));
-        }
-        let Some(panel) = self.terminal.clone() else {
-            return gpui::Empty.into_any_element();
-        };
-        let border = Theme::of(cx).border;
-        let handle_hover = Theme::of(cx).border_strong;
-        let height = self.settings.terminal_height;
-
-        let handle = div()
-            .id("terminal-resize")
-            .h(px(5.0))
-            .w_full()
-            .flex_none()
-            .cursor_row_resize()
-            .hover(move |s| s.bg(handle_hover))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
-                    this.terminal_drag_anchor =
-                        Some((f32::from(event.position.y), this.settings.terminal_height));
-                }),
-            )
-            .on_drag(TerminalResize, |_, _point: Point<gpui::Pixels>, _, cx| {
-                cx.stop_propagation();
-                cx.new(|_| DragGhost)
-            })
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                    if event.click_count == 2 {
-                        this.settings.terminal_height = TERMINAL_DEFAULT_HEIGHT;
-                        this.schedule_save(cx);
-                        cx.notify();
-                    }
-                }),
-            );
-
-        // Fixed-height inner clipped by the animated container: content never
-        // reflows mid-transition (same trick as the side panes).
-        let inner = div()
-            .h(px(height))
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(handle)
-            .child(div().flex_1().min_h_0().child(panel));
-
-        div()
-            .w_full()
-            .flex_none()
-            .overflow_hidden()
-            .border_t_1()
-            .border_color(border)
-            .h(px(self.eval_tween(tween, target)))
-            .child(inner)
-            .into_any_element()
-    }
 
     /// Working indicator strip: gradient spinner + rotating flavour word (7s,
     /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
@@ -3007,18 +2870,23 @@ impl Shell {
         }
     }
 
-    /// Right "Changes" pane — hidden by default, drag-resizable; content is the
-    /// lazy [`Changes`] diff viewer (created on first open).
+    /// Shared right utility pane — Terminal or Changes, hidden by default and
+    /// drag-resizable.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
-        let content: AnyElement = if self.right_pane_open(cx) {
-            let changes = self.changes_pane(cx);
-            // Idempotent — also covers a persisted-open pane on boot.
-            changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-            changes.into_any_element()
-        } else {
-            gpui::Empty.into_any_element()
+        let content: AnyElement = match self.active_utility_pane(cx) {
+            Some(UtilityPane::Terminal) => {
+                let terminal = self.terminal_panel(cx);
+                terminal.update(cx, |panel, cx| panel.set_open(true, cx));
+                terminal.into_any_element()
+            }
+            Some(UtilityPane::Changes) => {
+                let changes = self.changes_pane(cx);
+                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                changes.into_any_element()
+            }
+            None => gpui::Empty.into_any_element(),
         };
         // Its OWN inset card (user request): the conversation card's right
         // gutter is the gap; padding (not margins) keeps the tweened width
@@ -3668,7 +3536,6 @@ impl Render for Shell {
             .text_size(px(14.0))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
-            .on_drag_move(cx.listener(Self::on_terminal_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
             // no-ops (comet __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
@@ -3930,51 +3797,28 @@ mod tests {
         );
     }
 
-    // ---- per-session panel flags (§1.10/1.11 parity: comet sessionPanels) ----
+    // ---- per-session utility pane (§1.10/1.11) ----
 
     #[test]
-    fn session_panels_default_closed_per_chat() {
+    fn utility_panes_default_closed_per_chat() {
         let panels = SessionPanels::default();
-        assert_eq!(panels.get("a"), ChatPanels::default());
-        assert!(!panels.get("a").terminal_open);
-        assert!(!panels.get("a").changes_open);
-        // The new-chat canvas ("" key) is its own session, also closed.
-        assert!(!panels.get("").terminal_open);
+        assert_eq!(panels.active("a"), None);
+        assert_eq!(panels.active("b"), None);
     }
 
     #[test]
-    fn session_panels_flags_are_chat_scoped() {
+    fn utility_pane_toggle_is_exclusive_and_chat_scoped() {
         let mut panels = SessionPanels::default();
-        // Opening the terminal in chat A opens it ONLY in chat A.
-        assert!(panels.toggle_terminal("a"));
-        assert!(panels.get("a").terminal_open);
-        assert!(!panels.get("b").terminal_open);
-        assert!(!panels.get("").terminal_open);
-        // Changes pane in B is independent of A's terminal.
-        assert!(panels.toggle_changes("b"));
-        assert!(panels.get("b").changes_open);
-        assert!(!panels.get("b").terminal_open);
-        assert!(!panels.get("a").changes_open);
-        // Switching back to A restores A's state untouched.
-        assert!(panels.get("a").terminal_open);
-        // Toggling off round-trips.
-        assert!(!panels.toggle_terminal("a"));
-        assert!(!panels.get("a").terminal_open);
-    }
 
-    #[test]
-    fn session_panels_both_flags_coexist_per_chat() {
-        let mut panels = SessionPanels::default();
-        panels.toggle_terminal("a");
-        panels.toggle_changes("a");
-        assert_eq!(
-            panels.get("a"),
-            ChatPanels {
-                terminal_open: true,
-                changes_open: true
-            }
-        );
-        assert_eq!(panels.get("b"), ChatPanels::default());
+        assert!(panels.toggle("a", UtilityPane::Terminal));
+        assert_eq!(panels.active("a"), Some(UtilityPane::Terminal));
+        assert_eq!(panels.active("b"), None);
+
+        assert!(panels.toggle("a", UtilityPane::Changes));
+        assert_eq!(panels.active("a"), Some(UtilityPane::Changes));
+
+        assert!(!panels.toggle("a", UtilityPane::Changes));
+        assert_eq!(panels.active("a"), None);
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----
