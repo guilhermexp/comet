@@ -43,7 +43,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
     org_name_valid, parse_orgs, sort_memberships,
 };
-use crate::terminal::panel::{TerminalPanel, ToggleTerminal};
+use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, ToggleTerminal};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
@@ -180,15 +180,6 @@ pub enum UtilityPane {
     Changes,
 }
 
-impl UtilityPane {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Terminal => "Terminal",
-            Self::Changes => "Changes",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatPanelState {
     visible: bool,
@@ -268,25 +259,6 @@ impl SessionPanels {
                 state.visible = false;
             }
         }
-    }
-
-    /// Compatibility toggle while the shell callers migrate to explicit
-    /// show/hide operations.
-    fn toggle(&mut self, key: &str, pane: UtilityPane) -> bool {
-        if self.active(key) == Some(pane) {
-            self.hide(key);
-            false
-        } else {
-            match pane {
-                UtilityPane::Terminal => self.show_terminal(key),
-                UtilityPane::Changes => self.show_changes(key),
-            }
-            true
-        }
-    }
-
-    fn close(&mut self, key: &str) -> bool {
-        self.hide(key)
     }
 }
 
@@ -501,7 +473,9 @@ pub struct Shell {
     file_drag_active: bool,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
+    terminal_events: Option<Subscription>,
     changes: Option<Entity<Changes>>,
+    utility_add_menu_open: bool,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -701,7 +675,9 @@ impl Shell {
             composer,
             file_drag_active: false,
             terminal: None,
+            terminal_events: None,
             changes: None,
+            utility_add_menu_open: false,
             route,
             nav,
             devices_page: None,
@@ -767,9 +743,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         // Capture knob: the add-space palette needs only the device registry.
-        if self.debug_dialog.as_deref() == Some("add-space")
-            && !state.read(cx).devices.is_empty()
-        {
+        if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
             self.open_add_space(cx);
         }
@@ -844,10 +818,12 @@ impl Shell {
         {
             let (selected_space, selected_chat, chat_space) = {
                 let s = state.read(cx);
-                let chat_space = s
-                    .selected_chat_row()
-                    .and_then(|c| c.space_id.clone());
-                (s.selected_space.clone(), s.selected_chat.clone(), chat_space)
+                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
+                (
+                    s.selected_space.clone(),
+                    s.selected_chat.clone(),
+                    chat_space,
+                )
             };
             if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
                 self.space_last_chat.insert(space, chat);
@@ -968,22 +944,34 @@ impl Shell {
         cx.notify();
     }
 
-    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+    fn show_changes(&mut self, cx: &mut Context<Self>) {
         if !self.space_git_detected(cx) {
             return;
         }
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        let open = self.panels.toggle(&key, UtilityPane::Changes);
+        self.panels.show_changes(&key);
+        self.utility_add_menu_open = false;
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if let Some(terminal) = self.terminal.clone() {
             terminal.update(cx, |panel, cx| panel.set_open(false, cx));
         }
-        if open {
             let changes = self.changes_pane(cx);
             changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-        }
         cx.notify();
+        }
+
+    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+        if self.active_utility_pane(cx) == Some(UtilityPane::Changes) {
+            let from = self.right_target(cx);
+            let key = self.panel_key(cx);
+            self.panels.hide(&key);
+            self.utility_add_menu_open = false;
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
+        } else {
+            self.show_changes(cx);
+        }
     }
 
     fn changes_pane(&mut self, cx: &mut Context<Self>) -> Entity<Changes> {
@@ -995,37 +983,108 @@ impl Shell {
         changes
     }
 
+    fn on_terminal_panel_event(
+        &mut self,
+        terminal: &Entity<TerminalPanel>,
+        event: &TerminalPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self.right_target(cx);
+        let current_key = self.panel_key(cx);
+        let event_chat = match event {
+            TerminalPanelEvent::Changed { chat } | TerminalPanelEvent::Activated { chat } => chat,
+        };
+        match event {
+            TerminalPanelEvent::Changed { chat } => {
+                let has_terminal = terminal.read(cx).has_tabs(chat);
+                self.panels.reconcile_terminal_presence(chat, has_terminal);
+            }
+            TerminalPanelEvent::Activated { chat } => {
+                self.panels.show_terminal(chat);
+            }
+        }
+        if current_key == event_chat.as_str() {
+            let to = self.right_target(cx);
+            if from != to {
+                self.right_tween = Some(WidthTween::new(from, to));
+            }
+            cx.notify();
+        }
+    }
+
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
         let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), cx));
+        let terminal_for_events = terminal.clone();
+        let events = cx.subscribe(&terminal, move |this, _, event: &TerminalPanelEvent, cx| {
+            this.on_terminal_panel_event(&terminal_for_events, event, cx);
+        });
+        self.terminal_events = Some(events);
         self.terminal = Some(terminal.clone());
         terminal
     }
 
-    /// Toggle the session's terminal in the shared right-side utility card.
+    fn create_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        let key = self.panel_key(cx);
+        self.panels.show_terminal(&key);
+        self.utility_add_menu_open = false;
+        let panel = self.terminal_panel(cx);
+        panel.update(cx, |panel, cx| panel.open_new_tab(cx));
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+            window.focus(&panel.read(cx).focus_handle(), cx);
+        cx.notify();
+    }
+
+    /// Toggle the shared utility column while selecting Terminal when opening.
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        let open = self.panels.toggle(&key, UtilityPane::Terminal);
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         let panel = self.terminal_panel(cx);
-        panel.update(cx, |panel, cx| panel.set_open(open, cx));
-        if open {
-            window.focus(&panel.read(cx).focus_handle(), cx);
+        if self.active_utility_pane(cx) == Some(UtilityPane::Terminal) {
+            self.panels.hide(&key);
+            self.utility_add_menu_open = false;
+            panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            window.focus(&self.composer.focus_handle(cx), cx);
         } else {
+            self.panels.show_terminal(&key);
+            panel.update(cx, |panel, cx| panel.set_open(true, cx));
+            window.focus(&panel.read(cx).focus_handle(), cx);
+        }
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
+    }
+
+    fn close_changes_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        let key = self.panel_key(cx);
+        let has_terminal = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).has_tabs(&key));
+        self.panels.close_changes(&key, has_terminal);
+        self.utility_add_menu_open = false;
+        if self.active_utility_pane(cx) == Some(UtilityPane::Terminal) {
+            if let Some(terminal) = self.terminal.clone() {
+                terminal.update(cx, |panel, cx| panel.set_open(true, cx));
+                window.focus(&terminal.read(cx).focus_handle(), cx);
+            }
+        } else if !self.right_pane_open(cx) {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
     }
 
     fn close_utility_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        if !self.panels.close(&key) {
+        if !self.panels.hide(&key) {
             return;
         }
+        self.utility_add_menu_open = false;
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if let Some(terminal) = self.terminal.clone() {
             terminal.update(cx, |panel, cx| panel.set_open(false, cx));
@@ -1828,7 +1887,9 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover))
-            .when(selected, |el| el.shadow(crate::theme::glass_selected_shadows()))
+            .when(selected, |el| {
+                el.shadow(crate::theme::glass_selected_shadows())
+            })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2069,19 +2130,13 @@ impl Shell {
                     }),
                     )
                     .when(lists_fade_top && !glass, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(gpui::linear_gradient(
+                        el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
+                            gpui::linear_gradient(
                                     180.0,
                                     gpui::linear_color_stop(sidebar_fade, 0.0),
                                     gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                                )),
-                        )
+                            ),
+                        ))
                     })
                     .when(lists_fade_bottom && !glass, |el| {
                         el.child(
@@ -2134,11 +2189,7 @@ impl Shell {
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`comet update`); click dismisses it for that version.
-    fn render_update_strip(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
@@ -2154,9 +2205,7 @@ impl Shell {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
                 UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => {
-                    (format!("Update failed: {message}").into(), true)
-                }
+                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else {
             (
@@ -2172,10 +2221,7 @@ impl Shell {
         let (chip_bg, chip_bg_hover) = if failed {
             (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
         } else {
-            (
-                crate::theme::wash(0.11),
-                crate::theme::wash(0.16),
-            )
+            (crate::theme::wash(0.11), crate::theme::wash(0.16))
         };
 
         let mut strip = div()
@@ -2711,9 +2757,7 @@ impl Shell {
                             popover::btn_primary(&theme_owned, "Add a space")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_add_space(cx)
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
                         ),
                 ))
                 .into_any_element()
@@ -2897,7 +2941,6 @@ impl Shell {
         )
     }
 
-
     /// Working indicator strip: gradient spinner + rotating flavour word (7s,
     /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
     /// to a "Sending…" bridge and then the engine mode line.
@@ -2970,50 +3013,187 @@ impl Shell {
         }
     }
 
-    fn render_utility_header(
-        &mut self,
-        pane: UtilityPane,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_utility_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let icon_path = match pane {
-            UtilityPane::Terminal => icons::TERMINAL,
-            UtilityPane::Changes => icons::SIDEBAR_MINIMALISTIC,
+        let key = self.panel_key(cx);
+        let state = self.panels.get(&key);
+        let active = self.active_utility_pane(cx);
+        let terminal_group = self
+            .terminal
+            .clone()
+            .filter(|terminal| terminal.read(cx).has_tabs(&key))
+            .map(|terminal| {
+                terminal.update(cx, |panel, cx| {
+                    panel.render_tab_group(active == Some(UtilityPane::Terminal), cx)
+                })
+            })
+            .unwrap_or_else(|| gpui::Empty.into_any_element());
+
+        let changes_tab = if state.changes_open && self.space_git_detected(cx) {
+            let selected = active == Some(UtilityPane::Changes);
+            let (text_color, bg, glyph_alpha) = if selected {
+                (theme.text, crate::theme::white_alpha(0.08), 0.8)
+            } else {
+                (
+                    theme.text_muted.opacity(0.6),
+                    gpui::transparent_black(),
+                    0.6,
+                )
         };
-        let close = header_icon_button(
-            "close-utility-pane",
-            icons::CLOSE,
+            let close = div()
+                .id("changes-tab-close")
+                .size(px(20.0))
+                .flex_none()
+            .flex()
+            .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .when(!selected, |element| element.opacity(0.45))
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::white_alpha(0.09)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.close_changes_tab(window, cx);
+                }))
+            .child(
+                    icon(icons::CLOSE)
+                        .size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.8)),
+                );
+                div()
+                .id("changes-utility-tab")
+                .w(px(crate::terminal::panel::TAB_WIDTH))
+                .h(px(28.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .pl(px(8.0))
+                .pr(px(4.0))
+                .rounded(px(8.0))
+                .bg(motion::hover_blend(
+                    "changes-utility-tab",
+                    bg,
+                    theme.element_hover,
+                ))
+                .on_hover(motion::hover_listener("changes-utility-tab"))
+                .text_size(px(12.0))
+                .text_color(text_color)
+                .cursor_pointer()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.show_changes(cx);
+                }))
+                .child(
+                    icon(icons::SIDEBAR_MINIMALISTIC)
+                        .size(px(16.0))
+                        .text_color(text_color.opacity(glyph_alpha)),
+            )
+                .child(div().flex_1().min_w_0().truncate().child("Changes"))
+                .child(close)
+                .into_any_element()
+        } else {
+            gpui::Empty.into_any_element()
+        };
+
+        let add_menu_open = self.utility_add_menu_open;
+        let git_detected = self.space_git_detected(cx);
+        let add_menu = popover::popover_card(&theme)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.utility_add_menu_open = false;
+                cx.notify();
+            }))
+            .child(
+                popover::menu_row(&theme, false, "utility-add-terminal")
+                    .id("utility-add-terminal")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.create_terminal_tab(window, cx);
+                    }))
+                    .child(
+                        icon(icons::TERMINAL)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Terminal"),
+            )
+            .child(
+                popover::menu_row(&theme, false, "utility-add-changes")
+                    .id("utility-add-changes")
+                    .when(!git_detected, |element| {
+                        element.opacity(0.35).cursor(gpui::CursorStyle::Arrow)
+                    })
+                    .when(git_detected, |element| {
+                        element.on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.show_changes(cx);
+                        }))
+                    })
+                    .child(
+                        icon(icons::SIDEBAR_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Changes"),
+            )
+            .into_any_element();
+        let add = div()
+            .id("utility-add-tab")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .bg(motion::hover_blend(
+                "utility-add-tab",
+                gpui::transparent_black(),
+                crate::theme::white_alpha(0.05),
+            ))
+            .on_hover(motion::hover_listener("utility-add-tab"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.utility_add_menu_open = !this.utility_add_menu_open;
+                cx.notify();
+            }))
+            .child(
+                icon(icons::PLUS)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted.opacity(0.6)),
+            )
+            .when(add_menu_open, |element| {
+                element.child(popover::anchored_menu("utility-add-menu", add_menu))
+            });
+        let drag_space =
+            self.titlebar_drag_region("utility-tab-strip-drag", div().h_full().flex_1(), cx);
+        let collapse = header_icon_button(
+            "collapse-utility-pane",
+            icons::ALT_ARROW_DOWN,
             false,
             &theme,
             cx.listener(|this, _, window, cx| this.close_utility_pane(window, cx)),
         );
-        let tab = div()
-            .h(px(32.0))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .pl(px(10.0))
-            .pr(px(2.0))
-            .rounded(px(7.0))
-            .bg(theme.surface_raised)
-            .child(icon(icon_path).size(px(14.0)).text_color(theme.text_muted))
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(theme.text)
-                    .child(SharedString::from(pane.label())),
-            )
-            .child(close);
-        let bar = div()
-            .h(px(Theme::TITLEBAR_HEIGHT))
+
+        div()
+            .h(px(TAB_BAR_HEIGHT))
             .flex_none()
             .flex()
-            .items_end()
-            .pt(px(Theme::TITLEBAR_TOP_PAD))
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
             .pl(px(8.0))
-            .child(tab)
-            .child(div().flex_1());
-        self.titlebar_drag_region("utility-pane-titlebar", bar, cx)
+            .pr(px(6.0))
+            .child(terminal_group)
+            .child(changes_tab)
+            .child(add)
+            .child(drag_space)
+            .child(collapse)
             .into_any_element()
     }
 
@@ -3022,16 +3202,12 @@ impl Shell {
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let active = self.active_utility_pane(cx);
-        let header: AnyElement = match active {
-            Some(pane) => self.render_utility_header(pane, cx),
+        let tab_strip = match active {
+            Some(_) => self.render_utility_tab_strip(cx),
             None => gpui::Empty.into_any_element(),
         };
         let content: AnyElement = match active {
-            Some(UtilityPane::Terminal) => {
-                let terminal = self.terminal_panel(cx);
-                terminal.update(cx, |panel, cx| panel.set_open(true, cx));
-                terminal.into_any_element()
-            }
+            Some(UtilityPane::Terminal) => self.terminal_panel(cx).into_any_element(),
             Some(UtilityPane::Changes) => {
                 let changes = self.changes_pane(cx);
                 changes.update(cx, |changes, cx| changes.ensure_watch(cx));
@@ -3058,21 +3234,11 @@ impl Shell {
             .bg(theme.bg)
             .border_l_1()
             .border_color(theme.border)
-            .child(header)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(content),
-            )
+            .child(tab_strip)
+            .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .child(handle);
         let target = self.right_target(cx);
-        self.pane_container(
-            self.right_tween,
-            target,
-            column.into_any_element(),
-        )
+        self.pane_container(self.right_tween, target, column.into_any_element())
     }
 
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
@@ -3587,11 +3753,7 @@ fn header_icon_button(
     let bg = if active {
         crate::theme::glass_selected_bg()
     } else {
-        motion::hover_blend(
-            &fade_key,
-            crate::theme::wash(0.0),
-            crate::theme::wash(0.11),
-        )
+        motion::hover_blend(&fade_key, crate::theme::wash(0.0), crate::theme::wash(0.11))
     };
     div()
         .id(id)
@@ -3615,11 +3777,11 @@ fn header_icon_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
-        .child(
-            icon(icon_path)
-                .size(px(16.0))
-                .text_color(if active { theme.text } else { theme.text_muted }),
-        )
+        .child(icon(icon_path).size(px(16.0)).text_color(if active {
+            theme.text
+        } else {
+            theme.text_muted
+        }))
 }
 
 impl Render for Shell {
@@ -3800,13 +3962,7 @@ impl Render for Shell {
                     .h_full()
                     .flex_none()
                     .relative()
-                    .child(
-                        sidebar_handle
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(-2.0)),
-                    );
+                    .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
                 // Sidebar tone: a slightly lighter column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,
@@ -3980,6 +4136,25 @@ mod tests {
 
         panels.close_changes("chat-a", false);
         assert!(!panels.get("chat-a").visible);
+
+        panels.show_terminal("chat-a");
+        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Terminal));
+    }
+
+    #[test]
+    fn background_terminal_close_does_not_change_the_selected_session() {
+        let mut panels = SessionPanels::default();
+        panels.show_changes("selected");
+        panels.show_terminal("selected");
+        panels.show_terminal("background");
+
+        panels.reconcile_terminal_presence("background", false);
+
+        let selected = panels.get("selected");
+        assert!(selected.visible);
+        assert_eq!(selected.active, UtilityPane::Terminal);
+        assert!(selected.changes_open);
+        assert_eq!(panels.active("background"), None);
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

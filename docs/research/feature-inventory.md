@@ -32,9 +32,9 @@ display EXCLUDED. File paths refer to the reference repo.
 - Left sidebar: collapsible + drag-resizable (208-400px, default 256, persisted). Collapse animates
   transition-[width] 200ms ease-out to 0; main panel goes full-bleed (margins/radius/border melt).
   Double-click separator resets; arrow keys nudge +/-16px.
-- Right Terminal/Changes column: session-scoped exclusive content, drag-resizable 360-760px,
-  default 520 capped 52%, width transition 200ms; its named closeable header owns the top-right
-  window area and the body reaches the right/bottom edges.
+- Right Terminal/Changes column: session-scoped exclusive body, drag-resizable 360-760px,
+  default 520 capped 52%, width transition 200ms; the shared top strip shows Terminal sessions
+  and Changes side by side as tabs, while only the selected tab's body reaches the right/bottom edges.
 - Main header h-11, 3 keyed variants (settings / chat / empty drag strip). Bottom fade uses an
   overlay gradient instead of a mask so scrollbars remain visible.
 - Reserved status strip (h-6) for WorkingIndicator so composer never shifts.
@@ -99,9 +99,9 @@ display EXCLUDED. File paths refer to the reference repo.
 
 ### 1.10 Terminal panel
 - xterm.js equivalent needed. Session-scoped tabs, restored on return; PTYs on owning device
-  (detach != close). Tab drag-reorder (sliding transforms 150ms), middle-click close, new-tab,
-  and a visible titlebar toggle plus Cmd+J. Terminal and Changes share the full-height,
-  drag-resizable right utility column; opening one replaces the other without collapsing width.
+  (detach != close). Terminal tabs support drag-reorder (sliding transforms 150ms) and
+  middle-click close; Terminal and Changes share one closeable top tab strip and `+` menu in
+  the full-height, drag-resizable right utility column. Cmd+J toggles the column.
 - Input coalescing 12ms, resize debounce 80ms, reconnect backoff, "[process exited N]",
   #090909 bg + full ANSI palette. Bounded 1MB replay window.
 
