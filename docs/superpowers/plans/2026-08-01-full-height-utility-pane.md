@@ -1,262 +1,321 @@
-# Full-height Utility Pane Implementation Plan
+# Unified Utility Tab Strip Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: use
+> `superpowers:executing-plans` and execute each checkbox in order.
 
-**Goal:** Turn the shared Terminal/Changes pane into a full-height right column with its own named closeable header and no inset outer card or horizontal titlebar separation.
+**Goal:** Replace the duplicated utility-pane header and nested Terminal tab
+bar with one top strip containing Terminal sessions and Changes as sibling
+tabs.
 
-**Architecture:** Keep `SessionPanels` as the single session-scoped pane state and reuse the persisted shared width. Split the ready shell into a flexible left workspace and a full-height right utility column; the left workspace owns the existing titlebar, sidebar, and conversation card, while the utility column owns its own titlebar-height header and body.
+**Architecture:** `SessionPanels` owns session-scoped column visibility, the
+active tab kind, and whether Changes is open. `TerminalPanel` remains the sole
+owner of terminal identity, order, PTYs, and drag behavior; it exposes its tab
+group separately from its body and emits small chrome events to `Shell`.
+`Shell` composes terminal tabs, the Changes tab, the `+` menu, and the collapse
+control into one 40px strip.
 
-**Tech Stack:** Rust 2024, GPUI, existing Comet motion/theme/icon helpers, Cargo tests.
+**Tech Stack:** Rust 2024, GPUI, existing Comet popover/motion/theme helpers,
+Cargo tests.
 
 ## Global Constraints
 
-- Terminal and Changes remain mutually exclusive and session-scoped.
-- The utility pane reaches the top, right, and bottom window edges.
-- Remove the utility pane's inset card radius, outer gutters, and horizontal divider.
-- Keep only the thin vertical resize seam between conversation and utility pane.
-- Render `Terminal ×` or `Changes ×` in a dedicated first row; Terminal's internal tabs remain in the second row.
-- Preserve `Cmd+J`, the existing titlebar toggles, 200 ms width animation, persisted width, PTY state, and diff watching.
-- Do not change engine, RPC, PTY, or settings schema behavior.
+- Keep the current full-height lateral placement and persisted shared width.
+- Terminal and Changes tabs may remain open at the same time; only one body is
+  active.
+- Keep Terminal PTY identity, ordering, replay, input, resize, and reconnect
+  behavior unchanged.
+- Keep Changes diff watching and rendering unchanged.
+- The `+` menu contains only Terminal and Changes.
+- Keep the existing conversation-titlebar buttons and `Cmd+J`.
+- Do not add Browser, Files, Side Chat, engine, RPC, or settings-schema work.
 
 ---
 
-### Task 1: Explicit pane title and close state
+### Task 1: Model persistent sibling-tab state
 
 **Files:**
-- Modify: `crates/ui/src/shell.rs:176-205`
+- Modify: `crates/ui/src/shell.rs`
 - Test: `crates/ui/src/shell.rs` test module
 
 **Interfaces:**
-- Produces: `UtilityPane::label(self) -> &'static str`
-- Produces: `SessionPanels::close(&mut self, key: &str) -> bool`
-- Consumes: existing `SessionPanels::active` and `SessionPanels::toggle`
+- Replace the map value `UtilityPane` with a per-session state containing
+  `visible`, `active`, and `changes_open`.
+- Add explicit operations for showing Terminal, showing Changes, hiding the
+  column, closing Changes, and reconciling terminal presence.
+- Keep all state transitions pure and unit-testable.
 
-- [ ] **Step 1: Write the failing state-contract test**
+- [ ] **Step 1: Write failing state-transition tests**
+
+Cover these observable contracts:
 
 ```rust
 #[test]
-fn utility_pane_labels_and_close_are_explicit() {
-    assert_eq!(UtilityPane::Terminal.label(), "Terminal");
-    assert_eq!(UtilityPane::Changes.label(), "Changes");
-
+fn utility_tabs_remain_open_when_selection_changes() {
     let mut panels = SessionPanels::default();
-    assert!(panels.toggle("chat-a", UtilityPane::Terminal));
-    assert!(panels.close("chat-a"));
-    assert_eq!(panels.active("chat-a"), None);
-    assert!(!panels.close("chat-a"));
+    panels.show_changes("chat-a");
+    panels.show_terminal("chat-a");
+
+    let state = panels.get("chat-a");
+    assert!(state.visible);
+    assert_eq!(state.active, UtilityPane::Terminal);
+    assert!(state.changes_open);
+}
+
+#[test]
+fn closing_active_changes_falls_back_to_terminal() {
+    let mut panels = SessionPanels::default();
+    panels.show_changes("chat-a");
+    panels.close_changes("chat-a", true);
+
+    let state = panels.get("chat-a");
+    assert!(state.visible);
+    assert_eq!(state.active, UtilityPane::Terminal);
+    assert!(!state.changes_open);
+}
+
+#[test]
+fn removing_the_last_open_tab_collapses_the_column() {
+    let mut panels = SessionPanels::default();
+    panels.show_terminal("chat-a");
+    panels.reconcile_terminal_presence("chat-a", false);
+    assert!(!panels.get("chat-a").visible);
 }
 ```
 
-- [ ] **Step 2: Run the test and verify the missing APIs fail compilation**
+Also assert that hiding/reopening preserves `changes_open`, and that a
+remaining Changes tab becomes active when the final Terminal closes.
 
-Run: `cargo test -p comet-ui utility_pane_labels_and_close_are_explicit -- --nocapture`
+- [ ] **Step 2: Run the focused tests and observe failure**
 
-Expected: FAIL because `UtilityPane::label` and `SessionPanels::close` do not exist.
+Run:
 
-- [ ] **Step 3: Add the minimal model APIs**
-
-```rust
-impl UtilityPane {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Terminal => "Terminal",
-            Self::Changes => "Changes",
-        }
-    }
-}
-
-impl SessionPanels {
-    pub fn close(&mut self, key: &str) -> bool {
-        self.map.remove(key).is_some()
-    }
-}
+```bash
+cargo test -p comet-ui utility_tabs_ -- --nocapture
 ```
 
-Keep the existing `active` and `toggle` methods unchanged.
+Expected: FAIL because the new state and operations do not exist.
+
+- [ ] **Step 3: Implement the minimal state reducer**
+
+Use a small `ChatPanelState` value with a closed default. State lookup for an
+unknown key must not allocate. Mutating operations may lazily insert.
+
+The reducer must encode:
+
+- `show_terminal`: visible + Terminal active; preserve `changes_open`.
+- `show_changes`: visible + Changes active + `changes_open = true`.
+- `hide`: set only `visible = false`.
+- `close_changes(has_terminal)`: remove Changes; select Terminal when present,
+  otherwise hide.
+- `reconcile_terminal_presence(false)`: if Terminal was active, select Changes
+  when open, otherwise hide.
 
 - [ ] **Step 4: Run the focused state tests**
 
-Run: `cargo test -p comet-ui utility_pane -- --nocapture`
-
-Expected: both the existing exclusivity test and the new title/close test PASS.
-
-- [ ] **Step 5: Commit the state contract**
+Run:
 
 ```bash
-git add crates/ui/src/shell.rs
-git commit -m "refactor(ui): model utility pane close state"
+cargo test -p comet-ui utility_tabs_ -- --nocapture
 ```
+
+Expected: PASS.
 
 ---
 
-### Task 2: Build the full-height utility column
+### Task 2: Separate Terminal chrome from Terminal body
 
 **Files:**
-- Modify: `crates/ui/src/shell.rs:858-935`
-- Modify: `crates/ui/src/shell.rs:2873-2933`
-- Modify: `crates/ui/src/shell.rs:3598-3732`
-- Modify: `crates/ui/src/shell/tabs.rs:552-595` comments only where the titlebar ownership description changes
+- Modify: `crates/ui/src/terminal/panel.rs`
+- Modify: `crates/ui/src/shell.rs`
+- Test: existing `crates/ui/src/terminal/panel.rs` tests
 
 **Interfaces:**
-- Consumes: `UtilityPane::label`, `SessionPanels::close`, `Shell::pane_container`, `Shell::titlebar_drag_region`, `header_icon_button`
-- Produces: `Shell::close_utility_pane(&mut self, window: &mut Window, cx: &mut Context<Self>)`
-- Produces: `Shell::render_utility_header(&mut self, pane: UtilityPane, cx: &mut Context<Self>) -> AnyElement`
-- Preserves: `Shell::render_right_pane`, `Shell::right_target`, and the resize action signatures
+- Add a crate-visible `TerminalPanelEvent` with `Changed { chat }` and
+  `Activated { chat }`.
+- Implement `EventEmitter<TerminalPanelEvent>` for `TerminalPanel`.
+- Expose `has_tabs(chat)`, `open_new_tab`, and `render_tab_group`.
+- Make `Render for TerminalPanel` render only the active terminal body.
 
-- [ ] **Step 1: Add a single close transition used by the header ×**
+- [ ] **Step 1: Add the terminal-to-shell event contract**
 
-```rust
-fn close_utility_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    let from = self.right_target(cx);
-    let key = self.panel_key(cx);
-    if !self.panels.close(&key) {
-        return;
-    }
-    self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-    if let Some(terminal) = self.terminal.clone() {
-        terminal.update(cx, |panel, cx| panel.set_open(false, cx));
-    }
-    window.focus(&self.composer.focus_handle(cx), cx);
-    cx.notify();
-}
+Emit `Changed` only for chrome mutations: open, close, reorder, and drag-state
+changes. Emit `Activated` when a terminal tab is clicked. Do not emit chrome
+events for terminal output, cursor movement, or resize frames.
+
+- [ ] **Step 2: Expose the terminal tab group**
+
+Refactor the current `render_tab_bar` into a group that retains:
+
+- Fixed-width terminal tabs.
+- Selection, close, middle-click, drag ghost, and reorder behavior.
+- Active/exited styling.
+
+The group must omit:
+
+- The 40px outer bar.
+- Padding owned by the shared strip.
+- The `+` button.
+- The collapse chevron.
+
+Pass a `terminal_active` boolean so no terminal tab appears selected while
+Changes owns the body.
+
+- [ ] **Step 3: Render only the terminal body from the entity**
+
+Keep the existing focus, keyboard, scroll, emulator, and empty-chat behavior.
+Remove only the `.child(self.render_tab_bar(...))` layer.
+
+- [ ] **Step 4: Subscribe Shell to terminal chrome events**
+
+Store the lazy subscription beside the lazy `TerminalPanel` entity.
+
+- `Changed` repaints the shared strip and reconciles whether the current chat
+  still has terminal tabs.
+- `Activated` makes Terminal the visible active utility tab without creating a
+  new PTY.
+
+When the final Terminal closes, Changes becomes active if open; otherwise the
+column animates closed.
+
+- [ ] **Step 5: Run terminal and state tests**
+
+Run:
+
+```bash
+cargo test -p comet-ui terminal -- --nocapture
+cargo test -p comet-ui utility_tabs_ -- --nocapture
 ```
 
-This closes whichever pane is active without reusing a pane-specific toggle.
+Expected: PASS.
 
-- [ ] **Step 2: Add the owned utility header**
+---
 
-Build a `Theme::TITLEBAR_HEIGHT` row with no bottom border. Use `pane.label()` for the text, `icons::TERMINAL` or `icons::SIDEBAR_MINIMALISTIC` for the leading glyph, and `header_icon_button("close-utility-pane", icons::CLOSE, false, ...)` for ×. Wrap the row with:
+### Task 3: Compose the single shared strip
 
-```rust
-self.titlebar_drag_region("utility-pane-titlebar", bar, cx)
-    .into_any_element()
-```
+**Files:**
+- Modify: `crates/ui/src/shell.rs`
+- Reuse: `crates/ui/src/popover.rs`
 
-The close listener must call `close_utility_pane(window, cx)`. The close control remains occluding through `header_icon_button`, so it cannot start a native window drag.
+**Interfaces:**
+- Replace `render_utility_header` with `render_utility_tab_strip`.
+- Add Shell state for whether the utility `+` menu is open.
+- Keep `render_right_pane` as the full-height column owner.
 
-- [ ] **Step 3: Replace the inset right card with a full-height column**
+- [ ] **Step 1: Add explicit Shell actions**
 
-In `render_right_pane`, compute `active` once, derive its header and body from the same value, and compose:
+Implement:
+
+- Open/select Terminal.
+- Create a new Terminal from `+`.
+- Open/select Changes.
+- Close Changes.
+- Hide/reopen the utility column.
+
+The conversation-titlebar buttons route through these same operations.
+
+- [ ] **Step 2: Render one 40px top strip**
+
+Compose, left to right:
+
+1. Terminal tab group from `TerminalPanel`, when terminal tabs exist.
+2. One `Changes ×` tab when `changes_open` and git is available.
+3. The `+` trigger.
+4. Flexible draggable titlebar space.
+5. The existing collapse chevron.
+
+Interactive children must stop propagation so selecting, closing, dragging, or
+opening the menu cannot start a native window drag.
+
+- [ ] **Step 3: Add the `+` menu**
+
+Use existing `popover::popover_card`, `popover::menu_row`, and
+`popover::anchored_menu`. Render two rows:
+
+- Terminal — creates and selects a new terminal.
+- Changes — opens/selects the singleton Changes tab.
+
+Dismiss on outside mouse-down and after either selection.
+
+- [ ] **Step 4: Remove the duplicated header**
+
+Delete the `Terminal ×` / `Changes ×` header renderer. The right pane becomes:
 
 ```rust
 div()
     .size_full()
-    .relative()
     .flex()
     .flex_col()
-    .bg(theme.bg)
-    .border_l_1()
-    .border_color(theme.border)
-    .child(header)
-    .child(div().flex_1().min_h_0().overflow_hidden().child(content))
-    .child(handle)
+    .child(shared_tab_strip)
+    .child(active_body)
 ```
 
-Pass this element directly to `pane_container`. Delete the rounded outer card, `.pb(8)`, `.pr(8)`, and all inset-card comments. Keep the resize handle absolutely positioned on the left edge.
+Keep the left resize handle, border seam, width tween, and full-height
+composition unchanged.
 
-- [ ] **Step 4: Move the right pane outside the global titlebar column**
+- [ ] **Step 5: Compile the desktop app**
 
-Replace the ready page's `flex_col(title_bar, body_row)` composition with:
-
-```rust
-let left_workspace = div()
-    .h_full()
-    .flex_1()
-    .min_w_0()
-    .flex()
-    .flex_col()
-    .child(title_bar)
-    .child(
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_row()
-            .child(sidebar)
-            .child(sidebar_seam)
-            .child(card),
-    );
-
-let page = div()
-    .size_full()
-    .flex()
-    .flex_row()
-    .child(left_workspace)
-    .child(right)
-    .child(self.render_titlebar_cluster(cx))
-    .children(overlays);
-```
-
-The right pane now owns the top-right window area. Keep `sidebar_tone` as the existing absolute full-height background.
-
-- [ ] **Step 5: Remove the gap and square the conversation edge at the open seam**
-
-When `right_pane_open(cx)` is true, use a `0px` right margin on the conversation card and set its top-right and bottom-right radii to `0px`; otherwise preserve the current `8px` right gutter and `12px` radius. This leaves one continuous vertical seam instead of the previous card-to-card gap.
-
-- [ ] **Step 6: Compile the shell change**
-
-Run: `cargo check -p comet`
-
-Expected: PASS. Existing future-incompatibility dependency warnings are acceptable; new errors or warnings in modified code are not.
-
-- [ ] **Step 7: Commit the full-height composition**
+Run:
 
 ```bash
-git add crates/ui/src/shell.rs crates/ui/src/shell/tabs.rs
-git commit -m "feat(ui): extend utility pane to window top"
+cargo check -p comet
 ```
+
+Expected: PASS with no new project warnings.
 
 ---
 
-### Task 3: Regression and visual verification
+### Task 4: Verify the corrected behavior
 
-**Files:**
-- Verify: `crates/ui/src/shell.rs`
-- Verify: `crates/ui/src/shell/tabs.rs`
-- Verify: `crates/ui/src/terminal/panel.rs`
+- [ ] **Step 1: Run the complete UI suite**
 
-**Interfaces:**
-- Consumes: final `comet-ui` behavior and `scripts/dev-demo.sh`
-- Produces: evidence that layout, keyboard, focus, resize, and engine connectivity still work
-
-- [ ] **Step 1: Run the full UI test suite**
-
-Run: `cargo test -p comet-ui`
+```bash
+cargo test -p comet-ui
+```
 
 Expected: all tests PASS.
 
 - [ ] **Step 2: Build the desktop binary**
 
-Run: `cargo build -p comet`
+```bash
+cargo build -p comet
+```
 
-Expected: PASS with no new project warnings.
+Expected: PASS.
 
-- [ ] **Step 3: Restart the persistent demo**
+- [ ] **Step 3: Exercise the live desktop flow**
 
-Stop the existing `comet-dev` process through the harness, then start `/bin/zsh scripts/dev-demo.sh` from the repository root. Wait for the `opening comet` readiness log.
+Restart `scripts/dev-demo.sh`, then:
 
-Expected: the Comet window opens with seeded chats and a responsive local engine.
+1. Open Terminal.
+2. Use `+` to create Terminal 2.
+3. Use `+` to open Changes.
+4. Select Terminal 1, Terminal 2, and Changes in sequence.
+5. Close each active tab and verify neighbor fallback.
+6. Reopen/collapse with `Cmd+J`.
+7. Resize the left seam and switch chats.
+8. Type a harmless command in a terminal.
 
-- [ ] **Step 4: Exercise the terminal path**
+Expected:
 
-Open Terminal from the titlebar, confirm the `Terminal ×` header occupies the top-right row, verify `Terminal 1` is directly below it, resize from the vertical seam, close with ×, reopen with `Cmd+J`, and type a harmless shell command.
+- Exactly one top strip.
+- Terminal tabs and Changes remain visible beside one another.
+- No `Terminal ×` or `Changes ×` row above the tabs.
+- Only the active body is rendered.
+- The last tab closes the column.
+- PTY input/output, diff rendering, focus, width, and per-chat state remain
+  functional.
 
-Expected: the pane reaches top/right/bottom edges, has no outer rounded card, outer gutters, or horizontal divider; command output appears and the composer regains focus after close.
+- [ ] **Step 4: Verify local RPC health**
 
-- [ ] **Step 5: Exercise the Changes path and session state**
-
-Switch Terminal → Changes, close from the `Changes ×` header, reopen, then switch to another chat and back.
-
-Expected: switching content does not collapse width; only one pane is visible; each chat restores its own active pane; the resize width remains persisted.
-
-- [ ] **Step 6: Verify local RPC health**
-
-Run: `cargo run -q -p comet-rpc --example rpc_probe -- ws://127.0.0.1:27921 LocalDevice '{}'`
+```bash
+cargo run -q -p comet-rpc --example rpc_probe -- \
+  ws://127.0.0.1:27921 LocalDevice '{}'
+```
 
 Expected: one JSON object containing a non-empty `deviceId`.
 
-- [ ] **Step 7: Capture final visual evidence**
+- [ ] **Step 5: Capture final visual evidence**
 
-Capture the Comet window with Terminal open at desktop width and inspect it against the approved reference.
-
-Expected: full-height right column, named top header with ×, Terminal tabs on the second row, and only the thin vertical resize seam between columns.
+Capture the Comet window with two Terminal tabs and Changes visible. Compare it
+to the approved references: one shared row at the top of the lateral panel,
+with each component opening beside the others.
