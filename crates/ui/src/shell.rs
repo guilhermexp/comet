@@ -173,7 +173,7 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// The one utility pane that can occupy the right side of a chat.
+/// The active body in the shared right-side utility tab strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UtilityPane {
     Terminal,
@@ -189,31 +189,104 @@ impl UtilityPane {
     }
 }
 
-/// Session-scoped utility panes. Missing keys are closed; the new-chat canvas
-/// uses a space-specific key. State is intentionally in memory only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatPanelState {
+    visible: bool,
+    active: UtilityPane,
+    changes_open: bool,
+}
+
+impl Default for ChatPanelState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            active: UtilityPane::Terminal,
+            changes_open: false,
+        }
+    }
+}
+
+/// Session-scoped utility tabs. Missing keys use a closed state; the new-chat
+/// canvas uses a space-specific key. State is intentionally in memory only.
 #[derive(Debug, Default)]
 pub struct SessionPanels {
-    map: std::collections::HashMap<String, UtilityPane>,
+    map: std::collections::HashMap<String, ChatPanelState>,
 }
 
 impl SessionPanels {
-    pub fn active(&self, key: &str) -> Option<UtilityPane> {
-        self.map.get(key).copied()
+    fn get(&self, key: &str) -> ChatPanelState {
+        self.map.get(key).copied().unwrap_or_default()
     }
 
-    /// Select `pane`, or close it when it is already selected.
-    pub fn toggle(&mut self, key: &str, pane: UtilityPane) -> bool {
+    pub fn active(&self, key: &str) -> Option<UtilityPane> {
+        let state = self.get(key);
+        state.visible.then_some(state.active)
+    }
+
+    fn show_terminal(&mut self, key: &str) {
+        let state = self.map.entry(key.to_string()).or_default();
+        state.visible = true;
+        state.active = UtilityPane::Terminal;
+    }
+
+    fn show_changes(&mut self, key: &str) {
+        let state = self.map.entry(key.to_string()).or_default();
+        state.visible = true;
+        state.active = UtilityPane::Changes;
+        state.changes_open = true;
+    }
+
+    fn hide(&mut self, key: &str) -> bool {
+        let Some(state) = self.map.get_mut(key) else {
+            return false;
+        };
+        let was_visible = state.visible;
+        state.visible = false;
+        was_visible
+    }
+
+    fn close_changes(&mut self, key: &str, has_terminal: bool) {
+        let state = self.map.entry(key.to_string()).or_default();
+        state.changes_open = false;
+        if state.active == UtilityPane::Changes {
+            state.active = UtilityPane::Terminal;
+            state.visible = has_terminal;
+        }
+    }
+
+    fn reconcile_terminal_presence(&mut self, key: &str, has_terminal: bool) {
+        if has_terminal {
+            return;
+        }
+        let Some(state) = self.map.get_mut(key) else {
+            return;
+        };
+        if state.active == UtilityPane::Terminal {
+            if state.changes_open {
+                state.active = UtilityPane::Changes;
+            } else {
+                state.visible = false;
+            }
+        }
+    }
+
+    /// Compatibility toggle while the shell callers migrate to explicit
+    /// show/hide operations.
+    fn toggle(&mut self, key: &str, pane: UtilityPane) -> bool {
         if self.active(key) == Some(pane) {
-            self.map.remove(key);
+            self.hide(key);
             false
         } else {
-            self.map.insert(key.to_string(), pane);
+            match pane {
+                UtilityPane::Terminal => self.show_terminal(key),
+                UtilityPane::Changes => self.show_changes(key),
+            }
             true
         }
     }
 
-    pub fn close(&mut self, key: &str) -> bool {
-        self.map.remove(key).is_some()
+    fn close(&mut self, key: &str) -> bool {
+        self.hide(key)
     }
 }
 
@@ -3857,37 +3930,56 @@ mod tests {
     // ---- per-session utility pane (§1.10/1.11) ----
 
     #[test]
-    fn utility_panes_default_closed_per_chat() {
+    fn utility_tabs_default_closed_per_chat() {
         let panels = SessionPanels::default();
-        assert_eq!(panels.active("a"), None);
-        assert_eq!(panels.active("b"), None);
+        assert_eq!(panels.get("a"), ChatPanelState::default());
+        assert_eq!(panels.get("b"), ChatPanelState::default());
     }
 
     #[test]
-    fn utility_pane_toggle_is_exclusive_and_chat_scoped() {
+    fn utility_tabs_remain_open_when_selection_changes() {
         let mut panels = SessionPanels::default();
+        panels.show_changes("chat-a");
+        panels.show_terminal("chat-a");
 
-        assert!(panels.toggle("a", UtilityPane::Terminal));
-        assert_eq!(panels.active("a"), Some(UtilityPane::Terminal));
-        assert_eq!(panels.active("b"), None);
-
-        assert!(panels.toggle("a", UtilityPane::Changes));
-        assert_eq!(panels.active("a"), Some(UtilityPane::Changes));
-
-        assert!(!panels.toggle("a", UtilityPane::Changes));
-        assert_eq!(panels.active("a"), None);
+        let state = panels.get("chat-a");
+        assert!(state.visible);
+        assert_eq!(state.active, UtilityPane::Terminal);
+        assert!(state.changes_open);
     }
 
     #[test]
-    fn utility_pane_labels_and_close_are_explicit() {
-        assert_eq!(UtilityPane::Terminal.label(), "Terminal");
-        assert_eq!(UtilityPane::Changes.label(), "Changes");
-
+    fn utility_tabs_hide_without_forgetting_open_tabs() {
         let mut panels = SessionPanels::default();
-        assert!(panels.toggle("chat-a", UtilityPane::Terminal));
-        assert!(panels.close("chat-a"));
-        assert_eq!(panels.active("chat-a"), None);
-        assert!(!panels.close("chat-a"));
+        panels.show_changes("chat-a");
+        assert!(panels.hide("chat-a"));
+        assert!(!panels.get("chat-a").visible);
+        assert!(panels.get("chat-a").changes_open);
+
+        panels.show_changes("chat-a");
+        assert!(panels.get("chat-a").visible);
+    }
+
+    #[test]
+    fn utility_tabs_close_with_neighbor_fallback() {
+        let mut panels = SessionPanels::default();
+        panels.show_changes("chat-a");
+        panels.close_changes("chat-a", true);
+
+        let state = panels.get("chat-a");
+        assert!(state.visible);
+        assert_eq!(state.active, UtilityPane::Terminal);
+        assert!(!state.changes_open);
+
+        panels.show_changes("chat-a");
+        panels.show_terminal("chat-a");
+        panels.reconcile_terminal_presence("chat-a", false);
+        let state = panels.get("chat-a");
+        assert!(state.visible);
+        assert_eq!(state.active, UtilityPane::Changes);
+
+        panels.close_changes("chat-a", false);
+        assert!(!panels.get("chat-a").visible);
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----
