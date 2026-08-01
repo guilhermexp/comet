@@ -566,9 +566,8 @@ impl Shell {
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())
-            // Stable, discoverable utility controls. Both target the same
-            // right-side card, so the active wash also communicates which
-            // content currently occupies it.
+            // Stable utility controls at the right edge of the conversation
+            // titlebar; the active wash mirrors the adjacent full-height pane.
             .when(has_space, |el| {
                 el.child(header_icon_button(
                     "toggle-terminal",
@@ -588,9 +587,8 @@ impl Shell {
                 ))
             });
 
-        // The unified window titlebar: full-width on the glass shell, ABOVE
-        // the inset card. No bottom border — the card's own hairline is the
-        // separation; the glass gutter shows between.
+        // The conversation titlebar fills the flexible left workspace. An open
+        // utility pane owns the remaining top-right area with its own header.
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         self.titlebar_drag_region("chat-tabs-titlebar", bar, cx)
             .into_any_element()

@@ -947,6 +947,20 @@ impl Shell {
         cx.notify();
     }
 
+    fn close_utility_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        let key = self.panel_key(cx);
+        if !self.panels.close(&key) {
+            return;
+        }
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        if let Some(terminal) = self.terminal.clone() {
+            terminal.update(cx, |panel, cx| panel.set_open(false, cx));
+        }
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
     fn on_sidebar_drag(
         &mut self,
         event: &gpui::DragMoveEvent<SidebarResize>,
@@ -2883,12 +2897,63 @@ impl Shell {
         }
     }
 
-    /// Shared right utility pane — Terminal or Changes, hidden by default and
-    /// drag-resizable.
+    fn render_utility_header(
+        &mut self,
+        pane: UtilityPane,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let icon_path = match pane {
+            UtilityPane::Terminal => icons::TERMINAL,
+            UtilityPane::Changes => icons::SIDEBAR_MINIMALISTIC,
+        };
+        let close = header_icon_button(
+            "close-utility-pane",
+            icons::CLOSE,
+            false,
+            &theme,
+            cx.listener(|this, _, window, cx| this.close_utility_pane(window, cx)),
+        );
+        let tab = div()
+            .h(px(32.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .pl(px(10.0))
+            .pr(px(2.0))
+            .rounded(px(7.0))
+            .bg(theme.surface_raised)
+            .child(icon(icon_path).size(px(14.0)).text_color(theme.text_muted))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(pane.label())),
+            )
+            .child(close);
+        let bar = div()
+            .h(px(Theme::TITLEBAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_end()
+            .pt(px(Theme::TITLEBAR_TOP_PAD))
+            .pl(px(8.0))
+            .child(tab)
+            .child(div().flex_1());
+        self.titlebar_drag_region("utility-pane-titlebar", bar, cx)
+            .into_any_element()
+    }
+
+    /// Full-height right utility column — Terminal or Changes, hidden by
+    /// default and drag-resizable from its left seam.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let bg = theme.bg;
-        let content: AnyElement = match self.active_utility_pane(cx) {
+        let active = self.active_utility_pane(cx);
+        let header: AnyElement = match active {
+            Some(pane) => self.render_utility_header(pane, cx),
+            None => gpui::Empty.into_any_element(),
+        };
+        let content: AnyElement = match active {
             Some(UtilityPane::Terminal) => {
                 let terminal = self.terminal_panel(cx);
                 terminal.update(cx, |panel, cx| panel.set_open(true, cx));
@@ -2901,9 +2966,6 @@ impl Shell {
             }
             None => gpui::Empty.into_any_element(),
         };
-        // Its OWN inset card (user request): the conversation card's right
-        // gutter is the gap; padding (not margins) keeps the tweened width
-        // container clean, and the resize grabber floats over the gap.
         let handle = self
             .resize_handle(
                 "right-pane-resize",
@@ -2914,34 +2976,29 @@ impl Shell {
             .absolute()
             .top_0()
             .bottom_0()
-            // INSIDE the width-clipped container (a negative inset was
-            // clipped into unreachability — user-reported dead resize),
-            // overlapping the card's left border.
             .left(px(0.0));
-        let card = div()
+        let column = div()
             .size_full()
-            .rounded(px(12.0))
-            .border_1()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(theme.bg)
+            .border_l_1()
             .border_color(theme.border)
-            .bg(bg)
-            .overflow_hidden()
-            .child(content);
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(content),
+            )
+            .child(handle);
         let target = self.right_target(cx);
         self.pane_container(
             self.right_tween,
             target,
-            // Mirrors the conversation card's box exactly: flush under the
-            // titlebar (no top pad), 8px bottom/right gutters — the
-            // conversation card's own right margin is the 8px gap between the
-            // two insets (user-reported height/gap mismatch).
-            div()
-                .h_full()
-                .relative()
-                .pb(px(8.0))
-                .pr(px(8.0))
-                .child(card)
-                .child(handle)
-                .into_any_element(),
+            column.into_any_element(),
         )
     }
 
@@ -3633,18 +3690,13 @@ impl Render for Shell {
                     Empty.into_any_element()
                 };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // The signature frame: the conversation card and — when a
-                // utility pane is open — a SECOND inset card beside it, both
-                // rounded hairline-bordered floats on the frost shell.
+                // The conversation remains an inset card, but when the
+                // full-height utility column is open its right edge lands
+                // directly on the single vertical pane seam.
                 let theme = Theme::of(cx);
-                // Margins, radius, and border-color MELT over the same 200ms
-                // ease-out as the sidebar width (comet __root.tsx `<main>`
-                // `transition-[margin,border-radius,border-color]`; collapsed
-                // is `m-0 rounded-none border-transparent` — the border WIDTH
-                // stays, only its color fades, so layout never jumps by the
-                // hairline).
                 let border_color = theme.border;
-                let card = div()
+                let utility_open = on_chat && self.right_pane_open(cx);
+                let card: AnyElement = div()
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -3652,36 +3704,14 @@ impl Render for Shell {
                     .overflow_hidden()
                     .bg(theme.bg)
                     .border_1()
-                    .child(main);
-                // Manual drive on the SAME clock as the sidebar width tween.
-                // Crucially there is no `with_animation` wrapper here: the
-                // wrapper's epoch-keyed id used to change every card
-                // descendant's global element-id path on each toggle, which
-                // reset gpui's per-element animation state and REPLAYED any
-                // stale pane/terminal tween from t=0 (the changes pane slid
-                // ~100px under the clip mid-toggle — round-6 §2/§3).
-                //
-                // The inset card persists in EVERY state (user request): top
-                // gutter under the unified titlebar, constant left/right/
-                // bottom gutters, constant radius + hairline — the 8px left
-                // gap holds whether it borders the sidebar or the window edge.
-                // No top margin: the titlebar's own internal air (44px bar,
-                // 28px tabs) is the gap — an extra gutter read as a hole
-                // between the header and the app (user report).
-                // The right margin is the window gutter when the utility pane
-                // is closed, but the SEAM between the two inset cards when it
-                // is open — a full gutter there read double-wide next to the
-                // two borders it separates (user report).
-                let right_gap = if on_chat && self.right_pane_open(cx) {
-                    4.0
-                } else {
-                    8.0
-                };
-                let card: AnyElement = card
+                    .child(main)
                     .mb(px(8.0))
-                    .mr(px(right_gap))
+                    .mr(px(if utility_open { 0.0 } else { 8.0 }))
                     .ml(px(8.0))
                     .rounded(px(12.0))
+                    .when(utility_open, |el| {
+                        el.rounded_tr(px(0.0)).rounded_br(px(0.0))
+                    })
                     .border_color(border_color)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (comet
@@ -3722,8 +3752,10 @@ impl Render for Shell {
                     .bg(crate::theme::wash(0.05))
                     .border_r_1()
                     .border_color(border_color);
-                let page = div()
-                    .size_full()
+                let left_workspace = div()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .child(title_bar)
@@ -3735,9 +3767,14 @@ impl Render for Shell {
                             .flex_row()
                             .child(sidebar)
                             .child(sidebar_seam)
-                            .child(card)
-                            .child(right),
-                    )
+                            .child(card),
+                    );
+                let page = div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(left_workspace)
+                    .child(right)
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
