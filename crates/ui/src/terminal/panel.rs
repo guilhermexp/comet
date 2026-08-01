@@ -841,9 +841,8 @@ impl TerminalPanel {
 
         let bar_chat = chat_owned.clone();
         let drop_chat = chat_owned.clone();
-        // Comet terminal-panel.tsx: `flex h-10 items-center border-b
-        // border-white/[0.07] pl-2 pr-1.5` on the #090909 panel — no separate
-        // bar fill.
+        // The tab bar shares the terminal background; spacing alone separates
+        // it from the terminal viewport.
         div()
             .id("terminal-tab-bar")
             .h(px(TAB_BAR_HEIGHT))
@@ -854,8 +853,6 @@ impl TerminalPanel {
             .gap(px(4.0))
             .pl(px(8.0))
             .pr(px(6.0))
-            .border_b_1()
-            .border_color(crate::theme::white_alpha(0.07))
             .on_drag_move::<TabDragPayload>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
                     let payload = event.drag(cx);
