@@ -180,6 +180,15 @@ pub enum UtilityPane {
     Changes,
 }
 
+impl UtilityPane {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Changes => "Changes",
+        }
+    }
+}
+
 /// Session-scoped utility panes. Missing keys are closed; the new-chat canvas
 /// uses a space-specific key. State is intentionally in memory only.
 #[derive(Debug, Default)]
@@ -201,6 +210,10 @@ impl SessionPanels {
             self.map.insert(key.to_string(), pane);
             true
         }
+    }
+
+    pub fn close(&mut self, key: &str) -> bool {
+        self.map.remove(key).is_some()
     }
 }
 
@@ -3826,6 +3839,18 @@ mod tests {
 
         assert!(!panels.toggle("a", UtilityPane::Changes));
         assert_eq!(panels.active("a"), None);
+    }
+
+    #[test]
+    fn utility_pane_labels_and_close_are_explicit() {
+        assert_eq!(UtilityPane::Terminal.label(), "Terminal");
+        assert_eq!(UtilityPane::Changes.label(), "Changes");
+
+        let mut panels = SessionPanels::default();
+        assert!(panels.toggle("chat-a", UtilityPane::Terminal));
+        assert!(panels.close("chat-a"));
+        assert_eq!(panels.active("chat-a"), None);
+        assert!(!panels.close("chat-a"));
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----
