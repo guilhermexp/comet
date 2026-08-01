@@ -3432,16 +3432,24 @@ fn nav_history_button(
     window_control_button(id, icon_path, theme, on_click).into_any_element()
 }
 
-/// A size-7 icon button for the main-panel header (comet __root.tsx:
-/// `grid size-7 place-items-center rounded-md text-muted-foreground`).
+/// A size-7 toggle for the main-panel title bar.
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
+    active: bool,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let muted = theme.text_muted;
     let fade_key = format!("header-icon-{id}");
+    let bg = if active {
+        crate::theme::glass_selected_bg()
+    } else {
+        motion::hover_blend(
+            &fade_key,
+            crate::theme::wash(0.0),
+            crate::theme::wash(0.11),
+        )
+    };
     div()
         .id(id)
         .size(px(28.0))
@@ -3451,23 +3459,24 @@ fn header_icon_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // comet __root.tsx header buttons: `transition-colors`.
-        .bg(motion::hover_blend(
-            &fade_key,
-            crate::theme::wash(0.0),
-            crate::theme::wash(0.11),
-        ))
+        .bg(bg)
+        .when(active, |el| {
+            el.shadow(crate::theme::glass_selected_shadows())
+        })
         .on_hover(motion::hover_listener(fade_key))
-        // Same occlusion + click-swallowing as [`window_control_button`]: this
-        // button sits inside the chat header's titlebar drag region, so its
-        // rect must be carved out of the strip's drag/double-click surface.
+        // Title-bar controls must consume pointer events instead of starting a
+        // window drag or double-click zoom.
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
             on_click(event, window, cx)
         })
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
+        .child(
+            icon(icon_path)
+                .size(px(16.0))
+                .text_color(if active { theme.text } else { theme.text_muted }),
+        )
 }
 
 impl Render for Shell {

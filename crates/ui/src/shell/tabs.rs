@@ -177,7 +177,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// The tab strip: [scrollable tabs (edge fades)][+][drag spacer][toggle-changes].
+    /// The tab strip: [scrollable tabs][+][spacer][terminal][changes].
     pub(super) fn render_session_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
@@ -225,6 +225,9 @@ impl Shell {
         }
         let has_space = space_id.is_some();
         let git = self.space_git_detected(cx);
+        let active_utility = self.active_utility_pane(cx);
+        let terminal_active = active_utility == Some(UtilityPane::Terminal);
+        let changes_active = active_utility == Some(UtilityPane::Changes);
         let hovered = self.tab_hover.clone();
         let on_canvas = selected.is_none();
         // No sessions yet → the canvas already shows; a `+` would be redundant.
@@ -563,12 +566,23 @@ impl Shell {
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())
-            // Stable location: the toggle shows whether the pane is open or
-            // not (the pane's own header is gone).
+            // Stable, discoverable utility controls. Both target the same
+            // right-side card, so the active wash also communicates which
+            // content currently occupies it.
+            .when(has_space, |el| {
+                el.child(header_icon_button(
+                    "toggle-terminal",
+                    icons::TERMINAL,
+                    terminal_active,
+                    &theme,
+                    cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
+                ))
+            })
             .when(git, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
                     icons::SIDEBAR_MINIMALISTIC,
+                    changes_active,
                     &theme,
                     cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                 ))
