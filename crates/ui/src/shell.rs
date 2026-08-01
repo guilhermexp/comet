@@ -967,6 +967,15 @@ impl Shell {
         }
     }
 
+    /// Shared tail of every utility-column transition: the chooser never
+    /// survives a column mutation, and the width tween always starts from the
+    /// pre-mutation target.
+    fn finish_right_transition(&mut self, from: f32, cx: &mut Context<Self>) {
+        self.utility_add_menu_open = false;
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
+    }
+
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         let from = self.sidebar_target();
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
@@ -975,33 +984,36 @@ impl Shell {
         cx.notify();
     }
 
-    fn show_changes(&mut self, cx: &mut Context<Self>) {
+    fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.space_git_detected(cx) {
             return;
         }
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         self.panels.show_changes(&key);
-        self.utility_add_menu_open = false;
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if let Some(terminal) = self.terminal.clone() {
+            let was_focused = terminal
+                .read(cx)
+                .focus_handle()
+                .contains_focused(window, cx);
             terminal.update(cx, |panel, cx| panel.set_open(false, cx));
+            if was_focused {
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
         }
-            let changes = self.changes_pane(cx);
-            changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-        cx.notify();
-        }
+        let changes = self.changes_pane(cx);
+        changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+        self.finish_right_transition(from, cx);
+    }
 
-    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+    fn toggle_right_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_utility_pane(cx) == Some(UtilityPane::Changes) {
             let from = self.right_target(cx);
             let key = self.panel_key(cx);
             self.panels.hide(&key);
-            self.utility_add_menu_open = false;
-            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        cx.notify();
+            self.finish_right_transition(from, cx);
         } else {
-            self.show_changes(cx);
+            self.show_changes(window, cx);
         }
     }
 
@@ -1039,6 +1051,7 @@ impl Shell {
             if from != to {
                 self.right_tween = Some(WidthTween::new(from, to));
             }
+            self.utility_add_menu_open = false;
             cx.notify();
         }
     }
@@ -1057,39 +1070,54 @@ impl Shell {
         terminal
     }
 
+    /// Select the Terminal tab, but only once the panel really holds a tab for
+    /// this session: no selected chat (the new-chat canvas) and an unavailable
+    /// engine both leave zero tabs, and the column must never show up empty.
+    fn reveal_terminal(
+        &mut self,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = self.panel_key(cx);
+        let panel = self.terminal_panel(cx);
+        panel.update(cx, |panel, cx| {
+            if new_tab {
+                panel.open_new_tab(cx);
+            } else {
+                panel.set_open(true, cx);
+            }
+        });
+        if !panel.read(cx).has_tabs(&key) {
+            panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            return false;
+        }
+        self.panels.show_terminal(&key);
+        window.focus(&panel.read(cx).focus_handle(), cx);
+        true
+    }
+
     fn create_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.read(cx).selected_chat.is_none() {
+        let from = self.right_target(cx);
+        if !self.reveal_terminal(true, window, cx) {
             return;
         }
-        let from = self.right_target(cx);
-        let key = self.panel_key(cx);
-        self.panels.show_terminal(&key);
-        self.utility_add_menu_open = false;
-        let panel = self.terminal_panel(cx);
-        panel.update(cx, |panel, cx| panel.open_new_tab(cx));
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-            window.focus(&panel.read(cx).focus_handle(), cx);
-        cx.notify();
+        self.finish_right_transition(from, cx);
     }
 
     /// Toggle the shared utility column while selecting Terminal when opening.
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
-        let key = self.panel_key(cx);
-        let panel = self.terminal_panel(cx);
         if self.active_utility_pane(cx) == Some(UtilityPane::Terminal) {
+            let key = self.panel_key(cx);
             self.panels.hide(&key);
-            self.utility_add_menu_open = false;
+            let panel = self.terminal_panel(cx);
             panel.update(cx, |panel, cx| panel.set_open(false, cx));
             window.focus(&self.composer.focus_handle(cx), cx);
-        } else {
-            self.panels.show_terminal(&key);
-            self.utility_add_menu_open = false;
-            panel.update(cx, |panel, cx| panel.set_open(true, cx));
-            window.focus(&panel.read(cx).focus_handle(), cx);
+        } else if !self.reveal_terminal(false, window, cx) {
+            return;
         }
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        cx.notify();
+        self.finish_right_transition(from, cx);
     }
 
     fn toggle_utility_add_menu(&mut self) {
@@ -1120,7 +1148,6 @@ impl Shell {
             return;
         }
 
-        self.utility_add_menu_open = false;
         match self.active_utility_pane(cx) {
             Some(UtilityPane::Terminal) => {
                 let terminal = self.terminal_panel(cx);
@@ -1131,10 +1158,9 @@ impl Shell {
                 let changes = self.changes_pane(cx);
                 changes.update(cx, |changes, cx| changes.ensure_watch(cx));
             }
-            None => return,
+            None => {}
         }
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        cx.notify();
+        self.finish_right_transition(from, cx);
     }
 
     fn close_changes_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1145,7 +1171,6 @@ impl Shell {
             .as_ref()
             .is_some_and(|terminal| terminal.read(cx).has_tabs(&key));
         self.panels.close_changes(&key, has_terminal);
-        self.utility_add_menu_open = false;
         if self.active_utility_pane(cx) == Some(UtilityPane::Terminal) {
             if let Some(terminal) = self.terminal.clone() {
                 terminal.update(cx, |panel, cx| panel.set_open(true, cx));
@@ -1154,8 +1179,7 @@ impl Shell {
         } else if !self.right_pane_open(cx) {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        cx.notify();
+        self.finish_right_transition(from, cx);
     }
 
     fn close_utility_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1164,13 +1188,11 @@ impl Shell {
         if !self.panels.hide(&key) {
             return;
         }
-        self.utility_add_menu_open = false;
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if let Some(terminal) = self.terminal.clone() {
             terminal.update(cx, |panel, cx| panel.set_open(false, cx));
         }
         window.focus(&self.composer.focus_handle(cx), cx);
-        cx.notify();
+        self.finish_right_transition(from, cx);
     }
 
     fn on_sidebar_drag(
@@ -3145,9 +3167,9 @@ impl Shell {
                         element.opacity(0.35).cursor(gpui::CursorStyle::Arrow)
                     })
                     .when(git_detected, |element| {
-                        element.on_click(cx.listener(|this, _, _, cx| {
+                        element.on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
-                            this.show_changes(cx);
+                            this.show_changes(window, cx);
                         }))
                     })
                     .child(
@@ -3229,9 +3251,9 @@ impl Shell {
                 .cursor_pointer()
                 .occlude()
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
-                    this.show_changes(cx);
+                    this.show_changes(window, cx);
                 }))
                 .child(
                     icon(icons::DIFF)
@@ -3968,9 +3990,9 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
                 if matches!(this.route, Route::Chat) {
-                    this.toggle_right_pane(cx)
+                    this.toggle_right_pane(window, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
