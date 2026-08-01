@@ -236,17 +236,17 @@ impl SessionPanels {
         was_visible
     }
 
-    fn restore(&mut self, key: &str, has_terminal: bool) -> bool {
+    fn restore(&mut self, key: &str, has_terminal: bool, has_changes: bool) -> bool {
         let state = self.map.entry(key.to_string()).or_default();
         let active_exists = match state.active {
             UtilityPane::Terminal => has_terminal,
-            UtilityPane::Changes => state.changes_open,
+            UtilityPane::Changes => has_changes && state.changes_open,
         };
 
         if !active_exists {
             if has_terminal {
                 state.active = UtilityPane::Terminal;
-            } else if state.changes_open {
+            } else if has_changes && state.changes_open {
                 state.active = UtilityPane::Changes;
             } else {
                 state.visible = false;
@@ -498,6 +498,8 @@ pub struct Shell {
     terminal_events: Option<Subscription>,
     changes: Option<Entity<Changes>>,
     utility_add_menu_open: bool,
+    /// Suppresses the trigger click following an outside mouse-down dismissal.
+    utility_add_menu_dismissed_at: Option<std::time::Instant>,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -700,6 +702,7 @@ impl Shell {
             terminal_events: None,
             changes: None,
             utility_add_menu_open: false,
+            utility_add_menu_dismissed_at: None,
             route,
             nav,
             devices_page: None,
@@ -850,15 +853,21 @@ impl Shell {
             if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
                 self.space_last_chat.insert(space, chat);
             }
-            if selected_space != self.settings.last_space_id && selected_space.is_some() {
-                self.settings.last_space_id = selected_space;
-                self.schedule_save(cx);
+            if selected_space != self.settings.last_space_id {
+                self.utility_add_menu_open = false;
+                self.utility_add_menu_dismissed_at = None;
+                if selected_space.is_some() {
+                    self.settings.last_space_id = selected_space;
+                    self.schedule_save(cx);
+                }
             }
         }
         // Chat switch: restore that chat's utility pane without replaying the
         // width transition; panes belong to the destination chat.
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if selected != self.active_chat {
+            self.utility_add_menu_open = false;
+            self.utility_add_menu_dismissed_at = None;
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
@@ -1049,6 +1058,9 @@ impl Shell {
     }
 
     fn create_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.is_none() {
+            return;
+        }
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         self.panels.show_terminal(&key);
@@ -1080,6 +1092,14 @@ impl Shell {
         cx.notify();
     }
 
+    fn toggle_utility_add_menu(&mut self) {
+        let just_dismissed = self
+            .utility_add_menu_dismissed_at
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+        self.utility_add_menu_open = !self.utility_add_menu_open && !just_dismissed;
+        self.utility_add_menu_dismissed_at = None;
+    }
+
     fn toggle_utility_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_pane_open(cx) {
             self.close_utility_pane(window, cx);
@@ -1092,9 +1112,10 @@ impl Shell {
             .terminal
             .as_ref()
             .is_some_and(|terminal| terminal.read(cx).has_tabs(&key));
+        let has_changes = self.space_git_detected(cx);
 
-        if !self.panels.restore(&key, has_terminal) {
-            self.utility_add_menu_open = !self.utility_add_menu_open;
+        if !self.panels.restore(&key, has_terminal, has_changes) {
+            self.toggle_utility_add_menu();
             cx.notify();
             return;
         }
@@ -3075,6 +3096,7 @@ impl Shell {
     fn render_utility_menu(&mut self, launcher: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let git_detected = self.space_git_detected(cx);
+        let terminal_available = self.state.read(cx).selected_chat.is_some();
         let (menu_id, terminal_id, changes_id) = if launcher {
             (
                 "utility-launcher-menu",
@@ -3094,15 +3116,21 @@ impl Shell {
             .w(px(170.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.utility_add_menu_open = false;
+                this.utility_add_menu_dismissed_at = Some(std::time::Instant::now());
                 cx.notify();
             }))
             .child(
                 popover::menu_row(&theme, false, terminal_id)
                     .id(terminal_id)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.create_terminal_tab(window, cx);
-                    }))
+                    .when(!terminal_available, |element| {
+                        element.opacity(0.35).cursor(gpui::CursorStyle::Arrow)
+                    })
+                    .when(terminal_available, |element| {
+                        element.on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.create_terminal_tab(window, cx);
+                        }))
+                    })
                     .child(
                         icon(icons::TERMINAL)
                             .size(px(16.0))
@@ -3239,7 +3267,7 @@ impl Shell {
             .on_hover(motion::hover_listener("utility-add-tab"))
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.utility_add_menu_open = !this.utility_add_menu_open;
+                this.toggle_utility_add_menu();
                 cx.notify();
             }))
             .child(
@@ -4228,7 +4256,7 @@ mod tests {
         panels.show_changes("chat-a");
         panels.hide("chat-a");
 
-        assert!(panels.restore("chat-a", true));
+        assert!(panels.restore("chat-a", true, true));
         assert_eq!(panels.active("chat-a"), Some(UtilityPane::Changes));
         assert!(panels.get("chat-a").changes_open);
     }
@@ -4240,14 +4268,35 @@ mod tests {
         panels.show_terminal("chat-a");
         panels.hide("chat-a");
 
-        assert!(panels.restore("chat-a", false));
+        assert!(panels.restore("chat-a", false, true));
         assert_eq!(panels.active("chat-a"), Some(UtilityPane::Changes));
+    }
+
+    #[test]
+    fn utility_panel_restore_skips_unavailable_changes() {
+        let mut panels = SessionPanels::default();
+        panels.show_terminal("chat-a");
+        panels.show_changes("chat-a");
+        panels.hide("chat-a");
+
+        assert!(panels.restore("chat-a", true, false));
+        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Terminal));
+    }
+
+    #[test]
+    fn utility_panel_restore_rejects_unavailable_changes_only() {
+        let mut panels = SessionPanels::default();
+        panels.show_changes("chat-a");
+        panels.hide("chat-a");
+
+        assert!(!panels.restore("chat-a", false, false));
+        assert_eq!(panels.active("chat-a"), None);
     }
 
     #[test]
     fn utility_panel_restore_rejects_an_empty_panel() {
         let mut panels = SessionPanels::default();
-        assert!(!panels.restore("chat-a", false));
+        assert!(!panels.restore("chat-a", false, false));
         assert_eq!(panels.active("chat-a"), None);
     }
 
