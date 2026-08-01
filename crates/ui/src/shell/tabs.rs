@@ -4,7 +4,7 @@
 //! rest and swaps to a close button on hover. `+` at the end opens the
 //! new-session canvas (the tab materializes on first send). The strip inherits
 //! the old header's titlebar duties: 44px tall, drag region, animated
-//! window-controls inset, and the toggle-changes button (git spaces only).
+//! window-controls inset, and the utility panel controls.
 //!
 //! Styling and drag-reorder mirror the terminal tab bar
 //! (`terminal/panel.rs::render_tab_bar`) — same fixed-width tabs, drop-index
@@ -177,7 +177,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// The tab strip: [scrollable tabs][+][spacer][terminal][changes].
+    /// The tab strip: [scrollable tabs][+][spacer][terminal][utility panel].
     pub(super) fn render_session_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
@@ -224,10 +224,8 @@ impl Shell {
             None => self.tabs_scrolled_to = None,
         }
         let has_space = space_id.is_some();
-        let git = self.space_git_detected(cx);
         let active_utility = self.active_utility_pane(cx);
         let terminal_active = active_utility == Some(UtilityPane::Terminal);
-        let changes_active = active_utility == Some(UtilityPane::Changes);
         let hovered = self.tab_hover.clone();
         let on_canvas = selected.is_none();
         // No sessions yet → the canvas already shows; a `+` would be redundant.
@@ -555,6 +553,10 @@ impl Shell {
         // cluster.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
+        let launcher_menu = (has_space
+            && active_utility.is_none()
+            && self.utility_add_menu_open)
+            .then(|| self.render_utility_menu(true, cx));
         let inner = div()
             .size_full()
             .flex()
@@ -577,14 +579,27 @@ impl Shell {
                     cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                 ))
             })
-            .when(git, |el| {
-                el.child(header_icon_button(
-                    "toggle-changes",
-                    icons::SIDEBAR_MINIMALISTIC,
-                    changes_active,
-                    &theme,
-                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                ))
+            .when(has_space, |el| {
+                el.child(
+                    div()
+                        .relative()
+                        .size(px(28.0))
+                        .child(header_icon_button(
+                            "toggle-utility-panel",
+                            icons::SIDEBAR_MINIMALISTIC,
+                            active_utility.is_some(),
+                            &theme,
+                            cx.listener(|this, _, window, cx| {
+                                this.toggle_utility_panel(window, cx)
+                            }),
+                        ))
+                        .when_some(launcher_menu, |button, menu| {
+                            button.child(popover::anchored_menu(
+                                "utility-launcher-menu-anchor",
+                                menu,
+                            ))
+                        }),
+                )
             });
 
         // The conversation titlebar fills the flexible left workspace. An open
