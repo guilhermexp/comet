@@ -28,14 +28,15 @@ display EXCLUDED. File paths refer to the reference repo.
   never returns mid-session.
 
 ### 1.3 Shell layout (__root.tsx)
-- Sidebar column + main panel + optional right "Changes" pane; only middle outlet swaps.
+- Sidebar column + main panel + optional full-height right utility column; only middle outlet swaps.
 - Left sidebar: collapsible + drag-resizable (208-400px, default 256, persisted). Collapse animates
   transition-[width] 200ms ease-out to 0; main panel goes full-bleed (margins/radius/border melt).
   Double-click separator resets; arrow keys nudge +/-16px.
-- Right Changes pane: session-scoped open flag, drag-resizable 360-760px default 520 capped 52%,
-  width transition 200ms; inner content full-width while outer clips (no reflow mid-toggle).
-- Header h-11, 3 keyed variants (settings title / chat title + Remote badge + show-changes /
-  empty drag strip). Bottom fade: overlay gradient (not mask — preserves scrollbar).
+- Right Terminal/Changes column: session-scoped exclusive content, drag-resizable 360-760px,
+  default 520 capped 52%, width transition 200ms; its named closeable header owns the top-right
+  window area and the body reaches the right/bottom edges.
+- Main header h-11, 3 keyed variants (settings / chat / empty drag strip). Bottom fade uses an
+  overlay gradient instead of a mask so scrollbars remain visible.
 - Reserved status strip (h-6) for WorkingIndicator so composer never shifts.
 - Container queries: transcript gutters/message-rail collapse below ~48rem.
 
@@ -99,8 +100,8 @@ display EXCLUDED. File paths refer to the reference repo.
 ### 1.10 Terminal panel
 - xterm.js equivalent needed. Session-scoped tabs, restored on return; PTYs on owning device
   (detach != close). Tab drag-reorder (sliding transforms 150ms), middle-click close, new-tab,
-  and a visible titlebar toggle plus Cmd+J. Terminal and Changes share the drag-resizable
-  360-760px right utility pane; opening one replaces the other with a 200ms width transition.
+  and a visible titlebar toggle plus Cmd+J. Terminal and Changes share the full-height,
+  drag-resizable right utility column; opening one replaces the other without collapsing width.
 - Input coalescing 12ms, resize debounce 80ms, reconnect backoff, "[process exited N]",
   #090909 bg + full ANSI palette. Bounded 1MB replay window.
 
