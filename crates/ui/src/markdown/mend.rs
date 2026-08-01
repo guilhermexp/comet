@@ -45,6 +45,10 @@
 /// styles it like any link but must not register it as clickable.
 pub const PENDING_LINK_URL: &str = "comet:pending-link";
 
+/// Ceiling on simultaneously open emphasis runs, keeping the scan linear (see
+/// the overflow note in [`delim`]). Real prose peaks in the single digits.
+const MAX_OPEN_DELIMS: usize = 64;
+
 /// One unclosed emphasis-family delimiter run (`*`, `_`, or `~~`).
 struct OpenDelim {
     ch: char,
@@ -252,7 +256,17 @@ fn delim(
     if rest > 0 {
         // A lone `~` never opens; `~` entries of len 1 exist only as the
         // remainder of a half-streamed closer.
-        if can_open && (c != '~' || rest == 2) {
+        //
+        // Past MAX_OPEN_DELIMS the run stays literal. Both scans above are
+        // linear in the stack, so an unbounded stack makes the pass quadratic:
+        // `" *a".repeat(k)` parks k openers that no later run ever pops, and
+        // every following `~` or `]` then re-walks all of them. Measured on the
+        // unmended path: 12.5k chars 61ms, 25k 367ms, 50k 1.06s, 100k 3.8s —
+        // on the UI thread, once per doc commit. A block with hundreds of open
+        // emphasis runs is already past the point where mending stabilizes
+        // anything, and leaving the overflow literal is the same trade the
+        // scanner makes everywhere else.
+        if can_open && (c != '~' || rest == 2) && delims.len() < MAX_OPEN_DELIMS {
             delims.push(OpenDelim {
                 ch: c,
                 len: rest,
@@ -406,5 +420,34 @@ mod tests {
         stays("-"); // no line above
         stays("\n-"); // empty line above
         mends("**b\n-", "**b**\n-\u{200B}"); // closers go above the underline
+    }
+
+    #[test]
+    fn unclosed_openers_stay_bounded_and_linear() {
+        // `" *a"` parks an opener the scan never pops: prev is a space, so the
+        // run cannot close, and the `a` that follows lets it open. Repeating it
+        // grew the stack without limit, and both stack walks in `delim` then
+        // ran per token — one commit of a 100k-char block took 3.8s on the UI
+        // thread (12.5k 61ms, 25k 367ms, 50k 1.06s), against 22ms capped.
+        let witness = " *a".repeat(5_000);
+        let mended = close_hanging(&witness).expect("hanging emphasis mends");
+        assert_eq!(
+            mended.len() - witness.len(),
+            MAX_OPEN_DELIMS,
+            "one `*` closer per capped opener and nothing past the cap"
+        );
+
+        // The cap is the mechanism; this is the property it exists for. The
+        // ceiling sits ~45x over the measured cost so only a return to
+        // quadratic trips it.
+        let adversarial = format!("{}{}", " *a".repeat(20_000), "b~".repeat(20_000));
+        let start = std::time::Instant::now();
+        close_hanging(&adversarial);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "close_hanging went superlinear: {:?} for {} chars",
+            start.elapsed(),
+            adversarial.len()
+        );
     }
 }

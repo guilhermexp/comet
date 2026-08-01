@@ -599,12 +599,13 @@ impl IncrementalParser {
         let Some(last) = self.tree.blocks.last() else {
             return;
         };
-        // Code blocks render an unclosed fence verbatim (already stable);
-        // rules and tables have no inline tail to mend.
-        if matches!(
-            last.block,
-            Block::CodeBlock { .. } | Block::Rule | Block::Table { .. }
-        ) {
+        // A fence renders verbatim wherever it sits, so mending must not reach
+        // into one — including a fence nested in a quote or a list item, which
+        // is how agent output usually ships code ("1. run this: ```…").
+        // Rules and tables have no inline tail to mend.
+        if matches!(last.block, Block::Rule | Block::Table { .. })
+            || contains_code_block(&last.block)
+        {
             return;
         }
         let start = last.range.start;
@@ -622,6 +623,17 @@ impl IncrementalParser {
             top.range.end = (top.range.end + start).min(self.source.len());
         }
         self.display_tail = Some(tail);
+    }
+}
+
+/// Whether a fence sits anywhere inside `block`. Quotes and list items are the
+/// only containers, and both nest arbitrarily, so this walks them.
+fn contains_code_block(block: &Block) -> bool {
+    match block {
+        Block::CodeBlock { .. } => true,
+        Block::BlockQuote { children } => children.iter().any(contains_code_block),
+        Block::List { items, .. } => items.iter().flatten().any(contains_code_block),
+        _ => false,
     }
 }
 
@@ -926,6 +938,25 @@ mod tests {
         let mut p = IncrementalParser::new();
         p.set_text("intro\n\n```\nunclosed **fence");
         assert_eq!(p.display_tree(), *p.tree());
+    }
+
+    #[test]
+    fn display_tree_leaves_nested_code_blocks_alone() {
+        // A fence nested in a quote or a list item is still verbatim code: the
+        // mender must not append emphasis closers into it. Agent output hits
+        // this constantly ("1. run this: ```…").
+        for source in [
+            "> ```\n> unclosed **fence",
+            "- step\n\n  ```\n  unclosed **fence",
+        ] {
+            let mut p = IncrementalParser::new();
+            p.set_text(source);
+            assert_eq!(
+                p.display_tree(),
+                *p.tree(),
+                "mended a nested code block: {source:?}"
+            );
+        }
     }
 
     #[test]
