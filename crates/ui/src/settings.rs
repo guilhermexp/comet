@@ -27,7 +27,6 @@ pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 
-
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
@@ -476,5 +475,4 @@ mod tests {
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
     }
-
 }

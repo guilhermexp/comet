@@ -55,7 +55,6 @@ pub fn init(cx: &mut App) {
 // Pure logic (unit-tested)
 // ---------------------------------------------------------------------------
 
-
 /// Reconnect backoff: 500 ms doubling to an 8 s ceiling.
 pub fn backoff_ms(attempt: u32) -> u64 {
     (500u64 << attempt.min(4)).min(8_000)
@@ -294,12 +293,7 @@ impl TerminalPanel {
     /// "Session working directory is unavailable" (user report).
     fn chat_target(&self, chat: &str, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state
-            .chats
-            .iter()
-            .find(|c| c.id == chat)?
-            .device_id
-            .clone();
+        let device = state.chats.iter().find(|c| c.id == chat)?.device_id.clone();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -889,7 +883,11 @@ impl TerminalPanel {
                         let (text_color, bg, glyph_alpha) = if selected {
                             (theme.text, crate::theme::white_alpha(0.08), 0.8)
                         } else {
-                            (theme.text_muted.opacity(0.6), gpui::transparent_black(), 0.6)
+                            (
+                                theme.text_muted.opacity(0.6),
+                                gpui::transparent_black(),
+                                0.6,
+                            )
                         };
                         let close_btn = div()
                             .id(("terminal-tab-close", key))
@@ -1114,7 +1112,6 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn backoff_doubles_and_caps() {

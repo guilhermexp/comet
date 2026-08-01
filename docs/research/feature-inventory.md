@@ -99,7 +99,8 @@ display EXCLUDED. File paths refer to the reference repo.
 ### 1.10 Terminal panel
 - xterm.js equivalent needed. Session-scoped tabs, restored on return; PTYs on owning device
   (detach != close). Tab drag-reorder (sliding transforms 150ms), middle-click close, new-tab,
-  hide (Cmd+J). Height drag 160px-55vh, 200ms transition.
+  and a visible titlebar toggle plus Cmd+J. Terminal and Changes share the drag-resizable
+  360-760px right utility pane; opening one replaces the other with a 200ms width transition.
 - Input coalescing 12ms, resize debounce 80ms, reconnect backoff, "[process exited N]",
   #090909 bg + full ANSI palette. Bounded 1MB replay window.
 
