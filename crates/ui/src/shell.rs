@@ -236,6 +236,28 @@ impl SessionPanels {
         was_visible
     }
 
+    fn restore(&mut self, key: &str, has_terminal: bool) -> bool {
+        let state = self.map.entry(key.to_string()).or_default();
+        let active_exists = match state.active {
+            UtilityPane::Terminal => has_terminal,
+            UtilityPane::Changes => state.changes_open,
+        };
+
+        if !active_exists {
+            if has_terminal {
+                state.active = UtilityPane::Terminal;
+            } else if state.changes_open {
+                state.active = UtilityPane::Changes;
+            } else {
+                state.visible = false;
+                return false;
+            }
+        }
+
+        state.visible = true;
+        true
+    }
+
     fn close_changes(&mut self, key: &str, has_terminal: bool) {
         let state = self.map.entry(key.to_string()).or_default();
         state.changes_open = false;
@@ -4139,6 +4161,36 @@ mod tests {
 
         panels.show_terminal("chat-a");
         assert_eq!(panels.active("chat-a"), Some(UtilityPane::Terminal));
+    }
+
+    #[test]
+    fn utility_panel_restore_keeps_the_last_valid_tab() {
+        let mut panels = SessionPanels::default();
+        panels.show_terminal("chat-a");
+        panels.show_changes("chat-a");
+        panels.hide("chat-a");
+
+        assert!(panels.restore("chat-a", true));
+        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Changes));
+        assert!(panels.get("chat-a").changes_open);
+    }
+
+    #[test]
+    fn utility_panel_restore_falls_back_to_an_available_tab() {
+        let mut panels = SessionPanels::default();
+        panels.show_changes("chat-a");
+        panels.show_terminal("chat-a");
+        panels.hide("chat-a");
+
+        assert!(panels.restore("chat-a", false));
+        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Changes));
+    }
+
+    #[test]
+    fn utility_panel_restore_rejects_an_empty_panel() {
+        let mut panels = SessionPanels::default();
+        assert!(!panels.restore("chat-a", false));
+        assert_eq!(panels.active("chat-a"), None);
     }
 
     #[test]
