@@ -3610,10 +3610,9 @@ impl Render for Shell {
                     cx,
                 );
                 let main = self.render_main(cx);
-                // The Changes pane is chat-scoped chrome: the Settings route
-                // never renders it (comet __root.tsx `!isSettings && activeChat`
-                // around the diff column) — the per-session open flags stay
-                // intact for the return trip.
+                // The right utility pane is chat-scoped chrome: Settings never
+                // renders it, while each session's selected pane stays intact
+                // for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
@@ -3621,10 +3620,9 @@ impl Render for Shell {
                     Empty.into_any_element()
                 };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // The signature frame: the conversation card and — when the
-                // changes pane is open — a SECOND inset card beside it, both
-                // rounded hairline-bordered floats on the frost shell (the
-                // changes card is built inside `render_right_pane`).
+                // The signature frame: the conversation card and — when a
+                // utility pane is open — a SECOND inset card beside it, both
+                // rounded hairline-bordered floats on the frost shell.
                 let theme = Theme::of(cx);
                 // Margins, radius, and border-color MELT over the same 200ms
                 // ease-out as the sidebar width (comet __root.tsx `<main>`
@@ -3657,10 +3655,10 @@ impl Render for Shell {
                 // No top margin: the titlebar's own internal air (44px bar,
                 // 28px tabs) is the gap — an extra gutter read as a hole
                 // between the header and the app (user report).
-                // The right margin is the window gutter when the changes
-                // pane is closed, but the SEAM between the two inset cards
-                // when it's open — a full gutter there read double-wide next
-                // to the two borders it separates (user report).
+                // The right margin is the window gutter when the utility pane
+                // is closed, but the SEAM between the two inset cards when it
+                // is open — a full gutter there read double-wide next to the
+                // two borders it separates (user report).
                 let right_gap = if on_chat && self.right_pane_open(cx) {
                     4.0
                 } else {

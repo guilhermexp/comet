@@ -22,11 +22,10 @@ pub const SIDEBAR_MIN: f32 = 208.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
-/// Right ("Changes") pane drag-resize bounds (px).
+/// Shared right utility pane drag-resize bounds (px).
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
-
 
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
