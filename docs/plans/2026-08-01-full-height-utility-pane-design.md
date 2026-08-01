@@ -1,45 +1,65 @@
-# Full-height utility pane design
+# Unified utility tab strip design
 
 Date: 2026-08-01
-Status: approved
+Status: approved, corrected after visual review
 
 ## Goal
 
-Make the shared Terminal/Changes pane a true full-height right column. It starts at the top window edge and reaches the right and bottom edges, matching the supplied reference instead of appearing as a rounded inset card below the global titlebar.
+Keep the full-height right utility column while replacing its duplicated pane
+header plus Terminal tab bar with one shared tab strip. Terminal sessions and
+Changes appear as sibling tabs, matching the supplied references.
 
 ## Layout
 
-The ready-state shell becomes three visual columns: sidebar, conversation, and the optional utility pane. The conversation keeps its existing inset card. The utility pane leaves that card system and owns its full-height column.
+The existing sidebar, conversation, and full-height right utility column remain
+unchanged. The utility column owns one 40px top strip and one active body.
 
-The main titlebar ends at the utility-pane seam. When open, the utility pane renders its own top header inside the full-height column:
+The strip may contain:
 
-- `Terminal ×` when the terminal is active.
-- `Changes ×` when the diff viewer is active.
+- `Terminal 1 ×`, `Terminal 2 ×`, and further live terminal sessions.
+- One `Changes ×` tab.
+- A trailing `+` button.
 
-Only the thin vertical seam and resize target between the conversation and utility pane remain. Remove the utility pane's outer radius, outer border card, top/right/bottom gutters, and the horizontal separation created by placing it below the global titlebar.
+There is no separate `Terminal ×` or `Changes ×` header above this strip.
 
-## Content
+## State
 
-Terminal keeps its existing session-scoped PTY state and internal tab bar (`Terminal 1`, `+`, reorder, close) directly below the new pane header. Changes renders its current content directly below the same header contract.
+Each chat keeps a session-scoped utility-tab state:
 
-Terminal and Changes remain mutually exclusive. Switching between them replaces the header label and body without collapsing the column. Closing the active pane collapses the column with the existing 200 ms width transition.
+- Whether the full-height column is visible.
+- Which utility tab is active.
+- Whether Changes is open.
+
+Terminal tab identity, PTY ownership, ordering, replay, and lifecycle remain in
+`TerminalPanel`. The shell composes those terminal tab descriptors with the
+optional Changes descriptor into one strip.
+
+Changes remains in the strip when a Terminal tab is selected. Selecting a tab
+only swaps the body; it does not collapse or resize the column.
 
 ## Interaction
 
-- The existing Terminal and Changes titlebar buttons remain visible in the conversation titlebar.
-- The pane header `×` closes the active pane.
-- `Cmd+J` continues toggling Terminal.
-- The Changes shortcut retains its current behavior.
-- The left-edge drag target continues resizing the shared width.
-- The persisted width and session-scoped active pane remain unchanged.
+- `+` opens a small menu containing only Terminal and Changes.
+- Terminal creates and selects a new terminal tab.
+- Changes opens or selects the existing Changes tab.
+- Closing the active tab selects its next neighbor, then its previous neighbor.
+- Closing the final tab collapses the utility column.
+- The existing Terminal and Changes buttons remain visible in the conversation
+  titlebar and open/select their corresponding tabs.
+- `Cmd+J` continues toggling the utility column.
+- The left-edge resize target, persisted width, and 200ms width transition stay
+  unchanged.
 
 ## Scope
 
-No changes to engine, RPC, PTY ownership, replay, input, diff watching, or persistence schema. The work is a shell composition and chrome change.
+No Browser, Files, or Side Chat tabs. No changes to engine, RPC, PTY transport,
+diff watching, or the panel's lateral placement.
 
 ## Verification
 
-- Unit tests for pane selection and close behavior.
+- Unit tests for tab ordering, active-neighbor selection, Changes persistence,
+  and final-tab collapse.
 - `cargo test -p comet-ui` and `cargo build -p comet`.
-- Desktop smoke test covering Terminal/Changes switching, header close, keyboard toggle, resize, session switching, and focus.
-- Visual capture confirming the pane reaches the top/right/bottom edges and has no rounded outer card or horizontal divider.
+- Desktop smoke test covering two Terminal tabs plus Changes in one row, `+`
+  menu actions, close fallback, keyboard toggle, resize, and session switching.
+- Visual capture confirming a single top strip with no duplicated header.
