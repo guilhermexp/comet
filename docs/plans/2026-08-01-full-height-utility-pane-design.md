@@ -1,7 +1,9 @@
 # Unified utility tab strip design
 
 Date: 2026-08-01
-Status: approved, corrected after visual review
+Status: shipped; the titlebar-control contract below is superseded by
+`2026-08-01-utility-panel-toggle-design.md` (the Changes button became the
+utility-panel toggle).
 
 ## Goal
 

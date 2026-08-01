@@ -1,11 +1,13 @@
-//! The app shell (comet `__root.tsx`): sidebar column + main panel + optional
-//! right "Changes" pane, plus the boot splash and the connection gate.
+//! The app shell (comet `__root.tsx`): sidebar column + main panel + the
+//! optional full-height right utility column (Terminal sessions and Changes as
+//! sibling tabs), plus the boot splash and the connection gate.
 //!
 //! Layout is comet's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
-//! shifts; right pane scaffold (360–760px, default 520), hidden by default.
-//! Widths/collapsed state persist to `ui-settings.json` (debounced).
+//! shifts; utility column (360–760px, default 520), hidden by default.
+//! Widths/collapsed state persist to `ui-settings.json` (debounced); which
+//! utility tabs are open stays session-scoped and in memory ([`SessionPanels`]).
 //!
 //! Resize handles use gpui's drag-and-drop pattern (an `on_drag` with an empty
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
@@ -3208,13 +3210,13 @@ impl Shell {
                     gpui::transparent_black(),
                     0.6,
                 )
-        };
+            };
             let close = div()
                 .id("changes-tab-close")
                 .size(px(20.0))
                 .flex_none()
-            .flex()
-            .items_center()
+                .flex()
+                .items_center()
                 .justify_center()
                 .rounded(px(6.0))
                 .when(!selected, |element| element.opacity(0.45))
@@ -3224,12 +3226,12 @@ impl Shell {
                     cx.stop_propagation();
                     this.close_changes_tab(window, cx);
                 }))
-            .child(
+                .child(
                     icon(icons::CLOSE)
                         .size(px(12.0))
                         .text_color(theme.text_muted.opacity(0.8)),
                 );
-                div()
+            div()
                 .id("changes-utility-tab")
                 .w(px(crate::terminal::panel::TAB_WIDTH))
                 .h(px(28.0))
@@ -3259,7 +3261,7 @@ impl Shell {
                     icon(icons::DIFF)
                         .size(px(16.0))
                         .text_color(text_color.opacity(glyph_alpha)),
-            )
+                )
                 .child(div().flex_1().min_w_0().truncate().child("Changes"))
                 .child(close)
                 .into_any_element()
