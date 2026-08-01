@@ -1072,8 +1072,45 @@ impl Shell {
             window.focus(&self.composer.focus_handle(cx), cx);
         } else {
             self.panels.show_terminal(&key);
+            self.utility_add_menu_open = false;
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
             window.focus(&panel.read(cx).focus_handle(), cx);
+        }
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
+    }
+
+    fn toggle_utility_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.right_pane_open(cx) {
+            self.close_utility_pane(window, cx);
+            return;
+        }
+
+        let from = self.right_target(cx);
+        let key = self.panel_key(cx);
+        let has_terminal = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).has_tabs(&key));
+
+        if !self.panels.restore(&key, has_terminal) {
+            self.utility_add_menu_open = !self.utility_add_menu_open;
+            cx.notify();
+            return;
+        }
+
+        self.utility_add_menu_open = false;
+        match self.active_utility_pane(cx) {
+            Some(UtilityPane::Terminal) => {
+                let terminal = self.terminal_panel(cx);
+                terminal.update(cx, |panel, cx| panel.set_open(true, cx));
+                window.focus(&terminal.read(cx).focus_handle(), cx);
+            }
+            Some(UtilityPane::Changes) => {
+                let changes = self.changes_pane(cx);
+                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+            }
+            None => return,
         }
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
@@ -3035,6 +3072,66 @@ impl Shell {
         }
     }
 
+    fn render_utility_menu(&mut self, launcher: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let git_detected = self.space_git_detected(cx);
+        let (menu_id, terminal_id, changes_id) = if launcher {
+            (
+                "utility-launcher-menu",
+                "utility-launcher-terminal",
+                "utility-launcher-changes",
+            )
+        } else {
+            (
+                "utility-add-menu",
+                "utility-add-terminal",
+                "utility-add-changes",
+            )
+        };
+
+        popover::popover_card(&theme)
+            .id(menu_id)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.utility_add_menu_open = false;
+                cx.notify();
+            }))
+            .child(
+                popover::menu_row(&theme, false, terminal_id)
+                    .id(terminal_id)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.create_terminal_tab(window, cx);
+                    }))
+                    .child(
+                        icon(icons::TERMINAL)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Terminal"),
+            )
+            .child(
+                popover::menu_row(&theme, false, changes_id)
+                    .id(changes_id)
+                    .when(!git_detected, |element| {
+                        element.opacity(0.35).cursor(gpui::CursorStyle::Arrow)
+                    })
+                    .when(git_detected, |element| {
+                        element.on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.show_changes(cx);
+                        }))
+                    })
+                    .child(
+                        icon(icons::DIFF)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Changes"),
+            )
+            .into_any_element()
+    }
+
     fn render_utility_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let key = self.panel_key(cx);
@@ -3109,7 +3206,7 @@ impl Shell {
                     this.show_changes(cx);
                 }))
                 .child(
-                    icon(icons::SIDEBAR_MINIMALISTIC)
+                    icon(icons::DIFF)
                         .size(px(16.0))
                         .text_color(text_color.opacity(glyph_alpha)),
             )
@@ -3120,48 +3217,9 @@ impl Shell {
             gpui::Empty.into_any_element()
         };
 
-        let add_menu_open = self.utility_add_menu_open;
-        let git_detected = self.space_git_detected(cx);
-        let add_menu = popover::popover_card(&theme)
-            .w(px(170.0))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.utility_add_menu_open = false;
-                cx.notify();
-            }))
-            .child(
-                popover::menu_row(&theme, false, "utility-add-terminal")
-                    .id("utility-add-terminal")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.create_terminal_tab(window, cx);
-                    }))
-                    .child(
-                        icon(icons::TERMINAL)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child("Terminal"),
-            )
-            .child(
-                popover::menu_row(&theme, false, "utility-add-changes")
-                    .id("utility-add-changes")
-                    .when(!git_detected, |element| {
-                        element.opacity(0.35).cursor(gpui::CursorStyle::Arrow)
-                    })
-                    .when(git_detected, |element| {
-                        element.on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.show_changes(cx);
-                        }))
-                    })
-                    .child(
-                        icon(icons::SIDEBAR_MINIMALISTIC)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child("Changes"),
-            )
-            .into_any_element();
+        let add_menu = self
+            .utility_add_menu_open
+            .then(|| self.render_utility_menu(false, cx));
         let add = div()
             .id("utility-add-tab")
             .size(px(28.0))
@@ -3189,8 +3247,8 @@ impl Shell {
                     .size(px(16.0))
                     .text_color(theme.text_muted.opacity(0.6)),
             )
-            .when(add_menu_open, |element| {
-                element.child(popover::anchored_menu("utility-add-menu", add_menu))
+            .when_some(add_menu, |element, menu| {
+                element.child(popover::anchored_menu("utility-add-menu", menu))
             });
         let drag_space =
             self.titlebar_drag_region("utility-tab-strip-drag", div().h_full().flex_1(), cx);
