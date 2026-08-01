@@ -35,6 +35,7 @@ display EXCLUDED. File paths refer to the reference repo.
 - Right Terminal/Changes column: session-scoped exclusive body, drag-resizable 360-760px,
   default 520 capped 52%, width transition 200ms; the shared top strip shows Terminal sessions
   and Changes side by side as tabs, while only the selected tab's body reaches the right/bottom edges.
+  The external split-panel control hides/restores the entire column and opens its chooser when empty.
 - Main header h-11, 3 keyed variants (settings / chat / empty drag strip). Bottom fade uses an
   overlay gradient instead of a mask so scrollbars remain visible.
 - Reserved status strip (h-6) for WorkingIndicator so composer never shifts.
@@ -101,15 +102,17 @@ display EXCLUDED. File paths refer to the reference repo.
 - xterm.js equivalent needed. Session-scoped tabs, restored on return; PTYs on owning device
   (detach != close). Terminal tabs support drag-reorder (sliding transforms 150ms) and
   middle-click close; Terminal and Changes share one closeable top tab strip and `+` menu in
-  the full-height, drag-resizable right utility column. Cmd+J toggles the column.
+  the full-height, drag-resizable right utility column. The external split-panel control preserves
+  and restores every open utility tab; Cmd+J remains the direct Terminal shortcut.
 - Input coalescing 12ms, resize debounce 80ms, reconnect backoff, "[process exited N]",
   #090909 bg + full ANSI palette. Bounded 1MB replay window.
 
 ### 1.11 Changes / diff viewer
-- Unified patch -> file/hunk/line/notice rows; per-file Collapse 180ms, chevron rotate 200ms;
-  +/- gutters; syntax highlight via time-sliced tokenizer (6ms budget); header "N Uncommitted
-  changes / +a / -d / Partial snapshot"; states preparing/error+last/clean/list.
-  Resolves by chat.checkout_id or device+cwd.
+- A distinct diff glyph identifies Changes in the tab strip and both utility choosers. Unified
+  patch -> file/hunk/line/notice rows; per-file Collapse 180ms, chevron rotate 200ms; +/- gutters;
+  syntax highlight via time-sliced tokenizer (6ms budget); header "N Uncommitted changes / +a /
+  -d / Partial snapshot"; states preparing/error+last/clean/list. Resolves by chat.checkout_id or
+  device+cwd.
 
 ### 1.12 Working indicator & animation catalog (NO framer-motion; all CSS)
 - WorkingIndicator: gradient matrix spinner + rotating flavour word (20 words / 7s, seeded) +
