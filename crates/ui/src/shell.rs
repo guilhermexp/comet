@@ -974,7 +974,15 @@ impl Shell {
     /// pre-mutation target.
     fn finish_right_transition(&mut self, from: f32, cx: &mut Context<Self>) {
         self.utility_add_menu_open = false;
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        // A Terminal↔Changes switch inside an open column keeps the same
+        // width. Arming the tween anyway held `motion_active` for the full
+        // 200 ms, and Render answers that with a request_animation_frame per
+        // frame — the whole shell tree re-rendered for nothing.
+        // `on_terminal_panel_event` already guards this the same way.
+        let to = self.right_target(cx);
+        if from != to {
+            self.right_tween = Some(WidthTween::new(from, to));
+        }
         cx.notify();
     }
 

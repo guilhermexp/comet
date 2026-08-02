@@ -756,11 +756,16 @@ impl TerminalPanel {
     // ---- tab management ----
 
     fn select_tab(&mut self, chat: &str, ix: usize, cx: &mut Context<Self>) {
-        self.open = true;
+        // `open` only flips once the tab resolves. Setting it first left the
+        // panel marked open on a select that hit nothing — no `Activated`
+        // follows, so the shell never learns, and the next `AppState` notify
+        // has `on_state_changed` silently `open_tab` a PTY for whatever chat
+        // is selected then, with the column closed.
         if let Some(tabs) = self.chats.get_mut(chat)
             && ix < tabs.tabs.len()
         {
             tabs.active = ix;
+            self.open = true;
             cx.emit(TerminalPanelEvent::Activated {
                 chat: chat.to_string(),
             });
