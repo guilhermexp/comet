@@ -475,5 +475,4 @@ mod tests {
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
     }
-
 }

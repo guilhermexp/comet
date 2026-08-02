@@ -2205,40 +2205,40 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
-                    .child(
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from("Sessions")),
-                    )
-                    .child(if !list_items.is_empty() {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(Theme::SPACE_SM))
-                            .children(list_items)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pb(px(Theme::SPACE_SM))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from("No sessions yet"))
-                            .into_any_element()
-                    }),
+                            .child(
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pt(px(12.0))
+                                    .pb(px(4.0))
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from("Sessions")),
+                            )
+                            .child(if !list_items.is_empty() {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .children(list_items)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from("No sessions yet"))
+                                    .into_any_element()
+                            }),
                     )
                     .when(lists_fade_top && !glass, |el| {
                         el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
                             gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(sidebar_fade, 0.0),
-                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
+                                180.0,
+                                gpui::linear_color_stop(sidebar_fade, 0.0),
+                                gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
                             ),
                         ))
                     })
