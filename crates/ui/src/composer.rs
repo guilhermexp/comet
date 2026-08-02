@@ -13,12 +13,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PaintQuad, PathPromptOptions, Pixels, Point, SharedString, Style, StyledImage as _,
-    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, img, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
+    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
+    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
+    prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -66,6 +67,8 @@ pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
+/// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
+pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -131,6 +134,56 @@ pub fn composer_total_height(content_height: f32) -> f32 {
     (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN, TEXTAREA_MAX)
         + ACTIONS_ROW_HEIGHT
         + PILL_BORDER_V
+}
+
+fn input_max_scroll(content_height: f32, viewport_height: f32) -> f32 {
+    (content_height - viewport_height).max(0.0)
+}
+
+/// Apply GPUI's wheel delta to a top-origin input offset. Positive deltas mean
+/// scrolling toward the start, matching gpui's built-in list/div behavior.
+fn input_scroll_offset(
+    current: f32,
+    delta_y: f32,
+    content_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    (current - delta_y).clamp(0.0, input_max_scroll(content_height, viewport_height))
+}
+
+/// Minimally adjust the viewport so the caret row is fully visible.
+fn input_scroll_offset_for_cursor(
+    current: f32,
+    cursor_top: f32,
+    cursor_height: f32,
+    content_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    let mut next = current;
+    if cursor_top < next {
+        next = cursor_top;
+    } else if cursor_top + cursor_height > next + viewport_height {
+        next = cursor_top + cursor_height - viewport_height;
+    }
+    next.clamp(0.0, input_max_scroll(content_height, viewport_height))
+}
+
+/// Per-frame drag-selection scroll. Distance increases speed, capped at one
+/// text row per frame so crossing the input boundary never causes a jump.
+fn input_drag_scroll_delta(
+    pointer_y: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    line_height: f32,
+) -> f32 {
+    let distance = if pointer_y < viewport_top {
+        pointer_y - viewport_top
+    } else if pointer_y > viewport_bottom {
+        pointer_y - viewport_bottom
+    } else {
+        return 0.0;
+    };
+    distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
 }
 
 /// Staged-attachment strip metrics (comet attachment-ui.tsx AttachmentStrip:
@@ -530,18 +583,58 @@ actions!(
         Down,
         SelectLeft,
         SelectRight,
+        SelectUp,
+        SelectDown,
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
         WordLeft,
         WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DeleteToLineStart,
+        DeleteToLineEnd,
         Copy,
         Cut,
         Paste,
         Newline,
         Submit,
+        Undo,
+        Redo,
     ]
 );
+
+/// How long a run of single-character edits keeps merging into one undo step.
+/// A pause longer than this starts a fresh step, so undo rewinds in the
+/// bursts the user actually typed rather than one character at a time.
+const UNDO_COALESCE: Duration = Duration::from_millis(700);
+
+/// Cap on retained undo steps — a long-lived composer must not grow forever.
+const UNDO_LIMIT: usize = 200;
+
+/// A restorable point in the input's history: text plus where the caret and
+/// selection sat when the edit landed.
+#[derive(Clone)]
+struct EditSnapshot {
+    content: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+/// Direction of the last edit — a run only merges with edits of its own kind.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Insert,
+    Delete,
+}
 
 /// Bind the composer keymap. Call once at app boot.
 pub fn init(cx: &mut App) {
@@ -557,14 +650,47 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", Down, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
+        KeyBinding::new("shift-up", SelectUp, ctx),
+        KeyBinding::new("shift-down", SelectDown, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-home", SelectHome, ctx),
+        KeyBinding::new("shift-end", SelectEnd, ctx),
+        // macOS line/document motion — a laptop keyboard has no home/end keys,
+        // so Cmd+arrow is the only way users reach either edge.
+        KeyBinding::new("cmd-left", Home, ctx),
+        KeyBinding::new("cmd-right", End, ctx),
+        KeyBinding::new("cmd-up", DocStart, ctx),
+        KeyBinding::new("cmd-down", DocEnd, ctx),
+        KeyBinding::new("shift-cmd-left", SelectHome, ctx),
+        KeyBinding::new("shift-cmd-right", SelectEnd, ctx),
+        KeyBinding::new("shift-cmd-up", SelectDocStart, ctx),
+        KeyBinding::new("shift-cmd-down", SelectDocEnd, ctx),
+        // Deletion by word / to the line edge (Opt+Delete, Cmd+Delete).
+        KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
+        KeyBinding::new("alt-delete", DeleteWordRight, ctx),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
+        KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
     ];
+    for prefix in ["cmd", "ctrl"] {
+        bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, ctx));
+        bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, ctx));
+    }
     // Word navigation and clipboard: bind both modifier conventions so the same
     // map works across platforms.
     for prefix in ["ctrl", "alt"] {
         bindings.push(KeyBinding::new(&format!("{prefix}-left"), WordLeft, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-right"), WordRight, ctx));
+        bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-left"),
+            SelectWordLeft,
+            ctx,
+        ));
+        bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-right"),
+            SelectWordRight,
+            ctx,
+        ));
     }
     for prefix in ["cmd", "ctrl"] {
         bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, ctx));
@@ -585,12 +711,44 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("end", End, palette),
         KeyBinding::new("shift-left", SelectLeft, palette),
         KeyBinding::new("shift-right", SelectRight, palette),
+        // Modifier-qualified motion is safe here: the palette's own navigation
+        // uses BARE arrows/enter, which stay unbound and bubble to its frame.
+        KeyBinding::new("cmd-left", Home, palette),
+        KeyBinding::new("cmd-right", End, palette),
+        KeyBinding::new("shift-cmd-left", SelectHome, palette),
+        KeyBinding::new("shift-cmd-right", SelectEnd, palette),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, palette),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, palette),
     ];
+    for prefix in ["ctrl", "alt"] {
+        palette_bindings.push(KeyBinding::new(
+            &format!("{prefix}-left"),
+            WordLeft,
+            palette,
+        ));
+        palette_bindings.push(KeyBinding::new(
+            &format!("{prefix}-right"),
+            WordRight,
+            palette,
+        ));
+        palette_bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-left"),
+            SelectWordLeft,
+            palette,
+        ));
+        palette_bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-right"),
+            SelectWordRight,
+            palette,
+        ));
+    }
     for prefix in ["cmd", "ctrl"] {
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-x"), Cut, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-v"), Paste, palette));
+        palette_bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, palette));
+        palette_bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, palette));
     }
     cx.bind_keys(palette_bindings);
     cx.bind_keys(bindings);
@@ -621,8 +779,14 @@ pub struct ComposerInput {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
+    drag_position: Option<Point<Pixels>>,
+    drag_generation: u64,
+    drag_autoscroll_active: bool,
     /// Vertical scroll inside the input once content exceeds the max height.
     scroll_top: f32,
+    /// Normally keeps the caret visible through edits and rewraps. Manual
+    /// wheel scrolling pauses it until the next caret move or edit.
+    follow_cursor: bool,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
@@ -641,6 +805,12 @@ pub struct ComposerInput {
     blink_anchor: Instant,
     /// Half-period repaint driver, alive only while the input is focused.
     blink_task: Option<Task<()>>,
+    // -- undo history --
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    /// Kind, trailing offset, and time of the last edit — the merge test that
+    /// decides whether the next edit extends the current undo step.
+    last_edit: Option<(EditKind, usize, Instant)>,
 }
 
 impl ComposerInput {
@@ -665,7 +835,11 @@ impl ComposerInput {
             selection_reversed: false,
             marked_range: None,
             is_selecting: false,
+            drag_position: None,
+            drag_generation: 0,
+            drag_autoscroll_active: false,
             scroll_top: 0.0,
+            follow_cursor: true,
             last_lines: Vec::new(),
             line_starts: vec![0],
             last_bounds: None,
@@ -677,6 +851,9 @@ impl ComposerInput {
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
             blink_task: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: None,
         }
     }
 
@@ -747,9 +924,94 @@ impl ComposerInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_top = 0.0;
+        self.follow_cursor = true;
+        // Programmatic replacement (draft load, clear-on-submit) is a new
+        // document, not an edit — undo must not reach back past it.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = None;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
+    }
+
+    // ---- undo history ----
+
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    /// Called with the range about to be replaced, BEFORE the content changes,
+    /// so the pushed snapshot is the pre-edit state.
+    fn record_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        let kind = if new_text.is_empty() {
+            EditKind::Delete
+        } else {
+            EditKind::Insert
+        };
+        // A run merges only while it stays single-character, contiguous with
+        // the previous edit, of the same kind, and inside the idle window. A
+        // pause, a word break, a paste, or a caret jump all break the run so
+        // undo lands on a boundary the user recognizes.
+        let mergeable = match (kind, &self.last_edit) {
+            (EditKind::Insert, Some((EditKind::Insert, at, when))) => {
+                range.is_empty()
+                    && range.start == *at
+                    && new_text.chars().count() == 1
+                    && !new_text.starts_with(['\n', ' ', '\t'])
+                    && when.elapsed() < UNDO_COALESCE
+            }
+            (EditKind::Delete, Some((EditKind::Delete, at, when))) => {
+                range.end == *at && when.elapsed() < UNDO_COALESCE
+            }
+            _ => false,
+        };
+        if !mergeable {
+            self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+        }
+        // Any fresh edit invalidates the redo branch.
+        self.redo_stack.clear();
+        let tail = match kind {
+            EditKind::Insert => range.start + new_text.len(),
+            EditKind::Delete => range.start,
+        };
+        self.last_edit = Some((kind, tail, Instant::now()));
+    }
+
+    fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.content;
+        self.selected_range = snapshot.selected_range;
+        self.selection_reversed = snapshot.selection_reversed;
+        self.marked_range = None;
+        self.follow_cursor = true;
+        // Never merge a subsequent edit into a step that undo just crossed.
+        self.last_edit = None;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(previous) = self.undo_stack.pop() else {
+            return;
+        };
+        self.redo_stack.push(self.snapshot());
+        self.restore(previous, cx);
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        self.undo_stack.push(self.snapshot());
+        self.restore(next, cx);
     }
 
     // ---- editing ops ----
@@ -764,6 +1026,7 @@ impl ComposerInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.follow_cursor = true;
         self.reset_blink();
         cx.notify();
     }
@@ -778,6 +1041,7 @@ impl ComposerInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.follow_cursor = true;
         self.reset_blink();
         cx.notify();
     }
@@ -869,28 +1133,42 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(-1.0, cx);
+        if let Some(ix) = self.vertical_target(-1.0) {
+            self.move_to(ix, cx);
+        }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(1.0, cx);
+        if let Some(ix) = self.vertical_target(1.0) {
+            self.move_to(ix, cx);
+        }
     }
 
-    fn move_vertical(&mut self, dir: f32, cx: &mut Context<Self>) {
-        let Some(current) = self.point_for_index(self.cursor_offset()) else {
-            return;
-        };
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.vertical_target(-1.0) {
+            self.select_to(ix, cx);
+        }
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.vertical_target(1.0) {
+            self.select_to(ix, cx);
+        }
+    }
+
+    /// Offset one wrapped line above/below the cursor, keeping its x column.
+    /// Clamps to the document edges, matching the platform's behavior on the
+    /// first and last line.
+    fn vertical_target(&self, dir: f32) -> Option<usize> {
+        let current = self.point_for_index(self.cursor_offset())?;
         let target_y = f32::from(current.y) + dir * f32::from(self.line_height);
         if target_y < 0.0 {
-            self.move_to(0, cx);
-            return;
+            return Some(0);
         }
         if target_y >= self.content_height {
-            self.move_to(self.content.len(), cx);
-            return;
+            return Some(self.content.len());
         }
-        let ix = self.index_for_point(point(current.x, px(target_y)));
-        self.move_to(ix, cx);
+        Some(self.index_for_point(point(current.x, px(target_y))))
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -916,6 +1194,32 @@ impl ComposerInput {
         self.move_to(line.end, cx);
     }
 
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.line_range_at(self.cursor_offset());
+        self.select_to(line.start, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.line_range_at(self.cursor_offset());
+        self.select_to(line.end, cx);
+    }
+
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
         let prev = self.previous_word_boundary(self.cursor_offset());
         self.move_to(prev, cx);
@@ -924,6 +1228,68 @@ impl ComposerInput {
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
         let next = self.next_word_boundary(self.cursor_offset());
         self.move_to(next, cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let prev = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(prev, cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let next = self.next_word_boundary(self.cursor_offset());
+        self.select_to(next, cx);
+    }
+
+    /// Opt/Cmd + Delete family. With a live selection these delete the
+    /// selection only (platform behavior) — the extend runs off the cursor.
+    fn delete_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            if self.cursor_offset() == offset {
+                return;
+            }
+            self.select_to(offset, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prev = self.previous_word_boundary(self.cursor_offset());
+        self.delete_to(prev, window, cx);
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.next_word_boundary(self.cursor_offset());
+        self.delete_to(next, window, cx);
+    }
+
+    fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = self.line_range_at(self.cursor_offset()).start;
+        self.delete_to(start, window, cx);
+    }
+
+    fn delete_to_line_end(
+        &mut self,
+        _: &DeleteToLineEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = self.line_range_at(self.cursor_offset()).end;
+        self.delete_to(end, window, cx);
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -1054,6 +1420,9 @@ impl ComposerInput {
     ) {
         window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
+        self.drag_position = Some(event.position);
+        self.drag_generation = self.drag_generation.wrapping_add(1);
+        self.drag_autoscroll_active = false;
         let index = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
             self.select_to(index, cx);
@@ -1064,12 +1433,116 @@ impl ComposerInput {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.drag_position = None;
+        self.drag_generation = self.drag_generation.wrapping_add(1);
+        self.drag_autoscroll_active = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.drag_position = Some(event.position);
+            let position = self.drag_selection_position(event.position);
+            self.select_to(self.index_for_mouse_position(position), cx);
+            if self.drag_scroll_delta(event.position) != 0.0 && !self.drag_autoscroll_active {
+                self.start_drag_autoscroll(cx);
+            }
         }
+    }
+
+    fn start_drag_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self.drag_autoscroll_active = true;
+        let generation = self.drag_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(DRAG_SCROLL_FRAME_MS))
+                    .await;
+                let keep_running = this
+                    .update(cx, |input, cx| input.drag_autoscroll_tick(generation, cx))
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn drag_selection_position(&self, position: Point<Pixels>) -> Point<Pixels> {
+        let Some(bounds) = self.last_bounds else {
+            return position;
+        };
+        point(
+            position.x.clamp(bounds.left(), bounds.right() - px(0.5)),
+            position.y.clamp(bounds.top(), bounds.bottom() - px(0.5)),
+        )
+    }
+
+    fn drag_scroll_delta(&self, position: Point<Pixels>) -> f32 {
+        let Some(bounds) = self.last_bounds else {
+            return 0.0;
+        };
+        input_drag_scroll_delta(
+            f32::from(position.y),
+            f32::from(bounds.top()),
+            f32::from(bounds.bottom()),
+            f32::from(self.line_height),
+        )
+    }
+
+    fn drag_autoscroll_tick(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        if !self.is_selecting || self.drag_generation != generation {
+            return false;
+        }
+        let (Some(position), Some(bounds)) = (self.drag_position, self.last_bounds) else {
+            self.drag_autoscroll_active = false;
+            return false;
+        };
+        let delta = self.drag_scroll_delta(position);
+        if delta == 0.0 {
+            self.drag_autoscroll_active = false;
+            return false;
+        }
+        let next = (self.scroll_top + delta).clamp(
+            0.0,
+            input_max_scroll(self.content_height, f32::from(bounds.size.height)),
+        );
+        if next == self.scroll_top {
+            self.drag_autoscroll_active = false;
+            return false;
+        }
+        self.scroll_top = next;
+        let edge_position = self.drag_selection_position(position);
+        self.select_to(self.index_for_mouse_position(edge_position), cx);
+        // Selection motion normally resumes caret following. During an edge
+        // drag the autoscroll loop owns the viewport instead.
+        self.follow_cursor = false;
+        true
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let delta_y = f32::from(event.delta.pixel_delta(self.line_height).y);
+        let next = input_scroll_offset(
+            self.scroll_top,
+            delta_y,
+            self.content_height,
+            f32::from(bounds.size.height),
+        );
+        if next == self.scroll_top {
+            return;
+        }
+        self.scroll_top = next;
+        self.follow_cursor = false;
+        cx.stop_propagation();
+        cx.notify();
     }
 
     // ---- utf16 mapping (IME) ----
@@ -1181,17 +1654,20 @@ impl ComposerInput {
 
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) {
-        let max_scroll = (self.content_height - element_height).max(0.0);
-        if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
-            let cursor_top = f32::from(cursor.y);
-            let cursor_bottom = cursor_top + f32::from(self.line_height);
-            if cursor_top < self.scroll_top {
-                self.scroll_top = cursor_top;
-            } else if cursor_bottom > self.scroll_top + element_height {
-                self.scroll_top = cursor_bottom - element_height;
+        if self.follow_cursor {
+            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
+                self.scroll_top = input_scroll_offset_for_cursor(
+                    self.scroll_top,
+                    f32::from(cursor.y),
+                    f32::from(self.line_height),
+                    self.content_height,
+                    element_height,
+                );
             }
         }
-        self.scroll_top = self.scroll_top.clamp(0.0, max_scroll);
+        self.scroll_top = self
+            .scroll_top
+            .clamp(0.0, input_max_scroll(self.content_height, element_height));
     }
 }
 
@@ -1250,11 +1726,18 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        // An IME commit is the tail of a composition whose pre-composition
+        // snapshot was already taken (`replace_and_mark_text_in_range`);
+        // recording here would pin undo to the half-composed text instead.
+        if self.marked_range.is_none() {
+            self.record_edit(&range, new_text);
+        }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range.take();
+        self.follow_cursor = true;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -1273,6 +1756,16 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        // First keystroke of a composition: snapshot the text as it stood
+        // before any of it existed, so one undo drops the whole composition.
+        if self.marked_range.is_none() {
+            self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+            self.last_edit = None;
+        }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         if new_text.is_empty() {
@@ -1285,6 +1778,7 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.follow_cursor = true;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -1470,6 +1964,12 @@ impl gpui::Element for ComposerTextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble && event.pressed_button == Some(MouseButton::Left) {
+                input.update(cx, |input, cx| input.on_mouse_move(event, cx));
+            }
+        });
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
@@ -1535,20 +2035,36 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
             .on_action(cx.listener(Self::word_left))
             .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::delete_to_line_end))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
             .text_size(px(INPUT_TEXT_SIZE))
             .line_height(px(INPUT_LINE_HEIGHT))
@@ -2138,7 +2654,9 @@ impl Composer {
                 let mut chat_branch: Option<String> = None;
                 if is_new {
                     match &plan {
-                        crate::pickers::CheckoutPlan::CurrentCheckout => {}
+                        crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
+                            chat_branch = branch.clone();
+                        }
                         crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
                             cwd = path.clone();
                             worktree_cwd = Some(path.clone());
@@ -3260,6 +3778,53 @@ mod tests {
         );
         // Zero lines still measures one.
         assert_eq!(input_content_height(0), INPUT_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn input_wheel_scroll_uses_gpui_direction_and_clamps() {
+        // Positive wheel delta moves toward the start; negative moves down.
+        assert_eq!(input_scroll_offset(40.0, 20.0, 200.0, 100.0), 20.0);
+        assert_eq!(input_scroll_offset(40.0, -30.0, 200.0, 100.0), 70.0);
+        // Neither edge can be overscrolled.
+        assert_eq!(input_scroll_offset(10.0, 50.0, 200.0, 100.0), 0.0);
+        assert_eq!(input_scroll_offset(90.0, -50.0, 200.0, 100.0), 100.0);
+        // Short content has no internal scroll range.
+        assert_eq!(input_scroll_offset(20.0, -50.0, 80.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn input_scroll_reveals_only_when_caret_leaves_viewport() {
+        // A visible caret preserves the user's viewport.
+        assert_eq!(
+            input_scroll_offset_for_cursor(40.0, 60.0, 20.0, 300.0, 100.0),
+            40.0
+        );
+        // Moving above or below reveals the row with the smallest adjustment.
+        assert_eq!(
+            input_scroll_offset_for_cursor(80.0, 30.0, 20.0, 300.0, 100.0),
+            30.0
+        );
+        assert_eq!(
+            input_scroll_offset_for_cursor(20.0, 130.0, 20.0, 300.0, 100.0),
+            50.0
+        );
+        // Revealing the final row clamps exactly to the content end.
+        assert_eq!(
+            input_scroll_offset_for_cursor(0.0, 290.0, 20.0, 300.0, 100.0),
+            200.0
+        );
+    }
+
+    #[test]
+    fn input_drag_autoscroll_is_edge_proportional_and_capped() {
+        let top = 100.0;
+        let bottom = 300.0;
+        let line = INPUT_LINE_HEIGHT;
+        assert_eq!(input_drag_scroll_delta(200.0, top, bottom, line), 0.0);
+        assert_eq!(input_drag_scroll_delta(90.0, top, bottom, line), -2.0);
+        assert_eq!(input_drag_scroll_delta(315.0, top, bottom, line), 3.0);
+        assert_eq!(input_drag_scroll_delta(-100.0, top, bottom, line), -line);
+        assert_eq!(input_drag_scroll_delta(500.0, top, bottom, line), line);
     }
 
     /// One frame short of the full morph timeline (never rounds up to done).
