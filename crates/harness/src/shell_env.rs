@@ -102,16 +102,37 @@ mod unix {
     }
 
     fn passwd_shell() -> Option<PathBuf> {
-        // SAFETY: getpwuid's static buffer is only read here, and callers are
-        // serialized through the OnceLock init above.
-        unsafe {
-            let pw = libc::getpwuid(libc::getuid());
-            if pw.is_null() || (*pw).pw_shell.is_null() {
+        // `getpwuid`'s buffer is static for the whole PROCESS, not this call
+        // site: any other thread calling getpwuid/getpwnam/getpwent — a native
+        // dependency, or future code here — can recycle it between the lookup
+        // and the read. Serializing our own callers does not close that, so use
+        // the reentrant form and own the buffer.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; 1024];
+        loop {
+            // SAFETY: getpwuid_r writes only into `pwd`, `buf` and `result`,
+            // all owned here and alive for the whole call and the read below.
+            let rc = unsafe {
+                libc::getpwuid_r(
+                    libc::getuid(),
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE && buf.len() < 64 * 1024 {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 || result.is_null() || pwd.pw_shell.is_null() {
                 return None;
             }
-            let shell = std::ffi::CStr::from_ptr((*pw).pw_shell);
-            (!shell.to_bytes().is_empty())
-                .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(shell.to_bytes())))
+            // SAFETY: on success `pw_shell` points into `buf`, still alive.
+            let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
+            return (!shell.to_bytes().is_empty())
+                .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(shell.to_bytes())));
         }
     }
 
@@ -320,10 +341,15 @@ exit 1
             let dir = tempfile::tempdir().unwrap();
             // Simulates rc files that wedge only in interactive mode (`exec
             // tmux` and friends): sleep forever when -i is present.
+            //
+            // The fake PATH must keep `/usr/bin`: the payload runs `env`
+            // through it, and macOS has no `/bin/env` — without it the probe
+            // returns an empty snapshot instead of the fallback, which is a
+            // property of the fixture, not of the fallback being tested.
             let shell = fake_shell(
                 dir.path(),
                 &format!(
-                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/comet-test/fallback/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
+                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/comet-test/fallback/bin:/usr/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
                 ),
             );
             let start = Instant::now();
