@@ -160,9 +160,16 @@ async fn repos_round_trip_add_branches_worktrees() {
         by_name("main").current,
         "main is the main checkout: {refs:?}"
     );
+    // Compare resolved paths: git reports the linked checkout through the
+    // real path, and on macOS the temp root arrives as `/var/...` while git
+    // hands back `/private/var/...` for the same directory.
+    let resolved = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
     assert_eq!(
-        by_name(&worktree.branch).worktree_path.as_deref(),
-        Some(worktree.path.as_str()),
+        by_name(&worktree.branch)
+            .worktree_path
+            .as_deref()
+            .map(resolved),
+        Some(resolved(worktree.path.as_str())),
         "worktree branch maps to its path: {refs:?}"
     );
     let plain_ref = by_name("feature/x");
