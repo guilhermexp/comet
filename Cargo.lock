@@ -1264,6 +1264,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "comet-mcp"
+version = "0.1.9"
+dependencies = [
+ "async-trait",
+ "base64",
+ "comet-proto",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "comet-proto"
 version = "0.1.9"
 dependencies = [

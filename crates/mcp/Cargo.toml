@@ -1,0 +1,22 @@
+[package]
+name = "comet-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+comet-proto.workspace = true
+async-trait.workspace = true
+# PTY bytes ride base64 on both terminal RPCs (`TerminalEvent::Data`,
+# `WriteTerminal`); same version comet-engine already pins.
+base64 = "0.22"
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

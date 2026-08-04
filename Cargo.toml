@@ -7,6 +7,7 @@ members = [
     "crates/harness",
     "crates/engine",
     "crates/rpc",
+    "crates/mcp",
     "crates/update",
     "crates/ui",
     "crates/tui",
@@ -27,6 +28,7 @@ comet-sync = { path = "crates/sync" }
 comet-harness = { path = "crates/harness" }
 comet-engine = { path = "crates/engine" }
 comet-rpc = { path = "crates/rpc" }
+comet-mcp = { path = "crates/mcp" }
 comet-update = { path = "crates/update" }
 comet-ui = { path = "crates/ui" }
 comet-tui = { path = "crates/tui" }

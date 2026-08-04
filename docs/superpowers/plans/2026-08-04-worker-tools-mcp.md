@@ -68,11 +68,11 @@ Pure logic first, no MCP and no socket, so the bounded/resumable behavior is pin
 - Produces: `EngineClient` trait and `WorkerTools<C: EngineClient>` with `spawn`, `read`, `wait`, `kill`.
 - Consumes: `comet_proto::TerminalEvent`.
 
-- [ ] **Step 1: Scaffold the crate**
+- [x] **Step 1: Scaffold the crate**
 
 Mirror an existing small crate's `Cargo.toml` (`crates/update` is a good template). Package name `comet-mcp`, workspace version/edition/license.
 
-- [ ] **Step 2: Define the seam**
+- [x] **Step 2: Define the seam**
 
 ```rust
 #[async_trait]
@@ -91,7 +91,7 @@ pub trait EngineClient: Send + Sync {
 
 `WorkerTools` owns the `worker_id -> device` map (a `Mutex<HashMap<String, Option<String>>>`), read by the other three so the agent never repeats `target_device`. The entry is committed **only after both RPCs of a spawn succeed** — an id mapped by a spawn that then failed is a worker that does not exist, and every later call for it must be a clean not-found.
 
-- [ ] **Step 3: Write the failing tests first**
+- [x] **Step 3: Write the failing tests first**
 
 Against a stub `EngineClient` that replays a scripted event list. Cover exactly these:
 
@@ -115,7 +115,7 @@ kill_closes_and_forgets_the_worker
 
 The `spawn_past_max_depth` case takes the depth from `WorkerTools`' own configuration, not from any environment variable.
 
-- [ ] **Step 4: Implement until green**
+- [x] **Step 4: Implement until green**
 
 `spawn` = `open_terminal`, then `write_terminal` with `cd <cwd> && <command>\n` when a `cwd` is given and plain `<command>\n` otherwise. Shell-quote the cwd — a worktree under `/Users/First Last/...` is ordinary, and an unquoted `cd` silently runs in the wrong directory. On write failure: `close_terminal`, leave the map untouched, return the original error.
 
@@ -130,7 +130,7 @@ Run: `cargo test -p comet-mcp`
 
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 `feat(mcp): worker tool logic over an engine client seam`
 
