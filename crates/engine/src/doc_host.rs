@@ -17,6 +17,7 @@
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::watch;
@@ -36,6 +37,27 @@ use crate::{EngineError, new_id, now_ms};
 
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+
+/// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
+/// beyond this (and beyond [`comet_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
+/// oldest-access-first — reopening from the SQLite snapshot measured within
+/// ~11ms of a warm doc, so the cap trades no perceptible open latency.
+const WARM_DOC_CAP: usize = 12;
+
+/// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
+/// columnar+compressed; the in-memory doc plus mirror runs well above the blob
+/// size. A rough multiplier is enough here — the budget is a safety ceiling,
+/// the count cap does the day-to-day work.
+const RESIDENT_BYTES_PER_SNAPSHOT_BYTE: usize = 6;
+
+/// Floor per open doc (room socket buffers, tasks) regardless of content size.
+const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
+
+/// Docs touched this recently are never evicted. Closes the open→attach race:
+/// `open()` returns a handle, and until the caller's `watch_messages` lands
+/// the doc is unwatched and unpinned — a concurrent eviction would orphan the
+/// watcher on a roomless doc that renders once and never updates again.
+const EVICT_MIN_IDLE_MS: i64 = 30_000;
 
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
@@ -140,6 +162,13 @@ pub struct ChatDocHandle {
     device_id: String,
     doc: Arc<SessionDoc>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    /// True when the doc changed while nobody watched: the mirror rebuild is
+    /// deferred to the next `watch_messages` attach instead of paid per commit.
+    mirror_dirty: AtomicBool,
+    /// Epoch ms of the last open/watch touch — the LRU eviction key.
+    last_access: AtomicI64,
+    /// Last known snapshot blob size — the eviction budget estimate's input.
+    snapshot_bytes: AtomicUsize,
     room: Mutex<Option<RoomClient>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
@@ -159,8 +188,31 @@ impl ChatDocHandle {
     }
 
     /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
+    ///
+    /// Attach-time refresh: the mirror is only maintained while watched, so a
+    /// doc that changed unwatched materializes here, once, instead of on every
+    /// commit it sat through in the background.
     pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
-        self.messages_tx.subscribe()
+        self.touch();
+        // Attach is a user signal: verify a quiet room is actually alive
+        // (a doc-wedged DO keeps answering pings while delivering nothing,
+        // and the background probe cadence can be hours out). Coalescing
+        // no-op on a healthy or recently-active room.
+        if let Some(room) = lock(&self.room).as_ref() {
+            room.probe();
+        }
+        // Subscribe BEFORE the dirty check: a commit racing this attach then
+        // sees a live receiver and publishes, instead of re-marking dirty
+        // after our refresh and leaving the new watcher a cleared mirror.
+        let rx = self.messages_tx.subscribe();
+        if self.mirror_dirty.load(Ordering::Acquire) {
+            self.publish_messages();
+        }
+        rx
+    }
+
+    fn touch(&self) {
+        self.last_access.store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn connected(&self) -> bool {
@@ -221,6 +273,7 @@ impl ChatDocHandle {
     }
 
     fn publish_messages(&self) {
+        self.mirror_dirty.store(false, Ordering::Release);
         match self.doc.read_entries() {
             Ok(entries) => {
                 let joined = join_continuation_entries(entries);
@@ -232,6 +285,25 @@ impl ChatDocHandle {
                 tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
             }
         }
+    }
+
+    /// Per-commit publish path: unwatched docs just mark the mirror dirty —
+    /// rebuilding a full transcript nobody reads was a per-tick cost on every
+    /// open doc (and kept a second transcript copy hot).
+    fn publish_messages_if_watched(&self) {
+        if self.messages_tx.receiver_count() == 0 {
+            self.mirror_dirty.store(true, Ordering::Release);
+            // Shrink the stale mirror: watch_messages rebuilds on attach.
+            self.messages_tx.send_replace(Vec::new());
+        } else {
+            self.publish_messages();
+        }
+    }
+
+    /// Rough resident cost for the LRU budget.
+    fn resident_estimate(&self) -> usize {
+        (self.snapshot_bytes.load(Ordering::Relaxed) * RESIDENT_BYTES_PER_SNAPSHOT_BYTE)
+            .max(DOC_RESIDENT_FLOOR_BYTES)
     }
 }
 
@@ -277,10 +349,13 @@ impl DocHost {
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
+            handle.touch();
             return Ok(handle.clone());
         }
+        let mut snapshot_len = 0usize;
         let doc = match self.inner.store.load_snapshot(chat_id)? {
             Some(bytes) => {
+                snapshot_len = bytes.len();
                 let raw = loro::LoroDoc::new();
                 raw.import(&bytes)
                     .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
@@ -294,14 +369,19 @@ impl DocHost {
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        let joined = join_continuation_entries(doc.read_entries()?);
-        let (messages_tx, _) = watch::channel(joined);
+        // The mirror starts dirty and empty: many opens (command queueing,
+        // drains, nudges) never watch the transcript, and the first
+        // watch_messages attach materializes it on demand.
+        let (messages_tx, _) = watch::channel(Vec::new());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
             messages_tx,
+            mirror_dirty: AtomicBool::new(true),
+            last_access: AtomicI64::new(now_ms()),
+            snapshot_bytes: AtomicUsize::new(snapshot_len),
             room: Mutex::new(None),
             _sub: sub,
         });
@@ -313,29 +393,147 @@ impl DocHost {
             handles.insert(chat_id.to_string(), handle.clone());
         }
 
-        // Edge room join — offline-tolerant: a failed join logs and stays local-first.
+        // Edge room join — offline-tolerant AND supervised. `RoomClient` only
+        // self-reconnects AFTER a first successful join; a one-shot attempt
+        // here (the pre-LRU design) left the doc silently local-only until
+        // app restart whenever the dial hit a transient gap — a post-wake
+        // network, `Auth::token()` momentarily `None` around a refresh, an
+        // edge deploy. The LRU made that dice-roll constant (every reopen),
+        // and a watched doc is pinned against eviction, so nothing ever
+        // retried: the exact "transcript frozen until restart" report.
+        // Retry on the workspace host's capped, jittered backoff; a system
+        // wake redials immediately; eviction/purge ends the loop via `weak`.
         if let Some(edge) = &self.inner.config.edge {
             let url = edge.room_url(format!("/session/{chat_id}/ws"));
             let room_doc = doc.doc().clone();
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(&handle);
             tokio::spawn(async move {
-                match RoomClient::connect_via(url, &chat, room_doc).await {
-                    Ok(client) => {
-                        if let Some(handle) = weak.upgrade() {
+                let mut wake = comet_sync::wake::subscribe();
+                let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                loop {
+                    if weak.upgrade().is_none() {
+                        return; // evicted or purged while dialing
+                    }
+                    match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
+                        Ok(client) => {
+                            let Some(handle) = weak.upgrade() else {
+                                return; // evicted mid-dial: drop leaves the room
+                            };
                             *lock(&handle.room) = Some(client);
                             tracing::info!(chat = %chat, "session room joined");
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                chat = %chat,
+                                error = %err,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "session room join failed; retrying"
+                            );
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!(chat = %chat, error = %err, "session room join failed; staying offline");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
+                            backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
+                        }
+                        _ = wake.recv() => {
+                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        }
                     }
                 }
             });
         }
 
         tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
+        self.evict_over_budget();
         Ok(handle)
+    }
+
+    /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
+    /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
+    /// least-recently-touched unpinned docs. Pinned (never evicted):
+    /// - watched docs (`messages_tx` has receivers — a UI transcript);
+    /// - docs with a live writer (`Arc<SessionDoc>` held outside the handle —
+    ///   a run streaming into it);
+    /// - host-side docs with pending commands (the executor owes them work).
+    ///
+    /// Eviction flushes a final snapshot, so reopen loses nothing; missed
+    /// remote updates re-arrive through the room join's VV backfill.
+    fn evict_over_budget(&self) {
+        let mut by_age: Vec<(i64, String)> = {
+            let handles = lock(&self.inner.handles);
+            handles
+                .values()
+                .map(|h| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
+                .collect()
+        };
+        by_age.sort_unstable();
+        for (last_access, chat_id) in by_age {
+            if now_ms() - last_access < EVICT_MIN_IDLE_MS {
+                // Sorted oldest-first: everything after this is younger.
+                return;
+            }
+            let (count, estimate) = {
+                let handles = lock(&self.inner.handles);
+                (
+                    handles.len(),
+                    handles
+                        .values()
+                        .map(|h| h.resident_estimate())
+                        .sum::<usize>(),
+                )
+            };
+            if count <= WARM_DOC_CAP && estimate <= comet_doc::DOC_LRU_BYTE_BUDGET {
+                return;
+            }
+            let evicted = {
+                let mut handles = lock(&self.inner.handles);
+                match handles.get(&chat_id) {
+                    Some(handle) if !self.pinned(handle) => handles.remove(&chat_id),
+                    _ => None,
+                }
+            };
+            if let Some(handle) = evicted {
+                // Final flush outside the map lock; ≤1s of changes could be
+                // pending in the snapshot debounce.
+                self.save_snapshot(&handle);
+                tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
+            }
+        }
+    }
+
+    fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        if handle.messages_tx.receiver_count() > 0 {
+            return true;
+        }
+        // The handle itself holds one doc ref; more means a live writer.
+        if Arc::strong_count(&handle.doc) > 1 {
+            return true;
+        }
+        if self.is_host(&handle.chat_id) {
+            let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            match handle.doc.read_commands() {
+                Ok(commands) => commands
+                    .iter()
+                    .any(|c| c.status == SessionCommandStatus::Pending && !is_processed(&c.id)),
+                // Unreadable ledger: keep the doc, never evict blind.
+                Err(_) => true,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Drop a chat's doc unconditionally and delete its local snapshot — the
+    /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
+    /// stream end; a racing writer keeps its orphaned doc until the run ends.
+    pub fn purge_chat(&self, chat_id: &str) {
+        let removed = lock(&self.inner.handles).remove(chat_id);
+        drop(removed);
+        if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
+            tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
+        }
     }
 
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
@@ -712,6 +910,7 @@ impl DocHost {
     fn save_snapshot(&self, handle: &ChatDocHandle) {
         match handle.doc.export_snapshot() {
             Ok(bytes) => {
+                handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
                 if let Err(err) = self.inner.store.save_snapshot(&handle.chat_id, &bytes) {
                     tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
                 }
@@ -758,10 +957,10 @@ pub fn respond_input_prompt(
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
 async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
-    // Initial pass: the snapshot may already carry pending commands.
+    // Initial pass: the snapshot may already carry pending commands. The
+    // mirror stays lazy — it materializes on the first watch attach.
     {
         let Some(handle) = weak.upgrade() else { return };
-        handle.publish_messages();
         host.drain_commands(&handle).await;
     }
     let mut save_deadline: Option<tokio::time::Instant> = None;
@@ -773,7 +972,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break; // doc handle (and its change sender) is gone
                 }
                 let Some(handle) = weak.upgrade() else { break };
-                handle.publish_messages();
+                handle.publish_messages_if_watched();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(
@@ -786,6 +985,8 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 save_deadline = None;
                 let Some(handle) = weak.upgrade() else { break };
                 host.save_snapshot(&handle);
+                // Post-quiesce eviction pass: sizes just refreshed.
+                host.evict_over_budget();
             }
         }
     }

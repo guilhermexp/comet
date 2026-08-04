@@ -36,9 +36,6 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Terminal viewport over the same engine — attaches to a running app or
-    /// daemon, or starts one, and detaches (leaving work running) when it exits.
-    Tui(comet_tui::cli::TuiArgs),
     /// Speak MCP on stdio, exposing the worker tools to the agent running in
     /// `--chat`. Launched by the harness through `--mcp-config`, not by hand.
     /// stdout is the MCP transport: logs go to stderr.
@@ -102,38 +99,71 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     }
 }
 
+/// mimalloc: system malloc (macOS libmalloc especially) never returns the
+/// streaming churn's high-water pages, so transient allocation became
+/// permanent RSS (docs/memory-plan.md §1).
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // The TUI owns its own tracing (to a file — a line on stdout would land
-    // inside the alternate screen and corrupt it), so skip the global stdout
-    // subscriber entirely for it. Everything else logs to stdout: long-running
-    // modes at info, one-shot CLI commands at warn (RUST_LOG overrides either).
-    // `mcp-server` is the exception that must not be missed: its stdout IS the
-    // MCP transport, so a single log line there is a protocol frame the client
-    // cannot parse. It logs to stderr.
-    if !matches!(cli.command, Some(Command::Tui(_))) {
-        // loro's internal block-encode diagnostics log at info and flood
-        // journald on every snapshot export — enough to fill a disk on a
-        // long-running headless host. Quiet them by default (RUST_LOG still
-        // overrides the whole filter).
-        let default_filter = match &cli.command {
-            None | Some(Command::Headless) => "info,loro_internal=warn,loro=warn",
-            Some(_) => "warn",
-        };
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| default_filter.into());
-        if matches!(cli.command, Some(Command::McpServer { .. })) {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .init();
+    // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
+    // overrides either).
+    // loro's internal block-encode diagnostics log at info and flood
+    // journald on every snapshot export — enough to fill a disk on a
+    // long-running headless host. Quiet them by default (RUST_LOG still
+    // overrides the whole filter).
+    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let default_filter = if long_running {
+        "info,loro_internal=warn,loro=warn"
+    } else {
+        "warn"
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
+    // Long-running modes mirror stdout logging to {data_dir}/logs — a headed
+    // app launched from Finder has no visible stdout, which left every sync
+    // wedge report ("stale until restart") with zero diagnostics even though
+    // the engine logs the exact failure line. One file per launch, previous
+    // launch kept as `.old`.
+    let log_file = if long_running {
+        let mode = if cli.command.is_some() {
+            "headless"
         } else {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            "headed"
+        };
+        open_log_file(mode)
+    } else {
+        None
+    };
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        // `mcp-server` is the one mode that must not log to stdout: its stdout
+        // IS the MCP transport, so a single line there is a frame the client
+        // cannot parse. Everything else keeps the console on stdout.
+        let console: tracing_subscriber::fmt::writer::BoxMakeWriter =
+            if matches!(cli.command, Some(Command::McpServer { .. })) {
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+            } else {
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+            };
+        let registry = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(console));
+        match log_file {
+            Some(file) => registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Arc::new(file)),
+                )
+                .init(),
+            None => registry.init(),
         }
     }
 
     match cli.command {
-        Some(Command::Tui(args)) => comet_tui::cli::run(args),
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
@@ -251,4 +281,18 @@ fn harness_from_env() -> comet_engine::HarnessId {
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     std::path::PathBuf::from(home).join(".comet-native")
+}
+
+/// `{data_dir}/logs/comet-{mode}.log`, previous launch preserved as `.old`.
+/// Headed and headless are separate files so an embedded-engine app and a
+/// daemon on the same machine never interleave writes.
+fn open_log_file(mode: &str) -> Option<std::fs::File> {
+    let dir = std::env::var_os("COMET_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(dirs_data_dir)
+        .join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("comet-{mode}.log"));
+    let _ = std::fs::rename(&path, dir.join(format!("comet-{mode}.log.old")));
+    std::fs::File::create(&path).ok()
 }

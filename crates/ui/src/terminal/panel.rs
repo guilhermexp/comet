@@ -938,7 +938,7 @@ impl TerminalPanel {
                         let chat_drag = chat_owned.clone();
                         let ghost_title = title.clone();
                         let (text_color, bg, glyph_alpha) = if selected {
-                            (theme.text, crate::theme::white_alpha(0.08), 0.8)
+                            (theme.text, crate::theme::ink(0.08), 0.8)
                         } else {
                             (
                                 theme.text_muted.opacity(0.6),
@@ -956,7 +956,7 @@ impl TerminalPanel {
                             .rounded(px(6.0))
                             .when(!selected, |el| el.opacity(0.45))
                             .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::white_alpha(0.09)))
+                            .hover(|s| s.bg(crate::theme::ink(0.09)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(&chat_close2, key, cx);
