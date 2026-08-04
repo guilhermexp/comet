@@ -166,17 +166,27 @@ impl<C: EngineClient> WorkerTools<C> {
             .open_terminal(&self.config.chat_id, target_device)
             .await?;
 
-        // One write, one line. The cwd is shell-quoted: a worktree under
-        // `/Users/First Last/...` is ordinary, and an unquoted `cd` silently
-        // runs the worker in the wrong directory.
+        // One write, one line, and it must end the shell.
+        //
+        // `OpenTerminal` spawns the user's INTERACTIVE login shell, which
+        // returns to its prompt when a command finishes — and the engine only
+        // stamps `Exit` when the shell itself dies. Without the trailing
+        // `exit $?` a worker would never complete and `wait_worker` would
+        // always time out. `$?` is the command's status (or `cd`'s, when the
+        // `&&` short-circuits), so the exit code the agent reads is the
+        // worker's own.
+        //
+        // The cwd is shell-quoted: a worktree under `/Users/First Last/...` is
+        // ordinary, and an unquoted `cd` silently runs the worker in the wrong
+        // directory.
         let line = match cwd {
             Some(cwd) if !cwd.is_empty() => format!(
-                "export {DEPTH_ENV_VAR}={}; cd {} && {command}\n",
+                "export {DEPTH_ENV_VAR}={}; cd {} && {command}; exit $?\n",
                 self.config.depth + 1,
                 shell_quote(cwd)
             ),
             _ => format!(
-                "export {DEPTH_ENV_VAR}={}; {command}\n",
+                "export {DEPTH_ENV_VAR}={}; {command}; exit $?\n",
                 self.config.depth + 1
             ),
         };
@@ -536,7 +546,7 @@ mod tests {
             calls.writes,
             [(
                 "term-1".to_string(),
-                "export COMET_WORKER_DEPTH=1; echo hi\n".to_string(),
+                "export COMET_WORKER_DEPTH=1; echo hi; exit $?\n".to_string(),
                 None
             )]
         );
@@ -618,7 +628,7 @@ mod tests {
         let calls = tools.client.calls();
         assert_eq!(
             calls.writes[0].1,
-            "export COMET_WORKER_DEPTH=1; cd '/Users/First Last/wt' && cargo test\n"
+            "export COMET_WORKER_DEPTH=1; cd '/Users/First Last/wt' && cargo test; exit $?\n"
         );
     }
 

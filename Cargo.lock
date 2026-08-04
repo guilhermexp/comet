@@ -1277,6 +1277,7 @@ version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "comet-engine",
  "comet-proto",
  "comet-rpc",
  "futures",

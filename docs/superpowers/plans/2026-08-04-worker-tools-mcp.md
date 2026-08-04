@@ -233,11 +233,11 @@ Expected: PASS.
 **Files:**
 - Create: `crates/mcp/tests/worker_e2e.rs`
 
-- [ ] **Step 1: Real engine, real PTY**
+- [x] **Step 1: Real engine, real PTY**
 
 Following the `crates/rpc/examples/e2e_driver.rs` pattern: start an engine, create a space and a chat, then drive `WorkerTools` against a real `RpcClient`.
 
-- [ ] **Step 2: The cases that matter**
+- [x] **Step 2: The cases that matter**
 
 ```
 sh -c 'echo hi; exit 3'   -> exit_code 3, "hi" in output
@@ -249,16 +249,16 @@ Run: `cargo test -p comet-mcp`
 
 Expected: PASS.
 
-- [ ] **Step 3: Full suite**
+- [x] **Step 3: Full suite**
 
 Run: `cargo fmt --all && cargo test --workspace && cargo build -p comet`
 
 Expected: PASS. The workspace suite was green before this work; keep it that way.
 
-- [ ] **Step 4: Desktop smoke**
+- [ ] **Step 4: Desktop smoke** — not run here; the orchestrator owns it.
 
 Start the app, open a session, and ask the agent to spawn a real worker (`claude -p 'reply with the word banana'`). Confirm: the `mcp__comet__spawn_worker` chip renders in the transcript, the worker shows up in the Terminal pane, `wait_worker` returns its exit code, and the parent session stays responsive while it runs.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 `test(mcp): end-to-end worker lifecycle against a real engine`
