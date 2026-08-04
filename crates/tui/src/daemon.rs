@@ -235,49 +235,9 @@ fn spawn_detached(config: &DaemonConfig) -> anyhow::Result<u32> {
     Ok(child.id())
 }
 
-/// Find the `comet` binary. Checked in order of "most likely to be the one the
-/// user means": an explicit override, the binary sitting next to this one (a
-/// cargo target dir or an installed `app/current/`), PATH, then the installer's
-/// well-known location.
-pub fn resolve_comet_bin() -> anyhow::Result<PathBuf> {
-    let exe_name = if cfg!(windows) { "comet.exe" } else { "comet" };
-
-    if let Some(explicit) = std::env::var_os("COMET_BIN").map(PathBuf::from) {
-        if explicit.is_file() {
-            return Ok(explicit);
-        }
-        bail!("COMET_BIN={} is not a file", explicit.display());
-    }
-
-    if let Ok(self_exe) = std::env::current_exe()
-        && let Some(dir) = self_exe.parent()
-    {
-        let sibling = dir.join(exe_name);
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(exe_name);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let installed = PathBuf::from(home)
-            .join(".comet-native/app/current")
-            .join(exe_name);
-        if installed.is_file() {
-            return Ok(installed);
-        }
-    }
-
-    bail!("`{exe_name}` not found next to this binary, on PATH, or under ~/.comet-native/app")
-}
+/// Find the `comet` binary — the shared resolver in `comet-harness`, which
+/// needs the same answer to point the agent's MCP client at `comet mcp-server`.
+pub use comet_harness::comet_bin::resolve_comet_bin;
 
 /// Poll the IPC port until something answers, or the budget runs out.
 async fn wait_for_port(port: u16, budget: Duration) -> bool {

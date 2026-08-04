@@ -1343,6 +1343,7 @@ dependencies = [
  "chrono",
  "clap",
  "comet-doc",
+ "comet-harness",
  "comet-proto",
  "comet-rpc",
  "futures",

@@ -194,11 +194,11 @@ Expected: PASS, and the handshake answers.
 - Consumes: `RunControls.chat_id` from Task 1, the IPC port, and the comet binary path.
 - Produces: `--mcp-config <json>` on the Claude command; `-c mcp_servers.comet.*` on the Codex command.
 
-- [ ] **Step 1: Resolve the binary and the port**
+- [x] **Step 1: Resolve the binary and the port**
 
 Reuse `resolve_comet_bin()` (`crates/tui/src/daemon.rs:242`) rather than writing a second resolver; move it somewhere both callers can reach if that is what it takes. The port is the engine's IPC port, not a constant.
 
-- [ ] **Step 2: Build the Claude flag**
+- [x] **Step 2: Build the Claude flag**
 
 Shape of the value:
 
@@ -210,11 +210,11 @@ Shape of the value:
 
 Inline JSON, one argument. Do not pass `--strict-mcp-config`.
 
-- [ ] **Step 3: Build the Codex flags**
+- [x] **Step 3: Build the Codex flags**
 
 The same server through `-c mcp_servers.comet.command=<bin>` and `-c mcp_servers.comet.args=[...]`.
 
-- [ ] **Step 4: Pin it with tests**
+- [x] **Step 4: Pin it with tests**
 
 Assert both builders emit the flag, that the chat id and port land in the args, and that `--strict-mcp-config` is absent. Include a case with a binary path containing a space and a quote, parsing the emitted argument back with `serde_json` to prove it survives — a string-equality assertion on a hand-built template would pass while the real thing is broken. Assert nothing is emitted when the binary cannot be resolved: a missing binary must degrade to "no worker tools", never fail the run.
 
@@ -222,7 +222,7 @@ Run: `cargo test -p comet-harness`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 `feat(harness): hand the comet MCP server to Claude and Codex`
 

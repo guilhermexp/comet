@@ -176,6 +176,37 @@ impl CodexHarness {
             )
         })
     }
+
+    /// `worker_tools` is the comet MCP server to hand the agent, or `None` when
+    /// there is no comet binary to point at — a missing binary degrades to "no
+    /// worker tools", never to a failed run.
+    fn build_command(
+        &self,
+        exe: &PathBuf,
+        request: &RunRequest,
+        chat_id: &str,
+        worker_tools: Option<&crate::worker_tools::ServerTarget>,
+    ) -> Command {
+        let mut cmd = Command::new(exe);
+        cmd.arg("app-server");
+        crate::compose_child_path(&mut cmd, exe);
+        // The comet MCP server, so the agent can delegate to CLI workers that
+        // outlive its turn. Same server as the Claude path, through Codex's
+        // config overrides; the user's own `mcp_servers` entries are untouched.
+        cmd.args(crate::worker_tools::codex_mcp_flags(
+            worker_tools,
+            chat_id,
+            crate::worker_tools::SESSION_DEPTH,
+        ));
+        if !request.cwd.is_empty() {
+            cmd.current_dir(&request.cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    }
 }
 
 #[async_trait]
@@ -234,16 +265,8 @@ impl Harness for CodexHarness {
             );
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
         }
-        let mut cmd = Command::new(&exe);
-        cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let worker_tools = crate::worker_tools::server_target();
+        let mut cmd = self.build_command(&exe, &request, &controls.chat_id, worker_tools.as_ref());
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -1144,6 +1167,84 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn build_command_hands_the_agent_the_comet_mcp_server() {
+        let target = crate::worker_tools::ServerTarget {
+            bin: std::path::PathBuf::from("/opt/comet bin/comet"),
+            port: 30007,
+        };
+        let request = RunRequest {
+            prompt: "hi".into(),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: None,
+        };
+        let cmd = CodexHarness::default().build_command(
+            &PathBuf::from("/usr/bin/codex"),
+            &request,
+            "chat-42",
+            Some(&target),
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let command_flag = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.comet.command="))
+            .expect("the command override is emitted");
+        assert_eq!(
+            serde_json::from_str::<String>(
+                command_flag
+                    .strip_prefix("mcp_servers.comet.command=")
+                    .unwrap()
+            )
+            .expect("valid JSON string"),
+            "/opt/comet bin/comet"
+        );
+        let args_flag = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.comet.args="))
+            .expect("the args override is emitted");
+        let server_args: Vec<String> =
+            serde_json::from_str(args_flag.strip_prefix("mcp_servers.comet.args=").unwrap())
+                .expect("valid JSON array");
+        assert!(server_args.contains(&"chat-42".to_string()));
+        assert!(server_args.contains(&"30007".to_string()));
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn build_command_omits_the_server_when_there_is_no_comet_binary() {
+        let request = RunRequest {
+            prompt: "hi".into(),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: None,
+        };
+        let cmd = CodexHarness::default().build_command(
+            &PathBuf::from("/usr/bin/codex"),
+            &request,
+            "chat-42",
+            None,
+        );
+        assert!(
+            !cmd.as_std()
+                .get_args()
+                .any(|a| a.to_string_lossy().starts_with("mcp_servers.comet."))
+        );
+    }
     #[test]
     fn slashed_branch_worktrees_are_detected_for_sandbox_escalation() {
         let tmp = tempfile::tempdir().unwrap();

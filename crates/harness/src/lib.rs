@@ -72,8 +72,10 @@ pub trait Harness: Send + Sync {
 
 pub mod claude;
 pub mod codex;
+pub mod comet_bin;
 pub mod mock;
 pub mod shell_env;
+pub mod worker_tools;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell

@@ -145,7 +145,16 @@ impl ClaudeHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    /// `worker_tools` is the comet MCP server to hand the agent, or `None` when
+    /// there is no comet binary to point at — a missing binary degrades to "no
+    /// worker tools", never to a failed run.
+    fn build_command(
+        &self,
+        exe: &PathBuf,
+        request: &RunRequest,
+        chat_id: &str,
+        worker_tools: Option<&crate::worker_tools::ServerTarget>,
+    ) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
@@ -206,6 +215,17 @@ impl ClaudeHarness {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
         }
+        // The comet MCP server, so the agent can delegate to CLI workers that
+        // outlive its turn. Inline JSON, one argument. `--strict-mcp-config` is
+        // deliberately absent: it would drop the user's own MCP servers.
+        if let Some(config) = crate::worker_tools::claude_mcp_config(
+            worker_tools,
+            chat_id,
+            crate::worker_tools::SESSION_DEPTH,
+        ) {
+            cmd.arg("--mcp-config");
+            cmd.arg(config);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -255,7 +275,8 @@ impl Harness for ClaudeHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
+        let worker_tools = crate::worker_tools::server_target();
+        let mut cmd = self.build_command(&exe, &request, &controls.chat_id, worker_tools.as_ref());
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -747,6 +768,68 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn probe_request() -> RunRequest {
+        RunRequest {
+            prompt: "hi".into(),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: None,
+        }
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn build_command_hands_the_agent_the_comet_mcp_server() {
+        let target = crate::worker_tools::ServerTarget {
+            bin: std::path::PathBuf::from("/opt/comet bin/comet"),
+            port: 30007,
+        };
+        let cmd = ClaudeHarness::default().build_command(
+            &PathBuf::from("/usr/bin/claude"),
+            &probe_request(),
+            "chat-42",
+            Some(&target),
+        );
+        let args = args_of(&cmd);
+        let flag = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config is emitted");
+        // One inline argument, and it must parse: a malformed template shows up
+        // as "no tools", never as an error.
+        let parsed: Value =
+            serde_json::from_str(&args[flag + 1]).expect("the config argument is valid JSON");
+        let server = &parsed["mcpServers"]["comet"];
+        assert_eq!(server["command"], json!("/opt/comet bin/comet"));
+        let server_args: Vec<String> =
+            serde_json::from_value(server["args"].clone()).expect("args array");
+        assert!(server_args.contains(&"chat-42".to_string()));
+        assert!(server_args.contains(&"30007".to_string()));
+        // Strict mode would drop the user's own MCP servers.
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn build_command_omits_the_server_when_there_is_no_comet_binary() {
+        let cmd = ClaudeHarness::default().build_command(
+            &PathBuf::from("/usr/bin/claude"),
+            &probe_request(),
+            "chat-42",
+            None,
+        );
+        assert!(!args_of(&cmd).iter().any(|a| a == "--mcp-config"));
+    }
     #[test]
     fn parses_questions_tolerantly() {
         let input = json!({
