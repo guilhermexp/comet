@@ -8,3 +8,5 @@ node_modules
 .wrangler
 build/
 edge/dist/
+.auto-claude/
+.reverse-engineering/
