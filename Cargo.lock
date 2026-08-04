@@ -1163,6 +1163,7 @@ dependencies = [
  "comet-ui",
  "comet-update",
  "mimalloc",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
