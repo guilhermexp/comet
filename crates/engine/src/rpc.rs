@@ -129,6 +129,10 @@ struct DeleteWorktreeParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+    /// Serde-defaulted so an older viewport keeps the hidden-free listing it
+    /// has always had.
+    #[serde(default)]
+    include_hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1081,7 +1085,7 @@ impl RpcService for EngineRpc {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
                     .repos
-                    .list_folders(p.path)
+                    .list_folders(p.path, p.include_hidden)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)

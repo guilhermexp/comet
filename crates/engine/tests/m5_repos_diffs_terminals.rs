@@ -227,7 +227,7 @@ async fn folder_lister_flags_and_ordering() {
     let data = tempfile::tempdir().expect("data dir");
     let repos = test_repos(data.path());
     let listing = repos
-        .list_folders(Some(tmp.path().to_string_lossy().to_string()))
+        .list_folders(Some(tmp.path().to_string_lossy().to_string()), false)
         .await
         .expect("listing");
     assert!(!listing.truncated);
@@ -255,6 +255,32 @@ async fn folder_lister_flags_and_ordering() {
 }
 
 #[tokio::test]
+async fn folder_lister_includes_dotfiles_only_when_asked() {
+    // A folder browser that never lists dotfiles cannot pick one, and
+    // `.config`-style directories are ordinary workspaces.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("alpha")).expect("dir");
+    std::fs::create_dir_all(tmp.path().join(".hidden")).expect("hidden dir");
+    std::fs::write(tmp.path().join(".rc"), "x").expect("hidden file");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let repos = test_repos(data.path());
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let plain = repos
+        .list_folders(Some(path.clone()), false)
+        .await
+        .expect("listing");
+    let plain: Vec<&str> = plain.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(plain, vec!["alpha"]);
+
+    let all = repos.list_folders(Some(path), true).await.expect("listing");
+    let all: Vec<&str> = all.entries.iter().map(|e| e.name.as_str()).collect();
+    // Same ordering contract: dirs first name-sorted, files after.
+    assert_eq!(all, vec![".hidden", "alpha", ".rc"]);
+}
+
+#[tokio::test]
 async fn folder_lister_caps_at_500_with_truncated_flag() {
     let tmp = tempfile::tempdir().expect("tempdir");
     for i in 0..510 {
@@ -263,7 +289,7 @@ async fn folder_lister_caps_at_500_with_truncated_flag() {
     let data = tempfile::tempdir().expect("data dir");
     let repos = test_repos(data.path());
     let listing = repos
-        .list_folders(Some(tmp.path().to_string_lossy().to_string()))
+        .list_folders(Some(tmp.path().to_string_lossy().to_string()), false)
         .await
         .expect("listing");
     assert_eq!(listing.entries.len(), 500);
@@ -279,6 +305,7 @@ async fn folder_lister_timeout_path() {
             Some(tmp.path().to_string_lossy().to_string()),
             Duration::from_millis(50),
             true, // worker never responds
+            false,
         )
         .await
         .expect_err("times out");

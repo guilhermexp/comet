@@ -673,13 +673,20 @@ impl Repos {
 
     // ── ListFolders ─────────────────────────────────────────────────────────
 
-    /// One directory level (home by default): dotfiles hidden, directories first,
-    /// capped at [`FOLDER_LIST_MAX_ENTRIES`] with a `truncated` flag. The walk runs
-    /// in a spawned blocking task under a 6s wall-clock ceiling — a wedged path
-    /// (dead mount, permission-gated folder) fails this listing without blocking
-    /// anything else; the abandoned task unwinds on its own thread.
-    pub async fn list_folders(&self, path: Option<String>) -> Result<FolderListing, EngineError> {
-        self.list_folders_with(path, FOLDER_LIST_TIMEOUT, false)
+    /// One directory level (home by default): directories first, capped at
+    /// [`FOLDER_LIST_MAX_ENTRIES`] with a `truncated` flag. Dotfiles are hidden
+    /// unless `include_hidden` asks for them — a folder browser that never
+    /// shows them cannot pick one, and `.config`-style directories are
+    /// ordinary workspaces. The walk runs in a spawned blocking task under a 6s
+    /// wall-clock ceiling — a wedged path (dead mount, permission-gated folder)
+    /// fails this listing without blocking anything else; the abandoned task
+    /// unwinds on its own thread.
+    pub async fn list_folders(
+        &self,
+        path: Option<String>,
+        include_hidden: bool,
+    ) -> Result<FolderListing, EngineError> {
+        self.list_folders_with(path, FOLDER_LIST_TIMEOUT, false, include_hidden)
             .await
     }
 
@@ -746,6 +753,7 @@ impl Repos {
         path: Option<String>,
         timeout: Duration,
         hang_for_test: bool,
+        include_hidden: bool,
     ) -> Result<FolderListing, EngineError> {
         let target = match path.filter(|p| !p.trim().is_empty()) {
             Some(p) => absolutize(Path::new(&p)),
@@ -760,7 +768,7 @@ impl Repos {
                     // exit reclaims it) — the caller must hit its timeout.
                     std::thread::sleep(Duration::from_secs(3600));
                 }
-                let _ = tx.send(list_folders_blocking(&target));
+                let _ = tx.send(list_folders_blocking(&target, include_hidden));
             });
         if let Err(err) = spawned {
             return Err(EngineError::Other(format!("folder listing failed: {err}")));
@@ -799,7 +807,10 @@ async fn disposable_worker<T: Send + 'static>(
 
 /// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
 /// existence probe per directory entry.
-fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
+fn list_folders_blocking(
+    target: &Path,
+    include_hidden: bool,
+) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
             EngineError::Other("Comet doesn't have access to this folder on the device.".into())
@@ -809,7 +820,7 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     let mut entries: Vec<FolderEntry> = Vec::new();
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if !include_hidden && name.starts_with('.') {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);

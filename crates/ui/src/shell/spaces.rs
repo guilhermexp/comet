@@ -84,6 +84,10 @@ pub(super) struct AddSpaceFlow {
     /// descended through an entry whose `is_repo` we saw; the owning device's
     /// SpacesSync re-verifies either way).
     browser_repo: bool,
+    /// Whether the listing includes dotfiles. Off by default (home is noisy
+    /// with them), flipped from the footer and kept for the whole flow so
+    /// descending into a folder does not silently re-hide them.
+    show_hidden: bool,
     /// Keyboard highlight within the FILTERED folder rows.
     active: usize,
     submit_busy: bool,
@@ -669,6 +673,7 @@ impl Shell {
             browser_path: None,
             home: None,
             browser_repo: false,
+            show_hidden: false,
             active: 0,
             submit_busy: false,
             error: None,
@@ -767,6 +772,7 @@ impl Shell {
             return;
         };
         let device_id = flow.device.as_ref().map(|d| d.id.clone());
+        let show_hidden = flow.show_hidden;
         let went_home = path.is_none();
         flow.browser_path = path.clone();
         flow.browser = Loadable::Loading;
@@ -776,6 +782,9 @@ impl Shell {
             let mut params = serde_json::Map::new();
             if let Some(p) = &path {
                 params.insert("path".into(), serde_json::Value::String(p.clone()));
+            }
+            if show_hidden {
+                params.insert("includeHidden".into(), serde_json::Value::Bool(true));
             }
             // Only target remote devices — local calls skip the relay.
             if let (Some(target), local) = (&device_id, &local)
@@ -925,6 +934,18 @@ impl Shell {
         }
     }
 
+    /// Flip dotfile visibility and rebrowse the CURRENT path, so the toggle
+    /// reads as "show me more of what I am looking at" rather than a reset.
+    fn add_space_toggle_hidden(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        flow.show_hidden = !flow.show_hidden;
+        let path = flow.browser_path.clone();
+        self.load_space_folders(path, cx);
+        cx.notify();
+    }
+
     /// Palette keys (bubbling from the focused search input) — every legend
     /// maps to a REAL key: ↑↓ navigate, →/⏎ open the highlighted folder,
     /// ← up a level, ⌘⏎ add the OPEN folder, ⌫ (empty query) also goes up,
@@ -939,6 +960,12 @@ impl Shell {
             }
             "left" => {
                 self.add_space_go_up(cx);
+                return;
+            }
+            // ⇧⌘. is the Finder gesture for exactly this. Plain ⌘. is macOS
+            // Cancel and closing the palette is what it should keep doing.
+            "." if event.keystroke.modifiers.platform && event.keystroke.modifiers.shift => {
+                self.add_space_toggle_hidden(cx);
                 return;
             }
             _ => {}
@@ -1014,6 +1041,7 @@ impl Shell {
             focus,
             list_scroll,
             home,
+            show_hidden,
         ) = {
             let flow = self.add_space.as_ref()?;
             (
@@ -1028,6 +1056,7 @@ impl Shell {
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
                 flow.home.clone(),
+                flow.show_hidden,
             )
         };
         let devices = self.state.read(cx).devices.clone();
@@ -1500,6 +1529,45 @@ impl Shell {
             ))
             .child(popover::key_hint(&theme, icons::ARROW_LEFT, "Up"))
             .child(popover::key_hint(&theme, icons::ARROW_RIGHT, "Open"))
+            // Dotfiles are off by default, so the legend has to be clickable:
+            // a key-only affordance for a mode most people reach for once is
+            // undiscoverable. ⌘. is the Finder gesture and stays as the hint.
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("add-space-hidden")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .when(show_hidden, |el| el.bg(crate::theme::ink(0.06)))
+                    .hover(|s| s.bg(crate::theme::ink(0.09)))
+                    .child(
+                        popover::key_cap(&theme).child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted.opacity(0.7))
+                                .child("⇧⌘."),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(if show_hidden {
+                                theme.text
+                            } else {
+                                theme.text_muted.opacity(0.75)
+                            })
+                            .child("Hidden folders"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_space_toggle_hidden(cx);
+                    })),
+            )
             .when_some(error, |el, message| {
                 el.child(
                     div()
