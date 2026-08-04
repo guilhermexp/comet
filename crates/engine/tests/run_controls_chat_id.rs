@@ -5,6 +5,12 @@
 //! `RunControls` by hand proves the struct has a field, not that `dispatch`
 //! fills it — so this drives `sessions.dispatch` for a known chat and reads
 //! back what the harness was actually handed.
+//!
+//! One dispatch starts TWO runs: the user's turn, and the auto-titling run the
+//! executor fires off the first prompt. Both cross the same boundary and both
+//! must carry the id, so the assertions wait for both rather than stopping at
+//! whichever lands first. They are told apart by their sandbox level, which is
+//! the one field the two paths set differently (`titles.rs` runs read-only).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,9 +26,19 @@ use comet_proto::{
     SteeringMode,
 };
 
-/// Records the `chat_id` of every run it is handed, then completes.
+const CHAT: &str = "chat-controls-1";
+const SPACE: &str = "space-controls-1";
+
+/// One crossing of the executor boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Handed {
+    chat_id: String,
+    sandbox: SandboxLevel,
+}
+
+/// Records what every run it is handed was told, then completes.
 struct RecordingHarness {
-    seen: Arc<Mutex<Vec<String>>>,
+    seen: Arc<Mutex<Vec<Handed>>>,
 }
 
 #[async_trait]
@@ -47,10 +63,13 @@ impl Harness for RecordingHarness {
     }
     async fn run(
         &self,
-        _request: RunRequest,
+        request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        self.seen.lock().unwrap().push(controls.chat_id.clone());
+        self.seen.lock().unwrap().push(Handed {
+            chat_id: controls.chat_id.clone(),
+            sandbox: request.sandbox,
+        });
         Ok(futures::stream::iter(vec![Ok(AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -63,24 +82,42 @@ impl Harness for RecordingHarness {
 
 #[tokio::test]
 async fn dispatch_hands_the_chat_id_to_the_harness() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().join("checkout");
+    std::fs::create_dir_all(&cwd).expect("checkout dir");
+
     let seen = Arc::new(Mutex::new(Vec::new()));
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(RecordingHarness { seen: seen.clone() }));
-    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles");
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("engine core assembles");
 
-    let chat_id = "chat-controls-1";
+    // A real workspace row, so the titling path runs instead of bailing on a
+    // missing chat — the second boundary crossing has to be reachable for the
+    // assertion below to mean anything.
+    core.workspace
+        .create_space(SPACE, &core.device_id, &cwd.to_string_lossy(), None, true)
+        .expect("create space");
+    core.workspace
+        .create_chat(CHAT, SPACE, None, Some(cwd.to_string_lossy().into_owned()))
+        .expect("create chat");
+
     core.sessions
         .dispatch(
-            chat_id,
+            CHAT,
             HarnessId::Mock,
             RunRequest {
                 prompt: "hello".into(),
                 model: None,
                 reasoning: None,
                 model_options: serde_json::Map::new(),
-                cwd: "/tmp".into(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                // Distinct from the titling run's read-only sandbox.
                 sandbox: SandboxLevel::WorkspaceWrite,
                 auto_approve: true,
                 attachments: Vec::new(),
@@ -91,23 +128,29 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
         .await
         .expect("dispatch");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if !seen.lock().unwrap().is_empty() {
-            break;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let recorded = loop {
+        let recorded = seen.lock().unwrap().clone();
+        let has_turn = recorded
+            .iter()
+            .any(|h| h.sandbox == SandboxLevel::WorkspaceWrite);
+        let has_titling = recorded.iter().any(|h| h.sandbox == SandboxLevel::ReadOnly);
+        if has_turn && has_titling {
+            break recorded;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "harness never ran for {chat_id}"
+            "both dispatch paths must reach the harness; saw {recorded:?}"
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
+    };
+
+    // Every crossing carries the dispatching chat, not just the first.
+    for handed in &recorded {
+        assert_eq!(
+            handed.chat_id, CHAT,
+            "a run crossed the executor boundary without its chat id: {handed:?} \
+             (all: {recorded:?})"
+        );
     }
-    // The dispatch also kicks off the auto-titling run, which is a second run
-    // for the same chat: every run the executor starts must carry the id, so
-    // assert on all of them rather than only the first.
-    let recorded = seen.lock().unwrap().clone();
-    assert!(
-        recorded.iter().all(|id| id == chat_id),
-        "every run must carry the dispatching chat id, got {recorded:?}"
-    );
 }

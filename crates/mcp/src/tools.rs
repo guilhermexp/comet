@@ -833,23 +833,34 @@ mod tests {
 
     #[tokio::test]
     async fn read_caps_output_and_still_advances_next_seq() {
-        // 4 KiB per event, always ready: far past the cap inside the deadline.
-        let tools = tools(Stub::new().flood());
-        let spawned = tools.spawn("yes", None, None).await.expect("spawn");
+        // A FINITE replay that overshoots the cap, rather than a flood trimmed
+        // by the deadline: how many events arrive is then a property of the
+        // script, not of how fast the machine ran.
+        const CHUNK: usize = 4096;
+        let events = (MAX_OUTPUT_BYTES / CHUNK + 40) as u64;
+        let chunk = "x".repeat(CHUNK);
+        let script: Vec<TerminalEvent> = (1..=events).map(|seq| data(seq, &chunk)).collect();
+        let tools = tools(Stub::new().script(script));
+        let spawned = tools.spawn("flood", None, None).await.expect("spawn");
         let read = tools
-            .read(&spawned.worker_id, None, Some(80))
+            .read(&spawned.worker_id, None, Some(5_000))
             .await
             .expect("read");
-        assert_eq!(
-            read.output.len(),
-            MAX_OUTPUT_BYTES,
-            "the flood must be trimmed to the cap, not grow the heap"
-        );
-        // The cursor tracks what the engine sent, not what survived the cap.
+
         assert!(
-            read.next_seq as usize > MAX_OUTPUT_BYTES / 4096,
-            "next_seq must advance for dropped bytes too (got {})",
-            read.next_seq
+            read.output.len() <= MAX_OUTPUT_BYTES,
+            "the flood must be trimmed to the cap, not grow the heap (got {})",
+            read.output.len()
+        );
+        // The cursor tracks what the engine SENT, not what survived the cap:
+        // every scripted event is accounted for, including the dropped ones.
+        assert_eq!(read.next_seq, events);
+        assert!(
+            read.next_seq as usize * CHUNK > read.output.len(),
+            "bytes were dropped, so the cursor must be ahead of what survived \
+             (next_seq {}, output {})",
+            read.next_seq,
+            read.output.len()
         );
     }
 

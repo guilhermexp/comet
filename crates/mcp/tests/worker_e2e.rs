@@ -73,8 +73,10 @@ async fn engine_with_chat() -> (tempfile::TempDir, EngineCore, WorkerTools<RpcEn
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_runs_to_a_nonzero_exit_code() {
     let (_tmp, core, tools) = engine_with_chat().await;
+    // `hi$((1+1))` is typed, `hi2` is printed: a literal marker would match the
+    // PTY's echo of the command line and prove nothing about the output.
     let worker = tools
-        .spawn("sh -c 'echo hi; exit 3'", None, None)
+        .spawn("echo hi$((1+1)); exit 3", None, None)
         .await
         .expect("spawn");
 
@@ -83,10 +85,9 @@ async fn a_worker_runs_to_a_nonzero_exit_code() {
         .await
         .expect("wait");
     assert!(!waited.running, "the worker exited: {waited:?}");
-    // The login shell exits with the status of its last command.
     assert_eq!(waited.exit_code, Some(3), "output was {:?}", waited.output);
     assert!(
-        waited.output.contains("hi"),
+        waited.output.contains("hi2"),
         "output was {:?}",
         waited.output
     );
