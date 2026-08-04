@@ -4,7 +4,7 @@
 
 **Goal:** Let the agent in a comet session spawn CLI workers, read them, wait for an exit code, and kill them — through four MCP tools backed by the terminal RPCs the engine already has.
 
-**Design:** `docs/plans/2026-08-02-worker-tools-mcp-design.md`. Read it first; it explains why each bound exists. This plan does not repeat the rationale.
+**Design:** `docs/plans/2026-08-04-worker-tools-mcp-design.md`. Read it first; it explains why each bound exists. This plan does not repeat the rationale.
 
 **Architecture:** A new `comet-mcp` crate holds the tool logic behind an `EngineClient` trait, so the four tools are unit-testable without a socket. `comet mcp-server` is a subcommand of the existing binary that wires `rmcp` over stdio to a real `RpcClient`. The harness passes that subcommand to the agent through `--mcp-config` (Claude) and `-c mcp_servers.*` (Codex).
 

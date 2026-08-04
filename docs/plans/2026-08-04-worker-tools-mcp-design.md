@@ -1,6 +1,6 @@
 # Worker Tools over MCP Design
 
-**Date:** 2026-08-02
+**Date:** 2026-08-04
 **Status:** Proposed
 
 ## Goal
