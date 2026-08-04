@@ -4735,9 +4735,6 @@ impl Render for Composer {
             // an interactive resize.
             self.last_seen_width = 0.0;
         }
-        // New chats render expanded regardless of `expanded_mode` (see below),
-        // so a mode flip there changes nothing visible — never morph it.
-        let new_chat = self.state.read(cx).selected_chat.is_none();
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
         let now_ms = self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
@@ -4746,7 +4743,7 @@ impl Render for Composer {
             .is_some_and(|until| Instant::now() < until);
         self.flip_morph = flip_morph_step(
             self.flip_morph,
-            committed_flip && !new_chat,
+            committed_flip,
             self.last_rendered_height,
             now_ms,
             motion::reduced_motion(cx),
@@ -4826,11 +4823,6 @@ impl Render for Composer {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
-
-        // New chats always use the expanded layout: the repo/branch pickers
-        // need the full-width actions row (comet composer-actions.tsx
-        // `mustExpand = isNew || …`).
-        let expanded = expanded || new_chat;
 
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
