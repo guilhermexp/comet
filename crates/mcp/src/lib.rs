@@ -20,9 +20,11 @@
 //! Design: `docs/plans/2026-08-04-worker-tools-mcp-design.md`.
 
 pub mod client;
+pub mod server;
 pub mod tools;
 
-pub use client::{EngineClient, ToolError};
+pub use client::{EngineClient, RpcEngineClient, ToolError};
+pub use server::{INSTRUCTIONS, WorkerToolsServer, tool_definitions};
 pub use tools::{
     DEFAULT_MAX_WORKER_DEPTH, DEFAULT_READ_TIMEOUT_MS, DEFAULT_WAIT_TIMEOUT_MS, KillResult,
     MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, ReadResult, SpawnResult, WaitResult, WorkerConfig,

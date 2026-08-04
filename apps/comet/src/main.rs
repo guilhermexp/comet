@@ -39,6 +39,21 @@ enum Command {
     /// Terminal viewport over the same engine — attaches to a running app or
     /// daemon, or starts one, and detaches (leaving work running) when it exits.
     Tui(comet_tui::cli::TuiArgs),
+    /// Speak MCP on stdio, exposing the worker tools to the agent running in
+    /// `--chat`. Launched by the harness through `--mcp-config`, not by hand.
+    /// stdout is the MCP transport: logs go to stderr.
+    McpServer {
+        /// The chat whose terminals the workers are opened under.
+        #[arg(long)]
+        chat: String,
+        /// The engine's IPC port (`ws://127.0.0.1:<port>`).
+        #[arg(long)]
+        port: u16,
+        /// This server's worker depth; a server that hands its own config to a
+        /// worker must launch it at `depth + 1`.
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +108,9 @@ fn main() -> anyhow::Result<()> {
     // inside the alternate screen and corrupt it), so skip the global stdout
     // subscriber entirely for it. Everything else logs to stdout: long-running
     // modes at info, one-shot CLI commands at warn (RUST_LOG overrides either).
+    // `mcp-server` is the exception that must not be missed: its stdout IS the
+    // MCP transport, so a single log line there is a protocol frame the client
+    // cannot parse. It logs to stderr.
     if !matches!(cli.command, Some(Command::Tui(_))) {
         // loro's internal block-encode diagnostics log at info and flood
         // journald on every snapshot export — enough to fill a disk on a
@@ -102,12 +120,16 @@ fn main() -> anyhow::Result<()> {
             None | Some(Command::Headless) => "info,loro_internal=warn,loro=warn",
             Some(_) => "warn",
         };
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| default_filter.into()),
-            )
-            .init();
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| default_filter.into());
+        if matches!(cli.command, Some(Command::McpServer { .. })) {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        } else {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
     }
 
     match cli.command {
@@ -134,6 +156,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+        }
+        Some(Command::McpServer { chat, port, depth }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(mcp_server(chat, port, depth))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
@@ -164,6 +190,25 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// `comet mcp-server`: an MCP server on stdio backed by the engine's terminal
+/// RPCs over IPC. The harness launches one per run through `--mcp-config`.
+///
+/// stdout carries MCP frames and nothing else — the tracing subscriber above
+/// is pointed at stderr for this subcommand.
+async fn mcp_server(chat: String, port: u16, depth: usize) -> anyhow::Result<()> {
+    let rpc = comet_rpc::connect_ws(&format!("ws://127.0.0.1:{port}"))
+        .await
+        .map_err(|err| anyhow::anyhow!("could not reach the engine on port {port}: {err}"))?;
+    let tools = comet_mcp::WorkerTools::new(
+        comet_mcp::RpcEngineClient::new(std::sync::Arc::new(rpc)),
+        comet_mcp::WorkerConfig::new(chat, depth),
+    );
+    comet_mcp::WorkerToolsServer::new(std::sync::Arc::new(tools))
+        .serve_stdio()
+        .await?;
+    Ok(())
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,

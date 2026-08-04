@@ -7,7 +7,9 @@ publish.workspace = true
 
 [dependencies]
 comet-proto.workspace = true
+comet-rpc.workspace = true
 async-trait.workspace = true
+rmcp.workspace = true
 # PTY bytes ride base64 on both terminal RPCs (`TerminalEvent::Data`,
 # `WriteTerminal`); same version comet-engine already pins.
 base64 = "0.22"

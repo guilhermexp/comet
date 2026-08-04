@@ -149,27 +149,27 @@ Expected: all PASS.
 - Consumes: `comet_rpc::{connect_ws, RpcClient, methods}`.
 - Produces: `comet mcp-server --chat <id> --port <ipc> [--depth <n>]` speaking MCP on stdio.
 
-- [ ] **Step 1: Add rmcp**
+- [x] **Step 1: Add rmcp**
 
 `rmcp = "3"` in `[workspace.dependencies]`, with the feature set needed for a stdio server. Check the crate's own docs for the exact feature names rather than guessing — get it wrong and it compiles into a client-only build.
 
-- [ ] **Step 2: Implement the real client**
+- [x] **Step 2: Implement the real client**
 
 `RpcEngineClient` wrapping `RpcClient`: `call_as` for the unary methods, `subscribe` for `SubscribeTerminal`, adding `targetDeviceId` to the params when a device is set. Method name constants come from `comet_rpc::methods` — do not hardcode strings.
 
-- [ ] **Step 3: Register the tools**
+- [x] **Step 3: Register the tools**
 
 Four tools named `spawn_worker`, `read_worker`, `wait_worker`, `kill_worker`, with the parameters and returns from the design's table. Descriptions state the bounds plainly: that output is a 1 MiB tail, that `next_seq` is how you resume, that a not-found means the worker aged past its 30-minute window.
 
 Set `instructions` on the server so the agent learns the tools exist without a `CLAUDE.md` entry: what they are for, that `wait_worker` is how you block on a worker, and that `cwd` with a worktree is how you keep two agents off the same checkout.
 
-- [ ] **Step 4: Wire the subcommand**
+- [x] **Step 4: Wire the subcommand**
 
 Add `McpServer { chat: String, port: u16, depth: usize }` to `Command` in `apps/comet/src/main.rs`. It connects to `ws://127.0.0.1:<port>`, builds `WorkerTools`, and serves MCP on stdio.
 
 Nothing may be written to stdout except the MCP protocol — stdout is the transport. Logs go to stderr.
 
-- [ ] **Step 5: Prove it speaks MCP**
+- [x] **Step 5: Prove it speaks MCP**
 
 Run the subcommand by hand against a running engine, feed it an `initialize` frame and a `tools/list` on stdin, and confirm the four tools come back.
 
@@ -177,7 +177,7 @@ Run: `cargo build -p comet && cargo test -p comet-mcp`
 
 Expected: PASS, and the handshake answers.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 `feat(mcp): serve the worker tools over stdio from comet mcp-server`
 
