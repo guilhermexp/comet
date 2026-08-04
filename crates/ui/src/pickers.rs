@@ -22,7 +22,7 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
 };
 use comet_rpc::methods;
 
@@ -276,6 +276,10 @@ pub enum PickerKind {
     Checkout,
     HarnessModel,
     Traits,
+    /// New-session canvas only: which space the session mints into. A pick
+    /// re-keys everything space-derived (refs, harness/model catalogs) via
+    /// the state observer.
+    Space,
 }
 
 pub struct Pickers {
@@ -645,6 +649,7 @@ impl Pickers {
             },
             PickerKind::Branch => self.selected_ref_index(cx),
             PickerKind::HarnessModel | PickerKind::Traits => self.selected_model_index(cx),
+            PickerKind::Space => self.selected_space_index(cx),
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
@@ -662,6 +667,13 @@ impl Pickers {
                 });
                 window.focus(&handle, cx);
             }
+            PickerKind::Space => {
+                let handle = self.search.read(cx).focus_handle(cx);
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder("Search spaces…", cx);
+                });
+                window.focus(&handle, cx);
+            }
             _ => window.focus(&self.focus, cx),
         }
         match kind {
@@ -676,6 +688,8 @@ impl Pickers {
                 self.ensure_harnesses(true, cx);
                 self.prefetch_models(cx);
             }
+            // Spaces are already synced state — nothing to load.
+            PickerKind::Space => {}
         }
         cx.notify();
     }
@@ -1377,11 +1391,120 @@ impl Pickers {
         }
     }
 
+    // ---- the space picker (new-session canvas) ----
+
+    /// Spaces matching the search query, ranked (`popover::filter_indices`).
+    fn filtered_space_rows(&self, cx: &App) -> Vec<Space> {
+        let query = self.search.read(cx).text().to_string();
+        let state = self.state.read(cx);
+        let names: Vec<String> = state
+            .spaces
+            .iter()
+            .map(|s| s.display_name().to_string())
+            .collect();
+        popover::filter_indices(&query, &names)
+            .into_iter()
+            .map(|ix| state.spaces[ix].clone())
+            .collect()
+    }
+
+    /// Row index of the currently selected space (un-searched open).
+    fn selected_space_index(&self, cx: &App) -> usize {
+        let state = self.state.read(cx);
+        state
+            .selected_space
+            .as_deref()
+            .and_then(|id| state.spaces.iter().position(|s| s.id == id))
+            .unwrap_or(0)
+    }
+
+    /// Re-home the canvas onto another space. The state observer does the
+    /// heavy lifting: branch draft, ref cache, and the per-device
+    /// harness/model catalogs all invalidate on the space change.
+    fn pick_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |s, cx| s.select_space(Some(space_id), cx));
+        self.close(cx);
+    }
+
+    /// The space popover: search + one row per space (name, muted `@ device`
+    /// tag, check on the current pick).
+    fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let rows = self.filtered_space_rows(cx);
+        let (selected, device_names): (Option<String>, Vec<Option<String>>) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_space.clone(),
+                rows.iter()
+                    .map(|space| state.device_name(&space.device_id).map(str::to_string))
+                    .collect(),
+            )
+        };
+        let active = self.active;
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("No spaces match."))
+                .into_any_element()
+        } else {
+            div()
+                .id("space-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(224.0))
+                .overflow_y_scroll()
+                .children(rows.into_iter().zip(device_names).enumerate().map(
+                    |(ix, (space, device))| {
+                        let label: SharedString = space.display_name().to_string().into();
+                        let is_selected = selected.as_deref() == Some(space.id.as_str());
+                        let pick_id = space.id.clone();
+                        popover::menu_row_nav(
+                            &theme,
+                            is_selected,
+                            ix == active,
+                            format!("space-row-{ix}"),
+                        )
+                        .id(("space-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_space(pick_id.clone(), cx);
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .when_some(device, |el, device| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted.opacity(0.45))
+                                    .child(SharedString::from(format!("@ {device}"))),
+                            )
+                        })
+                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
+                    },
+                ))
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(self.search_box(&theme))
+            .child(body)
+            .into_any_element()
+    }
+
     fn on_search_submit(&mut self, cx: &mut Context<Self>) {
         if self.open == Some(PickerKind::Branch)
             && let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active)
         {
             self.pick_ref(row, cx);
+        }
+        if self.open == Some(PickerKind::Space)
+            && let Some(space) = self.filtered_space_rows(cx).into_iter().nth(self.active)
+        {
+            self.pick_space(space.id, cx);
         }
     }
 
@@ -1407,6 +1530,7 @@ impl Pickers {
                     // mouse-only.
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
                     Some(PickerKind::Traits) => 0, // merged into HarnessModel
+                    Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
                     None => 0,
                 };
                 self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
@@ -1456,6 +1580,7 @@ impl Pickers {
             PickerKind::Checkout => "picker-checkout",
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Traits => "picker-traits",
+            PickerKind::Space => "picker-space",
         };
         let open = self.open == Some(kind);
         // Ghost pill (comet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
@@ -1767,6 +1892,8 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
                         }
+                        // Spaces load nothing; no retry surface exists.
+                        PickerKind::Space => {}
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -2572,19 +2699,52 @@ impl Render for Pickers {
                     self.popover_frame_flush(240.0, content, cx),
                 ))
             }
+            Some(PickerKind::Space) => {
+                let content = self.render_space_popover(cx);
+                Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
+            }
             None => None,
         };
 
-        // Left cluster (the branch chip moved to the composer FOOTER row).
+        // Left cluster: the SPACE chip on the new-session canvas (which space
+        // the session mints into — wing's restructure; existing sessions are
+        // pinned to theirs, so the chip hides). The branch chip lives in the
+        // composer FOOTER row.
         // Right cluster: agent+model and traits — the composer appends
         // attach + send after this element (comet composer-actions.tsx
         // arrangement).
-        let left = div()
+        let new_chat = self.state.read(cx).selected_chat.is_none();
+        let space_label: Option<SharedString> = new_chat
+            .then(|| {
+                self.state
+                    .read(cx)
+                    .selected_space_row()
+                    .map(|s| SharedString::from(s.display_name().to_string()))
+            })
+            .flatten();
+        let mut left = div()
             .flex()
             .flex_row()
             .items_center()
             .min_w_0()
             .gap(px(4.0));
+        if let Some(label) = space_label {
+            let space_chip = self.trigger_chip(
+                PickerKind::Space,
+                label,
+                true,
+                Some((crate::icons::FOLDER, None)),
+                None,
+                &theme,
+                cx,
+            );
+            left = left.child(attach_overlay(
+                space_chip,
+                &mut overlay,
+                PickerKind::Space,
+                "space-popover",
+            ));
+        }
         // Model chip (brand icon + model name) beside a separate Traits chip
         // (t3code TraitsPicker arrangement): the trigger label is the joined
         // non-default summary ("High · 1M · Fast"), falling back to "Traits".
