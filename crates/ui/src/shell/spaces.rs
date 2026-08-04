@@ -159,8 +159,8 @@ impl Shell {
             .map(|menu| menu.search.read(cx).text().to_string())
             .unwrap_or_default();
         let state = self.state.read(cx);
-        let names: Vec<String> = state
-            .spaces
+        let spaces = state.spaces_sorted();
+        let names: Vec<String> = spaces
             .iter()
             .map(|s| s.display_name().to_string())
             .collect();
@@ -171,7 +171,7 @@ impl Shell {
         rows.extend(
             popover::filter_indices(&query, &names)
                 .into_iter()
-                .map(|ix| SpacesMenuRow::Space(state.spaces[ix].id.clone())),
+                .map(|ix| SpacesMenuRow::Space(spaces[ix].id.clone())),
         );
         rows.push(SpacesMenuRow::AddSpace);
         rows
