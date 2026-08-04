@@ -1482,7 +1482,6 @@ impl Pickers {
                                     .child(SharedString::from(format!("@ {device}"))),
                             )
                         })
-                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                     },
                 ))
                 .into_any_element()
@@ -2207,8 +2206,9 @@ impl Pickers {
         // keyboard-follow standard).
         let model_children: Vec<AnyElement> = match effective.map(|h| (h, self.models.get(&h))) {
             Some((_, Some(Loadable::Ready(models)))) => {
-                // The check mirrors the chip: the resolved concrete pick (draft
-                // / chat config / remembered, else the harness default row).
+                // The selected wash mirrors the chip: the resolved concrete
+                // pick (draft / chat config / remembered, else the harness
+                // default row).
                 let selected = self.selected_model(cx).map(|m| m.id.clone());
                 let active = self.active;
                 let models = models.clone();
