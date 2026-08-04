@@ -88,7 +88,7 @@ impl TitleGenerator {
             return Ok(()); // already named
         }
 
-        let generated = self.run_title_model(harness_id, prompt, cwd).await;
+        let generated = self.run_title_model(chat_id, harness_id, prompt, cwd).await;
         // Fallback so a chat is always named even if the model run produced nothing.
         let fallback: String = prompt
             .split_whitespace()
@@ -145,6 +145,7 @@ impl TitleGenerator {
     /// One-shot titling run: collect TextDeltas until Done; retries on failure.
     async fn run_title_model(
         &self,
+        chat_id: &str,
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
@@ -173,7 +174,7 @@ impl TitleGenerator {
                 attachments: Vec::new(),
                 resume: None,
             };
-            match collect_text(harness.as_ref(), request).await {
+            match collect_text(harness.as_ref(), chat_id, request).await {
                 Ok(raw) => {
                     let candidate = clean_title(&raw);
                     if !candidate.is_empty() {
@@ -224,6 +225,7 @@ fn clean_title(raw: &str) -> String {
 /// empty immediately (a titling prompt must never block on input).
 async fn collect_text(
     harness: &dyn comet_harness::Harness,
+    chat_id: &str,
     request: RunRequest,
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
@@ -235,6 +237,7 @@ async fn collect_text(
         }),
         steering: steer_rx,
         interrupt: CancellationToken::new(),
+        chat_id: chat_id.to_string(),
     };
     let mut stream = harness.run(request, controls).await?;
     let mut text = String::new();

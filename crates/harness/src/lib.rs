@@ -46,6 +46,12 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// The chat this run belongs to. Host-side only — `RunControls` is never
+    /// serialized, unlike [`RunRequest`], which the CRDT command ledger
+    /// persists verbatim. Harnesses use it to scope per-chat facilities they
+    /// hand the agent (the comet MCP server's `--chat`, whose terminal RPCs
+    /// are chat-scoped).
+    pub chat_id: String,
 }
 
 #[async_trait]

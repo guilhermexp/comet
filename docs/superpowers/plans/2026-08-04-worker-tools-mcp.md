@@ -34,15 +34,15 @@
 - Produces: `RunControls.chat_id: String`, populated by the executor at dispatch.
 - Consumes: nothing new. `RunRequest` is untouched.
 
-- [ ] **Step 1: Add the field and fix every construction site**
+- [x] **Step 1: Add the field and fix every construction site**
 
 Add `pub chat_id: String` to `RunControls` with a doc comment saying it is the chat the run belongs to, host-side only, never serialized. Compile and fix each site the compiler flags.
 
-- [ ] **Step 2: Populate it at dispatch**
+- [x] **Step 2: Populate it at dispatch**
 
 In `sessions.rs`, fill `chat_id` from the value `dispatch` already holds. Do not thread a new parameter through if the id is already in scope.
 
-- [ ] **Step 3: Prove it arrives through dispatch**
+- [x] **Step 3: Prove it arrives through dispatch**
 
 The test must cross the executor boundary — a test that builds `RunControls` by hand only proves the struct has a field. Drive `sessions.dispatch` for a known chat with a harness that records the `chat_id` it was handed, and assert it matches. `crates/engine/` is where this belongs, with the mock harness as the recorder.
 
@@ -50,7 +50,7 @@ Run: `cargo test -p comet-harness -p comet-engine`
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 `feat(harness): carry the chat id on RunControls`
 
