@@ -44,6 +44,11 @@ Every read is bounded and resumable. Each call takes an optional `timeoutMs` and
 stopped, including after a `wait_worker` that timed out. Output is a tail, not a \
 transcript — if you need the whole thing, redirect to a file inside the command.
 
+A worker has NO usable stdin: nothing can answer a prompt it writes, and there is no \
+tool to type into it, so an interactive command hangs until its timeout or until you \
+kill it. Make every command non-interactive — `--yes`, `-m '…'`, `--no-edit`, \
+`GIT_TERMINAL_PROMPT=0`, or `< /dev/null` — before you spawn it.
+
 Pass `cwd` with a fresh worktree (create one with the worktree tools) when the worker \
 writes code: two agents in one checkout is the failure that costs the most to unpick. \
 Pass `targetDevice` only at spawn; every later call for that worker is routed to the \
@@ -132,9 +137,12 @@ pub fn tool_definitions() -> Vec<Tool> {
                         "command",
                         prop(
                             "string",
-                            "Shell command line to run. It is written into a login shell, so \
-                             pipelines, redirection and `&&` all work. Redirect to a file when \
-                             the worker is chatty and you need the whole log.",
+                            "Shell command line to run. It is handed to `/bin/sh -c` as a \
+                             single argument, so pipelines, redirection, `&&` and background \
+                             jobs all work and a syntax error is the worker's own nonzero \
+                             exit. There is no stdin: make it non-interactive (`--yes`, \
+                             `-m '…'`, `< /dev/null`) or it will hang. Redirect to a file \
+                             when the worker is chatty and you need the whole log.",
                         ),
                     ),
                     (

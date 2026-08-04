@@ -166,30 +166,7 @@ impl<C: EngineClient> WorkerTools<C> {
             .open_terminal(&self.config.chat_id, target_device)
             .await?;
 
-        // One write, one line, and it must end the shell.
-        //
-        // `OpenTerminal` spawns the user's INTERACTIVE login shell, which
-        // returns to its prompt when a command finishes — and the engine only
-        // stamps `Exit` when the shell itself dies. Without the trailing
-        // `exit $?` a worker would never complete and `wait_worker` would
-        // always time out. `$?` is the command's status (or `cd`'s, when the
-        // `&&` short-circuits), so the exit code the agent reads is the
-        // worker's own.
-        //
-        // The cwd is shell-quoted: a worktree under `/Users/First Last/...` is
-        // ordinary, and an unquoted `cd` silently runs the worker in the wrong
-        // directory.
-        let line = match cwd {
-            Some(cwd) if !cwd.is_empty() => format!(
-                "export {DEPTH_ENV_VAR}={}; cd {} && {command}; exit $?\n",
-                self.config.depth + 1,
-                shell_quote(cwd)
-            ),
-            _ => format!(
-                "export {DEPTH_ENV_VAR}={}; {command}; exit $?\n",
-                self.config.depth + 1
-            ),
-        };
+        let line = worker_line(command, cwd, self.config.depth + 1);
         if let Err(err) = self
             .client
             .write_terminal(&worker_id, &line, target_device)
@@ -371,10 +348,47 @@ impl Drained {
     }
 }
 
-/// POSIX single-quoting: everything is literal inside `'…'`, and an embedded
-/// quote closes, escapes and reopens.
+/// Single-quoting that survives every shell the engine might have spawned:
+/// everything is literal inside `'…'`, and an embedded quote closes, escapes
+/// and reopens. `'\''` is read the same way by sh, bash, zsh, fish and csh.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// The one line written into a worker's PTY.
+///
+/// Three properties, and the shape is chosen for all three at once:
+///
+/// - **The interactive shell must parse nothing of `command`.** `OpenTerminal`
+///   runs `$SHELL` verbatim (`crates/engine/src/terminals.rs:109-123`), which
+///   may be fish or tcsh, where POSIX glue does not parse; and even in bash a
+///   trailing `&`, a dangling `\` or an unbalanced quote in `command` would
+///   break a line it was pasted into. So `command` travels as ONE quoted argv
+///   element to an explicit `/bin/sh`, and a malformed command is `sh`'s
+///   nonzero exit instead of a line the outer shell rejects.
+/// - **The PTY must die when the worker does.** The engine stamps
+///   [`TerminalEvent::Exit`] only when the pty child exits, and only EXITED
+///   sessions are reaped — a worker that returned the shell to its prompt would
+///   hold one of the device's 32 terminal slots forever. `exec` replaces the
+///   interactive shell, so the worker *is* the pty child and its status is the
+///   exit code the agent reads.
+/// - **`cd` must not read its operand as an option.** `cwd = "-P"` without the
+///   `--` would silently succeed into `$HOME` and run the worker in the wrong
+///   checkout, which is the isolation `cwd` exists to provide.
+///
+/// `exec` and a quoted simple command are all the outer shell ever sees; every
+/// POSIX construct lives inside the `/bin/sh` script. Workers therefore need a
+/// POSIX `/bin/sh`, which is every platform the engine's `cd`-based cwd
+/// handling already assumed.
+fn worker_line(command: &str, cwd: Option<&str>, worker_depth: usize) -> String {
+    let script = match cwd {
+        Some(cwd) if !cwd.is_empty() => format!(
+            "export {DEPTH_ENV_VAR}={worker_depth}; cd -- {} && {command}",
+            shell_quote(cwd)
+        ),
+        _ => format!("export {DEPTH_ENV_VAR}={worker_depth}; {command}"),
+    };
+    format!("exec /bin/sh -c {}\n", shell_quote(&script))
 }
 
 #[cfg(test)]
@@ -546,7 +560,7 @@ mod tests {
             calls.writes,
             [(
                 "term-1".to_string(),
-                "export COMET_WORKER_DEPTH=1; echo hi; exit $?\n".to_string(),
+                "exec /bin/sh -c 'export COMET_WORKER_DEPTH=1; echo hi'\n".to_string(),
                 None
             )]
         );
@@ -628,18 +642,41 @@ mod tests {
         let calls = tools.client.calls();
         assert_eq!(
             calls.writes[0].1,
-            "export COMET_WORKER_DEPTH=1; cd '/Users/First Last/wt' && cargo test; exit $?\n"
+            "exec /bin/sh -c 'export COMET_WORKER_DEPTH=1; \
+             cd -- '\\''/Users/First Last/wt'\\'' && cargo test'\n"
         );
+    }
+
+    #[test]
+    fn the_worker_line_hides_every_shell_construct_from_the_outer_shell() {
+        // A command full of glue that would break the line it was pasted into:
+        // a background `&`, an unbalanced quote, a trailing backslash.
+        let line = worker_line("npm run dev & echo 'x \\", None, 1);
+        let (prefix, rest) = line.split_once(" -c ").expect("an argv-shaped line");
+        assert_eq!(prefix, "exec /bin/sh");
+        // Everything after `-c` is ONE single-quoted element, so the
+        // interactive shell parses none of it: every `'` inside is escaped.
+        let body = rest.trim_end_matches('\n');
+        assert!(body.starts_with('\'') && body.ends_with('\''), "{body}");
+        assert!(
+            !body[1..body.len() - 1].contains("'") || body.contains(r"'\''"),
+            "embedded quotes must be escaped, not left bare: {body}"
+        );
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn the_worker_line_ends_cd_option_parsing() {
+        // `cd -P` would succeed into $HOME and run the worker in the wrong
+        // checkout while still looking like a success.
+        let line = worker_line("pwd", Some("-P"), 1);
+        assert!(line.contains(r"cd -- '\''-P'\''"), "{line}");
     }
 
     #[tokio::test]
     async fn spawn_past_max_depth_is_refused() {
-        // The ceiling is this server's own configuration. `WorkerTools` reads no
-        // environment at all, so a worker that rewrites `COMET_WORKER_DEPTH` in
-        // its shell changes nothing here.
-        let stub = Stub::new();
         let tools = WorkerTools::new(
-            stub,
+            Stub::new(),
             WorkerConfig {
                 chat_id: "chat-1".into(),
                 depth: 2,

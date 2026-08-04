@@ -96,10 +96,7 @@ async fn a_worker_runs_to_a_nonzero_exit_code() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_killed_worker_is_gone_rather_than_finished() {
     let (_tmp, core, tools) = engine_with_chat().await;
-    let worker = tools
-        .spawn("sh -c 'sleep 30'", None, None)
-        .await
-        .expect("spawn");
+    let worker = tools.spawn("sleep 30", None, None).await.expect("spawn");
 
     // Still running when the wait's deadline arrives — the bound is what makes
     // "check on it without committing the turn" real.
@@ -122,70 +119,142 @@ async fn a_killed_worker_is_gone_rather_than_finished() {
     core.shutdown().await;
 }
 
+/// Read forward from `cursor` until `needle` shows up, accumulating everything
+/// seen. Returns the accumulated output and the cursor to resume from — the
+/// same `nextSeq` chaining an agent would do, so the continuity assertions
+/// below are about the cursor and not about how long a call happened to take.
+async fn read_until(
+    tools: &WorkerTools<RpcEngineClient>,
+    worker_id: &str,
+    mut cursor: u64,
+    needle: &str,
+) -> (String, u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    loop {
+        let read = tools
+            .read(worker_id, Some(cursor), Some(200))
+            .await
+            .expect("read");
+        cursor = read.next_seq;
+        seen.push_str(&read.output);
+        if seen.contains(needle) {
+            return (seen, cursor);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw {needle:?}; got {seen:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_wait_yields_the_rest_exactly_once() {
-    let (_tmp, core, tools) = engine_with_chat().await;
+    let (tmp, core, tools) = engine_with_chat().await;
+    // The worker blocks on a gate file this test creates, so "b2 has not
+    // printed yet" is caused by the test rather than raced against a sleep.
+    let gate = tmp.path().join("gate");
     let worker = tools
         .spawn(
-            "sh -c 'echo a$((0+1)); sleep 1; echo b$((1+1))'",
+            &format!(
+                "echo a$((0+1)); while [ ! -f {} ]; do sleep 0.05; done; echo b$((1+1))",
+                gate.display()
+            ),
             None,
             None,
         )
         .await
         .expect("spawn");
 
-    // Short enough to land between the two prints.
-    let first = tools
-        .wait(&worker.worker_id, None, Some(400))
-        .await
-        .expect("first wait");
-    assert!(first.running, "the sleep is still ahead: {first:?}");
+    let (before, cursor) = read_until(&tools, &worker.worker_id, 0, "a1").await;
     assert!(
-        first.output.contains("a1"),
-        "first output was {:?}",
-        first.output
+        !before.contains("b2"),
+        "the gate is still closed, so b2 cannot have printed: {before:?}"
     );
-    assert!(
-        !first.output.contains("b2"),
-        "b2 cannot have printed yet: {:?}",
-        first.output
-    );
+    assert!(cursor > 0, "the cursor advanced over what was delivered");
+
+    std::fs::write(&gate, b"go").expect("open the gate");
 
     let resumed = tools
-        .wait(&worker.worker_id, Some(first.next_seq), Some(30_000))
+        .wait(&worker.worker_id, Some(cursor), Some(30_000))
         .await
         .expect("resumed wait");
     assert!(!resumed.running, "the worker exited: {resumed:?}");
     assert_eq!(resumed.exit_code, Some(0));
-    // No hole where b2 was, and no duplicate of a1.
+    // No hole where b2 was...
     assert!(
         resumed.output.contains("b2"),
         "resumed output was {:?}",
         resumed.output
     );
+    // ...and no duplicate of what the cursor already covered.
     assert!(
         !resumed.output.contains("a1"),
-        "a1 was already delivered: {:?}",
+        "a1 was already delivered before {cursor}: {:?}",
         resumed.output
     );
     core.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_command_exits_instead_of_hanging() {
+    let (_tmp, core, tools) = engine_with_chat().await;
+
+    // Real syntax errors. Pasted into a shell line these would be rejected by
+    // the INTERACTIVE shell, which then sits at its prompt forever holding one
+    // of the device's 32 terminal slots. Quoted whole into `sh -c` they are the
+    // inner shell's problem: it exits nonzero and the PTY dies with it.
+    for command in ["echo a &&", "echo 'unterminated", "if true; then"] {
+        let worker = tools.spawn(command, None, None).await.expect("spawn");
+        let waited = tools
+            .wait(&worker.worker_id, None, Some(30_000))
+            .await
+            .unwrap_or_else(|err| panic!("wait for {command:?}: {err}"));
+        assert!(
+            !waited.running,
+            "{command:?} must terminate, not hang: {waited:?}"
+        );
+        assert!(
+            matches!(waited.exit_code, Some(code) if code != 0),
+            "{command:?} must report a failure: {waited:?}"
+        );
+    }
+
+    // Valid but awkward glue — a bare `&`, a trailing backslash. These are the
+    // shapes that used to be concatenated into `…; exit $?` and turn the whole
+    // written line into a syntax error; now they just run.
+    for command in ["echo a &", "echo a \\", "echo bg$((3+4)) & wait"] {
+        let worker = tools.spawn(command, None, None).await.expect("spawn");
+        let waited = tools
+            .wait(&worker.worker_id, None, Some(30_000))
+            .await
+            .unwrap_or_else(|err| panic!("wait for {command:?}: {err}"));
+        assert!(
+            !waited.running,
+            "{command:?} must terminate, not hang: {waited:?}"
+        );
+        assert_eq!(
+            waited.exit_code,
+            Some(0),
+            "{command:?} is valid: {:?}",
+            waited.output
+        );
+    }
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_runs_in_the_cwd_it_was_given() {
     let (tmp, core, tools) = engine_with_chat().await;
-    // A path with a space: an unquoted `cd` would silently run in the wrong
-    // directory, and the worker would still look like it succeeded.
-    let worktree = tmp.path().join("Work Tree");
+    // A space AND a quote: an unquoted `cd` would silently run in the wrong
+    // directory and the worker would still look like it succeeded, and a
+    // naive quoting scheme would break the line outright.
+    let worktree = tmp.path().join("Work 'Tree'");
     std::fs::create_dir_all(&worktree).expect("worktree dir");
     std::fs::write(worktree.join("marker.txt"), b"m4rk3r\n").expect("marker");
 
     let worker = tools
-        .spawn(
-            "sh -c 'cat marker.txt; exit 0'",
-            Some(&worktree.to_string_lossy()),
-            None,
-        )
+        .spawn("cat marker.txt", Some(&worktree.to_string_lossy()), None)
         .await
         .expect("spawn");
     let waited = tools

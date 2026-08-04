@@ -77,7 +77,13 @@ Codex takes the same shape through `-c mcp_servers.comet.command=…` and `-c mc
 
 ## Working directory
 
-`OpenTerminal` derives cwd from the chat and takes no cwd parameter, so `spawn_worker` with a `cwd` writes `cd <path> && <command>` as the first line into the PTY. That keeps the RPC schema untouched. Giving `OpenTerminal` an explicit cwd is the cleaner shape and can come later if the shell prefix proves fragile.
+`OpenTerminal` derives cwd from the chat and takes no cwd parameter, so `spawn_worker` reaches the requested directory with a `cd` inside the command it writes. That keeps the RPC schema untouched. Giving `OpenTerminal` an explicit cwd is the cleaner shape and can come later.
+
+The line written into the PTY is `exec /bin/sh -c '<script>'`, with the script single-quoted whole and `<script>` = `export COMET_WORKER_DEPTH=<n>; cd -- <quoted cwd> && <command>`. Three separate hazards force that shape and none of them is hypothetical. The PTY runs `$SHELL` verbatim (`terminals.rs:109-123`), which may be fish or tcsh where POSIX glue does not parse; the `command` is agent-composed, so a trailing `&`, a dangling backslash or an unbalanced quote would break any line it was pasted into, even under bash; and a `cwd` of `-P` without the `--` would be read by `cd` as an option, succeed into `$HOME`, and run the worker in the wrong checkout while looking like success. Quoting the whole script into one argv element means the interactive shell parses only `exec /bin/sh -c '…'`, and a malformed command becomes the inner `sh`'s nonzero exit instead of a shell sitting at its prompt.
+
+`exec` is what makes the worker terminate. The engine stamps `TerminalEvent::Exit` when the pty child exits, and only EXITED sessions are reaped — an interactive shell that returned to its prompt would hold one of the device's 32 terminal slots forever. `exec` replaces that shell, so the worker *is* the pty child and its status is the exit code `wait_worker` returns.
+
+A worker has no usable stdin: nothing answers a prompt it writes, and there is no `write_worker`. An interactive command blocks until its timeout or a `kill_worker`, so the server's `instructions` tell the agent to make every command non-interactive.
 
 The `cwd` parameter is how a worker gets an isolated worktree: the agent calls the existing `CreateWorktree` and passes the resulting path. Two agents writing the same checkout is the failure this avoids, and it stays the agent's decision rather than a hidden default.
 
