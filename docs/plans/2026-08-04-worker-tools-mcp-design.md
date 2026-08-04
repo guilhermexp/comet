@@ -91,9 +91,11 @@ The `cwd` parameter is how a worker gets an isolated worktree: the agent calls t
 
 A worker is a plain process in a PTY and inherits no `--mcp-config`, so by default it has no worker tools. That is a default, not a guard: the agent composes the command string, so nothing stops it from writing its own `--mcp-config` and handing the tools to a child.
 
-The enforcement therefore lives where it cannot be bypassed by the command string — in the server, before the spawn. `comet mcp-server` is launched with its own `--depth` (0 for the session the harness starts) and refuses `spawn_worker` past a maximum, returning a tool error the agent can read. A server that hands its config to a child must launch it at `depth + 1`; a child launched with a forged lower depth still hits its own ceiling, because each server checks its own.
+`comet mcp-server` is launched with a `--depth` (0 for the session the harness starts) and refuses `spawn_worker` at a maximum, returning a tool error the agent can read. On its own that is worthless, because the command string is exactly what a recursing agent controls — it would simply write `--depth 0` for its child. So argv is not trusted: every spawn exports `COMET_WORKER_DEPTH=depth + 1` into the worker's PTY, and a server reads that variable **out of its own process environment** at startup and takes it as a *floor* under its `--depth`. A server launched from inside a worker therefore inherits the worker's depth no matter what argv claims, and the chain terminates.
 
-The PTY also carries `COMET_WORKER_DEPTH` for observability. That is a signal, not the check — an environment variable is mutable by whatever runs in the shell, so it can never be the thing that stops recursion.
+**This stops accidental recursion, not a determined agent.** The floor is an environment variable, and a command string can strip it — `env -u COMET_WORKER_DEPTH comet mcp-server --depth 0 …` defeats it completely, as does any command that unsets it before launching. There is no way to close that hole from the server, because everything the check can read is downstream of a string the agent wrote.
+
+The bound that actually holds is the engine's, and it is the reason this design adds no quota of its own: `MAX_TERMINALS` caps a device at 32 open terminals (`terminals.rs:30`), shared with the terminals the user opens by hand. A runaway recursion exhausts that and gets `Too many open terminals` — a bad afternoon for the Terminal pane, not an unbounded fork bomb. The depth floor exists to keep an ordinary agent from getting there by accident.
 
 ## Scope
 

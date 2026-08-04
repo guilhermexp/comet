@@ -47,9 +47,15 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 /// How deep a chain of servers-handing-tools-to-workers may go.
 pub const DEFAULT_MAX_WORKER_DEPTH: usize = 2;
 
-/// The PTY-visible depth marker. Observability only: whatever runs in the shell
-/// can rewrite it, so it can never be the thing that stops recursion — that
-/// check is [`WorkerConfig::max_depth`], which no command string can reach.
+/// The depth marker exported into every worker's PTY, and read back out of
+/// this process's own environment as a floor on [`WorkerConfig::depth`].
+///
+/// It stops **accidental** recursion, not a determined agent: a worker composes
+/// its own command string, so it can launch `comet mcp-server --depth 0` with a
+/// forged argv — the floor catches that, because the value was inherited rather
+/// than passed. It can also `env -u COMET_WORKER_DEPTH …`, which the floor
+/// cannot catch. The only bound nothing in the shell can lift is the engine's
+/// own `MAX_TERMINALS` (32 per device).
 pub const DEPTH_ENV_VAR: &str = "COMET_WORKER_DEPTH";
 
 /// How this server was launched.
@@ -57,20 +63,42 @@ pub const DEPTH_ENV_VAR: &str = "COMET_WORKER_DEPTH";
 pub struct WorkerConfig {
     /// The chat every worker is opened under; `OpenTerminal` is chat-scoped.
     pub chat_id: String,
-    /// This server's own depth — 0 for the session the harness starts.
+    /// This server's effective depth — 0 for the session the harness starts,
+    /// never below what [`DEPTH_ENV_VAR`] said when the process began.
     pub depth: usize,
     /// The depth at which `spawn` is refused.
     pub max_depth: usize,
 }
 
 impl WorkerConfig {
+    /// `depth` is the argv value; the inherited [`DEPTH_ENV_VAR`] is a floor
+    /// under it, so a server launched from inside a worker cannot claim to be
+    /// shallower than the worker that launched it.
     pub fn new(chat_id: impl Into<String>, depth: usize) -> Self {
+        Self::with_inherited(chat_id, depth, inherited_depth())
+    }
+
+    /// [`Self::new`] with the inherited depth supplied rather than read from the
+    /// environment — the seam the depth tests drive, since mutating the
+    /// process environment from a test is both unsafe and racy.
+    pub fn with_inherited(chat_id: impl Into<String>, depth: usize, inherited: usize) -> Self {
         Self {
             chat_id: chat_id.into(),
-            depth,
+            depth: depth.max(inherited),
             max_depth: DEFAULT_MAX_WORKER_DEPTH,
         }
     }
+}
+
+/// The depth this process inherited from the PTY it was launched in, if any.
+fn inherited_depth() -> usize {
+    parse_depth(std::env::var(DEPTH_ENV_VAR).ok().as_deref())
+}
+
+/// Anything unparseable reads as 0: a mangled marker must not lock a legitimate
+/// session out of spawning, only a well-formed one may raise the floor.
+fn parse_depth(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse().ok()).unwrap_or(0)
 }
 
 /// `spawn_worker`'s reply.
@@ -543,8 +571,10 @@ mod tests {
         }
     }
 
+    /// Inherited depth pinned to 0: the tests must not change behaviour when
+    /// the suite itself happens to run inside a comet worker.
     fn tools(stub: Stub) -> WorkerTools<Stub> {
-        WorkerTools::new(stub, WorkerConfig::new("chat-1", 0))
+        WorkerTools::new(stub, WorkerConfig::with_inherited("chat-1", 0, 0))
     }
 
     // ---- spawn ------------------------------------------------------------
@@ -690,6 +720,54 @@ mod tests {
         assert!(matches!(err, ToolError::Refused(_)), "got {err:?}");
         // Refused before the spawn, not cleaned up after it.
         assert!(tools.client.calls().opened.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inherited_depth_floors_a_forged_argv_depth() {
+        // A worker composes its own command string, so it can launch
+        // `comet mcp-server --depth 0` from inside its own PTY. The depth it
+        // INHERITED is what counts, precisely because argv is the thing it
+        // controls.
+        let tools = WorkerTools::new(
+            Stub::new(),
+            WorkerConfig::with_inherited("chat-1", 0, DEFAULT_MAX_WORKER_DEPTH),
+        );
+        assert_eq!(tools.config().depth, DEFAULT_MAX_WORKER_DEPTH);
+        let err = tools
+            .spawn("echo hi", None, None)
+            .await
+            .expect_err("the inherited depth is at the ceiling");
+        assert!(matches!(err, ToolError::Refused(_)), "got {err:?}");
+        assert!(tools.client.calls().opened.is_empty());
+    }
+
+    #[test]
+    fn the_inherited_depth_is_a_floor_and_never_a_ceiling() {
+        // Deeper argv than the environment: the argv value wins, so an honest
+        // caller can still declare itself deeper than it was launched.
+        assert_eq!(WorkerConfig::with_inherited("c", 3, 1).depth, 3);
+        assert_eq!(WorkerConfig::with_inherited("c", 0, 1).depth, 1);
+        // A mangled marker must not lock a legitimate session out of spawning.
+        assert_eq!(parse_depth(None), 0);
+        assert_eq!(parse_depth(Some("")), 0);
+        assert_eq!(parse_depth(Some("nonsense")), 0);
+        assert_eq!(parse_depth(Some("-1")), 0);
+        assert_eq!(parse_depth(Some(" 2 ")), 2);
+    }
+
+    #[tokio::test]
+    async fn a_spawned_worker_carries_the_next_depth_in_its_pty() {
+        // The PTY marker is what the floor above reads back, so the chain only
+        // terminates if each spawn exports one more than its own depth.
+        let tools = WorkerTools::new(Stub::new(), WorkerConfig::with_inherited("chat-1", 0, 1));
+        tools.spawn("echo hi", None, None).await.expect("spawn");
+        assert!(
+            tools.client.calls().writes[0]
+                .1
+                .contains("COMET_WORKER_DEPTH=2"),
+            "{:?}",
+            tools.client.calls().writes[0].1
+        );
     }
 
     // ---- read -------------------------------------------------------------
