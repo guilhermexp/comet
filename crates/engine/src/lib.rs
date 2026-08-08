@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use comet_proto::HarnessId;
+pub use comet_proto::{HarnessId, WorkspaceScope};
 
 use comet_sync::DocsStore;
 
@@ -18,6 +18,7 @@ pub mod diff_sync;
 pub mod chat2_host;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod profile;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -37,6 +38,7 @@ pub use diff_sync::{
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
+pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -108,6 +110,7 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -132,7 +135,8 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let org_id = env_or("COMET_ORG_ID", DEFAULT_ORG_ID);
         let user_id = env_or("COMET_USER_ID", DEFAULT_USER_ID);
-        Self::assemble_with_identity(data_dir, registry, default_harness, edge, &org_id, &user_id)
+        let profile = EngineProfile::development(data_dir, &org_id, &user_id);
+        Self::assemble_with_profile(profile, registry, default_harness, edge)
     }
 
     pub fn assemble_with_identity(
@@ -143,6 +147,18 @@ impl EngineCore {
         org_id: &str,
         user_id: &str,
     ) -> Result<Self, EngineError> {
+        let profile = EngineProfile::synced(data_dir, org_id, user_id);
+        Self::assemble_with_profile(profile, registry, default_harness, edge)
+    }
+
+    /// Assemble the engine against one resolved, immutable workspace profile.
+    pub fn assemble_with_profile(
+        profile: EngineProfile,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+    ) -> Result<Self, EngineError> {
+        let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
         // SQLite snapshots + journals. Taken before any store opens or the IPC
@@ -152,15 +168,9 @@ impl EngineCore {
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
-        // Identity-scoped storage: snapshots, the command ledger, and run
-        // journals live under `orgs/{orgId}/{userId}/` so switching accounts or
-        // orgs on one machine never reuses another identity's cached docs.
-        let org_dir = data_dir
-            .join("orgs")
-            .join(sanitize_path_id(org_id))
-            .join(sanitize_path_id(user_id));
-        let store = Arc::new(DocsStore::open(&org_dir)?);
-        let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
+        let journal_root = profile.store_root().join("journals");
+        let store = Arc::new(DocsStore::open(profile.store_root())?);
+        let journal = Arc::new(RunJournal::open(journal_root.clone())?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         let doc_host = DocHost::new(
             store.clone(),
@@ -176,8 +186,8 @@ impl EngineCore {
                 device_id: device_id.clone(),
                 device_name: local_device_name(),
                 platform: std::env::consts::OS.to_string(),
-                org_id: org_id.to_string(),
-                user_id: user_id.to_string(),
+                org_id: profile.org_id().to_string(),
+                user_id: profile.user_id().to_string(),
                 edge: edge.clone(),
             },
         )?;
@@ -189,10 +199,10 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
-        doc_host.spawn_transcript_salvage(org_dir.join("journals"));
+        doc_host.spawn_transcript_salvage(journal_root);
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
-        let uploads = Uploads::new(data_dir, edge.clone());
+        let uploads = Uploads::from_root(profile.uploads_root(), edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
@@ -218,11 +228,16 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
+    }
+
+    pub fn workspace_scope(&self) -> WorkspaceScope {
+        self.workspace_scope
     }
 
     /// Attach the auth service (before building the RPC service / relays).
@@ -367,6 +382,10 @@ pub struct EngineRuntime {
 impl EngineRuntime {
     pub fn core(&self) -> &EngineCore {
         &self.core
+    }
+
+    pub fn workspace_scope(&self) -> WorkspaceScope {
+        self.core.workspace_scope()
     }
 
     pub async fn shutdown(&self) {
@@ -725,19 +744,6 @@ fn env_or(key: &str, default: &str) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.to_string())
-}
-
-/// Filesystem-safe form of an org/user id (path segments for `orgs/{org}/{user}/`).
-fn sanitize_path_id(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
