@@ -1273,6 +1273,7 @@ version = "0.1.61"
 dependencies = [
  "anyhow",
  "async-trait",
+ "comet-doc",
  "comet-proto",
  "comet-sync",
  "futures",

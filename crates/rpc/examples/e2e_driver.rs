@@ -54,7 +54,7 @@ async fn wait_stream<T>(
     method: &str,
     params: serde_json::Value,
     what: &str,
-    predicate: impl Fn(&serde_json::Value) -> Option<T>,
+    mut predicate: impl FnMut(&serde_json::Value) -> Option<T>,
 ) -> T {
     let deadline = Instant::now() + STEP_TIMEOUT;
     'resubscribe: loop {
@@ -94,6 +94,15 @@ async fn wait_stream<T>(
             }
         }
     }
+}
+
+fn apply_transcript_item(
+    current: &mut Vec<comet_doc::SessionMessageEntry>,
+    item: &serde_json::Value,
+) -> Result<(), String> {
+    let frame: comet_doc::TranscriptFrame =
+        serde_json::from_value(item.clone()).map_err(|err| err.to_string())?;
+    comet_doc::apply_transcript_frame(current, frame).map_err(|err| err.to_string())
 }
 
 #[tokio::main]
@@ -227,30 +236,24 @@ async fn main() {
     pass("run command queued on B via the doc command queue");
 
     // 5a. Assistant entry executed by A arrives back on B, complete, with the
-    // mock text. WatchDocMessages speaks the framed protocol: a full `reset`
-    // list on attach, then `upsert`/`append` deltas (each wrapping an
-    // `entry`) — collect candidates from both shapes.
+    // mock text. Materialize the framed reset/upsert/append protocol before
+    // looking for the completed entry.
+    let mut transcript = Vec::new();
     let (by_device, text) = wait_stream(
         &b,
         methods::WATCH_DOC_MESSAGES,
         serde_json::json!({ "chatId": chat_id }),
         "assistant transcript on B",
         |item| {
-            let mut candidates: Vec<&serde_json::Value> = Vec::new();
-            if let Some(reset) = item.get("reset").and_then(|v| v.as_array()) {
-                candidates.extend(reset.iter());
-            }
-            for key in ["upsert", "append"] {
-                if let Some(deltas) = item.get(key).and_then(|v| v.as_array()) {
-                    candidates.extend(deltas.iter().filter_map(|d| d.get("entry")));
-                }
-            }
-            let entry = candidates.into_iter().find(|entry| {
-                entry.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                    && entry.get("status").and_then(|v| v.as_str()) == Some("complete")
+            apply_transcript_item(&mut transcript, item)
+                .unwrap_or_else(|err| fail(&format!("assistant transcript on B: {err}")));
+            let entry = transcript.iter().find(|entry| {
+                entry.role == comet_doc::MessageRole::Assistant
+                    && entry.status == Some(comet_doc::MessageStatus::Complete)
             })?;
-            let device = entry.get("deviceId")?.as_str()?.to_string();
-            let text = entry.to_string();
+            let device = entry.device_id.clone();
+            let text = serde_json::to_string(entry)
+                .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
             Some((device, text))
         },
     )
@@ -286,4 +289,35 @@ async fn main() {
     pass("session status (A working -> idle) round-tripped to B");
 
     println!("PASS: two-device e2e smoke complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_reset_frame_is_materialized() {
+        let mut transcript = Vec::new();
+        apply_transcript_item(
+            &mut transcript,
+            &serde_json::json!({
+                "reset": [{
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "parts": [{ "kind": "text", "id": "t0", "text": MOCK_TEXT }],
+                    "createdAt": 1,
+                    "deviceId": "device-a",
+                    "status": "complete"
+                }]
+            }),
+        )
+        .expect("reset frame");
+
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].device_id, "device-a");
+        assert_eq!(
+            transcript[0].status,
+            Some(comet_doc::MessageStatus::Complete)
+        );
+    }
 }
