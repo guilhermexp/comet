@@ -64,17 +64,39 @@ impl Shell {
     /// animated left inset, terminal and utility-panel controls).
     pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let (title, harness, on_canvas): (SharedString, Option<comet_proto::HarnessId>, bool) = {
+        // The canvas titles as NOTHING (user request — a "New session"
+        // header over the empty canvas was noise); the bar keeps its height,
+        // drag region, and buttons. A session appends its target as a muted
+        // "/project @ device" tag right of the title (the composer footer no
+        // longer carries it).
+        let (title, target, harness, on_canvas): (
+            SharedString,
+            Option<SharedString>,
+            Option<comet_proto::HarnessId>,
+            bool,
+        ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
-                Some(chat) => (
-                    SharedString::from(transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )),
-                    chat.config.as_ref().map(|c| c.harness),
-                    false,
-                ),
-                None => (SharedString::from("New session"), None, true),
+                Some(chat) => {
+                    let folder = chat
+                        .space_id
+                        .as_deref()
+                        .and_then(|id| state.space_row(id))
+                        .map(|s| s.display_name().to_string())
+                        .unwrap_or_else(|| "~".to_string());
+                    let device = state
+                        .device_name(&chat.device_id)
+                        .unwrap_or("Unknown device");
+                    (
+                        SharedString::from(transcript::single_line(
+                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        )),
+                        Some(SharedString::from(format!("/{folder} @ {device}"))),
+                        chat.config.as_ref().map(|c| c.harness),
+                        false,
+                    )
+                }
+                None => (SharedString::from(""), None, None, true),
             }
         };
         let has_space = !self.state.read(cx).spaces.is_empty();
@@ -136,12 +158,22 @@ impl Shell {
                                 theme.text.opacity(0.85)
                             })
                             .child(title),
-                    ),
+                    )
+                    .when_some(target, |el, target| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted.opacity(0.5))
+                                .child(target),
+                        )
+                    }),
             )
             .child(div().flex_1())
             // Stable utility controls at the right edge of the conversation
-            // titlebar; the active wash mirrors the adjacent full-height pane.
-            .when(has_space, |el| {
+            // titlebar; hidden on the new-session canvas because neither
+            // terminal nor changes has a session target there.
+            .when(has_space && !on_canvas, |el| {
                 el.child(header_icon_button(
                     "toggle-terminal",
                     icons::TERMINAL,
@@ -150,7 +182,7 @@ impl Shell {
                     cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                 ))
             })
-            .when(has_space, |el| {
+            .when(has_space && !on_canvas, |el| {
                 el.child(
                     div()
                         .relative()
