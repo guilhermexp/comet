@@ -2852,7 +2852,7 @@ impl Shell {
 
         let (user_line, trigger_subline, menu_identity): (
             SharedString,
-            SharedString,
+            Option<SharedString>,
             SharedString,
         ) = match workspace_scope {
             Some(WorkspaceScope::Local) => {
@@ -2861,15 +2861,11 @@ impl Shell {
                 } else {
                     "Local only"
                 };
-                (
-                    line.into(),
-                    "Stored on this device".into(),
-                    "Stored on this device".into(),
-                )
+                (line.into(), None, "Stored on this device".into())
             }
             Some(WorkspaceScope::Development) => (
                 "Development".into(),
-                "Local development runtime".into(),
+                Some("Local development runtime".into()),
                 "Authentication disabled".into(),
             ),
             Some(WorkspaceScope::Synced) | None => {
@@ -2881,7 +2877,7 @@ impl Shell {
                     .as_ref()
                     .map(|u| SharedString::from(u.email.clone()))
                     .unwrap_or_else(|| line.clone());
-                (line, "Alpha".into(), email)
+                (line, Some("Alpha".into()), email)
             }
         };
         let user_menu =
@@ -3130,7 +3126,7 @@ impl Shell {
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
-        trigger_subline: SharedString,
+        trigger_subline: Option<SharedString>,
         menu_identity: SharedString,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -3199,7 +3195,7 @@ impl Shell {
                     .child(initial),
             )
             .child(
-                // Name with the plan label underneath — no chip on the right.
+                // Name with an optional status line underneath — no chip on the right.
                 div()
                     .flex_1()
                     .min_w_0()
@@ -3214,13 +3210,15 @@ impl Shell {
                             .truncate()
                             .child(user_line.clone()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(15.0))
-                            .text_color(theme.text_muted)
-                            .child(trigger_subline),
-                    ),
+                    .when_some(trigger_subline, |identity, subline| {
+                        identity.child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(15.0))
+                                .text_color(theme.text_muted)
+                                .child(subline),
+                        )
+                    }),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
