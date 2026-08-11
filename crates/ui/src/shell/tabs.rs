@@ -117,6 +117,60 @@ impl Shell {
             (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
         let launcher_menu = (has_space && active_utility.is_none() && self.utility_add_menu_open)
             .then(|| self.render_utility_menu(true, cx));
+
+        // Trailing titlebar section. With the changes pane open this is the
+        // PANE'S HEADER — a strip exactly as wide as the pane carrying its
+        // controls (scope dropdown, ref selector, fold-all from the Changes
+        // entity; expand + close shell-side). It lives up here because the
+        // titlebar overlay owns this band's hit-testing: controls mounted in
+        // the pane itself would sit under the drag region and never see a
+        // click. Hidden on the new-session canvas — nothing to diff yet.
+        let changes_active = active_utility == Some(UtilityPane::Changes);
+        let takeover = changes_active && self.right_pane_expanded;
+        let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
+            let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
+            let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
+            // The row's own left padding is part of its content box: a strip
+            // wider than what's left after it overflows and clips at the right
+            // edge (flex_none never shrinks) — cap to the available width.
+            let avail = self.viewport_width - content_left - pr;
+            let controls = self
+                .changes_pane(cx)
+                .update(cx, |changes, cx| changes.render_header_controls(cx));
+            Some(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .overflow_hidden()
+                    // Right edge already sits at viewport − pr (the row's own
+                    // padding), so this width starts the strip exactly at the
+                    // pane's left border — and rides the open/close tween.
+                    .w(px((right_now - pr).min(avail).max(0.0)))
+                    .pl(px(Theme::SPACE_MD))
+                    .child(div().flex_1().min_w_0().h_full().child(controls))
+                    .child(header_icon_button(
+                        "expand-changes",
+                        icons::EXPAND_ARROWS,
+                        takeover,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                    ))
+                    .child(header_icon_button(
+                        "toggle-changes",
+                        icons::SIDEBAR_MINIMALISTIC,
+                        true,
+                        &theme,
+                        cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         let inner = div()
             .size_full()
             .flex()
@@ -128,7 +182,10 @@ impl Shell {
                 cfg!(target_os = "windows"),
                 Theme::SPACE_LG,
             )))
-            .child(
+            // In panel takeover the header strip spans the whole band — the
+            // title would sit UNDER it (both flex_none, the row overflows and
+            // paint order stacks them), so it hides for the duration.
+            .when(!takeover, |el| el.child(
                 div()
                     .min_w_0()
                     .flex()
@@ -168,12 +225,14 @@ impl Shell {
                                 .child(target),
                         )
                     }),
-            )
+            ))
             .child(div().flex_1())
+            .children(changes_trailing)
             // Stable utility controls at the right edge of the conversation
             // titlebar; hidden on the new-session canvas because neither
-            // terminal nor changes has a session target there.
-            .when(has_space && !on_canvas, |el| {
+            // terminal nor changes has a session target there. Changes owns
+            // the full trailing strip while active.
+            .when(!changes_active && has_space && !on_canvas, |el| {
                 el.child(header_icon_button(
                     "toggle-terminal",
                     icons::TERMINAL,
@@ -182,7 +241,7 @@ impl Shell {
                     cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                 ))
             })
-            .when(has_space && !on_canvas, |el| {
+            .when(!changes_active && has_space && !on_canvas, |el| {
                 el.child(
                     div()
                         .relative()
