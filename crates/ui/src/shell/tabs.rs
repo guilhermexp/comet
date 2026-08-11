@@ -127,13 +127,18 @@ impl Shell {
         // click. Hidden on the new-session canvas — nothing to diff yet.
         let changes_active = active_utility == Some(UtilityPane::Changes);
         let takeover = changes_active && self.right_pane_expanded;
+        // In takeover the title hides and the strip owns the whole band, so
+        // the row's left inset pulls back to the sidebar seam — the title
+        // inset would push the scope dropdown off the pane's own left gutter
+        // (user report: misaligned dead space).
+        let row_left = if takeover { sidebar_now } else { content_left };
         let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
             let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
             // edge (flex_none never shrinks) — cap to the available width.
-            let avail = self.viewport_width - content_left - pr;
+            let avail = self.viewport_width - row_left - pr;
             let controls = self
                 .changes_pane(cx)
                 .update(cx, |changes, cx| changes.render_header_controls(cx));
@@ -150,7 +155,10 @@ impl Shell {
                     // padding), so this width starts the strip exactly at the
                     // pane's left border — and rides the open/close tween.
                     .w(px((right_now - pr).min(avail).max(0.0)))
-                    .pl(px(Theme::SPACE_MD))
+                    // 8 + the trigger's own 8px pad = the pane's 16px text
+                    // gutter, so the scope label sits flush over the stats
+                    // strip below.
+                    .pl(px(8.0))
                     .child(div().flex_1().min_w_0().h_full().child(controls))
                     .child(header_icon_button(
                         "expand-changes",
@@ -177,7 +185,7 @@ impl Shell {
             .items_center()
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
-            .pl(px(content_left))
+            .pl(px(row_left))
             .pr(px(titlebar_right_padding(
                 cfg!(target_os = "windows"),
                 Theme::SPACE_LG,

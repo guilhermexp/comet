@@ -3779,9 +3779,13 @@ impl Shell {
             .relative()
             .flex()
             .flex_col()
+            // In takeover the panel's left edge IS the sidebar seam, which
+            // already carries the sidebar tone's right hairline — a second
+            // border there doubled up (user report).
+            .when(!self.right_pane_expanded, |el| {
+                el.border_l_1().border_color(theme.border)
+            })
             .bg(panel_bg)
-            .border_l_1()
-            .border_color(theme.border)
             .overflow_hidden()
             // The titlebar is a glass overlay over the full-height content
             // row; utility chrome starts below it.
