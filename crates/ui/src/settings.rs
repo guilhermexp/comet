@@ -25,9 +25,9 @@ pub const SIDEBAR_MIN: f32 = 208.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
-/// Shared right utility pane drag-resize bounds (px).
+/// Shared right utility pane drag-resize floor and default (px). Its runtime
+/// maximum follows the viewport and adjacent columns.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
-pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 
 /// Unified Details / Files sidebar bounds (Orchestrator.dev parity).
@@ -315,10 +315,11 @@ impl UiSettings {
             SIDEBAR_MAX,
             SIDEBAR_DEFAULT,
         );
-        self.right_pane_width = clamp_or(
+        // The right pane has no persisted upper bound: its live drag clamps
+        // against the current window, which is unavailable while loading.
+        self.right_pane_width = min_or(
             self.right_pane_width,
             RIGHT_PANE_MIN,
-            RIGHT_PANE_MAX,
             RIGHT_PANE_DEFAULT,
         );
         self.details_sidebar_width = clamp_or(
@@ -369,6 +370,14 @@ impl UiSettings {
 fn clamp_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
     if value.is_finite() {
         value.clamp(min, max)
+    } else {
+        default
+    }
+}
+
+fn min_or(value: f32, min: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.max(min)
     } else {
         default
     }
@@ -476,6 +485,16 @@ mod tests {
         let saved = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(!saved.contains("terminalHeight"));
         assert!(!saved.contains("terminalOpen"));
+    }
+
+    #[test]
+    fn large_right_pane_width_is_preserved() {
+        let loaded = UiSettings {
+            right_pane_width: 2400.0,
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(loaded.right_pane_width, 2400.0);
     }
 
     #[test]
