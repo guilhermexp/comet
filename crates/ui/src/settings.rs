@@ -16,6 +16,7 @@ pub mod archived;
 pub mod composer;
 pub mod devices;
 pub mod harnesses;
+pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
 
@@ -67,6 +68,12 @@ pub struct UiSettings {
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// Desktop banner notifications on the same transitions.
+    /// `COMET_DISABLE_NOTIFICATIONS` overrides.
+    pub notifications_enabled: bool,
+    /// Suppress the banner while a Comet window is focused (the chime covers
+    /// the foreground case).
+    pub notifications_background_only: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
@@ -90,6 +97,8 @@ impl Default for UiSettings {
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
+            notifications_enabled: true,
+            notifications_background_only: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             keymap: KeymapConfig::default(),
@@ -340,6 +349,8 @@ mod tests {
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sound_enabled: false,
+            notifications_enabled: false,
+            notifications_background_only: false,
             right_pane_width: 700.0,
             right_pane_open: true,
             keymap: KeymapConfig {
@@ -367,6 +378,14 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert!(
+            loaded.notifications_enabled,
+            "pre-banner files default banners on"
+        );
+        assert!(
+            loaded.notifications_background_only,
+            "pre-banner files default background-only on"
+        );
     }
 
     #[test]
