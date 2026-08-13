@@ -243,6 +243,7 @@ async fn git_history_is_topological_paged_and_carries_public_refs() {
     let first = repos.history(&repo_dir, 0, 2).await.expect("first page");
     assert_eq!(first.commits.len(), 2);
     assert_eq!(first.total_count, Some(4));
+    assert_eq!(first.head_commit_count, Some(4));
     assert_eq!(first.next_cursor, Some(2));
     assert_eq!(
         first.head_sha.as_deref(),
@@ -265,6 +266,7 @@ async fn git_history_is_topological_paged_and_carries_public_refs() {
     assert_eq!(second.commits.len(), 2);
     assert_eq!(second.next_cursor, None);
     assert_eq!(second.total_count, None);
+    assert_eq!(second.head_commit_count, None);
 }
 
 // ---------------------------------------------------------------------------
