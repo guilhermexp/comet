@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/syntax",
     "crates/proto",
     "crates/doc",
     "crates/sync",
@@ -32,6 +33,7 @@ zeron-mcp = { package = "comet-mcp", path = "crates/mcp" }
 comet-proto = { package = "zeron-proto", path = "crates/proto" }
 comet-engine = { package = "zeron-engine", path = "crates/engine" }
 comet-rpc = { package = "zeron-rpc", path = "crates/rpc" }
+comet-syntax = { path = "crates/syntax" }
 zeron-update = { path = "crates/update" }
 zeron-ui = { path = "crates/ui" }
 

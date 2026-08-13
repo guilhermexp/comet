@@ -13,6 +13,7 @@ zeron-engine.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
 zeron-update.workspace = true
+comet-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true

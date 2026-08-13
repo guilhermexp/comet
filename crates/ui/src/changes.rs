@@ -37,7 +37,7 @@ use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
-use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
+use crate::markdown::highlight::{Lang, LineCarry, Token, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -563,8 +563,7 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
 
 /// Language for a file path's extension (drives per-line highlighting).
 pub fn lang_for_path(path: &str) -> Option<Lang> {
-    let ext = path.rsplit('/').next()?.rsplit('.').next()?;
-    lang_for_tag(ext)
+    comet_syntax::language_for_path(path)
 }
 
 fn hash64(parts: &[&str]) -> u64 {
@@ -3204,7 +3203,7 @@ rename to new_name.rs
     #[test]
     fn langs_resolve_from_paths() {
         assert_eq!(lang_for_path("src/main.rs"), Some(Lang::Rust));
-        assert_eq!(lang_for_path("a/b/app.tsx"), Some(Lang::Js));
+        assert_eq!(lang_for_path("a/b/app.tsx"), Some(Lang::Tsx));
         assert_eq!(lang_for_path("Cargo.toml"), Some(Lang::Toml));
         assert_eq!(lang_for_path("script.sh"), Some(Lang::Bash));
         assert_eq!(lang_for_path("README"), None);
