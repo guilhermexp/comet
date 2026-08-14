@@ -10,7 +10,7 @@ members = [
     "crates/mcp",
     "crates/update",
     "crates/ui",
-    "apps/comet",
+    "apps/zeron",
 ]
 
 [workspace.package]
@@ -20,17 +20,22 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-comet-proto = { path = "crates/proto" }
-comet-doc = { path = "crates/doc" }
-comet-sync = { path = "crates/sync" }
-comet-harness = { path = "crates/harness" }
-comet-engine = { path = "crates/engine" }
-comet-rpc = { path = "crates/rpc" }
-comet-mcp = { path = "crates/mcp" }
-comet-update = { path = "crates/update" }
-comet-ui = { path = "crates/ui" }
+zeron-proto = { path = "crates/proto" }
+zeron-doc = { path = "crates/doc" }
+zeron-sync = { path = "crates/sync" }
+zeron-harness = { path = "crates/harness" }
+zeron-engine = { path = "crates/engine" }
+zeron-rpc = { path = "crates/rpc" }
+# The MCP crate arrived after the global rename and still exposes its original
+# package/dependency keys; aliases keep it buildable without dropping it.
+zeron-mcp = { package = "comet-mcp", path = "crates/mcp" }
+comet-proto = { package = "zeron-proto", path = "crates/proto" }
+comet-engine = { package = "zeron-engine", path = "crates/engine" }
+comet-rpc = { package = "zeron-rpc", path = "crates/rpc" }
+zeron-update = { path = "crates/update" }
+zeron-ui = { path = "crates/ui" }
 
-# MCP server for the worker tools (`comet mcp-server`). `transport-io` is the
+# MCP server for the worker tools (`zeron mcp-server`). `transport-io` is the
 # stdio SERVER transport; the defaults (server, macros, base64) stay on —
 # without `server` this compiles into a client-only build.
 rmcp = { version = "3", features = ["transport-io"] }
@@ -50,7 +55,7 @@ loro-protocol = "0.3"
 # sidebar); a6c1ad5 adds BackdropBlur + horizontal EdgeFade + glass fixes;
 # 9b672fa bounds renderer GPU memory (region-sized backdrop blur scratch,
 # idle release of blur/path intermediates, instance pool shrink,
-# COMET_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
+# ZERON_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
 # sprite-atlas tiles — remove_asset alone leaked them, see
 # attachments::flush_evicted); ac135eb adds device memory to the stats line;
 # f596cde fixes destination alpha on transparent windows (Porter-Duff OVER,
@@ -121,5 +126,3 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
-
-

@@ -24,8 +24,8 @@ use gpui::{
     px,
 };
 
-use comet_proto::{TerminalEvent, TerminalSession};
-use comet_rpc::methods;
+use zeron_proto::{TerminalEvent, TerminalSession};
+use zeron_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::state::{AppState, EngineHandle};

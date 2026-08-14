@@ -1,8 +1,8 @@
-//! The app shell (comet `__root.tsx`): sidebar column + main panel + the
+//! The app shell (zeron `__root.tsx`): sidebar column + main panel + the
 //! optional full-height right utility column (Terminal sessions and Changes as
 //! sibling tabs), plus the boot splash and the connection gate.
 //!
-//! Layout is comet's: collapsible drag-resizable sidebar (208–400px, default
+//! Layout is zeron's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
 //! shifts; utility column (360–760px, default 520), hidden by default.
@@ -23,10 +23,10 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
-use comet_engine::InstanceLock;
-use comet_proto::{AuthState, WorkspaceScope};
-use comet_rpc::methods;
 use gpui_tokio::Tokio;
+use zeron_engine::InstanceLock;
+use zeron_proto::{AuthState, WorkspaceScope};
+use zeron_rpc::methods;
 
 use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -66,7 +66,7 @@ actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
 // ---------------------------------------------------------------------------
 
 /// Where the top-left window-control cluster starts, in px from the window's
-/// left edge (comet window-controls.tsx: `left: fullscreen ? 12 : 88`). The
+/// left edge (zeron window-controls.tsx: `left: fullscreen ? 12 : 88`). The
 /// frameless hiddenInset chrome puts the macOS traffic lights at {14,15};
 /// fullscreen hides them and the cluster reclaims the inset.
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
@@ -169,7 +169,7 @@ impl SettingsSection {
         SettingsSection::Archived,
     ];
 
-    /// Sidebar + header label (comet settings-sidebar.tsx SECTIONS / __root.tsx
+    /// Sidebar + header label (zeron settings-sidebar.tsx SECTIONS / __root.tsx
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
@@ -302,7 +302,7 @@ impl SessionPanels {
     }
 }
 
-/// One route-history entry (comet parity: the renderer's TanStack memory
+/// One route-history entry (zeron parity: the renderer's TanStack memory
 /// history — every route the user visited, browser-style).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavEntry {
@@ -312,7 +312,7 @@ pub enum NavEntry {
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
-/// (comet window-controls.tsx semantics): every route change pushes an entry;
+/// (zeron window-controls.tsx semantics): every route change pushes an entry;
 /// Back/Forward walk the stack without changing it; pushing while behind the
 /// tip truncates the entries ahead (a new branch, exactly like a browser).
 #[derive(Debug)]
@@ -346,7 +346,7 @@ impl NavHistory {
     }
 
     /// Swap the current entry in place without growing the stack — the native
-    /// equivalent of a `replace: true` navigation (comet's boot redirect from
+    /// equivalent of a `replace: true` navigation (zeron's boot redirect from
     /// `/` into the last-used chat leaves no dead Back target behind).
     pub fn replace(&mut self, entry: NavEntry) {
         self.entries[self.index] = entry;
@@ -357,7 +357,7 @@ impl NavHistory {
     }
 
     /// Memory history keeps every entry, so "behind the last entry" is exactly
-    /// "can go forward" (comet window-controls.tsx).
+    /// "can go forward" (zeron window-controls.tsx).
     pub fn can_forward(&self) -> bool {
         self.index + 1 < self.entries.len()
     }
@@ -704,7 +704,7 @@ pub struct Shell {
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
+    sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
@@ -718,7 +718,7 @@ pub struct Shell {
     update_dismissed: Option<String>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: comet_update::InstallKind,
+    install: zeron_update::InstallKind,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -745,7 +745,7 @@ pub struct Shell {
     /// Last observed `window.is_window_active()` — rising edge fires a
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
     was_window_active: bool,
-    /// Dev/testing knobs (`COMET_OPEN_DIALOG`, `COMET_FORCE_GATE`) — see
+    /// Dev/testing knobs (`ZERON_OPEN_DIALOG`, `ZERON_FORCE_GATE`) — see
     /// [`Shell::new`].
     debug_dialog: Option<String>,
     debug_gate: Option<GatePhase>,
@@ -835,10 +835,10 @@ impl Shell {
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
-        // Dev/testing knob: `COMET_OPEN_ROUTE=settings[/<section>]` boots
+        // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("COMET_OPEN_ROUTE").ok().as_deref() {
+        let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
@@ -855,17 +855,17 @@ impl Shell {
             }
             _ => Route::Chat,
         };
-        // More capture knobs of the same kind: `COMET_OPEN_DIALOG=rename|delete`
+        // More capture knobs of the same kind: `ZERON_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
         // the combined harness/model menu once the shell is Ready;
-        // `COMET_FORCE_GATE=signin|org|failed` renders that gate regardless of
+        // `ZERON_FORCE_GATE=signin|org|failed` renders that gate regardless of
         // real auth state (display-only — for styling passes).
-        let debug_dialog = std::env::var("COMET_OPEN_DIALOG").ok();
-        let debug_gate = match std::env::var("COMET_FORCE_GATE").ok().as_deref() {
+        let debug_dialog = std::env::var("ZERON_OPEN_DIALOG").ok();
+        let debug_gate = match std::env::var("ZERON_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the comet engine on port 27901".into(),
+                "Could not reach the zeron engine on port 27901".into(),
             )),
             _ => None,
         };
@@ -917,7 +917,7 @@ impl Shell {
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
-            install: comet_update::detect_install(),
+            install: zeron_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -1025,19 +1025,19 @@ impl Shell {
         // still ring.
         {
             let now = Utc::now();
-            type Ping = (String, comet_proto::SessionStatus, bool, Option<String>);
+            type Ping = (String, zeron_proto::SessionStatus, bool, Option<String>);
             let sessions: Vec<Ping> = {
                 let state = state.read(cx);
                 state
                     .sessions
                     .iter()
                     .map(|s| {
-                        use comet_proto::view::Indicator;
-                        let status = match comet_proto::view::effective_indicator(Some(s), now) {
-                            Indicator::Working => comet_proto::SessionStatus::Working,
-                            Indicator::AwaitingInput => comet_proto::SessionStatus::AwaitingInput,
-                            Indicator::Errored => comet_proto::SessionStatus::Errored,
-                            Indicator::None => comet_proto::SessionStatus::Idle,
+                        use zeron_proto::view::Indicator;
+                        let status = match zeron_proto::view::effective_indicator(Some(s), now) {
+                            Indicator::Working => zeron_proto::SessionStatus::Working,
+                            Indicator::AwaitingInput => zeron_proto::SessionStatus::AwaitingInput,
+                            Indicator::Errored => zeron_proto::SessionStatus::Errored,
+                            Indicator::None => zeron_proto::SessionStatus::Idle,
                         };
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let title = state
@@ -1050,9 +1050,9 @@ impl Shell {
                     .collect()
             };
             // Background-only banners: `active_window()` is app-level (any
-            // Comet window being key), so a ping for a *background chat* in a
+            // Zeron window being key), so a ping for a *background chat* in a
             // focused app still stays a chime — you're already looking at
-            // Comet; the sidebar dot carries the rest.
+            // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
             for (chat_id, status, send_pending, title) in sessions {
                 let prev = self.sound_prev.insert(chat_id, status);
@@ -1146,7 +1146,7 @@ impl Shell {
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
-            // comet's `/` route redirected into the last-used chat, leaving no
+            // zeron's `/` route redirected into the last-used chat, leaving no
             // dead Back target. Walking history lands here too, but the
             // destination already equals `current()`, so the push dedups.
             if matches!(self.route, Route::Chat) {
@@ -1515,7 +1515,7 @@ impl Shell {
     ) {
         let viewport = f32::from(window.viewport_size().width);
         let width = viewport - f32::from(event.event.position.x);
-        // comet caps the pane at 52% of the window on top of the absolute range.
+        // zeron caps the pane at 52% of the window on top of the absolute range.
         let max = RIGHT_PANE_MAX.min(viewport * 0.52);
         self.settings.right_pane_width = width.clamp(RIGHT_PANE_MIN, max.max(RIGHT_PANE_MIN));
         self.right_tween = None;
@@ -1998,7 +1998,7 @@ impl Shell {
                     Ok(_) => cx.quit(),
                     Err(err) => {
                         shell.runtime_change_error = Some(format!(
-                            "Could not stop the remote engine: {err}. Run `comet daemon stop`, then quit and reopen Comet."
+                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron."
                         ).into());
                         cx.notify();
                     }
@@ -2166,7 +2166,7 @@ impl Shell {
     /// Evaluate a width tween at "now" (manual drive — see [`WidthTween`]).
     /// Mid-flight: eased 200ms lerp, and `motion_active` is flagged so render
     /// schedules the next animation frame. Finished, stale, absent, or under
-    /// reduced motion: exactly `target`. Honors `COMET_MOTION_SCALE`.
+    /// reduced motion: exactly `target`. Honors `ZERON_MOTION_SCALE`.
     fn eval_tween(&self, tween: Option<WidthTween>, target: f32) -> f32 {
         let Some(WidthTween { from, to, started }) = tween else {
             return target;
@@ -2217,11 +2217,11 @@ impl Shell {
     }
 
     /// The header's content row with the animated left inset — the native port
-    /// of comet __root.tsx `transition-[padding-left] duration-200 ease-out` +
+    /// of zeron __root.tsx `transition-[padding-left] duration-200 ease-out` +
     /// `style={{ paddingLeft: headerInset }}`: on sidebar toggles (and macOS
     /// fullscreen flips) the SAME element's padding tweens, so the title
     /// glides to its new x-position. Route changes SNAP: the tween is killed
-    /// by every route transition (comet remounts the keyed header variants —
+    /// by every route transition (zeron remounts the keyed header variants —
     /// instant swap, zero horizontal motion).
     /// Where unified-titlebar content (tabs / the settings label) starts: past
     /// the traffic lights + control cluster, riding the fullscreen inset tween.
@@ -2260,7 +2260,7 @@ impl Shell {
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
-    /// pattern (comet's `.drag` region): mark it a [`WindowControlArea::Drag`]
+    /// pattern (zeron's `.drag` region): mark it a [`WindowControlArea::Drag`]
     /// (macOS app-owned titlebar), hand the drag to the compositor once the
     /// pointer moves with the button down, and double-click zooms.
     fn titlebar_drag_region(
@@ -2312,7 +2312,7 @@ impl Shell {
     }
 
     /// The ONE top-left window-control cluster (sidebar toggle + back/forward —
-    /// comet window-controls.tsx): rendered once, in a paint-only overlay layer
+    /// zeron window-controls.tsx): rendered once, in a paint-only overlay layer
     /// pinned at the window's top-left, ABOVE the sidebar and headers. The
     /// sidebar width animates *beneath* it, so the buttons keep their element
     /// identity and never move or remount on collapse/expand; only the
@@ -2385,7 +2385,7 @@ impl Shell {
         (1.0 - sidebar_now / open_width).clamp(0.0, 1.0)
     }
 
-    /// Native Windows caption controls integrated into Comet's unified
+    /// Native Windows caption controls integrated into Zeron's unified
     /// titlebar. `WindowControlArea` maps these hit targets to HTMINBUTTON,
     /// HTMAXBUTTON, and HTCLOSE, so Windows owns their behavior (including
     /// Snap Layouts) while GPUI renders the system Segoe caption glyphs.
@@ -2457,7 +2457,7 @@ impl Shell {
         )
     }
 
-    /// Settings-mode sidebar (comet settings-sidebar.tsx): window-control
+    /// Settings-mode sidebar (zeron settings-sidebar.tsx): window-control
     /// strip, "Settings" heading, icon section rows styled like session rows,
     /// and a Back row pinned to the bottom.
     fn render_settings_nav(
@@ -2538,7 +2538,7 @@ impl Shell {
                         }),
                     )),
             )
-            // Back pinned to the bottom (comet settings-sidebar.tsx).
+            // Back pinned to the bottom (zeron settings-sidebar.tsx).
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
                     div()
@@ -2556,7 +2556,7 @@ impl Shell {
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
-                            // AltArrowLeft chevron (comet settings-sidebar.tsx),
+                            // AltArrowLeft chevron (zeron settings-sidebar.tsx),
                             // not the straight history arrow.
                             icon(icons::ALT_ARROW_LEFT)
                                 .size(px(16.0))
@@ -2568,7 +2568,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (comet session-row.tsx): status rail on the left
+    /// One session row (zeron session-row.tsx): status rail on the left
     /// (a live 2×3 mini spinner while working, a dot otherwise), title +
     /// relative time on the first line, "folder · device" underneath aligned
     /// to the title. Click selects; right-click opens the context menu.
@@ -2580,8 +2580,8 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        harness: Option<comet_proto::HarnessId>,
-        status: comet_proto::ChatIndicator,
+        harness: Option<zeron_proto::HarnessId>,
+        status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
         theme: &Theme,
@@ -2596,11 +2596,11 @@ impl Shell {
         let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
         let status_color = spaces::status_dot_color(status, theme);
         let status_label: Option<&'static str> = match status {
-            comet_proto::ChatIndicator::Working => Some("Working"),
-            comet_proto::ChatIndicator::AwaitingInput => Some("Input"),
-            comet_proto::ChatIndicator::Errored => Some("Failed"),
-            comet_proto::ChatIndicator::Completed => Some("Done"),
-            comet_proto::ChatIndicator::Idle => None,
+            zeron_proto::ChatIndicator::Working => Some("Working"),
+            zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
+            zeron_proto::ChatIndicator::Errored => Some("Failed"),
+            zeron_proto::ChatIndicator::Completed => Some("Done"),
+            zeron_proto::ChatIndicator::Idle => None,
         };
         let corner_body: AnyElement = if corner_hovered {
             div()
@@ -2647,21 +2647,20 @@ impl Shell {
                     // Glyph slot: Done wears the check; every other status a
                     // dot in its color (the Working spinner lives at the
                     // row's bottom-right, not up here).
-                    let glyph: AnyElement =
-                        if status == comet_proto::ChatIndicator::Completed {
-                            icon(icons::CHECK)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(status_color)
-                                .into_any_element()
-                        } else {
-                            div()
-                                .size(px(6.0))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(status_color)
-                                .into_any_element()
-                        };
+                    let glyph: AnyElement = if status == zeron_proto::ChatIndicator::Completed {
+                        icon(icons::CHECK)
+                            .size(px(11.0))
+                            .flex_none()
+                            .text_color(status_color)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .size(px(6.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(status_color)
+                            .into_any_element()
+                    };
                     div()
                         .flex()
                         .flex_row()
@@ -2720,7 +2719,7 @@ impl Shell {
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
-        // Hover fades over transition-colors (comet session-row.tsx) — both
+        // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
         let rest_bg = if selected {
@@ -2844,13 +2843,14 @@ impl Shell {
                     })
                     // Working rows animate the spinner at the row's
                     // bottom-right (the status word keeps its dot up top).
-                    .when(status == comet_proto::ChatIndicator::Working, |el| {
-                        el.child(div().flex_1()).child(loaders::mini_gradient_spinner(
-                            format!("chat-working-{id}"),
-                            2.0,
-                            cx.entity_id(),
-                            cx,
-                        ))
+                    .when(status == zeron_proto::ChatIndicator::Working, |el| {
+                        el.child(div().flex_1())
+                            .child(loaders::mini_gradient_spinner(
+                                format!("chat-working-{id}"),
+                                2.0,
+                                cx.entity_id(),
+                                cx,
+                            ))
                     }),
             )
             .into_any_element()
@@ -2977,15 +2977,12 @@ impl Shell {
             // rode the previous frame's offset, so the last frame of a content
             // shrink (row archived while scrolled) left a phantom fade stuck
             // over an unscrollable list (user report).
-            .child(crate::edge_fade::edge_faded(
-                SIDEBAR_GLASS_FADE_BAND,
-                true,
-                true,
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
+            .child(
+                crate::edge_fade::edge_faded(
+                    SIDEBAR_GLASS_FADE_BAND,
+                    true,
+                    true,
+                    div().relative().flex_1().min_h_0().child(
                         div()
                             .id("sidebar-lists")
                             .size_full()
@@ -3016,8 +3013,9 @@ impl Shell {
                             })
                             .children(archived_section),
                     ),
+                )
+                .fade_overflow_y(&self.sidebar_scroll),
             )
-            .fade_overflow_y(&self.sidebar_scroll))
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
@@ -3052,7 +3050,7 @@ impl Shell {
     /// UpdateStatus stream reports a newer release. On a macOS bundle install
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`comet update`); click dismisses it for that version.
+    /// (`zeron update`); click dismisses it for that version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
@@ -3062,7 +3060,7 @@ impl Shell {
         if self.update_dismissed.as_deref() == Some(latest.as_str()) {
             return None;
         }
-        let mac_app = matches!(self.install, comet_update::InstallKind::MacApp { .. });
+        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
 
         let (label, clickable): (SharedString, bool) = if mac_app {
             match &self.update_flow {
@@ -3073,7 +3071,7 @@ impl Shell {
             }
         } else {
             (
-                format!("Update available — v{latest} · run `comet update`").into(),
+                format!("Update available — v{latest} · run `zeron update`").into(),
                 true,
             )
         };
@@ -3126,7 +3124,7 @@ impl Shell {
     /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
     /// installs → dismiss for this version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, comet_update::InstallKind::MacApp { .. }) {
+        if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
             self.update_dismissed = self
                 .state
                 .read(cx)
@@ -3150,8 +3148,8 @@ impl Shell {
         let data_dir = self.data_dir.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
-            let manifest = comet_update::fetch_latest(&edge_url).await?;
-            comet_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            let manifest = zeron_update::fetch_latest(&edge_url).await?;
+            zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -3178,12 +3176,12 @@ impl Shell {
     /// relauncher, and quit — the relauncher `open`s the new bundle once this
     /// process (and its engine lock / IPC port) is gone.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        let comet_update::InstallKind::MacApp { bundle } = self.install.clone() else {
+        let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
             return;
         };
-        match comet_update::apply_mac_app(&staged, &bundle) {
+        match zeron_update::apply_mac_app(&staged, &bundle) {
             Ok(()) => {
-                comet_update::relaunch_app_after_exit(&bundle);
+                zeron_update::relaunch_app_after_exit(&bundle);
                 cx.quit();
             }
             Err(err) => {
@@ -3253,7 +3251,7 @@ impl Shell {
                 cx.notify();
             }))
             .child(
-                // Avatar: white circle, initial in near-black (comet user-menu.tsx).
+                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
                 div()
                     .size(px(28.0))
                     .flex_none()
@@ -3385,8 +3383,11 @@ impl Shell {
                     menu.child(popover::menu_separator()).child(row)
                 })
                 .into_any_element();
-            trigger =
-                trigger.child(popover::anchored_menu_above("user-menu-popover", menu, closing));
+            trigger = trigger.child(popover::anchored_menu_above(
+                "user-menu-popover",
+                menu,
+                closing,
+            ));
         }
         trigger.into_any_element()
     }
@@ -3411,7 +3412,7 @@ impl Shell {
         } else if remote_engine {
             "Stop daemon and quit"
         } else {
-            "Quit Comet"
+            "Quit Zeron"
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -3424,7 +3425,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Comet will keep using this local workspace until you quit and reopen.",
+                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
                     )),
                 )
                 .child(
@@ -3468,9 +3469,9 @@ impl Shell {
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Comet is using a background daemon. Stop it and quit Comet, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         } else {
-                            "Quit and reopen Comet to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         },
                     )),
                 )
@@ -3515,7 +3516,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Comet will remove your credentials, close the synced workspace, and continue in local mode.",
+                        "Zeron will remove your credentials, close the synced workspace, and continue in local mode.",
                     )),
                 )
                 .child(
@@ -3821,7 +3822,7 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
+                            icon(icons::ZERON_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
@@ -3852,7 +3853,7 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (comet index.tsx): the comet mark over the
+            // New-chat canvas (zeron index.tsx): the zeron mark over the
             // TARGET selectors (device + project — moved up from the
             // composer footer, user request) and the helper line.
             let helper: SharedString = if space_name.is_empty() {
@@ -3875,7 +3876,7 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
+                            icon(icons::ZERON_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
                                 // 0.09 read as barely-there on the glass
@@ -4014,7 +4015,11 @@ impl Shell {
     /// `stack_h` is the measured bottom chrome stack the full-height
     /// transcript scrolls under — the pill anchors just above it (the -14
     /// carries the old status-strip overlap).
-    fn render_jump_to_bottom(&mut self, stack_h: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_jump_to_bottom(
+        &mut self,
+        stack_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.transcript.read(cx).jump_button_shown() {
             return None;
         }
@@ -4082,7 +4087,7 @@ impl Shell {
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
-        // inner gutter (comet's `mx-auto h-6 max-w-3xl px-2`).
+        // inner gutter (zeron's `mx-auto h-6 max-w-3xl px-2`).
         let strip = div()
             .h(px(Theme::STATUS_STRIP_HEIGHT))
             .flex_none()
@@ -4466,7 +4471,7 @@ impl Shell {
             .items_center()
             .text_center()
             .child(
-                icon(icons::COMET_LOGO)
+                icon(icons::ZERON_LOGO)
                     .w(px(31.4))
                     .h(px(36.0))
                     .text_color(theme.text),
@@ -4487,7 +4492,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Comet removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                        "Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -4532,7 +4537,7 @@ impl Shell {
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let content: AnyElement = match phase {
-            // Backend unreachable: quiet centered copy (comet Gate `Failed`),
+            // Backend unreachable: quiet centered copy (zeron Gate `Failed`),
             // plus a Retry affordance (the native engine doesn't self-redial).
             GatePhase::Failed(error) => div()
                 .flex()
@@ -4561,7 +4566,7 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card (comet App.tsx Gate): centered card on the grid —
+            // Login card (zeron App.tsx Gate): centered card on the grid —
             // logo, "Log in to Zeron", copy, full-width white Log in button.
             _ => div()
                 .w(px(360.0))
@@ -4577,7 +4582,7 @@ impl Shell {
                 .items_center()
                 .text_center()
                 .child(
-                    icon(icons::COMET_LOGO)
+                    icon(icons::ZERON_LOGO)
                         .w(px(31.4))
                         .h(px(36.0))
                         .text_color(theme.text),
@@ -4633,7 +4638,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    // Keyed per phase (comet App.tsx `<div key={phase}
+                    // Keyed per phase (zeron App.tsx `<div key={phase}
                     // className="animate-in">`): every gate swap replays the
                     // 0.5s entrance instead of mutating one animated element.
                     .child(motion::fade_in(
@@ -4738,7 +4743,7 @@ impl Shell {
                     .into_any_element(),
             };
 
-        // comet App.tsx OrgGate: w-400 card on the grid — logo, headline,
+        // zeron App.tsx OrgGate: w-400 card on the grid — logo, headline,
         // explainer (+ signed-in email), name form with a white Create button,
         // then existing memberships and the account escape hatch.
         let blurb: SharedString = match email {
@@ -4763,7 +4768,7 @@ impl Shell {
             .flex()
             .flex_col()
             .child(
-                icon(icons::COMET_LOGO)
+                icon(icons::ZERON_LOGO)
                     .w(px(24.4))
                     .h(px(28.0))
                     .text_color(theme.text),
@@ -4875,7 +4880,7 @@ impl Shell {
     }
 }
 
-/// The sign-in gate's faint grid backdrop (comet styles.css `.bg-grid`):
+/// The sign-in gate's faint grid backdrop (zeron styles.css `.bg-grid`):
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 fn grid_backdrop(theme: &Theme) -> AnyElement {
@@ -4964,7 +4969,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A size-6 icon button for the titlebar strip (comet window-controls.tsx:
+/// A size-6 icon button for the titlebar strip (zeron window-controls.tsx:
 /// `grid size-6 place-items-center rounded-md text-muted-foreground`).
 fn window_control_button(
     id: &'static str,
@@ -4983,7 +4988,7 @@ fn window_control_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // comet window-controls.tsx: `transition-colors` — the wash fades.
+        // zeron window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
             theme.glass_hover().opacity(0.0),
@@ -5064,7 +5069,7 @@ fn windows_caption_button(
         .child(glyph)
 }
 
-/// A titlebar history button (comet window-controls.tsx): enabled it is a
+/// A titlebar history button (zeron window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
 fn nav_history_button(
@@ -5094,7 +5099,8 @@ fn nav_history_button(
     window_control_button(id, icon_path, theme, on_click).into_any_element()
 }
 
-/// A size-7 toggle for the main-panel title bar.
+/// A size-7 icon button for the main-panel header (zeron __root.tsx:
+/// `grid size-7 place-items-center rounded-md text-muted-foreground`).
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
@@ -5140,7 +5146,7 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        // The shell tone (comet `.frost`): the surface the sidebar sits on and
+        // The shell tone (zeron `.frost`): the surface the sidebar sits on and
         // the main panel floats over as an inset rounded card. On macOS the
         // window background is the blurred desktop (lib.rs `Blurred`), so the
         // frost paints translucent — the sidebar and card margins read as
@@ -5211,7 +5217,7 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
-            // no-ops (comet __root.tsx gates the hotkey on `!isSettings`, and
+            // no-ops (zeron __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
             // sidebar toggle stays live everywhere, as in the original.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
@@ -5268,7 +5274,7 @@ impl Render for Shell {
                             .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
                     }
                 }
-                // Capture knob: `COMET_OPEN_DIALOG=model` pops the combined
+                // Capture knob: `ZERON_OPEN_DIALOG=model` pops the combined
                 // harness/model menu (needs `window`, so it fires here rather
                 // than in `on_state_changed`).
                 if self.debug_dialog.as_deref() == Some("model") {
@@ -5299,7 +5305,7 @@ impl Render for Shell {
                 let main = self.render_main(cx);
                 // The right utility pane is chat-scoped chrome: Settings never
                 // renders it, while each session's selected pane stays intact
-                // for the return trip.
+                // for the return trip (zeron `!isSettings && activeChat`).
                 let on_chat = matches!(self.route, Route::Chat);
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
@@ -5321,7 +5327,7 @@ impl Render for Shell {
                     .overflow_hidden()
                     .child(main)
                     .into_any_element();
-                // The whole app page is one keyed `animate-in` entrance (comet
+                // The whole app page is one keyed `animate-in` entrance (zeron
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
                 // arriving from the splash or any gate fades the page in; the
                 // splash-out crossfades over it on boot.
@@ -5371,14 +5377,7 @@ impl Render for Shell {
                             .child(card)
                             .child(right),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .child(title_bar),
-                    )
+                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
@@ -5485,15 +5484,12 @@ mod tests {
             edge_token: None,
             org_id: None,
             workos_client_id: Some("client_test".into()),
-            default_harness: comet_proto::HarnessId::Mock,
+            default_harness: zeron_proto::HarnessId::Mock,
         };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
             .await
             .expect("saved session opens its synced profile");
-        assert_eq!(
-            synced.engine_info().workspace_scope,
-            WorkspaceScope::Synced
-        );
+        assert_eq!(synced.engine_info().workspace_scope, WorkspaceScope::Synced);
 
         synced
             .client()
@@ -5568,7 +5564,7 @@ mod tests {
     #[test]
     fn local_sign_in_waits_for_a_new_runtime_before_syncing() {
         let signed_in = AuthState::SignedIn {
-            user: comet_proto::UserProfile {
+            user: zeron_proto::UserProfile {
                 id: "user-1".into(),
                 email: "user@example.com".into(),
                 name: None,
@@ -5625,7 +5621,7 @@ mod tests {
     #[test]
     fn synced_sign_out_blocks_every_viewport_and_cannot_switch_accounts() {
         let signed_in_as_another_user = AuthState::SignedIn {
-            user: comet_proto::UserProfile {
+            user: zeron_proto::UserProfile {
                 id: "user-2".into(),
                 email: "other@example.com".into(),
                 name: None,
@@ -5663,8 +5659,8 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_cluster_matches_comet_window_controls() {
-        // comet window-controls.tsx: `left: fullscreen ? 12 : 88` — the
+    fn titlebar_cluster_matches_zeron_window_controls() {
+        // zeron window-controls.tsx: `left: fullscreen ? 12 : 88` — the
         // cluster clears the {14,15} traffic lights, and reclaims the inset
         // when fullscreen hides them.
         assert_eq!(titlebar_cluster_start(false), 88.0);
@@ -5710,7 +5706,7 @@ mod tests {
         );
     }
 
-    // ---- per-session utility pane (§1.10/1.11) ----
+    // ---- per-session utility pane (§1.10/1.11; zeron sessionPanels) ----
 
     #[test]
     fn utility_tabs_default_closed_per_chat() {
@@ -5950,7 +5946,7 @@ mod tests {
     #[test]
     fn nav_push_truncates_the_forward_branch() {
         // a → b → c, back to a, then push d: the b/c branch is gone (browser
-        // semantics — comet's memory history PUSH truncates entries ahead).
+        // semantics — zeron's memory history PUSH truncates entries ahead).
         let mut nav = NavHistory::new(chat("a"));
         nav.push(chat("b"));
         nav.push(chat("c"));
