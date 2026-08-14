@@ -8538,6 +8538,9 @@ impl Render for Shell {
                     )
                     - 10.0)
                     .max(0.0);
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_available_width(main_width, cx)
+                });
                 let stack_h = self.bottom_stack.get();
                 self.transcript.update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx);
