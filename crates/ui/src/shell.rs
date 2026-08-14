@@ -198,11 +198,24 @@ pub enum UtilityPane {
     Changes,
 }
 
+/// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
+/// kinds): the singleton git-diff page, or one embedded terminal keyed by its
+/// [`TerminalPanel`] tab key. `Picker` is the empty state ("Open a surface").
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RightSurface {
+    #[default]
+    Picker,
+    Diff,
+    Terminal(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatPanelState {
     visible: bool,
     active: UtilityPane,
     changes_open: bool,
+    diff_open: bool,
+    right_active: RightSurface,
 }
 
 impl Default for ChatPanelState {
@@ -211,6 +224,8 @@ impl Default for ChatPanelState {
             visible: false,
             active: UtilityPane::Terminal,
             changes_open: false,
+            diff_open: false,
+            right_active: RightSurface::Picker,
         }
     }
 }
@@ -299,6 +314,11 @@ impl SessionPanels {
                 state.visible = false;
             }
         }
+    }
+
+    /// Mutate `key`'s flags in place (right-pane surface bookkeeping).
+    fn update(&mut self, key: &str, f: impl FnOnce(&mut ChatPanelState)) {
+        f(self.map.entry(key.to_string()).or_default());
     }
 }
 
@@ -759,6 +779,12 @@ pub struct Shell {
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     terminal_events: Option<Subscription>,
+    /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
+    /// entity from the bottom drawer's (own PTYs, own grid geometry; one
+    /// panel can only size one visible grid at a time).
+    right_terminal: Option<Entity<TerminalPanel>>,
+    /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
+    right_plus: popover::Popup<()>,
     changes: Option<Entity<Changes>>,
     utility_add_menu_open: bool,
     /// Suppresses the trigger click following an outside mouse-down dismissal.
@@ -987,6 +1013,8 @@ impl Shell {
             archived_hover: None,
             terminal: None,
             terminal_events: None,
+            right_terminal: None,
+            right_plus: popover::Popup::default(),
             changes: None,
             utility_add_menu_open: false,
             utility_add_menu_dismissed_at: None,
@@ -1419,6 +1447,120 @@ impl Shell {
         } else {
             self.show_changes(window, cx);
         }
+    }
+
+    fn right_terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
+        if let Some(terminal) = &self.right_terminal {
+            return terminal.clone();
+        }
+        let terminal = cx.new(|cx| TerminalPanel::new_embedded(self.state.clone(), cx));
+        self.right_terminal = Some(terminal.clone());
+        terminal
+    }
+
+    /// The right pane's surface tabs in strip order: Diff first (singleton),
+    /// then the embedded terminals — `(surface, title)`.
+    fn right_surface_rows(&self, cx: &App) -> Vec<(RightSurface, SharedString)> {
+        let mut rows = Vec::new();
+        if self.panels.get(&self.panel_key(cx)).diff_open {
+            rows.push((RightSurface::Diff, SharedString::from("Diff")));
+        }
+        if let Some(terminal) = &self.right_terminal {
+            for (key, title, _) in terminal.read(cx).tab_summaries(cx) {
+                rows.push((RightSurface::Terminal(key), title));
+            }
+        }
+        rows
+    }
+
+    /// The surface that actually renders: the stored pick when it still
+    /// exists, else the first remaining tab, else the picker. Terminal keys
+    /// go stale when their tab closes/exits — never render a dead surface.
+    fn resolved_right_active(&self, cx: &App) -> RightSurface {
+        let picked = self.panels.get(&self.panel_key(cx)).right_active;
+        let rows = self.right_surface_rows(cx);
+        let exists = match picked {
+            RightSurface::Picker => false,
+            surface => rows.iter().any(|(s, _)| *s == surface),
+        };
+        if exists {
+            picked
+        } else {
+            rows.first()
+                .map(|(s, _)| *s)
+                .unwrap_or(RightSurface::Picker)
+        }
+    }
+
+    fn set_right_active(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        self.panels.update(&key, |p| p.right_active = surface);
+        match surface {
+            RightSurface::Terminal(tab) => {
+                let panel = self.right_terminal_panel(cx);
+                panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+            }
+            RightSurface::Diff => {
+                let changes = self.changes_pane(cx);
+                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+            }
+            RightSurface::Picker => {}
+        }
+        cx.notify();
+    }
+
+    /// The picker's Git card / the `+` menu's Diff row: open (or re-activate)
+    /// the singleton Diff surface.
+    fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        self.panels.update(&key, |p| p.diff_open = true);
+        self.set_right_active(RightSurface::Diff, cx);
+    }
+
+    /// The picker's Terminal card / the `+` menu's Terminal row: every click
+    /// opens a fresh embedded terminal tab.
+    fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
+        let panel = self.right_terminal_panel(cx);
+        let opened = panel.update(cx, |panel, cx| {
+            panel.set_open(true, cx);
+            panel.open_tab_for_selected(cx)
+        });
+        if let Some(tab) = opened {
+            self.set_right_active(RightSurface::Terminal(tab), cx);
+        }
+    }
+
+    /// A surface tab's ✕. The active fallback happens naturally through
+    /// [`Self::resolved_right_active`] on the next frame.
+    fn close_right_surface(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match surface {
+            RightSurface::Diff => {
+                let key = self.panel_key(cx);
+                self.panels.update(&key, |p| {
+                    p.diff_open = false;
+                    if p.right_active == RightSurface::Diff {
+                        p.right_active = RightSurface::Picker;
+                    }
+                });
+            }
+            RightSurface::Terminal(tab) => {
+                let panel = self.right_terminal_panel(cx);
+                panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
+                let key = self.panel_key(cx);
+                self.panels.update(&key, |p| {
+                    if p.right_active == RightSurface::Terminal(tab) {
+                        p.right_active = RightSurface::Picker;
+                    }
+                });
+            }
+            RightSurface::Picker => {}
+        }
+        cx.notify();
     }
 
     fn changes_pane(&mut self, cx: &mut Context<Self>) -> Entity<Changes> {
@@ -4974,6 +5116,298 @@ impl Shell {
         )
     }
 
+    /// The right pane's empty state (t3code RightPanelEmptyState): a
+    /// centered "Open a surface" heading over the two surface cards —
+    /// Terminal and Git.
+    fn render_surface_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let text = theme.text;
+        let muted = theme.text_muted;
+        let border = theme.border;
+        let border_strong = theme.border_strong;
+        let card = |id: &'static str,
+                    icon_path: &'static str,
+                    title: &'static str,
+                    copy: &'static str| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_h(px(112.0))
+                .p(px(16.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(border)
+                .bg(crate::theme::ink(0.02))
+                .flex()
+                .flex_col()
+                .items_start()
+                .cursor_pointer()
+                .hover(move |s| s.bg(crate::theme::ink(0.05)).border_color(border_strong))
+                .child(
+                    icon(icon_path)
+                        .size(px(20.0))
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .mt(px(12.0))
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(text)
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .mt(px(4.0))
+                        .text_size(px(11.5))
+                        .line_height(px(16.0))
+                        .text_color(muted.opacity(0.8))
+                        .child(SharedString::from(copy)),
+                )
+        };
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(480.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_center()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(text)
+                            .child(SharedString::from("Open a surface")),
+                    )
+                    .child(
+                        div()
+                            .mt(px(4.0))
+                            .mb(px(20.0))
+                            .text_center()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(SharedString::from("Choose what to show in the right panel.")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                card(
+                                    "surface-card-terminal",
+                                    icons::TERMINAL,
+                                    "Terminal",
+                                    "Start a shell in this workspace.",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_terminal_surface(cx);
+                                })),
+                            )
+                            .child(
+                                card(
+                                    "surface-card-git",
+                                    icons::GIT_BRANCH,
+                                    "Git",
+                                    "Review changes in this checkout.",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_diff_surface(cx);
+                                })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn close_right_plus(&mut self, cx: &mut Context<Self>) {
+        if self.right_plus.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.right_plus);
+        }
+        cx.notify();
+    }
+
+    /// The titlebar strip over the right pane: one chip per surface tab
+    /// (icon · title · ✕) plus the `+` menu — the t3code RightPanelTabs bar,
+    /// living in the top row; the diff options moved into the pane below.
+    pub(crate) fn render_right_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let rows = self.right_surface_rows(cx);
+        let active = self.resolved_right_active(cx);
+        let mut strip = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .overflow_hidden();
+        for (ix, (surface, title)) in rows.into_iter().enumerate() {
+            let is_active = surface == active;
+            let icon_path = match surface {
+                RightSurface::Diff => icons::GIT_BRANCH,
+                _ => icons::TERMINAL,
+            };
+            strip = strip.child(
+                div()
+                    .id(("right-surface-tab", ix))
+                    .h(px(24.0))
+                    .max_w(px(144.0))
+                    .pl(px(7.0))
+                    .pr(px(3.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .cursor_pointer()
+                    .occlude()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                        window.prevent_default()
+                    })
+                    .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
+                    .when(!is_active, |el| {
+                        el.hover(|s| s.bg(crate::theme::wash(0.06)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_right_active(surface, cx);
+                    }))
+                    .child(icon(icon_path).size(px(12.0)).text_color(
+                        if is_active {
+                            theme.text_muted
+                        } else {
+                            theme.text_muted.opacity(0.7)
+                        },
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.5))
+                            .text_color(if is_active {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id(("right-surface-close", ix))
+                            .flex_none()
+                            .size(px(16.0))
+                            .rounded(px(4.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme.text_muted.opacity(0.5))
+                            .hover(|s| s.bg(crate::theme::wash(0.10)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_right_surface(surface, window, cx);
+                            }))
+                            .child(icon(icons::CLOSE).size(px(9.0))),
+                    ),
+            );
+        }
+        // The `+` — a small menu offering the two surfaces (t3 "Add panel
+        // surface"); mirrors the picker cards.
+        let plus_open = self.right_plus.get().is_some();
+        let plus_fade = "right-surface-add-fade";
+        let mut plus = div()
+            .id("right-surface-add")
+            .size(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                plus_fade,
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.11),
+            ))
+            .on_hover(motion::hover_listener(plus_fade))
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    window.prevent_default();
+                    this.right_plus.note_trigger_press();
+                }),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                if this.right_plus.take_press_was_open() {
+                    this.close_right_plus(cx);
+                } else {
+                    this.right_plus.open(());
+                    cx.notify();
+                }
+            }))
+            .child(
+                icon(icons::PLUS)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted),
+            );
+        if plus_open {
+            let closing = self.right_plus.closing_since();
+            let menu = popover::popover_card(&theme)
+                .w(px(168.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_right_plus(cx)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-terminal")
+                                .id("right-plus-terminal-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_terminal_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::TERMINAL)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Terminal")),
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-diff")
+                                .id("right-plus-diff-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_diff_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Git diff")),
+                        ),
+                )
+                .into_any_element();
+            plus = plus.relative().child(popover::anchored_menu_below_gap(
+                "right-plus-menu",
+                menu,
+                closing,
+                10.0,
+            ));
+        }
+        strip = strip.child(plus);
+        strip.into_any_element()
+    }
+
     /// Toggle the changes-panel takeover (the header's expand button, t3code
     /// parity): the panel grows to fill everything right of the sidebar,
     /// hiding the conversation column; toggling back restores the saved
@@ -6453,6 +6887,21 @@ mod tests {
         assert_eq!(selected.active, UtilityPane::Terminal);
         assert!(selected.changes_open);
         assert_eq!(panels.active("background"), None);
+    }
+
+    #[test]
+    fn session_panels_update_tracks_right_surfaces() {
+        let mut panels = SessionPanels::default();
+        panels.update("a", |p| {
+            p.diff_open = true;
+            p.right_active = RightSurface::Diff;
+        });
+        assert!(panels.get("a").diff_open);
+        assert_eq!(panels.get("a").right_active, RightSurface::Diff);
+        // Other chats keep the picker default.
+        assert_eq!(panels.get("b").right_active, RightSurface::Picker);
+        panels.update("a", |p| p.right_active = RightSurface::Terminal(7));
+        assert_eq!(panels.get("a").right_active, RightSurface::Terminal(7));
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----
