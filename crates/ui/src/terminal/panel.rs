@@ -382,11 +382,11 @@ impl TerminalPanel {
     }
 
     /// Close the selected chat's tab `key` (surface-tab ✕).
-    pub fn close_tab_by_key(&mut self, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn close_tab_by_key(&mut self, key: u64, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
-        self.close_tab(&chat, key, window, cx);
+        self.close_tab(&chat, key, cx);
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -1338,10 +1338,14 @@ impl Render for TerminalPanel {
         if self.drag.is_some() && !cx.has_active_drag() {
             self.drag = None;
         }
+        // Embedded, the RIGHT PANE's own surface shows through — a second
+        // fill here stacked another shade on the pane (user report); the
+        // drawer keeps its own tone.
+        let panel_bg: Option<gpui::Hsla> = (!self.embedded).then(|| terminal_panel_bg(&theme));
         let Some(_chat) = self.selected_chat(cx) else {
             return div()
                 .size_full()
-                .bg(terminal_panel_bg(&theme))
+                .when_some(panel_bg, |el, bg| el.bg(bg))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1356,7 +1360,7 @@ impl Render for TerminalPanel {
             .size_full()
             .flex()
             .flex_col()
-            .bg(terminal_panel_bg(&theme))
+            .when_some(panel_bg, |el, bg| el.bg(bg))
             .child(
                 div()
                     .id("terminal-body")
