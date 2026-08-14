@@ -234,7 +234,6 @@ impl EngineCore {
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
-            edge.clone(),
         );
         // A recorded local→synced import grants this account the local
         // profile's uploads root read-only — transcripts imported earlier
@@ -460,7 +459,6 @@ impl EngineCore {
         if let Some(updater) = updater {
             updater.shutdown().await;
         }
-        self.uploads.shutdown().await;
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
