@@ -50,7 +50,7 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN, KeymapConfig,
+    CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN, KeymapConfig,
     RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
     SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
@@ -234,6 +234,13 @@ impl SettingsSection {
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+}
+
+/// Maximum requested width the right pane may occupy while retaining the
+/// conversation floor. The responsive multi-column allocator applies the
+/// final live constraint when Details is also open.
+fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
+    (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
 }
 
 /// The active body in the shared right-side utility tab strip.
@@ -2760,8 +2767,12 @@ impl Shell {
         // No arbitrary percentage or pixel ceiling: persist the requested
         // width, while the responsive target arbitrates the live main/details
         // column budget.
-        let max = (viewport - self.sidebar_target()).max(RIGHT_PANE_MIN);
-        self.settings.right_pane_width = width.clamp(RIGHT_PANE_MIN, max);
+        let max = right_pane_max_width(viewport, self.sidebar_target());
+        self.settings.right_pane_width = if max >= RIGHT_PANE_MIN {
+            width.clamp(RIGHT_PANE_MIN, max)
+        } else {
+            max
+        };
         self.right_tween = None;
         self.schedule_save(cx);
         cx.notify();
@@ -8761,6 +8772,16 @@ mod tests {
     fn workers_mode_hides_orchestrator_content() {
         assert!(SidebarMode::Orchestrator.shows_orchestrator_content());
         assert!(!SidebarMode::Workers.shows_orchestrator_content());
+    }
+
+    #[test]
+    fn right_pane_ceiling_preserves_the_chat_floor() {
+        assert_eq!(right_pane_max_width(1200.0, 256.0), 644.0);
+        assert_eq!(1200.0 - 256.0 - 644.0, CHAT_PANEL_MIN);
+        // The chat floor wins over the right pane's preferred 360px minimum
+        // when the whole window is unusually narrow.
+        assert_eq!(right_pane_max_width(800.0, 256.0), 244.0);
+        assert_eq!(800.0 - 256.0 - 244.0, CHAT_PANEL_MIN);
     }
 
     #[tokio::test]

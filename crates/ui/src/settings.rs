@@ -26,9 +26,12 @@ pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
 /// Shared right utility pane drag-resize floor and default (px). Its runtime
-/// maximum follows the viewport and adjacent columns.
+/// maximum is the window space remaining after the left sidebar and the
+/// conversation's [`CHAT_PANEL_MIN`] reservation.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+/// Minimum width retained for the conversation when the right pane is open.
+pub const CHAT_PANEL_MIN: f32 = 300.0;
 
 /// Unified Details / Files sidebar bounds (Orchestrator.dev parity).
 pub const DETAILS_SIDEBAR_MIN: f32 = 300.0;
