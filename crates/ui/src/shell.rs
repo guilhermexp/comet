@@ -5363,13 +5363,17 @@ impl Shell {
                                     this.add_terminal_surface(cx);
                                 })),
                             )
-                            .child(
-                                row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.add_diff_surface(cx);
-                                    }),
-                                ),
-                            ),
+                            // Git only where there IS git — the pane itself
+                            // no longer gates on it (terminals work anywhere).
+                            .when(self.space_git_detected(cx), |el| {
+                                el.child(
+                                    row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.add_diff_surface(cx);
+                                        }),
+                                    ),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -6722,13 +6726,11 @@ impl Render for Shell {
         let root = match self.splash {
             SplashPhase::Visible => {
                 let theme = Theme::of(cx).clone();
-                let view = cx.entity_id();
-                root.child(loaders::splash_overlay(&theme, false, view, cx))
+                root.child(loaders::splash_overlay(&theme, false))
             }
             SplashPhase::FadingOut => {
                 let theme = Theme::of(cx).clone();
-                let view = cx.entity_id();
-                root.child(loaders::splash_overlay(&theme, true, view, cx))
+                root.child(loaders::splash_overlay(&theme, true))
             }
             SplashPhase::Gone => root,
         };
