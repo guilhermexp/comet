@@ -243,6 +243,12 @@ fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
     (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
 }
 
+/// Width available to a right-pane takeover. The conversation yields while
+/// Details, when open, remains part of the expanded column allocation.
+fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
+    (viewport - sidebar).max(0.0)
+}
+
 /// The active body in the shared right-side utility tab strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UtilityPane {
@@ -363,7 +369,7 @@ fn expanded_right_column_widths(
     details_open: bool,
     requested_details: f32,
 ) -> (f32, f32) {
-    let budget = (viewport - sidebar).max(0.0);
+    let budget = right_pane_takeover_width(viewport, sidebar);
     if budget < RIGHT_PANE_MIN {
         return (0.0, 0.0);
     }
@@ -8782,6 +8788,12 @@ mod tests {
         // when the whole window is unusually narrow.
         assert_eq!(right_pane_max_width(800.0, 256.0), 244.0);
         assert_eq!(800.0 - 256.0 - 244.0, CHAT_PANEL_MIN);
+    }
+
+    #[test]
+    fn right_pane_takeover_consumes_the_chat_column() {
+        assert_eq!(right_pane_takeover_width(1200.0, 256.0), 944.0);
+        assert_eq!(1200.0 - 256.0 - 944.0, 0.0);
     }
 
     #[tokio::test]
