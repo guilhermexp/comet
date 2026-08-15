@@ -69,6 +69,8 @@ icon_assets![
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
     (DIFF, "diff"),
+    // Provider-neutral pull-request glyph, drawn in the same linear family.
+    (PULL_REQUEST, "pull-request"),
     // Compact history-ref glyphs, drawn in the same linear style.
     (CLOUD, "cloud"),
     (TAG, "tag"),
