@@ -206,6 +206,19 @@ pub enum UtilityPane {
     Changes,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SidebarMode {
+    #[default]
+    Orchestrator,
+    Workers,
+}
+
+impl SidebarMode {
+    fn shows_orchestrator_content(self) -> bool {
+        matches!(self, Self::Orchestrator)
+    }
+}
+
 /// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
 /// kinds): a git-diff page (each tab its own [`Changes`] viewer — multiple
 /// diff panels, user request) or one embedded terminal keyed by its
@@ -865,6 +878,9 @@ pub struct Shell {
     right_tab_scroll: gpui::ScrollHandle,
     /// Chat outlet vs settings pages.
     route: Route,
+    /// Session-local top-level sidebar content. Workers is intentionally empty
+    /// until its dedicated UI is introduced.
+    sidebar_mode: SidebarMode,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
@@ -1099,6 +1115,7 @@ impl Shell {
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
+            sidebar_mode: SidebarMode::default(),
             nav,
             devices_page: None,
             archived_page: None,
@@ -3083,11 +3100,100 @@ impl Shell {
         )
     }
 
+    fn render_sidebar_mode_button(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        mode: SidebarMode,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.sidebar_mode == mode;
+        let hover_bg = if selected {
+            theme.bg
+        } else {
+            theme.glass_hover()
+        };
+
+        div()
+            .id(id)
+            .h_full()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(9.0))
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(if selected {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .cursor_pointer()
+            .when(selected, |el| {
+                el.bg(theme.bg)
+                    .border_1()
+                    .border_color(theme.border.opacity(0.7))
+            })
+            .hover(move |el| el.bg(hover_bg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.sidebar_mode != mode {
+                    this.sidebar_mode = mode;
+                    cx.notify();
+                }
+            }))
+            .child(SharedString::from(label))
+            .into_any_element()
+    }
+
+    fn render_sidebar_mode_switcher(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let orchestrator = self.render_sidebar_mode_button(
+            "sidebar-mode-orchestrator",
+            "Orchestrator",
+            SidebarMode::Orchestrator,
+            theme,
+            cx,
+        );
+        let workers = self.render_sidebar_mode_button(
+            "sidebar-mode-workers",
+            "Workers",
+            SidebarMode::Workers,
+            theme,
+            cx,
+        );
+
+        div()
+            .id("sidebar-mode-switcher")
+            .h(px(40.0))
+            .mx(px(Theme::SPACE_LG))
+            .mt(px(Theme::SPACE_SM))
+            .mb(px(Theme::SPACE_MD))
+            .p(px(3.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(12.0))
+            .bg(theme.surface_raised.opacity(0.55))
+            .child(orchestrator)
+            .child(workers)
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let inner: AnyElement = match self.route {
-            Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+        let switcher = self.render_sidebar_mode_switcher(&theme, cx);
+        let inner: Option<AnyElement> = if self.sidebar_mode.shows_orchestrator_content() {
+            Some(match self.route {
+                Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
+                Route::Chat => self.render_chat_sidebar(&theme, cx),
+            })
+        } else {
+            None
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -3098,9 +3204,15 @@ impl Shell {
             self.sidebar_tween,
             target,
             div()
+                .w(px(self.settings.sidebar_width))
                 .h_full()
                 .pt(px(Theme::TITLEBAR_HEIGHT))
-                .child(inner)
+                .flex()
+                .flex_col()
+                .child(switcher)
+                .when_some(inner, |el, content| {
+                    el.child(div().flex_1().min_h_0().child(content))
+                })
                 .into_any_element(),
         )
     }
@@ -6786,6 +6898,17 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_mode_defaults_to_orchestrator() {
+        assert_eq!(SidebarMode::default(), SidebarMode::Orchestrator);
+    }
+
+    #[test]
+    fn workers_mode_hides_orchestrator_content() {
+        assert!(SidebarMode::Orchestrator.shows_orchestrator_content());
+        assert!(!SidebarMode::Workers.shows_orchestrator_content());
+    }
 
     #[tokio::test]
     async fn remote_shutdown_waits_for_ipc_release() {
