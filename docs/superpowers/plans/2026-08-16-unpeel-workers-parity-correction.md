@@ -112,5 +112,5 @@ GPUI Workers root. Preserve the existing Orchestrator branch.
   rebuild, and recapture final evidence.
 - [x] Smoke the real canonical home without destructive mutation.
 - [x] Switch to Orchestrator and verify its original surface remains intact.
-- [ ] Request final code review, fix actionable findings, commit the correction,
+- [x] Complete final code review, fix the stale shell comment, commit the correction,
   and leave the verified dev app running.
