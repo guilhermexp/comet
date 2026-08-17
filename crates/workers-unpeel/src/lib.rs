@@ -477,6 +477,30 @@ pub struct WorkersViewport {
     pub cols: u16,
     pub rows: u16,
     pub ansi: Vec<u8>,
+    pub input_modes: WorkersViewportInputModes,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkersViewportInputModes {
+    pub known: bool,
+    pub mouse_reporting: bool,
+    pub mouse_button_motion: bool,
+    pub mouse_any_motion: bool,
+    pub alternate_screen: bool,
+    pub mouse_alternate_scroll: bool,
+    pub application_cursor: bool,
+}
+
+fn viewport_input_modes(snapshot: &TerminalViewportSnapshot) -> WorkersViewportInputModes {
+    WorkersViewportInputModes {
+        known: snapshot.input_modes_known,
+        mouse_reporting: snapshot.mouse_reporting,
+        mouse_button_motion: snapshot.mouse_button_motion,
+        mouse_any_motion: snapshot.mouse_any_motion,
+        alternate_screen: snapshot.alternate_screen,
+        mouse_alternate_scroll: snapshot.mouse_alternate_scroll,
+        application_cursor: snapshot.application_cursor,
+    }
 }
 
 fn color_sgr(color: &str, foreground: bool) -> Option<String> {
@@ -788,6 +812,7 @@ impl LocalWorkersClient {
             cols: snapshot.cols,
             rows: snapshot.rows,
             ansi,
+            input_modes: viewport_input_modes(&snapshot),
         })
     }
 
@@ -2287,7 +2312,7 @@ mod terminal_viewport_tests {
         TerminalViewportRow, TerminalViewportSnapshot, TerminalViewportStyleRun,
     };
 
-    use super::viewport_snapshot_to_ansi;
+    use super::{WorkersViewportInputModes, viewport_input_modes, viewport_snapshot_to_ansi};
 
     fn snapshot(rows: Vec<TerminalViewportRow>) -> TerminalViewportSnapshot {
         TerminalViewportSnapshot {
@@ -2338,6 +2363,24 @@ mod terminal_viewport_tests {
         assert!(ansi.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?7l\x1b[1;1H"));
         assert!(welcome < directory);
         assert!(ansi.ends_with(b"\x1b[?7h\x1b[?1h\x1b[2;3H"));
+    }
+
+    #[test]
+    fn ghostty_input_modes_are_forwarded_without_ansi_inference() {
+        let snapshot = snapshot(Vec::new());
+
+        assert_eq!(
+            viewport_input_modes(&snapshot),
+            WorkersViewportInputModes {
+                known: true,
+                mouse_reporting: false,
+                mouse_button_motion: false,
+                mouse_any_motion: false,
+                alternate_screen: true,
+                mouse_alternate_scroll: false,
+                application_cursor: true,
+            }
+        );
     }
 
     #[test]
