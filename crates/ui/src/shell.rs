@@ -60,7 +60,7 @@ use crate::state::{
 };
 use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, ToggleTerminal};
 use crate::theme::Theme;
-use crate::transcript::{self, Transcript};
+use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workers::model::{WorkersModel, WorkersRoute};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
 use crate::workers::session_gallery;
@@ -386,6 +386,9 @@ pub enum RightSurface {
     Diff(u64),
     Terminal(u64),
     Preview(u64),
+    /// A subagent's transcript, read-only (per-subagent viz) — the handle
+    /// keys [`Shell::subagent_tabs`].
+    Subagent(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,6 +1032,18 @@ struct OrgGateUi {
     _events: Subscription,
 }
 
+/// One right-pane subagent tab: the doc it shows, its strip title, and the
+/// read-only transcript entity whose drop tears the view down.
+struct SubagentTab {
+    doc_id: String,
+    title: SharedString,
+    transcript: Entity<Transcript>,
+    /// Keeps a frozen-blob fetch alive (it falls back to a live doc watch).
+    _fetch: Option<Task<()>>,
+    /// Spawn chips INSIDE the subagent transcript open their own tabs.
+    _events: Subscription,
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -1073,6 +1088,10 @@ pub struct Shell {
     diff_seq: u64,
     preview_surfaces: std::collections::HashMap<u64, PreviewSurfaceInfo>,
     preview_seq: u64,
+    /// Subagent transcript surfaces by id — each tab a read-only
+    /// [`Transcript`] pinned to its subagent doc.
+    subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
+    subagent_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1227,6 +1246,8 @@ pub struct Shell {
     _state_observation: Subscription,
     _workers_observation: Subscription,
     _composer_events: Subscription,
+    /// The primary transcript's spawn-chip events (subagent tabs).
+    _transcript_events: Subscription,
 }
 
 impl Shell {
@@ -1275,6 +1296,8 @@ impl Shell {
                 }
             }
         });
+        // Spawn chips open their subagent's transcript as a right-pane tab.
+        let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -1415,6 +1438,8 @@ impl Shell {
             diff_seq: 0,
             preview_surfaces: std::collections::HashMap::new(),
             preview_seq: 0,
+            subagent_tabs: std::collections::HashMap::new(),
+            subagent_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1499,6 +1524,7 @@ impl Shell {
             _state_observation: observation,
             _workers_observation: workers_observation,
             _composer_events: composer_events,
+            _transcript_events: transcript_events,
         }
     }
 
@@ -2043,6 +2069,10 @@ impl Shell {
                         .unwrap_or(&info.relative_path);
                     (*surface, SharedString::from(title.to_string()))
                 }),
+                RightSurface::Subagent(id) => self
+                    .subagent_tabs
+                    .get(id)
+                    .map(|tab| (*surface, tab.title.clone())),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2131,6 +2161,9 @@ impl Shell {
                     });
                 }
             }
+            // The tab's feed (watch or snapshot) runs from open to close —
+            // activation needs no revalidation.
+            RightSurface::Subagent(_) => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -2269,6 +2302,126 @@ impl Shell {
         }
     }
 
+    /// Spawn-chip events from the primary transcript AND from subagent-tab
+    /// transcripts (nested spawns open their own tabs).
+    fn on_transcript_event(
+        &mut self,
+        _: Entity<Transcript>,
+        event: &TranscriptEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TranscriptEvent::OpenSubagent {
+                chat_id,
+                doc_id,
+                title,
+                frozen,
+            } => {
+                self.add_subagent_surface(chat_id.clone(), doc_id.clone(), title.clone(), *frozen, cx);
+            }
+        }
+    }
+
+    /// A spawn chip's "Open subagent": focus the existing tab for that doc,
+    /// or open one. `frozen` (subagent done/failed) tries the uploaded
+    /// transcript blob first and falls back to the live doc watch; running
+    /// subagents watch the doc directly.
+    fn add_subagent_surface(
+        &mut self,
+        chat_id: String,
+        doc_id: String,
+        title: String,
+        frozen: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // The chip lives in the conversation column — the pane it opens into
+        // may still be closed.
+        if !self.right_pane_open(cx) {
+            let from = self.right_target(cx);
+            let key = self.panel_key(cx);
+            self.panels.show_changes(&key);
+            self.finish_right_transition(from, cx);
+        }
+        if let Some((&id, _)) = self
+            .subagent_tabs
+            .iter()
+            .find(|(_, tab)| tab.doc_id == doc_id)
+        {
+            self.set_right_active(RightSurface::Subagent(id), cx);
+            return;
+        }
+        self.subagent_seq += 1;
+        let id = self.subagent_seq;
+        let transcript =
+            cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), cx));
+        let events = cx.subscribe(&transcript, Self::on_transcript_event);
+        let fetch = if frozen {
+            self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
+        } else {
+            self.state
+                .update(cx, |s, cx| s.watch_subagent_doc(doc_id.clone(), cx));
+            None
+        };
+        self.subagent_tabs.insert(
+            id,
+            SubagentTab {
+                doc_id,
+                title: title.into(),
+                transcript,
+                _fetch: fetch,
+                _events: events,
+            },
+        );
+        let key = self.panel_key(cx);
+        self.right_tabs
+            .entry(key)
+            .or_default()
+            .push(RightSurface::Subagent(id));
+        self.set_right_active(RightSurface::Subagent(id), cx);
+    }
+
+    /// Fetch a finished subagent's frozen transcript blob
+    /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
+    /// — the blob upload is best-effort engine-side.
+    fn spawn_subagent_snapshot_fetch(
+        &self,
+        chat_id: &str,
+        doc_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.state
+                .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
+            return None;
+        };
+        let blob_ref = format!("{chat_id}/{doc_id}");
+        let state = self.state.clone();
+        let doc_id = doc_id.to_string();
+        Some(cx.spawn(async move |_, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                methods::FETCH_TOOL_BLOB,
+                serde_json::json!({ "blobRef": blob_ref }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let entries: Option<Vec<zeron_doc::SessionMessageEntry>> = reply.ok().and_then(|v| {
+                let text = v.get("text")?.as_str()?.to_owned();
+                serde_json::from_str(&text).ok()
+            });
+            state.update(cx, |s, cx| {
+                match entries {
+                    Some(entries) => s.set_subagent_snapshot(doc_id, entries),
+                    None => s.watch_subagent_doc(doc_id, cx),
+                }
+                cx.notify();
+            });
+        }))
+    }
+
+    /// A surface tab's ✕. The active fallback happens naturally through
+    /// [`Self::resolved_right_active`] on the next frame.
     fn close_right_surface(
         &mut self,
         surface: RightSurface,
@@ -2303,6 +2456,14 @@ impl Shell {
                     self.file_preview.update(cx, |preview, cx| {
                         preview.close_path(&info.context_key, &info.relative_path, cx)
                     });
+                }
+            }
+            RightSurface::Subagent(id) => {
+                // Unwatch drops the watch task — that cancels the engine-side
+                // watch and unpins the subagent doc from the engine LRU.
+                if let Some(tab) = self.subagent_tabs.remove(&id) {
+                    self.state
+                        .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
             RightSurface::Picker => {}
@@ -3710,7 +3871,7 @@ impl Shell {
                         "workers-close-right-pane",
                         icons::SIDEBAR_MINIMALISTIC,
                         &theme,
-                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                        cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
                     ))
             });
             let bar = div()
@@ -3923,7 +4084,7 @@ impl Shell {
             "workers-toggle-right-pane",
             icons::SIDEBAR_MINIMALISTIC,
             theme,
-            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+            cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
         )
         .into_any_element()
     }
@@ -6930,6 +7091,10 @@ impl Shell {
                             .text_color(theme.text_muted)
                             .into_any_element()
                     }),
+                RightSurface::Subagent(_) => icon(icons::CHAT_ROUND_LINE)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
                 RightSurface::Picker => gpui::Empty.into_any_element(),
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
