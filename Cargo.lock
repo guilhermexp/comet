@@ -9499,6 +9499,7 @@ dependencies = [
 name = "zeron-workers-unpeel"
 version = "0.2.3"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "tempfile",

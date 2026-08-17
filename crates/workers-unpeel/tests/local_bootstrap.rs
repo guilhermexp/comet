@@ -48,7 +48,13 @@ fn bootstrap_reads_projects_from_the_canonical_unpeel_home()
                 "is_folder": false
             }],
             "active_project_id": "project-1",
-            "presets": [],
+            "presets": [{
+                "id": "preset-codex",
+                "label": "Codex",
+                "command": "codex",
+                "enabled": true,
+                "quick_launch": true
+            }],
             "active_tabs": {},
             "pinned_sessions": {}
         }))?,
@@ -63,6 +69,11 @@ fn bootstrap_reads_projects_from_the_canonical_unpeel_home()
     assert_eq!(snapshot.projects[0].id, "project-1");
     assert_eq!(snapshot.projects[0].name, "Workers Project");
     assert_eq!(snapshot.projects[0].path, "/tmp/workers-project");
+    assert_eq!(snapshot.projects[0].archived_session_count, 0);
+    assert_eq!(snapshot.presets.len(), 1);
+    assert_eq!(snapshot.presets[0].id, "preset-codex");
+    assert_eq!(snapshot.presets[0].command, "codex");
+    assert!(snapshot.presets[0].quick_launch);
     assert!(snapshot.sessions.is_empty());
     Ok(())
 }
