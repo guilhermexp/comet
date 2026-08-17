@@ -6,12 +6,13 @@ use zeron_workers_unpeel::{
 };
 
 use super::activity_menu::project_activity_menu;
+use super::model::WorkersSessionTarget;
 use super::presentation::{relative_age, runtime_icon_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentActivityRow {
     pub id: String,
-    pub session_id: Option<String>,
+    pub target: Option<WorkersSessionTarget>,
     pub title: String,
     pub project: String,
     pub event: String,
@@ -58,7 +59,7 @@ pub fn recent_activity_sections(
                 .into_iter()
                 .map(|row| RecentActivityRow {
                     id: format!("active:{}", row.session_id),
-                    session_id: Some(row.session_id),
+                    target: Some(WorkersSessionTarget::new(row.project_id, row.session_id)),
                     title: card_title(&row.title),
                     project: row.project,
                     event: row.status.to_owned(),
@@ -116,7 +117,8 @@ pub fn recent_activity_sections(
             .rows
             .push(RecentActivityRow {
                 id: entry.id.clone(),
-                session_id: live.map(|session| session.id.clone()),
+                target: live
+                    .map(|session| WorkersSessionTarget::new(&session.project_id, &session.id)),
                 title,
                 project,
                 event,
@@ -185,7 +187,7 @@ mod tests {
         WorkersProtocol, WorkersSession, WorkersSessionCapabilities,
     };
 
-    use super::recent_activity_sections;
+    use super::{WorkersSessionTarget, recent_activity_sections};
 
     fn session(id: &str, activity: &str) -> WorkersSession {
         WorkersSession {
@@ -261,7 +263,10 @@ mod tests {
 
         let sections = recent_activity_sections(&snapshot, 1_700_000_020_000);
         assert_eq!(sections[0].label, "Active");
-        assert_eq!(sections[0].rows[0].session_id.as_deref(), Some("busy"));
+        assert_eq!(
+            sections[0].rows[0].target,
+            Some(WorkersSessionTarget::new("project", "busy"))
+        );
         assert_eq!(
             sections
                 .iter()
@@ -271,5 +276,60 @@ mod tests {
         );
         assert_eq!(sections[1].rows[0].title, "Live idle");
         assert_eq!(sections[1].rows[0].event, "Finished 10s ago");
+    }
+
+    #[test]
+    fn recent_rows_preserve_the_exact_project_and_session_identity() {
+        let mut left = session("left-session", "working");
+        left.project_id = "project-left".to_owned();
+        left.title = "Same title".to_owned();
+        let mut right = session("right-session", "working");
+        right.project_id = "project-right".to_owned();
+        right.title = "Same title".to_owned();
+        let project = |id: &str| WorkersProject {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/tmp/{id}"),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: Default::default(),
+        };
+        let snapshot = WorkersBootstrap {
+            mac_name: "Mac".to_owned(),
+            protocol: WorkersProtocol {
+                major_version: 1,
+                minor_version: 0,
+                capabilities: Vec::new(),
+            },
+            projects: vec![project("project-left"), project("project-right")],
+            presets: Vec::new(),
+            sessions: vec![left, right],
+            activity_log: Vec::new(),
+        };
+
+        let sections = recent_activity_sections(&snapshot, 10);
+        let targets = sections[0]
+            .rows
+            .iter()
+            .map(|row| row.target.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                Some(crate::workers::model::WorkersSessionTarget::new(
+                    "project-left",
+                    "left-session",
+                )),
+                Some(crate::workers::model::WorkersSessionTarget::new(
+                    "project-right",
+                    "right-session",
+                )),
+            ]
+        );
     }
 }

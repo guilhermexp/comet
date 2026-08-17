@@ -14,7 +14,8 @@ use crate::icons::{self, icon};
 use crate::popover;
 use crate::theme::Theme;
 
-use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
+use super::archive::archive_restore_presentation;
+use super::model::{WorkersModel, WorkersRoute, WorkersSessionTarget, WorkersSettingsTab};
 use super::presentation::{
     HOSTED_SIDEBAR_TOP_PADDING, PROJECT_ROW_BASE_LEADING, SESSION_ROW_BASE_LEADING,
     SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
@@ -680,7 +681,6 @@ impl WorkersSidebar {
                 .into_any_element();
         }
         let selected = selected_session_id == Some(session.id.as_str());
-        let session_id = session.id.clone();
         let menu_session = session.clone();
         let menu_content = self.content.clone();
         let title: SharedString = if session.title.trim().is_empty() {
@@ -726,6 +726,8 @@ impl WorkersSidebar {
             .as_millis() as u64;
         let runtime_icon = runtime_icon_path(runtime_id, Some(session.command.as_str()));
         let age = relative_age(session.updated_at_unix_ms, now_ms);
+        let session_target = WorkersSessionTarget::new(&session.project_id, &session.id);
+        let menu_session_target = session_target.clone();
 
         div()
             .id(("workers-session-row", index))
@@ -744,14 +746,15 @@ impl WorkersSidebar {
             .when(selected, |el| el.bg(crate::theme::ink(0.16)))
             .hover(|el| el.bg(crate::theme::ink(0.10)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.model
-                    .update(cx, |model, cx| model.select_session(session_id.clone(), cx));
+                this.model.update(cx, |model, cx| {
+                    model.select_session_target(session_target.clone(), cx)
+                });
             }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     this.model.update(cx, |model, cx| {
-                        model.select_session(menu_session.id.clone(), cx)
+                        model.select_session_target(menu_session_target.clone(), cx)
                     });
                     menu_content.update(cx, |content, cx| {
                         content.open_session_menu(menu_session.clone(), event.position, cx)
@@ -2212,7 +2215,7 @@ impl WorkersContent {
                     .into_iter()
                     .enumerate()
                     .map(|(row_index, row)| {
-                        let session_id = row.session_id.clone().filter(|_| row.available);
+                        let target = row.target.clone().filter(|_| row.available);
                         let leading = if row.working {
                             let color = row
                                 .spinner_tint
@@ -2249,10 +2252,10 @@ impl WorkersContent {
                                 el.cursor_pointer()
                                     .hover(|el| el.bg(crate::theme::ink(0.07)))
                             })
-                            .when_some(session_id, |el, session_id| {
+                            .when_some(target, |el, target| {
                                 el.on_click(cx.listener(move |this, _, _, cx| {
                                     this.model.update(cx, |model, cx| {
-                                        model.request_session_reveal(session_id.clone(), cx)
+                                        model.request_session_reveal(target.clone(), cx)
                                     });
                                 }))
                             })
@@ -2415,18 +2418,14 @@ impl WorkersContent {
                         .into_any_element();
                 }
                 let restore_session = session.clone();
-                let resume_session = session.clone();
                 let remove_session = session.clone();
                 let title = if session.title.trim().is_empty() {
                     "Untitled session".to_owned()
                 } else {
                     session.title.clone()
                 };
-                let resume_label = if session.capabilities.resume_agent {
-                    "Resume"
-                } else {
-                    "Restart"
-                };
+                let restore = archive_restore_presentation(&session);
+                let restore_resume = restore.resume;
                 div()
                     .id(("workers-archive-row", index))
                     .min_h(px(52.0))
@@ -2479,30 +2478,10 @@ impl WorkersContent {
                             .when(busy, |el| el.opacity(0.4))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.model.update(cx, |model, cx| {
-                                    model.restore(restore_session.clone(), false, cx)
+                                    model.restore(restore_session.clone(), restore_resume, cx)
                                 });
                             }))
-                            .child("Restore"),
-                    )
-                    .child(
-                        div()
-                            .id(("workers-archive-resume", index))
-                            .h(px(27.0))
-                            .px(px(8.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted)
-                            .hover(|el| el.bg(crate::theme::ink(0.08)))
-                            .when(busy, |el| el.opacity(0.4))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.model.update(cx, |model, cx| {
-                                    model.restore(resume_session.clone(), true, cx)
-                                });
-                            }))
-                            .child(resume_label),
+                            .child(restore.label),
                     )
                     .child(
                         div()

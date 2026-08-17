@@ -44,8 +44,23 @@ pub enum WorkersRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkersRevealTarget {
     Workspace,
-    Session(String),
+    Session(WorkersSessionTarget),
     Recent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkersSessionTarget {
+    pub project_id: String,
+    pub session_id: String,
+}
+
+impl WorkersSessionTarget {
+    pub fn new(project_id: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            session_id: session_id.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +99,15 @@ pub fn sessions_for_project<'a>(
         .iter()
         .filter(|session| session.project_id == project_id && !session.archived)
         .collect()
+}
+
+pub fn resolve_session_target<'a>(
+    target: &WorkersSessionTarget,
+    sessions: &'a [WorkersSession],
+) -> Option<&'a WorkersSession> {
+    sessions
+        .iter()
+        .find(|session| session.id == target.session_id && session.project_id == target.project_id)
 }
 
 pub fn toggle_expanded(expanded: &mut HashSet<String>, project_id: &str) {
@@ -299,16 +323,12 @@ impl WorkersModel {
         &self.reveal
     }
 
-    pub fn request_session_reveal(&mut self, session_id: String, cx: &mut Context<Self>) {
+    pub fn request_session_reveal(&mut self, target: WorkersSessionTarget, cx: &mut Context<Self>) {
         self.route = WorkersRoute::Workspace;
         self.reveal.generation = self.reveal.generation.wrapping_add(1);
-        if self
-            .sessions()
-            .iter()
-            .any(|session| session.id == session_id)
-        {
-            self.select_session(session_id.clone(), cx);
-            self.reveal.target = WorkersRevealTarget::Session(session_id);
+        if resolve_session_target(&target, self.sessions()).is_some() {
+            self.select_session_target(target.clone(), cx);
+            self.reveal.target = WorkersRevealTarget::Session(target);
         } else {
             self.selected_project_id = None;
             self.selected_session_id = None;
@@ -402,21 +422,28 @@ impl WorkersModel {
     }
 
     pub fn select_session(&mut self, session_id: String, cx: &mut Context<Self>) {
-        let Some(session) = self
+        let Some(project_id) = self
             .sessions()
             .iter()
             .find(|session| session.id == session_id)
+            .map(|session| session.project_id.clone())
         else {
             return;
         };
-        let project_id = session.project_id.clone();
+        self.select_session_target(WorkersSessionTarget::new(project_id, session_id), cx);
+    }
+
+    pub fn select_session_target(&mut self, target: WorkersSessionTarget, cx: &mut Context<Self>) {
+        let Some(session) = resolve_session_target(&target, self.sessions()) else {
+            return;
+        };
         let was_unread = session.unread;
         self.pending_replacement = None;
         self.pending_launch_selection = None;
         self.reset_archive_view();
         self.route = WorkersRoute::Workspace;
-        self.selected_project_id = Some(project_id);
-        self.selected_session_id = Some(session_id);
+        self.selected_project_id = Some(target.project_id);
+        self.selected_session_id = Some(target.session_id);
         if was_unread {
             let selected = self.selected_session_id.clone().unwrap_or_default();
             self.run_unit_action(move |client| client.mark_read(&selected), cx);
@@ -1361,9 +1388,9 @@ mod tests {
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
     use super::{
-        PendingRemove, PendingReplacement, dispatch_or_queue_remove, reconcile_selection,
-        reconcile_selection_with_pending, replacement_selection, sessions_for_project,
-        toggle_expanded,
+        PendingRemove, PendingReplacement, WorkersSessionTarget, dispatch_or_queue_remove,
+        reconcile_selection, reconcile_selection_with_pending, replacement_selection,
+        resolve_session_target, sessions_for_project, toggle_expanded,
     };
 
     #[test]
@@ -1426,6 +1453,30 @@ mod tests {
         let sessions = vec![session("old", "project-a", true)];
 
         assert_eq!(reconcile_selection(None, &sessions), None);
+    }
+
+    #[test]
+    fn navigation_target_rejects_a_session_from_another_project() {
+        let sessions = vec![
+            session("same-title-a", "project-a", true),
+            session("same-title-b", "project-b", true),
+        ];
+
+        assert_eq!(
+            resolve_session_target(
+                &WorkersSessionTarget::new("project-b", "same-title-b"),
+                &sessions,
+            )
+            .map(|session| session.id.as_str()),
+            Some("same-title-b")
+        );
+        assert!(
+            resolve_session_target(
+                &WorkersSessionTarget::new("project-a", "same-title-b"),
+                &sessions,
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -21,11 +21,34 @@ pub fn restore_action(session: &WorkersSession) -> SessionAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveRestorePresentation {
+    pub label: &'static str,
+    pub resume: bool,
+}
+
+pub fn archive_restore_presentation(session: &WorkersSession) -> ArchiveRestorePresentation {
+    if session.capabilities.restart || session.capabilities.resume_agent {
+        ArchiveRestorePresentation {
+            label: "Restore & Resume",
+            resume: true,
+        }
+    } else {
+        ArchiveRestorePresentation {
+            label: "Restore",
+            resume: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use zeron_workers_unpeel::{SessionAction, WorkersSession, WorkersSessionCapabilities};
 
-    use super::{archived_sessions_for_project, restore_action};
+    use super::{
+        ArchiveRestorePresentation, archive_restore_presentation, archived_sessions_for_project,
+        restore_action,
+    };
 
     fn archived(id: &str, pinned: bool, updated_at_unix_ms: u64) -> WorkersSession {
         WorkersSession {
@@ -71,5 +94,36 @@ mod tests {
         assert_eq!(restore_action(&session), SessionAction::Restart);
         session.capabilities.resume_agent = true;
         assert_eq!(restore_action(&session), SessionAction::ResumeAgent);
+    }
+
+    #[test]
+    fn archive_exposes_exactly_one_restore_presentation() {
+        let mut session = archived("worker", false, 1);
+        assert_eq!(
+            archive_restore_presentation(&session),
+            ArchiveRestorePresentation {
+                label: "Restore",
+                resume: false,
+            }
+        );
+
+        session.capabilities.restart = true;
+        assert_eq!(
+            archive_restore_presentation(&session),
+            ArchiveRestorePresentation {
+                label: "Restore & Resume",
+                resume: true,
+            }
+        );
+
+        session.capabilities.restart = false;
+        session.capabilities.resume_agent = true;
+        assert_eq!(
+            archive_restore_presentation(&session),
+            ArchiveRestorePresentation {
+                label: "Restore & Resume",
+                resume: true,
+            }
+        );
     }
 }

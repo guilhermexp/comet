@@ -34,6 +34,7 @@ pub enum WorkersActivityRowKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersActivityRow {
+    pub project_id: String,
     pub session_id: String,
     pub title: String,
     pub project: String,
@@ -196,6 +197,7 @@ fn activity_row<'a>(
         .as_deref()
         .or(session.provider_id.as_deref());
     WorkersActivityRow {
+        project_id: session.project_id.clone(),
         session_id: session.id.clone(),
         title: session.title.clone(),
         project,

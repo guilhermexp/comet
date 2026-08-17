@@ -4,27 +4,27 @@ use std::time::Duration;
 use gpui::{Context, Entity, Global, Subscription, Task};
 
 use super::activity_menu::{WorkersActivityMenu, project_activity_menu};
-use super::model::WorkersModel;
+use super::model::{WorkersModel, WorkersSessionTarget};
 
 pub const ALL_RECENT_TAG: i64 = 10_000;
 const STATUS_ITEM_TAG: i64 = -1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuBarIntent {
-    SelectSession(String),
+    SelectSession(WorkersSessionTarget),
     ShowAllRecent,
     TogglePopover,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MenuBarBindings {
-    session_ids: Vec<String>,
+    session_targets: Vec<WorkersSessionTarget>,
 }
 
 impl MenuBarBindings {
-    pub fn new(ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn new(targets: impl IntoIterator<Item = WorkersSessionTarget>) -> Self {
         Self {
-            session_ids: ids.into_iter().map(Into::into).collect(),
+            session_targets: targets.into_iter().collect(),
         }
     }
 
@@ -37,7 +37,7 @@ impl MenuBarBindings {
         }
         usize::try_from(tag)
             .ok()
-            .and_then(|index| self.session_ids.get(index))
+            .and_then(|index| self.session_targets.get(index))
             .cloned()
             .map(MenuBarIntent::SelectSession)
     }
@@ -80,10 +80,10 @@ impl WorkersMenuBarController {
                     .update(cx, |this, cx| {
                         while let Ok(intent) = this.receiver.try_recv() {
                             match intent {
-                                MenuBarIntent::SelectSession(session_id) => {
+                                MenuBarIntent::SelectSession(target) => {
                                     this.native.close();
                                     this.model.update(cx, |model, cx| {
-                                        model.request_session_reveal(session_id, cx)
+                                        model.request_session_reveal(target, cx)
                                     });
                                     cx.activate(true);
                                 }
@@ -148,6 +148,7 @@ mod platform {
         WorkersActivityRow, WorkersActivityRowKind, WorkersMenuBarMode, menu_popover_size,
     };
     use super::{ALL_RECENT_TAG, MenuBarBindings, MenuBarIntent, STATUS_ITEM_TAG};
+    use crate::workers::model::WorkersSessionTarget;
     use crate::workers::presentation::SPINNER_FRAMES;
 
     type CGFloat = f64;
@@ -286,15 +287,15 @@ mod platform {
         pub fn update(&mut self, menu: &WorkersActivityMenu) {
             self.mode = menu.mode;
             self.frame = 0;
-            let ids = menu
+            let targets = menu
                 .blockers
                 .iter()
                 .chain(menu.jobs.iter())
                 .chain(menu.finished.iter())
-                .map(|row| row.session_id.clone());
+                .map(|row| WorkersSessionTarget::new(&row.project_id, &row.session_id));
             if let Some(mut guard) = BRIDGE.get().and_then(|bridge| bridge.lock().ok()) {
                 if let Some(bridge) = guard.as_mut() {
-                    bridge.bindings = MenuBarBindings::new(ids);
+                    bridge.bindings = MenuBarBindings::new(targets);
                 }
             }
             unsafe {
@@ -601,20 +602,27 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{ALL_RECENT_TAG, MenuBarBindings, MenuBarIntent};
+    use crate::workers::model::WorkersSessionTarget;
 
     #[test]
     fn native_tags_resolve_to_the_exact_session_intent() {
-        let bindings = MenuBarBindings::new(["session-a", "session-b"]);
+        let bindings = MenuBarBindings::new([
+            WorkersSessionTarget::new("project-a", "same-title-a"),
+            WorkersSessionTarget::new("project-b", "same-title-b"),
+        ]);
         assert_eq!(
             bindings.intent_for_tag(1),
-            Some(MenuBarIntent::SelectSession("session-b".to_owned()))
+            Some(MenuBarIntent::SelectSession(WorkersSessionTarget::new(
+                "project-b",
+                "same-title-b",
+            )))
         );
         assert_eq!(bindings.intent_for_tag(99), None);
     }
 
     #[test]
     fn all_recent_has_a_reserved_non_session_tag() {
-        let bindings = MenuBarBindings::new(["session-a"]);
+        let bindings = MenuBarBindings::new([WorkersSessionTarget::new("project-a", "session-a")]);
         assert_eq!(
             bindings.intent_for_tag(ALL_RECENT_TAG),
             Some(MenuBarIntent::ShowAllRecent)
