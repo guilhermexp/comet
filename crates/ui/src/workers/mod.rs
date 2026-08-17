@@ -3,6 +3,7 @@ pub mod archive;
 pub mod menu_bar;
 pub mod model;
 pub mod presentation;
+pub mod project_menu;
 pub mod recent;
 pub mod session_menu;
 pub mod settings;

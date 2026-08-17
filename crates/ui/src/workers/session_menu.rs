@@ -102,6 +102,8 @@ mod tests {
             worktree_branch: None,
             git_branch: None,
             archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: Default::default(),
         }
     }
 

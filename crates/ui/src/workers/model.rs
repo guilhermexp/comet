@@ -5,8 +5,9 @@ use std::time::Duration;
 use gpui::{Context, Task};
 use zeron_workers_unpeel::{
     LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch, WorkersBootstrap,
-    WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset, WorkersProject,
-    WorkersSession, WorkersSettingsSnapshot, WorkersTranscriptSettings,
+    WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
+    WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
+    WorkersSession, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
 };
 
 use super::archive::{archived_sessions_for_project, restore_action};
@@ -189,6 +190,7 @@ pub struct WorkersModel {
     pub settings_loading: bool,
     pub settings_error: Option<String>,
     pub confirming_remove_session_id: Option<String>,
+    pub confirming_remove_project: Option<WorkersProject>,
     confirming_remove_archived: bool,
     initialized_expansion: bool,
     refresh_generation: u64,
@@ -238,6 +240,7 @@ impl WorkersModel {
             settings_loading: false,
             settings_error: None,
             confirming_remove_session_id: None,
+            confirming_remove_project: None,
             confirming_remove_archived: false,
             initialized_expansion: false,
             refresh_generation: 0,
@@ -534,6 +537,204 @@ impl WorkersModel {
             },
             cx,
         );
+    }
+
+    pub fn create_group(
+        &mut self,
+        parent_project_id: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_action(
+            move |client| {
+                client.create_group(WorkersCreateGroupRequest {
+                    parent_project_id,
+                    name,
+                })
+            },
+            |model, project_id| {
+                model.expanded_project_ids.insert(project_id.clone());
+                model.selected_project_id = Some(project_id);
+                model.selected_session_id = None;
+            },
+            cx,
+        );
+    }
+
+    pub fn create_worktree(
+        &mut self,
+        project_id: String,
+        branch: String,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let parent_id = project_id.clone();
+        self.run_action(
+            move |client| {
+                client.create_worktree(WorkersCreateWorktreeRequest {
+                    project_id,
+                    branch,
+                    name,
+                    base_ref: None,
+                })
+            },
+            move |model, worktree| {
+                model.expanded_project_ids.insert(parent_id);
+                model.selected_project_id = Some(worktree.project_id);
+                model.selected_session_id = None;
+            },
+            cx,
+        );
+    }
+
+    pub fn create_worktree_and_launch(
+        &mut self,
+        project_id: String,
+        task_name: String,
+        branch: String,
+        preset_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let parent_id = project_id.clone();
+        self.run_action(
+            move |client| {
+                let launch = match preset_id {
+                    Some(preset_id) => WorkersLaunchRequest::preset(project_id.clone(), preset_id),
+                    None => WorkersLaunchRequest::terminal(project_id.clone()),
+                };
+                client.create_worktree_and_launch(
+                    WorkersCreateWorktreeRequest {
+                        project_id,
+                        branch,
+                        name: Some(task_name),
+                        base_ref: None,
+                    },
+                    launch,
+                )
+            },
+            move |model, result| {
+                model.expanded_project_ids.insert(parent_id);
+                model.expanded_project_ids.insert(result.project_id.clone());
+                model.selected_project_id = Some(result.project_id);
+                model.selected_session_id = Some(result.session_id);
+            },
+            cx,
+        );
+    }
+
+    pub fn rename_project(&mut self, project_id: String, name: String, cx: &mut Context<Self>) {
+        self.run_unit_action(
+            move |client| {
+                client.set_project_organization(
+                    &project_id,
+                    WorkersProjectOrganizationPatch {
+                        display_name: Some(name),
+                        ..Default::default()
+                    },
+                )
+            },
+            cx,
+        );
+    }
+
+    pub fn set_project_color(
+        &mut self,
+        project_id: String,
+        color_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_unit_action(
+            move |client| {
+                client.set_project_organization(
+                    &project_id,
+                    WorkersProjectOrganizationPatch {
+                        folder_color_id: Some(color_id),
+                        ..Default::default()
+                    },
+                )
+            },
+            cx,
+        );
+    }
+
+    pub fn set_project_session_sort(
+        &mut self,
+        project_id: String,
+        session_sort: WorkersSessionSort,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_unit_action(
+            move |client| {
+                client.set_project_organization(
+                    &project_id,
+                    WorkersProjectOrganizationPatch {
+                        session_sort: Some(session_sort),
+                        ..Default::default()
+                    },
+                )
+            },
+            cx,
+        );
+    }
+
+    pub fn stop_all(&mut self, sessions: Vec<WorkersSession>, cx: &mut Context<Self>) {
+        self.run_unit_action(
+            move |client| {
+                for session in sessions.into_iter().filter(WorkersSession::is_live) {
+                    client.session_action(&session.id, SessionAction::Stop)?;
+                }
+                Ok(())
+            },
+            cx,
+        );
+    }
+
+    pub fn remove_project(&mut self, project: WorkersProject, cx: &mut Context<Self>) {
+        let selected_id = project.id.clone();
+        self.run_action(
+            move |client| {
+                if project.worktree_branch.is_some() {
+                    client.remove_worktree(&project.id, false)
+                } else if project.parent_project_id.is_some() {
+                    client.remove_group(&project.id)
+                } else {
+                    client.remove_project(&project.id)
+                }
+            },
+            move |model, ()| {
+                model.expanded_project_ids.remove(&selected_id);
+                if model.selected_project_id.as_deref() == Some(&selected_id) {
+                    model.selected_project_id = None;
+                    model.selected_session_id = None;
+                }
+            },
+            cx,
+        );
+    }
+
+    pub fn request_remove_project(&mut self, project: WorkersProject, cx: &mut Context<Self>) {
+        self.confirming_remove_project = Some(project);
+        cx.notify();
+    }
+
+    pub fn cancel_remove_project(&mut self, cx: &mut Context<Self>) {
+        self.confirming_remove_project = None;
+        cx.notify();
+    }
+
+    pub fn confirm_remove_project(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.confirming_remove_project.take() else {
+            return;
+        };
+        self.remove_project(project, cx);
+    }
+
+    pub fn reveal_project(&mut self, path: String, cx: &mut Context<Self>) {
+        self.run_unit_action(move |client| client.reveal_project(&path), cx);
+    }
+
+    pub fn open_project_in_editor(&mut self, path: String, cx: &mut Context<Self>) {
+        self.run_unit_action(move |client| client.open_project_in_editor(&path), cx);
     }
 
     pub fn add_preset(&mut self, label: String, command: String, cx: &mut Context<Self>) {

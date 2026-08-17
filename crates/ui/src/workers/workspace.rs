@@ -5,7 +5,9 @@ use gpui::{
     PathPromptOptions, Pixels, Point, Render, SharedString, Subscription, Task, Window, div,
     prelude::*, px,
 };
-use zeron_workers_unpeel::{WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession};
+use zeron_workers_unpeel::{
+    WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession, WorkersSessionSort,
+};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
@@ -20,6 +22,7 @@ use super::presentation::{
     SessionIndicator, relative_age, runtime_icon_path, runtime_spinner_tint, session_indicator,
     spinner_frame,
 };
+use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
 use super::session_menu::{WorkersSessionMenuItem as SessionMenuItem, session_menu_items};
 use super::settings::WorkersSettingsView;
@@ -39,6 +42,49 @@ fn project_depth(project: &WorkersProject, projects: &[WorkersProject]) -> usize
         parent = project.parent_project_id.as_deref();
     }
     depth
+}
+
+fn worktree_branch_slug(task_name: &str) -> String {
+    let slug = task_name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .fold((String::new(), false), |(mut output, separator), ch| {
+            if ch.is_ascii_alphanumeric() {
+                if separator && !output.is_empty() {
+                    output.push('-');
+                }
+                output.push(ch);
+                (output, false)
+            } else {
+                (output, true)
+            }
+        })
+        .0;
+    if slug.is_empty() {
+        "session".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn project_folder_tint(color_id: Option<&str>, dark: bool) -> Option<gpui::Hsla> {
+    let (light, dark_color) = match color_id? {
+        "sky" => (0x2095C9, 0x7DD3FC),
+        "blue" => (0x4F73E6, 0x7EA6FF),
+        "violet" => (0x7B5BDA, 0xB79CFF),
+        "rose" => (0xD75F8F, 0xF79AC0),
+        "amber" => (0xB87511, 0xF8C86A),
+        "moss" => (0x5F9A3D, 0x9DD67A),
+        "teal" => (0x159B91, 0x64DCCB),
+        "graphite" => (0x687083, 0xB8BCC8),
+        _ => return None,
+    };
+    Some(gpui::Hsla::from(gpui::rgb(if dark {
+        dark_color
+    } else {
+        light
+    })))
 }
 
 fn project_visible(
@@ -205,13 +251,91 @@ impl WorkersSidebar {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self
+            .model
+            .read(cx)
+            .confirming_remove_project
+            .as_ref()
+            .is_some_and(|candidate| candidate.id == project.id)
+        {
+            let label = if project.worktree_branch.is_some() {
+                "Remove worktree?"
+            } else if project.parent_project_id.is_some() {
+                "Remove group?"
+            } else if sessions.is_empty() {
+                "Remove project?"
+            } else {
+                "Remove project and sessions?"
+            };
+            return div()
+                .id(("workers-project-remove-confirm", index))
+                .min_h(px(30.0))
+                .px(px(9.0))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .rounded(px(9.0))
+                .bg(crate::theme::ink(0.10))
+                .text_size(px(SIDEBAR_LABEL_SIZE))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(label)
+                .child(div().flex_1().min_w(px(4.0)))
+                .child(
+                    div()
+                        .id(("workers-project-remove-cancel", index))
+                        .h(px(22.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .bg(crate::theme::ink(0.06))
+                        .hover(|el| el.bg(crate::theme::ink(0.10)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.model
+                                .update(cx, |model, cx| model.cancel_remove_project(cx));
+                        }))
+                        .child("Cancel"),
+                )
+                .child(
+                    div()
+                        .id(("workers-project-remove-confirm-button", index))
+                        .h(px(22.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(theme.danger)
+                        .bg(theme.danger.opacity(0.15))
+                        .hover(|el| el.bg(theme.danger.opacity(0.25)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.model
+                                .update(cx, |model, cx| model.confirm_remove_project(cx));
+                        }))
+                        .child("Remove"),
+                )
+                .into_any_element();
+        }
         let project_id = project.id.clone();
         let select_project_id = project.id.clone();
         let toggle_project_id = project.id.clone();
         let project_name: SharedString = project.name.clone().into();
         let is_group = project.is_group;
         let is_child_folder = project.parent_project_id.is_some();
+        let folder_tint = project_folder_tint(
+            project.folder_color_id.as_deref(),
+            theme.appearance.is_dark(),
+        )
+        .unwrap_or(theme.text_muted);
 
+        let menu_sessions = sessions.clone();
+        let menu_project = project.clone();
+        let menu_content = self.content.clone();
         let rows = sessions
             .into_iter()
             .enumerate()
@@ -251,6 +375,9 @@ impl WorkersSidebar {
             .rev()
             .enumerate()
             .map(|(quick_index, preset)| {
+                let quick_menu_sessions = menu_sessions.clone();
+                let quick_menu_project = menu_project.clone();
+                let quick_menu_content = menu_content.clone();
                 let icon_path =
                     runtime_icon_path(preset.cli_id.as_deref(), Some(preset.command.as_str()));
                 let project_id = project.id.clone();
@@ -282,6 +409,19 @@ impl WorkersSidebar {
                             )
                         });
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                            quick_menu_content.update(cx, |content, cx| {
+                                content.open_project_menu(
+                                    quick_menu_project.clone(),
+                                    quick_menu_sessions.clone(),
+                                    event.position,
+                                    cx,
+                                )
+                            });
+                        }),
+                    )
                     .child(icon(icon_path).size(px(14.0)).text_color(theme.text_muted))
                     .into_any_element()
             })
@@ -335,7 +475,7 @@ impl WorkersSidebar {
                             icons::WORKER_FOLDER_CLOSED
                         })
                         .size(px(16.0))
-                        .text_color(theme.text_muted)
+                        .text_color(folder_tint)
                     })
                     .child(
                         div()
@@ -909,6 +1049,21 @@ struct AppendContextDialog {
     _events: Subscription,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectDialogKind {
+    Rename,
+    NewGroup,
+    NewWorktree,
+    NewWorktreeSession(Option<String>),
+}
+
+struct ProjectDialog {
+    project_id: String,
+    kind: ProjectDialogKind,
+    input: Entity<ComposerInput>,
+    _events: Subscription,
+}
+
 pub struct WorkersContent {
     model: Entity<WorkersModel>,
     terminal: Entity<WorkersTerminal>,
@@ -916,6 +1071,8 @@ pub struct WorkersContent {
     rename: Option<RenameDialog>,
     append_context: Option<AppendContextDialog>,
     session_menu: popover::Popup<(WorkersSession, Point<Pixels>)>,
+    project_menu: popover::Popup<(WorkersProject, Vec<WorkersSession>, Point<Pixels>)>,
+    project_dialog: Option<ProjectDialog>,
     transcript_task: Option<Task<()>>,
     _model_observation: Subscription,
 }
@@ -939,6 +1096,8 @@ impl WorkersContent {
             rename: None,
             append_context: None,
             session_menu: popover::Popup::default(),
+            project_menu: popover::Popup::default(),
+            project_dialog: None,
             transcript_task: None,
             _model_observation: model_observation,
         }
@@ -954,9 +1113,27 @@ impl WorkersContent {
         cx.notify();
     }
 
+    pub fn open_project_menu(
+        &mut self,
+        project: WorkersProject,
+        sessions: Vec<WorkersSession>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_menu.open((project, sessions, position));
+        cx.notify();
+    }
+
     fn close_session_menu(&mut self, cx: &mut Context<Self>) {
         if self.session_menu.begin_close() {
             popover::reap_popup(cx, |this| &mut this.session_menu);
+        }
+        cx.notify();
+    }
+
+    fn close_project_menu(&mut self, cx: &mut Context<Self>) {
+        if self.project_menu.begin_close() {
+            popover::reap_popup(cx, |this| &mut this.project_menu);
         }
         cx.notify();
     }
@@ -986,6 +1163,325 @@ impl WorkersContent {
             })
             .ok();
         }));
+    }
+
+    fn render_project_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (project, sessions, position) = self.project_menu.get()?.clone();
+        let closing = self.project_menu.closing_since();
+        let presets = self.model.read(cx).presets().to_vec();
+        let mut rows = Vec::new();
+        for (index, item) in project_menu_items(&project, &sessions)
+            .into_iter()
+            .enumerate()
+        {
+            if matches!(
+                item,
+                ProjectMenuItem::RevealInFinder | ProjectMenuItem::RemoveProject
+            ) {
+                rows.push(popover::menu_separator().into_any_element());
+            }
+            let label = match item {
+                ProjectMenuItem::Rename => "Rename",
+                ProjectMenuItem::NewSession => "New session",
+                ProjectMenuItem::FolderColor => "Folder color",
+                ProjectMenuItem::SortCustom => "Sort sessions · Custom order",
+                ProjectMenuItem::SortRecentlyUpdated => "Sort sessions · Recently updated",
+                ProjectMenuItem::NewWorktree => "New worktree…",
+                ProjectMenuItem::NewGroup => "New group…",
+                ProjectMenuItem::StopAll => "Stop all",
+                ProjectMenuItem::Archived => "Archived",
+                ProjectMenuItem::RevealInFinder => "Reveal in Finder",
+                ProjectMenuItem::OpenInEditor => "Open in editor",
+                ProjectMenuItem::RemoveWorktree => "Remove worktree",
+                ProjectMenuItem::RemoveGroup => "Remove group",
+                ProjectMenuItem::RemoveProject => "Remove project",
+            };
+            let icon_path = match item {
+                ProjectMenuItem::Rename => icons::PEN,
+                ProjectMenuItem::NewSession => icons::TERMINAL,
+                ProjectMenuItem::FolderColor => icons::FOLDER,
+                ProjectMenuItem::SortCustom | ProjectMenuItem::SortRecentlyUpdated => icons::CHECK,
+                ProjectMenuItem::NewWorktree => icons::GIT_BRANCH,
+                ProjectMenuItem::NewGroup => icons::WORKER_FOLDER_OPEN,
+                ProjectMenuItem::StopAll => icons::STOP,
+                ProjectMenuItem::Archived => icons::ARCHIVE_MINIMALISTIC,
+                ProjectMenuItem::RevealInFinder | ProjectMenuItem::OpenInEditor => icons::FOLDER,
+                ProjectMenuItem::RemoveWorktree
+                | ProjectMenuItem::RemoveGroup
+                | ProjectMenuItem::RemoveProject => icons::TRASH_BIN_MINIMALISTIC,
+            };
+            let destructive = matches!(
+                item,
+                ProjectMenuItem::RemoveWorktree
+                    | ProjectMenuItem::RemoveGroup
+                    | ProjectMenuItem::RemoveProject
+            );
+            let menu_project = project.clone();
+            let menu_sessions = sessions.clone();
+            let mut row = popover::menu_row(theme, false, format!("workers-project-menu-{index}"))
+                .id(("workers-project-menu-row", index))
+                .child(icon(icon_path).size(px(15.0)).text_color(if destructive {
+                    theme.danger
+                } else {
+                    theme.text_muted
+                }))
+                .child(SharedString::from(label));
+            if destructive {
+                row = row.text_color(theme.danger);
+            }
+            rows.push(
+                row.on_click(cx.listener(move |this, _, _, cx| {
+                    if matches!(
+                        item,
+                        ProjectMenuItem::NewSession | ProjectMenuItem::FolderColor
+                    ) {
+                        return;
+                    }
+                    this.close_project_menu(cx);
+                    match item {
+                        ProjectMenuItem::Rename => this.open_project_dialog(
+                            menu_project.clone(),
+                            ProjectDialogKind::Rename,
+                            cx,
+                        ),
+                        ProjectMenuItem::SortCustom => this.model.update(cx, |model, cx| {
+                            model.set_project_session_sort(
+                                menu_project.id.clone(),
+                                WorkersSessionSort::Custom,
+                                cx,
+                            )
+                        }),
+                        ProjectMenuItem::SortRecentlyUpdated => {
+                            this.model.update(cx, |model, cx| {
+                                model.set_project_session_sort(
+                                    menu_project.id.clone(),
+                                    WorkersSessionSort::RecentlyUpdated,
+                                    cx,
+                                )
+                            })
+                        }
+                        ProjectMenuItem::NewWorktree => this.open_project_dialog(
+                            menu_project.clone(),
+                            ProjectDialogKind::NewWorktree,
+                            cx,
+                        ),
+                        ProjectMenuItem::NewGroup => this.open_project_dialog(
+                            menu_project.clone(),
+                            ProjectDialogKind::NewGroup,
+                            cx,
+                        ),
+                        ProjectMenuItem::StopAll => this
+                            .model
+                            .update(cx, |model, cx| model.stop_all(menu_sessions.clone(), cx)),
+                        ProjectMenuItem::Archived => this.model.update(cx, |model, cx| {
+                            model.open_archive(menu_project.id.clone(), cx)
+                        }),
+                        ProjectMenuItem::RevealInFinder => this.model.update(cx, |model, cx| {
+                            model.reveal_project(menu_project.path.clone(), cx)
+                        }),
+                        ProjectMenuItem::OpenInEditor => this.model.update(cx, |model, cx| {
+                            model.open_project_in_editor(menu_project.path.clone(), cx)
+                        }),
+                        ProjectMenuItem::RemoveWorktree
+                        | ProjectMenuItem::RemoveGroup
+                        | ProjectMenuItem::RemoveProject => this.model.update(cx, |model, cx| {
+                            model.request_remove_project(menu_project.clone(), cx)
+                        }),
+                        ProjectMenuItem::NewSession | ProjectMenuItem::FolderColor => {}
+                    }
+                }))
+                .into_any_element(),
+            );
+
+            if item == ProjectMenuItem::NewSession {
+                let terminal_project = project.clone();
+                rows.push(
+                    popover::menu_row(theme, false, "workers-project-new-terminal")
+                        .id("workers-project-new-terminal-row")
+                        .pl(px(30.0))
+                        .child("Terminal")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_project_menu(cx);
+                            this.model.update(cx, |model, cx| {
+                                model.launch(
+                                    WorkersLaunchRequest::terminal(terminal_project.id.clone())
+                                        .with_optional_worktree(
+                                            terminal_project
+                                                .worktree_branch
+                                                .as_ref()
+                                                .map(|_| terminal_project.path.clone()),
+                                            terminal_project.worktree_branch.clone(),
+                                        ),
+                                    cx,
+                                )
+                            });
+                        }))
+                        .into_any_element(),
+                );
+                for (preset_index, preset) in
+                    presets.iter().filter(|preset| preset.enabled).enumerate()
+                {
+                    let preset_project = project.clone();
+                    let preset_id = preset.id.clone();
+                    rows.push(
+                        popover::menu_row(
+                            theme,
+                            false,
+                            format!("workers-project-new-preset-{preset_index}"),
+                        )
+                        .id(("workers-project-new-preset-row", preset_index))
+                        .pl(px(30.0))
+                        .child(preset.label.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_project_menu(cx);
+                            this.model.update(cx, |model, cx| {
+                                model.launch(
+                                    WorkersLaunchRequest::preset(
+                                        preset_project.id.clone(),
+                                        preset_id.clone(),
+                                    )
+                                    .with_optional_worktree(
+                                        preset_project
+                                            .worktree_branch
+                                            .as_ref()
+                                            .map(|_| preset_project.path.clone()),
+                                        preset_project.worktree_branch.clone(),
+                                    ),
+                                    cx,
+                                )
+                            });
+                        }))
+                        .into_any_element(),
+                    );
+                }
+                if project.parent_project_id.is_none() && !project.is_group {
+                    rows.push(popover::menu_separator().into_any_element());
+                    rows.push(
+                        popover::menu_row(theme, false, "workers-project-new-worktree-heading")
+                            .pl(px(30.0))
+                            .child("In a new worktree")
+                            .into_any_element(),
+                    );
+                    let worktree_terminal_project = project.clone();
+                    rows.push(
+                        popover::menu_row(theme, false, "workers-project-new-worktree-terminal")
+                            .id("workers-project-new-worktree-terminal-row")
+                            .pl(px(46.0))
+                            .child("Terminal")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_project_menu(cx);
+                                this.open_project_dialog(
+                                    worktree_terminal_project.clone(),
+                                    ProjectDialogKind::NewWorktreeSession(None),
+                                    cx,
+                                );
+                            }))
+                            .into_any_element(),
+                    );
+                    for (preset_index, preset) in
+                        presets.iter().filter(|preset| preset.enabled).enumerate()
+                    {
+                        let worktree_preset_project = project.clone();
+                        let worktree_preset_id = preset.id.clone();
+                        rows.push(
+                            popover::menu_row(
+                                theme,
+                                false,
+                                format!("workers-project-new-worktree-preset-{preset_index}"),
+                            )
+                            .id(("workers-project-new-worktree-preset-row", preset_index))
+                            .pl(px(46.0))
+                            .child(preset.label.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_project_menu(cx);
+                                this.open_project_dialog(
+                                    worktree_preset_project.clone(),
+                                    ProjectDialogKind::NewWorktreeSession(Some(
+                                        worktree_preset_id.clone(),
+                                    )),
+                                    cx,
+                                );
+                            }))
+                            .into_any_element(),
+                        );
+                    }
+                }
+                rows.push(
+                    popover::menu_row(theme, false, "workers-project-manage-presets")
+                        .id("workers-project-manage-presets-row")
+                        .pl(px(30.0))
+                        .child("Manage presets…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_project_menu(cx);
+                            this.model.update(cx, |model, cx| {
+                                model.open_settings(WorkersSettingsTab::Presets, cx)
+                            });
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if item == ProjectMenuItem::FolderColor {
+                const COLORS: [(&str, Option<&str>); 9] = [
+                    ("Default", None),
+                    ("Sky", Some("sky")),
+                    ("Blue", Some("blue")),
+                    ("Violet", Some("violet")),
+                    ("Rose", Some("rose")),
+                    ("Amber", Some("amber")),
+                    ("Moss", Some("moss")),
+                    ("Teal", Some("teal")),
+                    ("Graphite", Some("graphite")),
+                ];
+                for (color_index, (label, color_id)) in COLORS.into_iter().enumerate() {
+                    let color_project_id = project.id.clone();
+                    rows.push(
+                        popover::menu_row(
+                            theme,
+                            false,
+                            format!("workers-project-color-{color_index}"),
+                        )
+                        .id(("workers-project-color-row", color_index))
+                        .pl(px(30.0))
+                        .child(format!(
+                            "{}{}",
+                            if project.folder_color_id.as_deref() == color_id {
+                                "✓ "
+                            } else {
+                                ""
+                            },
+                            label
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_project_menu(cx);
+                            this.model.update(cx, |model, cx| {
+                                model.set_project_color(
+                                    color_project_id.clone(),
+                                    color_id.map(str::to_owned),
+                                    cx,
+                                )
+                            });
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
+        }
+        let menu = popover::popover_card(theme)
+            .id("workers-project-context-menu-card")
+            .w(px(230.0))
+            .max_h(px(540.0))
+            .overflow_y_scroll()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_project_menu(cx)))
+            .flex()
+            .flex_col()
+            .children(rows)
+            .into_any_element();
+        Some(popover::menu_at(
+            "workers-project-context-menu",
+            position,
+            menu,
+            closing,
+        ))
     }
 
     fn render_session_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1195,6 +1691,115 @@ impl WorkersContent {
             menu,
             closing,
         ))
+    }
+
+    fn open_project_dialog(
+        &mut self,
+        project: WorkersProject,
+        kind: ProjectDialogKind,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = match kind {
+            ProjectDialogKind::Rename => "Name",
+            ProjectDialogKind::NewGroup => "Group name",
+            ProjectDialogKind::NewWorktree => "Branch name",
+            ProjectDialogKind::NewWorktreeSession(_) => "What is this session working on?",
+        };
+        let input = cx.new(|cx| ComposerInput::new(placeholder, cx));
+        if matches!(kind, ProjectDialogKind::Rename) {
+            input.update(cx, |input, cx| input.set_text(project.name, cx));
+        }
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_project_dialog(cx);
+            }
+        });
+        self.project_dialog = Some(ProjectDialog {
+            project_id: project.id,
+            kind,
+            input,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn submit_project_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.project_dialog.take() else {
+            return;
+        };
+        let value = dialog.input.read(cx).text().trim().to_owned();
+        if value.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.model.update(cx, |model, cx| match dialog.kind {
+            ProjectDialogKind::Rename => model.rename_project(dialog.project_id, value, cx),
+            ProjectDialogKind::NewGroup => model.create_group(dialog.project_id, value, cx),
+            ProjectDialogKind::NewWorktree => {
+                model.create_worktree(dialog.project_id, value, None, cx)
+            }
+            ProjectDialogKind::NewWorktreeSession(preset_id) => {
+                let branch = worktree_branch_slug(&value);
+                model.create_worktree_and_launch(dialog.project_id, value, branch, preset_id, cx)
+            }
+        });
+        cx.notify();
+    }
+
+    fn render_project_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let dialog = self.project_dialog.as_ref()?;
+        let input = dialog.input.clone();
+        let (title, action) = match &dialog.kind {
+            ProjectDialogKind::Rename => ("Rename", "Rename"),
+            ProjectDialogKind::NewGroup => ("New group", "Create"),
+            ProjectDialogKind::NewWorktree => ("New worktree", "Create"),
+            ProjectDialogKind::NewWorktreeSession(_) => ("New session in worktree", "Create"),
+        };
+        let card = popover::dialog_card(&theme)
+            .child(popover::dialog_title(&theme, title))
+            .when(matches!(dialog.kind, ProjectDialogKind::NewWorktree), |el| {
+                el.child(
+                    div()
+                        .mt(px(8.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Creates or adopts the branch in Unpeel's managed worktrees folder."),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .child(popover::dialog_field(input.into_any_element())),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "workers-project-dialog-cancel")
+                            .id("workers-project-dialog-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.project_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_primary(&theme, action)
+                            .id("workers-project-dialog-save")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_project_dialog(cx)
+                            })),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("workers-project-dialog", viewport, card))
     }
 
     fn open_rename(&mut self, session: WorkersSession, cx: &mut Context<Self>) {
@@ -2169,7 +2774,9 @@ impl Render for WorkersContent {
 
         let rename_dialog = self.render_rename_dialog(window.viewport_size(), cx);
         let append_context_dialog = self.render_append_context_dialog(window.viewport_size(), cx);
+        let project_dialog = self.render_project_dialog(window.viewport_size(), cx);
         let session_menu = self.render_session_menu(&theme, cx);
+        let project_menu = self.render_project_menu(&theme, cx);
 
         div()
             .size_full()
@@ -2197,8 +2804,10 @@ impl Render for WorkersContent {
             )
             .child(workers_content_outlet().child(content))
             .when_some(session_menu, |el, menu| el.child(menu))
+            .when_some(project_menu, |el, menu| el.child(menu))
             .when_some(rename_dialog, |el, dialog| el.child(dialog))
             .when_some(append_context_dialog, |el, dialog| el.child(dialog))
+            .when_some(project_dialog, |el, dialog| el.child(dialog))
             .into_any_element()
     }
 }
@@ -2207,7 +2816,7 @@ impl Render for WorkersContent {
 mod layout_tests {
     use gpui::Styled as _;
 
-    use super::workers_content_outlet;
+    use super::{project_folder_tint, workers_content_outlet, worktree_branch_slug};
 
     #[test]
     fn workers_content_outlet_uses_only_the_remaining_vertical_space() {
@@ -2217,5 +2826,23 @@ mod layout_tests {
         assert_eq!(style.flex_grow, Some(1.0));
         assert_eq!(style.flex_shrink, Some(1.0));
         assert!(style.min_size.height.is_some());
+    }
+
+    #[test]
+    fn worktree_task_names_produce_stable_branch_slugs() {
+        assert_eq!(
+            worktree_branch_slug("Fix Workers sidebar spacing"),
+            "fix-workers-sidebar-spacing"
+        );
+        assert_eq!(worktree_branch_slug("  ---  "), "session");
+    }
+
+    #[test]
+    fn folder_palette_matches_unpeels_light_and_dark_variants() {
+        assert_ne!(
+            project_folder_tint(Some("sky"), false),
+            project_folder_tint(Some("sky"), true)
+        );
+        assert!(project_folder_tint(Some("unknown"), true).is_none());
     }
 }

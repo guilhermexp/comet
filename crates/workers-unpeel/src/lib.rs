@@ -145,6 +145,52 @@ pub struct WorkersProject {
     pub worktree_branch: Option<String>,
     pub git_branch: Option<String>,
     pub archived_session_count: usize,
+    pub folder_color_id: Option<String>,
+    pub session_sort: WorkersSessionSort,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkersSessionSort {
+    #[default]
+    Custom,
+    RecentlyUpdated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersCreateWorktreeRequest {
+    pub project_id: String,
+    pub branch: String,
+    pub name: Option<String>,
+    pub base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersCreateGroupRequest {
+    pub parent_project_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkersProjectOrganizationPatch {
+    pub display_name: Option<String>,
+    pub folder_color_id: Option<Option<String>>,
+    pub session_sort: Option<WorkersSessionSort>,
+    pub sort_order: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersWorktreeResult {
+    pub project_id: String,
+    pub path: String,
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersWorktreeLaunchResult {
+    pub project_id: String,
+    pub session_id: String,
+    pub path: String,
+    pub branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,6 +730,7 @@ impl LocalWorkersClient {
                 })
                 .unwrap_or_default(),
         };
+        apply_project_organization_overlay(&mut bootstrap.projects);
         apply_notify_when_done_overlay(&mut bootstrap.sessions);
         self.activity.enrich(&mut bootstrap.sessions);
         Ok(bootstrap)
@@ -960,6 +1007,354 @@ impl LocalWorkersClient {
             Ok(id)
         })
         .map_err(WorkersError::State)
+    }
+
+    pub fn create_group(&self, request: WorkersCreateGroupRequest) -> Result<String, WorkersError> {
+        let name = request.name.trim();
+        if name.is_empty() {
+            return Err(WorkersError::State("group name is required".into()));
+        }
+        let parent_project_id = request.parent_project_id;
+        unpeel_core::app_state::edit(|state| {
+            let projects = state
+                .get_mut("projects")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| "projects must be an array".to_string())?;
+            let parent = projects
+                .iter()
+                .find(|project| {
+                    project.get("id").and_then(Value::as_str) == Some(&parent_project_id)
+                })
+                .ok_or_else(|| format!("unknown parent project id: {parent_project_id}"))?;
+            let parent_path = parent
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let id = format!("comet-group-{}", uuid::Uuid::new_v4().simple());
+            projects.push(json!({
+                "id": id,
+                "name": name,
+                "path": parent_path,
+                "workspace_id": "personal",
+                "sort_order": projects.len() as u32,
+                "parent_project_id": parent_project_id,
+                "is_folder": true,
+            }));
+            Ok(id)
+        })
+        .map_err(WorkersError::State)
+    }
+
+    pub fn create_worktree(
+        &self,
+        request: WorkersCreateWorktreeRequest,
+    ) -> Result<WorkersWorktreeResult, WorkersError> {
+        let branch = request.branch.trim();
+        if branch.is_empty() {
+            return Err(WorkersError::State("worktree branch is required".into()));
+        }
+        let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+        let projects = state
+            .get("projects")
+            .and_then(Value::as_array)
+            .ok_or_else(|| WorkersError::State("projects must be an array".into()))?;
+        let parent = projects
+            .iter()
+            .find(|project| project.get("id").and_then(Value::as_str) == Some(&request.project_id))
+            .ok_or_else(|| {
+                WorkersError::State(format!("unknown parent project id: {}", request.project_id))
+            })?;
+        let parent_path = parent
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkersError::State("parent project path is missing".into()))?;
+        let worktree =
+            unpeel_core::worktrees::create(parent_path, branch, request.base_ref.as_deref())
+                .map_err(WorkersError::State)?;
+        let project_id = format!("comet-worktree-{}", uuid::Uuid::new_v4().simple());
+        let display_name = request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(branch)
+            .to_owned();
+        let path = worktree.path.clone();
+        let register = unpeel_core::app_state::edit(|state| {
+            let projects = state
+                .get_mut("projects")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| "projects must be an array".to_string())?;
+            projects.push(json!({
+                "id": project_id,
+                "name": display_name,
+                "path": path,
+                "workspace_id": "personal",
+                "sort_order": projects.len() as u32,
+                "parent_project_id": request.project_id,
+                "is_folder": true,
+                "worktree_branch": branch,
+            }));
+            Ok(())
+        });
+        if let Err(error) = register {
+            let _ = unpeel_core::worktrees::remove(&worktree.path, true);
+            return Err(WorkersError::State(error));
+        }
+        Ok(WorkersWorktreeResult {
+            project_id,
+            path: worktree.path,
+            branch: branch.to_owned(),
+        })
+    }
+
+    pub fn create_worktree_and_launch(
+        &self,
+        request: WorkersCreateWorktreeRequest,
+        mut launch: WorkersLaunchRequest,
+    ) -> Result<WorkersWorktreeLaunchResult, WorkersError> {
+        let worktree = self.create_worktree(request)?;
+        launch.project_id = worktree.project_id.clone();
+        launch.worktree_path = Some(worktree.path.clone());
+        launch.worktree_branch = Some(worktree.branch.clone());
+        match self.launch_session(&launch) {
+            Ok(session_id) => Ok(WorkersWorktreeLaunchResult {
+                project_id: worktree.project_id,
+                session_id,
+                path: worktree.path,
+                branch: worktree.branch,
+            }),
+            Err(error) => {
+                let _ = self.remove_worktree(&worktree.project_id, true);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn set_project_organization(
+        &self,
+        project_id: &str,
+        patch: WorkersProjectOrganizationPatch,
+    ) -> Result<(), WorkersError> {
+        let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+        let projects = state
+            .get("projects")
+            .and_then(Value::as_array)
+            .ok_or_else(|| WorkersError::State("projects must be an array".into()))?;
+        let project = projects
+            .iter()
+            .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+            .ok_or_else(|| WorkersError::State(format!("unknown project id: {project_id}")))?;
+        let parent_id = project
+            .get("parent_project_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        if let Some(display_name) = patch.display_name {
+            let display_name = display_name.trim();
+            if display_name.is_empty() {
+                return Err(WorkersError::State("project name is required".into()));
+            }
+            let is_worktree = project
+                .get("worktree_branch")
+                .and_then(Value::as_str)
+                .is_some();
+            if is_worktree {
+                rename_project_record(project_id, display_name)?;
+            } else {
+                unpeel_core::session_ops::rename_group_project(project_id, display_name)
+                    .map_err(WorkersError::State)?;
+            }
+        }
+        if let Some(folder_color_id) = patch.folder_color_id {
+            if parent_id.is_some() {
+                return Err(WorkersError::State(
+                    "only main projects can have a folder color".into(),
+                ));
+            }
+            set_project_folder_color(project_id, folder_color_id.as_deref())?;
+        }
+        if let Some(session_sort) = patch.session_sort {
+            unpeel_core::session_ops::set_session_date_sorted(
+                project_id,
+                session_sort == WorkersSessionSort::RecentlyUpdated,
+            )
+            .map_err(WorkersError::State)?;
+        }
+        if let Some(sort_order) = patch.sort_order {
+            let all_ids: Vec<String> = projects
+                .iter()
+                .filter_map(|project| project.get("id").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+            let mut sibling_ids: Vec<String> = projects
+                .iter()
+                .filter(|candidate| {
+                    candidate.get("parent_project_id").and_then(Value::as_str)
+                        == parent_id.as_deref()
+                })
+                .filter_map(|candidate| {
+                    candidate
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            let from = sibling_ids
+                .iter()
+                .position(|id| id == project_id)
+                .ok_or_else(|| WorkersError::State("project is not reorderable".into()))?;
+            let id = sibling_ids.remove(from);
+            let target = sort_order.min(sibling_ids.len());
+            sibling_ids.insert(target, id);
+            unpeel_core::session_ops::set_project_sibling_order(&sibling_ids, &all_ids)
+                .map_err(WorkersError::State)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_session_order(
+        &self,
+        project_id: &str,
+        session_ids: &[String],
+    ) -> Result<(), WorkersError> {
+        unpeel_core::session_ops::set_session_order(project_id, session_ids)
+            .map_err(WorkersError::State)
+    }
+
+    pub fn rename_worktree(&self, project_id: &str, name: &str) -> Result<(), WorkersError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(WorkersError::State("worktree name is required".into()));
+        }
+        rename_project_record(project_id, name)
+    }
+
+    pub fn remove_worktree(&self, project_id: &str, force: bool) -> Result<(), WorkersError> {
+        let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+        let project = state
+            .get("projects")
+            .and_then(Value::as_array)
+            .and_then(|projects| {
+                projects
+                    .iter()
+                    .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+            })
+            .ok_or_else(|| WorkersError::State(format!("unknown worktree id: {project_id}")))?;
+        if project
+            .get("worktree_branch")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(WorkersError::State("project is not a worktree".into()));
+        }
+        let path = project
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkersError::State("worktree path is missing".into()))?
+            .to_owned();
+        unpeel_core::worktrees::remove(&path, force).map_err(WorkersError::State)?;
+        let removed = project_tree_ids(project_id)?;
+        self.remove_sessions_in_projects(&removed)?;
+        remove_project_tree(project_id)
+    }
+
+    pub fn remove_group(&self, project_id: &str) -> Result<(), WorkersError> {
+        let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+        let project = state
+            .get("projects")
+            .and_then(Value::as_array)
+            .and_then(|projects| {
+                projects
+                    .iter()
+                    .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+            })
+            .ok_or_else(|| WorkersError::State(format!("unknown group id: {project_id}")))?;
+        let is_group = project.get("is_folder").and_then(Value::as_bool) == Some(true)
+            && project
+                .get("worktree_branch")
+                .and_then(Value::as_str)
+                .is_none()
+            && project
+                .get("parent_project_id")
+                .and_then(Value::as_str)
+                .is_some();
+        if !is_group {
+            return Err(WorkersError::State("project is not a group".into()));
+        }
+        let parent_id = project
+            .get("parent_project_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkersError::State("group parent is missing".into()))?
+            .to_owned();
+        for session in self
+            .bootstrap()?
+            .sessions
+            .into_iter()
+            .filter(|session| session.project_id == project_id)
+        {
+            unpeel_core::session_ops::set_pinned(&session.id, false)
+                .map_err(WorkersError::State)?;
+            unpeel_core::session_ops::set_project_override(&session.id, &parent_id)
+                .map_err(WorkersError::State)?;
+            unpeel_core::session_ops::archive_session(&session.id).map_err(WorkersError::State)?;
+        }
+        remove_project_record(project_id)
+    }
+
+    pub fn remove_project(&self, project_id: &str) -> Result<(), WorkersError> {
+        let removed = project_tree_ids(project_id)?;
+        self.remove_sessions_in_projects(&removed)?;
+        remove_project_tree(project_id)
+    }
+
+    fn remove_sessions_in_projects(
+        &self,
+        project_ids: &std::collections::HashSet<String>,
+    ) -> Result<(), WorkersError> {
+        for session in self
+            .bootstrap()?
+            .sessions
+            .into_iter()
+            .filter(|session| project_ids.contains(&session.project_id))
+        {
+            unpeel_core::session_ops::remove_session(&session.id).map_err(WorkersError::State)?;
+        }
+        Ok(())
+    }
+
+    pub fn reveal_project(&self, path: &str) -> Result<(), WorkersError> {
+        let status = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .status()
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| WorkersError::State("Finder could not reveal the project".into()))
+    }
+
+    pub fn open_project_in_editor(&self, path: &str) -> Result<(), WorkersError> {
+        let editor = unpeel_core::app_state::load()
+            .ok()
+            .and_then(|state| state.get("code_editor")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "code".into());
+        if std::process::Command::new(&editor)
+            .arg(path)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let status = std::process::Command::new("open")
+            .arg(path)
+            .status()
+            .map_err(|error| WorkersError::State(error.to_string()))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| WorkersError::State(format!("could not open project in {editor}")))
     }
 
     pub fn session_action(
@@ -1286,6 +1681,8 @@ struct ProjectWire {
     git_branch: Option<String>,
     #[serde(default)]
     archived_session_count: usize,
+    #[serde(default)]
+    date_sorted: bool,
 }
 
 impl From<ProjectWire> for WorkersProject {
@@ -1300,6 +1697,12 @@ impl From<ProjectWire> for WorkersProject {
             worktree_branch: value.worktree_branch,
             git_branch: value.git_branch,
             archived_session_count: value.archived_session_count,
+            folder_color_id: None,
+            session_sort: if value.date_sorted {
+                WorkersSessionSort::RecentlyUpdated
+            } else {
+                WorkersSessionSort::Custom
+            },
         }
     }
 }
@@ -1447,6 +1850,179 @@ struct ArchiveWire {
 }
 
 const NOTIFY_WHEN_DONE_OVERLAY_KEY: &str = "comet_workers_notify_when_done";
+const PROJECT_FOLDER_COLORS_KEY: &str = "comet_workers_project_folder_colors";
+
+fn apply_project_organization_overlay(projects: &mut [WorkersProject]) {
+    let Ok(state) = unpeel_core::app_state::load() else {
+        return;
+    };
+    let colors = state
+        .get(PROJECT_FOLDER_COLORS_KEY)
+        .and_then(Value::as_object);
+    for project in projects {
+        project.folder_color_id = colors
+            .and_then(|colors| colors.get(&project.id))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if unpeel_core::session_ops::session_date_sorted(&project.id) {
+            project.session_sort = WorkersSessionSort::RecentlyUpdated;
+        }
+    }
+}
+
+fn set_project_folder_color(project_id: &str, color_id: Option<&str>) -> Result<(), WorkersError> {
+    const COLORS: &[&str] = &[
+        "sky", "blue", "violet", "rose", "amber", "moss", "teal", "graphite",
+    ];
+    if color_id.is_some_and(|color| !COLORS.contains(&color)) {
+        return Err(WorkersError::State(format!(
+            "unknown folder color: {}",
+            color_id.unwrap_or_default()
+        )));
+    }
+    unpeel_core::app_state::edit(|state| {
+        let values = state
+            .entry(PROJECT_FOLDER_COLORS_KEY)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let values = values
+            .as_object_mut()
+            .ok_or_else(|| format!("{PROJECT_FOLDER_COLORS_KEY} must be an object"))?;
+        match color_id {
+            Some(color_id) => {
+                values.insert(project_id.to_owned(), Value::String(color_id.to_owned()));
+            }
+            None => {
+                values.remove(project_id);
+            }
+        }
+        Ok(())
+    })
+    .map_err(WorkersError::State)
+}
+
+fn rename_project_record(project_id: &str, name: &str) -> Result<(), WorkersError> {
+    unpeel_core::app_state::edit(|state| {
+        let projects = state
+            .get_mut("projects")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "projects must be an array".to_string())?;
+        let project = projects
+            .iter_mut()
+            .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+            .ok_or_else(|| format!("unknown project id: {project_id}"))?;
+        project["name"] = Value::String(name.to_owned());
+        Ok(())
+    })
+    .map_err(WorkersError::State)
+}
+
+fn remove_project_record(project_id: &str) -> Result<(), WorkersError> {
+    unpeel_core::app_state::edit(|state| {
+        let projects = state
+            .get_mut("projects")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "projects must be an array".to_string())?;
+        let before = projects.len();
+        projects.retain(|project| project.get("id").and_then(Value::as_str) != Some(project_id));
+        if projects.len() == before {
+            return Err(format!("unknown project id: {project_id}"));
+        }
+        if let Some(colors) = state
+            .get_mut(PROJECT_FOLDER_COLORS_KEY)
+            .and_then(Value::as_object_mut)
+        {
+            colors.remove(project_id);
+        }
+        if let Some(modes) = state
+            .get_mut("session_sort_modes")
+            .and_then(Value::as_object_mut)
+        {
+            modes.remove(project_id);
+        }
+        Ok(())
+    })
+    .map_err(WorkersError::State)
+}
+
+fn remove_project_tree(project_id: &str) -> Result<(), WorkersError> {
+    unpeel_core::app_state::edit(|state| {
+        let projects = state
+            .get_mut("projects")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "projects must be an array".to_string())?;
+        if !projects
+            .iter()
+            .any(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+        {
+            return Err(format!("unknown project id: {project_id}"));
+        }
+        let mut removed = std::collections::HashSet::from([project_id.to_owned()]);
+        loop {
+            let before = removed.len();
+            for project in projects.iter() {
+                if project
+                    .get("parent_project_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|parent| removed.contains(parent))
+                {
+                    if let Some(id) = project.get("id").and_then(Value::as_str) {
+                        removed.insert(id.to_owned());
+                    }
+                }
+            }
+            if removed.len() == before {
+                break;
+            }
+        }
+        projects.retain(|project| {
+            project
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !removed.contains(id))
+        });
+        for key in [PROJECT_FOLDER_COLORS_KEY, "session_sort_modes"] {
+            if let Some(map) = state.get_mut(key).and_then(Value::as_object_mut) {
+                map.retain(|id, _| !removed.contains(id));
+            }
+        }
+        Ok(())
+    })
+    .map_err(WorkersError::State)
+}
+
+fn project_tree_ids(project_id: &str) -> Result<std::collections::HashSet<String>, WorkersError> {
+    let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+    let projects = state
+        .get("projects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorkersError::State("projects must be an array".into()))?;
+    if !projects
+        .iter()
+        .any(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
+    {
+        return Err(WorkersError::State(format!(
+            "unknown project id: {project_id}"
+        )));
+    }
+    let mut removed = std::collections::HashSet::from([project_id.to_owned()]);
+    loop {
+        let before = removed.len();
+        for project in projects {
+            if project
+                .get("parent_project_id")
+                .and_then(Value::as_str)
+                .is_some_and(|parent| removed.contains(parent))
+            {
+                if let Some(id) = project.get("id").and_then(Value::as_str) {
+                    removed.insert(id.to_owned());
+                }
+            }
+        }
+        if removed.len() == before {
+            return Ok(removed);
+        }
+    }
+}
 
 fn apply_notify_when_done_overlay(sessions: &mut [WorkersSession]) {
     let Ok(state) = unpeel_core::app_state::load() else {
