@@ -447,6 +447,7 @@ pub struct WorkersSession {
     pub provider_id: Option<String>,
     pub active_runtime_id: Option<String>,
     pub runtime_launch_pending: bool,
+    pub runtime_generation: u64,
     pub notify_when_done: bool,
     pub terminal_background_hex: Option<String>,
     pub worktree_branch: Option<String>,
@@ -680,6 +681,12 @@ impl LocalWorkersClient {
             activity: activity_bridge::shared_activity_bridge(),
             last_displayed_grid: shared_displayed_grid(),
         }
+    }
+
+    /// Monotonic signal updated as soon as a lifecycle hook is accepted.
+    /// The UI can refresh immediately without inferring activity from time.
+    pub fn activity_epoch(&self) -> u64 {
+        self.activity.change_epoch()
     }
 
     /// Keep the most recently painted terminal grid available to the model's
@@ -1810,6 +1817,7 @@ impl From<SessionWire> for WorkersSession {
             provider_id: value.provider_id,
             active_runtime_id: value.active_runtime_id,
             runtime_launch_pending: value.runtime_launch_pending,
+            runtime_generation: 0,
             notify_when_done: value.notify_when_done,
             terminal_background_hex: value.terminal_background_hex,
             worktree_branch: value.worktree_branch,

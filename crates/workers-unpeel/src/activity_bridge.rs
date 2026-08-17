@@ -15,6 +15,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
@@ -44,19 +45,26 @@ struct HookIngress {
 pub(crate) struct ActivityBridge {
     engine: Mutex<ActivityEngine>,
     ingress: Option<HookIngress>,
+    change_epoch: Arc<AtomicU64>,
 }
 
 impl ActivityBridge {
     fn start() -> Arc<Self> {
-        let ingress = start_hook_ingress().ok();
+        let change_epoch = Arc::new(AtomicU64::new(0));
+        let ingress = start_hook_ingress(Arc::clone(&change_epoch)).ok();
         Arc::new(Self {
             engine: Mutex::new(ActivityEngine::default()),
             ingress,
+            change_epoch,
         })
     }
 
     pub(crate) fn hook_port(&self) -> Option<u16> {
         self.ingress.as_ref().map(|ingress| ingress.port)
+    }
+
+    pub(crate) fn change_epoch(&self) -> u64 {
+        self.change_epoch.load(Ordering::Acquire)
     }
 
     pub(crate) fn enrich(&self, sessions: &mut [WorkersSession]) {
@@ -90,14 +98,15 @@ impl ActivityBridge {
         engine.retain_sessions(&live_ids);
         let now = SystemTime::now();
         for session in sessions {
-            if session.state != "running" {
-                continue;
-            }
             let Some(manifest) = unpeel_core::session_host::load_manifest(&session.id) else {
                 continue;
             };
+            session.runtime_generation = manifest.runtime_launch_generation;
+            if session.state != "running" {
+                continue;
+            }
             let session_dir = unpeel_core::session_host::session_dir(&session.id);
-            session.activity = derive_activity(
+            let derived = derive_activity(
                 &mut engine,
                 ActivityInput {
                     session_id: &session.id,
@@ -113,14 +122,16 @@ impl ActivityBridge {
                     session_dir: &session_dir,
                 },
                 now,
-            )
-            .to_owned();
+            );
+            session.activity =
+                merge_derived_activity(&session.activity, session.unread, derived).to_owned();
         }
     }
 
     pub(crate) fn clear_attention(&self, session_id: &str) {
         let mut engine = self.engine.lock().unwrap_or_else(|lock| lock.into_inner());
         engine.apply_hook_event(session_id, "Stop", None, SystemTime::now());
+        self.change_epoch.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -212,6 +223,14 @@ fn derive_activity(
     }
 }
 
+fn merge_derived_activity<'a>(wire_activity: &'a str, unread: bool, derived: &'a str) -> &'a str {
+    if wire_activity == "done" && unread && derived == "idle" {
+        wire_activity
+    } else {
+        derived
+    }
+}
+
 fn registry_path() -> PathBuf {
     unpeel_core::app_paths::unpeel_home().join("app-ports")
 }
@@ -273,7 +292,7 @@ fn update_registry(port: u16, register: bool) {
     }
 }
 
-fn start_hook_ingress() -> Result<HookIngress, String> {
+fn start_hook_ingress(change_epoch: Arc<AtomicU64>) -> Result<HookIngress, String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|error| format!("hook listener bind: {error}"))?;
     let port = listener
@@ -285,7 +304,8 @@ fn start_hook_ingress() -> Result<HookIngress, String> {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let sender = sender.clone();
-            std::thread::spawn(move || handle_connection(stream, &sender));
+            let change_epoch = Arc::clone(&change_epoch);
+            std::thread::spawn(move || handle_connection(stream, &sender, &change_epoch));
         }
     });
     Ok(HookIngress {
@@ -302,7 +322,7 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     );
 }
 
-fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>) {
+fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>, change_epoch: &AtomicU64) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut buffer = Vec::new();
@@ -407,16 +427,21 @@ fn handle_connection(mut stream: TcpStream, events: &Sender<HookEvent>) {
         respond(&mut stream, "200 OK", r#"{"ok":true}"#);
         return;
     }
-    let _ = events.send(HookEvent {
-        session_id: session_id.to_owned(),
-        event_name: event_name.to_owned(),
-        tool_name: json
-            .get("tool_name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        runtime_generation,
-        received_at,
-    });
+    if events
+        .send(HookEvent {
+            session_id: session_id.to_owned(),
+            event_name: event_name.to_owned(),
+            tool_name: json
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            runtime_generation,
+            received_at,
+        })
+        .is_ok()
+    {
+        change_epoch.fetch_add(1, Ordering::Release);
+    }
     respond(&mut stream, "200 OK", r#"{"ok":true}"#);
 }
 
@@ -520,5 +545,19 @@ mod tests {
         let mut activity = input("s1", "pi", directory.path(), 1);
         activity.menu_prompt_active = true;
         assert_eq!(derive_activity(&mut engine, activity, now), "blocked");
+    }
+
+    #[test]
+    fn authoritative_unread_completion_survives_idle_hook_state() {
+        assert_eq!(merge_derived_activity("done", true, "idle"), "done");
+    }
+
+    #[test]
+    fn live_hook_state_replaces_non_terminal_wire_activity() {
+        assert_eq!(
+            merge_derived_activity("working", false, "blocked"),
+            "blocked"
+        );
+        assert_eq!(merge_derived_activity("done", false, "idle"), "idle");
     }
 }

@@ -11,6 +11,9 @@ use zeron_workers_unpeel::{
 };
 
 use super::archive::{archived_sessions_for_project, restore_action};
+use super::notification_policy::{
+    NotificationSample, NotificationState, WorkerNotification, reduce_notification,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkersSettingsTab {
@@ -49,28 +52,6 @@ pub enum WorkersRevealTarget {
 pub struct WorkersReveal {
     pub generation: u64,
     pub target: WorkersRevealTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerNotification {
-    Attention,
-    Done,
-}
-
-pub fn notification_transition(
-    previous: Option<(&str, bool)>,
-    activity: &str,
-    unread: bool,
-) -> Option<WorkerNotification> {
-    let was_attention = previous.is_some_and(|(activity, _)| activity == "blocked");
-    let was_done = previous.is_some_and(|(activity, unread)| activity == "done" && unread);
-    if activity == "blocked" && !was_attention {
-        Some(WorkerNotification::Attention)
-    } else if activity == "done" && unread && !was_done {
-        Some(WorkerNotification::Done)
-    } else {
-        None
-    }
 }
 
 pub fn reconcile_selection(current: Option<&str>, sessions: &[WorkersSession]) -> Option<String> {
@@ -204,23 +185,40 @@ pub struct WorkersModel {
     archive_task: Option<Task<()>>,
     settings_generation: u64,
     settings_task: Option<Task<()>>,
-    notification_state: HashMap<String, (String, bool)>,
+    notification_state: HashMap<String, NotificationState>,
     pending_replacement: Option<PendingReplacement>,
     _poll_task: Task<()>,
 }
 
 impl WorkersModel {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let client = LocalWorkersClient::new();
+        let poll_client = client.clone();
         let poll_task = cx.spawn(async move |this, cx| {
+            let mut observed_epoch = poll_client.activity_epoch();
+            let mut recovery_ticks = 0_u8;
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(125))
+                    .await;
+                recovery_ticks = recovery_ticks.wrapping_add(1);
+                let current_epoch = poll_client.activity_epoch();
+                let hook_changed = current_epoch != observed_epoch;
+                let recovery_due = recovery_ticks >= 8;
+                if !hook_changed && !recovery_due {
+                    continue;
+                }
+                observed_epoch = current_epoch;
+                if recovery_due {
+                    recovery_ticks = 0;
+                }
                 if this.update(cx, |model, cx| model.refresh(cx)).is_err() {
                     break;
                 }
             }
         });
         let mut model = Self {
-            client: LocalWorkersClient::new(),
+            client,
             snapshot: None,
             selected_project_id: None,
             selected_session_id: None,
@@ -1113,13 +1111,18 @@ impl WorkersModel {
             .map(|settings| settings.notifications.clone())
             .unwrap_or_default();
         for session in &snapshot.sessions {
-            let previous = self
-                .notification_state
-                .get(&session.id)
-                .map(|(activity, unread)| (activity.as_str(), *unread));
-            if let Some(notification) =
-                notification_transition(previous, &session.activity, session.unread)
-            {
+            let (next_state, notification) = reduce_notification(
+                self.notification_state.get(&session.id),
+                NotificationSample {
+                    generation: session.runtime_generation,
+                    activity: &session.activity,
+                    unread: session.unread,
+                    notify_when_done: session.notify_when_done,
+                },
+            );
+            self.notification_state
+                .insert(session.id.clone(), next_state);
+            if let Some(notification) = notification {
                 let (title, body, sound) = match notification {
                     WorkerNotification::Attention => (
                         "Worker needs attention",
@@ -1134,27 +1137,26 @@ impl WorkersModel {
                 };
                 let allowed = !matches!(notification, WorkerNotification::Attention)
                     || notification_settings.menu_attention_detection;
-                if allowed
-                    && notification_settings.desktop_notifications
-                    && (!notification_settings.background_only || !app_focused)
-                {
+                let session_is_observed =
+                    app_focused && self.selected_session_id.as_deref() == Some(session.id.as_str());
+                let delivery_allowed = allowed
+                    && !session_is_observed
+                    && (!notification_settings.background_only || !app_focused);
+                if delivery_allowed && notification_settings.desktop_notifications {
                     crate::notify::post(title, body);
                 }
-                if allowed && notification_settings.sound_enabled {
+                if delivery_allowed && notification_settings.sound_enabled {
                     crate::sound::play(sound);
                 }
             }
         }
-        self.notification_state = snapshot
+        let live_session_ids = snapshot
             .sessions
             .iter()
-            .map(|session| {
-                (
-                    session.id.clone(),
-                    (session.activity.clone(), session.unread),
-                )
-            })
-            .collect();
+            .map(|session| session.id.as_str())
+            .collect::<HashSet<_>>();
+        self.notification_state
+            .retain(|session_id, _| live_session_ids.contains(session_id.as_str()));
         if let Some(mut pending) = self.pending_replacement.take() {
             if snapshot
                 .sessions
@@ -1316,9 +1318,9 @@ mod tests {
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
     use super::{
-        PendingRemove, PendingReplacement, WorkerNotification, dispatch_or_queue_remove,
-        notification_transition, reconcile_selection, reconcile_selection_with_pending,
-        replacement_selection, sessions_for_project, toggle_expanded,
+        PendingRemove, PendingReplacement, dispatch_or_queue_remove, reconcile_selection,
+        reconcile_selection_with_pending, replacement_selection, sessions_for_project,
+        toggle_expanded,
     };
 
     #[test]
@@ -1349,6 +1351,7 @@ mod tests {
             provider_id: None,
             active_runtime_id: None,
             runtime_launch_pending: false,
+            runtime_generation: 1,
             notify_when_done: false,
             terminal_background_hex: None,
             worktree_branch: None,
@@ -1397,26 +1400,6 @@ mod tests {
         assert_eq!(
             reconcile_selection_with_pending(Some("new"), Some("new"), &visible).as_deref(),
             Some("new")
-        );
-    }
-
-    #[test]
-    fn notification_edges_are_authoritative_and_deduplicated() {
-        assert_eq!(
-            notification_transition(Some(("working", false)), "blocked", false),
-            Some(WorkerNotification::Attention)
-        );
-        assert_eq!(
-            notification_transition(Some(("blocked", false)), "blocked", false),
-            None
-        );
-        assert_eq!(
-            notification_transition(Some(("working", false)), "done", true),
-            Some(WorkerNotification::Done)
-        );
-        assert_eq!(
-            notification_transition(Some(("done", true)), "done", true),
-            None
         );
     }
 

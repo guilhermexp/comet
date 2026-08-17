@@ -41,6 +41,7 @@ mod tests {
             provider_id: None,
             active_runtime_id: None,
             runtime_launch_pending: false,
+            runtime_generation: 1,
             notify_when_done: false,
             terminal_background_hex: None,
             worktree_branch: None,

@@ -2,6 +2,7 @@ pub mod activity_menu;
 pub mod archive;
 pub mod menu_bar;
 pub mod model;
+pub mod notification_policy;
 pub mod presentation;
 pub mod project_menu;
 pub mod recent;

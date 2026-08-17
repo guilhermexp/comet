@@ -233,6 +233,7 @@ mod tests {
             provider_id: Some("claude".to_owned()),
             active_runtime_id: Some("claude".to_owned()),
             runtime_launch_pending: false,
+            runtime_generation: 1,
             notify_when_done: false,
             terminal_background_hex: None,
             worktree_branch: None,
