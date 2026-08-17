@@ -1,11 +1,62 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{Context, Task};
 use zeron_workers_unpeel::{
-    LocalWorkersClient, SessionAction, SessionOrganizationPatch, WorkersBootstrap, WorkersProject,
-    WorkersSession,
+    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch, WorkersBootstrap,
+    WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset, WorkersProject,
+    WorkersSession, WorkersSettingsSnapshot, WorkersTranscriptSettings,
 };
+
+use super::archive::{archived_sessions_for_project, restore_action};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkersSettingsTab {
+    Presets,
+    Transcripts,
+    Notifications,
+}
+
+impl WorkersSettingsTab {
+    pub const ALL: [Self; 3] = [Self::Presets, Self::Transcripts, Self::Notifications];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Presets => "Presets",
+            Self::Transcripts => "Transcripts",
+            Self::Notifications => "Notifications",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkersRoute {
+    Workspace,
+    Settings(WorkersSettingsTab),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerNotification {
+    Attention,
+    Done,
+}
+
+pub fn notification_transition(
+    previous: Option<(&str, bool)>,
+    activity: &str,
+    unread: bool,
+) -> Option<WorkerNotification> {
+    let was_attention = previous.is_some_and(|(activity, _)| activity == "blocked");
+    let was_done = previous.is_some_and(|(activity, unread)| activity == "done" && unread);
+    if activity == "blocked" && !was_attention {
+        Some(WorkerNotification::Attention)
+    } else if activity == "done" && unread && !was_done {
+        Some(WorkerNotification::Done)
+    } else {
+        None
+    }
+}
 
 pub fn reconcile_selection(current: Option<&str>, sessions: &[WorkersSession]) -> Option<String> {
     if let Some(current) = current
@@ -36,6 +87,42 @@ pub fn toggle_expanded(expanded: &mut HashSet<String>, project_id: &str) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingReplacement {
+    source_id: String,
+    project_id: String,
+    command: String,
+    provider_id: Option<String>,
+    worktree_branch: Option<String>,
+    source_created_at_unix_ms: u64,
+    baseline_ids: HashSet<String>,
+    remaining_refreshes: u8,
+}
+
+fn replacement_selection(
+    pending: &PendingReplacement,
+    sessions: &[WorkersSession],
+) -> Option<Option<String>> {
+    let candidates = sessions
+        .iter()
+        .filter(|session| {
+            session.project_id == pending.project_id
+                && !pending.baseline_ids.contains(&session.id)
+                && session.is_live()
+                && session.command == pending.command
+                && session.provider_id == pending.provider_id
+                && session.worktree_branch == pending.worktree_branch
+                && session.created_at_unix_ms >= pending.source_created_at_unix_ms
+        })
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [only] => Some(Some(only.clone())),
+        [] => None,
+        _ => Some(None),
+    }
+}
+
 pub struct WorkersModel {
     client: LocalWorkersClient,
     pub snapshot: Option<WorkersBootstrap>,
@@ -44,10 +131,24 @@ pub struct WorkersModel {
     pub expanded_project_ids: HashSet<String>,
     pub loading: bool,
     pub error: Option<String>,
+    pub archive_project_id: Option<String>,
+    pub archived_sessions: Vec<WorkersSession>,
+    pub archive_loading: bool,
+    pub archive_error: Option<String>,
+    pub route: WorkersRoute,
+    pub settings: Option<WorkersSettingsSnapshot>,
+    pub settings_loading: bool,
+    pub settings_error: Option<String>,
     initialized_expansion: bool,
     refresh_generation: u64,
     refresh_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
+    archive_generation: u64,
+    archive_task: Option<Task<()>>,
+    settings_generation: u64,
+    settings_task: Option<Task<()>>,
+    notification_state: HashMap<String, (String, bool)>,
+    pending_replacement: Option<PendingReplacement>,
     _poll_task: Task<()>,
 }
 
@@ -69,10 +170,24 @@ impl WorkersModel {
             expanded_project_ids: HashSet::new(),
             loading: true,
             error: None,
+            archive_project_id: None,
+            archived_sessions: Vec::new(),
+            archive_loading: false,
+            archive_error: None,
+            route: WorkersRoute::Workspace,
+            settings: None,
+            settings_loading: false,
+            settings_error: None,
             initialized_expansion: false,
             refresh_generation: 0,
             refresh_task: None,
             action_task: None,
+            archive_generation: 0,
+            archive_task: None,
+            settings_generation: 0,
+            settings_task: None,
+            notification_state: HashMap::new(),
+            pending_replacement: None,
             _poll_task: poll_task,
         };
         model.refresh(cx);
@@ -91,6 +206,74 @@ impl WorkersModel {
             .as_ref()
             .map(|snapshot| snapshot.sessions.as_slice())
             .unwrap_or_default()
+    }
+
+    pub fn presets(&self) -> &[WorkersPreset] {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.presets.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn action_in_flight(&self) -> bool {
+        self.action_task.is_some()
+    }
+
+    pub fn has_attention(&self) -> bool {
+        self.sessions()
+            .iter()
+            .any(|session| session.unread || (session.is_live() && session.activity == "blocked"))
+    }
+
+    pub fn open_settings(&mut self, tab: WorkersSettingsTab, cx: &mut Context<Self>) {
+        self.route = WorkersRoute::Settings(tab);
+        self.refresh_settings(cx);
+        cx.notify();
+    }
+
+    pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.route = WorkersRoute::Workspace;
+        cx.notify();
+    }
+
+    pub fn set_settings_tab(&mut self, tab: WorkersSettingsTab, cx: &mut Context<Self>) {
+        self.route = WorkersRoute::Settings(tab);
+        if self.settings.is_none() {
+            self.refresh_settings(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn refresh_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_task.is_some() {
+            return;
+        }
+        self.settings_generation = self.settings_generation.wrapping_add(1);
+        let generation = self.settings_generation;
+        let client = self.client.clone();
+        self.settings_loading = self.settings.is_none();
+        self.settings_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.settings() })
+                .await;
+            this.update(cx, |model, cx| {
+                if generation != model.settings_generation {
+                    return;
+                }
+                model.settings_task = None;
+                model.settings_loading = false;
+                match result {
+                    Ok(settings) => {
+                        model.settings = Some(settings);
+                        model.settings_error = None;
+                    }
+                    Err(error) => model.settings_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub fn selected_session(&self) -> Option<&WorkersSession> {
@@ -122,8 +305,16 @@ impl WorkersModel {
         else {
             return;
         };
-        self.selected_project_id = Some(session.project_id.clone());
+        let project_id = session.project_id.clone();
+        let was_unread = session.unread;
+        self.pending_replacement = None;
+        self.reset_archive_view();
+        self.selected_project_id = Some(project_id);
         self.selected_session_id = Some(session_id);
+        if was_unread {
+            let selected = self.selected_session_id.clone().unwrap_or_default();
+            self.run_unit_action(move |client| client.mark_read(&selected), cx);
+        }
         cx.notify();
     }
 
@@ -135,6 +326,8 @@ impl WorkersModel {
         {
             return;
         }
+        self.pending_replacement = None;
+        self.reset_archive_view();
         self.selected_project_id = Some(project_id);
         self.selected_session_id = None;
         cx.notify();
@@ -165,7 +358,10 @@ impl WorkersModel {
                 model.refresh_task = None;
                 model.loading = false;
                 match result {
-                    Ok(snapshot) => model.apply_snapshot(snapshot),
+                    Ok(snapshot) => {
+                        let app_focused = cx.active_window().is_some();
+                        model.apply_snapshot(snapshot, app_focused);
+                    }
                     Err(error) => model.error = Some(error.to_string()),
                 }
                 cx.notify();
@@ -174,12 +370,67 @@ impl WorkersModel {
         }));
     }
 
-    pub fn launch(&mut self, project_id: String, command: String, cx: &mut Context<Self>) {
+    pub fn launch(&mut self, request: WorkersLaunchRequest, cx: &mut Context<Self>) {
         self.run_action(
-            move |client| client.create_session(&project_id, &command),
-            |model, session_id| model.selected_session_id = Some(session_id),
+            move |client| client.launch_session(&request),
+            |model, session_id| {
+                model.route = WorkersRoute::Workspace;
+                model.selected_session_id = Some(session_id);
+            },
             cx,
         );
+    }
+
+    pub fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.run_action(
+            move |client| client.add_project(&path),
+            |model, project_id| {
+                model.route = WorkersRoute::Workspace;
+                model.selected_project_id = Some(project_id);
+                model.selected_session_id = None;
+            },
+            cx,
+        );
+    }
+
+    pub fn add_preset(&mut self, label: String, command: String, cx: &mut Context<Self>) {
+        self.run_settings_action(move |client| client.add_preset(&label, &command), cx);
+    }
+
+    pub fn update_preset(&mut self, id: String, patch: PresetPatch, cx: &mut Context<Self>) {
+        self.run_settings_action(move |client| client.update_preset(&id, patch), cx);
+    }
+
+    pub fn delete_preset(&mut self, id: String, cx: &mut Context<Self>) {
+        self.run_settings_action(move |client| client.delete_preset(&id), cx);
+    }
+
+    pub fn move_preset(&mut self, id: String, index: usize, cx: &mut Context<Self>) {
+        self.run_settings_action(move |client| client.move_preset(&id, index), cx);
+    }
+
+    pub fn set_transcript_settings(
+        &mut self,
+        settings: WorkersTranscriptSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_settings_action(move |client| client.set_transcript_settings(settings), cx);
+    }
+
+    pub fn set_notification_settings(
+        &mut self,
+        settings: WorkersNotificationSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_settings_action(move |client| client.set_notification_settings(settings), cx);
+    }
+
+    pub fn test_notification(&self) {
+        crate::notify::post(
+            "Workers notification",
+            "Notifications from active CLI workers are enabled.",
+        );
+        crate::sound::play(crate::sound::Sound::Done);
     }
 
     pub fn stop(&mut self, session_id: String, cx: &mut Context<Self>) {
@@ -190,6 +441,7 @@ impl WorkersModel {
     }
 
     pub fn restart(&mut self, session_id: String, cx: &mut Context<Self>) {
+        self.prepare_replacement(&session_id);
         self.run_unit_action(
             move |client| client.session_action(&session_id, SessionAction::Restart),
             cx,
@@ -225,6 +477,117 @@ impl WorkersModel {
         );
     }
 
+    pub fn rename(&mut self, session_id: String, title: String, cx: &mut Context<Self>) {
+        self.organize(
+            session_id,
+            SessionOrganizationPatch {
+                title: Some(title),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    pub fn open_archive(&mut self, project_id: String, cx: &mut Context<Self>) {
+        if self.archive_project_id.as_deref() != Some(project_id.as_str()) {
+            self.archived_sessions.clear();
+        }
+        self.archive_project_id = Some(project_id.clone());
+        self.archive_loading = true;
+        self.archive_error = None;
+        self.archive_generation = self.archive_generation.wrapping_add(1);
+        let generation = self.archive_generation;
+        let client = self.client.clone();
+        self.archive_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.archived_sessions(&project_id) })
+                .await;
+            this.update(cx, |model, cx| {
+                if generation != model.archive_generation {
+                    return;
+                }
+                model.archive_task = None;
+                model.archive_loading = false;
+                match result {
+                    Ok(sessions) => {
+                        model.archived_sessions = archived_sessions_for_project(sessions);
+                        model.archive_error = None;
+                    }
+                    Err(error) => model.archive_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub fn close_archive(&mut self, cx: &mut Context<Self>) {
+        self.reset_archive_view();
+        cx.notify();
+    }
+
+    fn reset_archive_view(&mut self) {
+        self.archive_generation = self.archive_generation.wrapping_add(1);
+        self.archive_task = None;
+        self.archive_project_id = None;
+        self.archive_loading = false;
+        self.archive_error = None;
+    }
+
+    pub fn restore(&mut self, session: WorkersSession, resume: bool, cx: &mut Context<Self>) {
+        if resume {
+            self.prepare_replacement_for(&session);
+        }
+        let session_id = session.id.clone();
+        let completed_id = session.id.clone();
+        self.run_action(
+            move |client| {
+                client.set_session_organization(
+                    &session_id,
+                    SessionOrganizationPatch {
+                        archived: Some(false),
+                        ..Default::default()
+                    },
+                )?;
+                if resume {
+                    if let Err(error) = client.session_action(&session_id, restore_action(&session))
+                    {
+                        let _ = client.set_session_organization(
+                            &session_id,
+                            SessionOrganizationPatch {
+                                archived: Some(true),
+                                ..Default::default()
+                            },
+                        );
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            },
+            move |model, ()| {
+                model
+                    .archived_sessions
+                    .retain(|session| session.id != completed_id);
+            },
+            cx,
+        );
+    }
+
+    pub fn remove_archived(&mut self, session_id: String, cx: &mut Context<Self>) {
+        let completed_id = session_id.clone();
+        self.run_action(
+            move |client| client.session_action(&session_id, SessionAction::Remove),
+            move |model, ()| {
+                model
+                    .archived_sessions
+                    .retain(|session| session.id != completed_id);
+            },
+            cx,
+        );
+    }
+
     fn organize(
         &mut self,
         session_id: String,
@@ -237,9 +600,108 @@ impl WorkersModel {
         );
     }
 
-    fn apply_snapshot(&mut self, snapshot: WorkersBootstrap) {
-        self.selected_session_id =
-            reconcile_selection(self.selected_session_id.as_deref(), &snapshot.sessions);
+    fn prepare_replacement(&mut self, source_id: &str) {
+        let source = self
+            .sessions()
+            .iter()
+            .find(|session| session.id == source_id)
+            .cloned();
+        if let Some(source) = source {
+            self.prepare_replacement_for(&source);
+        }
+    }
+
+    fn prepare_replacement_for(&mut self, source: &WorkersSession) {
+        self.pending_replacement = Some(PendingReplacement {
+            source_id: source.id.clone(),
+            project_id: source.project_id.clone(),
+            command: source.command.clone(),
+            provider_id: source.provider_id.clone(),
+            worktree_branch: source.worktree_branch.clone(),
+            source_created_at_unix_ms: source.created_at_unix_ms,
+            baseline_ids: self
+                .sessions()
+                .iter()
+                .map(|session| session.id.clone())
+                .collect(),
+            remaining_refreshes: 8,
+        });
+    }
+
+    fn apply_snapshot(&mut self, snapshot: WorkersBootstrap, app_focused: bool) {
+        let notification_settings = self
+            .settings
+            .as_ref()
+            .map(|settings| settings.notifications.clone())
+            .unwrap_or_default();
+        for session in &snapshot.sessions {
+            let previous = self
+                .notification_state
+                .get(&session.id)
+                .map(|(activity, unread)| (activity.as_str(), *unread));
+            if let Some(notification) =
+                notification_transition(previous, &session.activity, session.unread)
+            {
+                let (title, body, sound) = match notification {
+                    WorkerNotification::Attention => (
+                        "Worker needs attention",
+                        session.title.as_str(),
+                        crate::sound::Sound::Request,
+                    ),
+                    WorkerNotification::Done => (
+                        "Worker finished",
+                        session.title.as_str(),
+                        crate::sound::Sound::Done,
+                    ),
+                };
+                let allowed = !matches!(notification, WorkerNotification::Attention)
+                    || notification_settings.menu_attention_detection;
+                if allowed
+                    && notification_settings.desktop_notifications
+                    && (!notification_settings.background_only || !app_focused)
+                {
+                    crate::notify::post(title, body);
+                }
+                if allowed && notification_settings.sound_enabled {
+                    crate::sound::play(sound);
+                }
+            }
+        }
+        self.notification_state = snapshot
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    (session.activity.clone(), session.unread),
+                )
+            })
+            .collect();
+        if let Some(mut pending) = self.pending_replacement.take() {
+            if snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == pending.source_id)
+                && pending.remaining_refreshes > 0
+            {
+                pending.remaining_refreshes -= 1;
+                self.selected_session_id = Some(pending.source_id.clone());
+                self.pending_replacement = Some(pending);
+            } else {
+                match replacement_selection(&pending, &snapshot.sessions) {
+                    Some(selection) => self.selected_session_id = selection,
+                    None if pending.remaining_refreshes > 0 => {
+                        pending.remaining_refreshes -= 1;
+                        self.selected_session_id = None;
+                        self.pending_replacement = Some(pending);
+                    }
+                    None => self.selected_session_id = None,
+                }
+            }
+        } else {
+            self.selected_session_id =
+                reconcile_selection(self.selected_session_id.as_deref(), &snapshot.sessions);
+        }
         self.selected_project_id = self
             .selected_session_id
             .as_deref()
@@ -256,7 +718,13 @@ impl WorkersModel {
                     .filter(|selected| snapshot.projects.iter().any(|p| &p.id == *selected))
                     .cloned()
             })
-            .or_else(|| snapshot.projects.first().map(|project| project.id.clone()));
+            .or_else(|| {
+                snapshot
+                    .projects
+                    .iter()
+                    .find(|project| !project.is_group)
+                    .map(|project| project.id.clone())
+            });
         if !self.initialized_expansion {
             self.expanded_project_ids
                 .extend(snapshot.projects.iter().map(|project| project.id.clone()));
@@ -303,7 +771,38 @@ impl WorkersModel {
                         apply(model, value);
                         model.refresh(cx);
                     }
-                    Err(error) => model.error = Some(error.to_string()),
+                    Err(error) => {
+                        model.pending_replacement = None;
+                        model.error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn run_settings_action<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(LocalWorkersClient) -> Result<T, zeron_workers_unpeel::WorkersError>
+        + Send
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.action_task.is_some() {
+            return;
+        }
+        let client = self.client.clone();
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { operation(client) })
+                .await;
+            this.update(cx, |model, cx| {
+                model.action_task = None;
+                match result {
+                    Ok(_) => model.refresh_settings(cx),
+                    Err(error) => model.settings_error = Some(error.to_string()),
                 }
                 cx.notify();
             })
@@ -318,7 +817,10 @@ mod tests {
 
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
-    use super::{reconcile_selection, sessions_for_project, toggle_expanded};
+    use super::{
+        PendingReplacement, WorkerNotification, notification_transition, reconcile_selection,
+        replacement_selection, sessions_for_project, toggle_expanded,
+    };
 
     fn session(id: &str, project_id: &str, live: bool) -> WorkersSession {
         WorkersSession {
@@ -332,6 +834,10 @@ mod tests {
             pinned: false,
             archived: false,
             provider_id: None,
+            active_runtime_id: None,
+            runtime_launch_pending: false,
+            notify_when_done: false,
+            terminal_background_hex: None,
             worktree_branch: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -360,6 +866,26 @@ mod tests {
     }
 
     #[test]
+    fn notification_edges_are_authoritative_and_deduplicated() {
+        assert_eq!(
+            notification_transition(Some(("working", false)), "blocked", false),
+            Some(WorkerNotification::Attention)
+        );
+        assert_eq!(
+            notification_transition(Some(("blocked", false)), "blocked", false),
+            None
+        );
+        assert_eq!(
+            notification_transition(Some(("working", false)), "done", true),
+            Some(WorkerNotification::Done)
+        );
+        assert_eq!(
+            notification_transition(Some(("done", true)), "done", true),
+            None
+        );
+    }
+
+    #[test]
     fn project_grouping_preserves_upstream_session_order() {
         let sessions = vec![
             session("a", "one", true),
@@ -383,5 +909,36 @@ mod tests {
             expanded,
             HashSet::from(["two".to_owned(), "three".to_owned()])
         );
+    }
+
+    #[test]
+    fn replacement_adopts_only_one_new_live_session_in_the_same_project() {
+        let pending = PendingReplacement {
+            source_id: "old".to_owned(),
+            project_id: "one".to_owned(),
+            command: "zsh".to_owned(),
+            provider_id: None,
+            worktree_branch: None,
+            source_created_at_unix_ms: 1,
+            baseline_ids: HashSet::from(["other".to_owned()]),
+            remaining_refreshes: 8,
+        };
+        assert_eq!(
+            replacement_selection(
+                &pending,
+                &[session("other", "two", true), session("new", "one", true)]
+            ),
+            Some(Some("new".to_owned()))
+        );
+        assert_eq!(
+            replacement_selection(
+                &pending,
+                &[session("new-a", "one", true), session("new-b", "one", true)]
+            ),
+            Some(None)
+        );
+        let mut decoy = session("decoy", "one", true);
+        decoy.command = "claude".to_owned();
+        assert_eq!(replacement_selection(&pending, &[decoy]), None);
     }
 }

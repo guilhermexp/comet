@@ -22,6 +22,7 @@ use crate::theme::{Appearance, Theme, current_appearance, rgb_to_hsl};
 
 use super::emulator::{CellColor, CellSnapshot, Side};
 use super::panel::TerminalPanel;
+use crate::workers::terminal::WorkersTerminal;
 
 /// Terminal font metrics (mono).
 pub const TERM_FONT_SIZE: f32 = 13.0;
@@ -456,13 +457,28 @@ impl InputCoalescer {
 /// height for rows. The measured cols×rows feed back into the panel, which
 /// resizes the emulator immediately and debounces the `ResizeTerminal` RPC.
 pub struct TerminalElement {
-    panel: Entity<TerminalPanel>,
+    source: TerminalSource,
     focused: bool,
+}
+
+enum TerminalSource {
+    Engine(Entity<TerminalPanel>),
+    Workers(Entity<WorkersTerminal>),
 }
 
 impl TerminalElement {
     pub fn new(panel: Entity<TerminalPanel>, focused: bool) -> Self {
-        Self { panel, focused }
+        Self {
+            source: TerminalSource::Engine(panel),
+            focused,
+        }
+    }
+
+    pub fn new_workers(terminal: Entity<WorkersTerminal>, focused: bool) -> Self {
+        Self {
+            source: TerminalSource::Workers(terminal),
+            focused,
+        }
     }
 }
 
@@ -558,19 +574,23 @@ impl gpui::Element for TerminalElement {
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),
         );
-        let snapshot = self.panel.update(cx, |panel, cx| {
-            panel.on_grid_metrics(
-                super::panel::GridGeometry {
-                    origin,
-                    cell_w: f32::from(cell_w),
-                    line_h: f32::from(line_h),
-                    cols,
-                    rows,
-                },
-                cx,
-            );
-            panel.active_grid_snapshot(cx)
-        });
+        let geometry = super::panel::GridGeometry {
+            origin,
+            cell_w: f32::from(cell_w),
+            line_h: f32::from(line_h),
+            cols,
+            rows,
+        };
+        let snapshot = match &self.source {
+            TerminalSource::Engine(panel) => panel.update(cx, |panel, cx| {
+                panel.on_grid_metrics(geometry, cx);
+                panel.active_grid_snapshot(cx)
+            }),
+            TerminalSource::Workers(terminal) => terminal.update(cx, |terminal, cx| {
+                terminal.on_grid_metrics(geometry, cx);
+                terminal.active_grid_snapshot()
+            }),
+        };
         let Some(snapshot) = snapshot else {
             return TerminalPrepaint {
                 bg_quads: Vec::new(),

@@ -27,6 +27,7 @@ use gpui_tokio::Tokio;
 use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
+use zeron_workers_unpeel::WorkersLaunchRequest;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -53,6 +54,8 @@ use crate::state::{
 use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, ToggleTerminal};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
+use crate::workers::model::WorkersModel;
+use crate::workers::workspace::{WorkersContent, WorkersSidebar};
 
 mod spaces;
 mod tabs;
@@ -878,9 +881,12 @@ pub struct Shell {
     right_tab_scroll: gpui::ScrollHandle,
     /// Chat outlet vs settings pages.
     route: Route,
-    /// Session-local top-level sidebar content. Workers is intentionally empty
-    /// until its dedicated UI is introduced.
+    /// Session-local top-level sidebar content. Workers owns an independent,
+    /// retained Unpeel workspace while Orchestrator keeps its existing routes.
     sidebar_mode: SidebarMode,
+    workers_model: Entity<WorkersModel>,
+    workers_sidebar: Entity<WorkersSidebar>,
+    workers_content: Entity<WorkersContent>,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
@@ -1012,6 +1018,15 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let workers_model = cx.new(WorkersModel::new);
+        let workers_sidebar = cx.new({
+            let workers_model = workers_model.clone();
+            move |cx| WorkersSidebar::new(workers_model, cx)
+        });
+        let workers_content = cx.new({
+            let workers_model = workers_model.clone();
+            move |cx| WorkersContent::new(workers_model, cx)
+        });
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
@@ -1115,7 +1130,13 @@ impl Shell {
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
-            sidebar_mode: SidebarMode::default(),
+            sidebar_mode: match std::env::var("ZERON_SIDEBAR_MODE").ok().as_deref() {
+                Some("workers") => SidebarMode::Workers,
+                _ => SidebarMode::default(),
+            },
+            workers_model,
+            workers_sidebar,
+            workers_content,
             nav,
             devices_page: None,
             archived_page: None,
@@ -2904,6 +2925,23 @@ impl Shell {
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.sidebar_mode == SidebarMode::Workers {
+            let theme = Theme::of(cx).clone();
+            let bar = div()
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_muted)
+                .child("Workers");
+            return self
+                .titlebar_drag_region("workers-header-titlebar", bar, cx)
+                .into_any_element();
+        }
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
             Route::Settings(_) => {
@@ -3187,13 +3225,13 @@ impl Shell {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let switcher = self.render_sidebar_mode_switcher(&theme, cx);
-        let inner: Option<AnyElement> = if self.sidebar_mode.shows_orchestrator_content() {
-            Some(match self.route {
+        let inner: AnyElement = if self.sidebar_mode.shows_orchestrator_content() {
+            match self.route {
                 Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
                 Route::Chat => self.render_chat_sidebar(&theme, cx),
-            })
+            }
         } else {
-            None
+            self.workers_sidebar.clone().into_any_element()
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -3210,9 +3248,7 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .child(switcher)
-                .when_some(inner, |el, content| {
-                    el.child(div().flex_1().min_h_0().child(content))
-                })
+                .child(div().flex_1().min_h_0().child(inner))
                 .into_any_element(),
         )
     }
@@ -4737,6 +4773,9 @@ impl Shell {
     }
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.sidebar_mode == SidebarMode::Workers {
+            return self.workers_content.clone().into_any_element();
+        }
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);

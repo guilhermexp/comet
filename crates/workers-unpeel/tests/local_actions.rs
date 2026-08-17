@@ -3,7 +3,33 @@ use std::fs;
 use std::sync::Mutex;
 
 use tempfile::TempDir;
-use zeron_workers_unpeel::{LocalWorkersClient, WorkersError};
+use zeron_workers_unpeel::{
+    InitialTextSubmitMode, LocalWorkersClient, WorkersError, WorkersLaunchRequest,
+    is_session_host_mode, session_host_launch_args, session_host_launcher_path,
+};
+
+#[test]
+fn process_mode_only_claims_unpeel_session_hosts() {
+    assert!(is_session_host_mode(&[
+        "__session_host__".to_owned(),
+        "/tmp/launch.json".to_owned(),
+    ]));
+    assert!(!is_session_host_mode(&["headless".to_owned()]));
+    assert!(!is_session_host_mode(&[]));
+    assert_eq!(
+        session_host_launch_args(&["__session_host__".to_owned(), "/tmp/launch.json".to_owned(),]),
+        Some(&["/tmp/launch.json".to_owned()][..])
+    );
+    assert_eq!(
+        session_host_launcher_path(&["/tmp/launch.json".to_owned()]),
+        Some(std::path::Path::new("/tmp/launch.json"))
+    );
+    assert_eq!(session_host_launcher_path(&["headless".to_owned()]), None);
+    assert_eq!(
+        session_host_launcher_path(&["/tmp/launch.json".to_owned(), "unexpected".to_owned(),]),
+        None
+    );
+}
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -71,4 +97,40 @@ fn create_session_rejects_unknown_projects() -> Result<(), Box<dyn std::error::E
 
     assert!(matches!(error, WorkersError::Upstream { status: 400, .. }));
     Ok(())
+}
+
+#[test]
+fn launch_request_serializes_every_host_mode_exactly() {
+    let terminal = WorkersLaunchRequest::terminal("project-1");
+    assert_eq!(
+        terminal.wire_body(),
+        serde_json::json!({ "projectID": "project-1", "command": "" })
+    );
+
+    let preset = WorkersLaunchRequest::preset("project-1", "preset-1");
+    assert_eq!(
+        preset.wire_body(),
+        serde_json::json!({ "projectID": "project-1", "presetID": "preset-1" })
+    );
+
+    for (mode, wire) in [
+        (InitialTextSubmitMode::PasteOnly, "pasteOnly"),
+        (InitialTextSubmitMode::PasteAndSubmit, "pasteAndSubmit"),
+        (InitialTextSubmitMode::Raw, "raw"),
+    ] {
+        let request = WorkersLaunchRequest::command("worktree-1", " codex --full-auto ")
+            .with_worktree("/tmp/worktree", "feature/parity")
+            .with_initial_text("implement this", mode);
+        assert_eq!(
+            request.wire_body(),
+            serde_json::json!({
+                "projectID": "worktree-1",
+                "command": " codex --full-auto ",
+                "worktreePath": "/tmp/worktree",
+                "worktreeBranch": "feature/parity",
+                "initialText": "implement this",
+                "initialTextSubmitMode": wire,
+            })
+        );
+    }
 }

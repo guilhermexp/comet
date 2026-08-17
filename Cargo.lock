@@ -9325,6 +9325,7 @@ dependencies = [
  "zeron-rpc",
  "zeron-ui",
  "zeron-update",
+ "zeron-workers-unpeel",
 ]
 
 [[package]]
@@ -9506,6 +9507,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "unpeel-core",
+ "uuid",
 ]
 
 [[package]]

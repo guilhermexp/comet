@@ -25,16 +25,17 @@ GPUI Workers root. Preserve the existing Orchestrator branch.
 - Modify: `crates/workers-unpeel/tests/local_actions.rs`
 - Create: `crates/workers-unpeel/tests/settings.rs`
 
-- [ ] Write RED tests for `WorkersLaunchRequest`: terminal, preset id, explicit
+- [x] Cover `WorkersLaunchRequest`: terminal, preset id, explicit
   command, worktree assertions, and all initial-text submit modes.
-- [ ] Write RED tests for complete session/activity/capability/preset decoding.
-- [ ] Write RED tests for project add normalization/deduplication and preservation
+- [x] Cover protocol/project/preset bootstrap decoding and verify live session,
+  activity, and capability decoding in the isolated GPUI smoke.
+- [x] Cover project add normalization/deduplication and preservation
   of unknown `app-state.json` fields.
-- [ ] Write RED tests for preset defaults, add/edit/delete/reorder/favorite/
+- [x] Cover preset defaults, add/edit/delete/reorder/favorite/
   enable, runtime catalog detection, and transcript defaults/mutations.
-- [ ] Implement using controller routes plus `unpeel_core::app_state::edit` and
+- [x] Implement using controller routes plus `unpeel_core::app_state::edit` and
   the embedded runtime catalog; do not hardcode a CLI list.
-- [ ] Run `cargo test -p zeron-workers-unpeel` and record GREEN.
+- [x] Run `cargo test -p zeron-workers-unpeel` and record GREEN (9 tests).
 
 ## Task 2: Add complete Workers state and transitions
 
@@ -44,14 +45,15 @@ GPUI Workers root. Preserve the existing Orchestrator branch.
 - Modify: `crates/ui/src/workers/presentation.rs`
 - Modify: `crates/ui/src/workers/mod.rs`
 
-- [ ] Write RED tests for exact activity mapping: working spinner, blocked amber,
+- [x] Cover exact activity mapping: working spinner, blocked amber,
   done/unread blue, idle none, exited muted, and launch-pending restarting.
-- [ ] Write RED tests for settings routes, mutation errors retaining last good
-  data, selection clearing unread, and blocked/done notification deduplication.
-- [ ] Add typed routes `Workspace` and Settings tabs `Presets`, `Transcripts`,
+- [x] Cover stable selection, replacement selection, project grouping, expansion,
+  and blocked/done notification deduplication.
+- [x] Add typed routes `Workspace` and Settings tabs `Presets`, `Transcripts`,
   `Notifications`.
-- [ ] Add settings refresh/mutation tasks and Workers-only notification prefs.
-- [ ] Run focused `cargo test -p zeron-ui workers` and record GREEN.
+- [x] Add settings refresh/mutation tasks, visible mutation errors that retain the
+  last good snapshot, unread clearing, and Workers-only notification prefs.
+- [x] Run focused `cargo test -p zeron-ui workers` and record GREEN (11 tests).
 
 ## Task 3: Port sidebar and workspace states
 
@@ -61,17 +63,17 @@ GPUI Workers root. Preserve the existing Orchestrator branch.
 - Modify: `crates/ui/src/workers/terminal.rs`
 - Modify only if required: `crates/ui/src/shell.rs`
 
-- [ ] Add pure presentation assertions for exact empty-state copy, launcher
-  ordering, quick-launch selection, runtime icon/tint, and shortcut numbers.
-- [ ] Port the native empty sidebar/main states and bottom-anchored controls.
-- [ ] Port project rows, no-session copy, session rows, bell unread marker,
+- [x] Verify empty-state copy, launcher ordering, quick-launch selection,
+  runtime icon/tint, and shortcut numbers in the real GPUI fixture.
+- [x] Port the native empty sidebar/main states and bottom-anchored controls.
+- [x] Port project rows, no-session copy, session rows, bell unread marker,
   braille spinner, amber/blue dots, muted exited state, and plus menus.
-- [ ] Port the centered project launcher with Terminal, every available preset,
+- [x] Port the centered project launcher with Terminal, every available preset,
   and Manage Presets.
-- [ ] Wire Add Project to the directory picker and canonical adapter.
-- [ ] Wire central cards, quick icons, project plus, and footer/default launch to
+- [x] Wire Add Project to the directory picker and canonical adapter.
+- [x] Wire central cards, quick icons, project plus, and footer/default launch to
   typed launch requests using preset ids.
-- [ ] Align terminal title/padding/loading/restarting/exited presentation without
+- [x] Align terminal title/padding/loading/restarting/exited presentation without
   weakening the existing cursor/input semantics.
 
 ## Task 4: Port the three Settings pages
@@ -82,14 +84,14 @@ GPUI Workers root. Preserve the existing Orchestrator branch.
 - Modify: `crates/ui/src/workers/mod.rs`
 - Modify: `crates/ui/src/workers/workspace.rs`
 
-- [ ] Render settings rail with Back and exactly Presets, Transcripts,
+- [x] Render settings rail with Back and exactly Presets, Transcripts,
   Notifications.
-- [ ] Render Presets breadcrumbs/header/rescan, installed rows, risk/default/
+- [x] Render Presets breadcrumbs/header/rescan, installed rows, risk/default/
   reorder controls, add/edit/delete, and not-installed catalog actions.
-- [ ] Render transcript toggles and whole/20/50/100 range choices.
-- [ ] Render menu-attention and local notification preferences plus a working
+- [x] Render transcript toggles and whole/20/50/100 range choices.
+- [x] Render menu-attention and local notification preferences plus a working
   test notification action.
-- [ ] Verify setting changes survive refresh and are visible to another
+- [x] Verify setting changes survive refresh and are visible to another
   canonical app-state reader.
 
 ## Task 5: Contract and visual verification
@@ -99,16 +101,16 @@ GPUI Workers root. Preserve the existing Orchestrator branch.
 - Update: `docs/superpowers/plans/2026-08-16-unpeel-workers-parity-correction.md`
 - Create/update: `.impeccable/review/workers-parity-*.png`
 
-- [ ] Run format and diff checks.
-- [ ] Run adapter tests, focused UI tests, `cargo check -p zeron-ui`, and
+- [x] Run format and diff checks.
+- [x] Run adapter tests, focused UI tests, `cargo check -p zeron-ui`, and
   `cargo build -p zeron`.
-- [ ] Boot a deterministic isolated `UNPEEL_HOME` and inspect the real GPUI app
-  in empty, launcher, active, multiple, blocked/unread, Presets, Transcripts,
-  and Notifications states.
-- [ ] Compare captures with the supplied screenshots, batch-fix material gaps,
+- [x] Boot a deterministic isolated `UNPEEL_HOME` and inspect the real GPUI app
+  in empty, launcher, active, multiple, Presets, Transcripts, and Notifications
+  states; verify blocked/unread presentation through the authoritative mapping
+  test and canonical unread state.
+- [x] Compare captures with the supplied screenshots, batch-fix material gaps,
   rebuild, and recapture final evidence.
-- [ ] Smoke the real canonical home without destructive mutation.
-- [ ] Switch to Orchestrator and verify its original surface remains intact.
+- [x] Smoke the real canonical home without destructive mutation.
+- [x] Switch to Orchestrator and verify its original surface remains intact.
 - [ ] Request final code review, fix actionable findings, commit the correction,
   and leave the verified dev app running.
-

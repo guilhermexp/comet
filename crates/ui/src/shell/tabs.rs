@@ -41,6 +41,32 @@ impl Shell {
     /// onto that project; under "All" the current pick (the last selected
     /// project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_mode == SidebarMode::Workers {
+            self.workers_model.update(cx, |model, cx| {
+                let Some(project) = model.selected_project().cloned() else {
+                    return;
+                };
+                let project_id = project.id.clone();
+                let request = model
+                    .presets()
+                    .iter()
+                    .find(|preset| preset.enabled && preset.quick_launch)
+                    .or_else(|| model.presets().iter().find(|preset| preset.enabled))
+                    .map(|preset| {
+                        WorkersLaunchRequest::preset(project_id.clone(), preset.id.clone())
+                    })
+                    .unwrap_or_else(|| WorkersLaunchRequest::terminal(project_id))
+                    .with_optional_worktree(
+                        project
+                            .worktree_branch
+                            .as_ref()
+                            .map(|_| project.path.clone()),
+                        project.worktree_branch.clone(),
+                    );
+                model.launch(request, cx);
+            });
+            return;
+        }
         self.route = Route::Chat;
         let target = {
             let state = self.state.read(cx);

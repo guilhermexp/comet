@@ -109,6 +109,10 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    if zeron_workers_unpeel::run_session_host_mode_if_requested().map_err(anyhow::Error::msg)? {
+        return Ok(());
+    }
+    zeron_workers_unpeel::configure_self_as_session_host_launcher().map_err(anyhow::Error::msg)?;
     let cli = Cli::parse();
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).

@@ -30,6 +30,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: gpui system deps
         run: |
           sudo apt-get update -qq
@@ -71,6 +73,8 @@ jobs:
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
