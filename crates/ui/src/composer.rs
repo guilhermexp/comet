@@ -4480,10 +4480,9 @@ impl Composer {
         )
     }
 
-    /// New-chat sends need a project: with none picked (empty device, or a
-    /// selection healed away) the send button dims and submit is a no-op —
-    /// project-less `~`-cwd sessions are no longer mintable from the canvas.
-    /// Existing chats carry their own project, so they always send.
+    /// New-chat sends need a project and a runnable agent. If either selection
+    /// is missing, the send button dims and submit is a no-op. Existing chats
+    /// carry both in their persisted state, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
         if state.selected_chat.is_some() {

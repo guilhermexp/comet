@@ -3163,7 +3163,7 @@ impl Pickers {
         //    a divider, one brand icon per harness. The selected tab wears a
         //    3px accent bar hugging the rail's right edge. Hidden while a
         //    search is live (the query spans every harness).
-        let rail: Option<AnyElement> = (!searching).then(|| {
+        let rail: Option<AnyElement> = (!searching && !descriptors.is_empty()).then(|| {
             let mut column = div()
                 .w(px(44.0))
                 .flex_none()
@@ -3413,6 +3413,11 @@ impl Pickers {
                     el.into_any_element()
                 })
                 .collect()
+        } else if descriptors.is_empty() {
+            vec![empty_list_note(
+                &theme,
+                "Enable an installed agent in Settings, or install an agent CLI",
+            )]
         } else if searching {
             vec![empty_list_note(&theme, "No models found")]
         } else if favorites_view {
@@ -4008,7 +4013,7 @@ impl Pickers {
         let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
-            true,
+            !no_agents,
             Some(harness_icon),
             None,
             &theme,
@@ -4504,12 +4509,12 @@ mod tests {
                 descriptor(HarnessId::Grok, "Grok", grok),
             ]
         };
-        // A catalog from an engine predating the flag (all None) falls back
-        // to default-set membership: Claude Code + Codex only.
+        // A catalog from an engine predating the flag (all None) follows its
+        // installed probes, so every detected real harness is offered.
         let offered = offered_harnesses_impl(&catalog(None, None, None), false);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Grok]
         );
         // The device's flags win: Grok on, Codex off; catalog order holds.
         let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), Some(true)), false);
@@ -4521,7 +4526,7 @@ mod tests {
         let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), None), true);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![HarnessId::Mock, HarnessId::ClaudeCode]
+            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Grok]
         );
         // Nothing enabled offers nothing — the composer renders the
         // no-agents empty state instead of resurrecting disabled agents.
