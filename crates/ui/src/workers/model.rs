@@ -185,6 +185,8 @@ pub struct WorkersModel {
     archive_task: Option<Task<()>>,
     settings_generation: u64,
     settings_task: Option<Task<()>>,
+    runtime_install_tasks: HashMap<String, Task<()>>,
+    runtime_install_errors: HashMap<String, String>,
     notification_state: HashMap<String, NotificationState>,
     pending_replacement: Option<PendingReplacement>,
     _poll_task: Task<()>,
@@ -252,6 +254,8 @@ impl WorkersModel {
             archive_task: None,
             settings_generation: 0,
             settings_task: None,
+            runtime_install_tasks: HashMap::new(),
+            runtime_install_errors: HashMap::new(),
             notification_state: HashMap::new(),
             pending_replacement: None,
             _poll_task: poll_task,
@@ -749,6 +753,45 @@ impl WorkersModel {
 
     pub fn move_preset(&mut self, id: String, index: usize, cx: &mut Context<Self>) {
         self.run_settings_action(move |client| client.move_preset(&id, index), cx);
+    }
+
+    pub fn runtime_install_in_progress(&self, cli_id: &str) -> bool {
+        self.runtime_install_tasks.contains_key(cli_id)
+    }
+
+    pub fn runtime_install_error(&self, cli_id: &str) -> Option<&str> {
+        self.runtime_install_errors.get(cli_id).map(String::as_str)
+    }
+
+    pub fn install_runtime(&mut self, cli_id: String, cx: &mut Context<Self>) {
+        if self.runtime_install_tasks.contains_key(&cli_id) {
+            return;
+        }
+        self.runtime_install_errors.remove(&cli_id);
+        let client = self.client.clone();
+        let task_id = cli_id.clone();
+        let install_id = cli_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.install_runtime(&install_id) })
+                .await;
+            this.update(cx, |model, cx| {
+                model.runtime_install_tasks.remove(&task_id);
+                match result {
+                    Ok(_) => model.refresh_settings(cx),
+                    Err(error) => {
+                        model
+                            .runtime_install_errors
+                            .insert(task_id.clone(), error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.runtime_install_tasks.insert(cli_id, task);
+        cx.notify();
     }
 
     pub fn set_transcript_settings(

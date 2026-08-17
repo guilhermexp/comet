@@ -3,6 +3,7 @@
 mod activity_bridge;
 
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -857,6 +858,51 @@ impl LocalWorkersClient {
             transcripts,
             notifications,
         })
+    }
+
+    /// Install one of Unpeel's pinned built-in runtimes with its catalog-owned
+    /// command. The caller only supplies the runtime identity; executable
+    /// shell text is never accepted from the renderer.
+    pub fn install_runtime(&self, cli_id: &str) -> Result<WorkersRuntime, WorkersError> {
+        if let Some(runtime) = runtime_catalog_snapshot()
+            .into_iter()
+            .find(|runtime| runtime.cli_id == cli_id && runtime.installed)
+        {
+            return Ok(runtime);
+        }
+
+        let install = trusted_runtime_install(cli_id).ok_or_else(|| {
+            WorkersError::State(format!(
+                "No trusted install command is available for {cli_id}"
+            ))
+        })?;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned());
+        let output = Command::new(&shell)
+            .args(["-l", "-c", &install.command])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| WorkersError::State(format!("Failed to launch {shell}: {error}")))?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            let status = output.status.code().unwrap_or(-1);
+            return Err(WorkersError::State(install_failure_message(
+                status, &combined,
+            )));
+        }
+
+        runtime_catalog_snapshot()
+            .into_iter()
+            .find(|runtime| runtime.cli_id == install.cli_id && runtime.installed)
+            .ok_or_else(|| {
+                WorkersError::State(format!(
+                    "Installed, but {} was not found on your PATH",
+                    install.cli_id
+                ))
+            })
     }
 
     pub fn add_preset(&self, label: &str, command: &str) -> Result<String, WorkersError> {
@@ -2120,6 +2166,42 @@ fn runtime_catalog_snapshot() -> Vec<WorkersRuntime> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedRuntimeInstall {
+    cli_id: String,
+    command: String,
+}
+
+fn trusted_runtime_install(cli_id: &str) -> Option<TrustedRuntimeInstall> {
+    let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
+    let runtime = catalog.by_legacy_slug_for_current_platform(cli_id)?;
+    let command = runtime.install.as_ref()?.command.as_ref()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(TrustedRuntimeInstall {
+        cli_id: runtime.legacy_slug.clone(),
+        command: command.to_owned(),
+    })
+}
+
+fn install_failure_message(status: i32, output: &str) -> String {
+    let lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty() && !line.contains("A complete log of this run can be found in")
+        })
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(5);
+    let tail = lines[start..].join("\n");
+    if tail.is_empty() {
+        format!("Install failed (exit {status})")
+    } else {
+        tail
+    }
+}
+
 fn preset_settings(
     presets: Vec<unpeel_core::state::Preset>,
     runtimes: &[WorkersRuntime],
@@ -2290,5 +2372,37 @@ mod launch_grid_tests {
         terminal_client.remember_grid(224, 48);
 
         assert_eq!(model_client.remembered_grid(), Some((224, 48)));
+    }
+}
+
+#[cfg(test)]
+mod runtime_install_tests {
+    use super::{install_failure_message, trusted_runtime_install};
+
+    #[test]
+    fn install_failure_uses_the_last_five_meaningful_lines() {
+        let output = "first\nsecond\nthird\nfourth\nfifth\nsixth\n\
+            A complete log of this run can be found in /tmp/npm.log\n";
+
+        assert_eq!(
+            install_failure_message(17, output),
+            "second\nthird\nfourth\nfifth\nsixth"
+        );
+    }
+
+    #[test]
+    fn install_failure_falls_back_to_the_exit_status() {
+        assert_eq!(
+            install_failure_message(9, "\n\n"),
+            "Install failed (exit 9)"
+        );
+    }
+
+    #[test]
+    fn runtime_install_commands_only_come_from_the_pinned_catalog() {
+        let runtime = trusted_runtime_install("claude").expect("Claude is installable");
+        assert_eq!(runtime.cli_id, "claude");
+        assert!(!runtime.command.trim().is_empty());
+        assert!(trusted_runtime_install("unknown-provider").is_none());
     }
 }

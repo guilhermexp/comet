@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*, px,
 };
@@ -9,6 +12,7 @@ use crate::settings::widgets;
 use crate::theme::Theme;
 
 use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
+use super::presentation::{runtime_icon_path, spinner_frame};
 
 pub struct WorkersSettingsView {
     model: Entity<WorkersModel>,
@@ -113,13 +117,37 @@ impl WorkersSettingsView {
     }
 
     fn render_presets(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (settings, loading, busy, error) = {
+        let (settings, loading, busy, error, installing, install_errors) = {
             let model = self.model.read(cx);
+            let runtime_ids = model
+                .settings
+                .as_ref()
+                .map(|settings| {
+                    settings
+                        .runtimes
+                        .iter()
+                        .map(|runtime| runtime.cli_id.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             (
                 model.settings.clone(),
                 model.settings_loading,
                 model.action_in_flight(),
                 model.settings_error.clone(),
+                runtime_ids
+                    .iter()
+                    .filter(|cli_id| model.runtime_install_in_progress(cli_id))
+                    .map(|cli_id| (*cli_id).to_owned())
+                    .collect::<HashSet<_>>(),
+                runtime_ids
+                    .iter()
+                    .filter_map(|cli_id| {
+                        model
+                            .runtime_install_error(cli_id)
+                            .map(|error| ((*cli_id).to_owned(), error.to_owned()))
+                    })
+                    .collect::<HashMap<_, _>>(),
             )
         };
         let presets = settings
@@ -293,7 +321,17 @@ impl WorkersSettingsView {
             .filter(|runtime| !runtime.installed)
             .enumerate()
             .map(|(index, runtime)| {
+                let cli_id = runtime.cli_id.clone();
                 let official_url = runtime.official_url.clone();
+                let website_url = official_url.clone();
+                let has_install_command = runtime.install_command.is_some();
+                let is_installing = installing.contains(&runtime.cli_id);
+                let install_error = install_errors.get(&runtime.cli_id).cloned();
+                let provider_icon = runtime_icon_path(Some(&runtime.cli_id), None);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 div()
                     .id(("workers-runtime-not-installed", index))
                     .min_h(px(46.0))
@@ -305,17 +343,34 @@ impl WorkersSettingsView {
                     .border_1()
                     .border_color(theme.border.opacity(0.55))
                     .child(
-                        icon(icons::TERMINAL)
+                        icon(provider_icon)
                             .size(px(15.0))
                             .text_color(theme.text_faint),
                     )
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(12.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted)
-                            .child(runtime.label),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted)
+                                    .child(runtime.label),
+                            )
+                            .when_some(install_error.clone(), |el, error| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .text_color(theme.danger_muted)
+                                        .child(error),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -324,20 +379,49 @@ impl WorkersSettingsView {
                             .py(px(5.0))
                             .rounded(px(7.0))
                             .bg(crate::theme::ink(0.08))
-                            .cursor_pointer()
+                            .when(!is_installing, |el| el.cursor_pointer())
+                            .when(is_installing, |el| el.opacity(0.7))
                             .text_size(px(10.5))
                             .text_color(theme.text_muted)
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                if let Some(url) = &official_url {
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if is_installing {
+                                    return;
+                                }
+                                if has_install_command {
+                                    this.model.update(cx, |model, cx| {
+                                        model.install_runtime(cli_id.clone(), cx)
+                                    });
+                                } else if let Some(url) = &official_url {
                                     cx.open_url(url);
                                 }
                             }))
-                            .child(if runtime.install_command.is_some() {
-                                "Install"
+                            .child(if is_installing {
+                                format!("{} Installing…", spinner_frame(now_ms))
+                            } else if has_install_command {
+                                "Install".to_owned()
                             } else {
-                                "Website"
+                                "Website".to_owned()
                             }),
                     )
+                    .when(install_error.is_some() && website_url.is_some(), |el| {
+                        el.child(
+                            div()
+                                .id(("workers-runtime-website", index))
+                                .px(px(9.0))
+                                .py(px(5.0))
+                                .rounded(px(7.0))
+                                .bg(crate::theme::ink(0.08))
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    if let Some(url) = &website_url {
+                                        cx.open_url(url);
+                                    }
+                                }))
+                                .child("Website"),
+                        )
+                    })
             });
         let body = div()
             .flex()
