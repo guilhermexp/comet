@@ -2,10 +2,16 @@
 
 ## Status
 
-Approved correction to the Workers implementation. The pinned source at
-`third_party/unpeel` and the supplied native-app screenshots are the authority.
-Earlier foundation work remains useful, but it is not evidence of one-to-one
-visual or behavioral parity.
+Implemented and verified for the local macOS scope on 2026-08-17. The pinned
+source at `third_party/unpeel` and the supplied native-app screenshots remained
+the authority. Automated checks, real PTY coverage and native side-by-side QA
+are recorded in
+`docs/superpowers/plans/2026-08-17-unpeel-workers-parity-completion.md` and
+`.impeccable/review/workers-parity-completion/`.
+
+The only open delivery item is provenance, not product behavior: the local
+Unpeel compatibility commits `5f23a30` and `fb6f77d` need an explicitly
+authorized remote branch before the root gitlink can be updated reproducibly.
 
 ## Goal
 
@@ -205,4 +211,3 @@ Phone/Link controls remain absent because remote transport is deferred.
 - A real GPUI run is inspected against all supplied screenshot states: empty,
   settings, launcher, active session, multiple sessions, and unread/attention.
 - Orchestrator remains unchanged when its mode is selected.
-

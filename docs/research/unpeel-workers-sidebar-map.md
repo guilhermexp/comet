@@ -110,9 +110,43 @@ autorelease pool — causa confirmada do crash observado no primeiro smoke nativ
 
 ### Gates executados
 
-- 25 testes unitários de Workers, incluindo precedência, deduplicação, geometria,
+- 26 testes unitários do adapter e todas as suites de integração;
+- 45/45 testes de Workers UI, incluindo precedência, deduplicação, geometria,
   tags nativas e seleção entre projetos;
-- teste do adapter preservando os campos do ActivityLog do Unpeel;
-- `cargo build -p zeron`;
+- 9/9 testes do engine para convergência assíncrona de título/branch;
+- 689/689 assertions PTY reais do Unpeel;
+- `cargo check -p zeron-ui` e `cargo build -p zeron`;
 - smoke nativo com o status item permanecendo ativo após a atualização do model;
 - `cargo fmt --all -- --check` e `git diff --check`.
+
+## Ledger final de paridade
+
+| Superfície | Fonte Unpeel | Implementação Comet | Evidência |
+| --- | --- | --- | --- |
+| Árvore/hover/linhas | `SidebarView.swift` | `workers/workspace.rs`, `presentation.rs`, `session_menu.rs`, `project_menu.rs` | `01`, `03`, `09` |
+| Providers/SVGs | catálogo e assets nativos | `icons.rs`, adapter de runtime | testes de catálogo + `07`, `08` |
+| Spinner/attention/unread | `HookServer.swift`, activity reducer | `activity_bridge.rs`, `notification_policy.rs`, model compartilhado | 45 testes UI + `09`, `10` |
+| Terminal/input/resize | controller protocol + terminal viewport | `workers/terminal.rs`, initial-grid patch | 689 PTY + `07`, `08`, `10` |
+| Project/worktree/session actions | reducers e menus da sidebar | adapters tipados + menus por capability | suites `project_actions`/`session_actions` |
+| Archive/Recent | store e views nativas | `archive.rs`, `recent.rs` | testes de tuple identity + `05`, `09` |
+| Settings | painéis nativos | somente Presets, Transcripts, Notifications | `02` + testes de settings |
+| Menu bar | `MenuBarController.swift` | `workers/menu_bar.rs` + `NSStatusItem` | `04`, `05` |
+| Isolação Orchestrator | contrato Comet | root Workers retido e modelo separado | `11`, `12` |
+| Estado compartilhado | `~/.unpeel` + `session.sock` | core canônico, sem store paralelo | `10` + `unpeel ls/send/wait/screen` |
+
+Os números de evidência correspondem aos arquivos em
+`.impeccable/review/workers-parity-completion/`. No teste `10`, o CLI oficial do
+Unpeel descobriu a sessão criada no Comet, enviou
+`echo COMET_UNPEEL_SHARED_OK`, esperou o texto e leu a mesma viewport; o Comet
+refletiu o output e o título automaticamente. O primeiro ensaio usou um caminho
+temporário cujo `session.sock` tinha 105 caracteres e excedeu o limite Unix do
+macOS; o ensaio válido foi repetido em `/tmp/uqa.XcbWqA` com socket presente.
+
+## Proveniência pendente
+
+O checkout local de `third_party/unpeel` contém dois commits isolados sobre
+`b02a4b5`: `5f23a30` (initial terminal grid) e `fb6f77d` (estabilização das
+provas PTY). Eles passaram nos gates locais, mas não foram publicados. O root
+gitlink só deve ser atualizado depois de autorização explícita para criar ou
+usar `zeronsh/unpeel` e fazer push desses objetos; até lá, o `+` do submodule é
+esperado e evita registrar uma referência impossível de clonar.

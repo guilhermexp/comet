@@ -8,6 +8,35 @@
 
 **Tech Stack:** Rust 2024, GPUI, `unpeel-core` fixado em `b02a4b51fbc37a27afe6e1109b2a2b6ae087a25f`, terminal viewport protocol, AppKit para menu bar/notificações, Cargo tests e testes PTY reais do Unpeel.
 
+## Execution status — 2026-08-17
+
+Implementation, automated gates and native visual QA are complete for the local
+macOS scope. Tasks 1–7 and 9 were executed in the commits listed below. Task 8
+is complete locally, including the two isolated Unpeel commits and all upstream
+tests, but its publication/pinning step remains intentionally blocked until the
+user explicitly authorizes creating or updating `zeronsh/unpeel` and pushing
+the branch. The root therefore must not record the unpublished submodule object.
+
+| Task | Result | Commit/evidence |
+| --- | --- | --- |
+| 1–2 | session contract, lifecycle, inline confirmation and capability menus | `14874c6` |
+| 3 | projects, groups, worktrees, ordering and stable tuple selection | `bfc5e64` |
+| 4 | generation-authoritative activity, spinner, attention, unread and notifications | `e5fadd2` |
+| 5 | official provider SVGs/catalog and trusted installer | `6868813` |
+| 6 | input modes, focus, independent sessions and terminal viewport sizing | `2eae4f9` |
+| 7 | Archive, Recent and menu-bar identity/navigation | `3fdb715` |
+| engine convergence | title/branch asynchronous convergence proof | `b798631` |
+| 8 local patch | initial terminal grid + deterministic upstream PTY stabilization | Unpeel `5f23a30`, `fb6f77d` |
+| 9 | automated gates and 12 native/reference captures | `.impeccable/review/workers-parity-completion/` |
+
+Automated closeout: 689/689 real Unpeel PTY assertions, 26 adapter unit tests,
+all adapter integration suites, 45/45 Workers UI tests, 9/9 engine convergence
+tests, `cargo fmt`, `git diff --check`, `cargo check -p zeron-ui`, and
+`cargo build -p zeron`. Native QA additionally proved terminal input/focus,
+second-session auto-selection, cross-project routing, menu-bar empty/recent,
+Orchestrator isolation, and official Unpeel CLI control of a live Comet-created
+session through the same canonical home.
+
 ## Global Constraints
 
 - A autoridade é o checkout fixado em `third_party/unpeel`; screenshots servem como exemplos de aceitação.
@@ -768,3 +797,17 @@ git commit -m "docs(workers): record unpeel parity acceptance"
 - [ ] Orchestrator permanece sem regressão.
 - [ ] Root e submodule ficam limpos e reproduzíveis.
 - [ ] Gates Cargo, core Unpeel, native attach, 24 PTY cases e matriz visual estão registrados como evidência.
+
+### Closeout verdict
+
+- [x] Todos os verbos visíveis de sessão e projeto dentro do escopo local existem e obedecem às mesmas capabilities/estados do Unpeel.
+- [x] Spinner, attention, unread e notificações são dirigidos pela geração autoritativa e não reaparecem por seleção/reload.
+- [x] `Notify when done` é por sessão e snapshots iniciais não notificam.
+- [x] Providers usam o SVG/fallback oficial e instalação executa apenas comandos confiáveis do catálogo.
+- [x] Worktrees, grupos, ordenação, movimento e seleção entre projetos são determinísticos.
+- [x] Terminal cabe na janela, recebe foco e não cria um segundo scroll externo.
+- [x] Menu bar, Recent, Archive e sidebar preservam `(project_id, session_id)`.
+- [x] Settings contém somente Presets, Transcripts e Notifications.
+- [x] Orchestrator permaneceu isolado e com estado preservado no smoke nativo.
+- [x] Gates Cargo, Unpeel core/TUI, PTY e matriz visual estão registrados.
+- [ ] Root/submodule reproduzível em clone limpo — bloqueado somente pela publicação explícita dos commits locais `5f23a30` e `fb6f77d`.
