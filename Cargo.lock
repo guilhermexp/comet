@@ -9478,6 +9478,7 @@ dependencies = [
  "zeron-proto",
  "zeron-rpc",
  "zeron-update",
+ "zeron-workers-unpeel",
 ]
 
 [[package]]

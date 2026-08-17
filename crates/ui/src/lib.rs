@@ -38,6 +38,7 @@ pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
 pub mod transcript;
+pub mod workers;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
