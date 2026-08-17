@@ -88,6 +88,13 @@ zeron-workers-unpeel = { path = "crates/workers-unpeel" }
 unpeel-core = { path = "third_party/unpeel/crates/unpeel-core" }
 ```
 
+Exclude `third_party/unpeel` from the Comet workspace so its packages inherit
+the pinned upstream workspace metadata instead of Comet's metadata:
+
+```toml
+exclude = ["third_party/unpeel"]
+```
+
 Create `crates/workers-unpeel/Cargo.toml`:
 
 ```toml

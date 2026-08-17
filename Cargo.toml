@@ -10,9 +10,11 @@ members = [
     "crates/rpc",
     "crates/mcp",
     "crates/update",
+    "crates/workers-unpeel",
     "crates/ui",
     "apps/zeron",
 ]
+exclude = ["third_party/unpeel"]
 
 [workspace.package]
 version = "0.2.3"
@@ -35,7 +37,9 @@ comet-engine = { package = "zeron-engine", path = "crates/engine" }
 comet-rpc = { package = "zeron-rpc", path = "crates/rpc" }
 comet-syntax = { path = "crates/syntax" }
 zeron-update = { path = "crates/update" }
+zeron-workers-unpeel = { path = "crates/workers-unpeel" }
 zeron-ui = { path = "crates/ui" }
+unpeel-core = { path = "third_party/unpeel/crates/unpeel-core" }
 
 # MCP server for the worker tools (`zeron mcp-server`). `transport-io` is the
 # stdio SERVER transport; the defaults (server, macros, base64) stay on —
