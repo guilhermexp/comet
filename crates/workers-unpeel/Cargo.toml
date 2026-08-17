@@ -7,10 +7,12 @@ publish.workspace = true
 
 [dependencies]
 base64 = "0.22"
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 unpeel-core.workspace = true
+unicode-width = "0.2"
 uuid.workspace = true
 
 [dev-dependencies]

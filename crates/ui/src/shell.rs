@@ -55,6 +55,7 @@ use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, 
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 use crate::workers::model::WorkersModel;
+use crate::workers::presentation::workers_titlebar;
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
 
 mod spaces;
@@ -885,6 +886,7 @@ pub struct Shell {
     /// retained Unpeel workspace while Orchestrator keeps its existing routes.
     sidebar_mode: SidebarMode,
     workers_model: Entity<WorkersModel>,
+    workers_reveal_generation: u64,
     workers_sidebar: Entity<WorkersSidebar>,
     workers_content: Entity<WorkersContent>,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -1007,25 +1009,40 @@ pub struct Shell {
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
+    _workers_observation: Subscription,
     _composer_events: Subscription,
 }
 
 impl Shell {
-    pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        boot: EngineBootConfig,
+        workers_model: Entity<WorkersModel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-        let workers_model = cx.new(WorkersModel::new);
-        let workers_sidebar = cx.new({
-            let workers_model = workers_model.clone();
-            move |cx| WorkersSidebar::new(workers_model, cx)
+        let workers_reveal_generation = workers_model.read(cx).reveal().generation;
+        let workers_observation = cx.observe(&workers_model, |this, model, cx| {
+            let generation = model.read(cx).reveal().generation;
+            if generation != this.workers_reveal_generation {
+                this.workers_reveal_generation = generation;
+                this.sidebar_mode = SidebarMode::Workers;
+            }
+            cx.notify();
         });
         let workers_content = cx.new({
             let workers_model = workers_model.clone();
             move |cx| WorkersContent::new(workers_model, cx)
+        });
+        let workers_sidebar = cx.new({
+            let workers_model = workers_model.clone();
+            let workers_content = workers_content.clone();
+            move |cx| WorkersSidebar::new(workers_model, workers_content, cx)
         });
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
@@ -1135,6 +1152,7 @@ impl Shell {
                 _ => SidebarMode::default(),
             },
             workers_model,
+            workers_reveal_generation,
             workers_sidebar,
             workers_content,
             nav,
@@ -1200,6 +1218,7 @@ impl Shell {
             focus_sub: None,
             _ticker: ticker,
             _state_observation: observation,
+            _workers_observation: workers_observation,
             _composer_events: composer_events,
         }
     }
@@ -2927,17 +2946,94 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.sidebar_mode == SidebarMode::Workers {
             let theme = Theme::of(cx).clone();
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            let model = self.workers_model.read(cx);
+            let project = model.selected_session().and_then(|session| {
+                model
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == session.project_id)
+            });
+            let parent = project
+                .and_then(|project| project.parent_project_id.as_deref())
+                .and_then(|parent_id| {
+                    model
+                        .projects()
+                        .iter()
+                        .find(|project| project.id == parent_id)
+                });
+            let titlebar = workers_titlebar(project, parent);
+            let branch = titlebar.branch.clone();
+            let branch_icon = if titlebar.branch_is_worktree {
+                icons::WORKER_BRANCH
+            } else {
+                icons::WORKER_GIT_BRANCH
+            };
             let bar = div()
                 .h(px(Theme::TITLEBAR_HEIGHT))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
+                .pl(px(sidebar_now))
                 .pt(px(Theme::TITLEBAR_TOP_PAD))
-                .text_size(px(12.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text_muted)
-                .child("Workers");
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .children(titlebar.segments.into_iter().enumerate().flat_map(
+                            |(index, segment)| {
+                                let separator = (index > 0).then(|| {
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.text_muted.opacity(0.55))
+                                        .child("/")
+                                });
+                                [
+                                    separator.map(IntoElement::into_any_element),
+                                    Some(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .font_weight(if index == 0 {
+                                                gpui::FontWeight::SEMIBOLD
+                                            } else {
+                                                gpui::FontWeight::MEDIUM
+                                            })
+                                            .text_color(theme.text_muted)
+                                            .child(segment)
+                                            .into_any_element(),
+                                    ),
+                                ]
+                                .into_iter()
+                                .flatten()
+                            },
+                        ))
+                        .when_some(branch, |el, branch| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .ml(px(2.0))
+                                    .text_color(theme.text_muted.opacity(0.55))
+                                    .child(
+                                        icon(branch_icon)
+                                            .size(px(12.0))
+                                            .flex_none()
+                                            .text_color(theme.text_muted.opacity(0.55)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .child(branch),
+                                    ),
+                            )
+                        }),
+                );
             return self
                 .titlebar_drag_region("workers-header-titlebar", bar, cx)
                 .into_any_element();

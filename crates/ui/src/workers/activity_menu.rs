@@ -16,7 +16,9 @@ pub const FOOTER_HEIGHT: f64 = 28.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkersMenuBarMode {
-    Working { blocked: bool },
+    Working {
+        blocked: bool,
+    },
     Blocked,
     Unread,
     #[default]
@@ -165,7 +167,11 @@ fn activity_row<'a>(
         WorkersActivityRowKind::Unread if session.state != "running" => "Exited",
         WorkersActivityRowKind::Unread => "Done",
         WorkersActivityRowKind::Working if session.runtime_launch_pending => {
-            if session.is_live() { "Restarting" } else { "Resuming" }
+            if session.is_live() {
+                "Restarting"
+            } else {
+                "Resuming"
+            }
         }
         WorkersActivityRowKind::Working if session.activity == "starting" => "Starting",
         WorkersActivityRowKind::Working => "Working",
@@ -185,7 +191,10 @@ fn activity_row<'a>(
             }
         })
         .unwrap_or_else(|| "Unknown project".to_owned());
-    let runtime_id = session.active_runtime_id.as_deref().or(session.provider_id.as_deref());
+    let runtime_id = session
+        .active_runtime_id
+        .as_deref()
+        .or(session.provider_id.as_deref());
     WorkersActivityRow {
         session_id: session.id.clone(),
         title: session.title.clone(),
@@ -254,6 +263,7 @@ mod tests {
             }],
             presets: Vec::new(),
             sessions,
+            activity_log: Vec::new(),
         })
     }
 

@@ -1,5 +1,7 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
+mod activity_bridge;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,9 +10,12 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use unicode_width::UnicodeWidthChar as _;
+use unpeel_core::activity_log::{ActivityLogEntry, ActivityLogKind, ActivityLogStore};
 use unpeel_core::controller_host::ControllerHostRuntime;
 use unpeel_core::relay_crypto::TunnelRequest;
 use unpeel_core::session_host;
+use unpeel_core::terminal_viewport::{TerminalViewportSnapshot, TerminalViewportStyleRun};
 
 pub fn is_session_host_mode(args: &[String]) -> bool {
     session_host_launch_args(args).is_some()
@@ -73,6 +78,47 @@ pub struct WorkersBootstrap {
     pub projects: Vec<WorkersProject>,
     pub presets: Vec<WorkersPreset>,
     pub sessions: Vec<WorkersSession>,
+    pub activity_log: Vec<WorkersActivityLogEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkersActivityLogKind {
+    Started,
+    NeedsInput,
+    Finished,
+    Exited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersActivityLogEntry {
+    pub id: String,
+    pub session_id: String,
+    pub kind: WorkersActivityLogKind,
+    pub at_unix_ms: u64,
+    pub title: String,
+    pub command: String,
+    pub project_id: String,
+    pub project_name: String,
+}
+
+impl From<ActivityLogEntry> for WorkersActivityLogEntry {
+    fn from(value: ActivityLogEntry) -> Self {
+        Self {
+            id: value.id,
+            session_id: value.session_id,
+            kind: match value.kind {
+                ActivityLogKind::Started => WorkersActivityLogKind::Started,
+                ActivityLogKind::NeedsInput => WorkersActivityLogKind::NeedsInput,
+                ActivityLogKind::Finished => WorkersActivityLogKind::Finished,
+                ActivityLogKind::Exited => WorkersActivityLogKind::Exited,
+            },
+            at_unix_ms: value.at,
+            title: value.title,
+            command: value.command,
+            project_id: value.project_id,
+            project_name: value.project_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +143,7 @@ pub struct WorkersProject {
     pub parent_project_id: Option<String>,
     pub is_group: bool,
     pub worktree_branch: Option<String>,
+    pub git_branch: Option<String>,
     pub archived_session_count: usize,
 }
 
@@ -376,6 +423,103 @@ pub struct WorkersOutput {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersViewport {
+    pub output_offset: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub ansi: Vec<u8>,
+}
+
+fn color_sgr(color: &str, foreground: bool) -> Option<String> {
+    let channel = if foreground { 38 } else { 48 };
+    if let Some(index) = color.strip_prefix("ansi:") {
+        let index = index.parse::<u8>().ok()?;
+        return Some(format!("{channel};5;{index}"));
+    }
+    if let Some(index) = color.strip_prefix("ansi256:") {
+        let index = index.parse::<u8>().ok()?;
+        return Some(format!("{channel};5;{index}"));
+    }
+    let rgb = color.strip_prefix("rgb:")?;
+    let mut channels = rgb.split(',').map(str::parse::<u8>);
+    let red = channels.next()?.ok()?;
+    let green = channels.next()?.ok()?;
+    let blue = channels.next()?.ok()?;
+    channels
+        .next()
+        .is_none()
+        .then(|| format!("{channel};2;{red};{green};{blue}"))
+}
+
+fn style_sgr(style: Option<&TerminalViewportStyleRun>) -> String {
+    let Some(style) = style else {
+        return "\x1b[0m".into();
+    };
+    let mut attributes = vec!["0".to_owned()];
+    if style.bold {
+        attributes.push("1".into());
+    }
+    if style.inverse {
+        attributes.push("7".into());
+    }
+    if let Some(fg) = style.fg.as_deref().and_then(|color| color_sgr(color, true)) {
+        attributes.push(fg);
+    }
+    if let Some(bg) = style
+        .bg
+        .as_deref()
+        .and_then(|color| color_sgr(color, false))
+    {
+        attributes.push(bg);
+    }
+    format!("\x1b[{}m", attributes.join(";"))
+}
+
+fn viewport_snapshot_to_ansi(snapshot: &TerminalViewportSnapshot) -> Vec<u8> {
+    let mut ansi = Vec::new();
+    if snapshot.alternate_screen {
+        ansi.extend_from_slice(b"\x1b[?1049h");
+    }
+    ansi.extend_from_slice(b"\x1b[2J\x1b[H\x1b[?7l");
+
+    for (row_index, row) in snapshot.viewport_rows.iter().enumerate() {
+        ansi.extend_from_slice(format!("\x1b[{};1H", row_index + 1).as_bytes());
+        let mut column = 0_usize;
+        let mut active_style = None;
+        for character in row.text.chars() {
+            let style_index = row.styles.iter().position(|style| {
+                let start = usize::from(style.start);
+                let end = start.saturating_add(usize::from(style.len));
+                column >= start && column < end
+            });
+            if active_style != style_index {
+                ansi.extend_from_slice(
+                    style_sgr(style_index.map(|index| &row.styles[index])).as_bytes(),
+                );
+                active_style = style_index;
+            }
+            let mut encoded = [0_u8; 4];
+            ansi.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            column = column.saturating_add(character.width().unwrap_or(0));
+        }
+        if active_style.is_some() {
+            ansi.extend_from_slice(b"\x1b[0m");
+        }
+    }
+
+    ansi.extend_from_slice(b"\x1b[?7h");
+    ansi.extend_from_slice(if snapshot.application_cursor {
+        b"\x1b[?1h"
+    } else {
+        b"\x1b[?1l"
+    });
+    let cursor_row = snapshot.cursor_row.min(snapshot.rows.saturating_sub(1)) + 1;
+    let cursor_col = snapshot.cursor_col.min(snapshot.cols.saturating_sub(1)) + 1;
+    ansi.extend_from_slice(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
+    ansi
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     Stop,
@@ -383,6 +527,39 @@ pub enum SessionAction {
     RestartAgent,
     ResumeAgent,
     Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkersSessionCommand {
+    Stop,
+    RestartSession,
+    RestartAgent,
+    ResumeAgent,
+    Fork,
+    ClearAttention,
+    AppendSystemContext { text: String },
+    SetNotifyWhenDone { enabled: bool },
+    Archive,
+    Restore,
+    RestoreAndResume,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkersTranscriptRange {
+    Last20,
+    Last50,
+    WholeConversation,
+}
+
+impl WorkersTranscriptRange {
+    pub const fn entries(self) -> usize {
+        match self {
+            Self::Last20 => 20,
+            Self::Last50 => 50,
+            Self::WholeConversation => 0,
+        }
+    }
 }
 
 impl SessionAction {
@@ -402,6 +579,8 @@ pub struct SessionOrganizationPatch {
     pub title: Option<String>,
     pub pinned: Option<bool>,
     pub archived: Option<bool>,
+    pub notify_when_done: Option<bool>,
+    pub project_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Error)]
@@ -412,15 +591,34 @@ pub enum WorkersError {
     InvalidResponse(#[from] serde_json::Error),
     #[error("Unpeel returned invalid terminal output: {0}")]
     InvalidOutput(#[from] base64::DecodeError),
+    #[error("Unpeel protocol error: {0}")]
+    Protocol(String),
     #[error("Unpeel state operation failed: {0}")]
     State(String),
     #[error("Invalid project directory {path}: {message}")]
     InvalidProject { path: String, message: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalWorkersClient {
     next_request_id: Arc<AtomicU64>,
+    activity: Arc<activity_bridge::ActivityBridge>,
+    last_displayed_grid: Arc<AtomicU64>,
+}
+
+fn shared_displayed_grid() -> Arc<AtomicU64> {
+    static GRID: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
+    GRID.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
+}
+
+impl std::fmt::Debug for LocalWorkersClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalWorkersClient")
+            .field("hook_port", &self.activity.hook_port())
+            .field("remembered_grid", &self.remembered_grid())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for LocalWorkersClient {
@@ -433,13 +631,31 @@ impl LocalWorkersClient {
     pub fn new() -> Self {
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
+            activity: activity_bridge::shared_activity_bridge(),
+            last_displayed_grid: shared_displayed_grid(),
         }
+    }
+
+    /// Keep the most recently painted terminal grid available to the model's
+    /// independent client. Full-screen TUIs must receive these dimensions at
+    /// PTY creation time; a corrective resize after first paint is too late
+    /// for clients such as Kimi Code.
+    pub fn remember_grid(&self, columns: u16, rows: u16) {
+        let columns = columns.clamp(2, 300) as u64;
+        let rows = rows.clamp(2, 120) as u64;
+        self.last_displayed_grid
+            .store((columns << 16) | rows, Ordering::Relaxed);
+    }
+
+    fn remembered_grid(&self) -> Option<(u16, u16)> {
+        let packed = self.last_displayed_grid.load(Ordering::Relaxed);
+        (packed != 0).then_some(((packed >> 16) as u16, (packed & 0xffff) as u16))
     }
 
     pub fn bootstrap(&self) -> Result<WorkersBootstrap, WorkersError> {
         let body = self.request("GET", "/mobile/bootstrap", Vec::new(), Value::Null)?;
         let wire: BootstrapWire = serde_json::from_value(body)?;
-        Ok(WorkersBootstrap {
+        let mut bootstrap = WorkersBootstrap {
             mac_name: wire.mac_name,
             protocol: WorkersProtocol {
                 major_version: wire.host_protocol.major_version,
@@ -457,7 +673,20 @@ impl LocalWorkersClient {
                 .into_iter()
                 .map(WorkersSession::from)
                 .collect(),
-        })
+            activity_log: ActivityLogStore::load_default()
+                .map(|store| {
+                    store
+                        .entries()
+                        .iter()
+                        .cloned()
+                        .map(WorkersActivityLogEntry::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        apply_notify_when_done_overlay(&mut bootstrap.sessions);
+        self.activity.enrich(&mut bootstrap.sessions);
+        Ok(bootstrap)
     }
 
     pub fn read_output(
@@ -480,6 +709,30 @@ impl LocalWorkersClient {
             next_offset: wire.next_offset,
             data: base64::engine::general_purpose::STANDARD.decode(wire.data_base64)?,
             truncated: wire.truncated,
+        })
+    }
+
+    pub fn read_viewport(
+        &self,
+        session_id: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Result<WorkersViewport, WorkersError> {
+        let snapshot = unpeel_core::terminal_viewport::read_terminal_viewport_snapshot(
+            session_id.to_owned(),
+            columns.clamp(2, 300),
+            rows.clamp(2, 120),
+            None,
+            Some(0),
+            Some(rows.clamp(2, 120)),
+        )
+        .map_err(WorkersError::Protocol)?;
+        let ansi = viewport_snapshot_to_ansi(&snapshot);
+        Ok(WorkersViewport {
+            output_offset: snapshot.output_offset,
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            ansi,
         })
     }
 
@@ -506,7 +759,14 @@ impl LocalWorkersClient {
     }
 
     pub fn launch_session(&self, launch: &WorkersLaunchRequest) -> Result<String, WorkersError> {
-        let body = self.request("POST", "/mobile/sessions", Vec::new(), launch.wire_body())?;
+        let mut launch_body = launch.wire_body();
+        if let (Some(body), Some((columns, rows))) =
+            (launch_body.as_object_mut(), self.remembered_grid())
+        {
+            body.insert("initialColumns".into(), json!(columns));
+            body.insert("initialRows".into(), json!(rows));
+        }
+        let body = self.request("POST", "/mobile/sessions", Vec::new(), launch_body)?;
         let wire: CreatedSessionWire = serde_json::from_value(body)?;
         Ok(wire.session_id)
     }
@@ -713,6 +973,109 @@ impl LocalWorkersClient {
         )
     }
 
+    pub fn session_command(
+        &self,
+        session: &WorkersSession,
+        command: WorkersSessionCommand,
+    ) -> Result<Option<String>, WorkersError> {
+        let session_id = session.id.as_str();
+        match command {
+            WorkersSessionCommand::Stop => {
+                self.session_action(session_id, SessionAction::Stop)?;
+                Ok(None)
+            }
+            WorkersSessionCommand::RestartSession => {
+                self.session_action(session_id, SessionAction::Restart)?;
+                Ok(None)
+            }
+            WorkersSessionCommand::RestartAgent => {
+                self.session_action(session_id, SessionAction::RestartAgent)?;
+                Ok(None)
+            }
+            WorkersSessionCommand::ResumeAgent => {
+                self.session_action(session_id, SessionAction::ResumeAgent)?;
+                Ok(None)
+            }
+            WorkersSessionCommand::Fork => self.fork_session(session).map(Some),
+            WorkersSessionCommand::ClearAttention => {
+                self.clear_attention(session_id)?;
+                Ok(None)
+            }
+            WorkersSessionCommand::AppendSystemContext { text } => {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Err(WorkersError::State(
+                        "system context must not be blank".into(),
+                    ));
+                }
+                self.append_system_context(session_id, Some(text))?;
+                Ok(None)
+            }
+            WorkersSessionCommand::SetNotifyWhenDone { enabled } => {
+                self.set_session_organization(
+                    session_id,
+                    SessionOrganizationPatch {
+                        notify_when_done: Some(enabled),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(None)
+            }
+            WorkersSessionCommand::Archive => {
+                if session.is_live() {
+                    self.session_action(session_id, SessionAction::Stop)?;
+                }
+                self.set_session_organization(
+                    session_id,
+                    SessionOrganizationPatch {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(None)
+            }
+            WorkersSessionCommand::Restore => {
+                self.set_session_organization(
+                    session_id,
+                    SessionOrganizationPatch {
+                        archived: Some(false),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(None)
+            }
+            WorkersSessionCommand::RestoreAndResume => {
+                self.set_session_organization(
+                    session_id,
+                    SessionOrganizationPatch {
+                        archived: Some(false),
+                        ..Default::default()
+                    },
+                )?;
+                let resume = if session.capabilities.resume_agent {
+                    SessionAction::ResumeAgent
+                } else {
+                    SessionAction::Restart
+                };
+                if let Err(error) = self.session_action(session_id, resume) {
+                    let _ = self.set_session_organization(
+                        session_id,
+                        SessionOrganizationPatch {
+                            archived: Some(true),
+                            ..Default::default()
+                        },
+                    );
+                    return Err(error);
+                }
+                Ok(None)
+            }
+            WorkersSessionCommand::Remove => {
+                self.session_action(session_id, SessionAction::Remove)?;
+                Ok(None)
+            }
+        }
+    }
+
     pub fn set_session_organization(
         &self,
         session_id: &str,
@@ -729,7 +1092,71 @@ impl LocalWorkersClient {
         if let Some(archived) = patch.archived {
             body.insert("archived".into(), archived.into());
         }
+        if let Some(notify_when_done) = patch.notify_when_done {
+            set_notify_when_done_overlay(session_id, notify_when_done)?;
+        }
+        if let Some(project_id) = patch.project_id {
+            self.move_session(session_id, project_id.as_deref())?;
+        }
+        if body.len() == 1 {
+            return Ok(());
+        }
         self.mutate("/mobile/session-organization", body.into())
+    }
+
+    pub fn clear_attention(&self, session_id: &str) -> Result<(), WorkersError> {
+        if unpeel_core::session_host::load_manifest(session_id).is_none() {
+            return Err(WorkersError::State(format!("unknown session {session_id}")));
+        }
+        self.activity.clear_attention(session_id);
+        Ok(())
+    }
+
+    pub fn move_session(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<(), WorkersError> {
+        match project_id {
+            Some(project_id) => {
+                unpeel_core::session_ops::set_project_override(session_id, project_id)
+            }
+            None => unpeel_core::session_ops::clear_project_override(session_id),
+        }
+        .map_err(WorkersError::State)
+    }
+
+    pub fn append_system_context(
+        &self,
+        session_id: &str,
+        context: Option<&str>,
+    ) -> Result<(), WorkersError> {
+        unpeel_core::session_ops::set_appended_context(session_id, context)
+            .map_err(WorkersError::State)
+    }
+
+    pub fn fork_session(&self, session: &WorkersSession) -> Result<String, WorkersError> {
+        let manifest = unpeel_core::session_host::load_manifest(&session.id)
+            .ok_or_else(|| WorkersError::State(format!("unknown session {}", session.id)))?;
+        if !manifest.has_been_written_to {
+            return Err(WorkersError::State(
+                "A session must receive input before it can be forked".into(),
+            ));
+        }
+        let (provider_session_id, _) =
+            unpeel_core::session_ops::provider_session_marker(&session.id);
+        let command = unpeel_core::resume::forked(
+            &manifest.session.command,
+            provider_session_id
+                .as_deref()
+                .or(manifest.provider_session_id.as_deref()),
+        )
+        .ok_or_else(|| WorkersError::State("This worker does not support fork".into()))?;
+        let mut request = WorkersLaunchRequest::command(session.project_id.clone(), command);
+        if let Some(branch) = session.worktree_branch.clone() {
+            request = request.with_worktree(manifest.cwd, branch);
+        }
+        self.launch_session(&request)
     }
 
     pub fn archived_sessions(&self, project_id: &str) -> Result<Vec<WorkersSession>, WorkersError> {
@@ -747,6 +1174,30 @@ impl LocalWorkersClient {
             .collect())
     }
 
+    pub fn transcript_markdown(
+        &self,
+        session_id: &str,
+        entries: Option<usize>,
+    ) -> Result<String, WorkersError> {
+        let mut query = vec![("session_id".to_owned(), session_id.to_owned())];
+        if let Some(entries) = entries {
+            query.push(("entries".to_owned(), entries.to_string()));
+        }
+        let body = self.request("GET", "/mobile/transcript-markdown", query, Value::Null)?;
+        body.get("markdown")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| WorkersError::Protocol("transcript response missing markdown".into()))
+    }
+
+    pub fn transcript_markdown_range(
+        &self,
+        session_id: &str,
+        range: WorkersTranscriptRange,
+    ) -> Result<String, WorkersError> {
+        self.transcript_markdown(session_id, Some(range.entries()))
+    }
+
     fn mutate(&self, path: &str, body: Value) -> Result<(), WorkersError> {
         self.request("POST", path, Vec::new(), body).map(|_| ())
     }
@@ -759,7 +1210,8 @@ impl LocalWorkersClient {
         body: Value,
     ) -> Result<Value, WorkersError> {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let runtime = ControllerHostRuntime::owner_transport("comet-local", None, None);
+        let runtime =
+            ControllerHostRuntime::owner_transport("comet-local", None, self.activity.hook_port());
         let request = TunnelRequest {
             id,
             method: method.to_owned(),
@@ -831,6 +1283,8 @@ struct ProjectWire {
     #[serde(default)]
     worktree_branch: Option<String>,
     #[serde(default)]
+    git_branch: Option<String>,
+    #[serde(default)]
     archived_session_count: usize,
 }
 
@@ -844,6 +1298,7 @@ impl From<ProjectWire> for WorkersProject {
             parent_project_id: value.parent_project_id,
             is_group: value.is_group,
             worktree_branch: value.worktree_branch,
+            git_branch: value.git_branch,
             archived_session_count: value.archived_session_count,
         }
     }
@@ -991,6 +1446,43 @@ struct ArchiveWire {
     sessions: Vec<SessionWire>,
 }
 
+const NOTIFY_WHEN_DONE_OVERLAY_KEY: &str = "comet_workers_notify_when_done";
+
+fn apply_notify_when_done_overlay(sessions: &mut [WorkersSession]) {
+    let Ok(state) = unpeel_core::app_state::load() else {
+        return;
+    };
+    let Some(values) = state
+        .get(NOTIFY_WHEN_DONE_OVERLAY_KEY)
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(enabled) = values.get(&session.id).and_then(Value::as_bool) {
+            session.notify_when_done = enabled;
+        }
+    }
+}
+
+fn set_notify_when_done_overlay(session_id: &str, enabled: bool) -> Result<(), WorkersError> {
+    unpeel_core::app_state::edit(|state| {
+        let values = state
+            .entry(NOTIFY_WHEN_DONE_OVERLAY_KEY)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let values = values
+            .as_object_mut()
+            .ok_or_else(|| format!("{NOTIFY_WHEN_DONE_OVERLAY_KEY} must be an object"))?;
+        if enabled {
+            values.insert(session_id.to_owned(), Value::Bool(true));
+        } else {
+            values.remove(session_id);
+        }
+        Ok(())
+    })
+    .map_err(WorkersError::State)
+}
+
 fn edit_presets(
     mutate: impl FnOnce(&mut Vec<unpeel_core::state::Preset>) -> Result<(), String>,
 ) -> Result<(), WorkersError> {
@@ -1092,4 +1584,127 @@ fn command_is_risky(command: &str) -> bool {
             || argument == "-f"
             || argument.starts_with("--dangerously")
     })
+}
+
+#[cfg(test)]
+mod activity_log_tests {
+    use unpeel_core::activity_log::{ActivityLogEntry, ActivityLogKind};
+
+    use super::{WorkersActivityLogEntry, WorkersActivityLogKind};
+
+    #[test]
+    fn bootstrap_activity_log_preserves_upstream_history_fields() {
+        let dto = WorkersActivityLogEntry::from(ActivityLogEntry {
+            id: "event-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            kind: ActivityLogKind::Finished,
+            at: 1_234,
+            title: "Ship it".to_owned(),
+            command: "claude".to_owned(),
+            project_id: "project-1".to_owned(),
+            project_name: "Project One".to_owned(),
+        });
+        assert_eq!(dto.id, "event-1");
+        assert_eq!(dto.session_id, "session-1");
+        assert_eq!(dto.kind, WorkersActivityLogKind::Finished);
+        assert_eq!(dto.at_unix_ms, 1_234);
+        assert_eq!(dto.title, "Ship it");
+        assert_eq!(dto.command, "claude");
+        assert_eq!(dto.project_id, "project-1");
+        assert_eq!(dto.project_name, "Project One");
+    }
+}
+
+#[cfg(test)]
+mod terminal_viewport_tests {
+    use unpeel_core::terminal_viewport::{
+        TerminalViewportRow, TerminalViewportSnapshot, TerminalViewportStyleRun,
+    };
+
+    use super::viewport_snapshot_to_ansi;
+
+    fn snapshot(rows: Vec<TerminalViewportRow>) -> TerminalViewportSnapshot {
+        TerminalViewportSnapshot {
+            cols: 40,
+            rows: rows.len() as u16,
+            output_offset: 123,
+            truncated: false,
+            cursor_row: 1,
+            cursor_col: 2,
+            scrollback_rows: 0,
+            viewport_start_row: 0,
+            scroll_offset_rows: 0,
+            input_modes_known: true,
+            mouse_reporting: false,
+            mouse_button_motion: false,
+            mouse_any_motion: false,
+            alternate_screen: true,
+            mouse_alternate_scroll: false,
+            application_cursor: true,
+            viewport_rows: rows,
+        }
+    }
+
+    #[test]
+    fn ghostty_viewport_keeps_the_first_visible_row_at_the_top() {
+        let ansi = viewport_snapshot_to_ansi(&snapshot(vec![
+            TerminalViewportRow {
+                text: "Welcome to Kimi Code CLI!".into(),
+                styles: Vec::new(),
+                wrapped: false,
+            },
+            TerminalViewportRow {
+                text: "Directory: ~/project".into(),
+                styles: Vec::new(),
+                wrapped: false,
+            },
+        ]));
+
+        let welcome = ansi
+            .windows(b"Welcome to Kimi Code CLI!".len())
+            .position(|window| window == b"Welcome to Kimi Code CLI!")
+            .expect("welcome row must be present");
+        let directory = ansi
+            .windows(b"Directory: ~/project".len())
+            .position(|window| window == b"Directory: ~/project")
+            .expect("directory row must be present");
+
+        assert!(ansi.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?7l\x1b[1;1H"));
+        assert!(welcome < directory);
+        assert!(ansi.ends_with(b"\x1b[?7h\x1b[?1h\x1b[2;3H"));
+    }
+
+    #[test]
+    fn ghostty_cell_style_runs_are_preserved_in_the_rebuilt_viewport() {
+        let ansi = viewport_snapshot_to_ansi(&snapshot(vec![TerminalViewportRow {
+            text: "A界B".into(),
+            styles: vec![TerminalViewportStyleRun {
+                start: 1,
+                len: 2,
+                fg: Some("rgb:1,2,3".into()),
+                bg: Some("ansi256:42".into()),
+                bold: true,
+                inverse: false,
+            }],
+            wrapped: false,
+        }]));
+
+        let ansi = String::from_utf8(ansi).expect("viewport ANSI must remain valid UTF-8");
+        assert!(ansi.contains("\x1b[0;1;38;2;1;2;3;48;5;42m界"));
+    }
+}
+
+#[cfg(test)]
+mod launch_grid_tests {
+    use super::LocalWorkersClient;
+
+    #[test]
+    fn last_displayed_grid_is_shared_by_independent_clients() {
+        let terminal_client = LocalWorkersClient::new();
+        let model_client = LocalWorkersClient::new();
+
+        terminal_client.remember_grid(224, 48);
+
+        assert_eq!(model_client.remembered_grid(), Some((224, 48)));
+    }
 }

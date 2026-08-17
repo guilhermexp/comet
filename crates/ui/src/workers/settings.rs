@@ -749,7 +749,7 @@ impl Render for WorkersSettingsView {
         let theme = Theme::of(cx).clone();
         let tab = match self.model.read(cx).route {
             WorkersRoute::Settings(tab) => tab,
-            WorkersRoute::Workspace => WorkersSettingsTab::Presets,
+            WorkersRoute::Workspace | WorkersRoute::Recent => WorkersSettingsTab::Presets,
         };
         match tab {
             WorkersSettingsTab::Presets => self.render_presets(&theme, cx),

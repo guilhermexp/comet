@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -34,6 +34,20 @@ impl WorkersSettingsTab {
 pub enum WorkersRoute {
     Workspace,
     Settings(WorkersSettingsTab),
+    Recent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkersRevealTarget {
+    Workspace,
+    Session(String),
+    Recent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersReveal {
+    pub generation: u64,
+    pub target: WorkersRevealTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,16 +73,25 @@ pub fn notification_transition(
 }
 
 pub fn reconcile_selection(current: Option<&str>, sessions: &[WorkersSession]) -> Option<String> {
-    if let Some(current) = current
-        && sessions.iter().any(|session| session.id == current)
+    current
+        .filter(|current| sessions.iter().any(|session| session.id == *current))
+        .map(str::to_owned)
+}
+
+pub fn reconcile_selection_with_pending(
+    current: Option<&str>,
+    pending_session_id: Option<&str>,
+    sessions: &[WorkersSession],
+) -> Option<String> {
+    if let Some(pending_session_id) = pending_session_id
+        && current == Some(pending_session_id)
+        && !sessions
+            .iter()
+            .any(|session| session.id == pending_session_id)
     {
-        return Some(current.to_owned());
+        return Some(pending_session_id.to_owned());
     }
-    sessions
-        .iter()
-        .find(|session| session.is_live())
-        .or_else(|| sessions.first())
-        .map(|session| session.id.clone())
+    reconcile_selection(current, sessions)
 }
 
 pub fn sessions_for_project<'a>(
@@ -96,6 +119,31 @@ struct PendingReplacement {
     worktree_branch: Option<String>,
     source_created_at_unix_ms: u64,
     baseline_ids: HashSet<String>,
+    remaining_refreshes: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRemove {
+    session_id: String,
+    archived: bool,
+}
+
+fn dispatch_or_queue_remove(
+    action_running: bool,
+    queued: &mut Option<PendingRemove>,
+    request: PendingRemove,
+) -> Option<PendingRemove> {
+    if action_running {
+        *queued = Some(request);
+        None
+    } else {
+        Some(request)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingLaunchSelection {
+    session_id: String,
     remaining_refreshes: u8,
 }
 
@@ -136,13 +184,20 @@ pub struct WorkersModel {
     pub archive_loading: bool,
     pub archive_error: Option<String>,
     pub route: WorkersRoute,
+    reveal: WorkersReveal,
     pub settings: Option<WorkersSettingsSnapshot>,
     pub settings_loading: bool,
     pub settings_error: Option<String>,
+    pub confirming_remove_session_id: Option<String>,
+    confirming_remove_archived: bool,
     initialized_expansion: bool,
     refresh_generation: u64,
     refresh_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
+    pending_remove: Option<PendingRemove>,
+    launch_queue: VecDeque<WorkersLaunchRequest>,
+    launch_task: Option<Task<()>>,
+    pending_launch_selection: Option<PendingLaunchSelection>,
     archive_generation: u64,
     archive_task: Option<Task<()>>,
     settings_generation: u64,
@@ -175,13 +230,23 @@ impl WorkersModel {
             archive_loading: false,
             archive_error: None,
             route: WorkersRoute::Workspace,
+            reveal: WorkersReveal {
+                generation: 0,
+                target: WorkersRevealTarget::Workspace,
+            },
             settings: None,
             settings_loading: false,
             settings_error: None,
+            confirming_remove_session_id: None,
+            confirming_remove_archived: false,
             initialized_expansion: false,
             refresh_generation: 0,
             refresh_task: None,
             action_task: None,
+            pending_remove: None,
+            launch_queue: VecDeque::new(),
+            launch_task: None,
+            pending_launch_selection: None,
             archive_generation: 0,
             archive_task: None,
             settings_generation: 0,
@@ -216,13 +281,47 @@ impl WorkersModel {
     }
 
     pub fn action_in_flight(&self) -> bool {
-        self.action_task.is_some()
+        self.action_task.is_some() || self.launch_task.is_some() || !self.launch_queue.is_empty()
     }
 
     pub fn has_attention(&self) -> bool {
         self.sessions()
             .iter()
             .any(|session| session.unread || (session.is_live() && session.activity == "blocked"))
+    }
+
+    pub fn reveal(&self) -> &WorkersReveal {
+        &self.reveal
+    }
+
+    pub fn request_session_reveal(&mut self, session_id: String, cx: &mut Context<Self>) {
+        self.route = WorkersRoute::Workspace;
+        self.reveal.generation = self.reveal.generation.wrapping_add(1);
+        if self
+            .sessions()
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            self.select_session(session_id.clone(), cx);
+            self.reveal.target = WorkersRevealTarget::Session(session_id);
+        } else {
+            self.selected_project_id = None;
+            self.selected_session_id = None;
+            self.reveal.target = WorkersRevealTarget::Workspace;
+            cx.notify();
+        }
+    }
+
+    pub fn request_recent_reveal(&mut self, cx: &mut Context<Self>) {
+        self.route = WorkersRoute::Recent;
+        self.reveal.generation = self.reveal.generation.wrapping_add(1);
+        self.reveal.target = WorkersRevealTarget::Recent;
+        cx.notify();
+    }
+
+    pub fn close_recent(&mut self, cx: &mut Context<Self>) {
+        self.route = WorkersRoute::Workspace;
+        cx.notify();
     }
 
     pub fn open_settings(&mut self, tab: WorkersSettingsTab, cx: &mut Context<Self>) {
@@ -308,7 +407,9 @@ impl WorkersModel {
         let project_id = session.project_id.clone();
         let was_unread = session.unread;
         self.pending_replacement = None;
+        self.pending_launch_selection = None;
         self.reset_archive_view();
+        self.route = WorkersRoute::Workspace;
         self.selected_project_id = Some(project_id);
         self.selected_session_id = Some(session_id);
         if was_unread {
@@ -327,6 +428,7 @@ impl WorkersModel {
             return;
         }
         self.pending_replacement = None;
+        self.pending_launch_selection = None;
         self.reset_archive_view();
         self.selected_project_id = Some(project_id);
         self.selected_session_id = None;
@@ -335,6 +437,14 @@ impl WorkersModel {
 
     pub fn toggle_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
         toggle_expanded(&mut self.expanded_project_ids, project_id);
+        cx.notify();
+    }
+
+    pub fn collapse_all_projects(&mut self, cx: &mut Context<Self>) {
+        if self.expanded_project_ids.is_empty() {
+            return;
+        }
+        self.expanded_project_ids.clear();
         cx.notify();
     }
 
@@ -371,14 +481,47 @@ impl WorkersModel {
     }
 
     pub fn launch(&mut self, request: WorkersLaunchRequest, cx: &mut Context<Self>) {
-        self.run_action(
-            move |client| client.launch_session(&request),
-            |model, session_id| {
-                model.route = WorkersRoute::Workspace;
-                model.selected_session_id = Some(session_id);
-            },
-            cx,
-        );
+        self.launch_queue.push_back(request);
+        self.start_next_launch(cx);
+        cx.notify();
+    }
+
+    fn start_next_launch(&mut self, cx: &mut Context<Self>) {
+        if self.launch_task.is_some() {
+            return;
+        }
+        let Some(request) = self.launch_queue.pop_front() else {
+            return;
+        };
+        let project_id = request.project_id.clone();
+        let client = self.client.clone();
+        self.launch_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.launch_session(&request) })
+                .await;
+            this.update(cx, |model, cx| {
+                model.launch_task = None;
+                match result {
+                    Ok(session_id) => {
+                        model.reset_archive_view();
+                        model.route = WorkersRoute::Workspace;
+                        model.selected_project_id = Some(project_id.clone());
+                        model.selected_session_id = Some(session_id.clone());
+                        model.expanded_project_ids.insert(project_id.clone());
+                        model.pending_launch_selection = Some(PendingLaunchSelection {
+                            session_id,
+                            remaining_refreshes: 12,
+                        });
+                        model.refresh(cx);
+                    }
+                    Err(error) => model.error = Some(error.to_string()),
+                }
+                model.start_next_launch(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -448,11 +591,111 @@ impl WorkersModel {
         );
     }
 
+    pub fn resume_agent(&mut self, session_id: String, cx: &mut Context<Self>) {
+        self.run_unit_action(
+            move |client| client.session_action(&session_id, SessionAction::ResumeAgent),
+            cx,
+        );
+    }
+
+    pub fn fork(&mut self, session: WorkersSession, cx: &mut Context<Self>) {
+        let project_id = session.project_id.clone();
+        self.run_action(
+            move |client| client.fork_session(&session),
+            move |model, session_id| {
+                model.route = WorkersRoute::Workspace;
+                model.selected_project_id = Some(project_id.clone());
+                model.selected_session_id = Some(session_id.clone());
+                model.expanded_project_ids.insert(project_id);
+                model.pending_launch_selection = Some(PendingLaunchSelection {
+                    session_id,
+                    remaining_refreshes: 12,
+                });
+            },
+            cx,
+        );
+    }
+
+    pub fn clear_attention(&mut self, session_id: String, cx: &mut Context<Self>) {
+        self.run_unit_action(move |client| client.clear_attention(&session_id), cx);
+    }
+
+    pub fn move_session(
+        &mut self,
+        session_id: String,
+        project_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_unit_action(
+            move |client| client.move_session(&session_id, project_id.as_deref()),
+            cx,
+        );
+    }
+
+    pub fn append_system_context(
+        &mut self,
+        session_id: String,
+        context: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_unit_action(
+            move |client| client.append_system_context(&session_id, Some(&context)),
+            cx,
+        );
+    }
+
+    pub fn set_notify_when_done(
+        &mut self,
+        session_id: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.organize(
+            session_id,
+            SessionOrganizationPatch {
+                notify_when_done: Some(enabled),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
     pub fn remove(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.run_unit_action(
             move |client| client.session_action(&session_id, SessionAction::Remove),
             cx,
         );
+    }
+
+    pub fn request_remove(&mut self, session_id: String, archived: bool, cx: &mut Context<Self>) {
+        self.confirming_remove_session_id = Some(session_id);
+        self.confirming_remove_archived = archived;
+        cx.notify();
+    }
+
+    pub fn cancel_remove(&mut self, cx: &mut Context<Self>) {
+        self.confirming_remove_session_id = None;
+        self.confirming_remove_archived = false;
+        cx.notify();
+    }
+
+    pub fn confirm_remove(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.confirming_remove_session_id.take() else {
+            return;
+        };
+        let archived = std::mem::take(&mut self.confirming_remove_archived);
+        let request = PendingRemove {
+            session_id,
+            archived,
+        };
+        if let Some(request) = dispatch_or_queue_remove(
+            self.action_task.is_some(),
+            &mut self.pending_remove,
+            request,
+        ) {
+            self.dispatch_remove(request, cx);
+        }
+        cx.notify();
     }
 
     pub fn pin(&mut self, session_id: String, pinned: bool, cx: &mut Context<Self>) {
@@ -472,6 +715,24 @@ impl WorkersModel {
             SessionOrganizationPatch {
                 archived: Some(archived),
                 ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    pub fn stop_and_archive(&mut self, session_id: String, live: bool, cx: &mut Context<Self>) {
+        self.run_unit_action(
+            move |client| {
+                if live {
+                    client.session_action(&session_id, SessionAction::Stop)?;
+                }
+                client.set_session_organization(
+                    &session_id,
+                    SessionOrganizationPatch {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                )
             },
             cx,
         );
@@ -611,6 +872,22 @@ impl WorkersModel {
         }
     }
 
+    fn dispatch_remove(&mut self, request: PendingRemove, cx: &mut Context<Self>) {
+        if request.archived {
+            self.remove_archived(request.session_id, cx);
+        } else {
+            self.remove(request.session_id, cx);
+        }
+    }
+
+    fn start_pending_remove(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(request) = self.pending_remove.take() else {
+            return false;
+        };
+        self.dispatch_remove(request, cx);
+        true
+    }
+
     fn prepare_replacement_for(&mut self, source: &WorkersSession) {
         self.pending_replacement = Some(PendingReplacement {
             source_id: source.id.clone(),
@@ -698,6 +975,20 @@ impl WorkersModel {
                     None => self.selected_session_id = None,
                 }
             }
+        } else if let Some(mut pending) = self.pending_launch_selection.take() {
+            let visible = snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == pending.session_id);
+            self.selected_session_id = reconcile_selection_with_pending(
+                self.selected_session_id.as_deref(),
+                Some(pending.session_id.as_str()),
+                &snapshot.sessions,
+            );
+            if !visible && pending.remaining_refreshes > 0 {
+                pending.remaining_refreshes -= 1;
+                self.pending_launch_selection = Some(pending);
+            }
         } else {
             self.selected_session_id =
                 reconcile_selection(self.selected_session_id.as_deref(), &snapshot.sessions);
@@ -769,12 +1060,14 @@ impl WorkersModel {
                 match result {
                     Ok(value) => {
                         apply(model, value);
-                        model.refresh(cx);
                     }
                     Err(error) => {
                         model.pending_replacement = None;
                         model.error = Some(error.to_string());
                     }
+                }
+                if !model.start_pending_remove(cx) {
+                    model.refresh(cx);
                 }
                 cx.notify();
             })
@@ -801,8 +1094,12 @@ impl WorkersModel {
             this.update(cx, |model, cx| {
                 model.action_task = None;
                 match result {
-                    Ok(_) => model.refresh_settings(cx),
+                    Ok(_) if !model.start_pending_remove(cx) => model.refresh_settings(cx),
+                    Ok(_) => {}
                     Err(error) => model.settings_error = Some(error.to_string()),
+                }
+                if model.action_task.is_none() {
+                    model.start_pending_remove(cx);
                 }
                 cx.notify();
             })
@@ -818,9 +1115,24 @@ mod tests {
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
     use super::{
-        PendingReplacement, WorkerNotification, notification_transition, reconcile_selection,
+        PendingRemove, PendingReplacement, WorkerNotification, dispatch_or_queue_remove,
+        notification_transition, reconcile_selection, reconcile_selection_with_pending,
         replacement_selection, sessions_for_project, toggle_expanded,
     };
+
+    #[test]
+    fn remove_is_queued_instead_of_dropped_while_another_action_finishes() {
+        let request = PendingRemove {
+            session_id: "session-1".into(),
+            archived: false,
+        };
+        let mut queued = None;
+
+        let immediate = dispatch_or_queue_remove(true, &mut queued, request.clone());
+
+        assert_eq!(immediate, None);
+        assert_eq!(queued, Some(request));
+    }
 
     fn session(id: &str, project_id: &str, live: bool) -> WorkersSession {
         WorkersSession {
@@ -846,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_stays_stable_then_falls_back_to_the_first_live_session() {
+    fn selection_stays_stable_and_clears_when_the_session_disappears() {
         let sessions = vec![
             session("exited", "project", false),
             session("live", "project", true),
@@ -857,11 +1169,33 @@ mod tests {
         );
         assert_eq!(
             reconcile_selection(Some("missing"), &sessions).as_deref(),
-            Some("live")
+            None
         );
+        assert_eq!(reconcile_selection(None, &sessions), None);
+    }
+
+    #[test]
+    fn project_launcher_selection_never_falls_back_to_a_session_from_another_project() {
+        let sessions = vec![session("old", "project-a", true)];
+
+        assert_eq!(reconcile_selection(None, &sessions), None);
+    }
+
+    #[test]
+    fn pending_launch_selection_survives_until_the_new_session_reaches_the_snapshot() {
+        let existing = vec![session("old", "project", true)];
         assert_eq!(
-            reconcile_selection(None, &sessions).as_deref(),
-            Some("live")
+            reconcile_selection_with_pending(Some("new"), Some("new"), &existing).as_deref(),
+            Some("new")
+        );
+
+        let visible = vec![
+            session("old", "project", true),
+            session("new", "project", true),
+        ];
+        assert_eq!(
+            reconcile_selection_with_pending(Some("new"), Some("new"), &visible).as_deref(),
+            Some("new")
         );
     }
 

@@ -1,7 +1,10 @@
-pub mod archive;
 pub mod activity_menu;
+pub mod archive;
+pub mod menu_bar;
 pub mod model;
 pub mod presentation;
+pub mod recent;
+pub mod session_menu;
 pub mod settings;
 pub mod terminal;
 pub mod workspace;

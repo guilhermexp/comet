@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
@@ -19,16 +20,63 @@ struct SelectionDrag {
     armed: bool,
 }
 
+#[derive(Default)]
+struct RemoteGridTracker {
+    grids: HashMap<String, (u16, u16)>,
+}
+
+impl RemoteGridTracker {
+    fn record_resize(&mut self, session_id: &str, cols: u16, rows: u16) -> bool {
+        let next = (cols, rows);
+        if self.grids.get(session_id) == Some(&next) {
+            return false;
+        }
+        self.grids.insert(session_id.to_owned(), next);
+        true
+    }
+}
+
+#[derive(Default)]
+struct HistoricalReplay {
+    active: bool,
+    grid_ready: bool,
+}
+
+impl HistoricalReplay {
+    fn start(&mut self) {
+        self.active = true;
+        self.grid_ready = false;
+    }
+
+    fn observe_geometry(&mut self) {
+        self.grid_ready = true;
+    }
+
+    fn can_consume_output(&self) -> bool {
+        !self.active || self.grid_ready
+    }
+
+    fn observe_output(&mut self, had_data: bool) {
+        if !had_data {
+            self.active = false;
+        }
+    }
+}
+
 pub struct WorkersTerminal {
     client: LocalWorkersClient,
     session_id: Option<String>,
     emulator: Emulator,
     offset: u64,
     generation: u64,
+    viewport_dirty: bool,
     error: Option<String>,
     geometry: Option<GridGeometry>,
+    remote_grids: RemoteGridTracker,
+    historical_replay: HistoricalReplay,
     selection_drag: Option<SelectionDrag>,
     focus_handle: FocusHandle,
+    focus_pending: bool,
     coalescer: InputCoalescer,
     flush_task: Option<Task<()>>,
     _poll_task: Task<()>,
@@ -39,15 +87,25 @@ impl WorkersTerminal {
         let poll_task = cx.spawn(async move |this, cx| {
             let mut error_backoff_ms = 0_u64;
             loop {
-                let Ok((session_id, offset, generation, client)) =
-                    this.update(cx, |terminal, _| {
-                        (
-                            terminal.session_id.clone(),
-                            terminal.offset,
-                            terminal.generation,
-                            terminal.client.clone(),
-                        )
-                    })
+                let Ok((
+                    session_id,
+                    offset,
+                    generation,
+                    client,
+                    can_consume_output,
+                    geometry,
+                    viewport_dirty,
+                )) = this.update(cx, |terminal, _| {
+                    (
+                        terminal.session_id.clone(),
+                        terminal.offset,
+                        terminal.generation,
+                        terminal.client.clone(),
+                        terminal.historical_replay.can_consume_output(),
+                        terminal.geometry,
+                        terminal.viewport_dirty,
+                    )
+                })
                 else {
                     break;
                 };
@@ -57,12 +115,31 @@ impl WorkersTerminal {
                         .await;
                     continue;
                 };
+                if !can_consume_output {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
+                    continue;
+                }
                 let request_session_id = session_id.clone();
                 let result = cx
                     .background_executor()
-                    .spawn(
-                        async move { client.read_output(&request_session_id, Some(offset), 180) },
-                    )
+                    .spawn(async move {
+                        let output = client.read_output(&request_session_id, Some(offset), 180)?;
+                        let viewport =
+                            if viewport_dirty || output.truncated || !output.data.is_empty() {
+                                let geometry =
+                                    geometry.expect("historical replay waits for geometry");
+                                Some(client.read_viewport(
+                                    &request_session_id,
+                                    geometry.cols,
+                                    geometry.rows,
+                                )?)
+                            } else {
+                                None
+                            };
+                        Ok::<_, zeron_workers_unpeel::WorkersError>((output, viewport))
+                    })
                     .await;
                 let failed = result.is_err();
                 if this
@@ -73,21 +150,18 @@ impl WorkersTerminal {
                             return;
                         }
                         match result {
-                            Ok(output) => {
-                                if output.truncated {
-                                    terminal.emulator = Emulator::new(
-                                        terminal.emulator.cols() as u16,
-                                        terminal.emulator.rows() as u16,
-                                    );
-                                }
+                            Ok((output, viewport)) => {
+                                let had_data = !output.data.is_empty();
                                 terminal.offset = output.next_offset;
-                                if !output.data.is_empty() {
-                                    let responses = terminal.emulator.feed(&output.data);
-                                    if !responses.is_empty() {
-                                        terminal.queue_input(&responses, cx);
-                                    }
+                                if let Some(viewport) = viewport {
+                                    let mut emulator = Emulator::new(viewport.cols, viewport.rows);
+                                    let _ = emulator.feed(&viewport.ansi);
+                                    terminal.emulator = emulator;
+                                    terminal.offset = terminal.offset.max(viewport.output_offset);
+                                    terminal.viewport_dirty = false;
                                     cx.notify();
                                 }
+                                terminal.historical_replay.observe_output(had_data);
                                 terminal.error = None;
                             }
                             Err(error) => {
@@ -120,10 +194,14 @@ impl WorkersTerminal {
             emulator: Emulator::new(80, 24),
             offset: 0,
             generation: 0,
+            viewport_dirty: false,
             error: None,
             geometry: None,
+            remote_grids: RemoteGridTracker::default(),
+            historical_replay: HistoricalReplay::default(),
             selection_drag: None,
             focus_handle: cx.focus_handle(),
+            focus_pending: false,
             coalescer: InputCoalescer::default(),
             flush_task: None,
             _poll_task: poll_task,
@@ -134,9 +212,17 @@ impl WorkersTerminal {
         if self.session_id == session_id {
             return;
         }
+        self.focus_pending = session_id.is_some();
         self.session_id = session_id;
+        if self.session_id.is_some() {
+            self.historical_replay.start();
+        }
         self.generation = self.generation.wrapping_add(1);
-        self.emulator = Emulator::new(80, 24);
+        self.viewport_dirty = self.session_id.is_some();
+        self.emulator = self.geometry.map_or_else(
+            || Emulator::new(80, 24),
+            |geometry| Emulator::new(geometry.cols, geometry.rows),
+        );
         self.offset = 0;
         self.error = None;
         self.coalescer.take();
@@ -145,16 +231,29 @@ impl WorkersTerminal {
     }
 
     pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
+        self.client.remember_grid(geometry.cols, geometry.rows);
+        let dimensions_changed = self.geometry.is_none_or(|previous| {
+            previous.cols != geometry.cols || previous.rows != geometry.rows
+        });
         self.geometry = Some(geometry);
-        if self.emulator.cols() == geometry.cols as usize
-            && self.emulator.rows() == geometry.rows as usize
-        {
-            return;
+        self.historical_replay.observe_geometry();
+        if dimensions_changed && self.session_id.is_some() {
+            self.viewport_dirty = true;
         }
-        self.emulator.resize(geometry.cols, geometry.rows);
+        if self.emulator.cols() != geometry.cols as usize
+            || self.emulator.rows() != geometry.rows as usize
+        {
+            self.emulator.resize(geometry.cols, geometry.rows);
+        }
         let Some(session_id) = self.session_id.clone() else {
             return;
         };
+        if !self
+            .remote_grids
+            .record_resize(&session_id, geometry.cols, geometry.rows)
+        {
+            return;
+        }
         let client = self.client.clone();
         let cols = geometry.cols;
         let rows = geometry.rows;
@@ -179,30 +278,41 @@ impl WorkersTerminal {
         if self.session_id.is_none() || !self.coalescer.push(bytes) {
             return;
         }
-        self.flush_task = Some(cx.spawn(async move |this, cx| {
+        self.flush_task = Some(Self::schedule_flush(cx));
+    }
+
+    fn schedule_flush(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(COALESCE_MS))
                 .await;
-            let Ok((session_id, bytes, client)) = this.update(cx, |terminal, _| {
-                terminal.flush_task = None;
-                (
-                    terminal.session_id.clone(),
-                    terminal.coalescer.take(),
-                    terminal.client.clone(),
-                )
-            }) else {
-                return;
-            };
-            let Some(session_id) = session_id else { return };
-            if bytes.is_empty() {
-                return;
-            }
-            let data = String::from_utf8_lossy(&bytes).into_owned();
-            let _ = cx
+            let _ = this.update(cx, |terminal, cx| terminal.flush_input(cx));
+        })
+    }
+
+    fn flush_input(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let bytes = self.coalescer.take();
+        if bytes.is_empty() {
+            return;
+        }
+        let data = String::from_utf8_lossy(&bytes).into_owned();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
                 .background_executor()
                 .spawn(async move { client.write(&session_id, &data) })
                 .await;
-        }));
+            if let Err(error) = result {
+                let _ = this.update(cx, |terminal, cx| {
+                    terminal.error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -347,6 +457,9 @@ impl WorkersTerminal {
 
 impl Render for WorkersTerminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.focus_pending) {
+            window.focus(&self.focus_handle, cx);
+        }
         let focused = self.focus_handle.is_focused(window);
         let error = self.error.clone();
         div()
@@ -388,11 +501,37 @@ impl Render for WorkersTerminal {
 
 #[cfg(test)]
 mod tests {
+    use super::{HistoricalReplay, RemoteGridTracker};
+
     #[test]
     fn terminal_generation_rejects_a_previous_session_cycle() {
         let a_first = 1_u64;
         let b = a_first.wrapping_add(1);
         let a_second = b.wrapping_add(1);
         assert_ne!(a_first, a_second);
+    }
+
+    #[test]
+    fn returning_to_a_session_on_the_same_grid_does_not_resize_its_pty_again() {
+        let mut grids = RemoteGridTracker::default();
+
+        assert!(grids.record_resize("session-a", 180, 48));
+        assert!(grids.record_resize("session-b", 180, 48));
+        assert!(!grids.record_resize("session-a", 180, 48));
+        assert!(grids.record_resize("session-a", 200, 48));
+    }
+
+    #[test]
+    fn historical_replay_waits_for_the_visible_grid_before_consuming_output() {
+        let mut replay = HistoricalReplay::default();
+
+        replay.start();
+        assert!(!replay.can_consume_output());
+
+        replay.observe_geometry();
+        assert!(replay.can_consume_output());
+
+        replay.start();
+        assert!(!replay.can_consume_output());
     }
 }

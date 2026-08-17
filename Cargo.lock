@@ -9502,10 +9502,12 @@ name = "zeron-workers-unpeel"
 version = "0.2.3"
 dependencies = [
  "base64",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "unicode-width",
  "unpeel-core",
  "uuid",
 ]

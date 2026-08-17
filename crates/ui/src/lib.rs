@@ -118,6 +118,7 @@ impl UiConfig {
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
+    workers_model: gpui::Entity<workers::model::WorkersModel>,
 }
 
 impl gpui::Global for ReopenState {}
@@ -134,8 +135,12 @@ pub fn run_app(config: UiConfig) {
         if cx.windows().is_empty()
             && let Some(reopen) = cx.try_global::<ReopenState>()
         {
-            let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
-            open_main_window(state, boot, cx);
+            let (state, boot, workers_model) = (
+                reopen.state.clone(),
+                reopen.boot.clone(),
+                reopen.workers_model.clone(),
+            );
+            open_main_window(state, boot, workers_model, cx);
         }
     });
     app.run(move |cx: &mut App| {
@@ -156,6 +161,14 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
+        let workers_model = cx.new(workers::model::WorkersModel::new);
+        let workers_menu_bar = cx.new({
+            let workers_model = workers_model.clone();
+            move |cx| workers::menu_bar::WorkersMenuBarController::new(workers_model, cx)
+        });
+        cx.set_global(workers::menu_bar::WorkersMenuBarGlobal {
+            controller: workers_menu_bar,
+        });
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -177,8 +190,9 @@ pub fn run_app(config: UiConfig) {
         cx.set_global(ReopenState {
             state: state.clone(),
             boot: config.boot(),
+            workers_model: workers_model.clone(),
         });
-        open_main_window(state, config.boot(), cx);
+        open_main_window(state, config.boot(), workers_model, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -194,7 +208,12 @@ pub fn run_app(config: UiConfig) {
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
-fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
+fn open_main_window(
+    state: gpui::Entity<state::AppState>,
+    boot: EngineBootConfig,
+    workers_model: gpui::Entity<workers::model::WorkersModel>,
+    cx: &mut App,
+) {
     // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     cx.open_window(
@@ -242,7 +261,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // the subscription lives as long as the window does, and the window
             // owns nothing that would drop it early.
             appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, cx))
+            cx.new(|cx| shell::Shell::new(state, boot, workers_model, cx))
         },
     )
     .expect("failed to open window");

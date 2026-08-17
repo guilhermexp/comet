@@ -139,6 +139,37 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    // Unpeel runtime package marks. These are copied from
+    // `third_party/unpeel/runtimes/*/assets/icon.svg` so packaged builds do
+    // not depend on the source submodule at runtime.
+    (WORKER_AMP, "workers/amp"),
+    (WORKER_CLAUDE, "workers/claude"),
+    (WORKER_CLINE, "workers/cline"),
+    (WORKER_CODEX, "workers/codex"),
+    (WORKER_CURSOR, "workers/cursor-agent"),
+    (WORKER_GEMINI, "workers/gemini"),
+    (WORKER_GROK, "workers/grok"),
+    (WORKER_KIMI, "workers/kimi"),
+    (WORKER_KIRO, "workers/kiro"),
+    (WORKER_MUSE, "workers/muse-code"),
+    (WORKER_OPENCODE, "workers/opencode"),
+    (WORKER_PI, "workers/pi"),
+    // Unpeel's authored provider catalog has one deliberate fallback:
+    // GitHub Copilot uses the shared generic-agent SVG.
+    (WORKER_GENERIC_AGENT, "workers/generic-agent"),
+    // Exact sidebar chrome carried from Unpeel's ChromeIcons.swift.
+    (WORKER_FOLDER_CLOSED, "workers/chrome-folder-closed"),
+    (WORKER_FOLDER_OPEN, "workers/chrome-folder-open"),
+    (WORKER_FOLDER_SIMPLE, "workers/chrome-folder-simple"),
+    (WORKER_BRANCH, "workers/chrome-branch"),
+    (WORKER_GIT_BRANCH, "workers/chrome-git-branch"),
+    (WORKER_PIN, "workers/chrome-pin"),
+    (WORKER_PUSH_PIN, "workers/chrome-push-pin"),
+    (WORKER_SETTINGS, "workers/chrome-settings"),
+    (WORKER_ADD_PROJECT_PLUS, "workers/chrome-add-project-plus"),
+    (WORKER_PLUS, "workers/chrome-plus"),
+    (WORKER_COLLAPSE_ALL, "workers/chrome-collapse-all"),
+    (WORKER_DRAG_HANDLE, "workers/chrome-drag-handle"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
