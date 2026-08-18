@@ -2806,7 +2806,7 @@ impl Transcript {
                     .into_any_element(),
             );
         }
-        let (sending, queued, elapsed_secs) = {
+        let (sending, queued, elapsed_secs, upload_pct) = {
             let state = self.state.read(cx);
             if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
                 return None;
@@ -2824,14 +2824,17 @@ impl Transcript {
             let elapsed = turn_started
                 .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                 .unwrap_or(0);
-            (sending, queued, elapsed)
+            (sending, queued, elapsed, state.upload_progress_percent())
         };
         let word = if queued {
-            "Queued — will send automatically"
+            "Queued — will send automatically".to_string()
         } else if sending {
-            "Sending"
+            match upload_pct {
+                Some(pct) => format!("Uploading… {pct}%"),
+                None => "Sending…".to_string(),
+            }
         } else {
-            flavour_word(flavour_seed(&chat_id), elapsed_secs)
+            format!("{}…", flavour_word(flavour_seed(&chat_id), elapsed_secs))
         };
         let theme = Theme::of(cx).clone();
         Some(
@@ -2857,11 +2860,7 @@ impl Transcript {
                         } else {
                             theme.text_muted
                         })
-                        .child(SharedString::from(if queued {
-                            word.to_string()
-                        } else {
-                            format!("{word}…")
-                        })),
+                        .child(SharedString::from(word)),
                 )
                 .when(!sending, |el| {
                     el.child(

@@ -4782,6 +4782,18 @@ impl Composer {
                 let mut content = text.clone();
                 let mut attachment_paths: Vec<String> = Vec::new();
                 let mut transfers: Vec<serde_json::Value> = Vec::new();
+                let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                if !staged.is_empty() {
+                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
+                    let progress_for_state = progress.clone();
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |s, cx| {
+                            s.begin_upload_progress(total, progress_for_state);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
                 if !staged.is_empty() && queued_flow {
                     for (att, upload_id) in staged.iter().zip(&upload_ids) {
                         if let Err(err) = attachments::upload_attachment(
@@ -4790,6 +4802,7 @@ impl Composer {
                             None,
                             upload_id,
                             att,
+                            Some(progress.clone()),
                         )
                         .await
                         {
@@ -4827,6 +4840,7 @@ impl Composer {
                             host_device_id.as_deref(),
                             upload_id,
                             att,
+                            Some(progress.clone()),
                         );
                         let timer = cx.background_executor().timer(remaining);
                         futures::pin_mut!(upload);
@@ -4932,6 +4946,9 @@ impl Composer {
             .await;
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                composer
+                    .state
+                    .update(cx, |s, _| s.end_upload_progress());
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.
