@@ -175,6 +175,7 @@ impl TitleGenerator {
                 workers_parent_chat_id: None,
                 attachments: Vec::new(),
                 resume: None,
+                worktree: None,
             };
             match collect_text(harness.as_ref(), chat_id, request).await {
                 Ok(raw) => {

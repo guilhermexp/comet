@@ -309,6 +309,7 @@ async fn target_device_id_routes_over_the_relay() {
             enable_workers_mcp: false,
             workers_parent_chat_id: None,
             attachments: Vec::new(),
+            worktree: None,
             resume: None,
         },
         message_id: "m-a-1".into(),

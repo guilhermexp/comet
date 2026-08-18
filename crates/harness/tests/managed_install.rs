@@ -45,6 +45,7 @@ async fn managed_install_reaches_session_started() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
 

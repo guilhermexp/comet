@@ -54,6 +54,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
 
@@ -67,8 +68,5 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     assert!(message.contains("exit code 254"), "{message}");
     assert!(message.contains("ENOENT"), "{message}");
     assert!(message.contains("failed silently"), "{message}");
-    assert!(
-        message.contains("pi-acp"),
-        "names the package: {message}"
-    );
+    assert!(message.contains("pi-acp"), "names the package: {message}");
 }

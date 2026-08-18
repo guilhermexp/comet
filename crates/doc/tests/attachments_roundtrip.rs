@@ -18,6 +18,7 @@ fn run_request_attachments_survive_command_round_trip() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         attachments: vec!["/tmp/a.png".into()],
+        worktree: None,
         resume: None,
     };
     doc.queue_command(&SessionCommandEntry {

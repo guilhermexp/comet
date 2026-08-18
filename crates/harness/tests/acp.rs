@@ -56,6 +56,7 @@ fn request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }

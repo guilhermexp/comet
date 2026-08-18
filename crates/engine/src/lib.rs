@@ -230,6 +230,7 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(journal_root);
         let repos = Repos::new(data_dir, &device_id);
+        doc_host.set_repos(repos.clone());
         let terminals = Terminals::new();
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
