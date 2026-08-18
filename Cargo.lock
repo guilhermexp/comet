@@ -1189,7 +1189,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "comet-mcp"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "comet-syntax"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "thiserror 2.0.20",
  "tree-sitter",
@@ -9374,7 +9374,7 @@ dependencies = [
 
 [[package]]
 name = "zeron"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -9395,7 +9395,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-doc"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "chrono",
  "loro",
@@ -9409,7 +9409,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-engine"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9444,7 +9444,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-harness"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9464,7 +9464,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-proto"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "chrono",
  "serde",
@@ -9474,7 +9474,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-rpc"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9493,7 +9493,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-sync"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "chrono",
  "futures",
@@ -9515,7 +9515,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-ui"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -9553,7 +9553,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-update"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "futures",
@@ -9568,7 +9568,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-workers-unpeel"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "base64",
  "dirs",
