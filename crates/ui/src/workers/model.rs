@@ -182,6 +182,7 @@ pub struct WorkersModel {
     pub snapshot: Option<WorkersBootstrap>,
     pub selected_project_id: Option<String>,
     pub selected_session_id: Option<String>,
+    pub launcher_project_id: Option<String>,
     pub expanded_project_ids: HashSet<String>,
     pub loading: bool,
     pub error: Option<String>,
@@ -248,6 +249,7 @@ impl WorkersModel {
             snapshot: None,
             selected_project_id: None,
             selected_session_id: None,
+            launcher_project_id: None,
             expanded_project_ids: HashSet::new(),
             loading: true,
             error: None,
@@ -332,6 +334,7 @@ impl WorkersModel {
         } else {
             self.selected_project_id = None;
             self.selected_session_id = None;
+            self.launcher_project_id = None;
             self.reveal.target = WorkersRevealTarget::Workspace;
             cx.notify();
         }
@@ -417,6 +420,13 @@ impl WorkersModel {
             .find(|project| project.id == selected)
     }
 
+    pub fn launcher_project(&self) -> Option<&WorkersProject> {
+        let launcher_project_id = self.launcher_project_id.as_deref()?;
+        self.projects()
+            .iter()
+            .find(|project| project.id == launcher_project_id)
+    }
+
     pub fn sessions_for_project(&self, project_id: &str) -> Vec<&WorkersSession> {
         sessions_for_project(self.sessions(), project_id)
     }
@@ -444,6 +454,7 @@ impl WorkersModel {
         self.route = WorkersRoute::Workspace;
         self.selected_project_id = Some(target.project_id);
         self.selected_session_id = Some(target.session_id);
+        self.launcher_project_id = None;
         if was_unread {
             let selected = self.selected_session_id.clone().unwrap_or_default();
             self.run_unit_action(move |client| client.mark_read(&selected), cx);
@@ -464,6 +475,25 @@ impl WorkersModel {
         self.reset_archive_view();
         self.selected_project_id = Some(project_id);
         self.selected_session_id = None;
+        self.launcher_project_id = None;
+        cx.notify();
+    }
+
+    pub fn open_launcher(&mut self, project_id: String, cx: &mut Context<Self>) {
+        if !self
+            .projects()
+            .iter()
+            .any(|project| project.id == project_id && !project.is_group)
+        {
+            return;
+        }
+        self.pending_replacement = None;
+        self.pending_launch_selection = None;
+        self.reset_archive_view();
+        self.route = WorkersRoute::Workspace;
+        self.selected_project_id = Some(project_id.clone());
+        self.selected_session_id = None;
+        self.launcher_project_id = Some(project_id);
         cx.notify();
     }
 
@@ -540,6 +570,7 @@ impl WorkersModel {
                         model.route = WorkersRoute::Workspace;
                         model.selected_project_id = Some(project_id.clone());
                         model.selected_session_id = Some(session_id.clone());
+                        model.launcher_project_id = None;
                         model.expanded_project_ids.insert(project_id.clone());
                         model.pending_launch_selection = Some(PendingLaunchSelection {
                             session_id,
@@ -563,6 +594,7 @@ impl WorkersModel {
                 model.route = WorkersRoute::Workspace;
                 model.selected_project_id = Some(project_id);
                 model.selected_session_id = None;
+                model.launcher_project_id = None;
             },
             cx,
         );
@@ -585,6 +617,7 @@ impl WorkersModel {
                 model.expanded_project_ids.insert(project_id.clone());
                 model.selected_project_id = Some(project_id);
                 model.selected_session_id = None;
+                model.launcher_project_id = None;
             },
             cx,
         );
@@ -611,6 +644,7 @@ impl WorkersModel {
                 model.expanded_project_ids.insert(parent_id);
                 model.selected_project_id = Some(worktree.project_id);
                 model.selected_session_id = None;
+                model.launcher_project_id = None;
             },
             cx,
         );
@@ -646,6 +680,7 @@ impl WorkersModel {
                 model.expanded_project_ids.insert(result.project_id.clone());
                 model.selected_project_id = Some(result.project_id);
                 model.selected_session_id = Some(result.session_id);
+                model.launcher_project_id = None;
             },
             cx,
         );
@@ -735,6 +770,9 @@ impl WorkersModel {
                 if model.selected_project_id.as_deref() == Some(&selected_id) {
                     model.selected_project_id = None;
                     model.selected_session_id = None;
+                }
+                if model.launcher_project_id.as_deref() == Some(&selected_id) {
+                    model.launcher_project_id = None;
                 }
             },
             cx,
@@ -875,6 +913,7 @@ impl WorkersModel {
                 model.route = WorkersRoute::Workspace;
                 model.selected_project_id = Some(project_id.clone());
                 model.selected_session_id = Some(session_id.clone());
+                model.launcher_project_id = None;
                 model.expanded_project_ids.insert(project_id);
                 model.pending_launch_selection = Some(PendingLaunchSelection {
                     session_id,
@@ -1289,6 +1328,15 @@ impl WorkersModel {
                     .find(|project| !project.is_group)
                     .map(|project| project.id.clone())
             });
+        if self.selected_session_id.is_some() {
+            self.launcher_project_id = None;
+        } else {
+            self.launcher_project_id = self
+                .launcher_project_id
+                .as_ref()
+                .filter(|selected| snapshot.projects.iter().any(|p| &p.id == *selected))
+                .cloned();
+        }
         if !self.initialized_expansion {
             self.expanded_project_ids
                 .extend(snapshot.projects.iter().map(|project| project.id.clone()));

@@ -79,6 +79,69 @@ fn settings_use_upstream_defaults_and_catalog() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+fn settings_migrate_new_native_worker_presets_once() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = fixture()?;
+    let client = LocalWorkersClient::new();
+
+    let settings = client.settings()?;
+    let omp = settings
+        .presets
+        .iter()
+        .find(|preset| preset.id == "omp")
+        .expect("OMP preset should be added to existing profiles");
+    assert_eq!(omp.label, "OMP CLI");
+    assert_eq!(omp.command, "omp");
+    assert_eq!(omp.cli_id.as_deref(), Some("omp"));
+
+    let prime = settings
+        .presets
+        .iter()
+        .find(|preset| preset.id == "prime-agent")
+        .expect("Prime Agent preset should be added to existing profiles");
+    assert_eq!(prime.label, "prime-agent");
+    assert_eq!(prime.command, "prime-agent");
+    assert_eq!(prime.cli_id.as_deref(), Some("prime-agent"));
+
+    assert!(settings.runtimes.iter().any(|runtime| {
+        runtime.cli_id == "omp"
+            && runtime.label == "OMP CLI"
+            && runtime.install_command.as_deref() == Some("curl -fsSL https://omp.sh/install | sh")
+    }));
+    assert!(settings.runtimes.iter().any(|runtime| {
+        runtime.cli_id == "prime-agent"
+            && runtime.label == "Prime Agent"
+            && runtime.install_command.as_deref()
+                == Some("curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh")
+    }));
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
+    assert_eq!(raw["comet_workers_preset_catalog_version"], 1);
+    Ok(())
+}
+
+#[test]
+fn migrated_native_worker_preset_stays_deleted() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (_home, _guard) = fixture()?;
+    let client = LocalWorkersClient::new();
+
+    client.settings()?;
+    client.delete_preset("omp")?;
+
+    assert!(
+        client
+            .settings()?
+            .presets
+            .iter()
+            .all(|preset| preset.id != "omp"),
+        "the one-time migration must not resurrect a preset the user deleted"
+    );
+    Ok(())
+}
+
+#[test]
 fn settings_mutations_preserve_unknown_state() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
     let (home, _guard) = fixture()?;

@@ -13,7 +13,7 @@ pub fn workers_titlebar(
 ) -> WorkersTitlebar {
     let Some(project) = project else {
         return WorkersTitlebar {
-            segments: vec!["Workers".to_owned()],
+            segments: vec!["Zeron".to_owned()],
             branch: None,
             branch_is_worktree: false,
         };
@@ -93,7 +93,9 @@ pub fn runtime_icon_path(runtime_id: Option<&str>, command: Option<&str>) -> &'s
         "kiro" | "kiro-cli" | "dev.kiro.cli" => crate::icons::WORKER_KIRO,
         "muse" | "muse-code" | "ai.meta.muse-code" => crate::icons::WORKER_MUSE,
         "opencode" | "ai.opencode.cli" => crate::icons::WORKER_OPENCODE,
+        "omp" | "sh.omp.cli" => crate::icons::WORKER_GENERIC_AGENT,
         "pi" | "dev.mariozechner.pi" => crate::icons::WORKER_PI,
+        "prime-agent" | "ai.primeintellect.prime-agent" => crate::icons::WORKER_GENERIC_AGENT,
         _ => crate::icons::TERMINAL,
     }
 }
@@ -221,6 +223,11 @@ mod tests {
             ("ai.meta.muse-code", crate::icons::WORKER_MUSE),
             ("ai.opencode.cli", crate::icons::WORKER_OPENCODE),
             ("dev.mariozechner.pi", crate::icons::WORKER_PI),
+            ("sh.omp.cli", crate::icons::WORKER_GENERIC_AGENT),
+            (
+                "ai.primeintellect.prime-agent",
+                crate::icons::WORKER_GENERIC_AGENT,
+            ),
         ];
         for (runtime_id, expected) in cases {
             assert_eq!(runtime_icon_path(Some(runtime_id), None), expected);
@@ -325,6 +332,13 @@ mod tests {
         assert_eq!(titlebar.segments, [".orchestrator"]);
         assert_eq!(titlebar.branch.as_deref(), Some("master"));
         assert!(!titlebar.branch_is_worktree);
+    }
+
+    #[test]
+    fn empty_workers_titlebar_uses_the_app_name_like_unpeel() {
+        let titlebar = workers_titlebar(None, None);
+        assert_eq!(titlebar.segments, ["Zeron"]);
+        assert!(titlebar.branch.is_none());
     }
 
     #[test]

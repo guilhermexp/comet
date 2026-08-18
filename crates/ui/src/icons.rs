@@ -170,6 +170,7 @@ icon_assets![
     (WORKER_PLUS, "workers/chrome-plus"),
     (WORKER_COLLAPSE_ALL, "workers/chrome-collapse-all"),
     (WORKER_DRAG_HANDLE, "workers/chrome-drag-handle"),
+    (WORKER_UNPEEL_LOGO, "workers/unpeel-logo"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the

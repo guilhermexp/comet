@@ -856,7 +856,7 @@ impl LocalWorkersClient {
     }
 
     pub fn settings(&self) -> Result<WorkersSettingsSnapshot, WorkersError> {
-        let raw = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+        let raw = migrate_comet_workers_presets()?;
         let presets = raw
             .get("presets")
             .cloned()
@@ -2157,6 +2157,71 @@ fn edit_presets(
         Ok(())
     })
     .map_err(WorkersError::State)
+}
+
+const COMET_WORKERS_PRESET_CATALOG_VERSION_KEY: &str = "comet_workers_preset_catalog_version";
+const COMET_WORKERS_PRESET_CATALOG_VERSION: u64 = 1;
+const COMET_WORKERS_PRESET_V1_IDS: [&str; 2] = ["omp", "prime-agent"];
+
+fn migrate_comet_workers_presets() -> Result<Value, WorkersError> {
+    let raw = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+    let current_version = raw
+        .get(COMET_WORKERS_PRESET_CATALOG_VERSION_KEY)
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if current_version >= COMET_WORKERS_PRESET_CATALOG_VERSION {
+        return Ok(raw);
+    }
+
+    let has_presets = raw
+        .get("presets")
+        .and_then(Value::as_array)
+        .is_some_and(|presets| !presets.is_empty());
+    let native_presets_were_seeded = raw
+        .get("native_preset_overlay_migrated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !has_presets && !native_presets_were_seeded {
+        return Ok(raw);
+    }
+
+    unpeel_core::app_state::edit(|state| {
+        let current_version = state
+            .get(COMET_WORKERS_PRESET_CATALOG_VERSION_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if current_version >= COMET_WORKERS_PRESET_CATALOG_VERSION {
+            return Ok(());
+        }
+
+        let mut presets = state
+            .get("presets")
+            .cloned()
+            .map(serde_json::from_value::<Vec<unpeel_core::state::Preset>>)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        for builtin in unpeel_core::state::builtin_global_presets()
+            .into_iter()
+            .filter(|preset| COMET_WORKERS_PRESET_V1_IDS.contains(&preset.id.as_str()))
+        {
+            if presets.iter().all(|preset| preset.id != builtin.id) {
+                presets.push(builtin);
+            }
+        }
+        state.insert(
+            "presets".into(),
+            serde_json::to_value(presets).map_err(|error| error.to_string())?,
+        );
+        state.insert(
+            COMET_WORKERS_PRESET_CATALOG_VERSION_KEY.into(),
+            Value::from(COMET_WORKERS_PRESET_CATALOG_VERSION),
+        );
+        Ok(())
+    })
+    .map_err(WorkersError::State)?;
+
+    unpeel_core::app_state::load().map_err(WorkersError::State)
 }
 
 fn runtime_catalog_snapshot() -> Vec<WorkersRuntime> {

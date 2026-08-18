@@ -217,6 +217,10 @@ enum SidebarMode {
     Workers,
 }
 
+const SIDEBAR_MODE_SWITCHER_HEIGHT: f32 = 36.0;
+const SIDEBAR_MODE_SWITCHER_RADIUS: f32 = 10.0;
+const SIDEBAR_MODE_BUTTON_RADIUS: f32 = 8.0;
+
 impl SidebarMode {
     fn shows_orchestrator_content(self) -> bool {
         matches!(self, Self::Orchestrator)
@@ -3256,7 +3260,7 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(9.0))
+            .rounded(px(SIDEBAR_MODE_BUTTON_RADIUS))
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(if selected {
@@ -3303,7 +3307,7 @@ impl Shell {
 
         div()
             .id("sidebar-mode-switcher")
-            .h(px(40.0))
+            .h(px(SIDEBAR_MODE_SWITCHER_HEIGHT))
             .mx(px(Theme::SPACE_LG))
             .mt(px(Theme::SPACE_SM))
             .mb(px(Theme::SPACE_MD))
@@ -3311,7 +3315,7 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .rounded(px(12.0))
+            .rounded(px(SIDEBAR_MODE_SWITCHER_RADIUS))
             .bg(theme.surface_raised.opacity(0.55))
             .child(orchestrator)
             .child(workers)
@@ -7033,6 +7037,13 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_mode_switcher_uses_compact_geometry() {
+        assert_eq!(SIDEBAR_MODE_SWITCHER_HEIGHT, 36.0);
+        assert_eq!(SIDEBAR_MODE_SWITCHER_RADIUS, 10.0);
+        assert_eq!(SIDEBAR_MODE_BUTTON_RADIUS, 8.0);
+    }
 
     #[test]
     fn sidebar_mode_defaults_to_orchestrator() {

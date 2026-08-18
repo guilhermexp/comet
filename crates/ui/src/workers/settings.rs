@@ -14,25 +14,22 @@ use crate::theme::Theme;
 use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use super::presentation::{runtime_icon_path, spinner_frame};
 
+fn normalize_preset_command(raw: &str) -> Option<(String, String)> {
+    let command = raw.trim();
+    (!command.is_empty()).then(|| (command.to_owned(), command.to_owned()))
+}
+
 pub struct WorkersSettingsView {
     model: Entity<WorkersModel>,
-    label_input: Entity<ComposerInput>,
     command_input: Entity<ComposerInput>,
     editing_preset_id: Option<String>,
     _model_observation: Subscription,
-    _label_events: Subscription,
     _command_events: Subscription,
 }
 
 impl WorkersSettingsView {
     pub fn new(model: Entity<WorkersModel>, cx: &mut Context<Self>) -> Self {
-        let label_input = cx.new(|cx| ComposerInput::new("Label", cx));
-        let command_input = cx.new(|cx| ComposerInput::new("Command (e.g. claude --plan)", cx));
-        let label_events = cx.subscribe(&label_input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_preset(cx);
-            }
-        });
+        let command_input = cx.new(|cx| ComposerInput::new("Add command (e.g. claude --plan)", cx));
         let command_events = cx.subscribe(&command_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_preset(cx);
@@ -41,21 +38,18 @@ impl WorkersSettingsView {
         let model_observation = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             model,
-            label_input,
             command_input,
             editing_preset_id: None,
             _model_observation: model_observation,
-            _label_events: label_events,
             _command_events: command_events,
         }
     }
 
     fn submit_preset(&mut self, cx: &mut Context<Self>) {
-        let label = self.label_input.read(cx).text().trim().to_owned();
-        let command = self.command_input.read(cx).text().trim().to_owned();
-        if label.is_empty() || command.is_empty() {
+        let Some((label, command)) = normalize_preset_command(self.command_input.read(cx).text())
+        else {
             return;
-        }
+        };
         if let Some(id) = self.editing_preset_id.take() {
             self.model.update(cx, |model, cx| {
                 model.update_preset(
@@ -72,17 +66,13 @@ impl WorkersSettingsView {
             self.model
                 .update(cx, |model, cx| model.add_preset(label, command, cx));
         }
-        self.label_input
-            .update(cx, |input, cx| input.set_text("", cx));
         self.command_input
             .update(cx, |input, cx| input.set_text("", cx));
         cx.notify();
     }
 
-    fn begin_edit(&mut self, id: String, label: String, command: String, cx: &mut Context<Self>) {
+    fn begin_edit(&mut self, id: String, command: String, cx: &mut Context<Self>) {
         self.editing_preset_id = Some(id);
-        self.label_input
-            .update(cx, |input, cx| input.set_text(label, cx));
         self.command_input
             .update(cx, |input, cx| input.set_text(command, cx));
         cx.notify();
@@ -160,7 +150,6 @@ impl WorkersSettingsView {
             .unwrap_or_default();
         let rows = presets.into_iter().enumerate().map(|(index, preset)| {
             let edit_id = preset.id.clone();
-            let edit_label = preset.label.clone();
             let edit_command = preset.command.clone();
             let favorite_id = preset.id.clone();
             let enabled_id = preset.id.clone();
@@ -195,12 +184,7 @@ impl WorkersSettingsView {
                         .gap(px(8.0))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_edit(
-                                edit_id.clone(),
-                                edit_label.clone(),
-                                edit_command.clone(),
-                                cx,
-                            );
+                            this.begin_edit(edit_id.clone(), edit_command.clone(), cx);
                         }))
                         .child(
                             div()
@@ -316,6 +300,9 @@ impl WorkersSettingsView {
                         ),
                 )
         });
+        let add_command = self.command_input.read(cx).text().trim().to_owned();
+        let add_ready = !add_command.is_empty();
+        let add_icon = runtime_icon_path(None, Some(&add_command));
         let not_installed = runtimes
             .into_iter()
             .filter(|runtime| !runtime.installed)
@@ -463,7 +450,7 @@ impl WorkersSettingsView {
                     .mt(px(5.0))
                     .text_size(px(12.5))
                     .text_color(theme.text_muted)
-                    .child("Launch commands for your agents. The topmost preset for each CLI is its default."),
+                    .child("Launch commands for your agents. Drag to reorder — a CLI's topmost preset is its default."),
             )
             .when_some(error, |el, error| {
                 el.child(div().mt(px(12.0)).text_size(px(11.0)).text_color(theme.danger_muted).child(error))
@@ -476,23 +463,30 @@ impl WorkersSettingsView {
                 div()
                     .mt(px(10.0))
                     .flex()
-                    .gap(px(7.0))
-                    .child(div().h(px(38.0)).w(px(160.0)).rounded(px(9.0)).border_1().border_color(theme.border).child(self.label_input.clone()))
-                    .child(div().h(px(38.0)).flex_1().rounded(px(9.0)).border_1().border_color(theme.border).child(self.command_input.clone()))
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border.opacity(0.72))
+                    .bg(crate::theme::ink(0.025))
+                    .child(icon(add_icon).size(px(15.0)).text_color(theme.text_muted))
+                    .child(div().min_w_0().flex_1().child(self.command_input.clone()))
                     .child(
                         div()
                             .id("workers-preset-save")
-                            .h(px(38.0))
-                            .px(px(13.0))
+                            .px(px(9.0))
+                            .py(px(5.0))
                             .flex()
                             .items_center()
-                            .rounded(px(8.0))
-                            .bg(theme.text)
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.bg)
-                            .cursor_pointer()
-                            .when(busy, |el| el.opacity(0.5))
+                            .rounded(px(7.0))
+                            .bg(crate::theme::ink(0.08))
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .when(add_ready && !busy, |el| el.cursor_pointer())
+                            .when(!add_ready || busy, |el| el.opacity(0.45))
                             .on_click(cx.listener(|this, _, _, cx| this.submit_preset(cx)))
                             .child(if self.editing_preset_id.is_some() { "Save" } else { "Add" }),
                     ),
@@ -840,5 +834,19 @@ impl Render for WorkersSettingsView {
             WorkersSettingsTab::Transcripts => self.render_transcripts(&theme, cx),
             WorkersSettingsTab::Notifications => self.render_notifications(&theme, cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_preset_command;
+
+    #[test]
+    fn preset_add_row_uses_the_command_as_its_label_like_unpeel() {
+        assert_eq!(
+            normalize_preset_command("  codex --plan  "),
+            Some(("codex --plan".to_owned(), "codex --plan".to_owned()))
+        );
+        assert_eq!(normalize_preset_command("   "), None);
     }
 }

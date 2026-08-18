@@ -16,6 +16,9 @@ use crate::theme::Theme;
 
 use super::archive::archive_restore_presentation;
 use super::model::{WorkersModel, WorkersRoute, WorkersSessionTarget, WorkersSettingsTab};
+use super::new_session_menu::WorkersNewSessionMenuItem as NewSessionMenuItem;
+#[cfg(target_os = "macos")]
+use super::new_session_menu::native as native_new_session_menu;
 use super::presentation::{
     HOSTED_SIDEBAR_TOP_PADDING, PROJECT_ROW_BASE_LEADING, SESSION_ROW_BASE_LEADING,
     SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
@@ -25,6 +28,8 @@ use super::presentation::{
 };
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
+#[cfg(target_os = "macos")]
+use super::session_menu::native::{self as native_session_menu, Selection as NativeMenuSelection};
 use super::session_menu::{WorkersSessionMenuItem as SessionMenuItem, session_menu_items};
 use super::settings::WorkersSettingsView;
 use super::terminal::WorkersTerminal;
@@ -164,6 +169,86 @@ impl WorkersSidebar {
                 .ok();
             }
         }));
+    }
+
+    fn open_new_session_menu(
+        &mut self,
+        project: WorkersProject,
+        presets: Vec<WorkersPreset>,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            let allow_worktree = project.parent_project_id.is_none() && !project.is_group;
+            let selection = native_new_session_menu::show_async(&presets, allow_worktree);
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(selection)) = selection.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| match selection {
+                    NewSessionMenuItem::Terminal => {
+                        this.model.update(cx, |model, cx| {
+                            model.launch(
+                                WorkersLaunchRequest::terminal(project.id.clone())
+                                    .with_optional_worktree(
+                                        project
+                                            .worktree_branch
+                                            .as_ref()
+                                            .map(|_| project.path.clone()),
+                                        project.worktree_branch.clone(),
+                                    ),
+                                cx,
+                            )
+                        });
+                    }
+                    NewSessionMenuItem::Preset(preset_id) => {
+                        this.model.update(cx, |model, cx| {
+                            model.launch(
+                                WorkersLaunchRequest::preset(project.id.clone(), preset_id)
+                                    .with_optional_worktree(
+                                        project
+                                            .worktree_branch
+                                            .as_ref()
+                                            .map(|_| project.path.clone()),
+                                        project.worktree_branch.clone(),
+                                    ),
+                                cx,
+                            )
+                        });
+                    }
+                    NewSessionMenuItem::WorktreeTerminal => {
+                        this.content.update(cx, |content, cx| {
+                            content.open_project_dialog(
+                                project.clone(),
+                                ProjectDialogKind::NewWorktreeSession(None),
+                                cx,
+                            )
+                        });
+                    }
+                    NewSessionMenuItem::WorktreePreset(preset_id) => {
+                        this.content.update(cx, |content, cx| {
+                            content.open_project_dialog(
+                                project.clone(),
+                                ProjectDialogKind::NewWorktreeSession(Some(preset_id)),
+                                cx,
+                            )
+                        });
+                    }
+                    NewSessionMenuItem::ManagePresets => {
+                        this.model.update(cx, |model, cx| {
+                            model.open_settings(WorkersSettingsTab::Presets, cx)
+                        });
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.model
+            .update(cx, |model, cx| model.open_launcher(project.id, cx));
     }
 
     fn render_settings_nav(
@@ -322,7 +407,8 @@ impl WorkersSidebar {
                 )
                 .into_any_element();
         }
-        let project_id = project.id.clone();
+        let new_session_project = project.clone();
+        let new_session_presets = presets.clone();
         let select_project_id = project.id.clone();
         let toggle_project_id = project.id.clone();
         let project_name: SharedString = project.name.clone().into();
@@ -571,9 +657,11 @@ impl WorkersSidebar {
                                         .hover(|el| el.bg(crate::theme::ink(0.08)))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.model.update(cx, |model, cx| {
-                                                model.select_project(project_id.clone(), cx)
-                                            });
+                                            this.open_new_session_menu(
+                                                new_session_project.clone(),
+                                                new_session_presets.clone(),
+                                                cx,
+                                            );
                                         }))
                                         .child(
                                             icon(icons::WORKER_PLUS)
@@ -1112,8 +1200,44 @@ impl WorkersContent {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.session_menu.open((session, position));
-        cx.notify();
+        #[cfg(target_os = "macos")]
+        {
+            let move_targets = self
+                .model
+                .read(cx)
+                .projects()
+                .iter()
+                .filter(|project| project.id != session.project_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let items = session_menu_items(&session, &move_targets);
+            let selection = native_session_menu::show_async(&session, &move_targets, &items);
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(selection)) = selection.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| match selection {
+                    NativeMenuSelection::Item(item) => {
+                        this.perform_session_menu_action(session, item, cx)
+                    }
+                    NativeMenuSelection::MoveTo(project_id) => {
+                        this.model.update(cx, |model, cx| {
+                            model.move_session(session.id, Some(project_id), cx)
+                        });
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            let _ = position;
+            return;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.session_menu.open((session, position));
+            cx.notify();
+        }
     }
 
     pub fn open_project_menu(
@@ -1166,6 +1290,67 @@ impl WorkersContent {
             })
             .ok();
         }));
+    }
+
+    fn perform_session_menu_action(
+        &mut self,
+        session: WorkersSession,
+        item: SessionMenuItem,
+        cx: &mut Context<Self>,
+    ) {
+        match item {
+            SessionMenuItem::Rename => self.open_rename(session, cx),
+            SessionMenuItem::Pin | SessionMenuItem::Unpin => {
+                let pinned = item == SessionMenuItem::Pin;
+                self.model
+                    .update(cx, |model, cx| model.pin(session.id, pinned, cx));
+            }
+            SessionMenuItem::MoveTo | SessionMenuItem::CopyTranscript => {}
+            SessionMenuItem::ClearAttention => {
+                self.model
+                    .update(cx, |model, cx| model.clear_attention(session.id, cx));
+            }
+            SessionMenuItem::ResumeAgent => {
+                self.model
+                    .update(cx, |model, cx| model.resume_agent(session.id, cx));
+            }
+            SessionMenuItem::Resume => {
+                self.model
+                    .update(cx, |model, cx| model.restart(session.id, cx));
+            }
+            SessionMenuItem::Fork => {
+                self.model.update(cx, |model, cx| model.fork(session, cx));
+            }
+            SessionMenuItem::AppendSystemContext => self.open_append_context(session, cx),
+            SessionMenuItem::NotifyWhenDone => {
+                self.model.update(cx, |model, cx| {
+                    model.set_notify_when_done(session.id, !session.notify_when_done, cx)
+                });
+            }
+            SessionMenuItem::CopySessionId => cx.write_to_clipboard(ClipboardItem::new_string(
+                format!("Zeron Session ID: {}", session.id),
+            )),
+            SessionMenuItem::CopyTranscript20 => self.copy_transcript(session.id, Some(20), cx),
+            SessionMenuItem::CopyTranscript50 => self.copy_transcript(session.id, Some(50), cx),
+            SessionMenuItem::CopyTranscriptAll => self.copy_transcript(session.id, Some(0), cx),
+            SessionMenuItem::StopAndArchive | SessionMenuItem::Archive => {
+                let is_live = session.is_live();
+                self.model.update(cx, |model, cx| {
+                    model.stop_and_archive(session.id, is_live, cx)
+                });
+            }
+            SessionMenuItem::RestoreAndResume => {
+                self.model
+                    .update(cx, |model, cx| model.restore(session, true, cx));
+            }
+            SessionMenuItem::Restore => {
+                self.model
+                    .update(cx, |model, cx| model.restore(session, false, cx));
+            }
+            SessionMenuItem::Remove => self
+                .model
+                .update(cx, |model, cx| model.request_remove(session.id, false, cx)),
+        }
     }
 
     fn render_project_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1509,9 +1694,10 @@ impl WorkersContent {
                 let mut elements = Vec::new();
                 if matches!(
                     item,
-                    SessionMenuItem::CopyTranscript20
+                    SessionMenuItem::CopyTranscript
                         | SessionMenuItem::StopAndArchive
                         | SessionMenuItem::Archive
+                        | SessionMenuItem::Restore
                         | SessionMenuItem::RestoreAndResume
                 ) {
                     elements.push(popover::menu_separator().into_any_element());
@@ -1534,6 +1720,8 @@ impl WorkersContent {
                             "Notify when done"
                         }
                     }
+                    SessionMenuItem::CopyTranscript => "Copy transcript",
+                    SessionMenuItem::CopySessionId => "Copy session ID",
                     SessionMenuItem::CopyTranscript20 => "Copy transcript · Last 20 entries",
                     SessionMenuItem::CopyTranscript50 => "Copy transcript · Last 50 entries",
                     SessionMenuItem::CopyTranscriptAll => "Copy transcript · Whole conversation",
@@ -1554,7 +1742,9 @@ impl WorkersContent {
                     SessionMenuItem::NotifyWhenDone => icons::BELL,
                     SessionMenuItem::CopyTranscript20
                     | SessionMenuItem::CopyTranscript50
-                    | SessionMenuItem::CopyTranscriptAll => icons::COPY,
+                    | SessionMenuItem::CopyTranscriptAll
+                    | SessionMenuItem::CopyTranscript
+                    | SessionMenuItem::CopySessionId => icons::COPY,
                     SessionMenuItem::StopAndArchive
                     | SessionMenuItem::Archive
                     | SessionMenuItem::Restore
@@ -1577,77 +1767,7 @@ impl WorkersContent {
                 }
                 let row = row.on_click(cx.listener(move |this, _, _, cx| {
                     this.close_session_menu(cx);
-                    match item {
-                        SessionMenuItem::Rename => this.open_rename(menu_session.clone(), cx),
-                        SessionMenuItem::Pin | SessionMenuItem::Unpin => {
-                            let pinned = item == SessionMenuItem::Pin;
-                            this.model.update(cx, |model, cx| {
-                                model.pin(menu_session.id.clone(), pinned, cx)
-                            });
-                        }
-                        SessionMenuItem::MoveTo => {}
-                        SessionMenuItem::ClearAttention => {
-                            this.model.update(cx, |model, cx| {
-                                model.clear_attention(menu_session.id.clone(), cx)
-                            });
-                        }
-                        SessionMenuItem::ResumeAgent => {
-                            this.model.update(cx, |model, cx| {
-                                model.resume_agent(menu_session.id.clone(), cx)
-                            });
-                        }
-                        SessionMenuItem::Resume => {
-                            this.model
-                                .update(cx, |model, cx| model.restart(menu_session.id.clone(), cx));
-                        }
-                        SessionMenuItem::Fork => {
-                            this.model
-                                .update(cx, |model, cx| model.fork(menu_session.clone(), cx));
-                        }
-                        SessionMenuItem::AppendSystemContext => {
-                            this.open_append_context(menu_session.clone(), cx)
-                        }
-                        SessionMenuItem::NotifyWhenDone => {
-                            this.model.update(cx, |model, cx| {
-                                model.set_notify_when_done(
-                                    menu_session.id.clone(),
-                                    !menu_session.notify_when_done,
-                                    cx,
-                                )
-                            });
-                        }
-                        SessionMenuItem::CopyTranscript20 => {
-                            this.copy_transcript(menu_session.id.clone(), Some(20), cx)
-                        }
-                        SessionMenuItem::CopyTranscript50 => {
-                            this.copy_transcript(menu_session.id.clone(), Some(50), cx)
-                        }
-                        SessionMenuItem::CopyTranscriptAll => {
-                            this.copy_transcript(menu_session.id.clone(), Some(0), cx)
-                        }
-                        SessionMenuItem::StopAndArchive | SessionMenuItem::Archive => {
-                            this.model.update(cx, |model, cx| {
-                                model.stop_and_archive(
-                                    menu_session.id.clone(),
-                                    menu_session.is_live(),
-                                    cx,
-                                )
-                            });
-                        }
-                        SessionMenuItem::RestoreAndResume => {
-                            this.model.update(cx, |model, cx| {
-                                model.restore(menu_session.clone(), true, cx)
-                            });
-                        }
-                        SessionMenuItem::Restore => {
-                            this.model.update(cx, |model, cx| {
-                                model.restore(menu_session.clone(), false, cx)
-                            });
-                        }
-                        SessionMenuItem::Remove => this.model.update(cx, |model, cx| {
-                            model.request_remove(menu_session.id.clone(), false, cx)
-                        }),
-                    }
+                    this.perform_session_menu_action(menu_session.clone(), item, cx);
                 }));
                 elements.push(row.into_any_element());
                 if item == SessionMenuItem::MoveTo {
@@ -2612,6 +2732,51 @@ fn workers_content_outlet() -> gpui::Div {
     div().flex_1().min_w_0().min_h_0().overflow_hidden()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkersWorkspacePane {
+    Session,
+    Launcher,
+    Empty,
+}
+
+fn workers_workspace_pane(
+    has_selected_session: bool,
+    has_launcher_project: bool,
+) -> WorkersWorkspacePane {
+    if has_selected_session {
+        WorkersWorkspacePane::Session
+    } else if has_launcher_project {
+        WorkersWorkspacePane::Launcher
+    } else {
+        WorkersWorkspacePane::Empty
+    }
+}
+
+#[cfg(test)]
+mod empty_state_tests {
+    use super::{WorkersWorkspacePane, workers_workspace_pane};
+
+    #[test]
+    fn no_selected_session_uses_empty_state_until_launcher_is_explicitly_requested() {
+        assert_eq!(
+            workers_workspace_pane(false, false),
+            WorkersWorkspacePane::Empty
+        );
+        assert_eq!(
+            workers_workspace_pane(false, true),
+            WorkersWorkspacePane::Launcher
+        );
+    }
+
+    #[test]
+    fn selected_session_always_owns_the_workspace_pane() {
+        assert_eq!(
+            workers_workspace_pane(true, true),
+            WorkersWorkspacePane::Session
+        );
+    }
+}
+
 impl Render for WorkersContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -2622,6 +2787,7 @@ impl Render for WorkersContent {
             busy,
             selected_session,
             selected_project,
+            launcher_project,
             presets,
             archive_project_id,
             archived_sessions,
@@ -2637,6 +2803,7 @@ impl Render for WorkersContent {
                 model.action_in_flight(),
                 model.selected_session().cloned(),
                 model.selected_project().cloned(),
+                model.launcher_project().cloned(),
                 model.presets().to_vec(),
                 model.archive_project_id.clone(),
                 model.archived_sessions.clone(),
@@ -2647,6 +2814,8 @@ impl Render for WorkersContent {
         };
 
         let has_snapshot = snapshot.is_some();
+        let workspace_pane =
+            workers_workspace_pane(selected_session.is_some(), launcher_project.is_some());
         let content = if matches!(route, WorkersRoute::Settings(_)) {
             self.settings.clone().into_any_element()
         } else if matches!(route, WorkersRoute::Recent) {
@@ -2688,24 +2857,30 @@ impl Render for WorkersContent {
                     error.clone().unwrap_or_default()
                 ))
                 .into_any_element()
-        } else if let Some(session) = selected_session {
-            self.render_session(session, &theme)
-        } else if let Some(project) = selected_project {
+        } else if matches!(workspace_pane, WorkersWorkspacePane::Session) {
+            selected_session
+                .map(|session| self.render_session(session, &theme))
+                .unwrap_or_else(|| div().size_full().into_any_element())
+        } else if matches!(workspace_pane, WorkersWorkspacePane::Launcher) {
             // Paint the terminal surface behind the launcher so its exact grid
             // is known before a Session is created. Opacity keeps prepaint and
             // geometry measurement active; the foreground launcher owns input.
-            div()
-                .relative()
-                .size_full()
-                .child(
+            launcher_project
+                .map(|project| {
                     div()
-                        .absolute()
-                        .inset_0()
-                        .opacity(0.0)
-                        .child(self.terminal.clone()),
-                )
-                .child(self.render_launcher(project, presets, busy, &theme, cx))
-                .into_any_element()
+                        .relative()
+                        .size_full()
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .opacity(0.0)
+                                .child(self.terminal.clone()),
+                        )
+                        .child(self.render_launcher(project, presets, busy, &theme, cx))
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().size_full().into_any_element())
         } else {
             div()
                 .size_full()
@@ -2720,31 +2895,38 @@ impl Render for WorkersContent {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .gap(px(10.0))
+                        .gap(px(16.0))
                         .child(
-                            icon(icons::FOLDER)
+                            icon(icons::WORKER_UNPEEL_LOGO)
                                 .size(px(56.0))
                                 .text_color(theme.text_muted),
                         )
                         .child(
                             div()
-                                .mt(px(6.0))
-                                .text_size(px(14.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text_muted)
-                                .child("No session selected"),
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(14.0))
+                                        .text_color(theme.text_muted)
+                                        .child("No session selected"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text.opacity(0.35))
+                                        .child(
+                                            "Pick a session in the sidebar, or hit + on a project",
+                                        ),
+                                ),
                         )
                         .child(
                             div()
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child("Pick a session in the sidebar, or hit + on a project"),
-                        )
-                        .child(
-                            div()
-                                .mt(px(8.0))
                                 .text_size(px(10.0))
-                                .text_color(theme.text_faint.opacity(0.72))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text.opacity(0.25))
                                 .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                         ),
                 )

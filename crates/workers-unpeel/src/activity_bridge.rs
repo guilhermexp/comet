@@ -538,6 +538,45 @@ mod tests {
     }
 
     #[test]
+    fn pi_family_workers_stop_spinning_immediately_after_agent_end() {
+        for command in ["omp", "prime-agent"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut engine = ActivityEngine::default();
+            let now = SystemTime::now();
+
+            assert_eq!(
+                derive_activity(
+                    &mut engine,
+                    input("session", command, directory.path(), 1),
+                    now,
+                ),
+                "idle",
+            );
+            engine.apply_hook_event("session", "Start", None, now);
+            assert_eq!(
+                derive_activity(
+                    &mut engine,
+                    input("session", command, directory.path(), 2),
+                    now,
+                ),
+                "working",
+                "{command} must use its agent_start hook instead of the output fallback",
+            );
+
+            engine.apply_hook_event("session", "Stop", None, now);
+            assert_eq!(
+                derive_activity(
+                    &mut engine,
+                    input("session", command, directory.path(), 3),
+                    now,
+                ),
+                "idle",
+                "{command} must stop immediately even when output changed at agent_end",
+            );
+        }
+    }
+
+    #[test]
     fn menu_prompt_replaces_spinner_with_attention() {
         let directory = tempfile::tempdir().unwrap();
         let mut engine = ActivityEngine::default();
