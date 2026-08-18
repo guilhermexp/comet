@@ -7132,7 +7132,7 @@ impl Shell {
                             .text_color(theme.text_muted)
                             .into_any_element()
                     }),
-                RightSurface::Subagent(_) => icon(icons::CHAT_ROUND_LINE)
+                RightSurface::Subagent(_) => icon(icons::BOT)
                     .size(px(12.0))
                     .text_color(theme.text_muted)
                     .into_any_element(),
