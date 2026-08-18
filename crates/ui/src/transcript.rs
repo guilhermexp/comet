@@ -1373,10 +1373,14 @@ pub struct Transcript {
     chat_id: Option<String>,
     /// `Some(doc_id)` pins this instance to a SUBAGENT doc: rows come from
     /// `AppState::sub_transcript(doc_id)` instead of the selected chat, and
-    /// the instance is READ-ONLY — no echoes, no own-turn hold, no working
-    /// trailer, and no global attachment protection (that set is shared with
-    /// the primary transcript and overwritten wholesale).
+    /// the instance is READ-ONLY — no echoes, no own-turn hold, and no global
+    /// attachment protection (that set is shared with the primary transcript
+    /// and overwritten wholesale).
     doc_override: Option<String>,
+    /// Whether an override instance watches a LIVE doc (`for_doc(follow)`):
+    /// only then may the working trailer render — a frozen snapshot must
+    /// never spin, whatever its entries claim.
+    doc_live: bool,
     /// One-shot "open at the latest content" for UNPINNED (frozen) override
     /// instances: rows land ASYNC after the tab opens (watch replay / blob
     /// fetch), so the end-scroll fires on the first non-empty sync, then
@@ -1582,6 +1586,7 @@ impl Transcript {
             // instance must not reset (or re-pin) on selection changes.
             chat_id: doc_override.clone(),
             land_end_pending: doc_override.is_some() && !follow,
+            doc_live: doc_override.is_some() && follow,
             doc_override,
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
@@ -2802,80 +2807,92 @@ impl Transcript {
     }
 
     fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // A subagent doc has no Session row — `indicator_for` would read the
-        // PARENT chat's live state into a frozen tab.
-        if self.doc_override.is_some() {
-            return None;
-        }
-        let chat_id = self.chat_id.clone()?;
         let now = chrono::Utc::now();
-        // Failed-send state first: past the grace window the trailer IS the
-        // retry affordance, whatever the indicator fell back to.
-        if self.state.read(cx).send_undelivered(&chat_id, now) {
-            let theme = Theme::of(cx).clone();
-            return Some(
-                div()
-                    .id("undelivered-retry")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .pt(px(10.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.danger)
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
-                    .child(SharedString::from("Not delivered — click to retry"))
-                    .into_any_element(),
-            );
-        }
-        let (sending, queued, elapsed_secs) = {
-            let state = self.state.read(cx);
-            if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
-                // Past the pending-send TTL with no ack, the Working overlay
-                // has lapsed but the queued command is still undelivered
-                // (edge link down). Silence here read as a hang (2026-08-19)
-                // — say what's actually happening. Static line, no spinner:
-                // nothing is progressing; the ack notify clears it.
-                if state.send_queued_unacked(&chat_id, now) {
-                    let theme = Theme::of(cx).clone();
-                    return Some(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .pt(px(10.0))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(
-                                "Queued — waiting for connection…",
-                            ))
-                            .into_any_element(),
-                    );
-                }
+        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
+            // A subagent doc has no Session row — `indicator_for` would read
+            // the PARENT chat's live state into this tab. Liveness rides the
+            // doc itself instead: the sink's assistant entry streams until
+            // the subagent settles (run teardown finalizes abandoned sinks),
+            // and a trailing USER entry is a steer still awaiting its reply
+            // segment. Frozen snapshots never spin, whatever they claim.
+            if !self.doc_live {
                 return None;
             }
-            // During the send→turn window the session row's `started_at`
-            // still belongs to the PREVIOUS turn — a timer based on the send
-            // counted the round-trip and then restarted when the turn
-            // actually began (user report). Bridge it as "Sending…" with no
-            // timer instead; the word + timer start with the turn.
-            let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-            let sending = sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
-            // Degraded delivery path: the send is a durable local write
-            // waiting on connectivity — say so instead of faking progress.
-            let queued = sending && state.chat_delivery_degraded(&chat_id);
-            let elapsed = turn_started
-                .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-                .unwrap_or(0);
-            (sending, queued, elapsed)
+            let state = self.state.read(cx);
+            let last = state.sub_transcript(doc_id).last()?;
+            let live = last.status == Some(MessageStatus::Streaming)
+                || last.role == MessageRole::User;
+            if !live {
+                return None;
+            }
+            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            (false, false, elapsed, flavour_seed(doc_id))
+        } else {
+            let chat_id = self.chat_id.clone()?;
+            // Failed-send state first: past the grace window the trailer IS
+            // the retry affordance, whatever the indicator fell back to.
+            if self.state.read(cx).send_undelivered(&chat_id, now) {
+                let theme = Theme::of(cx).clone();
+                return Some(
+                    div()
+                        .id("undelivered-retry")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .pt(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.danger)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
+                        .child(SharedString::from("Not delivered — click to retry"))
+                        .into_any_element(),
+                );
+            }
+            let (sending, queued, elapsed) = {
+                let state = self.state.read(cx);
+                if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+                    if state.send_queued_unacked(&chat_id, now) {
+                        let theme = Theme::of(cx).clone();
+                        return Some(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .pt(px(10.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(
+                                    "Queued — waiting for connection…",
+                                ))
+                                .into_any_element(),
+                        );
+                    }
+                    return None;
+                }
+                // During the send→turn window the session row's `started_at`
+                // still belongs to the PREVIOUS turn — a timer based on the
+                // send counted the round-trip and then restarted when the
+                // turn actually began (user report). Bridge it as "Sending…"
+                // with no timer instead; the word + timer start with the
+                // turn.
+                let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
+                let sending =
+                    sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+                let queued = sending && state.chat_delivery_degraded(&chat_id);
+                let elapsed = turn_started
+                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                    .unwrap_or(0);
+                (sending, queued, elapsed)
+            };
+            (sending, queued, elapsed, flavour_seed(&chat_id))
         };
         let word = if queued {
             "Queued — will send automatically".to_string()
         } else if sending {
             "Sending…".to_string()
         } else {
-            format!("{}…", flavour_word(flavour_seed(&chat_id), elapsed_secs))
+            format!("{}…", flavour_word(seed, elapsed_secs))
         };
         let theme = Theme::of(cx).clone();
         Some(
