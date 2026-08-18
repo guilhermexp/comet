@@ -2352,8 +2352,10 @@ impl Shell {
         }
         self.subagent_seq += 1;
         let id = self.subagent_seq;
+        // A live subagent follows its streaming end (main-transcript feel);
+        // a frozen one reads top-down.
         let transcript =
-            cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), cx));
+            cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
         let fetch = if frozen {
             self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
@@ -6403,7 +6405,6 @@ impl Shell {
         if !self.transcript.read(cx).jump_button_shown() {
             return None;
         }
-        let theme = Theme::of(cx);
         Some(
             div()
                 .absolute()
@@ -6412,50 +6413,69 @@ impl Shell {
                 .right(px(10.0))
                 .flex()
                 .justify_center()
-                .child(motion::dialog_in(
+                .child(self.jump_pill(
                     "jump-to-bottom",
-                    div()
-                        .id("jump-to-bottom-btn")
-                        .h(px(30.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_md()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .pl(px(11.0))
-                        .pr(px(13.0))
-                        .cursor_pointer()
-                        // Hover must BRIGHTEN the opaque pill, never replace it
-                        // with a translucent wash (a 10%-alpha bg here made the
-                        // pill go see-through on hover — user-reported), and it
-                        // fades over the CSS transition-colors 150ms, not snaps.
-                        .bg(motion::hover_blend(
-                            "jump-pill",
-                            theme.surface_raised,
-                            theme.surface_raised_hover,
-                        ))
-                        .on_hover(motion::hover_listener("jump-pill"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.transcript
-                                .update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
-                        }))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("↓")),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(theme.text)
-                                .child(SharedString::from("Scroll to bottom")),
-                        ),
+                    "jump-pill",
+                    self.transcript.clone(),
+                    cx,
                 ))
                 .into_any_element(),
         )
+    }
+
+    /// The jump pill itself — shared between the conversation overlay and
+    /// the subagent pane so both read as one control. `anim_key`/`hover_key`
+    /// must be distinct per instance (they key global animation state).
+    fn jump_pill(
+        &self,
+        anim_key: &'static str,
+        hover_key: &'static str,
+        transcript: Entity<Transcript>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx);
+        motion::dialog_in(
+            anim_key,
+            div()
+                .id(anim_key)
+                .h(px(30.0))
+                .rounded_full()
+                .border_1()
+                .border_color(theme.border)
+                .shadow_md()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .pl(px(11.0))
+                .pr(px(13.0))
+                .cursor_pointer()
+                // Hover must BRIGHTEN the opaque pill, never replace it
+                // with a translucent wash (a 10%-alpha bg here made the
+                // pill go see-through on hover — user-reported), and it
+                // fades over the CSS transition-colors 150ms, not snaps.
+                .bg(motion::hover_blend(
+                    hover_key,
+                    theme.surface_raised,
+                    theme.surface_raised_hover,
+                ))
+                .on_hover(motion::hover_listener(hover_key))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    transcript.update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
+                }))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("↓")),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from("Scroll to bottom")),
+                ),
+        )
+        .into_any_element()
     }
 
     /// Working indicator strip: gradient spinner + rotating flavour word (7s,
