@@ -164,6 +164,7 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    (OPENCODE_MARK, "opencode-mark"),
     // Unpeel runtime package marks. These are copied from
     // `third_party/unpeel/runtimes/*/assets/icon.svg` so packaged builds do
     // not depend on the source submodule at runtime.
