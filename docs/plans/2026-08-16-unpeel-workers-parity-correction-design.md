@@ -9,9 +9,9 @@ are recorded in
 `docs/superpowers/plans/2026-08-17-unpeel-workers-parity-completion.md` and
 `.impeccable/review/workers-parity-completion/`.
 
-The only open delivery item is provenance, not product behavior: the local
-Unpeel compatibility commits `5f23a30` and `fb6f77d` need an explicitly
-authorized remote branch before the root gitlink can be updated reproducibly.
+The root gitlink is pinned locally to `fb6f77d` after explicit commit
+authorization. The only open external delivery item is publishing the local
+Unpeel compatibility commits `5f23a30` and `fb6f77d` to an authorized remote.
 
 ## Goal
 

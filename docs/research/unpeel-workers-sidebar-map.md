@@ -142,11 +142,11 @@ refletiu o output e o título automaticamente. O primeiro ensaio usou um caminho
 temporário cujo `session.sock` tinha 105 caracteres e excedeu o limite Unix do
 macOS; o ensaio válido foi repetido em `/tmp/uqa.XcbWqA` com socket presente.
 
-## Proveniência pendente
+## Proveniência local e publicação pendente
 
 O checkout local de `third_party/unpeel` contém dois commits isolados sobre
 `b02a4b5`: `5f23a30` (initial terminal grid) e `fb6f77d` (estabilização das
-provas PTY). Eles passaram nos gates locais, mas não foram publicados. O root
-gitlink só deve ser atualizado depois de autorização explícita para criar ou
-usar `zeronsh/unpeel` e fazer push desses objetos; até lá, o `+` do submodule é
-esperado e evita registrar uma referência impossível de clonar.
+provas PTY). Eles passaram nos gates locais e, após autorização explícita para
+commit, o root gitlink foi fixado em `fb6f77d`. Os objetos ainda não foram
+publicados; portanto a publicação de uma branch remota continua necessária
+antes de distribuir o commit raiz para clones externos.

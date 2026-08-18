@@ -13,9 +13,9 @@
 Implementation, automated gates and native visual QA are complete for the local
 macOS scope. Tasks 1–7 and 9 were executed in the commits listed below. Task 8
 is complete locally, including the two isolated Unpeel commits and all upstream
-tests, but its publication/pinning step remains intentionally blocked until the
-user explicitly authorizes creating or updating `zeronsh/unpeel` and pushing
-the branch. The root therefore must not record the unpublished submodule object.
+tests. The user authorized committing the local gitlink, so the root now pins
+`fb6f77d`; publishing the branch remains a separate external delivery step and
+was not inferred from that authorization.
 
 | Task | Result | Commit/evidence |
 | --- | --- | --- |
@@ -810,4 +810,5 @@ git commit -m "docs(workers): record unpeel parity acceptance"
 - [x] Settings contém somente Presets, Transcripts e Notifications.
 - [x] Orchestrator permaneceu isolado e com estado preservado no smoke nativo.
 - [x] Gates Cargo, Unpeel core/TUI, PTY e matriz visual estão registrados.
-- [ ] Root/submodule reproduzível em clone limpo — bloqueado somente pela publicação explícita dos commits locais `5f23a30` e `fb6f77d`.
+- [x] Root/submodule consistente no checkout local e gitlink fixado em `fb6f77d`.
+- [ ] Clone externo reproduzível — depende somente da publicação explícita dos commits locais `5f23a30` e `fb6f77d`.
