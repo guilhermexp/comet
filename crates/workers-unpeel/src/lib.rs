@@ -15,11 +15,26 @@ use unicode_width::UnicodeWidthChar as _;
 use unpeel_core::activity_log::{ActivityLogEntry, ActivityLogKind, ActivityLogStore};
 use unpeel_core::controller_host::ControllerHostRuntime;
 use unpeel_core::relay_crypto::TunnelRequest;
-use unpeel_core::session_host;
 use unpeel_core::terminal_viewport::{TerminalViewportSnapshot, TerminalViewportStyleRun};
+use unpeel_core::{browser_mcp, computer_mcp, mcp_gate, mcp_host, session_host};
 
 pub fn is_session_host_mode(args: &[String]) -> bool {
-    session_host_launch_args(args).is_some()
+    session_host_launch_args(args).is_some() || is_internal_host_mode(args)
+}
+
+fn is_internal_host_mode(args: &[String]) -> bool {
+    let Some(argument) = args.first().map(String::as_str) else {
+        return false;
+    };
+    matches!(
+        argument,
+        mcp_host::MCP_HOST_ARG
+            | browser_mcp::BROWSER_MCP_ARG
+            | mcp_gate::MCP_GATE_ARG
+            | browser_mcp::BROWSER_CLEANUP_ARG
+            | computer_mcp::COMPUTER_CLEANUP_ARG
+            | session_host::COMPACT_OUTPUT_JOURNALS_ARG
+    ) || unpeel_core::integrations::legacy_mcp_gate_kind(argument).is_some()
 }
 
 pub fn session_host_launch_args(args: &[String]) -> Option<&[String]> {
@@ -44,7 +59,51 @@ pub fn session_host_launcher_path(args: &[String]) -> Option<&Path> {
 /// Let the Comet executable serve as Unpeel's detached local PTY host.
 /// Returns `true` after a host invocation has run, `false` for normal Comet CLI/UI arguments.
 pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some(session_host::COMPACT_OUTPUT_JOURNALS_ARG) {
+        if args.len() != 1 {
+            return Err(format!(
+                "usage: zeron {}",
+                session_host::COMPACT_OUTPUT_JOURNALS_ARG
+            ));
+        }
+        let summary = session_host::compact_exited_output_journals()?;
+        println!(
+            "scanned={} compacted={} logical_bytes_evicted={}",
+            summary.scanned, summary.compacted, summary.logical_bytes_evicted
+        );
+        return Ok(true);
+    }
+    if args.first().map(String::as_str) == Some(mcp_host::MCP_HOST_ARG) {
+        mcp_host::run_stdio()?;
+        return Ok(true);
+    }
+    if args.first().map(String::as_str) == Some(browser_mcp::BROWSER_MCP_ARG) {
+        browser_mcp::run_stdio()?;
+        return Ok(true);
+    }
+    if args.first().map(String::as_str) == Some(mcp_gate::MCP_GATE_ARG) {
+        args.remove(0);
+        mcp_gate::run_stdio(args.first().map(String::as_str).unwrap_or_default())?;
+        return Ok(true);
+    }
+    if let Some(kind) = args
+        .first()
+        .and_then(|argument| unpeel_core::integrations::legacy_mcp_gate_kind(argument))
+    {
+        mcp_gate::run_stdio(kind)?;
+        return Ok(true);
+    }
+    if args.first().map(String::as_str) == Some(browser_mcp::BROWSER_CLEANUP_ARG) {
+        args.remove(0);
+        browser_mcp::run_cleanup(&args)?;
+        return Ok(true);
+    }
+    if args.first().map(String::as_str) == Some(computer_mcp::COMPUTER_CLEANUP_ARG) {
+        args.remove(0);
+        computer_mcp::run_cleanup(&args)?;
+        return Ok(true);
+    }
     if let Some(host_args) = session_host_launch_args(&args) {
         session_host::run_from_args(host_args)?;
         return Ok(true);
@@ -763,6 +822,7 @@ impl LocalWorkersClient {
                 .unwrap_or_default(),
         };
         apply_project_organization_overlay(&mut bootstrap.projects);
+        apply_runtime_capabilities(&mut bootstrap.sessions);
         apply_notify_when_done_overlay(&mut bootstrap.sessions);
         self.activity.enrich(&mut bootstrap.sessions);
         Ok(bootstrap)
@@ -1433,6 +1493,35 @@ impl LocalWorkersClient {
             .success()
             .then_some(())
             .ok_or_else(|| WorkersError::State(format!("could not open project in {editor}")))
+    }
+
+    pub fn open_project_with_application(
+        &self,
+        path: &str,
+        bundle_ids: Vec<String>,
+        app_names: Vec<String>,
+    ) -> Result<(), WorkersError> {
+        for bundle_id in bundle_ids {
+            if std::process::Command::new("/usr/bin/open")
+                .args(["-b", bundle_id.as_str(), path])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+        }
+        for app_name in app_names {
+            if std::process::Command::new("/usr/bin/open")
+                .args(["-a", app_name.as_str(), path])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+        }
+        Err(WorkersError::State(
+            "the selected workspace application is unavailable".into(),
+        ))
     }
 
     pub fn session_action(
@@ -2120,6 +2209,21 @@ fn apply_notify_when_done_overlay(sessions: &mut [WorkersSession]) {
     }
 }
 
+fn apply_runtime_capabilities(sessions: &mut [WorkersSession]) {
+    use unpeel_core::runtime_catalog::RuntimeCapability;
+
+    let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
+    for session in sessions {
+        let command = unpeel_core::integrations::command_head(&session.command);
+        let Some(runtime) = catalog.by_command_alias_for_current_platform(command) else {
+            continue;
+        };
+        session.capabilities.notify_when_done = runtime
+            .capabilities
+            .contains(&RuntimeCapability::NotifyWhenDone);
+    }
+}
+
 fn set_notify_when_done_overlay(session_id: &str, enabled: bool) -> Result<(), WorkersError> {
     unpeel_core::app_state::edit(|state| {
         let values = state
@@ -2340,6 +2444,78 @@ fn command_is_risky(command: &str) -> bool {
             || argument == "-f"
             || argument.starts_with("--dangerously")
     })
+}
+
+#[cfg(test)]
+mod host_mode_tests {
+    use unpeel_core::{browser_mcp, computer_mcp, mcp_gate, mcp_host, session_host};
+
+    use super::is_session_host_mode;
+
+    #[test]
+    fn every_detached_unpeel_helper_is_routed_before_the_app_starts() {
+        for argument in [
+            session_host::SESSION_HOST_ARG,
+            session_host::COMPACT_OUTPUT_JOURNALS_ARG,
+            mcp_host::MCP_HOST_ARG,
+            browser_mcp::BROWSER_MCP_ARG,
+            mcp_gate::MCP_GATE_ARG,
+            browser_mcp::BROWSER_CLEANUP_ARG,
+            computer_mcp::COMPUTER_CLEANUP_ARG,
+        ] {
+            assert!(
+                is_session_host_mode(&[argument.to_owned()]),
+                "{argument} must not fall through into the desktop app"
+            );
+        }
+        assert!(!is_session_host_mode(&["--help".to_owned()]));
+    }
+}
+
+#[cfg(test)]
+mod runtime_capability_tests {
+    use super::{WorkersSession, WorkersSessionCapabilities, apply_runtime_capabilities};
+
+    fn session(command: &str) -> WorkersSession {
+        WorkersSession {
+            id: command.to_owned(),
+            project_id: "project".to_owned(),
+            title: command.to_owned(),
+            command: command.to_owned(),
+            state: "running".to_owned(),
+            activity: "idle".to_owned(),
+            unread: false,
+            pinned: false,
+            archived: false,
+            provider_id: None,
+            active_runtime_id: None,
+            runtime_launch_pending: false,
+            runtime_generation: 0,
+            notify_when_done: false,
+            terminal_background_hex: None,
+            worktree_branch: None,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            capabilities: WorkersSessionCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn completion_notifications_follow_the_pinned_runtime_catalog() {
+        let mut sessions = vec![
+            session("claude"),
+            session("pi"),
+            session("omp"),
+            session("prime-agent"),
+        ];
+
+        apply_runtime_capabilities(&mut sessions);
+
+        assert!(sessions[0].capabilities.notify_when_done);
+        assert!(!sessions[1].capabilities.notify_when_done);
+        assert!(sessions[2].capabilities.notify_when_done);
+        assert!(sessions[3].capabilities.notify_when_done);
+    }
 }
 
 #[cfg(test)]

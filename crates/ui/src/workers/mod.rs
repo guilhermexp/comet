@@ -11,3 +11,4 @@ pub mod session_menu;
 pub mod settings;
 pub mod terminal;
 pub mod workspace;
+pub mod workspace_open_menu;

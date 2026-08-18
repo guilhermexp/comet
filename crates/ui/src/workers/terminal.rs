@@ -35,6 +35,23 @@ enum TerminalScrollAction {
     Swallow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalRefresh {
+    Snapshot,
+    Incremental,
+    Idle,
+}
+
+fn terminal_refresh(viewport_dirty: bool, truncated: bool, has_data: bool) -> TerminalRefresh {
+    if viewport_dirty || truncated {
+        TerminalRefresh::Snapshot
+    } else if has_data {
+        TerminalRefresh::Incremental
+    } else {
+        TerminalRefresh::Idle
+    }
+}
+
 fn mouse_report_bytes(
     kind: MouseReportKind,
     column: usize,
@@ -138,6 +155,41 @@ impl HistoricalReplay {
     }
 }
 
+#[derive(Default)]
+struct ResizeSync {
+    epoch: u64,
+    pending: bool,
+}
+
+impl ResizeSync {
+    fn start(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pending = true;
+        self.epoch
+    }
+
+    fn complete(&mut self, epoch: u64) -> bool {
+        if self.epoch != epoch {
+            return false;
+        }
+        self.pending = false;
+        true
+    }
+
+    fn reset(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pending = false;
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn pending(&self) -> bool {
+        self.pending
+    }
+}
+
 pub struct WorkersTerminal {
     client: LocalWorkersClient,
     session_id: Option<String>,
@@ -149,6 +201,7 @@ pub struct WorkersTerminal {
     geometry: Option<GridGeometry>,
     remote_grids: RemoteGridTracker,
     historical_replay: HistoricalReplay,
+    resize_sync: ResizeSync,
     input_modes: WorkersViewportInputModes,
     selection_drag: Option<SelectionDrag>,
     focus_handle: FocusHandle,
@@ -171,15 +224,18 @@ impl WorkersTerminal {
                     can_consume_output,
                     geometry,
                     viewport_dirty,
+                    resize_epoch,
                 )) = this.update(cx, |terminal, _| {
                     (
                         terminal.session_id.clone(),
                         terminal.offset,
                         terminal.generation,
                         terminal.client.clone(),
-                        terminal.historical_replay.can_consume_output(),
+                        terminal.historical_replay.can_consume_output()
+                            && !terminal.resize_sync.pending(),
                         terminal.geometry,
                         terminal.viewport_dirty,
+                        terminal.resize_sync.epoch(),
                     )
                 })
                 else {
@@ -202,18 +258,21 @@ impl WorkersTerminal {
                     .background_executor()
                     .spawn(async move {
                         let output = client.read_output(&request_session_id, Some(offset), 180)?;
-                        let viewport =
-                            if viewport_dirty || output.truncated || !output.data.is_empty() {
-                                let geometry =
-                                    geometry.expect("historical replay waits for geometry");
-                                Some(client.read_viewport(
-                                    &request_session_id,
-                                    geometry.cols,
-                                    geometry.rows,
-                                )?)
-                            } else {
-                                None
-                            };
+                        let refresh = terminal_refresh(
+                            viewport_dirty,
+                            output.truncated,
+                            !output.data.is_empty(),
+                        );
+                        let viewport = if refresh == TerminalRefresh::Snapshot {
+                            let geometry = geometry.expect("historical replay waits for geometry");
+                            Some(client.read_viewport(
+                                &request_session_id,
+                                geometry.cols,
+                                geometry.rows,
+                            )?)
+                        } else {
+                            None
+                        };
                         Ok::<_, zeron_workers_unpeel::WorkersError>((output, viewport))
                     })
                     .await;
@@ -222,6 +281,7 @@ impl WorkersTerminal {
                     .update(cx, |terminal, cx| {
                         if terminal.generation != generation
                             || terminal.session_id.as_deref() != Some(session_id.as_str())
+                            || terminal.resize_sync.epoch() != resize_epoch
                         {
                             return;
                         }
@@ -236,6 +296,9 @@ impl WorkersTerminal {
                                     terminal.emulator = emulator;
                                     terminal.offset = terminal.offset.max(viewport.output_offset);
                                     terminal.viewport_dirty = false;
+                                    cx.notify();
+                                } else if had_data {
+                                    let _ = terminal.emulator.feed(&output.data);
                                     cx.notify();
                                 }
                                 terminal.historical_replay.observe_output(had_data);
@@ -276,6 +339,7 @@ impl WorkersTerminal {
             geometry: None,
             remote_grids: RemoteGridTracker::default(),
             historical_replay: HistoricalReplay::default(),
+            resize_sync: ResizeSync::default(),
             input_modes: WorkersViewportInputModes::default(),
             selection_drag: None,
             focus_handle: cx.focus_handle(),
@@ -296,6 +360,7 @@ impl WorkersTerminal {
             self.historical_replay.start();
         }
         self.generation = self.generation.wrapping_add(1);
+        self.resize_sync.reset();
         self.viewport_dirty = self.session_id.is_some();
         self.emulator = self.geometry.map_or_else(
             || Emulator::new(80, 24),
@@ -316,9 +381,6 @@ impl WorkersTerminal {
         });
         self.geometry = Some(geometry);
         self.historical_replay.observe_geometry();
-        if dimensions_changed && self.session_id.is_some() {
-            self.viewport_dirty = true;
-        }
         if self.emulator.cols() != geometry.cols as usize
             || self.emulator.rows() != geometry.rows as usize
         {
@@ -331,18 +393,42 @@ impl WorkersTerminal {
             .remote_grids
             .record_resize(&session_id, geometry.cols, geometry.rows)
         {
+            if dimensions_changed {
+                self.viewport_dirty = true;
+                cx.notify();
+            }
             return;
         }
+        let resize_epoch = self.resize_sync.start();
+        let generation = self.generation;
         let client = self.client.clone();
         let cols = geometry.cols;
         let rows = geometry.rows;
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(error) = client.resize(&session_id, cols, rows) {
-                    tracing::warn!(%error, "workers terminal resize failed");
+        let request_session_id = session_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.resize(&request_session_id, cols, rows) })
+                .await;
+            let _ = this.update(cx, |terminal, cx| {
+                if terminal.generation != generation
+                    || terminal.session_id.as_deref() != Some(session_id.as_str())
+                    || !terminal.resize_sync.complete(resize_epoch)
+                {
+                    return;
                 }
-            })
-            .detach();
+                terminal.viewport_dirty = true;
+                match result {
+                    Ok(()) => terminal.error = None,
+                    Err(error) => {
+                        tracing::warn!(%error, "workers terminal resize failed");
+                        terminal.error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn active_grid_snapshot(&self) -> Option<GridSnapshot> {
@@ -419,11 +505,9 @@ impl WorkersTerminal {
             cx.stop_propagation();
             return;
         }
-        let application_cursor = if self.input_modes.known {
-            self.input_modes.application_cursor
-        } else {
-            self.emulator.app_cursor_mode()
-        };
+        // Incremental output is fed directly into the emulator between full
+        // viewport snapshots, so its cursor mode is the freshest source.
+        let application_cursor = self.emulator.app_cursor_mode();
         if let Some(bytes) = keystroke_bytes(
             &keystroke.key,
             keystroke.key_char.as_deref(),
@@ -651,9 +735,26 @@ mod tests {
     use crate::terminal::view::paste_bytes;
 
     use super::{
-        HistoricalReplay, MouseReportKind, RemoteGridTracker, TerminalScrollAction,
-        mouse_report_bytes, scroll_action,
+        HistoricalReplay, MouseReportKind, RemoteGridTracker, ResizeSync, TerminalRefresh,
+        TerminalScrollAction, mouse_report_bytes, scroll_action, terminal_refresh,
     };
+
+    #[test]
+    fn terminal_refresh_reuses_the_existing_emulator_for_incremental_output() {
+        assert_eq!(
+            terminal_refresh(false, false, true),
+            TerminalRefresh::Incremental
+        );
+        assert_eq!(terminal_refresh(false, false, false), TerminalRefresh::Idle);
+        assert_eq!(
+            terminal_refresh(true, false, true),
+            TerminalRefresh::Snapshot
+        );
+        assert_eq!(
+            terminal_refresh(false, true, true),
+            TerminalRefresh::Snapshot
+        );
+    }
 
     #[test]
     fn terminal_generation_rejects_a_previous_session_cycle() {
@@ -685,6 +786,28 @@ mod tests {
 
         replay.start();
         assert!(!replay.can_consume_output());
+    }
+
+    #[test]
+    fn resize_sync_releases_only_the_latest_resize() {
+        let mut sync = ResizeSync::default();
+        let resize = sync.start();
+
+        assert!(sync.pending());
+        assert!(sync.complete(resize));
+        assert!(!sync.pending());
+    }
+
+    #[test]
+    fn stale_resize_completion_does_not_release_a_newer_resize() {
+        let mut sync = ResizeSync::default();
+        let stale_resize = sync.start();
+        let current_resize = sync.start();
+
+        assert!(!sync.complete(stale_resize));
+        assert!(sync.pending());
+        assert!(sync.complete(current_resize));
+        assert!(!sync.pending());
     }
 
     #[test]

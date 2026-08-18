@@ -91,6 +91,31 @@ pub fn reconcile_selection_with_pending(
     reconcile_selection(current, sessions)
 }
 
+pub fn selection_after_remove(
+    current: Option<&str>,
+    removed_session_id: &str,
+    sessions: &[WorkersSession],
+) -> Option<String> {
+    if current != Some(removed_session_id) {
+        return current.map(str::to_owned);
+    }
+    let removed_index = sessions
+        .iter()
+        .position(|session| session.id == removed_session_id)?;
+    let project_id = &sessions[removed_index].project_id;
+    sessions
+        .iter()
+        .skip(removed_index + 1)
+        .find(|session| session.project_id == *project_id && !session.archived)
+        .or_else(|| {
+            sessions[..removed_index]
+                .iter()
+                .rev()
+                .find(|session| session.project_id == *project_id && !session.archived)
+        })
+        .map(|session| session.id.clone())
+}
+
 pub fn sessions_for_project<'a>(
     sessions: &'a [WorkersSession],
     project_id: &str,
@@ -151,6 +176,7 @@ fn dispatch_or_queue_remove(
 struct PendingLaunchSelection {
     session_id: String,
     remaining_refreshes: u8,
+    visible_refreshes: u8,
 }
 
 fn replacement_selection(
@@ -201,6 +227,7 @@ pub struct WorkersModel {
     initialized_expansion: bool,
     refresh_generation: u64,
     refresh_task: Option<Task<()>>,
+    refresh_requested: bool,
     action_task: Option<Task<()>>,
     pending_remove: Option<PendingRemove>,
     launch_queue: VecDeque<WorkersLaunchRequest>,
@@ -271,6 +298,7 @@ impl WorkersModel {
             initialized_expansion: false,
             refresh_generation: 0,
             refresh_task: None,
+            refresh_requested: false,
             action_task: None,
             pending_remove: None,
             launch_queue: VecDeque::new(),
@@ -512,6 +540,7 @@ impl WorkersModel {
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.refresh_task.is_some() {
+            self.refresh_requested = true;
             return;
         }
         self.refresh_generation = self.refresh_generation.wrapping_add(1);
@@ -535,6 +564,9 @@ impl WorkersModel {
                         model.apply_snapshot(snapshot, app_focused);
                     }
                     Err(error) => model.error = Some(error.to_string()),
+                }
+                if std::mem::take(&mut model.refresh_requested) {
+                    model.refresh(cx);
                 }
                 cx.notify();
             })
@@ -575,6 +607,7 @@ impl WorkersModel {
                         model.pending_launch_selection = Some(PendingLaunchSelection {
                             session_id,
                             remaining_refreshes: 12,
+                            visible_refreshes: 0,
                         });
                         model.refresh(cx);
                     }
@@ -804,6 +837,19 @@ impl WorkersModel {
         self.run_unit_action(move |client| client.open_project_in_editor(&path), cx);
     }
 
+    pub fn open_project_with_application(
+        &mut self,
+        path: String,
+        bundle_ids: Vec<String>,
+        app_names: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_unit_action(
+            move |client| client.open_project_with_application(&path, bundle_ids, app_names),
+            cx,
+        );
+    }
+
     pub fn add_preset(&mut self, label: String, command: String, cx: &mut Context<Self>) {
         self.run_settings_action(move |client| client.add_preset(&label, &command), cx);
     }
@@ -918,6 +964,7 @@ impl WorkersModel {
                 model.pending_launch_selection = Some(PendingLaunchSelection {
                     session_id,
                     remaining_refreshes: 12,
+                    visible_refreshes: 0,
                 });
             },
             cx,
@@ -992,6 +1039,11 @@ impl WorkersModel {
             return;
         };
         let archived = std::mem::take(&mut self.confirming_remove_archived);
+        self.selected_session_id = selection_after_remove(
+            self.selected_session_id.as_deref(),
+            &session_id,
+            self.sessions(),
+        );
         let request = PendingRemove {
             session_id,
             archived,
@@ -1297,7 +1349,12 @@ impl WorkersModel {
                 Some(pending.session_id.as_str()),
                 &snapshot.sessions,
             );
-            if !visible && pending.remaining_refreshes > 0 {
+            if visible {
+                pending.visible_refreshes = pending.visible_refreshes.saturating_add(1);
+            } else {
+                pending.visible_refreshes = 0;
+            }
+            if pending.visible_refreshes < 3 && pending.remaining_refreshes > 0 {
                 pending.remaining_refreshes -= 1;
                 self.pending_launch_selection = Some(pending);
             }
@@ -1438,7 +1495,7 @@ mod tests {
     use super::{
         PendingRemove, PendingReplacement, WorkersSessionTarget, dispatch_or_queue_remove,
         reconcile_selection, reconcile_selection_with_pending, replacement_selection,
-        resolve_session_target, sessions_for_project, toggle_expanded,
+        resolve_session_target, selection_after_remove, sessions_for_project, toggle_expanded,
     };
 
     #[test]
@@ -1542,6 +1599,42 @@ mod tests {
         assert_eq!(
             reconcile_selection_with_pending(Some("new"), Some("new"), &visible).as_deref(),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn removing_the_selected_session_selects_the_nearest_sibling_in_the_same_project() {
+        let sessions = vec![
+            session("first", "project", true),
+            session("selected", "project", true),
+            session("next", "project", true),
+            session("foreign", "other", true),
+        ];
+
+        assert_eq!(
+            selection_after_remove(Some("selected"), "selected", &sessions).as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            selection_after_remove(Some("next"), "next", &sessions).as_deref(),
+            Some("selected")
+        );
+        assert_eq!(
+            selection_after_remove(Some("first"), "first", &sessions).as_deref(),
+            Some("selected")
+        );
+    }
+
+    #[test]
+    fn removing_an_unselected_session_keeps_the_current_selection() {
+        let sessions = vec![
+            session("selected", "project", true),
+            session("removed", "project", true),
+        ];
+
+        assert_eq!(
+            selection_after_remove(Some("selected"), "removed", &sessions).as_deref(),
+            Some("selected")
         );
     }
 

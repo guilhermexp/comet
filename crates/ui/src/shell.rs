@@ -57,6 +57,9 @@ use crate::transcript::{self, Transcript};
 use crate::workers::model::WorkersModel;
 use crate::workers::presentation::workers_titlebar;
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
+use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
+#[cfg(target_os = "macos")]
+use crate::workers::workspace_open_menu::native as native_workspace_open_menu;
 
 mod spaces;
 mod tabs;
@@ -2951,96 +2954,136 @@ impl Shell {
         if self.sidebar_mode == SidebarMode::Workers {
             let theme = Theme::of(cx).clone();
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            let model = self.workers_model.read(cx);
-            let project = model.selected_session().and_then(|session| {
-                model
-                    .projects()
-                    .iter()
-                    .find(|project| project.id == session.project_id)
-            });
-            let parent = project
-                .and_then(|project| project.parent_project_id.as_deref())
-                .and_then(|parent_id| {
+            let (workspace_path, titlebar) = {
+                let model = self.workers_model.read(cx);
+                let workspace_path = model
+                    .launcher_project()
+                    .or_else(|| model.selected_project())
+                    .or_else(|| model.projects().iter().find(|project| !project.is_group))
+                    .or_else(|| model.projects().first())
+                    .map(|project| project.path.clone());
+                let project = model.selected_session().and_then(|session| {
                     model
                         .projects()
                         .iter()
-                        .find(|project| project.id == parent_id)
+                        .find(|project| project.id == session.project_id)
                 });
-            let titlebar = workers_titlebar(project, parent);
+                let parent = project
+                    .and_then(|project| project.parent_project_id.as_deref())
+                    .and_then(|parent_id| {
+                        model
+                            .projects()
+                            .iter()
+                            .find(|project| project.id == parent_id)
+                    });
+                (workspace_path, workers_titlebar(project, parent))
+            };
             let branch = titlebar.branch.clone();
             let branch_icon = if titlebar.branch_is_worktree {
                 icons::WORKER_BRANCH
             } else {
                 icons::WORKER_GIT_BRANCH
             };
-            let bar = div()
-                .h(px(Theme::TITLEBAR_HEIGHT))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .pl(px(sidebar_now))
-                .pt(px(Theme::TITLEBAR_TOP_PAD))
-                .text_color(theme.text_muted)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.0))
-                        .children(titlebar.segments.into_iter().enumerate().flat_map(
-                            |(index, segment)| {
-                                let separator = (index > 0).then(|| {
+            let title =
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .children(titlebar.segments.into_iter().enumerate().flat_map(
+                        |(index, segment)| {
+                            let separator = (index > 0).then(|| {
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_muted.opacity(0.55))
+                                    .child("/")
+                            });
+                            [
+                                separator.map(IntoElement::into_any_element),
+                                Some(
                                     div()
                                         .text_size(px(13.0))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(theme.text_muted.opacity(0.55))
-                                        .child("/")
-                                });
-                                [
-                                    separator.map(IntoElement::into_any_element),
-                                    Some(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .font_weight(if index == 0 {
-                                                gpui::FontWeight::SEMIBOLD
-                                            } else {
-                                                gpui::FontWeight::MEDIUM
-                                            })
-                                            .text_color(theme.text_muted)
-                                            .child(segment)
-                                            .into_any_element(),
-                                    ),
-                                ]
-                                .into_iter()
-                                .flatten()
-                            },
-                        ))
-                        .when_some(branch, |el, branch| {
-                            el.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(3.0))
-                                    .ml(px(2.0))
-                                    .text_color(theme.text_muted.opacity(0.55))
-                                    .child(
-                                        icon(branch_icon)
-                                            .size(px(12.0))
-                                            .flex_none()
-                                            .text_color(theme.text_muted.opacity(0.55)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .child(branch),
-                                    ),
-                            )
-                        }),
+                                        .font_weight(if index == 0 {
+                                            gpui::FontWeight::SEMIBOLD
+                                        } else {
+                                            gpui::FontWeight::MEDIUM
+                                        })
+                                        .text_color(theme.text_muted)
+                                        .child(segment)
+                                        .into_any_element(),
+                                ),
+                            ]
+                            .into_iter()
+                            .flatten()
+                        },
+                    ))
+                    .when_some(branch, |el, branch| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(3.0))
+                                .ml(px(2.0))
+                                .text_color(theme.text_muted.opacity(0.55))
+                                .child(
+                                    icon(branch_icon)
+                                        .size(px(12.0))
+                                        .flex_none()
+                                        .text_color(theme.text_muted.opacity(0.55)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .child(branch),
+                                ),
+                        )
+                    });
+            let drag_bar = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .w_full()
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .text_color(theme.text_muted)
+                // Center the workspace title inside the content pane itself.
+                // Padding a full-width titlebar enlarged its layout box and
+                // pushed the right-side workspace control past the viewport.
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(sidebar_now))
+                        .right_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .pt(px(Theme::TITLEBAR_TOP_PAD))
+                        .child(title),
                 );
-            return self
-                .titlebar_drag_region("workers-header-titlebar", bar, cx)
-                .into_any_element();
+            let drag_bar =
+                self.titlebar_drag_region("workers-header-titlebar-drag-region", drag_bar, cx);
+            let workspace_action = workspace_path.map(|path| {
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(10.0))
+                    .occlude()
+                    .child(self.render_workers_workspace_open_button(path, &theme, cx))
+            });
+            let bar = div()
+                .relative()
+                .w_full()
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex_none()
+                .child(drag_bar)
+                // Paint interactive chrome after the drag surface so its
+                // hitbox and pixels win inside the native titlebar.
+                .children(workspace_action);
+            return bar.into_any_element();
         }
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
@@ -3060,6 +3103,107 @@ impl Shell {
                     .into_any_element()
             }
         }
+    }
+
+    fn open_workers_workspace_menu(&mut self, path: String, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let selection = native_workspace_open_menu::show_async();
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(target)) = selection.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    this.workers_model.update(cx, |model, cx| {
+                        if target == WorkspaceOpenTarget::Finder {
+                            model.reveal_project(path, cx);
+                        } else {
+                            model.open_project_with_application(
+                                path,
+                                target
+                                    .bundle_ids()
+                                    .iter()
+                                    .map(|id| (*id).to_owned())
+                                    .collect(),
+                                target
+                                    .app_names()
+                                    .iter()
+                                    .map(|name| (*name).to_owned())
+                                    .collect(),
+                                cx,
+                            );
+                        }
+                    });
+                })
+                .ok();
+            })
+            .detach();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (path, cx);
+        }
+    }
+
+    fn render_workers_workspace_open_button(
+        &mut self,
+        path: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let preferred_path = path.clone();
+        div()
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.text.opacity(0.08))
+            .bg(theme.surface_raised.opacity(0.92))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("workers-open-workspace-preferred")
+                    .w(px(32.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workers_model.update(cx, |model, cx| {
+                            model.open_project_in_editor(preferred_path.clone(), cx)
+                        });
+                    }))
+                    .child(
+                        icon(icons::WORKER_OPEN_CODE)
+                            .size(px(18.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.text.opacity(0.10)))
+            .child(
+                div()
+                    .id("workers-open-workspace-menu")
+                    .w(px(25.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_workers_workspace_menu(path.clone(), cx)
+                    }))
+                    .child(
+                        icon(icons::ALT_ARROW_DOWN)
+                            .size(px(9.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar

@@ -2732,6 +2732,17 @@ fn workers_content_outlet() -> gpui::Div {
     div().flex_1().min_w_0().min_h_0().overflow_hidden()
 }
 
+fn workers_viewport_layer() -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(Theme::TITLEBAR_HEIGHT))
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .flex()
+        .flex_col()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkersWorkspacePane {
     Session,
@@ -2938,12 +2949,7 @@ impl Render for WorkersContent {
         let project_dialog = self.render_project_dialog(window.viewport_size(), cx);
         let session_menu = self.render_session_menu(&theme, cx);
         let project_menu = self.render_project_menu(&theme, cx);
-
-        div()
-            .size_full()
-            .pt(px(Theme::TITLEBAR_HEIGHT))
-            .flex()
-            .flex_col()
+        let viewport = workers_viewport_layer()
             .when(
                 has_snapshot && error.is_some() && archive_project_id.is_none(),
                 |el| {
@@ -2963,7 +2969,12 @@ impl Render for WorkersContent {
                     )
                 },
             )
-            .child(workers_content_outlet().child(content))
+            .child(workers_content_outlet().child(content));
+
+        div()
+            .relative()
+            .size_full()
+            .child(viewport)
             .when_some(session_menu, |el, menu| el.child(menu))
             .when_some(project_menu, |el, menu| el.child(menu))
             .when_some(rename_dialog, |el, dialog| el.child(dialog))
@@ -2977,7 +2988,19 @@ impl Render for WorkersContent {
 mod layout_tests {
     use gpui::Styled as _;
 
-    use super::{project_folder_tint, workers_content_outlet, worktree_branch_slug};
+    use super::{
+        project_folder_tint, workers_content_outlet, workers_viewport_layer, worktree_branch_slug,
+    };
+
+    #[test]
+    fn workers_viewport_is_bounded_below_the_native_titlebar() {
+        let mut viewport = workers_viewport_layer();
+        let style = viewport.style();
+
+        assert_eq!(style.position, Some(gpui::Position::Absolute));
+        assert!(style.inset.top.is_some());
+        assert!(style.inset.bottom.is_some());
+    }
 
     #[test]
     fn workers_content_outlet_uses_only_the_remaining_vertical_space() {

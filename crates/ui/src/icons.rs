@@ -170,6 +170,7 @@ icon_assets![
     (WORKER_PLUS, "workers/chrome-plus"),
     (WORKER_COLLAPSE_ALL, "workers/chrome-collapse-all"),
     (WORKER_DRAG_HANDLE, "workers/chrome-drag-handle"),
+    (WORKER_OPEN_CODE, "workers/chrome-open-code"),
     (WORKER_UNPEEL_LOGO, "workers/unpeel-logo"),
 ];
 

@@ -111,6 +111,7 @@ impl ActivityBridge {
                 ActivityInput {
                     session_id: &session.id,
                     command: &manifest.session.command,
+                    active_runtime_id: session.active_runtime_id.as_deref(),
                     menu_prompt_active: manifest.menu_prompt_active,
                     runtime_launch_generation: manifest.runtime_launch_generation,
                     runtime_launched_at: manifest.runtime_launched_at,
@@ -123,8 +124,10 @@ impl ActivityBridge {
                 },
                 now,
             );
-            session.activity =
-                merge_derived_activity(&session.activity, session.unread, derived).to_owned();
+            if let Some(derived) = derived {
+                session.activity =
+                    merge_derived_activity(&session.activity, session.unread, derived).to_owned();
+            }
         }
     }
 
@@ -159,6 +162,7 @@ pub(crate) fn shared_activity_bridge() -> Arc<ActivityBridge> {
 struct ActivityInput<'a> {
     session_id: &'a str,
     command: &'a str,
+    active_runtime_id: Option<&'a str>,
     menu_prompt_active: bool,
     runtime_launch_generation: u64,
     runtime_launched_at: Option<u64>,
@@ -170,12 +174,23 @@ fn derive_activity(
     engine: &mut ActivityEngine,
     input: ActivityInput<'_>,
     now: SystemTime,
-) -> &'static str {
+) -> Option<&'static str> {
+    let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
     let command_head = unpeel_core::integrations::command_head(input.command);
-    let lifecycle = unpeel_core::runtime_catalog::builtin_runtime_catalog()
-        .by_command_alias_for_current_platform(command_head)
+    let lifecycle = input
+        .active_runtime_id
+        .and_then(|runtime_id| {
+            catalog
+                .by_id(runtime_id)
+                .or_else(|| catalog.by_slug(runtime_id))
+                .or_else(|| catalog.by_legacy_slug(runtime_id))
+        })
+        .or_else(|| catalog.by_command_alias_for_current_platform(command_head))
         .map(|runtime| &runtime.lifecycle);
     let uses_lifecycle_hooks = lifecycle.is_some_and(|policy| policy.uses_hook_port());
+    if !uses_lifecycle_hooks {
+        return input.menu_prompt_active.then_some("blocked");
+    }
     let anchor_start_to_output = lifecycle
         .map(|policy| policy.anchor_start_event_to_output)
         .unwrap_or(true);
@@ -191,36 +206,32 @@ fn derive_activity(
         input.runtime_launch_generation,
         input.runtime_launched_at,
     );
-    let state = if uses_lifecycle_hooks {
-        engine.seed_from_disk(
-            input.session_id,
-            input.session_dir,
-            anchor_start_to_output,
-            input.runtime_launched_at,
-            input.runtime_launch_generation,
-        );
-        engine.note_output_and_sweep(
-            input.session_id,
-            input.activity_signal,
-            attention_clears_on_output,
-            distrust_stops,
-            now,
-        );
-        engine
-            .hook_owned_state(input.session_id)
-            .unwrap_or(HookState::Idle)
-    } else {
-        engine.heuristic_state(input.session_id, input.activity_signal, now)
-    };
+    engine.seed_from_disk(
+        input.session_id,
+        input.session_dir,
+        anchor_start_to_output,
+        input.runtime_launched_at,
+        input.runtime_launch_generation,
+    );
+    engine.note_output_and_sweep(
+        input.session_id,
+        input.activity_signal,
+        attention_clears_on_output,
+        distrust_stops,
+        now,
+    );
+    let state = engine
+        .hook_owned_state(input.session_id)
+        .unwrap_or(HookState::Idle);
 
     if input.menu_prompt_active && matches!(state, HookState::Busy | HookState::Idle) {
-        return "blocked";
+        return Some("blocked");
     }
-    match state {
+    Some(match state {
         HookState::Busy => "working",
         HookState::Attention => "blocked",
         HookState::Idle => "idle",
-    }
+    })
 }
 
 fn merge_derived_activity<'a>(wire_activity: &'a str, unread: bool, derived: &'a str) -> &'a str {
@@ -453,12 +464,31 @@ mod tests {
         ActivityInput {
             session_id: id,
             command,
+            active_runtime_id: None,
             menu_prompt_active: false,
             runtime_launch_generation: 1,
             runtime_launched_at: None,
             activity_signal: signal,
             session_dir: dir,
         }
+    }
+
+    #[test]
+    fn active_runtime_identity_uses_hooks_even_when_command_is_wrapped() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("last-hook-event.json"),
+            r#"{"hook_event_name":"SessionStart"}"#,
+        )
+        .unwrap();
+        let mut engine = ActivityEngine::default();
+        let mut activity = input("s1", "custom-wrapper", directory.path(), 1);
+        activity.active_runtime_id = Some("claude");
+
+        assert_eq!(
+            derive_activity(&mut engine, activity, SystemTime::now()),
+            Some("idle")
+        );
     }
 
     #[test]
@@ -473,12 +503,12 @@ mod tests {
         let now = SystemTime::now();
         assert_eq!(
             derive_activity(&mut engine, input("s1", "claude", directory.path(), 1), now),
-            "working"
+            Some("working")
         );
         engine.apply_hook_event("s1", "Stop", None, now);
         assert_eq!(
             derive_activity(&mut engine, input("s1", "claude", directory.path(), 1), now),
-            "idle"
+            Some("idle")
         );
     }
 
@@ -490,7 +520,7 @@ mod tests {
 
         assert_eq!(
             derive_activity(&mut engine, input("s1", "claude", directory.path(), 1), now,),
-            "idle"
+            Some("idle")
         );
         assert_eq!(
             derive_activity(
@@ -498,7 +528,7 @@ mod tests {
                 input("s1", "claude", directory.path(), 2),
                 now + Duration::from_secs(1),
             ),
-            "idle"
+            Some("idle")
         );
     }
 
@@ -518,22 +548,22 @@ mod tests {
                 input("s1", "codex", directory.path(), 1),
                 SystemTime::now(),
             ),
-            "idle"
+            Some("idle")
         );
     }
 
     #[test]
-    fn hookless_runtime_uses_output_change_fallback() {
+    fn hookless_runtime_preserves_the_authoritative_wire_activity() {
         let directory = tempfile::tempdir().unwrap();
         let mut engine = ActivityEngine::default();
         let now = SystemTime::now();
         assert_eq!(
             derive_activity(&mut engine, input("s1", "pi", directory.path(), 1), now),
-            "idle"
+            None
         );
         assert_eq!(
             derive_activity(&mut engine, input("s1", "pi", directory.path(), 2), now),
-            "working"
+            None
         );
     }
 
@@ -550,7 +580,7 @@ mod tests {
                     input("session", command, directory.path(), 1),
                     now,
                 ),
-                "idle",
+                Some("idle"),
             );
             engine.apply_hook_event("session", "Start", None, now);
             assert_eq!(
@@ -559,7 +589,7 @@ mod tests {
                     input("session", command, directory.path(), 2),
                     now,
                 ),
-                "working",
+                Some("working"),
                 "{command} must use its agent_start hook instead of the output fallback",
             );
 
@@ -570,7 +600,7 @@ mod tests {
                     input("session", command, directory.path(), 3),
                     now,
                 ),
-                "idle",
+                Some("idle"),
                 "{command} must stop immediately even when output changed at agent_end",
             );
         }
@@ -583,7 +613,7 @@ mod tests {
         let now = SystemTime::now();
         let mut activity = input("s1", "pi", directory.path(), 1);
         activity.menu_prompt_active = true;
-        assert_eq!(derive_activity(&mut engine, activity, now), "blocked");
+        assert_eq!(derive_activity(&mut engine, activity, now), Some("blocked"));
     }
 
     #[test]
