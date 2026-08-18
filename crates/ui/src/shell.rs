@@ -7097,6 +7097,20 @@ impl Shell {
                     .into_any_element(),
                 RightSurface::Picker => gpui::Empty.into_any_element(),
             };
+            // A live subagent tab swaps its icon for the mini working
+            // spinner (the history fetch button's in-flight recipe) — the
+            // doc's streaming tail entry IS the run's liveness, so the swap
+            // settles by itself when the subagent finishes.
+            let subagent_running = match surface {
+                RightSurface::Subagent(id) => self.subagent_tabs.get(&id).is_some_and(|tab| {
+                    self.state
+                        .read(cx)
+                        .sub_transcript(&tab.doc_id)
+                        .last()
+                        .is_some_and(|e| e.status == Some(zeron_doc::MessageStatus::Streaming))
+                }),
+                _ => false,
+            };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
             // (same slot, no width jump) — the ✕ only shows while the tab is
             // hovered (user request).
@@ -7176,7 +7190,17 @@ impl Shell {
                                     .items_center()
                                     .justify_center()
                                     .group_hover(group.clone(), |s| s.opacity(0.0))
-                                    .child(surface_icon),
+                                    .child(if subagent_running {
+                                        loaders::mini_gradient_spinner(
+                                            format!("subagent-tab-{ix}"),
+                                            2.0,
+                                            cx.entity_id(),
+                                            cx,
+                                        )
+                                        .into_any_element()
+                                    } else {
+                                        surface_icon
+                                    }),
                             )
                             .child(
                                 div()
