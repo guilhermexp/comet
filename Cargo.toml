@@ -17,7 +17,7 @@ members = [
 exclude = ["third_party/unpeel"]
 
 [workspace.package]
-version = "0.2.11"
+version = "0.2.12"
 edition = "2024"
 license = "MIT"
 publish = false
