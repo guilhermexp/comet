@@ -335,7 +335,14 @@ pub fn keystroke_bytes(
         })
     };
     match key {
-        "enter" => Some(b"\r".to_vec()),
+        // Preserve Shift+Enter as a modified key instead of collapsing it to
+        // plain Return. OMP accepts this legacy sequence as "insert newline",
+        // while plain Enter remains CR and submits the prompt.
+        "enter" => Some(if mods.shift {
+            b"\x1b[13;2~".to_vec()
+        } else {
+            b"\r".to_vec()
+        }),
         "backspace" => Some(vec![0x7f]),
         "tab" => Some(if mods.shift {
             b"\x1b[Z".to_vec()
@@ -879,6 +886,18 @@ mod tests {
         assert_eq!(
             keystroke_bytes("enter", None, &mods(), false),
             Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            keystroke_bytes(
+                "enter",
+                None,
+                &Modifiers {
+                    shift: true,
+                    ..mods()
+                },
+                false
+            ),
+            Some(b"\x1b[13;2~".to_vec())
         );
         assert_eq!(
             keystroke_bytes("backspace", None, &mods(), false),

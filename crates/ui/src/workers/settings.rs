@@ -151,6 +151,8 @@ impl WorkersSettingsView {
             .map(|settings| settings.runtimes.clone())
             .unwrap_or_default();
         let rows = presets.into_iter().enumerate().map(|(index, preset)| {
+            let provider_icon =
+                runtime_icon_path(preset.cli_id.as_deref(), Some(preset.command.as_str()));
             let edit_id = preset.id.clone();
             let edit_command = preset.command.clone();
             let favorite_id = preset.id.clone();
@@ -172,7 +174,7 @@ impl WorkersSettingsView {
                 .bg(crate::theme::ink(0.025))
                 .when(!enabled, |el| el.opacity(0.62))
                 .child(
-                    icon(icons::TERMINAL)
+                    icon(provider_icon)
                         .size(px(15.0))
                         .text_color(theme.text_muted),
                 )

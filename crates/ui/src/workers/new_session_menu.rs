@@ -184,6 +184,8 @@ pub mod native {
     }
 
     fn icon_bytes(path: &str) -> Option<&'static [u8]> {
+        let path = path.strip_prefix("icons/").unwrap_or(path);
+        let path = path.strip_suffix(".svg").unwrap_or(path);
         match path {
             "terminal" => Some(include_bytes!("../../assets/icons/terminal.svg")),
             "workers/chrome-branch" => Some(include_bytes!(
@@ -208,9 +210,18 @@ pub mod native {
             "workers/kiro" => Some(include_bytes!("../../assets/icons/workers/kiro.svg")),
             "workers/muse-code" => Some(include_bytes!("../../assets/icons/workers/muse-code.svg")),
             "workers/opencode" => Some(include_bytes!("../../assets/icons/workers/opencode.svg")),
+            "workers/omp" => Some(include_bytes!("../../assets/icons/workers/omp.svg")),
             "workers/pi" => Some(include_bytes!("../../assets/icons/workers/pi.svg")),
+            "workers/prime-agent" => {
+                Some(include_bytes!("../../assets/icons/workers/prime-agent.svg"))
+            }
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_icon_bytes(path: &str) -> bool {
+        icon_bytes(path).is_some()
     }
 
     unsafe fn add_submenu(
@@ -388,5 +399,42 @@ mod tests {
                 Item::ManagePresets,
             ]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_menu_embeds_the_dedicated_omp_and_prime_agent_icons() {
+        assert!(super::native::has_icon_bytes(crate::icons::WORKER_OMP));
+        assert!(super::native::has_icon_bytes(
+            crate::icons::WORKER_PRIME_AGENT
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_menu_embeds_every_builtin_provider_icon() {
+        for runtime_id in [
+            "com.sourcegraph.amp",
+            "com.anthropic.claude-code",
+            "bot.cline.cli",
+            "com.openai.codex",
+            "com.cursor.agent",
+            "com.google.gemini-cli",
+            "com.github.copilot-cli",
+            "ai.x.grok-cli",
+            "com.moonshot.kimi-code",
+            "dev.kiro.cli",
+            "ai.meta.muse-code",
+            "ai.opencode.cli",
+            "dev.mariozechner.pi",
+            "sh.omp.cli",
+            "ai.primeintellect.prime-agent",
+        ] {
+            let path = crate::workers::presentation::runtime_icon_path(Some(runtime_id), None);
+            assert!(
+                super::native::has_icon_bytes(path),
+                "missing native bytes for {runtime_id}: {path}"
+            );
+        }
     }
 }

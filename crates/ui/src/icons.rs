@@ -153,7 +153,9 @@ icon_assets![
     (WORKER_KIRO, "workers/kiro"),
     (WORKER_MUSE, "workers/muse-code"),
     (WORKER_OPENCODE, "workers/opencode"),
+    (WORKER_OMP, "workers/omp"),
     (WORKER_PI, "workers/pi"),
+    (WORKER_PRIME_AGENT, "workers/prime-agent"),
     // Unpeel's authored provider catalog has one deliberate fallback:
     // GitHub Copilot uses the shared generic-agent SVG.
     (WORKER_GENERIC_AGENT, "workers/generic-agent"),

@@ -93,9 +93,9 @@ pub fn runtime_icon_path(runtime_id: Option<&str>, command: Option<&str>) -> &'s
         "kiro" | "kiro-cli" | "dev.kiro.cli" => crate::icons::WORKER_KIRO,
         "muse" | "muse-code" | "ai.meta.muse-code" => crate::icons::WORKER_MUSE,
         "opencode" | "ai.opencode.cli" => crate::icons::WORKER_OPENCODE,
-        "omp" | "sh.omp.cli" => crate::icons::WORKER_GENERIC_AGENT,
+        "omp" | "sh.omp.cli" => crate::icons::WORKER_OMP,
         "pi" | "dev.mariozechner.pi" => crate::icons::WORKER_PI,
-        "prime-agent" | "ai.primeintellect.prime-agent" => crate::icons::WORKER_GENERIC_AGENT,
+        "prime-agent" | "ai.primeintellect.prime-agent" => crate::icons::WORKER_PRIME_AGENT,
         _ => crate::icons::TERMINAL,
     }
 }
@@ -223,10 +223,10 @@ mod tests {
             ("ai.meta.muse-code", crate::icons::WORKER_MUSE),
             ("ai.opencode.cli", crate::icons::WORKER_OPENCODE),
             ("dev.mariozechner.pi", crate::icons::WORKER_PI),
-            ("sh.omp.cli", crate::icons::WORKER_GENERIC_AGENT),
+            ("sh.omp.cli", crate::icons::WORKER_OMP),
             (
                 "ai.primeintellect.prime-agent",
-                crate::icons::WORKER_GENERIC_AGENT,
+                crate::icons::WORKER_PRIME_AGENT,
             ),
         ];
         for (runtime_id, expected) in cases {
