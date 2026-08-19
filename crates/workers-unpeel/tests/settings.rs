@@ -4,7 +4,8 @@ use std::sync::Mutex;
 
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
-    LocalWorkersClient, PresetPatch, WorkersNotificationSettings, WorkersTranscriptSettings,
+    LocalWorkersClient, PresetPatch, WorkersNotificationSettings, WorkersResourceSettings,
+    WorkersTranscriptSettings,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -63,6 +64,7 @@ fn settings_use_upstream_defaults_and_catalog() -> Result<(), Box<dyn std::error
 
     let settings = LocalWorkersClient::new().settings()?;
     assert_eq!(settings.transcripts, WorkersTranscriptSettings::default());
+    assert_eq!(settings.resources, WorkersResourceSettings::default());
     assert_eq!(
         settings.notifications,
         WorkersNotificationSettings::default()
@@ -75,6 +77,63 @@ fn settings_use_upstream_defaults_and_catalog() -> Result<(), Box<dyn std::error
             .iter()
             .any(|runtime| runtime.cli_id == "claude")
     );
+    Ok(())
+}
+
+#[test]
+fn resource_settings_default_to_invisible_monitoring_and_disabled_hibernation() {
+    let settings = WorkersResourceSettings::default();
+
+    assert!(settings.monitoring_enabled);
+    assert_eq!(settings.per_worker_warning_gib, 4);
+    assert_eq!(settings.per_worker_critical_gib, 8);
+    assert!(settings.notifications_enabled);
+    assert!(!settings.hibernation_enabled);
+    assert_eq!(settings.hibernate_after_idle_minutes, 15);
+    assert_eq!(settings.max_live_idle_workers, 12);
+}
+
+#[test]
+fn resource_settings_persist_and_preserve_unknown_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = fixture()?;
+    let client = LocalWorkersClient::new();
+    let resources = WorkersResourceSettings {
+        monitoring_enabled: false,
+        per_worker_warning_gib: 6,
+        per_worker_critical_gib: 10,
+        notifications_enabled: false,
+        hibernation_enabled: true,
+        hibernate_after_idle_minutes: 30,
+        max_live_idle_workers: 8,
+    };
+
+    client.set_resource_settings(resources.clone())?;
+
+    assert_eq!(client.settings()?.resources, resources);
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
+    assert_eq!(raw["future_owner_key"]["must"], "survive");
+    Ok(())
+}
+
+#[test]
+fn resource_settings_reject_invalid_threshold_order() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (_home, _guard) = fixture()?;
+    let client = LocalWorkersClient::new();
+    let invalid = WorkersResourceSettings {
+        per_worker_warning_gib: 8,
+        per_worker_critical_gib: 4,
+        ..WorkersResourceSettings::default()
+    };
+
+    let error = client
+        .set_resource_settings(invalid)
+        .expect_err("critical threshold below warning must be rejected");
+
+    assert!(error.to_string().contains("critical"));
     Ok(())
 }
 

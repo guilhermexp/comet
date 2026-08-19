@@ -463,6 +463,74 @@ pub struct WorkersAppearanceSettings {
     pub show_session_gallery: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkersResourceSettings {
+    #[serde(default = "default_true")]
+    pub monitoring_enabled: bool,
+    #[serde(default = "default_resource_warning_gib")]
+    pub per_worker_warning_gib: u16,
+    #[serde(default = "default_resource_critical_gib")]
+    pub per_worker_critical_gib: u16,
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
+    #[serde(default)]
+    pub hibernation_enabled: bool,
+    #[serde(default = "default_hibernate_idle_minutes")]
+    pub hibernate_after_idle_minutes: u16,
+    #[serde(default = "default_max_live_idle_workers")]
+    pub max_live_idle_workers: u16,
+}
+
+const fn default_resource_warning_gib() -> u16 {
+    4
+}
+
+const fn default_resource_critical_gib() -> u16 {
+    8
+}
+
+const fn default_hibernate_idle_minutes() -> u16 {
+    15
+}
+
+const fn default_max_live_idle_workers() -> u16 {
+    12
+}
+
+impl Default for WorkersResourceSettings {
+    fn default() -> Self {
+        Self {
+            monitoring_enabled: true,
+            per_worker_warning_gib: default_resource_warning_gib(),
+            per_worker_critical_gib: default_resource_critical_gib(),
+            notifications_enabled: true,
+            hibernation_enabled: false,
+            hibernate_after_idle_minutes: default_hibernate_idle_minutes(),
+            max_live_idle_workers: default_max_live_idle_workers(),
+        }
+    }
+}
+
+impl WorkersResourceSettings {
+    fn validated(mut self) -> Result<Self, WorkersError> {
+        if self.per_worker_warning_gib == 0 {
+            return Err(WorkersError::State(
+                "resource warning threshold must be at least 1 GiB".into(),
+            ));
+        }
+        if self.per_worker_critical_gib < self.per_worker_warning_gib {
+            return Err(WorkersError::State(
+                "resource critical threshold must be at least the warning threshold".into(),
+            ));
+        }
+        self.per_worker_warning_gib = self.per_worker_warning_gib.min(1_024);
+        self.per_worker_critical_gib = self.per_worker_critical_gib.clamp(1, 1_024);
+        self.hibernate_after_idle_minutes = self.hibernate_after_idle_minutes.clamp(1, 10_080);
+        self.max_live_idle_workers = self.max_live_idle_workers.clamp(1, 256);
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersArtifact {
     pub kind: String,
@@ -503,6 +571,7 @@ pub struct WorkersSettingsSnapshot {
     pub transcripts: WorkersTranscriptSettings,
     pub notifications: WorkersNotificationSettings,
     pub appearance: WorkersAppearanceSettings,
+    pub resources: WorkersResourceSettings,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -991,6 +1060,14 @@ impl LocalWorkersClient {
             .map(serde_json::from_value::<WorkersAppearanceSettings>)
             .transpose()?
             .unwrap_or_default();
+        let resources = raw
+            .get("comet_workers_resources")
+            .cloned()
+            .map(serde_json::from_value::<WorkersResourceSettings>)
+            .transpose()?
+            .unwrap_or_default()
+            .validated()
+            .unwrap_or_default();
         let runtimes = runtime_catalog_snapshot();
         let presets = preset_settings(presets, &runtimes);
         Ok(WorkersSettingsSnapshot {
@@ -999,6 +1076,7 @@ impl LocalWorkersClient {
             transcripts,
             notifications,
             appearance,
+            resources,
         })
     }
 
@@ -1201,6 +1279,21 @@ impl LocalWorkersClient {
         unpeel_core::app_state::edit(|state| {
             state.insert(
                 "comet_workers_appearance".into(),
+                serde_json::to_value(settings).map_err(|error| error.to_string())?,
+            );
+            Ok(())
+        })
+        .map_err(WorkersError::State)
+    }
+
+    pub fn set_resource_settings(
+        &self,
+        settings: WorkersResourceSettings,
+    ) -> Result<(), WorkersError> {
+        let settings = settings.validated()?;
+        unpeel_core::app_state::edit(|state| {
+            state.insert(
+                "comet_workers_resources".into(),
                 serde_json::to_value(settings).map_err(|error| error.to_string())?,
             );
             Ok(())
