@@ -446,6 +446,10 @@ impl WorkersTerminal {
         self.flush_task = Some(Self::schedule_flush(cx));
     }
 
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.queue_input(text.as_bytes(), cx);
+    }
+
     fn schedule_flush(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             cx.background_executor()

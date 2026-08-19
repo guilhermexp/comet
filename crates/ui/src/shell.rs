@@ -54,7 +54,7 @@ use crate::state::{
 use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, ToggleTerminal};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
-use crate::workers::model::WorkersModel;
+use crate::workers::model::{WorkersModel, WorkersRoute};
 use crate::workers::presentation::workers_titlebar;
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
 use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
@@ -2954,7 +2954,13 @@ impl Shell {
         if self.sidebar_mode == SidebarMode::Workers {
             let theme = Theme::of(cx).clone();
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            let (workspace_path, titlebar) = {
+            let (
+                workspace_path,
+                gallery_session_id,
+                gallery_pulsing,
+                show_session_gallery,
+                titlebar,
+            ) = {
                 let model = self.workers_model.read(cx);
                 let workspace_path = model
                     .launcher_project()
@@ -2976,7 +2982,23 @@ impl Shell {
                             .iter()
                             .find(|project| project.id == parent_id)
                     });
-                (workspace_path, workers_titlebar(project, parent))
+                let gallery_session_id = model
+                    .selected_session()
+                    .filter(|session| {
+                        session.provider_id.is_some() || session.active_runtime_id.is_some()
+                    })
+                    .map(|session| session.id.clone());
+                let gallery_pulsing = gallery_session_id.as_ref().is_some_and(|session_id| {
+                    model.gallery_pulse_session_id.as_ref() == Some(session_id)
+                });
+                (
+                    workspace_path,
+                    gallery_session_id,
+                    gallery_pulsing,
+                    model.appearance_settings().show_session_gallery
+                        && matches!(model.route, WorkersRoute::Workspace),
+                    workers_titlebar(project, parent),
+                )
             };
             let branch = titlebar.branch.clone();
             let branch_icon = if titlebar.branch_is_worktree {
@@ -3074,6 +3096,26 @@ impl Shell {
                     .occlude()
                     .child(self.render_workers_workspace_open_button(path, &theme, cx))
             });
+            let gallery_action =
+                gallery_session_id
+                    .filter(|_| show_session_gallery)
+                    .map(|session_id| {
+                        div()
+                            .absolute()
+                            .top(px(6.0))
+                            .right(px(if workspace_action.is_some() {
+                                77.0
+                            } else {
+                                10.0
+                            }))
+                            .occlude()
+                            .child(self.render_workers_session_gallery_button(
+                                session_id,
+                                gallery_pulsing,
+                                &theme,
+                                cx,
+                            ))
+                    });
             let bar = div()
                 .relative()
                 .w_full()
@@ -3082,6 +3124,7 @@ impl Shell {
                 .child(drag_bar)
                 // Paint interactive chrome after the drag surface so its
                 // hitbox and pixels win inside the native titlebar.
+                .children(gallery_action)
                 .children(workspace_action);
             return bar.into_any_element();
         }
@@ -3196,6 +3239,74 @@ impl Shell {
                     .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_workers_workspace_menu(path.clone(), cx)
+                    }))
+                    .child(
+                        icon(icons::ALT_ARROW_DOWN)
+                            .size(px(9.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_workers_session_gallery_button(
+        &mut self,
+        session_id: String,
+        pulsing: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let gallery_session_id = session_id.clone();
+        div()
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.text.opacity(0.08))
+            .bg(theme.surface_raised.opacity(0.92))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("workers-session-gallery-toggle")
+                    .w(px(32.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
+                    .when(pulsing, |el| el.bg(theme.text.opacity(0.10)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workers_content.update(cx, |content, cx| {
+                            content.toggle_session_gallery(gallery_session_id.clone(), cx)
+                        });
+                    }))
+                    .child(
+                        icon(icons::WORKER_GALLERY)
+                            .size(px(if pulsing { 19.0 } else { 17.0 }))
+                            .text_color(if pulsing {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
+                    ),
+            )
+            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.text.opacity(0.10)))
+            .child(
+                div()
+                    .id("workers-session-capture-menu")
+                    .w(px(25.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workers_content.update(cx, |content, cx| {
+                            content.open_capture_menu(session_id.clone(), cx)
+                        });
                     }))
                     .child(
                         icon(icons::ALT_ARROW_DOWN)

@@ -2,7 +2,7 @@
 
 mod activity_bridge;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -456,6 +456,34 @@ pub struct WorkersNotificationSettings {
     pub background_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkersAppearanceSettings {
+    #[serde(default)]
+    pub show_session_gallery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersArtifact {
+    pub kind: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub modified_at_unix_ms: u64,
+    pub is_image: bool,
+}
+
+pub fn is_image_artifact_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp"
+            )
+        })
+}
+
 impl Default for WorkersNotificationSettings {
     fn default() -> Self {
         Self {
@@ -473,6 +501,7 @@ pub struct WorkersSettingsSnapshot {
     pub runtimes: Vec<WorkersRuntime>,
     pub transcripts: WorkersTranscriptSettings,
     pub notifications: WorkersNotificationSettings,
+    pub appearance: WorkersAppearanceSettings,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -935,6 +964,12 @@ impl LocalWorkersClient {
             .map(serde_json::from_value::<WorkersNotificationSettings>)
             .transpose()?
             .unwrap_or_default();
+        let appearance = raw
+            .get("comet_workers_appearance")
+            .cloned()
+            .map(serde_json::from_value::<WorkersAppearanceSettings>)
+            .transpose()?
+            .unwrap_or_default();
         let runtimes = runtime_catalog_snapshot();
         let presets = preset_settings(presets, &runtimes);
         Ok(WorkersSettingsSnapshot {
@@ -942,7 +977,44 @@ impl LocalWorkersClient {
             runtimes,
             transcripts,
             notifications,
+            appearance,
         })
+    }
+
+    pub fn session_artifacts(&self, session_id: &str) -> Vec<WorkersArtifact> {
+        unpeel_core::session_artifacts::list(session_id)
+            .into_iter()
+            .filter_map(|artifact| {
+                let path = unpeel_core::session_artifacts::kind_dir(session_id, &artifact.kind)?
+                    .join(&artifact.name);
+                Some(WorkersArtifact {
+                    is_image: is_image_artifact_name(&artifact.name),
+                    kind: artifact.kind,
+                    name: artifact.name,
+                    path,
+                    size: artifact.size,
+                    modified_at_unix_ms: artifact.modified_at_unix_ms,
+                })
+            })
+            .collect()
+    }
+
+    pub fn session_artifact_dir(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> Result<PathBuf, WorkersError> {
+        unpeel_core::session_artifacts::kind_dir(session_id, kind)
+            .ok_or_else(|| WorkersError::State("invalid session artifact path".into()))
+    }
+
+    pub fn delete_session_artifact(
+        &self,
+        session_id: &str,
+        kind: &str,
+        name: &str,
+    ) -> Result<(), WorkersError> {
+        unpeel_core::session_artifacts::delete(session_id, kind, name).map_err(WorkersError::State)
     }
 
     /// Install one of Unpeel's pinned built-in runtimes with its catalog-owned
@@ -1094,6 +1166,20 @@ impl LocalWorkersClient {
         unpeel_core::app_state::edit(|state| {
             state.insert(
                 "comet_workers_notifications".into(),
+                serde_json::to_value(settings).map_err(|error| error.to_string())?,
+            );
+            Ok(())
+        })
+        .map_err(WorkersError::State)
+    }
+
+    pub fn set_appearance_settings(
+        &self,
+        settings: WorkersAppearanceSettings,
+    ) -> Result<(), WorkersError> {
+        unpeel_core::app_state::edit(|state| {
+            state.insert(
+                "comet_workers_appearance".into(),
                 serde_json::to_value(settings).map_err(|error| error.to_string())?,
             );
             Ok(())
@@ -2688,5 +2774,30 @@ mod runtime_install_tests {
         assert_eq!(runtime.cli_id, "claude");
         assert!(!runtime.command.trim().is_empty());
         assert!(trusted_runtime_install("unknown-provider").is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_gallery_tests {
+    use super::{WorkersAppearanceSettings, is_image_artifact_name};
+
+    #[test]
+    fn session_gallery_is_disabled_by_default() {
+        assert!(!WorkersAppearanceSettings::default().show_session_gallery);
+    }
+
+    #[test]
+    fn gallery_recognizes_unpeels_supported_image_extensions_case_insensitively() {
+        for name in [
+            "shot.png",
+            "photo.JPG",
+            "image.jpeg",
+            "anim.GIF",
+            "capture.webp",
+        ] {
+            assert!(is_image_artifact_name(name), "expected image: {name}");
+        }
+        assert!(!is_image_artifact_name("transcript.txt"));
+        assert!(!is_image_artifact_name("no-extension"));
     }
 }

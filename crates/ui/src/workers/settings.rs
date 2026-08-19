@@ -4,7 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*, px,
 };
-use zeron_workers_unpeel::{PresetPatch, WorkersNotificationSettings, WorkersTranscriptSettings};
+use zeron_workers_unpeel::{
+    PresetPatch, WorkersAppearanceSettings, WorkersNotificationSettings, WorkersTranscriptSettings,
+};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
@@ -820,6 +822,90 @@ impl WorkersSettingsView {
             theme,
         )
     }
+
+    fn render_appearance(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .model
+            .read(cx)
+            .settings
+            .as_ref()
+            .map(|settings| settings.appearance.clone())
+            .unwrap_or_default();
+        let mut next = current.clone();
+        next.show_session_gallery = !next.show_session_gallery;
+        let body = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(21.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child("Appearance"),
+            )
+            .child(
+                div()
+                    .mt(px(5.0))
+                    .text_size(px(12.5))
+                    .text_color(theme.text_muted)
+                    .child("How local Workers looks and behaves."),
+            )
+            .child(
+                div()
+                    .mt(px(22.0))
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child("TERMINAL"),
+            )
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .min_h(px(70.0))
+                    .px(px(16.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child("Session gallery"),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(3.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Show session captures and screenshot controls in the terminal title bar."),
+                            ),
+                    )
+                    .child(
+                        widgets::toggle_switch(theme, current.show_session_gallery)
+                            .id("workers-session-gallery-switch")
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.model.update(cx, |model, cx| {
+                                    model.set_appearance_settings(next.clone(), cx)
+                                });
+                            })),
+                    ),
+            );
+        self.page_shell(
+            WorkersSettingsTab::Appearance,
+            body.into_any_element(),
+            theme,
+        )
+    }
 }
 
 impl Render for WorkersSettingsView {
@@ -831,6 +917,7 @@ impl Render for WorkersSettingsView {
         };
         match tab {
             WorkersSettingsTab::Presets => self.render_presets(&theme, cx),
+            WorkersSettingsTab::Appearance => self.render_appearance(&theme, cx),
             WorkersSettingsTab::Transcripts => self.render_transcripts(&theme, cx),
             WorkersSettingsTab::Notifications => self.render_notifications(&theme, cx),
         }

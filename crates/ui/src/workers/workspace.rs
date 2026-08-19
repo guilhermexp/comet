@@ -1,12 +1,16 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::io::Read as _;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, IntoElement, MouseButton, MouseDownEvent,
-    PathPromptOptions, Pixels, Point, Render, SharedString, Subscription, Task, Window, div,
-    prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, Image, IntoElement, MouseButton, MouseDownEvent,
+    ObjectFit, PathPromptOptions, Pixels, Point, Render, SharedString, StyledImage as _,
+    Subscription, Task, Window, div, img, prelude::*, px,
 };
 use zeron_workers_unpeel::{
-    WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession, WorkersSessionSort,
+    WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession,
+    WorkersSessionSort,
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -28,6 +32,9 @@ use super::presentation::{
 };
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
+#[cfg(target_os = "macos")]
+use super::session_gallery::native as native_session_gallery;
+use super::session_gallery::{self, CaptureMode};
 #[cfg(target_os = "macos")]
 use super::session_menu::native::{self as native_session_menu, Selection as NativeMenuSelection};
 use super::session_menu::{WorkersSessionMenuItem as SessionMenuItem, session_menu_items};
@@ -1155,6 +1162,20 @@ struct ProjectDialog {
     _events: Subscription,
 }
 
+#[derive(Clone)]
+struct GalleryArtifact {
+    artifact: WorkersArtifact,
+    image: Option<Arc<Image>>,
+}
+
+fn gallery_artifact_key(artifact: &WorkersArtifact) -> String {
+    format!("{}/{}", artifact.kind, artifact.name)
+}
+
+fn gallery_session_matches(selected_session_id: Option<&str>, gallery_session_id: &str) -> bool {
+    selected_session_id == Some(gallery_session_id)
+}
+
 pub struct WorkersContent {
     model: Entity<WorkersModel>,
     terminal: Entity<WorkersTerminal>,
@@ -1165,6 +1186,16 @@ pub struct WorkersContent {
     project_menu: popover::Popup<(WorkersProject, Vec<WorkersSession>, Point<Pixels>)>,
     project_dialog: Option<ProjectDialog>,
     transcript_task: Option<Task<()>>,
+    gallery_open: bool,
+    gallery_session_id: Option<String>,
+    gallery_artifacts: Vec<GalleryArtifact>,
+    gallery_selected: Option<String>,
+    gallery_confirm_delete: Option<String>,
+    gallery_error: Option<String>,
+    gallery_capture_task: Option<Task<()>>,
+    gallery_capture_baselines: HashMap<String, u64>,
+    gallery_pulse_task: Option<Task<()>>,
+    _gallery_poll_task: Task<()>,
     _model_observation: Subscription,
 }
 
@@ -1174,10 +1205,31 @@ impl WorkersContent {
         let settings = cx.new(|cx| WorkersSettingsView::new(model.clone(), cx));
         let model_observation = cx.observe(&model, {
             let terminal = terminal.clone();
-            move |_, model, cx| {
+            move |this, model, cx| {
                 let session_id = model.read(cx).selected_session_id.clone();
                 terminal.update(cx, |terminal, cx| terminal.set_session(session_id, cx));
+                if this.gallery_session_id != model.read(cx).selected_session_id
+                    || !matches!(model.read(cx).route, WorkersRoute::Workspace)
+                {
+                    this.close_session_gallery(cx);
+                }
                 cx.notify();
+            }
+        });
+        let gallery_poll_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.gallery_open {
+                            this.refresh_session_gallery(cx);
+                        }
+                        this.poll_session_captures(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
         Self {
@@ -1190,8 +1242,701 @@ impl WorkersContent {
             project_menu: popover::Popup::default(),
             project_dialog: None,
             transcript_task: None,
+            gallery_open: false,
+            gallery_session_id: None,
+            gallery_artifacts: Vec::new(),
+            gallery_selected: None,
+            gallery_confirm_delete: None,
+            gallery_error: None,
+            gallery_capture_task: None,
+            gallery_capture_baselines: HashMap::new(),
+            gallery_pulse_task: None,
+            _gallery_poll_task: gallery_poll_task,
             _model_observation: model_observation,
         }
+    }
+
+    pub fn toggle_session_gallery(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if self.gallery_open && self.gallery_session_id.as_deref() == Some(session_id.as_str()) {
+            self.close_session_gallery(cx);
+            return;
+        }
+        self.gallery_open = true;
+        self.gallery_session_id = Some(session_id);
+        self.gallery_selected = None;
+        self.gallery_confirm_delete = None;
+        self.gallery_error = None;
+        self.model
+            .update(cx, |model, cx| model.set_gallery_pulse(None, cx));
+        self.refresh_session_gallery(cx);
+    }
+
+    fn poll_session_captures(&mut self, cx: &mut Context<Self>) {
+        let selected = self.model.read(cx).selected_session().and_then(|session| {
+            (session.provider_id.is_some() || session.active_runtime_id.is_some())
+                .then(|| session.id.clone())
+        });
+        let Some(session_id) = selected else {
+            return;
+        };
+        let newest = self
+            .model
+            .read(cx)
+            .session_artifacts(&session_id)
+            .into_iter()
+            .filter(|artifact| {
+                artifact.is_image && matches!(artifact.kind.as_str(), "screenshots" | "computer")
+            })
+            .map(|artifact| artifact.modified_at_unix_ms)
+            .max()
+            .unwrap_or(0);
+        let baseline = self
+            .gallery_capture_baselines
+            .entry(session_id.clone())
+            .or_insert(newest);
+        if self.gallery_open && self.gallery_session_id.as_deref() == Some(session_id.as_str()) {
+            *baseline = (*baseline).max(newest);
+            return;
+        }
+        if newest <= *baseline {
+            return;
+        }
+        *baseline = newest;
+        self.model.update(cx, |model, cx| {
+            model.set_gallery_pulse(Some(session_id.clone()), cx)
+        });
+        self.gallery_pulse_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(2_200))
+                .await;
+            this.update(cx, |this, cx| {
+                this.model.update(cx, |model, cx| {
+                    if model.gallery_pulse_session_id.as_deref() == Some(session_id.as_str()) {
+                        model.set_gallery_pulse(None, cx);
+                    }
+                });
+            })
+            .ok();
+        }));
+    }
+
+    fn close_session_gallery(&mut self, cx: &mut Context<Self>) {
+        self.gallery_open = false;
+        self.gallery_session_id = None;
+        self.gallery_selected = None;
+        self.gallery_confirm_delete = None;
+        self.gallery_artifacts.clear();
+        self.gallery_error = None;
+        cx.notify();
+    }
+
+    fn refresh_session_gallery(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.gallery_session_id.as_deref() else {
+            return;
+        };
+        let previous = std::mem::take(&mut self.gallery_artifacts);
+        let artifacts = self
+            .model
+            .read(cx)
+            .session_artifacts(session_id)
+            .into_iter()
+            .map(|artifact| {
+                let key = gallery_artifact_key(&artifact);
+                let image = previous
+                    .iter()
+                    .find(|entry| {
+                        gallery_artifact_key(&entry.artifact) == key
+                            && entry.artifact.size == artifact.size
+                            && entry.artifact.modified_at_unix_ms == artifact.modified_at_unix_ms
+                    })
+                    .and_then(|entry| entry.image.clone());
+                GalleryArtifact { artifact, image }
+            })
+            .collect::<Vec<_>>();
+        self.gallery_artifacts = artifacts;
+        if self.gallery_selected.as_ref().is_some_and(|selected| {
+            !self
+                .gallery_artifacts
+                .iter()
+                .any(|entry| gallery_artifact_key(&entry.artifact) == *selected)
+        }) {
+            self.gallery_selected = None;
+        }
+        let pending_images = self
+            .gallery_artifacts
+            .iter()
+            .filter(|entry| entry.artifact.is_image && entry.image.is_none())
+            .filter(|entry| entry.artifact.size <= crate::attachments::MAX_ATTACHMENT_BYTES)
+            .take(18)
+            .map(|entry| entry.artifact.clone())
+            .collect::<Vec<_>>();
+        for artifact in pending_images {
+            let key = gallery_artifact_key(&artifact);
+            let modified_at = artifact.modified_at_unix_ms;
+            let size = artifact.size;
+            cx.spawn(async move |this, cx| {
+                let path = artifact.path.clone();
+                let image = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let format = crate::attachments::format_by_extension(&path)?;
+                        let file = std::fs::File::open(path).ok()?;
+                        let mut bytes = Vec::new();
+                        file.take(crate::attachments::MAX_ATTACHMENT_BYTES + 1)
+                            .read_to_end(&mut bytes)
+                            .ok()?;
+                        if bytes.len() as u64 > crate::attachments::MAX_ATTACHMENT_BYTES {
+                            return None;
+                        }
+                        Some(Arc::new(Image::from_bytes(format, bytes)))
+                    })
+                    .await;
+                let Some(image) = image else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    if let Some(entry) = this.gallery_artifacts.iter_mut().find(|entry| {
+                        gallery_artifact_key(&entry.artifact) == key
+                            && entry.artifact.modified_at_unix_ms == modified_at
+                            && entry.artifact.size == size
+                    }) {
+                        entry.image = Some(image);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    pub fn open_capture_menu(&mut self, session_id: String, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let selection = native_session_gallery::show_async();
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(mode)) = selection.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    this.capture_session_screenshot(session_id, mode, cx)
+                })
+                .ok();
+            })
+            .detach();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (session_id, cx);
+        }
+    }
+
+    fn capture_session_screenshot(
+        &mut self,
+        session_id: String,
+        mode: CaptureMode,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = match self
+            .model
+            .read(cx)
+            .session_artifact_dir(&session_id, "uploads")
+        {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.gallery_error = Some(error);
+                self.gallery_open = true;
+                self.gallery_session_id = Some(session_id);
+                cx.notify();
+                return;
+            }
+        };
+        self.gallery_capture_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { session_gallery::capture_screenshot(&directory, mode) })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(path) => {
+                        if !gallery_session_matches(
+                            this.model.read(cx).selected_session_id.as_deref(),
+                            &session_id,
+                        ) {
+                            return;
+                        }
+                        this.gallery_open = true;
+                        this.gallery_session_id = Some(session_id);
+                        this.gallery_error = None;
+                        this.refresh_session_gallery(cx);
+                        this.gallery_selected = this
+                            .gallery_artifacts
+                            .iter()
+                            .find(|entry| entry.artifact.path == path)
+                            .map(|entry| gallery_artifact_key(&entry.artifact));
+                    }
+                    Err(error) if error == "Screenshot capture was cancelled" => return,
+                    Err(error) => this.gallery_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn add_gallery_artifact_to_prompt(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !gallery_session_matches(
+            self.model.read(cx).selected_session_id.as_deref(),
+            self.gallery_session_id.as_deref().unwrap_or_default(),
+        ) {
+            self.gallery_error =
+                Some("The selected Worker changed; capture was not attached.".into());
+            cx.notify();
+            return;
+        }
+        if !self
+            .model
+            .read(cx)
+            .selected_session()
+            .is_some_and(WorkersSession::is_live)
+        {
+            self.gallery_error = Some("This Worker is no longer running.".into());
+            cx.notify();
+            return;
+        }
+        let Some(entry) = self
+            .gallery_artifacts
+            .iter()
+            .find(|entry| gallery_artifact_key(&entry.artifact) == key)
+        else {
+            return;
+        };
+        let text = format!(
+            "{} ",
+            session_gallery::shell_quote_path(&entry.artifact.path)
+        );
+        self.terminal
+            .update(cx, |terminal, cx| terminal.insert_text(&text, cx));
+        self.close_session_gallery(cx);
+    }
+
+    fn reveal_gallery_artifact(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .gallery_artifacts
+            .iter()
+            .find(|entry| gallery_artifact_key(&entry.artifact) == key)
+        else {
+            return;
+        };
+        self.model.update(cx, |model, cx| {
+            model.reveal_project(entry.artifact.path.to_string_lossy().into_owned(), cx)
+        });
+    }
+
+    fn delete_gallery_artifact(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(session_id) = self.gallery_session_id.clone() else {
+            return;
+        };
+        let Some(entry) = self
+            .gallery_artifacts
+            .iter()
+            .find(|entry| gallery_artifact_key(&entry.artifact) == key)
+            .cloned()
+        else {
+            return;
+        };
+        match self.model.read(cx).delete_session_artifact(
+            &session_id,
+            &entry.artifact.kind,
+            &entry.artifact.name,
+        ) {
+            Ok(()) => {
+                self.gallery_selected = None;
+                self.gallery_confirm_delete = None;
+                self.gallery_error = None;
+                self.refresh_session_gallery(cx);
+            }
+            Err(error) => {
+                self.gallery_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_session_gallery(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.gallery_open {
+            return None;
+        }
+
+        let can_add_to_prompt = self
+            .model
+            .read(cx)
+            .selected_session()
+            .is_some_and(WorkersSession::is_live);
+        let header = div()
+            .h(px(42.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(14.0))
+            .border_b_1()
+            .border_color(theme.text.opacity(0.08))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Session gallery"),
+                    )
+                    .when(!self.gallery_artifacts.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(self.gallery_artifacts.len().to_string()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("workers-session-gallery-close")
+                    .size(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| this.close_session_gallery(cx)))
+                    .child(
+                        icon(icons::CLOSE)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
+                    ),
+            );
+
+        let body = if let Some(selected_key) = self.gallery_selected.clone() {
+            self.gallery_artifacts
+                .iter()
+                .find(|entry| gallery_artifact_key(&entry.artifact) == selected_key)
+                .cloned()
+                .map(|entry| {
+                    let key = gallery_artifact_key(&entry.artifact);
+                    let image = entry.image.clone();
+                    let is_image = entry.artifact.is_image;
+                    let delete_confirmed =
+                        self.gallery_confirm_delete.as_deref() == Some(key.as_str());
+                    let age = relative_age(
+                        entry.artifact.modified_at_unix_ms,
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    );
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .p(px(14.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .id("workers-session-gallery-back")
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.gallery_selected = None;
+                                    this.gallery_confirm_delete = None;
+                                    cx.notify();
+                                }))
+                                .child(icon(icons::ALT_ARROW_LEFT).size(px(12.0)))
+                                .child("All captures"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .when(can_add_to_prompt, |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(entry.artifact.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_faint)
+                                            .child(format!(
+                                                "{age} · {} KB",
+                                                entry.artifact.size / 1024
+                                            )),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .rounded(px(9.0))
+                                        .overflow_hidden()
+                                        .bg(theme.surface)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when_some(image, |el, image| {
+                                            el.child(
+                                                img(image)
+                                                    .size_full()
+                                                    .object_fit(ObjectFit::Contain),
+                                            )
+                                        })
+                                        .when(!is_image, |el| {
+                                            el.child(
+                                                icon(icons::DOCUMENT)
+                                                    .size(px(34.0))
+                                                    .text_color(theme.text_faint),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div().flex().items_center().gap(px(8.0)).child(
+                                        div()
+                                            .id("workers-session-gallery-add-to-prompt")
+                                            .h(px(30.0))
+                                            .px(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(8.0))
+                                            .bg(theme.text)
+                                            .text_color(theme.bg)
+                                            .text_size(px(11.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .on_click(cx.listener({
+                                                let key = key.clone();
+                                                move |this, _, _, cx| {
+                                                    this.add_gallery_artifact_to_prompt(&key, cx)
+                                                }
+                                            }))
+                                            .child("Add to prompt"),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .id("workers-session-gallery-reveal")
+                                        .h(px(30.0))
+                                        .px(px(10.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(8.0))
+                                        .bg(theme.surface_raised)
+                                        .text_size(px(11.0))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener({
+                                            let key = key.clone();
+                                            move |this, _, _, cx| {
+                                                this.reveal_gallery_artifact(&key, cx)
+                                            }
+                                        }))
+                                        .child("Reveal in Finder"),
+                                )
+                                .when(!delete_confirmed, |el| {
+                                    el.child(
+                                        div()
+                                            .id("workers-session-gallery-delete")
+                                            .size(px(30.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(8.0))
+                                            .cursor_pointer()
+                                            .hover(|el| el.bg(theme.danger.opacity(0.10)))
+                                            .on_click(cx.listener({
+                                                let key = key.clone();
+                                                move |this, _, _, cx| {
+                                                    this.gallery_confirm_delete = Some(key.clone());
+                                                    cx.notify();
+                                                }
+                                            }))
+                                            .child(
+                                                icon(icons::TRASH_BIN_MINIMALISTIC)
+                                                    .size(px(14.0))
+                                                    .text_color(theme.danger),
+                                            ),
+                                    )
+                                })
+                                .when(delete_confirmed, |el| {
+                                    el.child(
+                                        div()
+                                            .id("workers-session-gallery-delete-cancel")
+                                            .h(px(30.0))
+                                            .px(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(8.0))
+                                            .bg(theme.surface_raised)
+                                            .text_size(px(11.0))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.gallery_confirm_delete = None;
+                                                cx.notify();
+                                            }))
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("workers-session-gallery-delete-confirm")
+                                            .h(px(30.0))
+                                            .px(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(8.0))
+                                            .bg(theme.danger.opacity(0.14))
+                                            .text_color(theme.danger)
+                                            .text_size(px(11.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .on_click(cx.listener({
+                                                let key = key.clone();
+                                                move |this, _, _, cx| {
+                                                    this.delete_gallery_artifact(&key, cx)
+                                                }
+                                            }))
+                                            .child("Delete"),
+                                    )
+                                }),
+                        )
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element())
+        } else if self.gallery_artifacts.is_empty() {
+            div()
+                .id("workers-session-gallery-grid")
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.0))
+                .child(
+                    icon(icons::WORKER_GALLERY)
+                        .size(px(36.0))
+                        .text_color(theme.text_faint),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child("No images yet"),
+                )
+                .child(
+                    div()
+                        .w(px(330.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text.opacity(0.4))
+                        .child("Screenshots captured by the agent's browser and computer tools — and images you add — show up here."),
+                )
+                .into_any_element()
+        } else {
+            let rows = self
+                .gallery_artifacts
+                .chunks(3)
+                .enumerate()
+                .map(|(row_index, row)| {
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .children(row.iter().enumerate().map(|(column_index, entry)| {
+                            let index = row_index * 3 + column_index;
+                            let key = gallery_artifact_key(&entry.artifact);
+                            let is_image = entry.artifact.is_image;
+                            div()
+                                .id(("workers-session-gallery-item", index))
+                                .w(px(136.0))
+                                .h(px(104.0))
+                                .rounded(px(8.0))
+                                .overflow_hidden()
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.text.opacity(0.08))
+                                .cursor_pointer()
+                                .hover(|el| el.border_color(theme.text.opacity(0.24)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.gallery_selected = Some(key.clone());
+                                    this.gallery_confirm_delete = None;
+                                    cx.notify();
+                                }))
+                                .when_some(entry.image.clone(), |el, image| {
+                                    el.child(img(image).size_full().object_fit(ObjectFit::Cover))
+                                })
+                                .when(!is_image, |el| {
+                                    el.flex().items_center().justify_center().child(
+                                        icon(icons::DOCUMENT)
+                                            .size(px(26.0))
+                                            .text_color(theme.text_faint),
+                                    )
+                                })
+                        }))
+                })
+                .collect::<Vec<_>>();
+            div()
+                .id("workers-session-gallery-grid")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(px(14.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .children(rows)
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .absolute()
+                .top(px(Theme::TITLEBAR_HEIGHT + 8.0))
+                .right(px(77.0))
+                .w(px(460.0))
+                .h(px(500.0))
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_session_gallery(cx)))
+                .child(
+                    popover::popover_card(theme)
+                        .size_full()
+                        .p(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .child(header)
+                        .when_some(self.gallery_error.clone(), |el, error| {
+                            el.child(
+                                div()
+                                    .mx(px(14.0))
+                                    .mt(px(10.0))
+                                    .p(px(8.0))
+                                    .rounded(px(7.0))
+                                    .bg(theme.danger.opacity(0.10))
+                                    .text_size(px(10.0))
+                                    .text_color(theme.danger_muted)
+                                    .child(error),
+                            )
+                        })
+                        .child(body),
+                )
+                .into_any_element(),
+        )
     }
 
     pub fn open_session_menu(
@@ -2949,6 +3694,7 @@ impl Render for WorkersContent {
         let project_dialog = self.render_project_dialog(window.viewport_size(), cx);
         let session_menu = self.render_session_menu(&theme, cx);
         let project_menu = self.render_project_menu(&theme, cx);
+        let session_gallery = self.render_session_gallery(&theme, cx);
         let viewport = workers_viewport_layer()
             .when(
                 has_snapshot && error.is_some() && archive_project_id.is_none(),
@@ -2977,6 +3723,7 @@ impl Render for WorkersContent {
             .child(viewport)
             .when_some(session_menu, |el, menu| el.child(menu))
             .when_some(project_menu, |el, menu| el.child(menu))
+            .when_some(session_gallery, |el, gallery| el.child(gallery))
             .when_some(rename_dialog, |el, dialog| el.child(dialog))
             .when_some(append_context_dialog, |el, dialog| el.child(dialog))
             .when_some(project_dialog, |el, dialog| el.child(dialog))
@@ -2989,8 +3736,31 @@ mod layout_tests {
     use gpui::Styled as _;
 
     use super::{
-        project_folder_tint, workers_content_outlet, workers_viewport_layer, worktree_branch_slug,
+        gallery_artifact_key, gallery_session_matches, project_folder_tint, workers_content_outlet,
+        workers_viewport_layer, worktree_branch_slug,
     };
+    use std::path::PathBuf;
+    use zeron_workers_unpeel::WorkersArtifact;
+
+    #[test]
+    fn gallery_actions_are_scoped_to_the_selected_session() {
+        assert!(gallery_session_matches(Some("session-a"), "session-a"));
+        assert!(!gallery_session_matches(Some("session-b"), "session-a"));
+        assert!(!gallery_session_matches(None, "session-a"));
+    }
+
+    #[test]
+    fn gallery_selection_uses_the_stable_kind_and_name_address() {
+        let artifact = WorkersArtifact {
+            kind: "screenshots".into(),
+            name: "shot.png".into(),
+            path: PathBuf::from("/tmp/shot.png"),
+            size: 42,
+            modified_at_unix_ms: 7,
+            is_image: true,
+        };
+        assert_eq!(gallery_artifact_key(&artifact), "screenshots/shot.png");
+    }
 
     #[test]
     fn workers_viewport_is_bounded_below_the_native_titlebar() {

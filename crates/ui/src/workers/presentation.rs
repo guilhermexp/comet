@@ -350,7 +350,7 @@ mod tests {
             .and_then(|source| source.split("match self.route").next())
             .expect("workers titlebar renderer");
         assert!(
-            workers_titlebar.contains(".pl(px(sidebar_now))"),
+            workers_titlebar.contains(".left(px(sidebar_now))"),
             "the selected project title must be centered after excluding the sidebar width"
         );
     }

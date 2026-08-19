@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use gpui::{Context, Task};
 use zeron_workers_unpeel::{
-    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch, WorkersBootstrap,
-    WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
-    WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
-    WorkersSession, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
+    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch,
+    WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap, WorkersCreateGroupRequest,
+    WorkersCreateWorktreeRequest, WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset,
+    WorkersProject, WorkersProjectOrganizationPatch, WorkersSession, WorkersSessionSort,
+    WorkersSettingsSnapshot, WorkersTranscriptSettings,
 };
 
 use super::archive::{archived_sessions_for_project, restore_action};
@@ -18,16 +19,23 @@ use super::notification_policy::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkersSettingsTab {
     Presets,
+    Appearance,
     Transcripts,
     Notifications,
 }
 
 impl WorkersSettingsTab {
-    pub const ALL: [Self; 3] = [Self::Presets, Self::Transcripts, Self::Notifications];
+    pub const ALL: [Self; 4] = [
+        Self::Presets,
+        Self::Appearance,
+        Self::Transcripts,
+        Self::Notifications,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Presets => "Presets",
+            Self::Appearance => "Appearance",
             Self::Transcripts => "Transcripts",
             Self::Notifications => "Notifications",
         }
@@ -223,6 +231,7 @@ pub struct WorkersModel {
     pub settings_error: Option<String>,
     pub confirming_remove_session_id: Option<String>,
     pub confirming_remove_project: Option<WorkersProject>,
+    pub gallery_pulse_session_id: Option<String>,
     confirming_remove_archived: bool,
     initialized_expansion: bool,
     refresh_generation: u64,
@@ -294,6 +303,7 @@ impl WorkersModel {
             settings_error: None,
             confirming_remove_session_id: None,
             confirming_remove_project: None,
+            gallery_pulse_session_id: None,
             confirming_remove_archived: false,
             initialized_expansion: false,
             refresh_generation: 0,
@@ -436,6 +446,41 @@ impl WorkersModel {
         self.sessions()
             .iter()
             .find(|session| session.id == selected)
+    }
+
+    pub fn appearance_settings(&self) -> WorkersAppearanceSettings {
+        self.settings
+            .as_ref()
+            .map(|settings| settings.appearance.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_gallery_pulse(&mut self, session_id: Option<String>, cx: &mut Context<Self>) {
+        if self.gallery_pulse_session_id != session_id {
+            self.gallery_pulse_session_id = session_id;
+            cx.notify();
+        }
+    }
+
+    pub fn session_artifacts(&self, session_id: &str) -> Vec<WorkersArtifact> {
+        self.client.session_artifacts(session_id)
+    }
+
+    pub fn session_artifact_dir(&self, session_id: &str, kind: &str) -> Result<PathBuf, String> {
+        self.client
+            .session_artifact_dir(session_id, kind)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn delete_session_artifact(
+        &self,
+        session_id: &str,
+        kind: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        self.client
+            .delete_session_artifact(session_id, kind, name)
+            .map_err(|error| error.to_string())
     }
 
     pub fn selected_project(&self) -> Option<&WorkersProject> {
@@ -911,6 +956,14 @@ impl WorkersModel {
         cx: &mut Context<Self>,
     ) {
         self.run_settings_action(move |client| client.set_transcript_settings(settings), cx);
+    }
+
+    pub fn set_appearance_settings(
+        &mut self,
+        settings: WorkersAppearanceSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_settings_action(move |client| client.set_appearance_settings(settings), cx);
     }
 
     pub fn set_notification_settings(
@@ -1493,10 +1546,17 @@ mod tests {
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
     use super::{
-        PendingRemove, PendingReplacement, WorkersSessionTarget, dispatch_or_queue_remove,
-        reconcile_selection, reconcile_selection_with_pending, replacement_selection,
-        resolve_session_target, selection_after_remove, sessions_for_project, toggle_expanded,
+        PendingRemove, PendingReplacement, WorkersSessionTarget, WorkersSettingsTab,
+        dispatch_or_queue_remove, reconcile_selection, reconcile_selection_with_pending,
+        replacement_selection, resolve_session_target, selection_after_remove,
+        sessions_for_project, toggle_expanded,
     };
+
+    #[test]
+    fn appearance_is_the_second_workers_settings_tab_like_unpeel() {
+        assert_eq!(WorkersSettingsTab::ALL[1], WorkersSettingsTab::Appearance);
+        assert_eq!(WorkersSettingsTab::Appearance.label(), "Appearance");
+    }
 
     #[test]
     fn remove_is_queued_instead_of_dropped_while_another_action_finishes() {
