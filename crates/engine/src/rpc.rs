@@ -1188,6 +1188,9 @@ impl RpcService for EngineRpc {
                     "chats": chats,
                 }))
             }
+            methods::WATCH_CONNECTIVITY => Ok(RpcReply::Stream(watch_stream(
+                self.doc_host.watch_connectivity(),
+            ))),
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }
