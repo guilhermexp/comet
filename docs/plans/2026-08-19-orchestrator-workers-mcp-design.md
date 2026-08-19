@@ -153,11 +153,21 @@ Completed on 2026-08-19 on `feat/unpeel-workers-menu-bar`.
   enabled presets.
 - No `__workers_mcp__` or `comet-workers` entry exists in the inspected Unpeel,
   Cursor, Kimi Code, or Kiro worker MCP configurations.
+- The controller startup marker is consumed before any worker launch. A real worker
+  printed `MARKER_CLEARED`, proving it did not inherit
+  `COMET_WORKERS_CONTROLLER`.
+- `archive_worker` now rejects live sessions and requires the explicit sequence
+  `stop_worker` → wait for `state=exited` → `archive_worker`. A live-archive smoke
+  returned an MCP tool error without stopping the worker.
+- `send_text` uses Unpeel's shared `session_input` sanitizer and bracketed-paste +
+  settle + double-Enter delivery pipeline. A `/bin/cat` fixture received
+  `MCP_TEXT_DELIVERY`, then was explicitly stopped and archived.
 
 Validation summary:
 
-- Workers MCP tests: 8 passed.
-- ACP integration: 31 passed, 7 real-network tests ignored.
+- Workers MCP tests: 11 passed.
+- ACP controller tests cover both `session/new` and `session/load`; the broader ACP
+  integration reports 31 passed and 7 real-network tests ignored.
 - Engine full suite: all targets passed except one timing test that passed both on
   the base commit and current code when isolated.
 - Harness full suite: one pre-existing shell-env timing test fails on the base
