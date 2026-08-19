@@ -115,6 +115,15 @@ struct QueueWorkerNotificationParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RelayCommandParams {
+    chat_id: String,
+    /// The full command entry, client-minted id included — the exactly-once
+    /// key the host claims in its processed ledger before executing.
+    entry: zeron_doc::SessionCommandEntry,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
@@ -1122,6 +1131,15 @@ impl RpcService for EngineRpc {
                     .queue_worker_notification(&p.chat_id, p.command_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::RELAY_COMMAND => {
+                let p: RelayCommandParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .ingest_relayed_command(&p.chat_id, p.entry)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "outcome": outcome }))
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
