@@ -28,6 +28,19 @@ fn fixture_path() -> PathBuf {
     path
 }
 
+fn workers_mcp_fixture_path() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-acp-workers-mcp.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    path
+}
+
 fn harness() -> AcpHarness {
     AcpHarness::grok().with_executable(fixture_path())
 }
@@ -42,6 +55,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
         attachments: Vec::new(),
         resume: None,
     }
@@ -208,6 +222,53 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     // usage_update maps to nothing (context gauge, not per-turn tokens).
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
 
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[test]
+fn workers_mcp_descriptor_is_controller_only_and_absolute() {
+    let servers = zeron_harness::acp::workers_mcp_servers_for(
+        std::path::Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
+        true,
+        false,
+    );
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["name"], "comet-workers");
+    assert_eq!(
+        servers[0]["command"],
+        "/Applications/Zeron.app/Contents/MacOS/zeron"
+    );
+    assert_eq!(servers[0]["args"], serde_json::json!(["__workers_mcp__"]));
+    assert_eq!(servers[0]["env"][0]["name"], "COMET_WORKERS_CONTROLLER");
+
+    assert!(
+        zeron_harness::acp::workers_mcp_servers_for(
+            std::path::Path::new("/tmp/zeron"),
+            false,
+            false,
+        )
+        .is_empty()
+    );
+    assert!(zeron_harness::acp::workers_mcp_servers_for(
+        std::path::Path::new("/tmp/zeron"),
+        true,
+        true,
+    )
+    .is_empty());
+}
+
+#[tokio::test]
+async fn primary_run_injects_workers_mcp_into_acp_session() {
+    let harness = AcpHarness::grok().with_executable(workers_mcp_fixture_path());
+    let (controls, _steer, _token) = controls();
+    let mut run = request("scenario:workers-mcp");
+    run.enable_workers_mcp = true;
+
+    let events = run_to_end(&harness, run, controls).await;
+
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "workers mcp configured".into()
+    }));
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 

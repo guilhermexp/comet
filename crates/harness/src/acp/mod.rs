@@ -51,6 +51,39 @@ use zeron_proto::{
     RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+const WORKERS_MCP_ARG: &str = "__workers_mcp__";
+
+#[doc(hidden)]
+pub fn workers_mcp_servers_for(
+    executable: &std::path::Path,
+    enabled: bool,
+    disabled_by_environment: bool,
+) -> Vec<Value> {
+    if !enabled || disabled_by_environment || !executable.is_absolute() {
+        return Vec::new();
+    }
+    vec![json!({
+        "type": "stdio",
+        "name": "comet-workers",
+        "command": executable.to_string_lossy(),
+        "args": [WORKERS_MCP_ARG],
+        "env": [{ "name": "COMET_WORKERS_CONTROLLER", "value": "1" }]
+    })]
+}
+
+fn workers_mcp_servers(enabled: bool) -> Vec<Value> {
+    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
+        .ok()
+        .is_some_and(|value| value == "1");
+    let executable = std::env::var_os("ZERON_WORKERS_MCP_BIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
+    executable
+        .as_deref()
+        .map(|executable| workers_mcp_servers_for(executable, enabled, disabled))
+        .unwrap_or_default()
+}
+
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{cursor_todo_events, map_update, parse_commands, preferred_allow_option};
@@ -2003,7 +2036,8 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        let mcp_servers = workers_mcp_servers(request.enable_workers_mcp);
+        let session_params = json!({ "cwd": request.cwd, "mcpServers": mcp_servers });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());

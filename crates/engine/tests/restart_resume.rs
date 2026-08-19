@@ -45,6 +45,7 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         cwd: cwd.into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
         attachments: Vec::new(),
         resume: None,
     }
@@ -847,6 +848,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
         cwd: cwd.clone(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
+        enable_workers_mcp: false,
         attachments: Vec::new(),
         resume: None,
     };

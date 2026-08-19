@@ -171,6 +171,7 @@ impl TitleGenerator {
                 cwd: cwd.to_string(),
                 sandbox: SandboxLevel::ReadOnly,
                 auto_approve: true,
+                enable_workers_mcp: false,
                 attachments: Vec::new(),
                 resume: None,
             };

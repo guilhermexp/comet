@@ -50,6 +50,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
         attachments: Vec::new(),
         resume: None,
     }

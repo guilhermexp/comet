@@ -42,6 +42,7 @@ async fn managed_install_reaches_session_started() {
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
         attachments: Vec::new(),
         resume: None,
     };

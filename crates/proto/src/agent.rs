@@ -101,6 +101,10 @@ pub struct RunRequest {
     pub sandbox: SandboxLevel,
     #[serde(default)]
     pub auto_approve: bool,
+    /// Inject Comet's controller-only Workers MCP into this primary agent run.
+    /// Additive and disabled by default for old wire payloads.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enable_workers_mcp: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -111,6 +115,10 @@ pub struct RunRequest {
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan
@@ -344,6 +352,7 @@ mod tests {
         let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
         let req: RunRequest = serde_json::from_str(old).unwrap();
         assert!(req.attachments.is_empty());
+        assert!(!req.enable_workers_mcp);
         // …and an empty list serializes away (old readers never see it).
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("attachments").is_none());
@@ -355,6 +364,26 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn run_request_workers_mcp_is_additive_and_round_trips() {
+        let request: RunRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "coordinate workers",
+            "model": null,
+            "reasoning": null,
+            "cwd": "/tmp",
+            "sandbox": "workspace-write",
+            "resume": null,
+            "enableWorkersMcp": true
+        }))
+        .unwrap();
+
+        assert!(request.enable_workers_mcp);
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["enableWorkersMcp"],
+            true
+        );
     }
 
     #[test]

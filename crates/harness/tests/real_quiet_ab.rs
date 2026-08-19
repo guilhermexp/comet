@@ -119,6 +119,7 @@ async fn probe_once(print_trace: bool) -> (usize, usize, bool) {
         cwd: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
         attachments: Vec::new(),
         resume: None,
     };

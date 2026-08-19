@@ -1,0 +1,21 @@
+#!/bin/sh
+
+emit() { printf '%s\n' "$1"; }
+rid() { printf '%s' "$1" | sed 's/.*"id":\([0-9]*\).*/\1/'; }
+has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+
+read -r line || exit 1
+has "$line" '"method":"initialize"' || exit 1
+emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true}}}"
+
+read -r line || exit 1
+has "$line" '"method":"session/new"' || exit 1
+has "$line" '"name":"comet-workers"' || exit 1
+has "$line" '"args":["__workers_mcp__"]' || exit 1
+has "$line" '"name":"COMET_WORKERS_CONTROLLER","value":"1"' || exit 1
+emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"workers-mcp-session\"}}"
+
+read -r line || exit 1
+has "$line" '"method":"session/prompt"' || exit 1
+emit '{"method":"session/update","params":{"sessionId":"workers-mcp-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"workers mcp configured"}}}}'
+emit "{\"id\":$(rid "$line"),\"result\":{\"stopReason\":\"end_turn\"}}"

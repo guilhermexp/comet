@@ -2193,6 +2193,7 @@ impl DocHost {
                 .map(|c| c.sandbox)
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
+            enable_workers_mcp: true,
             attachments: Vec::new(),
             resume: None,
         })

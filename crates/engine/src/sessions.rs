@@ -676,6 +676,7 @@ impl SessionsEngine {
                             cwd,
                             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
+                            enable_workers_mcp: true,
                             attachments: Vec::new(),
                             resume: None,
                         })

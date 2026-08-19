@@ -4781,6 +4781,7 @@ impl Composer {
                             cwd,
                             sandbox: SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
+                            enable_workers_mcp: true,
                             resume: None,
                             attachments: attachment_paths,
                         },
