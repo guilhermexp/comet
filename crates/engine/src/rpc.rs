@@ -98,6 +98,11 @@ struct SetHarnessEnabledParams {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    /// Queued attachments (bytes already committed locally as `pending://`
+    /// refs) the engine delivers to a remote host AFTER the command is
+    /// durably queued — never as a gate in front of it.
+    #[serde(default)]
+    transfers: Vec<crate::uploads::AttachmentTransfer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1093,7 +1098,7 @@ impl RpcService for EngineRpc {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
                     .doc_host
-                    .queue_command(&p.chat_id, p.command)
+                    .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
@@ -1769,6 +1774,9 @@ impl RpcService for EngineRpc {
                     .uploads
                     .commit(&p.upload_id, &p.file_name)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Bytes just landed on this device: any command deferred on
+                // them (queued-attachment refs) is executable NOW.
+                self.doc_host.kick_drains();
                 RpcReply::value(&serde_json::json!({ "path": path }))
             }
             methods::READ_ATTACHMENT_CHUNK => {
