@@ -273,6 +273,25 @@ async fn primary_run_injects_workers_mcp_into_acp_session() {
 }
 
 #[tokio::test]
+async fn resumed_primary_run_keeps_workers_mcp_in_session_load() {
+    let harness = AcpHarness::grok().with_executable(workers_mcp_fixture_path());
+    let (controls, _steer, _token) = controls();
+    let mut run = request("scenario:workers-mcp-resume");
+    run.enable_workers_mcp = true;
+    run.resume = Some("workers-mcp-resumed".into());
+
+    let events = run_to_end(&harness, run, controls).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "workers-mcp-resumed"
+    )));
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "workers mcp configured".into()
+    }));
+}
+
+#[tokio::test]
 async fn config_options_apply_requested_model_and_effort() {
     let (controls, _steer, _token) = controls();
     let mut req = request("scenario:config");

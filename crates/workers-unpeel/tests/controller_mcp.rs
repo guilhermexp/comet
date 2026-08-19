@@ -4,8 +4,10 @@ use std::fs;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
-    controller_mcp_clean_output, controller_mcp_encode_keys, controller_mcp_handle_request,
-    controller_mcp_parse_launch, ensure_controller_mcp_host_launcher, is_session_host_mode,
+    WorkersSession, WorkersSessionCapabilities, controller_mcp_archive_guard,
+    controller_mcp_clean_output, controller_mcp_consume_authority_marker,
+    controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_parse_launch,
+    controller_mcp_sanitize_text, ensure_controller_mcp_host_launcher, is_session_host_mode,
 };
 
 #[test]
@@ -177,5 +179,65 @@ fn controller_mcp_prepares_the_current_binary_as_session_host() {
             Some(value) => std::env::set_var("UNPEEL_HOST_CMD", value),
             None => std::env::remove_var("UNPEEL_HOST_CMD"),
         }
+    }
+}
+
+#[test]
+fn controller_authority_marker_is_consumed_before_workers_launch() {
+    let _lock = ENV_LOCK.lock().expect("environment test lock");
+    let previous = std::env::var_os("COMET_WORKERS_CONTROLLER");
+    // SAFETY: this test binary serializes its environment mutations with ENV_LOCK.
+    unsafe { std::env::set_var("COMET_WORKERS_CONTROLLER", "1") };
+
+    controller_mcp_consume_authority_marker().expect("valid marker is consumed");
+
+    assert!(std::env::var_os("COMET_WORKERS_CONTROLLER").is_none());
+    // SAFETY: restore before releasing ENV_LOCK.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("COMET_WORKERS_CONTROLLER", value),
+            None => std::env::remove_var("COMET_WORKERS_CONTROLLER"),
+        }
+    }
+}
+
+#[test]
+fn archive_requires_an_explicit_stop_for_live_workers() {
+    let mut session = worker_with_state("running");
+    assert!(controller_mcp_archive_guard(&session).is_err());
+
+    session.state = "exited".into();
+    assert!(controller_mcp_archive_guard(&session).is_ok());
+}
+
+#[test]
+fn controller_text_uses_the_runtime_sanitizer() {
+    assert_eq!(
+        controller_mcp_sanitize_text("hello\u{0} world\r\nnext\u{1b}"),
+        "hello world\nnext"
+    );
+}
+
+fn worker_with_state(state: &str) -> WorkersSession {
+    WorkersSession {
+        id: "worker-1".into(),
+        project_id: "project-1".into(),
+        title: "Worker".into(),
+        command: "codex".into(),
+        state: state.into(),
+        activity: "idle".into(),
+        unread: false,
+        pinned: false,
+        archived: false,
+        provider_id: None,
+        active_runtime_id: None,
+        runtime_launch_pending: false,
+        runtime_generation: 1,
+        notify_when_done: false,
+        terminal_background_hex: None,
+        worktree_branch: None,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+        capabilities: WorkersSessionCapabilities::default(),
     }
 }

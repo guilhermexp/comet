@@ -39,11 +39,7 @@ const ACTIONS: &[&str] = &[
 ];
 
 pub fn run_stdio() -> Result<(), String> {
-    if std::env::var(CONTROLLER_ENV).ok().as_deref() != Some("1") {
-        return Err(format!(
-            "{CONTROLLER_MCP_ARG} is reserved for Comet controller sessions"
-        ));
-    }
+    consume_authority_marker()?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -61,6 +57,18 @@ pub fn run_stdio() -> Result<(), String> {
             stdout.flush().map_err(|error| error.to_string())?;
         }
     }
+    Ok(())
+}
+
+pub fn consume_authority_marker() -> Result<(), String> {
+    if std::env::var(CONTROLLER_ENV).ok().as_deref() != Some("1") {
+        return Err(format!(
+            "{CONTROLLER_MCP_ARG} is reserved for Comet controller sessions"
+        ));
+    }
+    // SAFETY: called before the server launches any threads or child workers.
+    // Descendants must never inherit the controller-only startup marker.
+    unsafe { std::env::remove_var(CONTROLLER_ENV) };
     Ok(())
 }
 
@@ -303,13 +311,11 @@ fn dispatch_action(client: &LocalWorkersClient, arguments: &Value) -> Result<Val
                 .get("submit")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let mut data = format!("\u{1b}[200~{text}\u{1b}[201~");
-            if submit {
-                data.push('\r');
+            let sanitized = sanitize_text(&text);
+            if sanitized.trim().is_empty() {
+                return Err("text is empty after removing control characters".into());
             }
-            client
-                .write(&session.id, &data)
-                .map_err(|error| error.to_string())?;
+            unpeel_core::session_input::deliver_sanitized_text(&session.id, &sanitized, submit)?;
             Ok(json!({ "session_id": session.id, "sent": true, "submitted": submit }))
         }
         "send_keys" => {
@@ -342,6 +348,7 @@ fn dispatch_action(client: &LocalWorkersClient, arguments: &Value) -> Result<Val
         }
         "archive_worker" => {
             let session = find_session(client, arguments)?;
+            archive_guard(&session)?;
             client
                 .session_command(&session, WorkersSessionCommand::Archive)
                 .map_err(|error| error.to_string())?;
@@ -351,6 +358,20 @@ fn dispatch_action(client: &LocalWorkersClient, arguments: &Value) -> Result<Val
             "Unknown workers action '{action}'. Use action=help."
         )),
     }
+}
+
+pub fn sanitize_text(text: &str) -> String {
+    unpeel_core::session_input::sanitize_paste_text(text)
+}
+
+pub fn archive_guard(session: &WorkersSession) -> Result<(), String> {
+    if session.is_live() {
+        return Err(format!(
+            "Worker '{}' is live. Call stop_worker explicitly, wait for state=exited, then archive_worker.",
+            session.id
+        ));
+    }
+    Ok(())
 }
 
 fn validate_launch_target(

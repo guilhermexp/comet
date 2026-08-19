@@ -151,6 +151,21 @@ pub fn controller_mcp_clean_output(text: &str, max_bytes: usize) -> String {
     controller_mcp::clean_output(text, max_bytes)
 }
 
+#[doc(hidden)]
+pub fn controller_mcp_consume_authority_marker() -> Result<(), String> {
+    controller_mcp::consume_authority_marker()
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_sanitize_text(text: &str) -> String {
+    controller_mcp::sanitize_text(text)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_archive_guard(session: &WorkersSession) -> Result<(), String> {
+    controller_mcp::archive_guard(session)
+}
+
 /// Make the current Comet executable the Unpeel launcher when no explicit
 /// host override was supplied. This keeps packaged and development builds
 /// self-contained: the launcher-file mode above re-execs the same binary in
