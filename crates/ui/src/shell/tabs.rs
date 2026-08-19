@@ -192,7 +192,7 @@ impl Shell {
         // budgets for it: the title's left inset grows by one button slot as
         // the + fades in, so the text never sits under it.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let plus_inset = 26.0 * self.titlebar_plus_alpha();
+        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha();
         let details_open = self.details_sidebar_open(cx);
         let details_now = if details_open {
             self.eval_tween(self.details_tween, self.details_target(cx))
@@ -228,7 +228,7 @@ impl Shell {
         // (user report: misaligned dead space). With the sidebar COLLAPSED
         // the seam is the window edge, where the traffic lights + nav
         // cluster overlay lives — the strip must still clear it, but only
-        // just: `title_bar_content_start` carries a 10px TEXT margin the
+        // just: `title_bar_content_start` carries the identity-group margin the
         // strip doesn't want (it brings its own 8px pad), and doubling up
         // read as a hole after the `+` (user report).
         let row_left = if takeover {
@@ -241,7 +241,8 @@ impl Shell {
             // own 8px pad lands the first chip on the pane gutter. The
             // window-control cluster still wins while the sidebar is
             // collapsed (the chips clear it instead of underlapping).
-            let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
+            let cluster_end =
+                self.title_bar_content_start() - TITLEBAR_IDENTITY_GAP + plus_inset - 14.0;
             (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
