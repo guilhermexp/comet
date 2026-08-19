@@ -131,3 +131,36 @@ does not add UI polling or permanent visual elements.
 - Full Workers, harness, engine, check, and build gates.
 - Native dev validation: ask the Orchestrator to list projects, launch a safe shell
   worker, wait for output, stop/archive it, and inspect the terminal history.
+
+## Implemented result
+
+Completed on 2026-08-19 on `feat/unpeel-workers-menu-bar`.
+
+- `comet-workers` is a Comet-owned stdio MCP server with one compact `workers`
+  action-enum tool and all 13 designed actions.
+- `RunRequest.enable_workers_mcp` explicitly gates ACP injection. Composer/chat
+  runs enable it; title generation, model/command discovery, and ordinary tests do
+  not.
+- The server self-configures the current binary as Unpeel's detached session-host
+  launcher and retains one `LocalWorkersClient` for a monotonic controller request
+  sequence.
+- Direct MCP lifecycle smoke launched session
+  `a24d917e-9b43-4dcc-a21e-6aedbafaf1ce`, read
+  `COMET_MCP_SMOKE_READY`, matched `running`, stopped it, matched `exited`, reread
+  its output journal, and archived it.
+- Native app validation showed the primary Orchestrator calling only
+  `list_projects` and `list_presets`, returning the three real projects and six
+  enabled presets.
+- No `__workers_mcp__` or `comet-workers` entry exists in the inspected Unpeel,
+  Cursor, Kimi Code, or Kiro worker MCP configurations.
+
+Validation summary:
+
+- Workers MCP tests: 8 passed.
+- ACP integration: 31 passed, 7 real-network tests ignored.
+- Engine full suite: all targets passed except one timing test that passed both on
+  the base commit and current code when isolated.
+- Harness full suite: one pre-existing shell-env timing test fails on the base
+  commit too; the remaining 46 library tests and all ACP tests pass.
+- `cargo check -p zeron-ui --no-default-features`, `cargo build -p zeron`, format,
+  and diff checks pass. Existing Objective-C cfg warnings remain unchanged.

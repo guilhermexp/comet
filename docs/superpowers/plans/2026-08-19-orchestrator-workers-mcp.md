@@ -31,7 +31,7 @@
 - Produces: `CONTROLLER_MCP_ARG`, `run_stdio()`, `handle_request(Value) -> Option<Value>`, and one `workers` action-enum tool definition.
 - Consumes: `COMET_WORKERS_CONTROLLER=1` startup marker.
 
-- [ ] **Step 1: Write failing protocol and startup tests**
+- [x] **Step 1: Write failing protocol and startup tests**
 
 ```rust
 #[test]
@@ -50,23 +50,23 @@ fn initialize_and_tools_list_advertise_one_compact_workers_tool() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `cargo test -p zeron-workers-unpeel controller_mcp --no-fail-fast`
 
 Expected: compile failure because the controller MCP module and mode do not exist.
 
-- [ ] **Step 3: Implement the minimal MCP loop**
+- [x] **Step 3: Implement the minimal MCP loop**
 
 Implement newline-framed stdin/stdout handling for `initialize`, `ping`, `notifications/initialized`, `tools/list`, and `tools/call`. Return JSON-RPC `-32700`, `-32600`, and `-32601` for parse, invalid, and unknown-method errors. Tool-call failures use MCP `isError: true` content. Refuse `run_stdio` unless `COMET_WORKERS_CONTROLLER == "1"`.
 
-- [ ] **Step 4: Run tests and verify GREEN**
+- [x] **Step 4: Run tests and verify GREEN**
 
 Run: `cargo test -p zeron-workers-unpeel controller_mcp --no-fail-fast`
 
 Expected: protocol/startup tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/workers-unpeel/src/controller_mcp.rs crates/workers-unpeel/src/lib.rs crates/workers-unpeel/tests/local_actions.rs
@@ -83,7 +83,7 @@ git commit -m "feat(workers): add controller MCP server"
 - Produces: `ControllerAction`, `dispatch_action(&LocalWorkersClient, &Value)`, bounded key encoding, output cleanup, and wait policy.
 - Consumes: `LocalWorkersClient::{bootstrap,launch_session,read_output,transcript_markdown,write,session_action,session_command}`.
 
-- [ ] **Step 1: Write failing action contract tests**
+- [x] **Step 1: Write failing action contract tests**
 
 ```rust
 #[test]
@@ -106,23 +106,23 @@ fn ansi_cleanup_caps_model_output() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `cargo test -p zeron-workers-unpeel controller_mcp::tests --no-fail-fast`
 
 Expected: failures because action parsing and encoding are absent.
 
-- [ ] **Step 3: Implement actions**
+- [x] **Step 3: Implement actions**
 
 Implement the 13 actions from the design. Validate IDs against the current bootstrap before writes. `read_output` returns at most 64 KiB and transcript at most 96 KiB. `send_text` writes bracketed paste plus carriage return when `submit=true`. `send_keys` accepts at most 64 entries. `wait_for_status` clamps timeout to 1..120 seconds, polls every 250 ms, never mutates the target, and returns the last observed worker on timeout. `archive_worker` resolves the exact session then calls `WorkersSessionCommand::Archive`.
 
-- [ ] **Step 4: Run tests and verify GREEN**
+- [x] **Step 4: Run tests and verify GREEN**
 
 Run: `cargo test -p zeron-workers-unpeel controller_mcp::tests --no-fail-fast`
 
 Expected: all parser/protocol/action tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/workers-unpeel/src/controller_mcp.rs
@@ -147,7 +147,7 @@ git commit -m "feat(workers): expose orchestration MCP actions"
 - Produces: `RunRequest.enable_workers_mcp: bool` and `workers_mcp_servers() -> Vec<Value>`.
 - Consumes: ACP v1 `session/new` / `session/load` `mcpServers` array.
 
-- [ ] **Step 1: Write failing wire and ACP tests**
+- [x] **Step 1: Write failing wire and ACP tests**
 
 Add tests proving missing JSON defaults the field to false, UI/controller requests set it true, title requests set it false, and an actual harness run sends:
 
@@ -157,7 +157,7 @@ Add tests proving missing JSON defaults the field to false, UI/controller reques
 
 The fake ACP fixture must still require `mcpServers: []` for discovery probes and must require `comet-workers` for `scenario:workers-mcp`.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 ```bash
 cargo test -p zeron-proto run_request --no-fail-fast
@@ -166,11 +166,11 @@ cargo test -p zeron-harness workers_mcp --no-fail-fast
 
 Expected: failures because the field and descriptor builder do not exist.
 
-- [ ] **Step 3: Implement explicit injection**
+- [x] **Step 3: Implement explicit injection**
 
 Add the serde-defaulted field. Set it true in composer and chat-row reconstruction, preserve it through retries/resume, and false for automatic titles and unrelated test helpers. Build the descriptor from `ZERON_WORKERS_MCP_BIN` or `std::env::current_exe()`. Omit it when the request flag is false or `ZERON_DISABLE_WORKERS_MCP=1`. Use the same `session_params` for new/load/fallback.
 
-- [ ] **Step 4: Run tests and verify GREEN**
+- [x] **Step 4: Run tests and verify GREEN**
 
 ```bash
 cargo test -p zeron-proto run_request --no-fail-fast
@@ -180,7 +180,7 @@ cargo test -p zeron-harness --test acp --no-fail-fast
 
 Expected: wire and ACP integration tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/proto crates/ui/src/composer.rs crates/engine crates/harness
@@ -198,7 +198,7 @@ git commit -m "feat(orchestrator): inject Workers MCP"
 - Consumes: completed server and ACP injection.
 - Produces: verified Orchestrator-to-Workers lifecycle and operator documentation.
 
-- [ ] **Step 1: Run built-binary stdio smoke**
+- [x] **Step 1: Run built-binary stdio smoke**
 
 Pipe initialize, tools/list, and list-projects calls to:
 
@@ -208,7 +208,7 @@ COMET_WORKERS_CONTROLLER=1 target/debug/zeron __workers_mcp__
 
 Assert server name, one tool, and real project IDs. Run once without the marker and assert non-zero exit.
 
-- [ ] **Step 2: Run canonical gates once**
+- [x] **Step 2: Run canonical gates once**
 
 ```bash
 cargo fmt --all -- --check
@@ -223,11 +223,11 @@ git diff --check
 
 Expected: every command exits 0; existing Objective-C `unexpected cfg cargo-clippy` warnings may remain.
 
-- [ ] **Step 3: Validate in the dev app**
+- [x] **Step 3: Validate in the dev app**
 
 Open a fresh primary chat and ask it to list Workers projects/presets, launch a terminal worker running a deterministic shell command, wait for the text, inspect/read output, stop/archive it, and confirm terminal history remains readable. Verify no controller MCP action appears in a worker CLI's own MCP tool list.
 
-- [ ] **Step 4: Update docs and commit**
+- [x] **Step 4: Update docs and commit**
 
 Record the implemented action list, explicit controller-only injection, test results, and remaining Browser/Computer-domain non-goals.
 
