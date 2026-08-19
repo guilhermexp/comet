@@ -100,7 +100,11 @@ Values are validated and clamped before persistence. The Resources page shows:
 - sessions ordered by physical footprint;
 - sample age and attribution status;
 - expandable top processes;
-- thresholds and hibernation controls.
+- monitoring, notification, and alert thresholds.
+
+Automatic hibernation remains hidden until the separate guarded lifecycle phase
+is implemented and explicitly approved; the persisted fields are reserved for
+that migration and do not create a no-op control.
 
 The page exists only under Settings and does not add a permanent entry to the
 terminal or sidebar.

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Subcommand;
 use zeron_workers_unpeel::LocalWorkersClient;
@@ -89,6 +90,19 @@ fn render_human(
     identities: &[WorkersTopIdentity],
     include_processes: bool,
 ) -> String {
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    render_human_at(snapshot, identities, include_processes, now_unix_ms)
+}
+
+fn render_human_at(
+    snapshot: &WorkersResourceSnapshot,
+    identities: &[WorkersTopIdentity],
+    include_processes: bool,
+    now_unix_ms: u64,
+) -> String {
     if snapshot.support == ResourceSupport::Unsupported {
         return format!(
             "Workers resources unavailable: {}\n",
@@ -99,7 +113,10 @@ fn render_human(
         .iter()
         .map(|identity| (identity.session_id.as_str(), identity))
         .collect::<HashMap<_, _>>();
-    let mut output = String::from("CPU      MEMORY    PROC  PROJECT              SESSION\n");
+    let sample_age_seconds = now_unix_ms.saturating_sub(snapshot.sampled_at_unix_ms) / 1_000;
+    let mut output = format!(
+        "Sample age: {sample_age_seconds}s\nCPU      MEMORY    PROC  PROJECT              SESSION\n"
+    );
     for session in &snapshot.sessions {
         let identity = identities.get(session.session_id.as_str()).copied();
         let project = identity.map(|value| value.project.as_str()).unwrap_or("-");
@@ -214,6 +231,7 @@ mod tests {
         assert!(output.contains("12.5%"));
         assert!(output.contains("2.00 GiB"));
         assert!(output.contains("3"));
+        assert!(output.contains("Sample age:"));
         assert!(!output.contains("pid 42"));
     }
 

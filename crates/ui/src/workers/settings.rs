@@ -1174,10 +1174,6 @@ impl WorkersSettingsView {
             notifications_enabled: !settings.notifications_enabled,
             ..settings.clone()
         };
-        let hibernation_next = WorkersResourceSettings {
-            hibernation_enabled: !settings.hibernation_enabled,
-            ..settings.clone()
-        };
         let warning_decrement = threshold_settings(&settings, ThresholdKind::Warning, -1);
         let warning_increment = threshold_settings(&settings, ThresholdKind::Warning, 1);
         let critical_decrement = threshold_settings(&settings, ThresholdKind::Critical, -1);
@@ -1251,23 +1247,6 @@ impl WorkersSettingsView {
                     critical_increment,
                     cx,
                 )),
-            )
-            .child(
-                resource_setting_row(
-                    theme,
-                    "Automatic hibernation",
-                    "Opt-in lifecycle policy for idle workers; disabled by default.",
-                )
-                .child(
-                    widgets::toggle_switch(theme, settings.hibernation_enabled)
-                        .id("workers-resource-hibernation")
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.model.update(cx, |model, cx| {
-                                model.set_resource_settings(hibernation_next.clone(), cx)
-                            });
-                        })),
-                ),
             );
 
         let session_rows =

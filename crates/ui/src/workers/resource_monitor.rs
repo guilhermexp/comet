@@ -58,6 +58,18 @@ impl MemoryPressureReducer {
     }
 }
 
+fn reduce_pressure_sample(
+    reducer: &mut MemoryPressureReducer,
+    current: MemoryPressureLevel,
+    pending_peak: MemoryPressureLevel,
+) -> PressureAction {
+    let action = reducer.observe(pending_peak.max(current));
+    if current < pending_peak {
+        let _ = reducer.observe(current);
+    }
+    action
+}
+
 #[cfg(target_os = "macos")]
 mod pressure_source {
     use std::sync::Arc;
@@ -74,6 +86,7 @@ mod pressure_source {
 
     pub struct MemoryPressureSource {
         level: Arc<AtomicU8>,
+        pending_peak: Arc<AtomicU8>,
         source: DispatchRetained<DispatchSource>,
         _handler: RcBlock<dyn Fn()>,
     }
@@ -98,6 +111,8 @@ mod pressure_source {
             let source_ptr: *const DispatchSource = &*source;
             let level = Arc::new(AtomicU8::new(0));
             let callback_level = level.clone();
+            let pending_peak = Arc::new(AtomicU8::new(0));
+            let callback_peak = pending_peak.clone();
             let handler: RcBlock<dyn Fn()> = RcBlock::new(move || {
                 // SAFETY: the handler is retained by `MemoryPressureSource`, which also retains
                 // the source for the entire callback lifetime.
@@ -115,6 +130,9 @@ mod pressure_source {
                     0
                 };
                 callback_level.store(next, Ordering::Release);
+                if next > 0 {
+                    callback_peak.fetch_max(next, Ordering::AcqRel);
+                }
             });
             // SAFETY: libdispatch copies the valid heap block and invokes it with no arguments.
             unsafe {
@@ -123,17 +141,24 @@ mod pressure_source {
             source.activate();
             Self {
                 level,
+                pending_peak,
                 source,
                 _handler: handler,
             }
         }
 
-        pub fn level(&self) -> MemoryPressureLevel {
-            match self.level.load(Ordering::Acquire) {
-                2 => MemoryPressureLevel::Critical,
-                1 => MemoryPressureLevel::Warning,
-                _ => MemoryPressureLevel::Normal,
-            }
+        pub fn sample(&self) -> (MemoryPressureLevel, MemoryPressureLevel) {
+            let current = decode_level(self.level.load(Ordering::Acquire));
+            let pending = decode_level(self.pending_peak.swap(0, Ordering::AcqRel));
+            (current, pending)
+        }
+    }
+
+    fn decode_level(value: u8) -> MemoryPressureLevel {
+        match value {
+            2 => MemoryPressureLevel::Critical,
+            1 => MemoryPressureLevel::Warning,
+            _ => MemoryPressureLevel::Normal,
         }
     }
 
@@ -155,8 +180,8 @@ mod pressure_source {
             Self
         }
 
-        pub fn level(&self) -> MemoryPressureLevel {
-            MemoryPressureLevel::Normal
+        pub fn sample(&self) -> (MemoryPressureLevel, MemoryPressureLevel) {
+            (MemoryPressureLevel::Normal, MemoryPressureLevel::Normal)
         }
     }
 }
@@ -318,17 +343,11 @@ impl WorkersResourceMonitor {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.sync_settings(cx);
+        self.observe_memory_pressure(cx);
         if self.sampling {
             return;
         }
-        self.observe_memory_pressure(cx);
-        self.settings = self
-            .model
-            .read(cx)
-            .settings
-            .as_ref()
-            .map(|settings| settings.resources.clone())
-            .unwrap_or_else(WorkersResourceSettings::default);
         if !self.settings.monitoring_enabled {
             return;
         }
@@ -356,9 +375,19 @@ impl WorkersResourceMonitor {
         .detach();
     }
 
+    fn sync_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings = self
+            .model
+            .read(cx)
+            .settings
+            .as_ref()
+            .map(|settings| settings.resources.clone())
+            .unwrap_or_else(WorkersResourceSettings::default);
+    }
+
     fn observe_memory_pressure(&mut self, cx: &mut Context<Self>) {
-        let level = self.pressure_source.level();
-        let action = self.pressure_reducer.observe(level);
+        let (level, pending_peak) = self.pressure_source.sample();
+        let action = reduce_pressure_sample(&mut self.pressure_reducer, level, pending_peak);
         let changed = level != self.pressure_level;
         self.pressure_level = level;
         if action != PressureAction::None {
@@ -369,7 +398,7 @@ impl WorkersResourceMonitor {
                 }
             }
             self.pressure_generation = self.pressure_generation.wrapping_add(1);
-            post_pressure_alert(level, self.snapshot.as_ref());
+            post_pressure_alert(pending_peak.max(level), self.snapshot.as_ref());
         }
         if changed || action != PressureAction::None {
             self.generation = self.generation.wrapping_add(1);
@@ -378,28 +407,33 @@ impl WorkersResourceMonitor {
     }
 
     fn apply_snapshot(&mut self, snapshot: WorkersResourceSnapshot, cx: &mut Context<Self>) {
+        self.sync_settings(cx);
         let metadata = resource_metadata(&self.model.read(cx));
         let live_ids = snapshot
             .sessions
             .iter()
             .map(|session| session.session_id.clone())
             .collect::<HashSet<_>>();
-        for session in &snapshot.sessions {
-            let transition = self
-                .reducers
-                .entry(session.session_id.clone())
-                .or_default()
-                .observe(
-                    self.settings.per_worker_warning_gib,
-                    self.settings.per_worker_critical_gib,
-                    session.physical_footprint_bytes,
-                    session.attribution_complete,
-                );
-            if self.settings.notifications_enabled
-                && let Some(level) = transition
-            {
-                post_resource_alert(level, session, metadata.get(&session.session_id));
+        if self.settings.monitoring_enabled {
+            for session in &snapshot.sessions {
+                let transition = self
+                    .reducers
+                    .entry(session.session_id.clone())
+                    .or_default()
+                    .observe(
+                        self.settings.per_worker_warning_gib,
+                        self.settings.per_worker_critical_gib,
+                        session.physical_footprint_bytes,
+                        session.attribution_complete,
+                    );
+                if self.settings.notifications_enabled
+                    && let Some(level) = transition
+                {
+                    post_resource_alert(level, session, metadata.get(&session.session_id));
+                }
             }
+        } else {
+            self.reducers.clear();
         }
         self.reducers
             .retain(|session_id, _| live_ids.contains(session_id));
@@ -558,6 +592,18 @@ mod tests {
             reducer.observe(MemoryPressureLevel::Warning),
             PressureAction::TrimCaches
         );
+    }
+
+    #[test]
+    fn transient_critical_pressure_is_not_lost_before_the_next_poll() {
+        let mut reducer = MemoryPressureReducer::default();
+        let action = reduce_pressure_sample(
+            &mut reducer,
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Critical,
+        );
+
+        assert_eq!(action, PressureAction::TrimAggressively);
     }
 
     fn gib(value: f64) -> u64 {

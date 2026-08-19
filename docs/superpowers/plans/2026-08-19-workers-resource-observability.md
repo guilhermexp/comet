@@ -447,7 +447,8 @@ Add the tab and render:
 - per-session rows ordered by footprint;
 - expandable bounded top-process rows;
 - monitoring/notification thresholds;
-- disabled-by-default hibernation controls (persistence only in this plan).
+- no hibernation control in this phase; persistence fields remain reserved for
+  the separately approved guarded lifecycle implementation.
 
 Do not modify `render_session_row`, `render_session`, Workers title bar, or
 menu-bar projection to include resource values.

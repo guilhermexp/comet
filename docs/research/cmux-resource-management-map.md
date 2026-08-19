@@ -1,8 +1,8 @@
 # CMUX Resource Management Map for Comet
 
-Date: 2026-08-19  
-CMUX source: `https://github.com/manaflow-ai/cmux.git`  
-Pinned commit: `90c1222375ab1751760393f8d4c2533929334bb9`  
+Date: 2026-08-19
+CMUX source: `https://github.com/manaflow-ai/cmux.git`
+Pinned commit: `90c1222375ab1751760393f8d4c2533929334bb9`
 Local oracle: `third_party/cmux` (reference only; never vendor or commit)
 
 ## Scope and license boundary
