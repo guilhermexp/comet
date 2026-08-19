@@ -236,6 +236,10 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Changes pane: side-by-side diffs instead of the unified stack.
+    pub diff_split: bool,
+    /// Interactive identity accent. Defaults to the upstream Zeron color.
+    pub accent_color: crate::theme::AccentColor,
 }
 
 impl Default for UiSettings {
@@ -262,6 +266,8 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            diff_split: false,
+            accent_color: crate::theme::AccentColor::default(),
         }
     }
 }
@@ -548,6 +554,8 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            diff_split: true,
+            accent_color: crate::theme::AccentColor::Cyan,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -597,6 +605,7 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert_eq!(loaded.accent_color, crate::theme::AccentColor::Zeron);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
         assert!(
