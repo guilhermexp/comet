@@ -582,6 +582,7 @@ impl gpui::Element for TerminalElement {
             bounds.top() + px(TERM_PADDING),
         );
         let geometry = super::panel::GridGeometry {
+            bounds,
             origin,
             cell_w: f32::from(cell_w),
             line_h: f32::from(line_h),
