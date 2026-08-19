@@ -4,6 +4,7 @@
 //! ACP controller sessions receive this process in their `mcpServers` list.
 
 use std::io::{BufRead as _, Write as _};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -15,6 +16,11 @@ use crate::{
 
 pub const CONTROLLER_MCP_ARG: &str = "__workers_mcp__";
 const CONTROLLER_ENV: &str = "COMET_WORKERS_CONTROLLER";
+
+fn controller_client() -> &'static LocalWorkersClient {
+    static CLIENT: OnceLock<LocalWorkersClient> = OnceLock::new();
+    CLIENT.get_or_init(LocalWorkersClient::new)
+}
 
 const ACTIONS: &[&str] = &[
     "help",
@@ -95,7 +101,7 @@ pub fn handle_request(request: Value) -> Option<Value> {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                match dispatch_action(&LocalWorkersClient::new(), &arguments) {
+                match dispatch_action(controller_client(), &arguments) {
                     Ok(value) => tool_success(id, value),
                     Err(error) => tool_error(id, &error),
                 }
