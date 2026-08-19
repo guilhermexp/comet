@@ -1,7 +1,10 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
 mod activity_bridge;
+mod controller_mcp;
 pub mod resources;
+
+pub use controller_mcp::CONTROLLER_MCP_ARG;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,7 +32,8 @@ fn is_internal_host_mode(args: &[String]) -> bool {
     };
     matches!(
         argument,
-        mcp_host::MCP_HOST_ARG
+        controller_mcp::CONTROLLER_MCP_ARG
+            | mcp_host::MCP_HOST_ARG
             | browser_mcp::BROWSER_MCP_ARG
             | mcp_gate::MCP_GATE_ARG
             | browser_mcp::BROWSER_CLEANUP_ARG
@@ -61,6 +65,16 @@ pub fn session_host_launcher_path(args: &[String]) -> Option<&Path> {
 /// Returns `true` after a host invocation has run, `false` for normal Comet CLI/UI arguments.
 pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some(controller_mcp::CONTROLLER_MCP_ARG) {
+        if args.len() != 1 {
+            return Err(format!(
+                "usage: zeron {}",
+                controller_mcp::CONTROLLER_MCP_ARG
+            ));
+        }
+        controller_mcp::run_stdio()?;
+        return Ok(true);
+    }
     if args.first().map(String::as_str) == Some(session_host::COMPACT_OUTPUT_JOURNALS_ARG) {
         if args.len() != 1 {
             return Err(format!(
@@ -114,6 +128,11 @@ pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
         return Ok(true);
     }
     Ok(false)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_handle_request(request: Value) -> Option<Value> {
+    controller_mcp::handle_request(request)
 }
 
 /// Make the current Comet executable the Unpeel launcher when no explicit
