@@ -5,6 +5,7 @@
 mod auth_cli;
 mod daemon;
 mod update_cli;
+mod workers_cli;
 
 use clap::{Parser, Subcommand};
 
@@ -53,6 +54,11 @@ enum Command {
         /// worker must launch it at `depth + 1`.
         #[arg(long, default_value_t = 0)]
         depth: usize,
+    },
+    /// Inspect local worker sessions without starting the headed app.
+    Workers {
+        #[command(subcommand)]
+        command: workers_cli::WorkersCommand,
     },
 }
 
@@ -202,6 +208,7 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(mcp_server(chat, port, depth))
         }
+        Some(Command::Workers { command }) => workers_cli::run(command),
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
             DaemonCommand::Uninstall => daemon::uninstall(),
@@ -233,7 +240,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `comet mcp-server`: an MCP server on stdio backed by the engine's terminal
+/// `zeron mcp-server`: an MCP server on stdio backed by the engine's terminal
 /// RPCs over IPC. The harness launches one per run through `--mcp-config`.
 ///
 /// stdout carries MCP frames and nothing else — the tracing subscriber above
