@@ -72,6 +72,7 @@ pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
                 controller_mcp::CONTROLLER_MCP_ARG
             ));
         }
+        ensure_controller_mcp_host_launcher()?;
         controller_mcp::run_stdio()?;
         return Ok(true);
     }
@@ -164,6 +165,11 @@ pub fn configure_self_as_session_host_launcher() -> Result<(), String> {
     // any application worker threads exist. Children inherit this value.
     unsafe { std::env::set_var("UNPEEL_HOST_CMD", executable) };
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn ensure_controller_mcp_host_launcher() -> Result<(), String> {
+    configure_self_as_session_host_launcher()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

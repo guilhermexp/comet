@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
     controller_mcp_clean_output, controller_mcp_encode_keys, controller_mcp_handle_request,
-    controller_mcp_parse_launch, is_session_host_mode,
+    controller_mcp_parse_launch, ensure_controller_mcp_host_launcher, is_session_host_mode,
 };
 
 #[test]
@@ -156,4 +156,26 @@ fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error:
         "project-1"
     );
     Ok(())
+}
+
+#[test]
+fn controller_mcp_prepares_the_current_binary_as_session_host() {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let previous = std::env::var_os("UNPEEL_HOST_CMD");
+    // SAFETY: this test binary serializes its environment mutations with ENV_LOCK.
+    unsafe { std::env::remove_var("UNPEEL_HOST_CMD") };
+
+    ensure_controller_mcp_host_launcher().expect("controller configures its host launcher");
+
+    assert_eq!(
+        std::env::var_os("UNPEEL_HOST_CMD").map(std::path::PathBuf::from),
+        std::env::current_exe().ok()
+    );
+    // SAFETY: restore the process environment before releasing ENV_LOCK.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("UNPEEL_HOST_CMD", value),
+            None => std::env::remove_var("UNPEEL_HOST_CMD"),
+        }
+    }
 }
