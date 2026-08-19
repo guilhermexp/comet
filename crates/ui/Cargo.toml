@@ -35,6 +35,8 @@ sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+dispatch2 = "0.3.1"
+block2 = "0.6.2"
 
 [dev-dependencies]
 tempfile.workspace = true

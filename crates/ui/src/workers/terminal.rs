@@ -439,6 +439,21 @@ impl WorkersTerminal {
         })
     }
 
+    /// Release the local terminal history while preserving the hosted PTY and session.
+    /// The next poll asks the worker host for a fresh viewport, so no agent is stopped.
+    pub fn shed_scrollback(&mut self, cx: &mut Context<Self>) {
+        if self.session_id.is_none() {
+            return;
+        }
+        self.emulator = self.geometry.map_or_else(
+            || Emulator::new(80, 24),
+            |geometry| Emulator::new(geometry.cols, geometry.rows),
+        );
+        self.viewport_dirty = true;
+        self.selection_drag = None;
+        cx.notify();
+    }
+
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.session_id.is_none() || !self.coalescer.push(bytes) {
             return;

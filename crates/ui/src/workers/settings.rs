@@ -1125,6 +1125,7 @@ impl WorkersSettingsView {
         let snapshot = monitor.snapshot().cloned();
         let last_error = monitor.last_error().map(str::to_owned);
         let sampling = monitor.is_sampling();
+        let pressure_label = monitor.pressure_level().label();
         let settings = self
             .model
             .read(cx)
@@ -1382,6 +1383,7 @@ impl WorkersSettingsView {
                 resource_metric_card(theme, "Memory", format_memory_bytes(total_memory)),
                 resource_metric_card(theme, "CPU", format_cpu_percent(total_cpu)),
                 resource_metric_card(theme, "Processes", total_processes.to_string()),
+                resource_metric_card(theme, "Pressure", pressure_label.to_owned()),
             ]))
             .child(
                 div()

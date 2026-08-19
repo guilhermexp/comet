@@ -10,6 +10,160 @@ use super::model::WorkersModel;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryPressureLevel {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+impl MemoryPressureLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Warning => "Warning",
+            Self::Critical => "Critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PressureAction {
+    #[default]
+    None,
+    TrimCaches,
+    TrimAggressively,
+}
+
+#[derive(Debug, Default)]
+pub struct MemoryPressureReducer {
+    level: MemoryPressureLevel,
+}
+
+impl MemoryPressureReducer {
+    pub fn observe(&mut self, level: MemoryPressureLevel) -> PressureAction {
+        let action = match (self.level, level) {
+            (previous, MemoryPressureLevel::Critical)
+                if previous < MemoryPressureLevel::Critical =>
+            {
+                PressureAction::TrimAggressively
+            }
+            (MemoryPressureLevel::Normal, MemoryPressureLevel::Warning) => {
+                PressureAction::TrimCaches
+            }
+            _ => PressureAction::None,
+        };
+        self.level = level;
+        action
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod pressure_source {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use block2::RcBlock;
+    use dispatch2::{
+        _dispatch_source_type_memorypressure, DispatchObject, DispatchQoS, DispatchQueue,
+        DispatchRetained, DispatchSource, GlobalQueueIdentifier,
+        dispatch_source_memorypressure_flags_t,
+    };
+
+    use super::MemoryPressureLevel;
+
+    pub struct MemoryPressureSource {
+        level: Arc<AtomicU8>,
+        source: DispatchRetained<DispatchSource>,
+        _handler: RcBlock<dyn Fn()>,
+    }
+
+    impl MemoryPressureSource {
+        pub fn new() -> Self {
+            let mask = dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_NORMAL.0
+                | dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_WARN.0
+                | dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL.0;
+            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+                DispatchQoS::Utility,
+            ));
+            // SAFETY: libdispatch owns this process-wide source type and the source has no handle.
+            let source = unsafe {
+                DispatchSource::new(
+                    std::ptr::addr_of!(_dispatch_source_type_memorypressure).cast_mut(),
+                    0,
+                    mask as usize,
+                    Some(&queue),
+                )
+            };
+            let source_ptr: *const DispatchSource = &*source;
+            let level = Arc::new(AtomicU8::new(0));
+            let callback_level = level.clone();
+            let handler: RcBlock<dyn Fn()> = RcBlock::new(move || {
+                // SAFETY: the handler is retained by `MemoryPressureSource`, which also retains
+                // the source for the entire callback lifetime.
+                let data = unsafe { (&*source_ptr).data() };
+                let critical =
+                    dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL.0
+                        as usize;
+                let warning =
+                    dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_WARN.0 as usize;
+                let next = if data & critical != 0 {
+                    2
+                } else if data & warning != 0 {
+                    1
+                } else {
+                    0
+                };
+                callback_level.store(next, Ordering::Release);
+            });
+            // SAFETY: libdispatch copies the valid heap block and invokes it with no arguments.
+            unsafe {
+                source.set_event_handler_with_block(RcBlock::as_ptr(&handler).cast());
+            }
+            source.activate();
+            Self {
+                level,
+                source,
+                _handler: handler,
+            }
+        }
+
+        pub fn level(&self) -> MemoryPressureLevel {
+            match self.level.load(Ordering::Acquire) {
+                2 => MemoryPressureLevel::Critical,
+                1 => MemoryPressureLevel::Warning,
+                _ => MemoryPressureLevel::Normal,
+            }
+        }
+    }
+
+    impl Drop for MemoryPressureSource {
+        fn drop(&mut self) {
+            self.source.cancel();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod pressure_source {
+    use super::MemoryPressureLevel;
+
+    pub struct MemoryPressureSource;
+
+    impl MemoryPressureSource {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn level(&self) -> MemoryPressureLevel {
+            MemoryPressureLevel::Normal
+        }
+    }
+}
+
+use pressure_source::MemoryPressureSource;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResourceAlertLevel {
     #[default]
     Normal,
@@ -65,6 +219,11 @@ pub struct WorkersResourceMonitor {
     details_requested: bool,
     generation: u64,
     last_error: Option<String>,
+    pressure_source: MemoryPressureSource,
+    pressure_reducer: MemoryPressureReducer,
+    pressure_level: MemoryPressureLevel,
+    pressure_action: PressureAction,
+    pressure_generation: u64,
     _poll_task: Task<()>,
 }
 
@@ -88,6 +247,11 @@ impl WorkersResourceMonitor {
             details_requested: false,
             generation: 0,
             last_error: None,
+            pressure_source: MemoryPressureSource::new(),
+            pressure_reducer: MemoryPressureReducer::default(),
+            pressure_level: MemoryPressureLevel::Normal,
+            pressure_action: PressureAction::None,
+            pressure_generation: 0,
             _poll_task: poll_task,
         };
         monitor.refresh(cx);
@@ -112,6 +276,18 @@ impl WorkersResourceMonitor {
 
     pub fn is_sampling(&self) -> bool {
         self.sampling
+    }
+
+    pub fn pressure_level(&self) -> MemoryPressureLevel {
+        self.pressure_level
+    }
+
+    pub fn pressure_action(&self) -> PressureAction {
+        self.pressure_action
+    }
+
+    pub fn pressure_generation(&self) -> u64 {
+        self.pressure_generation
     }
 
     pub fn set_details_requested(&mut self, requested: bool, cx: &mut Context<Self>) {
@@ -145,6 +321,7 @@ impl WorkersResourceMonitor {
         if self.sampling {
             return;
         }
+        self.observe_memory_pressure(cx);
         self.settings = self
             .model
             .read(cx)
@@ -156,7 +333,8 @@ impl WorkersResourceMonitor {
             return;
         }
         self.sampling = true;
-        let include_processes = self.details_requested;
+        let include_processes =
+            self.details_requested && self.pressure_level == MemoryPressureLevel::Normal;
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -176,6 +354,27 @@ impl WorkersResourceMonitor {
             });
         })
         .detach();
+    }
+
+    fn observe_memory_pressure(&mut self, cx: &mut Context<Self>) {
+        let level = self.pressure_source.level();
+        let action = self.pressure_reducer.observe(level);
+        let changed = level != self.pressure_level;
+        self.pressure_level = level;
+        if action != PressureAction::None {
+            self.pressure_action = action;
+            if let Some(snapshot) = self.snapshot.as_mut() {
+                for session in &mut snapshot.sessions {
+                    session.top_processes.clear();
+                }
+            }
+            self.pressure_generation = self.pressure_generation.wrapping_add(1);
+            post_pressure_alert(level, self.snapshot.as_ref());
+        }
+        if changed || action != PressureAction::None {
+            self.generation = self.generation.wrapping_add(1);
+            cx.notify();
+        }
     }
 
     fn apply_snapshot(&mut self, snapshot: WorkersResourceSnapshot, cx: &mut Context<Self>) {
@@ -255,6 +454,29 @@ fn post_resource_alert(
     );
 }
 
+fn post_pressure_alert(level: MemoryPressureLevel, snapshot: Option<&WorkersResourceSnapshot>) {
+    let heaviest = snapshot
+        .into_iter()
+        .flat_map(|snapshot| snapshot.sessions.iter())
+        .filter(|session| session.attribution_complete)
+        .max_by_key(|session| session.physical_footprint_bytes)
+        .map(|session| session.session_id.as_str());
+    let severity = match level {
+        MemoryPressureLevel::Normal => return,
+        MemoryPressureLevel::Warning => "Memory pressure is elevated",
+        MemoryPressureLevel::Critical => "Memory pressure is critical",
+    };
+    let detail = heaviest
+        .map(|session_id| format!(" Heaviest hosted worker: {session_id}."))
+        .unwrap_or_default();
+    crate::notify::post(
+        "Workers memory pressure",
+        &format!(
+            "{severity}. Comet released local caches without stopping any worker.{detail} Open Settings -> Resources for details."
+        ),
+    );
+}
+
 pub struct WorkersResourceGlobal {
     pub monitor: Entity<WorkersResourceMonitor>,
 }
@@ -306,6 +528,35 @@ mod tests {
         assert_eq!(
             reducer.observe(2, 6, gib(3.0), true),
             Some(ResourceAlertLevel::Warning)
+        );
+    }
+
+    #[test]
+    fn pressure_reducer_reacts_only_to_escalation_and_resets_on_normal() {
+        let mut reducer = MemoryPressureReducer::default();
+        assert_eq!(
+            reducer.observe(MemoryPressureLevel::Normal),
+            PressureAction::None
+        );
+        assert_eq!(
+            reducer.observe(MemoryPressureLevel::Warning),
+            PressureAction::TrimCaches
+        );
+        assert_eq!(
+            reducer.observe(MemoryPressureLevel::Warning),
+            PressureAction::None
+        );
+        assert_eq!(
+            reducer.observe(MemoryPressureLevel::Critical),
+            PressureAction::TrimAggressively
+        );
+        assert_eq!(
+            reducer.observe(MemoryPressureLevel::Normal),
+            PressureAction::None
+        );
+        assert_eq!(
+            reducer.observe(MemoryPressureLevel::Warning),
+            PressureAction::TrimCaches
         );
     }
 

@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, Image, IntoElement, MouseButton, MouseDownEvent,
-    ObjectFit, PathPromptOptions, Pixels, Point, Render, SharedString, StyledImage as _,
-    Subscription, Task, Window, div, img, prelude::*, px,
+    AnyElement, AppContext as _, ClipboardItem, Context, Entity, Image, IntoElement, MouseButton,
+    MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point, Render, SharedString,
+    StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
 };
 use zeron_workers_unpeel::{
     WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession,
@@ -32,6 +32,7 @@ use super::presentation::{
 };
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
+use super::resource_monitor::{PressureAction, WorkersResourceGlobal};
 #[cfg(target_os = "macos")]
 use super::session_gallery::native as native_session_gallery;
 use super::session_gallery::{self, CaptureMode};
@@ -1197,12 +1198,15 @@ pub struct WorkersContent {
     gallery_pulse_task: Option<Task<()>>,
     _gallery_poll_task: Task<()>,
     _model_observation: Subscription,
+    _resource_observation: Subscription,
+    last_pressure_generation: u64,
 }
 
 impl WorkersContent {
     pub fn new(model: Entity<WorkersModel>, cx: &mut Context<Self>) -> Self {
         let terminal = cx.new(WorkersTerminal::new);
         let settings = cx.new(|cx| WorkersSettingsView::new(model.clone(), cx));
+        let resource_monitor = cx.global::<WorkersResourceGlobal>().monitor.clone();
         let model_observation = cx.observe(&model, {
             let terminal = terminal.clone();
             move |this, model, cx| {
@@ -1214,6 +1218,27 @@ impl WorkersContent {
                     this.close_session_gallery(cx);
                 }
                 cx.notify();
+            }
+        });
+        let resource_observation = cx.observe(&resource_monitor, {
+            let terminal = terminal.clone();
+            move |this, monitor, cx| {
+                let monitor = monitor.read(cx);
+                if monitor.pressure_generation() == this.last_pressure_generation {
+                    return;
+                }
+                this.last_pressure_generation = monitor.pressure_generation();
+                match monitor.pressure_action() {
+                    PressureAction::None => {}
+                    PressureAction::TrimCaches | PressureAction::TrimAggressively => {
+                        terminal.update(cx, |terminal, cx| terminal.shed_scrollback(cx));
+                        if this.gallery_open {
+                            this.close_session_gallery(cx);
+                        } else {
+                            this.gallery_artifacts.clear();
+                        }
+                    }
+                }
             }
         });
         let gallery_poll_task = cx.spawn(async move |this, cx| {
@@ -1253,6 +1278,8 @@ impl WorkersContent {
             gallery_pulse_task: None,
             _gallery_poll_task: gallery_poll_task,
             _model_observation: model_observation,
+            _resource_observation: resource_observation,
+            last_pressure_generation: resource_monitor.read(cx).pressure_generation(),
         }
     }
 
