@@ -549,7 +549,7 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 /// A composer send whose doc command is queued but not yet executed by the
 /// chat's host device — cleared when the host writes the user message back
 /// into the transcript (same client-minted id as the [`AppState::echoes`]
-/// dedup), or after [`PENDING_SEND_TTL_MS`].
+/// dedup), or after [`UNDELIVERED_GRACE_MS`].
 #[derive(Debug, Clone)]
 struct PendingSend {
     message_id: String,
@@ -1024,6 +1024,15 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Relaxed)
             .min(progress.total);
         Some(((done * 100) / progress.total).min(99) as u8)
+    }
+
+    /// A send whose queued command is past the delivery grace and still
+    /// unacked. The explicit failed/retry trailer takes precedence; this
+    /// compatibility seam remains for the static queued fallback.
+    pub fn send_queued_unacked(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+        })
     }
 
     /// Is a send still in flight for this chat (unacked)? Inside the grace
@@ -2404,6 +2413,24 @@ mod tests {
 
         state.apply_devices(vec![device("local", "José's MacBook Pro")]);
         assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
+    }
+
+    #[test]
+    fn queued_unacked_takes_over_after_the_ttl() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        assert!(!s.send_queued_unacked("c", now), "no send, no queued line");
+        s.begin_pending_send("c", "m1", now);
+        // Inside the TTL the Working overlay owns the surface.
+        assert!(s.send_pending("c", now));
+        assert!(!s.send_queued_unacked("c", now));
+        // Past it, the overlay lapses and the queued line takes over.
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        assert!(!s.send_pending("c", later));
+        assert!(s.send_queued_unacked("c", later));
+        // The host ack (or failure cleanup) clears it.
+        s.end_pending_send("c", "m1");
+        assert!(!s.send_queued_unacked("c", later));
     }
 
     #[test]
