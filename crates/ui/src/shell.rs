@@ -3646,8 +3646,15 @@ impl Shell {
         motion::lerp(from, to, RESIZE.progress(raw))
     }
 
-    /// Animated width container: tweens 200ms ease-out on collapse/expand, and
-    /// clips a fixed-width inner so content never reflows mid-transition.
+    fn tween_active(&self, tween: Option<WidthTween>) -> bool {
+        tween.is_some_and(|tween| {
+            !self.reduced_motion
+                && tween.started.elapsed() < RESIZE.total().mul_f32(motion::speed_scale())
+        })
+    }
+
+    /// Animated width container: tweens 200ms ease-out on collapse/expand and
+    /// clips the surface as it follows the current width.
     fn pane_container(
         &self,
         tween: Option<WidthTween>,
@@ -6969,7 +6976,14 @@ impl Shell {
             None => gpui::Empty.into_any_element(),
         };
         let content: AnyElement = match active {
-            Some(UtilityPane::Terminal) => self.terminal_panel(cx).into_any_element(),
+            Some(UtilityPane::Terminal) => {
+                let panel = self.terminal_panel(cx);
+                let resize_suspended = self.tween_active(self.right_tween);
+                panel.update(cx, |panel, _| {
+                    panel.set_resize_suspended(resize_suspended)
+                });
+                panel.into_any_element()
+            }
             Some(UtilityPane::Changes) => {
                 let changes = self.changes_pane(cx);
                 changes.update(cx, |changes, cx| changes.ensure_watch(cx));

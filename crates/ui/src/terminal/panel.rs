@@ -276,6 +276,10 @@ pub struct TerminalPanel {
     /// Explicit right-pane context used by Workers. `None` keeps the existing
     /// selected-Orchestrator-chat behavior.
     render_context: Option<String>,
+    /// The right pane is in its width tween. Keep painting the retained grid
+    /// through the changing clip, but do not feed transient widths into the
+    /// emulator: alternate-screen rows truncate rather than reflow.
+    resize_suspended: bool,
     tab_seq: u64,
     drag: Option<DragState>,
     tabs_scroll: ScrollHandle,
@@ -299,6 +303,7 @@ impl TerminalPanel {
             open: false,
             embedded: false,
             render_context: None,
+            resize_suspended: false,
             tab_seq: 0,
             drag: None,
             tabs_scroll: ScrollHandle::new(),
@@ -331,6 +336,10 @@ impl TerminalPanel {
         if let Some(chat) = self.selected_chat(cx) {
             self.open_tab(chat, cx);
         }
+    }
+
+    pub fn set_resize_suspended(&mut self, suspended: bool) {
+        self.resize_suspended = suspended;
     }
 
     /// Shell toggle hook. Opening lazily creates the first tab for the
@@ -863,6 +872,9 @@ impl TerminalPanel {
         // mapping needs the placement even on frames where nothing resized,
         // which is almost all of them.
         self.geometry = Some(geometry);
+        if self.resize_suspended {
+            return;
+        }
         let (cols, rows) = (geometry.cols, geometry.rows);
         let Some(chat) = self.selected_chat(cx) else {
             return;
@@ -1107,6 +1119,7 @@ impl TerminalPanel {
         // is selected then, with the column closed.
         if let Some(tabs) = self.chats.get_mut(chat)
             && ix < tabs.tabs.len()
+            && tabs.active != ix
         {
             tabs.active = ix;
             self.open = true;
