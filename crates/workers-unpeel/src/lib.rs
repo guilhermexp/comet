@@ -1,6 +1,7 @@
 //! Typed Comet adapter for the pinned Unpeel local worker runtime.
 
 mod activity_bridge;
+pub mod resources;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
