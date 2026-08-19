@@ -391,6 +391,11 @@ pub async fn upload_attachment(
                             Err(err) if attempt < 2 => {
                                 attempt += 1;
                                 tracing::warn!(error = %err, seq, attempt, "upload chunk retry");
+                                // Stagger by seq so parallel chunks that failed
+                                // together don't re-collide in lockstep.
+                                executor
+                                    .timer(Duration::from_millis(50 * (attempt as u64) * (seq + 1)))
+                                    .await;
                             }
                             Err(err) => return Err(err),
                         }
