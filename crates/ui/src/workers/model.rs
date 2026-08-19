@@ -7,8 +7,8 @@ use zeron_workers_unpeel::{
     LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch,
     WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap, WorkersCreateGroupRequest,
     WorkersCreateWorktreeRequest, WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset,
-    WorkersProject, WorkersProjectOrganizationPatch, WorkersSession, WorkersSessionSort,
-    WorkersSettingsSnapshot, WorkersTranscriptSettings,
+    WorkersProject, WorkersProjectOrganizationPatch, WorkersResourceSettings, WorkersSession,
+    WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
 };
 
 use super::archive::{archived_sessions_for_project, restore_action};
@@ -22,14 +22,16 @@ pub enum WorkersSettingsTab {
     Appearance,
     Transcripts,
     Notifications,
+    Resources,
 }
 
 impl WorkersSettingsTab {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Presets,
         Self::Appearance,
         Self::Transcripts,
         Self::Notifications,
+        Self::Resources,
     ];
 
     pub fn label(self) -> &'static str {
@@ -38,6 +40,7 @@ impl WorkersSettingsTab {
             Self::Appearance => "Appearance",
             Self::Transcripts => "Transcripts",
             Self::Notifications => "Notifications",
+            Self::Resources => "Resources",
         }
     }
 }
@@ -974,6 +977,14 @@ impl WorkersModel {
         self.run_settings_action(move |client| client.set_notification_settings(settings), cx);
     }
 
+    pub fn set_resource_settings(
+        &mut self,
+        settings: WorkersResourceSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_settings_action(move |client| client.set_resource_settings(settings), cx);
+    }
+
     pub fn test_notification(&self) {
         crate::notify::post(
             "Workers notification",
@@ -1556,6 +1567,8 @@ mod tests {
     fn appearance_is_the_second_workers_settings_tab_like_unpeel() {
         assert_eq!(WorkersSettingsTab::ALL[1], WorkersSettingsTab::Appearance);
         assert_eq!(WorkersSettingsTab::Appearance.label(), "Appearance");
+        assert_eq!(WorkersSettingsTab::ALL[4], WorkersSettingsTab::Resources);
+        assert_eq!(WorkersSettingsTab::Resources.label(), "Resources");
     }
 
     #[test]

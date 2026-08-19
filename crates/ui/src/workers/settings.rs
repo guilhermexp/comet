@@ -2,10 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*, px,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, Render, Subscription, Window, div,
+    prelude::*, px,
 };
+use zeron_workers_unpeel::resources::WorkersSessionResource;
 use zeron_workers_unpeel::{
-    PresetPatch, WorkersAppearanceSettings, WorkersNotificationSettings, WorkersTranscriptSettings,
+    PresetPatch, WorkersAppearanceSettings, WorkersNotificationSettings, WorkersResourceSettings,
+    WorkersTranscriptSettings,
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -15,6 +18,189 @@ use crate::theme::Theme;
 
 use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use super::presentation::{runtime_icon_path, spinner_frame};
+use super::resource_monitor::{WorkersResourceGlobal, WorkersResourceMonitor};
+
+fn format_memory_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f64 = bytes as f64;
+    if bytes_f64 >= GIB {
+        format!("{:.1} GiB", bytes_f64 / GIB)
+    } else if bytes_f64 >= MIB {
+        format!("{:.1} MiB", bytes_f64 / MIB)
+    } else if bytes_f64 >= KIB {
+        format!("{:.1} KiB", bytes_f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_cpu_percent(cpu_percent: f64) -> String {
+    format!("{:.1}%", cpu_percent.max(0.0))
+}
+
+fn sort_resource_sessions(sessions: &mut [WorkersSessionResource]) {
+    sessions.sort_by(|left, right| {
+        right
+            .physical_footprint_bytes
+            .cmp(&left.physical_footprint_bytes)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+}
+
+#[derive(Clone, Copy)]
+enum ThresholdKind {
+    Warning,
+    Critical,
+}
+
+fn threshold_settings(
+    settings: &WorkersResourceSettings,
+    kind: ThresholdKind,
+    delta: i16,
+) -> WorkersResourceSettings {
+    let mut next = settings.clone();
+    match kind {
+        ThresholdKind::Warning => {
+            next.per_worker_warning_gib = add_signed_u16(
+                next.per_worker_warning_gib,
+                delta,
+                1,
+                next.per_worker_critical_gib,
+            );
+        }
+        ThresholdKind::Critical => {
+            next.per_worker_critical_gib = add_signed_u16(
+                next.per_worker_critical_gib,
+                delta,
+                next.per_worker_warning_gib,
+                1_024,
+            );
+        }
+    }
+    next
+}
+
+fn add_signed_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
+    (i32::from(value) + i32::from(delta)).clamp(i32::from(minimum), i32::from(maximum)) as u16
+}
+
+fn resource_metric_card(theme: &Theme, label: &'static str, value: String) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h(px(68.0))
+        .p(px(12.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border.opacity(0.72))
+        .bg(crate::theme::ink(0.025))
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.text_muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .mt(px(5.0))
+                .text_size(px(17.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(value),
+        )
+        .into_any_element()
+}
+
+fn resource_setting_row(
+    theme: &Theme,
+    title: &'static str,
+    description: &'static str,
+) -> gpui::Div {
+    div()
+        .min_h(px(58.0))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border.opacity(0.72))
+        .bg(crate::theme::ink(0.025))
+        .child(
+            div()
+                .flex_1()
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.text)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .mt(px(2.0))
+                        .text_size(px(10.5))
+                        .text_color(theme.text_muted)
+                        .child(description),
+                ),
+        )
+}
+
+fn resource_stepper(
+    theme: &Theme,
+    id: &'static str,
+    value: u16,
+    decrement: WorkersResourceSettings,
+    increment: WorkersResourceSettings,
+    cx: &mut Context<WorkersSettingsView>,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(
+            div()
+                .mr(px(4.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(format!("{value} GiB")),
+        )
+        .child(
+            div()
+                .id(format!("{id}-minus"))
+                .size(px(26.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.0))
+                .cursor_pointer()
+                .hover(|el| el.bg(crate::theme::ink(0.1)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.set_resource_settings(decrement.clone(), cx)
+                    });
+                }))
+                .child("−"),
+        )
+        .child(
+            div()
+                .id(format!("{id}-plus"))
+                .size(px(26.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.0))
+                .cursor_pointer()
+                .hover(|el| el.bg(crate::theme::ink(0.1)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.set_resource_settings(increment.clone(), cx)
+                    });
+                }))
+                .child("+"),
+        )
+        .into_any_element()
+}
 
 fn normalize_preset_command(raw: &str) -> Option<(String, String)> {
     let command = raw.trim();
@@ -23,26 +209,51 @@ fn normalize_preset_command(raw: &str) -> Option<(String, String)> {
 
 pub struct WorkersSettingsView {
     model: Entity<WorkersModel>,
+    resource_monitor: Entity<WorkersResourceMonitor>,
     command_input: Entity<ComposerInput>,
     editing_preset_id: Option<String>,
+    expanded_resource_sessions: HashSet<String>,
     _model_observation: Subscription,
+    _resource_observation: Subscription,
     _command_events: Subscription,
 }
 
 impl WorkersSettingsView {
     pub fn new(model: Entity<WorkersModel>, cx: &mut Context<Self>) -> Self {
+        let resource_monitor = cx.global::<WorkersResourceGlobal>().monitor.clone();
         let command_input = cx.new(|cx| ComposerInput::new("Add command (e.g. claude --plan)", cx));
         let command_events = cx.subscribe(&command_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_preset(cx);
             }
         });
-        let model_observation = cx.observe(&model, |_, _, cx| cx.notify());
+        let observed_monitor = resource_monitor.clone();
+        let model_observation = cx.observe(&model, move |_, model, cx| {
+            let details_requested = matches!(
+                model.read(cx).route,
+                WorkersRoute::Settings(WorkersSettingsTab::Resources)
+            );
+            observed_monitor.update(cx, |monitor, cx| {
+                monitor.set_details_requested(details_requested, cx)
+            });
+            cx.notify();
+        });
+        let resource_observation = cx.observe(&resource_monitor, |_, _, cx| cx.notify());
+        let details_requested = matches!(
+            model.read(cx).route,
+            WorkersRoute::Settings(WorkersSettingsTab::Resources)
+        );
+        resource_monitor.update(cx, |monitor, cx| {
+            monitor.set_details_requested(details_requested, cx)
+        });
         Self {
             model,
+            resource_monitor,
             command_input,
             editing_preset_id: None,
+            expanded_resource_sessions: HashSet::new(),
             _model_observation: model_observation,
+            _resource_observation: resource_observation,
             _command_events: command_events,
         }
     }
@@ -908,6 +1119,323 @@ impl WorkersSettingsView {
             theme,
         )
     }
+
+    fn render_resources(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let monitor = self.resource_monitor.read(cx);
+        let snapshot = monitor.snapshot().cloned();
+        let last_error = monitor.last_error().map(str::to_owned);
+        let sampling = monitor.is_sampling();
+        let settings = self
+            .model
+            .read(cx)
+            .settings
+            .as_ref()
+            .map(|settings| settings.resources.clone())
+            .unwrap_or_else(|| monitor.settings().clone());
+        let session_metadata = self
+            .model
+            .read(cx)
+            .sessions()
+            .iter()
+            .map(|session| (session.id.clone(), session.title.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut sessions = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.sessions.clone())
+            .unwrap_or_default();
+        sort_resource_sessions(&mut sessions);
+
+        let total_cpu = sessions
+            .iter()
+            .map(|session| session.cpu_percent)
+            .sum::<f64>();
+        let total_memory = sessions
+            .iter()
+            .map(|session| session.physical_footprint_bytes)
+            .sum::<u64>();
+        let total_processes = sessions
+            .iter()
+            .map(|session| session.process_count)
+            .sum::<usize>();
+        let sample_age = snapshot.as_ref().map(|snapshot| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            now.saturating_sub(snapshot.sampled_at_unix_ms) / 1_000
+        });
+
+        let monitoring_next = WorkersResourceSettings {
+            monitoring_enabled: !settings.monitoring_enabled,
+            ..settings.clone()
+        };
+        let notifications_next = WorkersResourceSettings {
+            notifications_enabled: !settings.notifications_enabled,
+            ..settings.clone()
+        };
+        let hibernation_next = WorkersResourceSettings {
+            hibernation_enabled: !settings.hibernation_enabled,
+            ..settings.clone()
+        };
+        let warning_decrement = threshold_settings(&settings, ThresholdKind::Warning, -1);
+        let warning_increment = threshold_settings(&settings, ThresholdKind::Warning, 1);
+        let critical_decrement = threshold_settings(&settings, ThresholdKind::Critical, -1);
+        let critical_increment = threshold_settings(&settings, ThresholdKind::Critical, 1);
+
+        let controls = div()
+            .mt(px(24.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Background monitoring",
+                    "Samples hosted workers without adding metrics to the terminal or sidebar.",
+                )
+                .child(
+                    widgets::toggle_switch(theme, settings.monitoring_enabled)
+                        .id("workers-resource-monitoring")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.update(cx, |model, cx| {
+                                model.set_resource_settings(monitoring_next.clone(), cx)
+                            });
+                        })),
+                ),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Exceptional alerts",
+                    "Notify only when a worker crosses a configured memory threshold.",
+                )
+                .child(
+                    widgets::toggle_switch(theme, settings.notifications_enabled)
+                        .id("workers-resource-notifications")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.update(cx, |model, cx| {
+                                model.set_resource_settings(notifications_next.clone(), cx)
+                            });
+                        })),
+                ),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Warning per worker",
+                    "Memory threshold for a discreet notification.",
+                )
+                .child(resource_stepper(
+                    theme,
+                    "workers-resource-warning",
+                    settings.per_worker_warning_gib,
+                    warning_decrement,
+                    warning_increment,
+                    cx,
+                )),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Critical per worker",
+                    "Critical alerts require complete process attribution.",
+                )
+                .child(resource_stepper(
+                    theme,
+                    "workers-resource-critical",
+                    settings.per_worker_critical_gib,
+                    critical_decrement,
+                    critical_increment,
+                    cx,
+                )),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Automatic hibernation",
+                    "Opt-in lifecycle policy for idle workers; disabled by default.",
+                )
+                .child(
+                    widgets::toggle_switch(theme, settings.hibernation_enabled)
+                        .id("workers-resource-hibernation")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.update(cx, |model, cx| {
+                                model.set_resource_settings(hibernation_next.clone(), cx)
+                            });
+                        })),
+                ),
+            );
+
+        let session_rows =
+            sessions.into_iter().enumerate().map(|(index, session)| {
+                let expanded = self
+                    .expanded_resource_sessions
+                    .contains(&session.session_id);
+                let session_id = session.session_id.clone();
+                let title = session_metadata
+                    .get(&session.session_id)
+                    .cloned()
+                    .unwrap_or_else(|| session.session_id.clone());
+                let processes = session.top_processes.clone();
+                div()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border.opacity(0.72))
+                    .bg(crate::theme::ink(0.025))
+                    .child(
+                        div()
+                            .id(("workers-resource-session", index))
+                            .min_h(px(46.0))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.expanded_resource_sessions.remove(&session_id) {
+                                    this.expanded_resource_sessions.insert(session_id.clone());
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.text)
+                                    .child(title),
+                            )
+                            .when(!session.attribution_complete, |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.warning)
+                                        .child("Partial"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_muted)
+                                    .child(format!(
+                                        "{} · {} · {}",
+                                        format_memory_bytes(session.physical_footprint_bytes),
+                                        format_cpu_percent(session.cpu_percent),
+                                        session.process_count
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .w(px(14.0))
+                                    .text_center()
+                                    .text_color(theme.text_faint)
+                                    .child(if expanded { "⌄" } else { "›" }),
+                            ),
+                    )
+                    .when(expanded, |el| {
+                        el.children(processes.into_iter().enumerate().map(
+                            |(process_index, process)| {
+                                div()
+                                    .id(("workers-resource-process", index * 16 + process_index))
+                                    .h(px(27.0))
+                                    .pl(px(18.0))
+                                    .pr(px(10.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_muted)
+                                    .child(
+                                        div().flex_1().truncate().font_family("monospace").child(
+                                            format!("{} · PID {}", process.name, process.pid),
+                                        ),
+                                    )
+                                    .child(format_memory_bytes(process.physical_footprint_bytes))
+                                    .child(format_cpu_percent(process.cpu_percent))
+                            },
+                        ))
+                    })
+            });
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(21.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child("Resources"),
+            )
+            .child(
+                div()
+                    .mt(px(5.0))
+                    .text_size(px(12.5))
+                    .text_color(theme.text_muted)
+                    .child("Background worker diagnostics, available here on demand."),
+            )
+            .child(div().mt(px(22.0)).flex().gap(px(10.0)).children([
+                resource_metric_card(theme, "Memory", format_memory_bytes(total_memory)),
+                resource_metric_card(theme, "CPU", format_cpu_percent(total_cpu)),
+                resource_metric_card(theme, "Processes", total_processes.to_string()),
+            ]))
+            .child(
+                div()
+                    .mt(px(9.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint)
+                    .child(match (sample_age, sampling) {
+                        (Some(age), true) => format!("Updating · last sample {age}s ago"),
+                        (Some(age), false) => format!("Last sample {age}s ago"),
+                        (None, true) => "Sampling…".to_owned(),
+                        (None, false) => "No sample yet".to_owned(),
+                    }),
+            )
+            .when_some(last_error, |el, error| {
+                el.child(
+                    div()
+                        .mt(px(8.0))
+                        .text_size(px(10.5))
+                        .text_color(theme.warning)
+                        .child(error),
+                )
+            })
+            .child(controls)
+            .child(
+                div()
+                    .mt(px(28.0))
+                    .mb(px(9.0))
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child("WORKERS"),
+            )
+            .when(
+                snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.sessions.is_empty()),
+                |el| {
+                    el.child(
+                        div()
+                            .py(px(18.0))
+                            .text_size(px(12.0))
+                            .text_color(theme.text_faint)
+                            .child("No hosted worker process is currently attached."),
+                    )
+                },
+            )
+            .children(session_rows);
+
+        self.page_shell(
+            WorkersSettingsTab::Resources,
+            body.into_any_element(),
+            theme,
+        )
+    }
 }
 
 impl Render for WorkersSettingsView {
@@ -922,13 +1450,15 @@ impl Render for WorkersSettingsView {
             WorkersSettingsTab::Appearance => self.render_appearance(&theme, cx),
             WorkersSettingsTab::Transcripts => self.render_transcripts(&theme, cx),
             WorkersSettingsTab::Notifications => self.render_notifications(&theme, cx),
+            WorkersSettingsTab::Resources => self.render_resources(&theme, cx),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_preset_command;
+    use super::{format_cpu_percent, format_memory_bytes, normalize_preset_command};
+    use zeron_workers_unpeel::resources::WorkersSessionResource;
 
     #[test]
     fn preset_add_row_uses_the_command_as_its_label_like_unpeel() {
@@ -937,5 +1467,42 @@ mod tests {
             Some(("codex --plan".to_owned(), "codex --plan".to_owned()))
         );
         assert_eq!(normalize_preset_command("   "), None);
+    }
+
+    #[test]
+    fn resource_values_are_compact_and_stable() {
+        assert_eq!(format_memory_bytes(512), "512 B");
+        assert_eq!(format_memory_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_memory_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        assert_eq!(format_cpu_percent(0.0), "0.0%");
+        assert_eq!(format_cpu_percent(143.24), "143.2%");
+    }
+
+    #[test]
+    fn resource_sessions_sort_by_footprint_then_id() {
+        let mut sessions = vec![session("b", 10), session("a", 10), session("c", 20)];
+        super::sort_resource_sessions(&mut sessions);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
+    }
+
+    fn session(session_id: &str, bytes: u64) -> WorkersSessionResource {
+        WorkersSessionResource {
+            session_id: session_id.to_owned(),
+            sampled_at_unix_ms: 0,
+            root_pid: Some(1),
+            root_pid_started_at: Some(1),
+            cpu_percent: 0.0,
+            physical_footprint_bytes: bytes,
+            resident_bytes: bytes,
+            process_count: 1,
+            attribution_complete: true,
+            top_processes: Vec::new(),
+        }
     }
 }
