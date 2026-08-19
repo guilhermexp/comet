@@ -5,8 +5,8 @@ pub mod resources;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -765,11 +765,20 @@ pub struct LocalWorkersClient {
     next_request_id: Arc<AtomicU64>,
     activity: Arc<activity_bridge::ActivityBridge>,
     last_displayed_grid: Arc<AtomicU64>,
+    resource_sampler: Arc<Mutex<resources::ResourceSampler>>,
 }
 
 fn shared_displayed_grid() -> Arc<AtomicU64> {
     static GRID: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
     GRID.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
+}
+
+fn shared_resource_sampler() -> Arc<Mutex<resources::ResourceSampler>> {
+    static SAMPLER: std::sync::OnceLock<Arc<Mutex<resources::ResourceSampler>>> =
+        std::sync::OnceLock::new();
+    SAMPLER
+        .get_or_init(|| Arc::new(Mutex::new(resources::ResourceSampler::default())))
+        .clone()
 }
 
 impl std::fmt::Debug for LocalWorkersClient {
@@ -794,6 +803,7 @@ impl LocalWorkersClient {
             next_request_id: Arc::new(AtomicU64::new(1)),
             activity: activity_bridge::shared_activity_bridge(),
             last_displayed_grid: shared_displayed_grid(),
+            resource_sampler: shared_resource_sampler(),
         }
     }
 
@@ -801,6 +811,16 @@ impl LocalWorkersClient {
     /// The UI can refresh immediately without inferring activity from time.
     pub fn activity_epoch(&self) -> u64 {
         self.activity.change_epoch()
+    }
+
+    pub fn resource_snapshot(
+        &self,
+        include_processes: bool,
+    ) -> Result<resources::WorkersResourceSnapshot, WorkersError> {
+        self.resource_sampler
+            .lock()
+            .map_err(|_| WorkersError::State("worker resource sampler lock was poisoned".into()))
+            .map(|mut sampler| sampler.sample(include_processes))
     }
 
     /// Keep the most recently painted terminal grid available to the model's
