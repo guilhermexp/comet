@@ -308,6 +308,14 @@ pub(crate) struct Normalizer {
     /// Structured task ids already observed. Later lifecycle frames can be
     /// sparse, so identity is the only provider context retained here.
     workflow_tasks: std::collections::HashSet<String>,
+    /// tool_use ids of Agent/Task spawn calls, recorded from their own
+    /// assistant frames (plus `task_started`'s agent-task pairing). Gates
+    /// `task_notification`: background SHELL tasks settle through the same
+    /// subtype carrying their Bash call's id, and tagging that Done as
+    /// subagent traffic stamped a spawn ref onto an ordinary Run chip —
+    /// which then opened as an empty, never-created subagent doc (user
+    /// report 2026-08-20).
+    agent_spawn_tools: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -323,6 +331,7 @@ impl Normalizer {
             saw_init: false,
             agent_tasks: std::collections::HashMap::new(),
             workflow_tasks: std::collections::HashSet::new(),
+            agent_spawn_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
             context_window: None,
@@ -447,31 +456,30 @@ impl Normalizer {
                 // Surface it as the subagent's tagged Done so the chip flips
                 // done/failed and the transcript freezes.
                 if f.subtype == "task_notification" {
-                    let done =
-                        f.tool_use_id
-                            .as_deref()
-                            .filter(|tool| !tool.is_empty())
-                            .and_then(|parent| {
-                                let status = match f.status.as_deref().unwrap_or("") {
-                                    "completed" | "complete" | "succeeded" | "success" => {
-                                        DoneStatus::Completed
-                                    }
-                                    "failed" | "errored" | "error" => DoneStatus::Errored,
-                                    "killed" | "cancelled" | "canceled" | "stopped"
-                                    | "interrupted" => DoneStatus::Interrupted,
-                                    // Non-terminal notification shapes: nothing to close.
-                                    _ => return None,
-                                };
-                                Some(tag(
-                                    parent,
-                                    AgentEvent::Done {
-                                        status,
-                                        result: None,
-                                        error: None,
-                                        session_id: None,
-                                    },
-                                ))
-                            });
+                    let done = f
+                        .tool_use_id
+                        .as_deref()
+                        .filter(|parent| self.agent_spawn_tools.contains(*parent))
+                        .and_then(|parent| {
+                            let status = match f.status.as_deref().unwrap_or("") {
+                                "completed" | "complete" | "succeeded" | "success" => {
+                                    DoneStatus::Completed
+                                }
+                                "failed" | "errored" | "error" => DoneStatus::Errored,
+                                "killed" | "cancelled" | "canceled" | "stopped"
+                                | "interrupted" => DoneStatus::Interrupted,
+                                _ => return None,
+                            };
+                            Some(tag(
+                                parent,
+                                AgentEvent::Done {
+                                    status,
+                                    result: None,
+                                    error: None,
+                                    session_id: None,
+                                },
+                            ))
+                        });
                     return workflow.into_iter().chain(done).collect();
                 }
                 // An AGENT task starting (subagent_type present — subagent-
@@ -485,6 +493,7 @@ impl Normalizer {
                     )
                 {
                     self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+                    self.agent_spawn_tools.insert(tool.to_owned());
                     return workflow.into_iter().collect();
                 }
                 if f.subtype != "init" || self.saw_init {
@@ -613,6 +622,13 @@ impl Normalizer {
                     self.streaming_tools
                         .retain(|_, tool| tool.parent_tool_use_id.as_deref() != Some(parent));
                     return out;
+                }
+                // Record spawn tool ids up front: `task_notification` keys on
+                // them, and only foreground spawns ever get a `task_started`.
+                for b in f.message.blocks() {
+                    if b.kind == "tool_use" && matches!(b.name.as_str(), "Agent" | "Task") {
+                        self.agent_spawn_tools.insert(b.id.clone());
+                    }
                 }
                 let mut out: Vec<AgentEvent> = f
                     .message
@@ -1334,23 +1350,36 @@ mod tests {
     fn task_notification_settles_the_subagent_with_a_tagged_done() {
         // The wire's ONLY terminal signal for a background subagent
         // (live-verified 2.1.228): an untagged system frame carrying the
-        // spawning tool's id. Shape from the captured fixture.
-        let ev = normalize_one(
+        // spawning tool's id. Shape from the captured fixture. The spawn's
+        // own tool_use frame always precedes it — that's what marks the id
+        // as an AGENT task (shell tasks share the subtype).
+        let spawn = |norm: &mut Normalizer| {
+            let frame = crate::claude::wire::parse_frame(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"probe"}}]}}"#,
+            )
+            .expect("parses");
+            norm.normalize(frame, false);
+        };
+        let notify = |norm: &mut Normalizer, raw: &str| {
+            let frame = crate::claude::wire::parse_frame(raw).expect("parses");
+            norm.normalize(frame, false)
+        };
+        let mut norm = Normalizer::new();
+        spawn(&mut norm);
+        let ev = notify(
+            &mut norm,
             r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_agent","status":"completed","summary":"DONE."}"#,
         );
-        assert_eq!(
-            ev,
-            vec![AgentEvent::Subagent {
-                parent_tool_use_id: "toolu_agent".into(),
-                event: Box::new(AgentEvent::Done {
-                    status: DoneStatus::Completed,
-                    result: None,
-                    error: None,
-                    session_id: None,
-                }),
-            }]
-        );
-        let ev = normalize_one(
+        assert!(matches!(
+            &ev[..],
+            [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "toolu_agent"
+                    && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        ));
+        let mut norm = Normalizer::new();
+        spawn(&mut norm);
+        let ev = notify(
+            &mut norm,
             r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"failed"}"#,
         );
         assert!(matches!(
@@ -1359,7 +1388,10 @@ mod tests {
                 if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Errored, .. })
         ));
         // Non-terminal or id-less notifications close nothing.
-        assert!(normalize_one(
+        let mut norm = Normalizer::new();
+        spawn(&mut norm);
+        assert!(notify(
+            &mut norm,
             r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"running"}"#,
         )
         .is_empty());
@@ -1397,6 +1429,11 @@ mod tests {
     #[test]
     fn claude_sparse_terminal_notification_preserves_subagent_done() {
         let mut normalizer = Normalizer::new();
+        let spawn = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"prompt":"Audit"}}]}}"#,
+        )
+        .expect("spawn parses");
+        normalizer.normalize(spawn, false);
         let started = crate::claude::wire::parse_frame(
             r#"{"type":"system","subtype":"task_started","task_id":"wf-1","task_type":"local_workflow","workflow_name":"Audit"}"#,
         )
@@ -1450,6 +1487,30 @@ mod tests {
             [AgentEvent::WorkflowTask { task }]
                 if task.task_id == "wf-1" && task.progress.is_empty() && task.usage.is_none()
         ));
+    }
+
+    #[test]
+    fn shell_task_notification_never_settles_a_subagent() {
+        // `Bash` with `run_in_background` settles through the SAME
+        // `task_notification` subtype, carrying the Bash call's own id.
+        // Tagging that Done bound a subagent ref onto an ordinary Run chip,
+        // which then rendered as a spawn chip opening an empty, never-created
+        // subagent doc (user report 2026-08-20).
+        let mut norm = Normalizer::new();
+        for raw in [
+            // The shell task's start is already unmapped (no subagent_type)…
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+            // …and the Bash call itself must not mark the id as a spawn.
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"git clone …","run_in_background":true}}]}}"#,
+        ] {
+            let frame = crate::claude::wire::parse_frame(raw).expect("parses");
+            norm.normalize(frame, false);
+        }
+        let done = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(done, false).is_empty());
     }
 
     #[test]
