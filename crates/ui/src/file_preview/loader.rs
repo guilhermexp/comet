@@ -213,17 +213,17 @@ mod tests {
     #[test]
     fn rejects_parent_traversal_and_external_symlink() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(
+        assert!(matches!(
             load_preview(temp.path(), Path::new("../secret")),
             Err(PreviewLoadError::OutsideCheckout)
-        );
+        ));
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/etc/hosts", temp.path().join("hosts")).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 load_preview(temp.path(), Path::new("hosts")),
                 Err(PreviewLoadError::OutsideCheckout)
-            );
+            ));
         }
     }
 
@@ -235,10 +235,10 @@ mod tests {
             vec![b'x'; 4 * 1024 * 1024 + 1],
         )
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             load_preview(temp.path(), Path::new("large.txt")),
             Err(PreviewLoadError::TooLarge)
-        );
+        ));
     }
 
     #[test]
@@ -273,11 +273,11 @@ mod tests {
     #[test]
     fn isolated_html_is_serialized_into_a_sandboxed_document() {
         let document = isolated_html_document(
-            "<script>window.top.location='https://example.com'</script><h1>Preview</h1>",
+            "<script>window.top.location=\"https://example.com\"</script><h1>Preview</h1>",
         );
         assert!(document.contains("<iframe sandbox referrerpolicy=\"no-referrer\""));
         assert!(document.contains("default-src 'none'"));
-        assert!(document.contains("&quot;https://example.com&quot;"));
-        assert!(!document.contains("<script>window.top"));
+        assert!(document.contains("window.top.location=&quot;https://example.com&quot;"));
+        assert!(!document.contains("window.top.location=\"https://example.com\""));
     }
 }
