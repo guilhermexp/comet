@@ -385,10 +385,7 @@ fn composer_footer_right_order() -> [ComposerFooterControl; 2] {
     [ComposerFooterControl::Model, ComposerFooterControl::Branch]
 }
 
-fn composer_footer_right(
-    model_controls: AnyElement,
-    branch_control: AnyElement,
-) -> gpui::Div {
+fn composer_footer_right(model_controls: AnyElement, branch_control: AnyElement) -> gpui::Div {
     let mut model_controls = Some(model_controls);
     let mut branch_control = Some(branch_control);
     composer_footer_right_order().into_iter().fold(

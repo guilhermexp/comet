@@ -2,11 +2,11 @@
 
 ## Objetivo
 
-Replicar no Comet o file preview do Orchestrator.dev como uma superfície nativa GPUI, mantendo a árvore Files à direita e abrindo os arquivos em um painel central com abas, cabeçalho, ações e renderização específica por tipo.
+Replicar no Comet o file preview do Orchestrator.dev como uma superfície nativa GPUI, mantendo a árvore Files à direita e abrindo os arquivos no painel lateral compartilhado de Terminal/Diff, com abas, cabeçalho, ações e renderização específica por tipo.
 
 ## Autoridade visual e comportamental
 
-O Orchestrator.dev em `/Users/guilhermevarela/Documents/Orchestrator.dev` é a fonte de verdade. Os screenshots fornecidos em 2026-08-20 definem a geometria, hierarquia, estados ativos e interações. O preview não substitui a sidebar Details/Files nem o painel Terminal/Git; ele ocupa o conteúdo principal e funciona nos modos Orchestrator e Workers.
+O Orchestrator.dev em `/Users/guilhermevarela/Documents/Orchestrator.dev` é a fonte de verdade. Os screenshots fornecidos em 2026-08-20 definem a geometria, hierarquia, estados ativos e interações. O preview não substitui a sidebar Details/Files: ele reutiliza o painel Terminal/Git, mantém o chat montado e visível no modo lateral e funciona nos modos Orchestrator e Workers.
 
 ## Arquitetura
 
@@ -24,7 +24,7 @@ O Orchestrator.dev em `/Users/guilhermevarela/Documents/Orchestrator.dev` é a f
 2. A aba recebe o mesmo ícone Material Icon Theme da árvore e pode ser fechada.
 3. Fechar a aba ativa seleciona a vizinha anterior; fechar a última restaura o conteúdo anterior.
 4. O cabeçalho mostra modo/fechar, ícone, nome, expandir, abrir externamente e copiar caminho.
-5. Markdown é renderizado; código/texto mostra linhas e syntax highlighting; HTML possui preview; imagens e PDF são exibidos; dados tabulares são somente leitura.
+5. Markdown é renderizado; código/texto mostra linhas e syntax highlighting; HTML possui preview; imagens e PDF são exibidos; CSV/TSV e a primeira planilha de arquivos XLS/XLSX são tabelas somente leitura. HTML e PDF usam o viewer nativo no macOS e mostram o fallback de abertura externa nas demais plataformas.
 6. Arquivos binários não suportados exibem um estado de recuperação claro sem travar o app.
 7. Leituras são confinadas ao checkout, limitadas por tamanho e executadas fora da thread de UI.
 
@@ -36,6 +36,8 @@ O Orchestrator.dev em `/Users/guilhermevarela/Documents/Orchestrator.dev` é a f
 - A sidebar Files permanece visível e sincroniza o destaque com o arquivo ativo. Sua coluna não possui linha divisória externa; apenas cards/widgets e seus separadores internos desenham borda.
 - O controle de captura pertence ao cabeçalho do chat e permanece fora do painel de superfícies.
 - No modo expandido o preview usa toda a área central, preservando a sidebar Files.
+- O contrato visual de fundo da coluna permanece centralizado no
+  [design da sidebar Details/Files](2026-08-20-details-files-sidebar-design.md#visual-contract).
 
 ## Testes
 

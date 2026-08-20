@@ -67,7 +67,7 @@ fn navigation_policy(
 }
 
 extern "C" fn decide_navigation(
-    this: &Object,
+    this: &mut Object,
     _selector: Sel,
     _view: *mut Object,
     action: *mut Object,
@@ -85,13 +85,9 @@ extern "C" fn decide_navigation(
         };
         let allow_file = *this.get_ivar::<BOOL>("_allowFile") == YES;
         let file_navigation_used = *this.get_ivar::<BOOL>("_fileNavigationUsed") == YES;
-        let (policy, file_navigation_used) = navigation_policy(
-            scheme.as_deref(),
-            allow_file,
-            file_navigation_used,
-        );
-        let this = this as *const Object as *mut Object;
-        (&mut *this).set_ivar(
+        let (policy, file_navigation_used) =
+            navigation_policy(scheme.as_deref(), allow_file, file_navigation_used);
+        this.set_ivar(
             "_fileNavigationUsed",
             if file_navigation_used { YES } else { NO },
         );
@@ -111,13 +107,7 @@ fn navigation_delegate() -> *mut Object {
             declaration.add_method(
                 sel!(webView:decidePolicyForNavigationAction:decisionHandler:),
                 decide_navigation
-                    as extern "C" fn(
-                        &Object,
-                        Sel,
-                        *mut Object,
-                        *mut Object,
-                        *mut c_void,
-                    ),
+                    as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object, *mut c_void),
             );
             declaration.register()
         } else {
@@ -182,7 +172,8 @@ impl NativeDocumentView {
             let view = isolated_view(true)?;
             let path_string = ns_string(path.to_string_lossy().as_ref());
             let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: path_string];
-            let _: *mut Object = msg_send![view.view, loadFileURL: url allowingReadAccessToURL: url];
+            let _: *mut Object =
+                msg_send![view.view, loadFileURL: url allowingReadAccessToURL: url];
             Some(view)
         }
     }

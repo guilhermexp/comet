@@ -457,8 +457,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let unit = std::fs::read_to_string(home.join(".config/systemd/user/zeron.service"))
-            .unwrap();
+        let unit =
+            std::fs::read_to_string(home.join(".config/systemd/user/zeron.service")).unwrap();
         let properties = unit
             .lines()
             .filter_map(|line| line.split_once('='))

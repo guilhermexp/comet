@@ -330,7 +330,7 @@ pub struct WorkersModel {
     notification_state: HashMap<String, NotificationState>,
     pending_replacement: Option<PendingReplacement>,
     parent_notification_in_flight: HashSet<String>,
-    parent_notification_failures: HashMap<String, u8>,
+    parent_notification_failures: HashMap<String, ParentNotificationRetry>,
     _poll_task: Task<()>,
 }
 

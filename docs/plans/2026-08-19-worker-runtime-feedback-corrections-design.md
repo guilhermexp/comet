@@ -114,7 +114,8 @@ Codex hook responsible for command-not-found/exit-127 failures.
 - If hook migration cannot verify provider configs, keep the legacy files and
   report the migration error rather than deleting a still-referenced script.
 - Parent delivery remains idempotent through the deterministic command ledger.
-- Permanently deleted parents retain the existing bounded retry policy.
+- Parent-delivery retry behavior remains owned by the
+  [Worker Parent Task Notification design](2026-08-19-worker-parent-task-notification-design.md).
 
 ## Tests
 

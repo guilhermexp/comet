@@ -35,17 +35,18 @@ Replicate the checkout explorer behavior from Orchestrator.dev:
 - hidden-file visibility toggle, persisted per checkout;
 - search by workspace-relative path;
 - active-file highlight;
-- virtualized rendering for large visible trees;
-- file preview in the sidebar's own preview state;
-- add a file path to Orchestrator chat context when a native composer exists;
-- open in Finder, copy absolute path, and copy relative path;
-- rename, delete, and move within the checkout;
-- reject path traversal, `.git` traversal, and moves into a folder's own
-  descendant.
+- bounded rendering for large trees, with a search refinement notice after the
+  visible-row cap;
+- file preview through the shared `RightSurface` host, as owned by the
+  [file-preview design](2026-08-20-file-preview-parity-design.md);
+- open in Finder and copy the absolute path.
 
 External file drop/import and arbitrary editor integrations are deferred: the
 native Comet app currently has neither Orchestrator.dev's Electron drop bridge
-nor its preferred-editor registry. Their absence must not leave dead menu rows.
+nor its preferred-editor registry. Adding a file to chat context, copying a
+relative path, and exposing the existing jailed rename/delete/move primitives
+also remain deferred until their native interaction and confirmation flows are
+designed. Their absence must not leave dead menu rows.
 
 ## Architecture
 
@@ -95,8 +96,10 @@ both modes so behavior cannot drift.
 
 The scanner uses the `ignore` crate, always prunes `.git`, optionally includes
 dotfiles, returns directories and files, and enforces a bounded result count.
-All mutations canonicalize the checkout root and target parent before acting.
-The service performs blocking filesystem work on GPUI's background executor.
+It performs blocking filesystem work on GPUI's background executor. Workers
+checkouts are local; an Orchestrator checkout is readable only when its owning
+device matches the attached local engine. Remote checkouts render an explicit
+unavailable state and never fall back to the same path on the current machine.
 
 ### Workspace widget
 
@@ -139,23 +142,24 @@ explicit states. Usage is account-wide, not checkout-scoped.
 - Files-only header actions: hidden toggle, search, expand/collapse all.
 - Widget cards use the reference structure: rounded outer border, 32px header,
   compact 28px property/list rows, and subtle separators.
-- The pane is flush against the window's right edge and uses Comet theme tokens,
-  not hard-coded reference colors.
+- The pane is flush against the window's right edge, paints no independent
+  column background, and therefore inherits exactly the central chat surface.
+- When the viewport cannot preserve the 320px conversation minimum and both
+  right-column minimums, the surface host takes priority and Details/Files is
+  temporarily collapsed without clearing its persisted open state.
 
 ## Error handling
 
-- File scan errors render inline with Retry and never close the pane.
-- A vanished checkout changes the view to an unavailable state and disables
-  mutations.
-- Failed rename/delete/move leaves the tree untouched and shows an inline
-  error.
+- File scan errors render inline and never close the pane.
+- A vanished or remote checkout changes Files to an unavailable state.
 - Usage failures affect only Usage; Workspace and Files remain usable.
-- No destructive filesystem action runs without an in-pane confirmation.
+- No destructive filesystem action is exposed in this phase.
 
 ## Testing
 
-1. Pure unit tests for context resolution, tree construction, visibility,
-   sorting, path jail, move validation, todo folding, and usage summaries.
+1. Pure unit tests for context resolution, local-device gating, tree
+   construction, visibility, sorting, path jail, move validation, todo folding,
+   and usage summaries.
 2. Shell tests proving the details pane is independent from Terminal/Git and
    available in both top-level modes.
 3. Focused `zeron-ui` tests during development.

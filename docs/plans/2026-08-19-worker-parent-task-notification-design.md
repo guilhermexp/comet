@@ -129,7 +129,9 @@ retries the same command ID and is therefore idempotent.
 Workers snapshot it asks the binding store for pending lifecycle states. One in-flight set
 prevents duplicate local RPC attempts while a request is unresolved. Each
 successful `QueueWorkerNotification` call acknowledges its state; failures remain pending
-and retry on a later refresh.
+and retry on a later refresh with exponential backoff capped at 32 seconds.
+Retries do not exhaust during the app run; the deterministic command ID keeps
+repeated delivery attempts idempotent.
 
 The coordinator does not depend on the Workers sidebar being selected or a
 terminal being mounted. It runs with the existing background Workers refresh.
@@ -142,7 +144,8 @@ terminal being mounted. It runs with the existing background Workers refresh.
 - Output read failure: deliver the lifecycle notification with `output: none`.
 - Engine unavailable: do not acknowledge; retry after engine attachment.
 - Parent chat deleted: the command is rejected; leave the event pending for
-  bounded retry and log the failure without recreating a chat.
+  capped exponential-backoff retry and log the failure without recreating a
+  chat.
 - Duplicate lifecycle state: deterministic command ID and acknowledged state set
   prevent an extra turn.
 

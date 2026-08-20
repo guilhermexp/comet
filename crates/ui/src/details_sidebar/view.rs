@@ -157,7 +157,10 @@ enum ContextFileAccess {
     WaitingForDevice,
 }
 
-fn context_file_access(context: &DetailsContext, local_device_id: Option<&str>) -> ContextFileAccess {
+fn context_file_access(
+    context: &DetailsContext,
+    local_device_id: Option<&str>,
+) -> ContextFileAccess {
     match (context.target_device_id.as_deref(), local_device_id) {
         (None, _) => ContextFileAccess::Local,
         (Some(target), Some(local)) if target == local => ContextFileAccess::Local,

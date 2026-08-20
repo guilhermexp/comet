@@ -35,10 +35,7 @@ fn rooted_context_key(kind: &str, id: &str, device_id: Option<&str>, root: &str)
     )
 }
 
-pub fn worker_context_key(
-    project: &WorkersProject,
-    session: Option<&WorkersSession>,
-) -> String {
+pub fn worker_context_key(project: &WorkersProject, session: Option<&WorkersSession>) -> String {
     let (kind, id) = session
         .map(|session| ("workers-session", session.id.as_str()))
         .unwrap_or(("workers-project", project.id.as_str()));
@@ -55,12 +52,7 @@ pub fn context_for_orchestrator(
             .as_deref()
             .or_else(|| space.map(|space| space.path.as_str()))?;
         return Some(DetailsContext {
-            key: rooted_context_key(
-                "orchestrator-chat",
-                &chat.id,
-                Some(&chat.device_id),
-                cwd,
-            ),
+            key: rooted_context_key("orchestrator-chat", &chat.id, Some(&chat.device_id), cwd),
             cwd: PathBuf::from(cwd),
             branch: chat.branch.clone(),
             chat_id: Some(chat.id.clone()),

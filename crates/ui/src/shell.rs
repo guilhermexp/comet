@@ -1,13 +1,14 @@
 //! The app shell (zeron `__root.tsx`): sidebar column + main panel + the
-//! optional full-height right utility column (Terminal sessions and Changes as
-//! sibling tabs), plus the boot splash and the connection gate.
+//! optional full-height right utility surface (Terminal/Changes) and optional
+//! Details/Files sidebar, plus the boot splash and connection gate.
 //!
 //! Layout is zeron's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
-//! shifts; utility column (360–760px, default 520), hidden by default.
-//! Widths/collapsed state persist to `ui-settings.json` (debounced); which
-//! utility tabs are open stays session-scoped and in memory ([`SessionPanels`]).
+//! shifts; right utility surface (360–760px, default 520) and Details/Files
+//! sidebar (300–700px, default 500), both hidden by default. Widths/collapsed
+//! state persist to `ui-settings.json`; open tabs stay session-scoped in memory
+//! ([`SessionPanels`]).
 //!
 //! Resize handles use gpui's drag-and-drop pattern (an `on_drag` with an empty
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
@@ -32,9 +33,7 @@ use zeron_workers_unpeel::WorkersLaunchRequest;
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::details_sidebar::{
-    context::{
-        DetailsContext, context_for_orchestrator, context_for_worker, worker_context_key,
-    },
+    context::{DetailsContext, context_for_orchestrator, context_for_worker, worker_context_key},
     view::{DetailsSidebar, DetailsSidebarEvent},
 };
 use crate::file_preview::view::{FilePreview, FilePreviewEvent};
@@ -323,9 +322,7 @@ fn responsive_right_column_widths(
                 DETAILS_SIDEBAR_MIN + details_extra * extra_scale,
             )
         }
-        (true, _) if budget >= RIGHT_PANE_MIN => {
-            (right.clamp(RIGHT_PANE_MIN, budget), 0.0)
-        }
+        (true, _) if budget >= RIGHT_PANE_MIN => (right.clamp(RIGHT_PANE_MIN, budget), 0.0),
         (false, true) if budget >= DETAILS_SIDEBAR_MIN => {
             (0.0, details.clamp(DETAILS_SIDEBAR_MIN, budget))
         }
@@ -358,10 +355,10 @@ fn orchestrator_capture_right_offset(
     (if right_open { right_width } else { 0.0 }) + details_width + 10.0
 }
 
-/// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
-/// kinds): a git-diff page (each tab its own [`Changes`] viewer — multiple
-/// diff panels, user request) or one embedded terminal keyed by its
-/// [`TerminalPanel`] tab key. `Picker` is the empty state ("Open a surface").
+/// One right-pane surface tab (t3code RightPanelSurface): a git-diff page
+/// (each tab its own [`Changes`] viewer — multiple diff panels, user request),
+/// an embedded terminal keyed by its [`TerminalPanel`] tab key, or a file
+/// preview. `Picker` is the empty state ("Open a surface").
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RightSurface {
     #[default]
@@ -1166,7 +1163,7 @@ pub struct Shell {
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
     details_tween: Option<WidthTween>,
-    /// Changes-panel takeover (the header's expand button): the panel fills
+    /// Surface-host takeover (the header's expand button): the host fills
     /// everything right of the sidebar and the conversation column collapses
     /// to zero. Session-local view state — never persisted, reset on close.
     right_pane_expanded: bool,
@@ -1734,7 +1731,7 @@ impl Shell {
     }
 
     /// Does the selected space's folder have git? Owner-stamped and synced —
-    /// gates the Changes pane, its toggle, and Cmd-B with zero RPCs.
+    /// gates Git surface rows with zero RPCs, without gating the surface host.
     fn space_git_detected(&self, cx: &App) -> bool {
         match self.sidebar_mode {
             SidebarMode::Orchestrator => self.state.read(cx).selected_space_git(),
@@ -7045,8 +7042,8 @@ impl Shell {
         }
     }
 
-    /// Toggle the changes-panel takeover (the header's expand button, t3code
-    /// parity): the panel grows to fill everything right of the sidebar,
+    /// Toggle the surface-host takeover (the header's expand button, t3code
+    /// parity): the host grows to fill everything right of the sidebar,
     /// hiding the conversation column; toggling back restores the saved
     /// width. Rides the same width tween as open/close so the jump glides.
     fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
@@ -7894,8 +7891,8 @@ impl Render for Shell {
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
-                // Stamped for `right_target` — the expanded changes panel
-                // sizes itself to the viewport.
+                // Stamped for `right_target` — the expanded surface host sizes
+                // itself to the viewport.
                 self.viewport_width = viewport;
                 let main_width = (viewport
                     - self.sidebar_target()
@@ -7921,9 +7918,9 @@ impl Render for Shell {
                     cx,
                 );
                 let main = self.render_main(cx);
-                // The right utility pane is chat-scoped chrome: Settings never
-                // renders it, while each session's selected pane stays intact
-                // for the return trip (zeron `!isSettings && activeChat`).
+                // The right utility surface is chat-scoped chrome: the Settings
+                // route never renders it — the per-session open flags stay
+                // intact for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
@@ -7940,7 +7937,7 @@ impl Render for Shell {
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
                 // flush and unbordered, the transcript directly on the frost
-                // glass; the utility column is a flush left-bordered glass panel
+                // glass; the utility surface is a flush left-bordered glass panel
                 // (built inside `render_right_pane`).
                 let card: AnyElement = div()
                     .flex_1()
@@ -7985,7 +7982,7 @@ impl Render for Shell {
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
-                // must NOT underlap (sidebar content, the changes panel,
+                // must NOT underlap (sidebar content, the surface host,
                 // settings) pad themselves down by the titlebar height.
                 let page = div()
                     .size_full()

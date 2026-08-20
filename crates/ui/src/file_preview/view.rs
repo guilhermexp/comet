@@ -101,12 +101,7 @@ impl FilePreview {
         relative_path: String,
         cx: &mut Context<Self>,
     ) {
-        self.activate_surface(
-            context_key.clone(),
-            root,
-            relative_path.clone(),
-            cx,
-        );
+        self.activate_surface(context_key.clone(), root, relative_path.clone(), cx);
         cx.emit(FilePreviewEvent::ActiveChanged {
             context_key,
             relative_path: Some(relative_path),
@@ -362,9 +357,7 @@ impl FilePreview {
                 .py(px(24.0))
                 .child(markdown_render::render_tree(
                     tree.as_ref(),
-                    &markdown_render::RenderOptions::settled(
-                        format!("file-preview:{path}").into(),
-                    ),
+                    &markdown_render::RenderOptions::settled(format!("file-preview:{path}").into()),
                     theme,
                     window,
                     &|_| None,

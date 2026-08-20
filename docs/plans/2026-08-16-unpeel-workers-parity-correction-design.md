@@ -187,6 +187,10 @@ The page exposes menu-attention detection and local desktop notification
 behavior, including a test notification. Preferences are Workers-only and do
 not alter Orchestrator notification settings. Transition detection is
 generation-safe and emits at most once for each blocked/done transition.
+The model must load the persisted Workers notification settings before any
+transition can emit a desktop banner or sound. Snapshots observed while those
+settings are unavailable seed transition state without falling back to enabled
+defaults or replaying the transition after the settings load.
 Phone/Link controls remain absent because remote transport is deferred.
 
 ## Failure behavior

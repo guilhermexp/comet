@@ -149,8 +149,9 @@ zeron/
     rpc/          zeron-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
                                  # sockets ({s,k,to,from} frames)
-    ui/           zeron-ui       # gpui app: shell, sidebar, conversation, composer,
-                                 # terminal view, diff pane, settings, animation kit
+    ui/           zeron-ui       # gpui app: Orchestrator/Workers shell, chat/composer,
+                                 # Terminal/Git/file-preview surface host, Details/Files,
+                                 # settings, animation kit
   apps/
     zeron/                       # the binary (headed default, `headless` subcommand)
   edge/                          # TypeScript Worker + DOs (ported from zeron/apps/edge,
@@ -194,6 +195,13 @@ feature spec `docs/research/feature-inventory.md` §1.
   images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
+- **Right-side surfaces**: one tab host owns Terminal, Git diff, and file-preview
+  surfaces while a separate `Details / Files` column owns workspace metadata and
+  the checkout tree. Both columns are available in Orchestrator and Workers;
+  their normal responsive layout preserves a minimum conversation width. The
+  detailed contracts are specified in
+  [`docs/plans/2026-08-20-details-files-sidebar-design.md`](docs/plans/2026-08-20-details-files-sidebar-design.md)
+  and [`docs/plans/2026-08-20-file-preview-parity-design.md`](docs/plans/2026-08-20-file-preview-parity-design.md).
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
   engine side; custom gpui grid element; 12ms input coalescing / 80ms resize debounce, 1MB
   replay, detach ≠ close. Panel chrome (the shared full-height utility column, its Terminal +

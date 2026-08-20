@@ -130,9 +130,8 @@ pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, 
     }
     let bytes = fs::read(&path).map_err(|error| PreviewLoadError::Io(error.to_string()))?;
     if kind == PreviewKind::Image {
-        let format = image_format(&path).ok_or_else(|| {
-            PreviewLoadError::Io("the image format is not supported".to_owned())
-        })?;
+        let format = image_format(&path)
+            .ok_or_else(|| PreviewLoadError::Io("the image format is not supported".to_owned()))?;
         return Ok(LoadedPreview::Image(Arc::new(Image::from_bytes(
             format, bytes,
         ))));
@@ -157,9 +156,7 @@ pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, 
             .ok()
             .map(Arc::new),
         }),
-        PreviewKind::Html => Ok(LoadedPreview::Html(
-            isolated_html_document(&source).into(),
-        )),
+        PreviewKind::Html => Ok(LoadedPreview::Html(isolated_html_document(&source).into())),
         PreviewKind::Data => {
             let separator = if path.to_ascii_lowercase().ends_with(".tsv") {
                 '\t'
