@@ -736,6 +736,21 @@ impl SessionDoc {
                     Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == part_id
                 );
                 if is_tool && id_matches {
+                    let is_spawn = part
+                        .get("call")
+                        .and_then(|value| match value {
+                            loro::ValueOrContainer::Value(value) => {
+                                serde_json::to_value(value).ok()
+                            }
+                            _ => None,
+                        })
+                        .and_then(|value| {
+                            serde_json::from_value::<zeron_proto::ToolCall>(value).ok()
+                        })
+                        .is_some_and(|call| call.is_subagent_spawn());
+                    if !is_spawn {
+                        return Ok(false);
+                    }
                     if let Some(r) = subagent_ref {
                         part.insert("subagentRef", r)?;
                     }
@@ -1712,6 +1727,79 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn update_subagent_chip_refuses_non_spawn_parts() {
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let tool = |id: &str, call: ToolCall| MessagePart::Tool {
+            id: id.into(),
+            call,
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let parts = vec![
+            tool(
+                "toolu_bash",
+                ToolCall::Exec {
+                    command: "git clone …".into(),
+                },
+            ),
+            tool(
+                "toolu_spawn",
+                ToolCall::Unknown {
+                    name: "Agent: scan".into(),
+                    input: None,
+                },
+            ),
+        ];
+        writer.sync(&parts).unwrap();
+
+        assert!(
+            doc.update_subagent_chip(
+                "toolu_spawn",
+                Some("c1--sub--toolu_spawn"),
+                Some("running"),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !doc.update_subagent_chip(
+                "toolu_bash",
+                Some("c1--sub--toolu_bash"),
+                Some("done"),
+                None,
+            )
+            .unwrap()
+        );
+        let entries = doc.read_entries().unwrap();
+        let MessagePart::Tool {
+            subagent_ref,
+            subagent_status,
+            ..
+        } = &entries[0].parts[0]
+        else {
+            panic!("tool expected")
+        };
+        assert!(subagent_ref.is_none());
+        assert!(subagent_status.is_none());
+        let MessagePart::Tool { subagent_ref, .. } = &entries[0].parts[1] else {
+            panic!("tool expected")
+        };
+        assert_eq!(subagent_ref.as_deref(), Some("c1--sub--toolu_spawn"));
     }
 
     #[test]
