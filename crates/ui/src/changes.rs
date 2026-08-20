@@ -538,6 +538,7 @@ impl DiffScope {
         Self::LatestTurn,
         Self::History,
     ];
+    pub const WORKERS: [DiffScope; 2] = [Self::WorkingTree, Self::Branch];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -1070,6 +1071,9 @@ struct CommentDraft {
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
     state: Entity<AppState>,
+    /// Workers right-pane context. When present, diff/branch RPCs target this
+    /// checkout directly instead of consulting the selected Orchestrator chat.
+    explicit_cwd: Option<String>,
     diffs: Vec<CheckoutDiff>,
     started: bool,
     error: Option<SharedString>,
@@ -1136,6 +1140,7 @@ impl Changes {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
         Self {
             state,
+            explicit_cwd: None,
             diffs: Vec::new(),
             started: false,
             error: None,
@@ -1175,6 +1180,12 @@ impl Changes {
         }
     }
 
+    pub fn for_cwd(state: Entity<AppState>, cwd: String, cx: &mut Context<Self>) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.explicit_cwd = Some(cwd);
+        changes
+    }
+
     /// A pane pinned to one commit's diff (a History row click) — fetches
     /// `parent vs commit` once and never offers the scope menu.
     pub fn for_commit(
@@ -1207,6 +1218,9 @@ impl Changes {
     /// Without this the local stream simply never carries the remote checkout
     /// and the pane sits on "Preparing diff…" forever (user report).
     fn desired_target(&self, cx: &App) -> Option<String> {
+        if self.explicit_cwd.is_some() {
+            return None;
+        }
         let state = self.state.read(cx);
         let device = state.selected_chat_row()?.device_id.clone();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
@@ -1300,6 +1314,9 @@ impl Changes {
     }
 
     fn resolved(&self, cx: &App) -> Option<CheckoutDiff> {
+        if let Some(cwd) = &self.explicit_cwd {
+            return self.diffs.iter().find(|diff| &diff.cwd == cwd).cloned();
+        }
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
         resolve_diff(&self.diffs, chat).cloned()
@@ -1308,6 +1325,9 @@ impl Changes {
     /// The checkout root the scoped RPCs address: the watch-resolved diff's
     /// canonical cwd when available, else the chat row's own.
     fn scoped_cwd(&self, cx: &App) -> Option<String> {
+        if let Some(cwd) = &self.explicit_cwd {
+            return Some(cwd.clone());
+        }
         if let Some(diff) = self.resolved(cx) {
             return Some(diff.cwd);
         }
@@ -1421,14 +1441,14 @@ impl Changes {
             self.scoped_task = None;
             return;
         }
-        let Some(chat_id) = self
+        let chat_id = self
             .state
             .read(cx)
             .selected_chat_row()
-            .map(|chat| chat.id.clone())
-        else {
+            .map(|chat| chat.id.clone());
+        if self.scope == DiffScope::LatestTurn && chat_id.is_none() {
             return;
-        };
+        }
         let Some(cwd) = self.scoped_cwd(cx) else {
             return;
         };
@@ -1450,7 +1470,7 @@ impl Changes {
         let context = format!(
             "{}|{}|{}|{}|{}|{}",
             target.as_deref().unwrap_or("local"),
-            chat_id,
+            chat_id.as_deref().unwrap_or("workers"),
             cwd,
             self.scope.mode(),
             base.as_deref().unwrap_or(""),
@@ -1480,7 +1500,9 @@ impl Changes {
             let mut params = serde_json::Map::new();
             params.insert("cwd".into(), serde_json::Value::String(cwd));
             params.insert("mode".into(), serde_json::Value::String(mode.to_string()));
-            params.insert("chatId".into(), serde_json::Value::String(chat_id));
+            if let Some(chat_id) = chat_id {
+                params.insert("chatId".into(), serde_json::Value::String(chat_id));
+            }
             if let Some(base) = base {
                 params.insert("baseRef".into(), serde_json::Value::String(base));
             }
@@ -2774,6 +2796,11 @@ impl Changes {
 
     fn render_scope_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let current = self.scope;
+        let scopes = if self.explicit_cwd.is_some() {
+            DiffScope::WORKERS.as_slice()
+        } else {
+            DiffScope::ALL.as_slice()
+        };
         popover::popover_card(theme)
             .w(px(180.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
@@ -2782,7 +2809,7 @@ impl Changes {
                 // the card abutted, adjacent washes read as one slab (user
                 // report).
                 div().flex().flex_col().gap(px(2.0)).children(
-                    DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
+                    scopes.iter().copied().enumerate().map(|(ix, scope)| {
                         popover::menu_row(
                             theme,
                             scope == current,
@@ -3587,7 +3614,8 @@ impl Render for Changes {
         let base = self.base_ref.clone();
         // With no session selected (new-chat canvas) there is nothing to
         // prepare — show the quiet empty state, not an endless spinner.
-        let no_chat = self.state.read(cx).selected_chat_row().is_none();
+        let no_chat =
+            self.explicit_cwd.is_none() && self.state.read(cx).selected_chat_row().is_none();
         let phase = if no_chat {
             DiffPhase::Clean
         } else {

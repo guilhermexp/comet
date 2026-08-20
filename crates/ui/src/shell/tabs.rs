@@ -210,6 +210,7 @@ impl Shell {
                     // gutter, so the scope label sits flush over the stats
                     // strip below.
                     .pl(px(8.0))
+                    .child(self.render_orchestrator_capture_button(&theme, cx))
                     // Clipped: a long base-ref name must truncate inside the
                     // controls, never paint under the buttons to the right.
                     .child(
@@ -237,7 +238,21 @@ impl Shell {
                     .into_any_element(),
             )
         } else {
-            None
+            let capabilities = titlebar_capabilities(
+                SidebarMode::Orchestrator,
+                !self.active_chat.is_empty(),
+                false,
+            );
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when(capabilities.capture, |el| {
+                        el.child(self.render_orchestrator_capture_button(&theme, cx))
+                    })
+                    .into_any_element(),
+            )
         };
         let inner = div()
             .size_full()

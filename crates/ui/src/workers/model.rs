@@ -2,14 +2,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{Context, Task};
+use gpui::{Context, Entity, Task};
+use zeron_doc::SessionCommandPayload;
+use zeron_rpc::methods;
 use zeron_workers_unpeel::{
     LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch,
-    WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap, WorkersCreateGroupRequest,
-    WorkersCreateWorktreeRequest, WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset,
-    WorkersProject, WorkersProjectOrganizationPatch, WorkersResourceSettings, WorkersSession,
-    WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
+    WorkerParentNotification, WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap,
+    WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
+    WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
+    WorkersResourceSettings, WorkersSession, WorkersSessionSort, WorkersSettingsSnapshot,
+    WorkersTranscriptSettings, ack_worker_parent_notification,
+    build_worker_parent_notification_prompt, pending_worker_parent_notifications,
 };
+
+use crate::state::AppState;
 
 use super::archive::{archived_sessions_for_project, restore_action};
 use super::notification_policy::{
@@ -214,7 +220,48 @@ fn replacement_selection(
     }
 }
 
+#[derive(Debug, Clone)]
+struct WorkerParentDelivery {
+    notification: WorkerParentNotification,
+    prompt: String,
+}
+
+fn claim_parent_notification_delivery(in_flight: &mut HashSet<String>, id: &str) -> bool {
+    in_flight.insert(id.to_owned())
+}
+
+const MAX_PARENT_NOTIFICATION_RETRIES: u8 = 5;
+
+fn parent_notification_retry_allowed(failures: &HashMap<String, u8>, id: &str) -> bool {
+    failures.get(id).copied().unwrap_or(0) < MAX_PARENT_NOTIFICATION_RETRIES
+}
+
+fn note_parent_notification_failure(failures: &mut HashMap<String, u8>, id: &str) {
+    let count = failures.entry(id.to_owned()).or_default();
+    *count = count.saturating_add(1);
+}
+
+fn parent_notification_rpc_params(
+    notification: &WorkerParentNotification,
+    prompt: &str,
+) -> serde_json::Value {
+    let command = SessionCommandPayload::Steer {
+        prompt: prompt.to_owned(),
+        message_id: Some(format!(
+            "worker-notify-message:{}:{}",
+            notification.worker_session_id, notification.event_id
+        )),
+    };
+    serde_json::json!({
+        "chatId": notification.parent_chat_id,
+        "commandId": notification.notification_id,
+        "command": serde_json::to_value(command)
+            .expect("SessionCommandPayload::Steer is JSON serializable")
+    })
+}
+
 pub struct WorkersModel {
+    state: Entity<AppState>,
     client: LocalWorkersClient,
     pub snapshot: Option<WorkersBootstrap>,
     pub selected_project_id: Option<String>,
@@ -253,11 +300,13 @@ pub struct WorkersModel {
     runtime_install_errors: HashMap<String, String>,
     notification_state: HashMap<String, NotificationState>,
     pending_replacement: Option<PendingReplacement>,
+    parent_notification_in_flight: HashSet<String>,
+    parent_notification_failures: HashMap<String, u8>,
     _poll_task: Task<()>,
 }
 
 impl WorkersModel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let client = LocalWorkersClient::new();
         let poll_client = client.clone();
         let poll_task = cx.spawn(async move |this, cx| {
@@ -284,6 +333,7 @@ impl WorkersModel {
             }
         });
         let mut model = Self {
+            state,
             client,
             snapshot: None,
             selected_project_id: None,
@@ -325,6 +375,8 @@ impl WorkersModel {
             runtime_install_errors: HashMap::new(),
             notification_state: HashMap::new(),
             pending_replacement: None,
+            parent_notification_in_flight: HashSet::new(),
+            parent_notification_failures: HashMap::new(),
             _poll_task: poll_task,
         };
         model.refresh(cx);
@@ -598,7 +650,40 @@ impl WorkersModel {
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { client.bootstrap() })
+                .spawn(async move {
+                    let snapshot = client.bootstrap()?;
+                    let project_names = snapshot
+                        .projects
+                        .iter()
+                        .map(|project| (project.id.as_str(), project.name.as_str()))
+                        .collect::<HashMap<_, _>>();
+                    let pending = pending_worker_parent_notifications(&snapshot.sessions)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "worker parent notification state is unreadable");
+                            Vec::new()
+                        });
+                    let deliveries = pending
+                        .into_iter()
+                        .map(|mut notification| {
+                            if let Some(project_name) = project_names
+                                .get(notification.project_name.as_str())
+                            {
+                                notification.project_name = (*project_name).to_owned();
+                            }
+                            let output = client
+                                .read_output(&notification.worker_session_id, None, 0)
+                                .map(|output| String::from_utf8_lossy(&output.data).into_owned())
+                                .unwrap_or_default();
+                            let prompt =
+                                build_worker_parent_notification_prompt(&notification, &output);
+                            WorkerParentDelivery {
+                                notification,
+                                prompt,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    Ok::<_, zeron_workers_unpeel::WorkersError>((snapshot, deliveries))
+                })
                 .await;
             this.update(cx, |model, cx| {
                 if generation != model.refresh_generation {
@@ -607,9 +692,10 @@ impl WorkersModel {
                 model.refresh_task = None;
                 model.loading = false;
                 match result {
-                    Ok(snapshot) => {
+                    Ok((snapshot, deliveries)) => {
                         let app_focused = cx.active_window().is_some();
                         model.apply_snapshot(snapshot, app_focused);
+                        model.dispatch_parent_notifications(deliveries, cx);
                     }
                     Err(error) => model.error = Some(error.to_string()),
                 }
@@ -620,6 +706,74 @@ impl WorkersModel {
             })
             .ok();
         }));
+    }
+
+    fn dispatch_parent_notifications(
+        &mut self,
+        deliveries: Vec<WorkerParentDelivery>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        for delivery in deliveries {
+            let engine = engine.clone();
+            let notification_id = delivery.notification.notification_id.clone();
+            if !parent_notification_retry_allowed(
+                &self.parent_notification_failures,
+                &notification_id,
+            ) {
+                continue;
+            }
+            if !claim_parent_notification_delivery(
+                &mut self.parent_notification_in_flight,
+                &notification_id,
+            ) {
+                continue;
+            }
+            let params = parent_notification_rpc_params(&delivery.notification, &delivery.prompt);
+            let notification = delivery.notification;
+            cx.spawn(async move |this, cx| {
+                let result = engine
+                    .client()
+                    .call(methods::QUEUE_WORKER_NOTIFICATION, params)
+                    .await;
+                let acknowledged = if result.is_ok() {
+                    ack_worker_parent_notification(&notification)
+                } else {
+                    Ok(())
+                };
+                let delivery_succeeded = result.is_ok() && acknowledged.is_ok();
+                this.update(cx, |model, _| {
+                    model
+                        .parent_notification_in_flight
+                        .remove(&notification_id);
+                    if delivery_succeeded {
+                        model.parent_notification_failures.remove(&notification_id);
+                    } else {
+                        note_parent_notification_failure(
+                            &mut model.parent_notification_failures,
+                            &notification_id,
+                        );
+                    }
+                })
+                .ok();
+                if let Err(error) = result {
+                    tracing::warn!(
+                        notification = %notification_id,
+                        %error,
+                        "worker parent notification delivery failed; retrying later"
+                    );
+                } else if let Err(error) = acknowledged {
+                    tracing::warn!(
+                        notification = %notification_id,
+                        %error,
+                        "worker parent notification acknowledgement failed; deterministic retry remains safe"
+                    );
+                }
+            })
+            .detach();
+        }
     }
 
     pub fn launch(&mut self, request: WorkersLaunchRequest, cx: &mut Context<Self>) {
@@ -1552,16 +1706,82 @@ impl WorkersModel {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
-    use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
+    use zeron_workers_unpeel::{
+        WorkerParentNotification, WorkerParentNotificationKind, WorkersSession,
+        WorkersSessionCapabilities,
+    };
 
     use super::{
         PendingRemove, PendingReplacement, WorkersSessionTarget, WorkersSettingsTab,
-        dispatch_or_queue_remove, reconcile_selection, reconcile_selection_with_pending,
+        claim_parent_notification_delivery, dispatch_or_queue_remove,
+        note_parent_notification_failure, parent_notification_retry_allowed,
+        parent_notification_rpc_params, reconcile_selection, reconcile_selection_with_pending,
         replacement_selection, resolve_session_target, selection_after_remove,
         sessions_for_project, toggle_expanded,
     };
+
+    fn parent_notification() -> WorkerParentNotification {
+        WorkerParentNotification {
+            notification_id: "worker-notify:worker-1:7:completed".into(),
+            event_id: "7:completed".into(),
+            superseded_event_ids: Vec::new(),
+            retained_latch_event_id: None,
+            worker_session_id: "worker-1".into(),
+            parent_chat_id: "parent-chat-1".into(),
+            kind: WorkerParentNotificationKind::Completed,
+            runtime_generation: 7,
+            occurred_at_unix_ms: 1,
+            title: "Review parser".into(),
+            command: "codex".into(),
+            project_name: "Comet".into(),
+        }
+    }
+
+    #[test]
+    fn worker_parent_notification_builds_a_deterministic_steer_command() {
+        let notification = parent_notification();
+        let params = parent_notification_rpc_params(&notification, "worker finished");
+
+        assert_eq!(params["chatId"], "parent-chat-1");
+        assert_eq!(params["commandId"], "worker-notify:worker-1:7:completed");
+        assert_eq!(params["command"]["kind"], "steer");
+        assert_eq!(params["command"]["prompt"], "worker finished");
+        assert_eq!(
+            params["command"]["messageId"],
+            "worker-notify-message:worker-1:7:completed"
+        );
+    }
+
+    #[test]
+    fn worker_parent_notification_allows_only_one_local_in_flight_attempt() {
+        let mut in_flight = HashSet::new();
+        assert!(claim_parent_notification_delivery(
+            &mut in_flight,
+            "worker-notify:worker-1:7:completed"
+        ));
+        assert!(!claim_parent_notification_delivery(
+            &mut in_flight,
+            "worker-notify:worker-1:7:completed"
+        ));
+    }
+
+    #[test]
+    fn worker_parent_notification_retries_are_bounded_per_app_run() {
+        let mut failures = HashMap::new();
+        for _ in 0..5 {
+            assert!(parent_notification_retry_allowed(
+                &failures,
+                "worker-notify:worker-1"
+            ));
+            note_parent_notification_failure(&mut failures, "worker-notify:worker-1");
+        }
+        assert!(!parent_notification_retry_allowed(
+            &failures,
+            "worker-notify:worker-1"
+        ));
+    }
 
     #[test]
     fn appearance_is_the_second_workers_settings_tab_like_unpeel() {

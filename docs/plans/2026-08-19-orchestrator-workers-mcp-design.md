@@ -162,10 +162,26 @@ Completed on 2026-08-19 on `feat/unpeel-workers-menu-bar`.
 - `send_text` uses Unpeel's shared `session_input` sanitizer and bracketed-paste +
   settle + double-Enter delivery pipeline. A `/bin/cat` fixture received
   `MCP_TEXT_DELIVERY`, then was explicitly stopped and archived.
+- Controller launches now prepare workspace trust before creating the PTY.
+  Claude merges the canonical project/worktree into its `.claude.json` project
+  record; Codex updates its TOML document with `trust_level = "trusted"`.
+  Provider-specific config locations and command-local `env` overrides are
+  honored, writes are locked/atomic, valid TOML formatting and symlinks survive,
+  and stale Comet/provider locks recover safely.
+- Gemini and Pi do not mutate shared trust stores: Comet resolves the selected
+  preset and applies the native per-session controls
+  `GEMINI_CLI_TRUST_WORKSPACE=true` and `--approve` to the launch request. These
+  controls trust project resources without changing the saved preset or its
+  approval/sandbox policy, and the pinned Unpeel submodule stays clean.
+- `launch_worker.initial_text` is sanitized and withheld from the early session
+  creation payload. After the session exists it is submitted through the same
+  hardened bracketed-paste pipeline used by `send_text`, preventing the briefing
+  from being consumed by a first-run trust screen.
 
 Validation summary:
 
-- Workers MCP tests: 11 passed.
+- Workers MCP tests: 12 passed; workspace-trust coverage adds provider stores,
+  worktrees, environment overrides, TOML formatting, locking, and symlink cases.
 - ACP controller tests cover both `session/new` and `session/load`; the broader ACP
   integration reports 31 passed and 7 real-network tests ignored.
 - Engine full suite: all targets passed except one timing test that passed both on

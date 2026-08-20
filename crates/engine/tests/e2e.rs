@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use loro::LoroDoc;
 
 use zeron_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
@@ -36,6 +37,7 @@ fn run_request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         resume: None,
     }
@@ -583,6 +585,111 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
     assert_eq!(verdict, zeron_doc::CommandDisposition::Skip);
+}
+
+#[tokio::test]
+async fn deterministic_queue_command_id_is_returned_and_executes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let command = serde_json::to_value(SessionCommandPayload::Steer {
+        prompt: "worker finished".into(),
+        message_id: Some("worker-notify-message:worker-1:7:completed".into()),
+    })
+    .unwrap();
+    let params = serde_json::json!({
+        "chatId": CHAT,
+        "commandId": "worker-notify:worker-1:7:completed",
+        "command": command
+    });
+
+    let first = client
+        .call(
+            zeron_rpc::methods::QUEUE_WORKER_NOTIFICATION,
+            params.clone(),
+        )
+        .await
+        .unwrap();
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    let bytes = store
+        .load_snapshot(CHAT)
+        .unwrap()
+        .expect("notification command is durable before RPC success");
+    let restored = LoroDoc::new();
+    restored.import(&bytes).unwrap();
+    assert!(
+        SessionDoc::from_doc(restored)
+            .read_commands()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == "worker-notify:worker-1:7:completed")
+    );
+    let second = client
+        .call(zeron_rpc::methods::QUEUE_WORKER_NOTIFICATION, params)
+        .await
+        .unwrap();
+    assert_eq!(first["commandId"], "worker-notify:worker-1:7:completed");
+    assert_eq!(second["commandId"], "worker-notify:worker-1:7:completed");
+
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .filter(|entry| entry.role == MessageRole::Assistant)
+                .count()
+                == 1
+        },
+        "one deterministic command execution",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| entry.role == MessageRole::Assistant)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn worker_notification_rejects_a_deleted_parent_without_creating_an_orphan_doc() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let command = serde_json::to_value(SessionCommandPayload::Steer {
+        prompt: "worker finished".into(),
+        message_id: Some("worker-notify-message:missing".into()),
+    })
+    .unwrap();
+
+    let error = client
+        .call(
+            zeron_rpc::methods::QUEUE_WORKER_NOTIFICATION,
+            serde_json::json!({
+                "chatId": "deleted-parent",
+                "commandId": "worker-notify:missing",
+                "command": command
+            }),
+        )
+        .await
+        .expect_err("missing parent must be rejected");
+    assert!(error.to_string().contains("parent chat does not exist"));
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    assert!(store.load_snapshot("deleted-parent").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1659,6 +1766,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
         enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: vec![path],
         resume: None,
     };

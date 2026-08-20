@@ -384,7 +384,7 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
                 "{server} · {tool}\n{}",
                 serde_json::to_string_pretty(input).unwrap_or_default()
             ),
-            None => format!("{server} · {tool}"),
+            None => return None,
         },
         ToolCall::Unknown { name, input } => match input {
             Some(input) => format!(
@@ -4702,6 +4702,16 @@ mod tests {
         };
         assert_eq!(lines[0].as_ref(), "gh · issues");
         assert!(lines.iter().any(|l| l.contains("\"repo\": \"zeron\"")));
+
+        assert!(
+            call_block(&ToolCall::Mcp {
+                server: "comet-workers".into(),
+                tool: "launch_worker".into(),
+                input: None,
+            })
+            .is_none(),
+            "the chip header already names an MCP call with no visible input"
+        );
 
         // Todos list one item per line with checkbox state.
         let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {

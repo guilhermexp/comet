@@ -46,13 +46,12 @@ use crate::theme::Theme;
 pub const TEXTAREA_PAD_V: f32 = 20.0;
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
-/// 260)` (zeron composer.tsx line 235). The 76px floor applies even when
-/// empty — it's what makes the always-expanded new-chat composer tall.
+/// 260)` (zeron composer.tsx line 235). The 76px floor applies whenever the
+/// composer has switched into its expanded layout.
 pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
-/// Expanded actions row: `pt-1` (4) + h-8 picker chips (32 — the tallest
-/// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) — zeron
-/// composer-actions.tsx line 60.
+/// Expanded actions row keeps the original 46px bottom-control band. Model
+/// controls now live in the footer; attach/send remain bottom-anchored here.
 pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
@@ -82,6 +81,13 @@ pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
 /// During an interactive window resize the current mode is frozen until the
 /// measured widths have been stable this long.
 pub const RESIZE_SETTLE_MS: u64 = 150;
+
+/// The rendered layout follows the measured compact/expanded mode for both
+/// existing and new chats. `new_chat` remains explicit here so the parity
+/// contract cannot accidentally regress into forcing every new chat open.
+pub fn composer_layout_expanded(expanded_mode: bool, _new_chat: bool) -> bool {
+    expanded_mode
+}
 
 /// Compact↔expanded flip with hysteresis. `capacity` is the *compact-mode*
 /// input capacity (a layout-stable width: measured while compact, tracked by
@@ -317,10 +323,8 @@ pub fn collapse_text_glide(from: f32, progress: f32) -> f32 {
 }
 
 /// The decaying [`CLUSTER_Y_DELTA`] offset for the in-flight morph.
-/// The whole control cluster — chips AND attach/send — rides the stationary
-/// bottom anchor at FULL alpha throughout (round-9 follow-up: any fade on the
-/// picker chips read as flicker; their screen position is near-stationary
-/// across the flip, so nothing needs to be hidden).
+/// The attach/send cluster rides the stationary bottom anchor at full alpha
+/// throughout the compact/expanded morph.
 pub fn morph_cluster_dy(progress: f32) -> f32 {
     CLUSTER_Y_DELTA * (1.0 - progress)
 }
@@ -3557,6 +3561,11 @@ impl Composer {
         self.add_staged(staged, cx);
     }
 
+    pub(crate) fn set_failure(&mut self, message: String, cx: &mut Context<Self>) {
+        self.failure = Some(message.into());
+        cx.notify();
+    }
+
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(list) = self.attachments.get_mut(&self.current_key) {
             list.retain(|a| a.id != id);
@@ -4782,6 +4791,7 @@ impl Composer {
                             sandbox: SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             enable_workers_mcp: true,
+                            workers_parent_chat_id: None,
                             resume: None,
                             attachments: attachment_paths,
                         },
@@ -5368,6 +5378,7 @@ impl Render for Composer {
             // an interactive resize.
             self.last_seen_width = 0.0;
         }
+        let new_chat = self.state.read(cx).selected_chat.is_none();
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
         let now_ms = self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
@@ -5477,10 +5488,9 @@ impl Render for Composer {
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
 
-        // New chats always use the expanded layout: the repo/branch pickers
-        // need the full-width actions row (zeron composer-actions.tsx
-        // `mustExpand = isNew || …`).
-        let expanded = expanded || new_chat;
+        // Empty new chats use the same compact pill as existing chats. The
+        // measured flip still expands for multiline/overflow content.
+        let expanded = composer_layout_expanded(expanded, new_chat);
 
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
@@ -5546,8 +5556,8 @@ impl Render for Composer {
 
         // The pill chrome (zeron composer.tsx): `rounded-[26px] border
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
-        // a hairline over a faint wash, never a solid grey box. Picker chips,
-        // attach, and the send circle all live INSIDE the pill.
+        // a hairline over a faint wash, never a solid grey box. Attach and the
+        // send circle live inside; model/effort now belong to the footer.
         let pill_bg = theme.input_glass_bg();
         // No drop shadow on glass: it paints BEHIND the translucent fill and
         // shows through as an inner glow (theme.rs's card_selected_shadows
@@ -5572,8 +5582,8 @@ impl Render for Composer {
             // text container is laid out at TARGET size (committed layout
             // never reflows mid-tween — the caret can't jump); its top pad
             // eases 12→16 so the first line glides from its compact resting
-            // place. The whole control cluster stays at full alpha — chips,
-            // attach and send are all (near-)stationary on the bottom anchor.
+            // place. Attach and send stay at full alpha and remain
+            // near-stationary on the bottom anchor.
             let text_pt = morph_text_pad(morph_t);
             pill.h(px(pill_height))
                 .overflow_hidden()
@@ -5611,7 +5621,7 @@ impl Render for Composer {
                         .pr(px(morph_cluster_inset(true, morph_t)))
                         .pt(px(4.0))
                         .pb(px(10.0))
-                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
+                        .child(div().flex_1().min_w_0())
                         .child(attach)
                         .child(send_button),
                 )
@@ -5622,8 +5632,8 @@ impl Render for Composer {
             // The row is BOTTOM-justified: during the collapse morph the pill
             // top sweeps down over a stationary row, the text walks down from
             // its expanded resting place via a decaying relative offset, and
-            // the whole inline cluster (chips + attach/send) holds its spot at
-            // full alpha (2.5px centering delta gliding in).
+            // the inline attach/send cluster holds its spot at full alpha
+            // (2.5px centering delta gliding in).
             let text_glide = match self.flip_morph {
                 Some(m) if morphing => collapse_text_glide(m.from, morph_t),
                 _ => 0.0,
@@ -5666,7 +5676,6 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(div().flex_none().child(self.pickers.clone()))
                                 .child(attach)
                                 .child(send_button),
                         ),
@@ -5687,7 +5696,7 @@ impl Render for Composer {
         // labels once the session exists. Git spaces only.
         let footer = self
             .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(cx));
+            .update(cx, |pickers, cx| pickers.render_footer(window, cx));
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,
@@ -5722,6 +5731,14 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_new_chat_uses_compact_composer() {
+        assert!(!composer_layout_expanded(false, true));
+        assert!(!composer_layout_expanded(false, false));
+        assert!(composer_layout_expanded(true, true));
+        assert!(composer_layout_expanded(true, false));
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {
@@ -6071,8 +6088,8 @@ mod tests {
         assert_eq!(COMPOSER_MIN_HEIGHT, 124.0);
         assert_eq!(COMPOSER_MAX_HEIGHT, 308.0);
         // One line sits at the floor: the textarea BOX (content + `pt-4 pb-1`)
-        // clamps UP to 76 exactly like `Math.max(scrollHeight, 76)` — this is
-        // what makes the always-expanded new-chat composer 124px tall.
+        // clamps UP to 76 exactly like `Math.max(scrollHeight, 76)` once the
+        // composer has switched into expanded mode.
         assert_eq!(
             composer_total_height(input_content_height(1)),
             COMPOSER_MIN_HEIGHT

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +128,61 @@ impl ResourceSampler {
     pub fn sample(&mut self, include_processes: bool) -> WorkersResourceSnapshot {
         sample_resources(&mut self.cpu, include_processes)
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn current_session_process_identities(session_id: &str) -> Result<Vec<(u32, u64)>, String> {
+    use unpeel_core::session_host::PidIdentity;
+
+    let manifest = unpeel_core::session_host::load_manifest(session_id)
+        .ok_or_else(|| format!("no manifest for worker {session_id}"))?;
+    let (root_pid, root_started_at) = manifest
+        .pid
+        .zip(manifest.pid_started_at)
+        .ok_or_else(|| format!("worker {session_id} has no live process identity"))?;
+    if unpeel_core::session_host::manifest_pid_identity(&manifest) != PidIdentity::Matches {
+        return Err(format!("worker {session_id} process identity is stale"));
+    }
+    let platform = MacProcessPlatform::capture()?;
+    if platform.process_started_at_unix_ms(root_pid) != Some(root_started_at) {
+        return Err(format!(
+            "worker {session_id} root process changed during inspection"
+        ));
+    }
+    let processes = platform.processes()?;
+    let owned = owned_process_ids(&processes, root_pid);
+    let mut identities = processes
+        .into_iter()
+        .filter(|process| owned.contains(&process.pid))
+        .map(|process| (process.pid, process.started_at_unix_ms))
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    Ok(identities)
+}
+
+fn owned_process_ids(processes: &[PlatformProcess], root_pid: u32) -> HashSet<u32> {
+    let mut owned = processes
+        .iter()
+        .filter(|process| process.pid == root_pid || process.kernel_session_id == root_pid)
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    loop {
+        let before = owned.len();
+        for process in processes {
+            if owned.contains(&process.parent_pid) {
+                owned.insert(process.pid);
+            }
+        }
+        if owned.len() == before {
+            break;
+        }
+    }
+    owned
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn current_session_process_identities(_session_id: &str) -> Result<Vec<(u32, u64)>, String> {
+    Err("worker process inspection is unavailable on this platform".into())
 }
 
 impl CpuTracker {
@@ -274,9 +329,10 @@ fn sample_root<P: ProcessPlatform>(
         return empty();
     }
     let sampled_at_ns = platform.sampled_at_ns();
+    let owned = owned_process_ids(&processes, root.pid);
     let measurements = processes
         .into_iter()
-        .filter(|process| process.kernel_session_id == root.pid)
+        .filter(|process| owned.contains(&process.pid))
         .map(|process| ProcessMeasurement {
             pid: process.pid,
             parent_pid: process.parent_pid,
@@ -556,6 +612,7 @@ mod sampler_tests {
             processes: vec![
                 process(100, 1, 100, 1_000),
                 process(101, 100, 100, 1_001),
+                process(102, 101, 102, 1_002),
                 process(200, 1, 200, 2_000),
             ],
             sampled_at_unix_ms: 3_000,
@@ -565,7 +622,13 @@ mod sampler_tests {
 
         let sample = sample_root(&root(100, 1_000), &platform, true, &mut cpu);
 
-        assert_eq!(sample.process_count, 2);
+        assert_eq!(sample.process_count, 3);
+        assert!(
+            sample
+                .top_processes
+                .iter()
+                .any(|process| process.pid == 102)
+        );
         assert!(
             sample
                 .top_processes

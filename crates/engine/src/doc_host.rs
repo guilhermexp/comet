@@ -1679,8 +1679,19 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
+        self.queue_command_with_id(chat_id, new_id(), payload)
+    }
+
+    /// Queue a command under a caller-stable id. Notification bridges use this
+    /// to retry safely after a crash: the processed-command ledger makes a
+    /// repeated id idempotent even if the first RPC reply was lost.
+    pub fn queue_command_with_id(
+        &self,
+        chat_id: &str,
+        id: String,
+        payload: SessionCommandPayload,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
-        let id = new_id();
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
             turn_id: Some(m.id.clone()),
@@ -1720,6 +1731,45 @@ impl DocHost {
         // the command is durable in the doc either way (a host that opens the chat
         // for any other reason still executes it).
         self.nudge_remote_host(chat_id);
+        Ok(id)
+    }
+
+    /// Durable outbox seam for app-owned Worker lifecycle notifications.
+    /// Unlike ordinary composer commands, the parent must already exist and the
+    /// chat snapshot is persisted synchronously before success is returned.
+    pub fn queue_worker_notification(
+        &self,
+        chat_id: &str,
+        command_id: String,
+        payload: SessionCommandPayload,
+    ) -> Result<String, EngineError> {
+        let parent_exists = self
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace is not ready".into()))?
+            .chat(chat_id)?
+            .is_some();
+        if !parent_exists {
+            return Err(EngineError::Other(format!(
+                "parent chat does not exist: {chat_id}"
+            )));
+        }
+        let id = self.queue_command_with_id(chat_id, command_id, payload)?;
+        let handle = self.open(chat_id)?;
+        self.persist_snapshot(&handle)?;
+        // Close the check→queue race with DeleteChat/DeleteSpace. If a
+        // concurrent tombstone landed after the first check, remove the
+        // just-persisted orphan and keep the Worker event unacknowledged.
+        if self
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace is not ready".into()))?
+            .chat(chat_id)?
+            .is_none()
+        {
+            self.purge_chat(chat_id);
+            return Err(EngineError::Other(format!(
+                "parent chat does not exist: {chat_id}"
+            )));
+        }
         Ok(id)
     }
 
@@ -2194,12 +2244,13 @@ impl DocHost {
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
             enable_workers_mcp: true,
+            workers_parent_chat_id: Some(chat_id.to_owned()),
             attachments: Vec::new(),
             resume: None,
         })
     }
 
-    fn save_snapshot(&self, handle: &ChatDocHandle) {
+    fn persist_snapshot(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
         if handle.retired.load(Ordering::Relaxed) {
             // A chat2 seed replaced this lineage on disk; persisting this
             // handle's fat doc would clobber the thin one. But retired with
@@ -2212,19 +2263,18 @@ impl DocHost {
                 Ok(Some((_, _, epoch))) if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH
             );
             if thin_on_disk {
-                return;
+                return Ok(());
             }
         }
-        match handle.doc.export_snapshot() {
-            Ok(bytes) => {
-                handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
-                if let Err(err) = self.inner.store.save_snapshot(&handle.chat_id, &bytes) {
-                    tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot export failed");
-            }
+        let bytes = handle.doc.export_snapshot()?;
+        handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        Ok(())
+    }
+
+    fn save_snapshot(&self, handle: &ChatDocHandle) {
+        if let Err(err) = self.persist_snapshot(handle) {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
         }
     }
 

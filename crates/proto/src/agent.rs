@@ -105,6 +105,10 @@ pub struct RunRequest {
     /// Additive and disabled by default for old wire payloads.
     #[serde(default, skip_serializing_if = "is_false")]
     pub enable_workers_mcp: bool,
+    /// Authoritative Comet chat that owns controller-launched Workers. The
+    /// engine stamps this field; UI and remote callers do not choose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_parent_chat_id: Option<String>,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -353,6 +357,7 @@ mod tests {
         let req: RunRequest = serde_json::from_str(old).unwrap();
         assert!(req.attachments.is_empty());
         assert!(!req.enable_workers_mcp);
+        assert_eq!(req.workers_parent_chat_id, None);
         // …and an empty list serializes away (old readers never see it).
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("attachments").is_none());
@@ -375,14 +380,23 @@ mod tests {
             "cwd": "/tmp",
             "sandbox": "workspace-write",
             "resume": null,
-            "enableWorkersMcp": true
+            "enableWorkersMcp": true,
+            "workersParentChatId": "chat-parent-1"
         }))
         .unwrap();
 
         assert!(request.enable_workers_mcp);
         assert_eq!(
-            serde_json::to_value(request).unwrap()["enableWorkersMcp"],
+            request.workers_parent_chat_id.as_deref(),
+            Some("chat-parent-1")
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["enableWorkersMcp"],
             true
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["workersParentChatId"],
+            "chat-parent-1"
         );
     }
 

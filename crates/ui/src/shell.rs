@@ -56,6 +56,9 @@ use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 use crate::workers::model::{WorkersModel, WorkersRoute};
 use crate::workers::presentation::workers_titlebar;
+use crate::workers::session_gallery;
+#[cfg(target_os = "macos")]
+use crate::workers::session_gallery::native as native_session_gallery;
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
 use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
 #[cfg(target_os = "macos")]
@@ -228,6 +231,40 @@ impl SidebarMode {
     fn shows_orchestrator_content(self) -> bool {
         matches!(self, Self::Orchestrator)
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TitlebarCapabilities {
+    capture: bool,
+    right_pane: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkersPanelContext {
+    key: String,
+    cwd: String,
+    git_detected: bool,
+}
+
+fn titlebar_capabilities(
+    mode: SidebarMode,
+    has_orchestrator_chat: bool,
+    has_worker_context: bool,
+) -> TitlebarCapabilities {
+    let available = match mode {
+        SidebarMode::Orchestrator => has_orchestrator_chat,
+        SidebarMode::Workers => has_worker_context,
+    };
+    TitlebarCapabilities {
+        capture: available,
+        right_pane: available,
+    }
+}
+
+fn workers_panel_key(session_id: Option<&str>, project_id: &str) -> String {
+    session_id
+        .map(|session_id| format!("workers-session:{session_id}"))
+        .unwrap_or_else(|| format!("workers-project:{project_id}"))
 }
 
 /// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
@@ -1492,12 +1529,43 @@ impl Shell {
     /// Does the selected space's folder have git? Owner-stamped and synced —
     /// gates the Changes pane, its toggle, and Cmd-B with zero RPCs.
     fn space_git_detected(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_space_git()
+        match self.sidebar_mode {
+            SidebarMode::Orchestrator => self.state.read(cx).selected_space_git(),
+            SidebarMode::Workers => self
+                .worker_panel_context(cx)
+                .is_some_and(|context| context.git_detected),
+        }
+    }
+
+    fn worker_panel_context(&self, cx: &App) -> Option<WorkersPanelContext> {
+        let model = self.workers_model.read(cx);
+        let session = model.selected_session();
+        let project = session
+            .and_then(|session| {
+                model
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == session.project_id)
+            })
+            .or_else(|| model.selected_project())?;
+        let key = workers_panel_key(session.map(|session| session.id.as_str()), &project.id);
+        Some(WorkersPanelContext {
+            key,
+            cwd: project.path.clone(),
+            git_detected: project.git_branch.is_some()
+                || std::path::Path::new(&project.path).join(".git").exists(),
+        })
     }
 
     /// The per-session panel key. The new-chat canvas (no selection) keys per
     /// space so its state is not shared across workspaces.
     fn panel_key(&self, cx: &App) -> String {
+        if self.sidebar_mode == SidebarMode::Workers {
+            return self
+                .worker_panel_context(cx)
+                .map(|context| context.key)
+                .unwrap_or_else(|| "workers:none".into());
+        }
         if self.active_chat.is_empty() {
             let space = self
                 .state
@@ -1519,7 +1587,11 @@ impl Shell {
     }
 
     fn right_pane_open(&self, cx: &App) -> bool {
-        self.active_utility_pane(cx).is_some()
+        let context_available = match self.sidebar_mode {
+            SidebarMode::Orchestrator => !self.active_chat.is_empty(),
+            SidebarMode::Workers => self.worker_panel_context(cx).is_some(),
+        };
+        context_available && self.active_utility_pane(cx).is_some()
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -1622,7 +1694,13 @@ impl Shell {
         let terminals: Vec<(u64, SharedString, bool)> = self
             .right_terminal
             .as_ref()
-            .map(|t| t.read(cx).tab_summaries(cx))
+            .map(|terminal| {
+                if self.sidebar_mode == SidebarMode::Workers {
+                    terminal.read(cx).tab_summaries_for_context(&key)
+                } else {
+                    terminal.read(cx).tab_summaries(cx)
+                }
+            })
             .unwrap_or_default();
         stored
             .iter()
@@ -1704,7 +1782,14 @@ impl Shell {
         match surface {
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+                let key = self.panel_key(cx);
+                if self.sidebar_mode == SidebarMode::Workers {
+                    panel.update(cx, |panel, cx| {
+                        panel.select_tab_by_key_for_context(&key, tab, cx)
+                    });
+                } else {
+                    panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+                }
             }
             RightSurface::Diff(id) => {
                 if let Some(changes) = self.diffs.get(&id).cloned() {
@@ -1720,7 +1805,14 @@ impl Shell {
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
-        let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        let changes = if let Some(context) = (self.sidebar_mode == SidebarMode::Workers)
+            .then(|| self.worker_panel_context(cx))
+            .flatten()
+        {
+            cx.new(|cx| Changes::for_cwd(self.state.clone(), context.cwd, cx))
+        } else {
+            cx.new(|cx| Changes::new(self.state.clone(), cx))
+        };
         self.register_diff_surface(changes, cx);
     }
 
@@ -1757,9 +1849,15 @@ impl Shell {
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
         let panel = self.right_terminal_panel(cx);
+        let worker_context = (self.sidebar_mode == SidebarMode::Workers)
+            .then(|| self.worker_panel_context(cx))
+            .flatten();
         let opened = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
-            panel.open_tab_for_selected(cx)
+            match worker_context {
+                Some(context) => panel.open_tab_for_cwd(context.key, context.cwd, cx),
+                None => panel.open_tab_for_selected(cx),
+            }
         });
         if let Some(tab) = opened {
             let key = self.panel_key(cx);
@@ -1791,7 +1889,13 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
+                if self.sidebar_mode == SidebarMode::Workers {
+                    panel.update(cx, |panel, cx| {
+                        panel.close_tab_by_key_for_context(&key, tab, window, cx)
+                    });
+                } else {
+                    panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
+                }
             }
             RightSurface::Picker => {}
         }
@@ -3061,6 +3165,12 @@ impl Shell {
                                 ),
                         )
                     });
+            let right_open = self.right_pane_open(cx);
+            let right_now = if right_open {
+                self.eval_tween(self.right_tween, self.right_target(cx))
+            } else {
+                0.0
+            };
             let drag_bar = div()
                 .absolute()
                 .top_0()
@@ -3079,7 +3189,7 @@ impl Shell {
                         .top_0()
                         .bottom_0()
                         .left(px(sidebar_now))
-                        .right_0()
+                        .right(px(right_now))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -3088,11 +3198,12 @@ impl Shell {
                 );
             let drag_bar =
                 self.titlebar_drag_region("workers-header-titlebar-drag-region", drag_bar, cx);
+            let action_right = if right_open { right_now + 10.0 } else { 10.0 };
             let workspace_action = workspace_path.map(|path| {
                 div()
                     .absolute()
                     .top(px(6.0))
-                    .right(px(10.0))
+                    .right(px(action_right))
                     .occlude()
                     .child(self.render_workers_workspace_open_button(path, &theme, cx))
             });
@@ -3104,9 +3215,9 @@ impl Shell {
                             .absolute()
                             .top(px(6.0))
                             .right(px(if workspace_action.is_some() {
-                                77.0
+                                action_right + 67.0
                             } else {
-                                10.0
+                                action_right
                             }))
                             .occlude()
                             .child(self.render_workers_session_gallery_button(
@@ -3116,6 +3227,57 @@ impl Shell {
                                 cx,
                             ))
                     });
+            let panel_action = (titlebar_capabilities(
+                SidebarMode::Workers,
+                false,
+                self.worker_panel_context(cx).is_some(),
+            )
+            .right_pane
+                && !right_open)
+                .then(|| {
+                    let preceding = usize::from(workspace_action.is_some())
+                        + usize::from(gallery_action.is_some());
+                    div()
+                        .absolute()
+                        .top(px(6.0))
+                        .right(px(action_right + preceding as f32 * 67.0))
+                        .occlude()
+                        .child(self.render_workers_right_pane_button(&theme, cx))
+                });
+            let panel_header = right_open.then(|| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .w(px(right_now))
+                    .h(px(Theme::TITLEBAR_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .pl(px(8.0))
+                    .pr(px(10.0))
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .occlude()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(self.render_right_tab_strip(cx)),
+                    )
+                    .child(header_icon_button(
+                        "workers-expand-right-pane",
+                        icons::EXPAND_ARROWS,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                    ))
+                    .child(header_icon_button(
+                        "workers-close-right-pane",
+                        icons::SIDEBAR_MINIMALISTIC,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                    ))
+            });
             let bar = div()
                 .relative()
                 .w_full()
@@ -3125,7 +3287,9 @@ impl Shell {
                 // Paint interactive chrome after the drag surface so its
                 // hitbox and pixels win inside the native titlebar.
                 .children(gallery_action)
-                .children(workspace_action);
+                .children(workspace_action)
+                .children(panel_action)
+                .children(panel_header);
             return bar.into_any_element();
         }
         match self.route {
@@ -3308,6 +3472,106 @@ impl Shell {
                             content.open_capture_menu(session_id.clone(), cx)
                         });
                     }))
+                    .child(
+                        icon(icons::ALT_ARROW_DOWN)
+                            .size(px(9.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_workers_right_pane_button(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        header_icon_button(
+            "workers-toggle-right-pane",
+            icons::SIDEBAR_MINIMALISTIC,
+            theme,
+            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+        )
+        .into_any_element()
+    }
+
+    fn open_orchestrator_capture_menu(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let selection = native_session_gallery::show_async();
+            let composer = self.composer.clone();
+            cx.spawn(async move |_, cx| {
+                let Ok(Some(mode)) = selection.await else {
+                    return;
+                };
+                let directory = std::env::temp_dir().join("comet-orchestrator-captures");
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { session_gallery::capture_screenshot(&directory, mode) })
+                    .await;
+                match result {
+                    Ok(path) => {
+                        let cleanup = path.clone();
+                        composer.update(cx, |composer, cx| composer.add_paths(vec![path], cx));
+                        let _ = std::fs::remove_file(cleanup);
+                    }
+                    Err(error) if error == "Screenshot capture was cancelled" => {}
+                    Err(error) => {
+                        composer.update(cx, |composer, cx| composer.set_failure(error, cx));
+                    }
+                }
+            })
+            .detach();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+        }
+    }
+
+    fn render_orchestrator_capture_button(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.text.opacity(0.08))
+            .bg(theme.surface_raised.opacity(0.92))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("orchestrator-capture")
+                    .w(px(32.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_orchestrator_capture_menu(cx)))
+                    .child(
+                        icon(icons::WORKER_GALLERY)
+                            .size(px(17.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.text.opacity(0.10)))
+            .child(
+                div()
+                    .id("orchestrator-capture-menu")
+                    .w(px(25.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_orchestrator_capture_menu(cx)))
                     .child(
                         icon(icons::ALT_ARROW_DOWN)
                             .size(px(9.0))
@@ -7710,7 +7974,46 @@ mod tests {
     }
 
     #[test]
-    fn utility_tabs_remain_open_when_selection_changes() {
+    fn cross_mode_titlebar_capabilities_require_the_active_mode_context() {
+        assert_eq!(
+            titlebar_capabilities(SidebarMode::Orchestrator, true, false),
+            TitlebarCapabilities {
+                capture: true,
+                right_pane: true,
+            }
+        );
+        assert_eq!(
+            titlebar_capabilities(SidebarMode::Orchestrator, false, false),
+            TitlebarCapabilities::default()
+        );
+        assert_eq!(
+            titlebar_capabilities(SidebarMode::Workers, false, true),
+            TitlebarCapabilities {
+                capture: true,
+                right_pane: true,
+            }
+        );
+        assert_eq!(
+            titlebar_capabilities(SidebarMode::Workers, true, false),
+            TitlebarCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn workers_panel_keys_never_alias_orchestrator_chat_ids() {
+        assert_eq!(
+            workers_panel_key(Some("session-1"), "project-1"),
+            "workers-session:session-1"
+        );
+        assert_eq!(
+            workers_panel_key(None, "project-1"),
+            "workers-project:project-1"
+        );
+        assert_ne!(workers_panel_key(Some("chat-1"), "project-1"), "chat-1");
+    }
+
+    #[test]
+    fn session_panels_flags_are_chat_scoped() {
         let mut panels = SessionPanels::default();
         panels.show_changes("chat-a");
         panels.show_terminal("chat-a");

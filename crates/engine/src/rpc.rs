@@ -102,6 +102,14 @@ struct QueueCommandParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct QueueWorkerNotificationParams {
+    chat_id: String,
+    command_id: String,
+    command: SessionCommandPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
@@ -177,7 +185,10 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenTerminalParams {
-    chat_id: String,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
     cols: u16,
     rows: u16,
 }
@@ -775,6 +786,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
+            | methods::QUEUE_WORKER_NOTIFICATION
             | methods::WATCH_DOC_MESSAGES
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
@@ -1044,6 +1056,27 @@ impl RpcService for EngineRpc {
                 let command_id = self
                     .doc_host
                     .queue_command(&p.chat_id, p.command)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::QUEUE_WORKER_NOTIFICATION => {
+                let p: QueueWorkerNotificationParams = parse_params(params)?;
+                if p.command_id.is_empty()
+                    || p.command_id.len() > 512
+                    || p.command_id.chars().any(char::is_control)
+                {
+                    return Err(RpcError::Failed(
+                        "commandId must be 1-512 characters without control characters".into(),
+                    ));
+                }
+                if !matches!(p.command, SessionCommandPayload::Steer { .. }) {
+                    return Err(RpcError::Failed(
+                        "worker notification command must be a steer".into(),
+                    ));
+                }
+                let command_id = self
+                    .doc_host
+                    .queue_worker_notification(&p.chat_id, p.command_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
@@ -1562,15 +1595,21 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
-                let cwd = self
-                    .workspace
-                    .chat(&p.chat_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                let cwd = match (p.chat_id, p.cwd) {
+                    (Some(chat_id), None) => self
+                        .workspace
+                        .chat(&chat_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|chat| chat.cwd)
+                        .unwrap_or_else(|| home_dir().to_string_lossy().to_string()),
+                    (None, Some(cwd)) if !cwd.trim().is_empty() => cwd,
+                    _ => {
+                        return Err(RpcError::BadParams(
+                            "OpenTerminal requires exactly one non-empty chatId or cwd".into(),
+                        ));
+                    }
+                };
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -1741,6 +1780,7 @@ mod tests {
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        assert!(forwardable(methods::QUEUE_WORKER_NOTIFICATION));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
     }

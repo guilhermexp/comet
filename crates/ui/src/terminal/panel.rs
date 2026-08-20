@@ -273,6 +273,9 @@ pub struct TerminalPanel {
     /// explicitly (no ensure-on-open/chat-switch), and closing the last tab
     /// must not dispatch the bottom drawer's [`ToggleTerminal`].
     embedded: bool,
+    /// Explicit right-pane context used by Workers. `None` keeps the existing
+    /// selected-Orchestrator-chat behavior.
+    render_context: Option<String>,
     tab_seq: u64,
     drag: Option<DragState>,
     tabs_scroll: ScrollHandle,
@@ -295,6 +298,7 @@ impl TerminalPanel {
             chats: HashMap::new(),
             open: false,
             embedded: false,
+            render_context: None,
             tab_seq: 0,
             drag: None,
             tabs_scroll: ScrollHandle::new(),
@@ -359,8 +363,12 @@ impl TerminalPanel {
         let Some(chat) = self.selected_chat(cx) else {
             return Vec::new();
         };
+        self.tab_summaries_for_context(&chat)
+    }
+
+    pub fn tab_summaries_for_context(&self, context: &str) -> Vec<(u64, SharedString, bool)> {
         self.chats
-            .get(&chat)
+            .get(context)
             .map(|tabs| {
                 tabs.tabs
                     .iter()
@@ -372,24 +380,47 @@ impl TerminalPanel {
 
     /// Open a fresh tab for the selected chat and return its key.
     pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
+        self.render_context = None;
         let chat = self.selected_chat(cx)?;
         self.open_tab(chat, cx);
         Some(self.tab_seq)
     }
 
+    pub fn open_tab_for_cwd(
+        &mut self,
+        context: String,
+        cwd: String,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        self.render_context = Some(context.clone());
+        self.open_tab_in_context(context, Some(cwd), None, cx);
+        Some(self.tab_seq)
+    }
+
     /// Make `key` the rendered tab of the selected chat.
     pub fn select_tab_by_key(&mut self, key: u64, cx: &mut Context<Self>) {
+        self.render_context = None;
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
+        self.select_tab_by_key_for_context(&chat, key, cx);
+    }
+
+    pub fn select_tab_by_key_for_context(
+        &mut self,
+        context: &str,
+        key: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.render_context = Some(context.to_owned());
         let Some(ix) = self
             .chats
-            .get(&chat)
+            .get(context)
             .and_then(|tabs| tabs.tabs.iter().position(|t| t.key == key))
         else {
             return;
         };
-        self.select_tab(&chat, ix, cx);
+        self.select_tab(context, ix, cx);
     }
 
     /// Close the selected chat's tab `key` (surface-tab ✕).
@@ -398,6 +429,17 @@ impl TerminalPanel {
             return;
         };
         self.close_tab(&chat, key, cx);
+    }
+
+    pub fn close_tab_by_key_for_context(
+        &mut self,
+        context: &str,
+        key: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.render_context = Some(context.to_owned());
+        self.close_tab(context, key, window, cx);
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -437,7 +479,9 @@ impl TerminalPanel {
     }
 
     fn selected_chat(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).selected_chat.clone()
+        self.render_context
+            .clone()
+            .or_else(|| self.state.read(cx).selected_chat.clone())
     }
 
     fn ensure_tab(&mut self, cx: &mut Context<Self>) {
@@ -458,7 +502,7 @@ impl TerminalPanel {
     }
 
     fn active_tab(&self, cx: &App) -> Option<&TerminalTab> {
-        let chat = self.state.read(cx).selected_chat.clone()?;
+        let chat = self.selected_chat(cx)?;
         let tabs = self.chats.get(&chat)?;
         tabs.tabs.get(tabs.active)
     }
@@ -466,12 +510,23 @@ impl TerminalPanel {
     // ---- open / stream lifecycle ----
 
     fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) {
+        let target = self.chat_target(&chat, cx);
+        self.open_tab_in_context(chat, None, target, cx);
+    }
+
+    fn open_tab_in_context(
+        &mut self,
+        context: String,
+        cwd: Option<String>,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
         self.tab_seq += 1;
         let key = self.tab_seq;
-        let entry = self.chats.entry(chat.clone()).or_default();
+        let entry = self.chats.entry(context.clone()).or_default();
         let tab_no = entry.tabs.len() + 1;
         entry.tabs.push(TerminalTab {
             key,
@@ -487,9 +542,8 @@ impl TerminalPanel {
         });
         entry.active = entry.tabs.len() - 1;
 
-        let target = self.chat_target(&chat, cx);
-        let run = Self::spawn_session(chat.clone(), key, engine, target, cx);
-        if let Some(tab) = self.tab_mut(&chat, key) {
+        let run = Self::spawn_session(context.clone(), key, engine, target, cwd, cx);
+        if let Some(tab) = self.tab_mut(&context, key) {
             tab._run = Some(run);
         }
         cx.emit(TerminalPanelEvent::Changed { chat });
@@ -498,30 +552,32 @@ impl TerminalPanel {
 
     /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.
     fn spawn_session(
-        chat: String,
+        context: String,
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let (cols, rows) = this
                 .update(cx, |panel, _| {
                     panel
-                        .tab_mut(&chat, key)
+                        .tab_mut(&context, key)
                         .map(|t| (t.emulator.cols() as u16, t.emulator.rows() as u16))
                         .unwrap_or((80, 24))
                 })
                 .unwrap_or((80, 24));
 
+            let terminal_context = match cwd {
+                Some(cwd) => serde_json::json!({ "cwd": cwd, "cols": cols, "rows": rows }),
+                None => serde_json::json!({ "chatId": context, "cols": cols, "rows": rows }),
+            };
             let opened = engine
                 .client()
                 .call_as::<TerminalSession>(
                     methods::OPEN_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows }),
-                        &target,
-                    ),
+                    with_target(terminal_context, &target),
                 )
                 .await;
             let session = match opened {
@@ -529,7 +585,7 @@ impl TerminalPanel {
                 Err(err) => {
                     tracing::warn!(error = %err, "OpenTerminal failed");
                     let _ = this.update(cx, |panel, cx| {
-                        if let Some(tab) = panel.tab_mut(&chat, key) {
+                        if let Some(tab) = panel.tab_mut(&context, key) {
                             tab.emulator.feed(
                                 format!("\x1b[31mfailed to open terminal: {err}\x1b[0m\r\n")
                                     .as_bytes(),
@@ -544,7 +600,7 @@ impl TerminalPanel {
             let terminal_id = session.id.clone();
             let attached = this
                 .update(cx, |panel, cx| {
-                    if let Some(tab) = panel.tab_mut(&chat, key) {
+                    if let Some(tab) = panel.tab_mut(&context, key) {
                         tab.terminal_id = Some(terminal_id.clone());
                         cx.notify();
                         true
@@ -571,7 +627,7 @@ impl TerminalPanel {
             let mut attempt: u32 = 0;
             loop {
                 let Ok(after_seq) = this.update(cx, |panel, _| {
-                    panel.tab_mut(&chat, key).map(|t| t.last_seq)
+                    panel.tab_mut(&context, key).map(|t| t.last_seq)
                 }) else {
                     return; // entity released
                 };
@@ -609,7 +665,7 @@ impl TerminalPanel {
                     };
                     attempt = 0;
                     let outcome = this.update(cx, |panel, cx| {
-                        panel.apply_stream_event(&chat, key, &engine, event, cx)
+                        panel.apply_stream_event(&context, key, &engine, event, cx)
                     });
                     match outcome {
                         Ok(StreamDisposition::Continue) => {}
@@ -621,7 +677,10 @@ impl TerminalPanel {
                 // Stream dropped without an exit — reconnect from afterSeq.
                 let done = this
                     .update(cx, |panel, _| {
-                        panel.tab_mut(&chat, key).map(|t| t.exited.is_some()).unwrap_or(true)
+                        panel
+                            .tab_mut(&context, key)
+                            .map(|t| t.exited.is_some())
+                            .unwrap_or(true)
                     })
                     .unwrap_or(true);
                 if done {

@@ -154,6 +154,12 @@ fn arg_from_title(title: &str) -> Option<String> {
     }
 }
 
+fn qualified_mcp_tool(title: &str) -> Option<(&str, &str)> {
+    let qualified = title.trim().strip_prefix("mcp__")?;
+    let (server, tool) = qualified.rsplit_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
+}
+
 /// Reduce an ACP tool call (kind + title + rawInput + locations + diff
 /// content) to the typed [`ToolCall`] zeron renders. Best-effort: agents vary
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
@@ -172,6 +178,18 @@ fn typed_call(update: &Value) -> ToolCall {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
+    if let Some((server, advertised_tool)) = qualified_mcp_tool(&title) {
+        let tool = if server == "comet-workers" && advertised_tool == "workers" {
+            raw_str("action").unwrap_or_else(|| advertised_tool.to_owned())
+        } else {
+            advertised_tool.to_owned()
+        };
+        return ToolCall::Mcp {
+            server: server.to_owned(),
+            tool,
+            input: raw.cloned(),
+        };
+    }
     match kind {
         "execute" => ToolCall::Exec {
             command: raw_str("command")
@@ -839,6 +857,37 @@ mod tests {
                         "_toolName": "task",
                         "description": "Look up multitask docs",
                         "prompt": "find the reminder",
+                    })),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn workers_mcp_title_promotes_action_to_typed_tool_name() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "mcp-1",
+            "title": "mcp__comet-workers__workers",
+            "kind": "other",
+            "rawInput": {
+                "action": "launch_worker",
+                "project_id": "project-1",
+                "preset_id": "claude",
+            },
+        });
+
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "mcp-1".into(),
+                call: ToolCall::Mcp {
+                    server: "comet-workers".into(),
+                    tool: "launch_worker".into(),
+                    input: Some(json!({
+                        "action": "launch_worker",
+                        "project_id": "project-1",
+                        "preset_id": "claude",
                     })),
                 },
             }]

@@ -2149,8 +2149,8 @@ impl Pickers {
 
     /// The new-session canvas's target row — device + project selector chips
     /// under the canvas logo (their popovers anchor BELOW; the composer
-    /// footer carries only checkout + ref now, and sessions show their
-    /// target in the titlebar instead).
+    /// footer carries checkout + model/effort + ref, while sessions show
+    /// their target in the titlebar instead).
     pub fn render_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = self.open.closing_since();
@@ -2228,7 +2228,11 @@ impl Pickers {
     /// the picked (or session's) project has git. Device + project moved to
     /// the new-session canvas ([`Self::render_target_selectors`]); sessions
     /// name their target in the titlebar.
-    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_footer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
@@ -2261,118 +2265,139 @@ impl Pickers {
                 .px(px(10.0))
                 .mb(px(-8.0))
         };
+        let model_controls = self.render_model_controls(window, cx);
 
         if let Some(chat) = &session {
-            // Sessions never move: read-only checkout-kind + ref labels,
-            // LEFT-aligned, only when the session's project has git. The
-            // target (project @ device) lives in the titlebar now.
-            let Some(space) = space.as_ref().filter(|s| s.git_detected) else {
-                return None;
-            };
-            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
-            let (icon_path, label) = if is_worktree {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
+            // Sessions never move: checkout-kind + ref stay read-only. Model
+            // and effort remain editable for the next turn even when the
+            // project has no git metadata.
+            let git_space = space.as_ref().filter(|space| space.git_detected);
+            let left = if let Some(space) = git_space {
+                let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
+                let (icon_path, label) = if is_worktree {
+                    (crate::icons::FOLDER_WITH_FILES, "Worktree")
+                } else {
+                    (crate::icons::FOLDER, "Local checkout")
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .min_w_0()
+                    .child(Self::footer_label(
+                        icon_path,
+                        SharedString::from(label),
+                        &theme,
+                    ))
             } else {
-                (crate::icons::FOLDER, "Local checkout")
+                div()
             };
-            // Mirrors the draft chips: checkout hugs the left edge, ref the
-            // right.
-            let left = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .min_w_0()
-                .child(Self::footer_label(
-                    icon_path,
-                    SharedString::from(label),
-                    &theme,
-                ));
+            let branch_control = git_space
+                .map(|_| {
+                    Self::footer_label(
+                        crate::icons::GIT_BRANCH,
+                        chat.branch
+                            .clone()
+                            .map(SharedString::from)
+                            .unwrap_or_else(|| SharedString::from("No ref")),
+                        &theme,
+                    )
+                    .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element());
             let right = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .min_w_0()
-                .child(Self::footer_label(
-                    crate::icons::GIT_BRANCH,
-                    chat.branch
-                        .clone()
-                        .map(SharedString::from)
-                        .unwrap_or_else(|| SharedString::from("No ref")),
-                    &theme,
-                ));
+                .gap(px(4.0))
+                .child(model_controls)
+                .child(branch_control);
             return Some(row().child(left).child(right).into_any_element());
         }
 
-        // New-session canvas: checkout + ref only, LEFT-aligned (device +
-        // project live under the canvas logo now).
+        // New-session canvas: checkout stays left; model + effort + optional
+        // ref form the right context cluster.
         let git = space.as_ref().is_some_and(|s| s.git_detected);
-        if !git {
-            return None;
-        }
         // Refs feed the draft labels — eager + idempotent.
-        self.ensure_refs(false, cx);
+        if git {
+            self.ensure_refs(false, cx);
+        }
         let closing = self.open.closing_since();
-        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
-            Some(PickerKind::Branch) => {
-                let content = self.render_branch_popover(cx);
-                Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
+        let mut overlay: Option<(PickerKind, AnyElement)> = if git {
+            match self.mounted_kind() {
+                Some(PickerKind::Branch) => {
+                    let content = self.render_branch_popover(cx);
+                    Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
+                }
+                Some(PickerKind::Checkout) => {
+                    let content = self.render_checkout_popover(cx);
+                    Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
+                }
+                // Space/Device popovers mount on the canvas selectors
+                // (`render_target_selectors`), not here.
+                _ => None,
             }
-            Some(PickerKind::Checkout) => {
-                let content = self.render_checkout_popover(cx);
-                Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
-            }
-            // Space/Device popovers mount on the canvas selectors
-            // (`render_target_selectors`), not here.
-            _ => None,
+        } else {
+            None
         };
 
-        let ref_label = self.ref_label();
-        let ref_chip = self.footer_chip(
-            PickerKind::Branch,
-            "picker-branch",
-            crate::icons::GIT_BRANCH,
-            ref_label,
-            &theme,
-            cx,
-        );
-        let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
-            (CheckoutKind::Local, false) => crate::icons::FOLDER,
-            _ => crate::icons::FOLDER_WITH_FILES,
-        };
-        let kind_chip = self.footer_chip(
-            PickerKind::Checkout,
-            "picker-checkout",
-            kind_icon,
-            SharedString::from(self.checkout_label()),
-            &theme,
-            cx,
-        );
-        // Checkout on the left edge, ref on the right — the row's
-        // justify_between splits them (user request).
-        let left = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .child(attach_overlay(
-                kind_chip,
-                &mut overlay,
+        let left = if git {
+            let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
+                (CheckoutKind::Local, false) => crate::icons::FOLDER,
+                _ => crate::icons::FOLDER_WITH_FILES,
+            };
+            let kind_chip = self.footer_chip(
                 PickerKind::Checkout,
-                "checkout-popover",
-                closing,
-            ));
-        let right = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .child(attach_overlay_end(
+                "picker-checkout",
+                kind_icon,
+                SharedString::from(self.checkout_label()),
+                &theme,
+                cx,
+            );
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .min_w_0()
+                .child(attach_overlay(
+                    kind_chip,
+                    &mut overlay,
+                    PickerKind::Checkout,
+                    "checkout-popover",
+                    closing,
+                ))
+        } else {
+            div()
+        };
+        let branch_control = if git {
+            let ref_chip = self.footer_chip(
+                PickerKind::Branch,
+                "picker-branch",
+                crate::icons::GIT_BRANCH,
+                self.ref_label(),
+                &theme,
+                cx,
+            );
+            attach_overlay_end(
                 ref_chip,
                 &mut overlay,
                 PickerKind::Branch,
                 "branch-popover",
                 closing,
-            ));
+            )
+            .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+        let right = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .gap(px(4.0))
+            .child(model_controls)
+            .child(branch_control);
         Some(row().child(left).child(right).into_any_element())
     }
 
@@ -3401,8 +3426,12 @@ fn attach_overlay_end(
     chip
 }
 
-impl Render for Pickers {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Pickers {
+    pub fn render_model_controls(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // A ZERON_OPEN_PICKER popover never went through `toggle`, so claim
         // its keyboard focus here (re-claim until it sticks — the shell's
@@ -3523,17 +3552,6 @@ impl Render for Pickers {
             None => None,
         };
 
-        // Left cluster: empty — the device/project pickers live in the
-        // composer FOOTER row alongside checkout + ref.
-        // Right cluster: agent+model and traits — the composer appends
-        // attach + send after this element (zeron composer-actions.tsx
-        // arrangement).
-        let left = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .gap(px(4.0));
         // Model chip (brand icon + model name) beside a separate Traits chip
         // (t3code TraitsPicker arrangement): the trigger label is the joined
         // effective summary ("High · 1M · Fast", "Agent · Balance") so the
@@ -3589,22 +3607,43 @@ impl Render for Pickers {
                     closing,
                 )
             }));
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(Theme::SPACE_SM))
-            .child(left)
-            .child(right)
+        right.into_any_element()
+    }
+}
+
+impl Render for Pickers {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_model_controls(window, cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_controls_move_to_footer() {
+        let composer = include_str!("composer.rs");
+        assert!(
+            !composer.contains(".child(div().flex_1().min_w_0().child(self.pickers.clone()))")
+                && !composer.contains(".child(div().flex_none().child(self.pickers.clone()))"),
+            "model and effort controls must not remain inside either composer layout"
+        );
+
+        let source = include_str!("pickers.rs");
+        let footer = source
+            .split("pub fn render_footer")
+            .nth(1)
+            .and_then(|source| source.split("fn popover_frame").next())
+            .expect("footer renderer source");
+        let model = footer
+            .find(".child(model_controls)")
+            .expect("footer model controls");
+        let branch = footer
+            .find(".child(branch_control)")
+            .expect("footer branch control");
+        assert!(model < branch, "footer order must be model, effort, branch");
+    }
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
 
     fn bare_model(id: &str, label: &str) -> Model {

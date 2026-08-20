@@ -2,9 +2,25 @@
 
 mod activity_bridge;
 mod controller_mcp;
+mod hook_migration;
+mod parent_notifications;
 pub mod resources;
+mod session_event_journal;
+pub mod workspace_trust;
 
 pub use controller_mcp::CONTROLLER_MCP_ARG;
+#[doc(hidden)]
+pub use hook_migration::remove_legacy_hook_root_at;
+pub use parent_notifications::{
+    WorkerCompletionEvidence, WorkerParentNotification, WorkerParentNotificationKind,
+    ack_worker_parent_notification, ack_worker_parent_notification_at, activate_worker_parent_task,
+    activate_worker_parent_task_at, begin_worker_parent_task, begin_worker_parent_task_at,
+    build_worker_parent_notification_prompt, cancel_worker_parent_task,
+    cancel_worker_parent_task_at, confirm_worker_parent_task_submission,
+    pending_worker_parent_notifications, pending_worker_parent_notifications_at,
+    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
+    prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -121,6 +137,7 @@ pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
         return Ok(true);
     }
     if let Some(host_args) = session_host_launch_args(&args) {
+        let _journal = session_event_journal::install_for_session_host(host_args)?;
         session_host::run_from_args(host_args)?;
         return Ok(true);
     }
@@ -142,6 +159,13 @@ pub fn controller_mcp_parse_launch(request: Value) -> Result<WorkersLaunchReques
 }
 
 #[doc(hidden)]
+pub fn controller_mcp_parse_launch_briefing(
+    request: Value,
+) -> Result<(WorkersLaunchRequest, Option<String>), String> {
+    controller_mcp::parse_launch_briefing(request)
+}
+
+#[doc(hidden)]
 pub fn controller_mcp_encode_keys(keys: &[String]) -> Result<String, String> {
     controller_mcp::encode_keys(keys)
 }
@@ -152,8 +176,41 @@ pub fn controller_mcp_clean_output(text: &str, max_bytes: usize) -> String {
 }
 
 #[doc(hidden)]
+pub fn controller_mcp_choose_semantic_output(
+    raw: &str,
+    screen_rows: Option<Vec<String>>,
+    max_bytes: usize,
+) -> String {
+    controller_mcp::choose_semantic_output(raw, screen_rows, max_bytes)
+}
+
+#[doc(hidden)]
 pub fn controller_mcp_consume_authority_marker() -> Result<(), String> {
     controller_mcp::consume_authority_marker()
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_take_parent_chat_id() -> Option<String> {
+    controller_mcp::take_parent_chat_id()
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_startup_prompt_response(screen: &str) -> Option<String> {
+    controller_mcp::startup_prompt_response(screen)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_tracks_task_episode(parent_chat_id: Option<&str>, submit: bool) -> bool {
+    controller_mcp::tracks_task_episode(parent_chat_id, submit)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_is_briefing_screen_ready(
+    runtime: &str,
+    screen: &str,
+    stable_for_ms: u64,
+) -> bool {
+    controller_mcp::is_briefing_screen_ready(runtime, screen, stable_for_ms)
 }
 
 #[doc(hidden)]
@@ -923,6 +980,13 @@ impl Default for LocalWorkersClient {
 
 impl LocalWorkersClient {
     pub fn new() -> Self {
+        if hook_migration::is_comet_application_process()
+            && let Err(error) = hook_migration::ensure_managed_hook_migration()
+        {
+            unpeel_core::hook_assets::append_trace_log_line(&format!(
+                "Comet managed hook migration is incomplete: {error}"
+            ));
+        }
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
             activity: activity_bridge::shared_activity_bridge(),
@@ -1073,6 +1137,12 @@ impl LocalWorkersClient {
     }
 
     pub fn launch_session(&self, launch: &WorkersLaunchRequest) -> Result<String, WorkersError> {
+        let bootstrap = self.bootstrap()?;
+        let launch = workspace_trust::prepare_launch_workspace_trust(
+            launch,
+            &bootstrap.projects,
+            &bootstrap.presets,
+        )?;
         let mut launch_body = launch.wire_body();
         if let (Some(body), Some((columns, rows))) =
             (launch_body.as_object_mut(), self.remembered_grid())

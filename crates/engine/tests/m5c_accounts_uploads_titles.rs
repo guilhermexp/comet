@@ -568,6 +568,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         resume: None,
     };
@@ -612,6 +613,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         resume: None,
     };

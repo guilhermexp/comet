@@ -56,6 +56,7 @@ fn request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         resume: None,
     }
@@ -231,6 +232,7 @@ fn workers_mcp_descriptor_is_controller_only_and_absolute() {
         std::path::Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
         true,
         false,
+        Some("chat-parent-1"),
     );
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0]["name"], "comet-workers");
@@ -240,21 +242,32 @@ fn workers_mcp_descriptor_is_controller_only_and_absolute() {
     );
     assert_eq!(servers[0]["args"], serde_json::json!(["__workers_mcp__"]));
     assert_eq!(servers[0]["env"][0]["name"], "COMET_WORKERS_CONTROLLER");
+    assert_eq!(
+        servers[0]["env"][1],
+        serde_json::json!({
+            "name": "COMET_WORKERS_PARENT_CHAT_ID",
+            "value": "chat-parent-1"
+        })
+    );
 
     assert!(
         zeron_harness::acp::workers_mcp_servers_for(
             std::path::Path::new("/tmp/zeron"),
             false,
             false,
+            Some("chat-parent-1"),
         )
         .is_empty()
     );
-    assert!(zeron_harness::acp::workers_mcp_servers_for(
-        std::path::Path::new("/tmp/zeron"),
-        true,
-        true,
-    )
-    .is_empty());
+    assert!(
+        zeron_harness::acp::workers_mcp_servers_for(
+            std::path::Path::new("/tmp/zeron"),
+            true,
+            true,
+            Some("chat-parent-1"),
+        )
+        .is_empty()
+    );
 }
 
 #[tokio::test]

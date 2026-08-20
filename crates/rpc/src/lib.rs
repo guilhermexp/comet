@@ -40,6 +40,10 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// App-owned durable delivery of a Worker lifecycle event to its existing
+    /// parent chat. Uses a deterministic command id and fsync-equivalent store
+    /// persistence before acknowledging the RPC.
+    pub const QUEUE_WORKER_NOTIFICATION: &str = "QueueWorkerNotification";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint

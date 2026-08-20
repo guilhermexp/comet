@@ -106,6 +106,13 @@ impl ActivityBridge {
                 continue;
             }
             let session_dir = unpeel_core::session_host::session_dir(&session.id);
+            session.updated_at_unix_ms = latest_activity_timestamp(
+                session.updated_at_unix_ms,
+                file_modified_unix_ms(&session_dir.join("output.bin")),
+                file_modified_unix_ms(
+                    &session_dir.join(crate::session_event_journal::JOURNAL_FILE),
+                ),
+            );
             let derived = derive_activity(
                 &mut engine,
                 ActivityInput {
@@ -136,6 +143,27 @@ impl ActivityBridge {
         engine.apply_hook_event(session_id, "Stop", None, SystemTime::now());
         self.change_epoch.fetch_add(1, Ordering::Release);
     }
+}
+
+fn file_modified_unix_ms(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn latest_activity_timestamp(
+    manifest_updated_at: u64,
+    output_updated_at: Option<u64>,
+    hook_updated_at: Option<u64>,
+) -> u64 {
+    output_updated_at
+        .into_iter()
+        .chain(hook_updated_at)
+        .fold(manifest_updated_at, u64::max)
 }
 
 impl Drop for ActivityBridge {
@@ -628,5 +656,11 @@ mod tests {
             "blocked"
         );
         assert_eq!(merge_derived_activity("done", false, "idle"), "idle");
+    }
+
+    #[test]
+    fn activity_timestamp_tracks_output_and_hook_progress() {
+        assert_eq!(latest_activity_timestamp(100, Some(300), Some(200)), 300);
+        assert_eq!(latest_activity_timestamp(400, Some(300), Some(200)), 400);
     }
 }

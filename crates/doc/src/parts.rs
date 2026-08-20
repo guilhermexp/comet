@@ -278,15 +278,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool OUTPUTS never enter the doc (2026-08-10 product
-                    // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
-                    // host's run journal. Inline diffs die the same way:
-                    // stats only, never text. `is_error` still folds so
-                    // failed chips read as failed.
-                    let _ = output; // journal-only
-                    *out_slot = None;
+                    // Keep only the bounded summary in the replicated doc so
+                    // an expanded card explains what the tool returned. Full
+                    // output remains journal-only while the R2 sidecar is
+                    // parked; inline diff text is still reduced to stats.
+                    *out_slot = output.as_deref().and_then(summarize_tool_output);
                     *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
@@ -593,6 +589,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_keeps_bounded_output_for_the_transcript_card() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "worker-call".into(),
+                call: ToolCall::Mcp {
+                    server: "comet-workers".into(),
+                    tool: "launch_worker".into(),
+                    input: None,
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "worker-call".into(),
+                is_error: false,
+                output: Some(
+                    r#"{"session_id":"worker-1","launched":true,"briefing_submitted":true}"#.into(),
+                ),
+                diff: None,
+            },
+        );
+
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                resolved: true,
+                output: Some(output),
+                ..
+            } if output.contains("worker-1") && output.contains("launched")
+        ));
+    }
+
+    #[test]
     fn sanitize_strips_heavy_inputs_and_is_idempotent() {
         let call = ToolCall::WriteFile {
             path: "/x".into(),
@@ -749,9 +781,10 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: outputs never enter the doc at all
-                // (journal-only); diff text neither — stats survive.
-                assert_eq!(output.as_deref(), None);
+                // The bounded output summary explains the result in the
+                // expanded card; full output stays journal-only. Diff text
+                // still stays out of the doc while stats survive.
+                assert_eq!(output.as_deref(), Some("running 42 tests…"));
                 assert_eq!(*output_bytes, None);
                 assert!(diff.is_none(), "inline diff text must not enter the doc");
                 let stats = diff_stats.as_ref().unwrap();

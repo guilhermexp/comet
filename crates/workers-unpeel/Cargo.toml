@@ -7,10 +7,13 @@ publish.workspace = true
 
 [dependencies]
 base64 = "0.22"
+dirs = "6"
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shell-words = "1"
 thiserror.workspace = true
+toml_edit = "0.22"
 unpeel-core.workspace = true
 unicode-width = "0.2"
 uuid.workspace = true

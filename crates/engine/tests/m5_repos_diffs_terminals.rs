@@ -372,8 +372,14 @@ async fn folder_lister_flags_and_ordering() {
         .expect("listing");
     assert!(!listing.truncated);
     let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-    // Dirs first (name-sorted), files after; dotfiles hidden.
-    assert_eq!(names, vec!["alpha", "beta", "aaa.txt"]);
+    // Dirs first (name-sorted), including hidden directories; files follow.
+    assert_eq!(names, vec![".hidden", "alpha", "beta", "aaa.txt"]);
+    let hidden = listing
+        .entries
+        .iter()
+        .find(|e| e.name == ".hidden")
+        .expect("hidden directory entry");
+    assert!(hidden.is_dir && !hidden.is_repo);
     let beta = listing
         .entries
         .iter()
@@ -1278,6 +1284,22 @@ async fn rpc_dispatch_for_m5_methods() {
         .expect("OpenTerminal");
     let terminal_id = session["id"].as_str().expect("terminal id").to_string();
     assert_eq!(session["cwd"], repo_path);
+
+    let worker_session = client
+        .call(
+            methods::OPEN_TERMINAL,
+            serde_json::json!({ "cwd": repo_path, "cols": 80, "rows": 24 }),
+        )
+        .await
+        .expect("OpenTerminal accepts an explicit Workers cwd");
+    assert_eq!(worker_session["cwd"], repo_path);
+    client
+        .call(
+            methods::CLOSE_TERMINAL,
+            serde_json::json!({ "terminalId": worker_session["id"] }),
+        )
+        .await
+        .expect("close Workers cwd terminal");
 
     let mut stream = client
         .subscribe(

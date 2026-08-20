@@ -161,7 +161,10 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
-        let workers_model = cx.new(workers::model::WorkersModel::new);
+        let workers_model = cx.new({
+            let state = state.clone();
+            move |cx| workers::model::WorkersModel::new(state, cx)
+        });
         let workers_resource_monitor = cx.new({
             let workers_model = workers_model.clone();
             move |cx| workers::resource_monitor::WorkersResourceMonitor::new(workers_model, cx)

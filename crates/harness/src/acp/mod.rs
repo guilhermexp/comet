@@ -58,20 +58,28 @@ pub fn workers_mcp_servers_for(
     executable: &std::path::Path,
     enabled: bool,
     disabled_by_environment: bool,
+    parent_chat_id: Option<&str>,
 ) -> Vec<Value> {
     if !enabled || disabled_by_environment || !executable.is_absolute() {
         return Vec::new();
+    }
+    let mut env = vec![json!({ "name": "COMET_WORKERS_CONTROLLER", "value": "1" })];
+    if let Some(parent_chat_id) = parent_chat_id.filter(|value| !value.trim().is_empty()) {
+        env.push(json!({
+            "name": "COMET_WORKERS_PARENT_CHAT_ID",
+            "value": parent_chat_id
+        }));
     }
     vec![json!({
         "type": "stdio",
         "name": "comet-workers",
         "command": executable.to_string_lossy(),
         "args": [WORKERS_MCP_ARG],
-        "env": [{ "name": "COMET_WORKERS_CONTROLLER", "value": "1" }]
+        "env": env
     })]
 }
 
-fn workers_mcp_servers(enabled: bool) -> Vec<Value> {
+fn workers_mcp_servers(enabled: bool, parent_chat_id: Option<&str>) -> Vec<Value> {
     let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
         .ok()
         .is_some_and(|value| value == "1");
@@ -80,7 +88,7 @@ fn workers_mcp_servers(enabled: bool) -> Vec<Value> {
         .or_else(|| std::env::current_exe().ok());
     executable
         .as_deref()
-        .map(|executable| workers_mcp_servers_for(executable, enabled, disabled))
+        .map(|executable| workers_mcp_servers_for(executable, enabled, disabled, parent_chat_id))
         .unwrap_or_default()
 }
 
@@ -2036,7 +2044,10 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let mcp_servers = workers_mcp_servers(request.enable_workers_mcp);
+        let mcp_servers = workers_mcp_servers(
+            request.enable_workers_mcp,
+            request.workers_parent_chat_id.as_deref(),
+        );
         let session_params = json!({ "cwd": request.cwd, "mcpServers": mcp_servers });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();

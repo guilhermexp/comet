@@ -161,6 +161,7 @@ async fn transcript_survives_open_racing_create_chat() {
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: true,
                         enable_workers_mcp: false,
+                        workers_parent_chat_id: None,
                         attachments: Vec::new(),
                         resume: None,
                     },

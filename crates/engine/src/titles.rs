@@ -172,6 +172,7 @@ impl TitleGenerator {
                 sandbox: SandboxLevel::ReadOnly,
                 auto_approve: true,
                 enable_workers_mcp: false,
+                workers_parent_chat_id: None,
                 attachments: Vec::new(),
                 resume: None,
             };

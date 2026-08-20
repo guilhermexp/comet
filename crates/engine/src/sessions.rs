@@ -296,6 +296,7 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        request.workers_parent_chat_id = request.enable_workers_mcp.then(|| chat_id.to_owned());
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -677,6 +678,7 @@ impl SessionsEngine {
                             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             enable_workers_mcp: true,
+                            workers_parent_chat_id: Some(chat_id.clone()),
                             attachments: Vec::new(),
                             resume: None,
                         })

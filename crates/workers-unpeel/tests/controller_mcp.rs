@@ -5,9 +5,13 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
     WorkersSession, WorkersSessionCapabilities, controller_mcp_archive_guard,
-    controller_mcp_clean_output, controller_mcp_consume_authority_marker,
-    controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_parse_launch,
-    controller_mcp_sanitize_text, ensure_controller_mcp_host_launcher, is_session_host_mode,
+    controller_mcp_choose_semantic_output, controller_mcp_clean_output,
+    controller_mcp_consume_authority_marker, controller_mcp_encode_keys,
+    controller_mcp_handle_request, controller_mcp_is_briefing_screen_ready,
+    controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
+    controller_mcp_sanitize_text, controller_mcp_startup_prompt_response,
+    controller_mcp_take_parent_chat_id, controller_mcp_tracks_task_episode,
+    ensure_controller_mcp_host_launcher, is_session_host_mode,
 };
 
 #[test]
@@ -76,6 +80,30 @@ fn launch_requires_exactly_one_launch_mode() {
 }
 
 #[test]
+fn controller_defers_a_sanitized_briefing_until_after_session_creation() {
+    let (launch, briefing) = controller_mcp_parse_launch_briefing(json!({
+        "project_id": "p",
+        "preset_id": "claude",
+        "initial_text": "review\u{0} this\r\ncarefully"
+    }))
+    .expect("launch and briefing parse");
+
+    assert_eq!(
+        launch.wire_body(),
+        json!({ "projectID": "p", "presetID": "claude" })
+    );
+    assert_eq!(briefing.as_deref(), Some("review this\ncarefully"));
+    assert!(
+        controller_mcp_parse_launch_briefing(json!({
+            "project_id": "p",
+            "preset_id": "claude",
+            "initial_text": "\u{0}\u{1b}"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn key_encoder_is_bounded_and_deterministic() {
     assert_eq!(
         controller_mcp_encode_keys(&["escape".into(), "down".into(), "enter".into()])
@@ -93,6 +121,80 @@ fn ansi_cleanup_caps_model_output() {
         "hello"
     );
     assert_eq!(controller_mcp_clean_output("abcdef", 4), "…f");
+}
+
+#[test]
+fn semantic_screen_replaces_raw_tui_repaint_frames() {
+    let raw = "\u{1b}[27;1H•Wor\u{1b}[27;1H•Work\u{1b}[27;1H•Working";
+    let semantic = controller_mcp_choose_semantic_output(
+        raw,
+        Some(vec![
+            "Final report".into(),
+            "- changed parser".into(),
+            "".into(),
+        ]),
+        64 * 1024,
+    );
+
+    assert_eq!(semantic, "Final report\n- changed parser");
+    assert!(!semantic.contains("•Wor"));
+}
+
+#[test]
+fn semantic_fallback_interprets_repaints_and_removes_controls() {
+    let raw = "\u{1b}[27;1H•Wor\u{1b}[27;1H•Work\u{1b}[27;1HFinal reporx\u{8}t\u{0}";
+    let semantic = controller_mcp_choose_semantic_output(raw, None, 64 * 1024);
+
+    assert_eq!(semantic, "Final report");
+    assert!(!semantic.chars().any(char::is_control));
+}
+
+#[test]
+fn known_startup_prompts_are_dismissed_before_submitting_the_brief() {
+    assert_eq!(
+        controller_mcp_startup_prompt_response(
+            "Update available! 0.147 -> 0.148\n1. Update now\n2. Skip\nPress enter"
+        )
+        .as_deref(),
+        Some("2\r")
+    );
+    assert_eq!(
+        controller_mcp_startup_prompt_response(
+            "Quick safety check: Is this a project you created or one you trust?\n1. Yes, I trust this folder\n2. No, exit"
+        )
+        .as_deref(),
+        Some("1\r")
+    );
+    assert_eq!(controller_mcp_startup_prompt_response("❯"), None);
+}
+
+#[test]
+fn briefing_waits_for_a_stable_agent_prompt_and_rejects_unknown_menus() {
+    assert!(!controller_mcp_is_briefing_screen_ready(
+        "claude",
+        "Loading agent…",
+        100
+    ));
+    assert!(!controller_mcp_is_briefing_screen_ready(
+        "claude",
+        "Loading agent…",
+        1_000
+    ));
+    assert!(controller_mcp_is_briefing_screen_ready(
+        "claude",
+        "Claude Code\n❯",
+        400
+    ));
+    assert!(controller_mcp_is_briefing_screen_ready(
+        "gemini",
+        "Gemini CLI\n> ",
+        400
+    ));
+    assert!(!controller_mcp_is_briefing_screen_ready(
+        "claude",
+        "Choose setup:\n1. Continue\n2. Exit\nPress enter",
+        1_000
+    ));
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -199,6 +301,41 @@ fn controller_authority_marker_is_consumed_before_workers_launch() {
             None => std::env::remove_var("COMET_WORKERS_CONTROLLER"),
         }
     }
+}
+
+#[test]
+fn controller_parent_chat_identity_is_consumed_before_worker_descendants_spawn() {
+    let _lock = ENV_LOCK.lock().expect("environment test lock");
+    let previous = std::env::var_os("COMET_WORKERS_PARENT_CHAT_ID");
+    // SAFETY: this test binary serializes its environment mutations with ENV_LOCK.
+    unsafe { std::env::set_var("COMET_WORKERS_PARENT_CHAT_ID", " parent-chat-1 ") };
+
+    assert_eq!(
+        controller_mcp_take_parent_chat_id().as_deref(),
+        Some("parent-chat-1")
+    );
+    assert!(std::env::var_os("COMET_WORKERS_PARENT_CHAT_ID").is_none());
+
+    // SAFETY: restore before releasing ENV_LOCK.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("COMET_WORKERS_PARENT_CHAT_ID", value),
+            None => std::env::remove_var("COMET_WORKERS_PARENT_CHAT_ID"),
+        }
+    }
+}
+
+#[test]
+fn task_episode_tracking_requires_a_parent_and_a_submitted_prompt() {
+    assert!(controller_mcp_tracks_task_episode(
+        Some("parent-chat"),
+        true
+    ));
+    assert!(!controller_mcp_tracks_task_episode(None, true));
+    assert!(!controller_mcp_tracks_task_episode(
+        Some("parent-chat"),
+        false
+    ));
 }
 
 #[test]
