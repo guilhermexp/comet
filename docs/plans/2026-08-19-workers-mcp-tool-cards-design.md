@@ -17,4 +17,3 @@ The document keeps a bounded copy of tool output so the existing expandable tran
 - Failed MCP calls retain the destructive state and readable failure output.
 - Ordinary unknown tools and non-Workers MCP tools keep their current behavior.
 - No MCP server schema change and no additional top-level tools.
-

@@ -143,4 +143,3 @@ Codex hook responsible for command-not-found/exit-127 failures.
    fragments.
 6. Controller timestamps reflect real output activity.
 7. Initial brief submission cannot silently fail behind a successful launch.
-

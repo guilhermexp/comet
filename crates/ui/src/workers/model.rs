@@ -260,6 +260,12 @@ fn parent_notification_rpc_params(
     })
 }
 
+fn notification_settings_for_snapshot(
+    settings: Option<&WorkersSettingsSnapshot>,
+) -> Option<&WorkersNotificationSettings> {
+    settings.map(|settings| &settings.notifications)
+}
+
 pub struct WorkersModel {
     state: Entity<AppState>,
     client: LocalWorkersClient,
@@ -646,11 +652,13 @@ impl WorkersModel {
         self.refresh_generation = self.refresh_generation.wrapping_add(1);
         let generation = self.refresh_generation;
         let client = self.client.clone();
+        let needs_settings = self.settings.is_none();
         self.loading = self.snapshot.is_none();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let settings = needs_settings.then(|| client.settings());
                     let snapshot = client.bootstrap()?;
                     let project_names = snapshot
                         .projects
@@ -682,7 +690,7 @@ impl WorkersModel {
                             }
                         })
                         .collect::<Vec<_>>();
-                    Ok::<_, zeron_workers_unpeel::WorkersError>((snapshot, deliveries))
+                    Ok::<_, zeron_workers_unpeel::WorkersError>((snapshot, settings, deliveries))
                 })
                 .await;
             this.update(cx, |model, cx| {
@@ -692,7 +700,16 @@ impl WorkersModel {
                 model.refresh_task = None;
                 model.loading = false;
                 match result {
-                    Ok((snapshot, deliveries)) => {
+                    Ok((snapshot, settings, deliveries)) => {
+                        if let Some(settings) = settings {
+                            match settings {
+                                Ok(settings) => {
+                                    model.settings = Some(settings);
+                                    model.settings_error = None;
+                                }
+                                Err(error) => model.settings_error = Some(error.to_string()),
+                            }
+                        }
                         let app_focused = cx.active_window().is_some();
                         model.apply_snapshot(snapshot, app_focused);
                         model.dispatch_parent_notifications(deliveries, cx);
@@ -1484,11 +1501,7 @@ impl WorkersModel {
     }
 
     fn apply_snapshot(&mut self, snapshot: WorkersBootstrap, app_focused: bool) {
-        let notification_settings = self
-            .settings
-            .as_ref()
-            .map(|settings| settings.notifications.clone())
-            .unwrap_or_default();
+        let notification_settings = notification_settings_for_snapshot(self.settings.as_ref());
         for session in &snapshot.sessions {
             let (next_state, notification) = reduce_notification(
                 self.notification_state.get(&session.id),
@@ -1501,7 +1514,9 @@ impl WorkersModel {
             );
             self.notification_state
                 .insert(session.id.clone(), next_state);
-            if let Some(notification) = notification {
+            if let (Some(notification), Some(notification_settings)) =
+                (notification, notification_settings)
+            {
                 let (title, body, sound) = match notification {
                     WorkerNotification::Attention => (
                         "Worker needs attention",
@@ -1709,17 +1724,17 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use zeron_workers_unpeel::{
-        WorkerParentNotification, WorkerParentNotificationKind, WorkersSession,
-        WorkersSessionCapabilities,
+        WorkerParentNotification, WorkerParentNotificationKind, WorkersNotificationSettings,
+        WorkersSession, WorkersSessionCapabilities, WorkersSettingsSnapshot,
     };
 
     use super::{
         PendingRemove, PendingReplacement, WorkersSessionTarget, WorkersSettingsTab,
         claim_parent_notification_delivery, dispatch_or_queue_remove,
-        note_parent_notification_failure, parent_notification_retry_allowed,
-        parent_notification_rpc_params, reconcile_selection, reconcile_selection_with_pending,
-        replacement_selection, resolve_session_target, selection_after_remove,
-        sessions_for_project, toggle_expanded,
+        note_parent_notification_failure, notification_settings_for_snapshot,
+        parent_notification_retry_allowed, parent_notification_rpc_params, reconcile_selection,
+        reconcile_selection_with_pending, replacement_selection, resolve_session_target,
+        selection_after_remove, sessions_for_project, toggle_expanded,
     };
 
     fn parent_notification() -> WorkerParentNotification {
@@ -1731,6 +1746,7 @@ mod tests {
             worker_session_id: "worker-1".into(),
             parent_chat_id: "parent-chat-1".into(),
             kind: WorkerParentNotificationKind::Completed,
+            task_episode: 1,
             runtime_generation: 7,
             occurred_at_unix_ms: 1,
             title: "Review parser".into(),
@@ -1789,6 +1805,30 @@ mod tests {
         assert_eq!(WorkersSettingsTab::Appearance.label(), "Appearance");
         assert_eq!(WorkersSettingsTab::ALL[4], WorkersSettingsTab::Resources);
         assert_eq!(WorkersSettingsTab::Resources.label(), "Resources");
+    }
+
+    #[test]
+    fn notifications_wait_for_persisted_settings_instead_of_using_enabled_defaults() {
+        assert_eq!(notification_settings_for_snapshot(None), None);
+
+        let settings = WorkersSettingsSnapshot {
+            presets: Vec::new(),
+            runtimes: Vec::new(),
+            transcripts: Default::default(),
+            notifications: WorkersNotificationSettings {
+                menu_attention_detection: false,
+                desktop_notifications: false,
+                sound_enabled: false,
+                background_only: false,
+            },
+            appearance: Default::default(),
+            resources: Default::default(),
+        };
+
+        assert_eq!(
+            notification_settings_for_snapshot(Some(&settings)),
+            Some(&settings.notifications)
+        );
     }
 
     #[test]

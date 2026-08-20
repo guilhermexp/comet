@@ -929,7 +929,7 @@ impl WorkersSettingsView {
             ),
             (
                 "Only when in the background",
-                "Reserve desktop banners for times when Comet is not focused.",
+                "Reserve desktop banners for times when Zeron is not focused.",
                 current.background_only,
                 |s| s.background_only = !s.background_only,
             ),

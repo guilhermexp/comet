@@ -19,8 +19,8 @@ use std::time::Duration;
 use chrono::Utc;
 use gpui::{
     AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, SharedString,
+    Subscription, Task, Window, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -31,6 +31,11 @@ use zeron_workers_unpeel::WorkersLaunchRequest;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::details_sidebar::{
+    context::{DetailsContext, context_for_orchestrator, context_for_worker},
+    view::{DetailsSidebar, DetailsSidebarEvent},
+};
+use crate::file_preview::view::{FilePreview, FilePreviewEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -44,8 +49,9 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, UiSettings, platform_combo,
+    DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN, KeymapConfig,
+    RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
+    SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -261,6 +267,55 @@ fn titlebar_capabilities(
     }
 }
 
+fn details_sidebar_available(
+    mode: SidebarMode,
+    has_orchestrator_context: bool,
+    has_worker_context: bool,
+) -> bool {
+    match mode {
+        SidebarMode::Orchestrator => has_orchestrator_context,
+        SidebarMode::Workers => has_worker_context,
+    }
+}
+
+fn right_columns_width(
+    right_open: bool,
+    right_width: f32,
+    details_open: bool,
+    details_width: f32,
+) -> f32 {
+    (if right_open { right_width } else { 0.0 }) + (if details_open { details_width } else { 0.0 })
+}
+
+const RESPONSIVE_MAIN_PANE_MIN: f32 = 320.0;
+
+fn responsive_right_column_widths(
+    viewport: f32,
+    sidebar: f32,
+    right_open: bool,
+    requested_right: f32,
+    details_open: bool,
+    requested_details: f32,
+) -> (f32, f32) {
+    let right = right_open.then_some(requested_right).unwrap_or(0.0);
+    let details = details_open.then_some(requested_details).unwrap_or(0.0);
+    let requested_total = right + details;
+    let budget = (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN).max(0.0);
+    if requested_total <= budget || requested_total <= f32::EPSILON {
+        return (right, details);
+    }
+    let scale = budget / requested_total;
+    (right * scale, details * scale)
+}
+
+fn orchestrator_capture_right_offset(
+    right_open: bool,
+    right_width: f32,
+    details_width: f32,
+) -> f32 {
+    (if right_open { right_width } else { 0.0 }) + details_width + 10.0
+}
+
 fn workers_panel_key(session_id: Option<&str>, project_id: &str) -> String {
     session_id
         .map(|session_id| format!("workers-session:{session_id}"))
@@ -277,6 +332,40 @@ pub enum RightSurface {
     Picker,
     Diff(u64),
     Terminal(u64),
+    Preview(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewSurfaceInfo {
+    context_key: String,
+    root: PathBuf,
+    relative_path: String,
+}
+
+fn register_preview_surface(
+    surfaces: &mut std::collections::HashMap<u64, PreviewSurfaceInfo>,
+    sequence: &mut u64,
+    context_key: &str,
+    root: PathBuf,
+    relative_path: &str,
+) -> (RightSurface, bool) {
+    if let Some((id, _)) = surfaces
+        .iter()
+        .find(|(_, info)| info.context_key == context_key && info.relative_path == relative_path)
+    {
+        return (RightSurface::Preview(*id), false);
+    }
+    *sequence = sequence.wrapping_add(1);
+    let id = *sequence;
+    surfaces.insert(
+        id,
+        PreviewSurfaceInfo {
+            context_key: context_key.to_string(),
+            root,
+            relative_path: relative_path.to_string(),
+        },
+    );
+    (RightSurface::Preview(id), true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +613,8 @@ const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 struct SidebarResize;
 /// Drag marker for the right-pane resize handle.
 struct RightPaneResize;
+/// Drag marker for the independent Details / Files sidebar.
+struct DetailsSidebarResize;
 
 /// The dragged surface-tab payload (strip reorder).
 struct RightTabDrag {
@@ -916,6 +1007,8 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
+    preview_surfaces: std::collections::HashMap<u64, PreviewSurfaceInfo>,
+    preview_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -924,6 +1017,11 @@ pub struct Shell {
     /// Surface-tab strip scroll (the strip overflows horizontally, t3
     /// ScrollArea-style; drag drop-math reads the offset back out).
     right_tab_scroll: gpui::ScrollHandle,
+    /// Independent rightmost Details / Files column (Orchestrator.dev parity).
+    details_sidebar: Entity<DetailsSidebar>,
+    _details_sub: Subscription,
+    file_preview: Entity<FilePreview>,
+    _file_preview_sub: Subscription,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Session-local top-level sidebar content. Workers owns an independent,
@@ -1020,6 +1118,7 @@ pub struct Shell {
     debug_gate: Option<GatePhase>,
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
+    details_tween: Option<WidthTween>,
     /// Changes-panel takeover (the header's expand button): the panel fills
     /// everything right of the sidebar and the conversation column collapses
     /// to zero. Session-local view state — never persisted, reset on close.
@@ -1126,6 +1225,60 @@ impl Shell {
         });
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
+        let details_sidebar = cx.new({
+            let state = state.clone();
+            let preferences = settings.details_sidebar_preferences.clone();
+            move |cx| DetailsSidebar::new(state, preferences, cx)
+        });
+        let file_preview = cx.new(|_| FilePreview::new());
+        let details_sub = cx.subscribe(
+            &details_sidebar,
+            move |this: &mut Shell, _, event: &DetailsSidebarEvent, cx| match event {
+                DetailsSidebarEvent::Close => {
+                    let from = this.details_target(cx);
+                    this.settings.details_sidebar_open = false;
+                    this.details_tween = Some(WidthTween::new(from, 0.0));
+                    this.schedule_save(cx);
+                    cx.notify();
+                }
+                DetailsSidebarEvent::PreferencesChanged(preferences) => {
+                    this.settings.details_sidebar_preferences = preferences.clone();
+                    this.schedule_save(cx);
+                }
+                DetailsSidebarEvent::OpenFile {
+                    context_key,
+                    root,
+                    relative_path,
+                } => {
+                    this.open_preview_surface(
+                        context_key.clone(),
+                        root.clone(),
+                        relative_path.clone(),
+                        cx,
+                    );
+                }
+            },
+        );
+        let details_for_preview = details_sidebar.clone();
+        let file_preview_sub = cx.subscribe(
+            &file_preview,
+            move |this: &mut Shell, _, event: &FilePreviewEvent, cx| match event {
+                FilePreviewEvent::ActiveChanged { relative_path, .. } => {
+                    details_for_preview.update(cx, |sidebar, cx| {
+                        sidebar.set_active_file(relative_path.clone(), cx)
+                    });
+                }
+                FilePreviewEvent::DisplayModeChanged(mode) => {
+                    this.right_pane_expanded =
+                        *mode == crate::file_preview::model::PreviewDisplayMode::FullPage;
+                    cx.notify();
+                }
+                FilePreviewEvent::CloseRequested {
+                    context_key,
+                    relative_path,
+                } => this.close_preview_surface(context_key, relative_path, cx),
+            },
+        );
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
@@ -1187,9 +1340,15 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
+            preview_surfaces: std::collections::HashMap::new(),
+            preview_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
+            details_sidebar,
+            _details_sub: details_sub,
+            file_preview,
+            _file_preview_sub: file_preview_sub,
             route,
             sidebar_mode: match std::env::var("ZERON_SIDEBAR_MODE").ok().as_deref() {
                 Some("workers") => SidebarMode::Workers,
@@ -1249,6 +1408,7 @@ impl Shell {
             debug_gate,
             sidebar_tween: None,
             right_tween: None,
+            details_tween: None,
             right_pane_expanded: false,
             viewport_width: 1280.0,
             fullscreen: None,
@@ -1606,7 +1766,16 @@ impl Shell {
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
             (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
         } else {
-            self.settings.right_pane_width
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            responsive_right_column_widths(
+                self.viewport_width,
+                sidebar_now,
+                true,
+                self.settings.right_pane_width,
+                self.details_sidebar_open(cx),
+                self.settings.details_sidebar_width,
+            )
+            .0
         }
     }
 
@@ -1627,6 +1796,74 @@ impl Shell {
         if from != to {
             self.right_tween = Some(WidthTween::new(from, to));
         }
+        cx.notify();
+    }
+
+    fn details_context(&self, cx: &App) -> Option<DetailsContext> {
+        match self.sidebar_mode {
+            SidebarMode::Orchestrator => {
+                let state = self.state.read(cx);
+                context_for_orchestrator(state.selected_chat_row(), state.selected_space_row())
+            }
+            SidebarMode::Workers => {
+                let model = self.workers_model.read(cx);
+                context_for_worker(model.selected_project(), model.selected_session())
+            }
+        }
+    }
+
+    fn details_sidebar_open(&self, cx: &App) -> bool {
+        let has_context = self.details_context(cx).is_some();
+        self.settings.details_sidebar_open
+            && details_sidebar_available(
+                self.sidebar_mode,
+                self.sidebar_mode == SidebarMode::Orchestrator && has_context,
+                self.sidebar_mode == SidebarMode::Workers && has_context,
+            )
+    }
+
+    fn details_target(&self, cx: &App) -> f32 {
+        let details_open = self.details_sidebar_open(cx);
+        if !details_open {
+            return 0.0;
+        }
+        if self.right_pane_expanded {
+            return self.settings.details_sidebar_width;
+        }
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        responsive_right_column_widths(
+            self.viewport_width,
+            sidebar_now,
+            self.right_pane_open(cx),
+            self.settings.right_pane_width,
+            true,
+            self.settings.details_sidebar_width,
+        )
+        .1
+    }
+
+    fn toggle_details_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.details_context(cx).is_none() {
+            return;
+        }
+        let from = self.details_target(cx);
+        self.settings.details_sidebar_open = !self.settings.details_sidebar_open;
+        self.details_tween = Some(WidthTween::new(from, self.details_target(cx)));
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn on_details_sidebar_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DetailsSidebarResize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = f32::from(window.viewport_size().width);
+        let width = viewport - f32::from(event.event.position.x);
+        self.settings.details_sidebar_width = width.clamp(DETAILS_SIDEBAR_MIN, DETAILS_SIDEBAR_MAX);
+        self.details_tween = None;
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -1715,6 +1952,14 @@ impl Shell {
                     .iter()
                     .find(|(k, _, _)| k == tab)
                     .map(|(_, title, _)| (*surface, title.clone())),
+                RightSurface::Preview(id) => self.preview_surfaces.get(id).map(|info| {
+                    let title = info
+                        .relative_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&info.relative_path);
+                    (*surface, SharedString::from(title.to_string()))
+                }),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -1796,6 +2041,13 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
+            RightSurface::Preview(id) => {
+                if let Some(info) = self.preview_surfaces.get(&id).cloned() {
+                    self.file_preview.update(cx, |preview, cx| {
+                        preview.open(info.context_key, info.root, info.relative_path, cx)
+                    });
+                }
+            }
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -1843,6 +2095,69 @@ impl Shell {
             .or_default()
             .push(RightSurface::Diff(id));
         self.set_right_active(RightSurface::Diff(id), cx);
+    }
+
+    fn open_preview_surface(
+        &mut self,
+        context_key: String,
+        root: PathBuf,
+        relative_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self.right_target(cx);
+        let (surface, inserted) = register_preview_surface(
+            &mut self.preview_surfaces,
+            &mut self.preview_seq,
+            &context_key,
+            root,
+            &relative_path,
+        );
+        let key = self.panel_key(cx);
+        if inserted {
+            self.right_tabs
+                .entry(key.clone())
+                .or_default()
+                .push(surface);
+        }
+        self.panels.update(&key, |panels| {
+            panels.changes_open = true;
+            panels.right_active = surface;
+        });
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        self.set_right_active(surface, cx);
+    }
+
+    fn close_preview_surface(
+        &mut self,
+        context_key: &str,
+        relative_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self
+            .preview_surfaces
+            .iter()
+            .find(|(_, info)| {
+                info.context_key == context_key && info.relative_path == relative_path
+            })
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        let surface = RightSurface::Preview(id);
+        self.preview_surfaces.remove(&id);
+        let key = self.panel_key(cx);
+        if let Some(tabs) = self.right_tabs.get_mut(&key) {
+            tabs.retain(|tab| *tab != surface);
+        }
+        self.file_preview.update(cx, |preview, cx| {
+            preview.close_path(context_key, relative_path, cx)
+        });
+        self.panels.update(&key, |panels| {
+            if panels.right_active == surface {
+                panels.right_active = RightSurface::Picker;
+            }
+        });
+        cx.notify();
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
@@ -1895,6 +2210,13 @@ impl Shell {
                     });
                 } else {
                     panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
+                }
+            }
+            RightSurface::Preview(id) => {
+                if let Some(info) = self.preview_surfaces.remove(&id) {
+                    self.file_preview.update(cx, |preview, cx| {
+                        preview.close_path(&info.context_key, &info.relative_path, cx)
+                    });
                 }
             }
             RightSurface::Picker => {}
@@ -3171,6 +3493,13 @@ impl Shell {
             } else {
                 0.0
             };
+            let details_open = self.details_sidebar_open(cx);
+            let details_now = if details_open {
+                self.eval_tween(self.details_tween, self.details_target(cx))
+            } else {
+                0.0
+            };
+            let occupied_right = right_now + details_now;
             let drag_bar = div()
                 .absolute()
                 .top_0()
@@ -3189,7 +3518,7 @@ impl Shell {
                         .top_0()
                         .bottom_0()
                         .left(px(sidebar_now))
-                        .right(px(right_now))
+                        .right(px(occupied_right))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -3198,7 +3527,11 @@ impl Shell {
                 );
             let drag_bar =
                 self.titlebar_drag_region("workers-header-titlebar-drag-region", drag_bar, cx);
-            let action_right = if right_open { right_now + 10.0 } else { 10.0 };
+            let action_right = if right_open || details_open {
+                occupied_right + 10.0
+            } else {
+                10.0
+            };
             let workspace_action = workspace_path.map(|path| {
                 div()
                     .absolute()
@@ -3244,11 +3577,26 @@ impl Shell {
                         .occlude()
                         .child(self.render_workers_right_pane_button(&theme, cx))
                 });
+            let details_action = (!details_open && self.details_context(cx).is_some()).then(|| {
+                let preceding = usize::from(workspace_action.is_some())
+                    + usize::from(gallery_action.is_some())
+                    + usize::from(panel_action.is_some());
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(action_right + preceding as f32 * 67.0))
+                    .occlude()
+                    .child(self.render_details_sidebar_button(
+                        "workers-toggle-details-sidebar",
+                        &theme,
+                        cx,
+                    ))
+            });
             let panel_header = right_open.then(|| {
                 div()
                     .absolute()
                     .top_0()
-                    .right_0()
+                    .right(px(details_now))
                     .w(px(right_now))
                     .h(px(Theme::TITLEBAR_HEIGHT))
                     .flex()
@@ -3289,6 +3637,7 @@ impl Shell {
                 .children(gallery_action)
                 .children(workspace_action)
                 .children(panel_action)
+                .children(details_action)
                 .children(panel_header);
             return bar.into_any_element();
         }
@@ -3491,6 +3840,21 @@ impl Shell {
             icons::SIDEBAR_MINIMALISTIC,
             theme,
             cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+        )
+        .into_any_element()
+    }
+
+    fn render_details_sidebar_button(
+        &mut self,
+        id: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        header_icon_button(
+            id,
+            icons::SIDEBAR_MINIMALISTIC,
+            theme,
+            cx.listener(|this, _, _, cx| this.toggle_details_sidebar(cx)),
         )
         .into_any_element()
     }
@@ -6067,9 +6431,59 @@ impl Shell {
         )
     }
 
-    /// The right pane's empty state (t3code RightPanelEmptyState): a
-    /// centered "Open a surface" heading over the two surface cards —
-    /// Terminal and Git.
+    fn render_details_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.details_sidebar_open(cx) {
+            return gpui::Empty.into_any_element();
+        }
+        let context = self.details_context(cx);
+        self.details_sidebar
+            .update(cx, |sidebar, cx| sidebar.set_context(context, cx));
+        let handle = self
+            .resize_handle(
+                "details-sidebar-resize",
+                || DetailsSidebarResize,
+                |shell, _| shell.settings.details_sidebar_width = DETAILS_SIDEBAR_DEFAULT,
+                cx,
+            )
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0();
+        let target = self.details_target(cx);
+        self.pane_container(
+            self.details_tween,
+            target,
+            div()
+                .h_full()
+                .relative()
+                .overflow_hidden()
+                .child(self.details_sidebar.clone())
+                .child(handle)
+                .into_any_element(),
+        )
+    }
+
+    fn render_details_header_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.details_sidebar_open(cx) {
+            return None;
+        }
+        let width = self.eval_tween(self.details_tween, self.details_target(cx));
+        let header = self
+            .details_sidebar
+            .update(cx, |sidebar, cx| sidebar.render_shell_header(cx));
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(width))
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .occlude()
+                .child(header)
+                .into_any_element(),
+        )
+    }
+
     /// The right pane's empty state: the "Open a surface" heading over a
     /// compact vertical list of surface rows (icon + label) — the Capy
     /// arrangement (user request): the old two-card grid clipped in narrow
@@ -6254,9 +6668,42 @@ impl Shell {
             ));
         for (ix, (surface, title)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
-            let icon_path = match surface {
-                RightSurface::Diff(_) => icons::GIT_BRANCH,
-                _ => icons::TERMINAL,
+            let surface_icon: AnyElement = match surface {
+                RightSurface::Diff(_) => icon(icons::GIT_BRANCH)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+                RightSurface::Terminal(_) => icon(icons::TERMINAL)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+                RightSurface::Preview(id) => self
+                    .preview_surfaces
+                    .get(&id)
+                    .and_then(|info| {
+                        let name = info
+                            .relative_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&info.relative_path);
+                        let path = crate::details_sidebar::files_view::material_icon_path(
+                            name, false, false,
+                        );
+                        icons::material_file_icon_image(path.as_ref())
+                    })
+                    .map(|image| {
+                        img(image)
+                            .size(px(13.0))
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element()
+                    })
+                    .unwrap_or_else(|| {
+                        icon(icons::DOCUMENT)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .into_any_element()
+                    }),
+                RightSurface::Picker => gpui::Empty.into_any_element(),
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
             // (same slot, no width jump) — the ✕ only shows while the tab is
@@ -6337,13 +6784,7 @@ impl Shell {
                                     .items_center()
                                     .justify_center()
                                     .group_hover(group.clone(), |s| s.opacity(0.0))
-                                    .child(icon(icon_path).size(px(12.0)).text_color(
-                                        if is_active {
-                                            theme.text_muted
-                                        } else {
-                                            theme.text_muted.opacity(0.7)
-                                        },
-                                    )),
+                                    .child(surface_icon),
                             )
                             .child(
                                 div()
@@ -7322,6 +7763,7 @@ impl Render for Shell {
             .text_size(px(14.0))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
+            .on_drag_move(cx.listener(Self::on_details_sidebar_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
             // no-ops (zeron __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
@@ -7396,8 +7838,16 @@ impl Render for Shell {
                 // Stamped for `right_target` — the expanded changes panel
                 // sizes itself to the viewport.
                 self.viewport_width = viewport;
-                let main_width =
-                    (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
+                let main_width = (viewport
+                    - self.sidebar_target()
+                    - right_columns_width(
+                        self.right_pane_open(cx),
+                        self.right_target(cx),
+                        self.details_sidebar_open(cx),
+                        self.details_target(cx),
+                    )
+                    - 10.0)
+                    .max(0.0);
                 let stack_h = self.bottom_stack.get();
                 self.transcript.update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx);
@@ -7418,6 +7868,11 @@ impl Render for Shell {
                 let on_chat = matches!(self.route, Route::Chat);
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
+                } else {
+                    Empty.into_any_element()
+                };
+                let details: AnyElement = if on_chat {
+                    self.render_details_sidebar(cx)
                 } else {
                     Empty.into_any_element()
                 };
@@ -7484,9 +7939,11 @@ impl Render for Shell {
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
-                            .child(right),
+                            .child(right)
+                            .child(details),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
+                    .children(self.render_details_header_overlay(cx))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
@@ -8000,6 +8457,51 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_capture_stays_on_the_chat_side_of_right_columns() {
+        assert_eq!(orchestrator_capture_right_offset(false, 520.0, 0.0), 10.0);
+        assert_eq!(orchestrator_capture_right_offset(true, 520.0, 0.0), 530.0);
+        assert_eq!(orchestrator_capture_right_offset(true, 520.0, 360.0), 890.0);
+    }
+
+    #[test]
+    fn details_sidebar_is_available_in_both_modes_with_matching_context() {
+        assert!(details_sidebar_available(
+            SidebarMode::Orchestrator,
+            true,
+            false
+        ));
+        assert!(details_sidebar_available(SidebarMode::Workers, false, true));
+        assert!(!details_sidebar_available(
+            SidebarMode::Workers,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn details_and_surface_panels_reserve_independent_columns() {
+        assert_eq!(right_columns_width(true, 520.0, true, 500.0), 1020.0);
+        assert_eq!(right_columns_width(true, 520.0, false, 500.0), 520.0);
+        assert_eq!(right_columns_width(false, 520.0, true, 500.0), 500.0);
+    }
+
+    #[test]
+    fn right_columns_shrink_together_before_the_chat_can_overlap() {
+        assert_eq!(
+            responsive_right_column_widths(1600.0, 260.0, true, 520.0, true, 360.0),
+            (520.0, 360.0)
+        );
+        let (right, details) =
+            responsive_right_column_widths(1200.0, 260.0, true, 520.0, true, 360.0);
+        assert!((right + details - 620.0).abs() < 0.01);
+        assert!((right / details - 520.0 / 360.0).abs() < 0.01);
+        assert_eq!(
+            responsive_right_column_widths(1000.0, 260.0, true, 520.0, false, 360.0),
+            (420.0, 0.0)
+        );
+    }
+
+    #[test]
     fn workers_panel_keys_never_alias_orchestrator_chat_ids() {
         assert_eq!(
             workers_panel_key(Some("session-1"), "project-1"),
@@ -8137,6 +8639,41 @@ mod tests {
         assert_eq!(panels.get("b").right_active, RightSurface::Picker);
         panels.update("a", |p| p.right_active = RightSurface::Terminal(7));
         assert_eq!(panels.get("a").right_active, RightSurface::Terminal(7));
+    }
+
+    #[test]
+    fn preview_surfaces_deduplicate_by_context_and_path() {
+        let mut sequence = 0;
+        let mut surfaces = std::collections::HashMap::new();
+        let (first, inserted) = register_preview_surface(
+            &mut surfaces,
+            &mut sequence,
+            "project-a",
+            PathBuf::from("/tmp/project-a"),
+            "README.md",
+        );
+        assert!(inserted);
+        assert_eq!(first, RightSurface::Preview(1));
+
+        let (same, inserted) = register_preview_surface(
+            &mut surfaces,
+            &mut sequence,
+            "project-a",
+            PathBuf::from("/tmp/project-a"),
+            "README.md",
+        );
+        assert!(!inserted);
+        assert_eq!(same, first);
+
+        let (other, inserted) = register_preview_surface(
+            &mut surfaces,
+            &mut sequence,
+            "project-b",
+            PathBuf::from("/tmp/project-b"),
+            "README.md",
+        );
+        assert!(inserted);
+        assert_eq!(other, RightSurface::Preview(2));
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

@@ -30,6 +30,19 @@ pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 
+/// Unified Details / Files sidebar bounds (Orchestrator.dev parity).
+pub const DETAILS_SIDEBAR_MIN: f32 = 300.0;
+pub const DETAILS_SIDEBAR_MAX: f32 = 700.0;
+pub const DETAILS_SIDEBAR_DEFAULT: f32 = 500.0;
+
+/// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
+/// viewport-relative cap applies at runtime; the absolute cap here only heals
+/// hand-edited files.
+pub const TERMINAL_MIN_HEIGHT: f32 = 160.0;
+pub const TERMINAL_MAX_VH: f32 = 0.55;
+pub const TERMINAL_ABS_MAX_HEIGHT: f32 = 2000.0;
+pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
+
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
@@ -79,6 +92,12 @@ pub struct UiSettings {
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
     pub right_pane_open: bool,
+    pub details_sidebar_width: f32,
+    pub details_sidebar_open: bool,
+    pub details_sidebar_preferences: crate::details_sidebar::view::DetailsSidebarPreferences,
+    pub terminal_height: f32,
+    /// Legacy — see [`Self::right_pane_open`].
+    pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
@@ -101,6 +120,12 @@ impl Default for UiSettings {
             notifications_background_only: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
+            details_sidebar_width: DETAILS_SIDEBAR_DEFAULT,
+            details_sidebar_open: false,
+            details_sidebar_preferences:
+                crate::details_sidebar::view::DetailsSidebarPreferences::default(),
+            terminal_height: TERMINAL_DEFAULT_HEIGHT,
+            terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
         }
@@ -296,6 +321,18 @@ impl UiSettings {
             RIGHT_PANE_MAX,
             RIGHT_PANE_DEFAULT,
         );
+        self.details_sidebar_width = clamp_or(
+            self.details_sidebar_width,
+            DETAILS_SIDEBAR_MIN,
+            DETAILS_SIDEBAR_MAX,
+            DETAILS_SIDEBAR_DEFAULT,
+        );
+        self.terminal_height = clamp_or(
+            self.terminal_height,
+            TERMINAL_MIN_HEIGHT,
+            TERMINAL_ABS_MAX_HEIGHT,
+            TERMINAL_DEFAULT_HEIGHT,
+        );
         self
     }
 
@@ -361,6 +398,12 @@ mod tests {
             notifications_background_only: false,
             right_pane_width: 700.0,
             right_pane_open: true,
+            details_sidebar_width: 540.0,
+            details_sidebar_open: true,
+            details_sidebar_preferences:
+                crate::details_sidebar::view::DetailsSidebarPreferences::default(),
+            terminal_height: 320.0,
+            terminal_open: true,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()

@@ -345,7 +345,7 @@ mod tests {
     fn workers_titlebar_centers_inside_content_area_not_across_sidebar() {
         let source = include_str!("../shell.rs");
         let workers_titlebar = source
-            .split("if self.sidebar_mode == SidebarMode::Workers")
+            .split("fn render_title_bar")
             .nth(1)
             .and_then(|source| source.split("match self.route").next())
             .expect("workers titlebar renderer");

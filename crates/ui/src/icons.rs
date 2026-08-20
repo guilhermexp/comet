@@ -16,7 +16,13 @@
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Hsla, Result, SharedString, Styled as _, Svg, svg};
+use std::sync::Arc;
+
+use gpui::{AssetSource, Hsla, Image, ImageFormat, Result, SharedString, Styled as _, Svg, svg};
+
+mod material_file_icon_assets {
+    include!(concat!(env!("OUT_DIR"), "/material_file_icon_assets.rs"));
+}
 
 macro_rules! icon_assets {
     ($(($const_name:ident, $path:literal)),+ $(,)?) => {
@@ -27,6 +33,9 @@ macro_rules! icon_assets {
 
         impl AssetSource for Assets {
             fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+                if let Some(bytes) = material_file_icon_assets::load(path) {
+                    return Ok(Some(Cow::Borrowed(bytes)));
+                }
                 Ok(match path {
                     $(concat!("icons/", $path, ".svg") => Some(Cow::Borrowed(
                         include_bytes!(concat!("../assets/icons/", $path, ".svg")).as_slice(),
@@ -112,6 +121,12 @@ icon_assets![
     // Hand-drawn info glyph in the Solar Linear style (like the terminal/
     // plus/return ports) — the embedded set has no info-circle.
     (INFO_CIRCLE, "info-circle"),
+    (DETAILS_CHEVRONS_RIGHT, "details-chevrons-right"),
+    (DETAILS_EYE, "details-eye"),
+    (DETAILS_EYE_OFF, "details-eye-off"),
+    (DETAILS_BOX, "details-box"),
+    (DETAILS_GAUGE, "details-gauge"),
+    (DETAILS_FILES, "details-files"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
     // Hand-drawn bell + speaker in the Solar Linear style (like the terminal/
@@ -186,8 +201,16 @@ pub fn claude_brand() -> Hsla {
 /// An icon element for an embedded asset path. Size and colour are set by the
 /// caller (`.size(..)`, `.text_color(..)`), matching the web app's
 /// `[&_svg]:size-4` idiom.
-pub fn icon(path: &'static str) -> Svg {
-    svg().path(path).flex_none()
+pub fn icon(path: impl Into<SharedString>) -> Svg {
+    svg().path(path.into()).flex_none()
+}
+
+pub fn material_file_icon_image(path: &str) -> Option<Arc<Image>> {
+    let bytes = material_file_icon_assets::load(path)?;
+    Some(Arc::new(Image::from_bytes(
+        ImageFormat::Svg,
+        bytes.to_vec(),
+    )))
 }
 
 #[cfg(test)]
@@ -211,6 +234,24 @@ mod tests {
     #[test]
     fn unknown_paths_are_none() {
         assert!(Assets.load("icons/nope.svg").unwrap().is_none());
+    }
+
+    #[test]
+    fn material_file_icon_assets_are_embedded() {
+        for path in [
+            "file-icons/readme.svg",
+            "file-icons/nodejs.svg",
+            "file-icons/rust.svg",
+            "file-icons/react_ts.svg",
+            "file-icons/folder-src.svg",
+            "file-icons/folder-src-open.svg",
+        ] {
+            let bytes = Assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing material icon {path}"));
+            assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
+        }
     }
 
     #[test]

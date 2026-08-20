@@ -14,4 +14,3 @@ Keep the Orchestrator composer at the same compact one-line height whether a cha
 ## Scope
 
 Remove only the new-chat force-expanded override. Preserve the route morph, send controls, footer controls, drafts, and automatic growth behavior.
-

@@ -135,6 +135,38 @@ impl Shell {
         // the + fades in, so the text never sits under it.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         let plus_inset = 26.0 * self.titlebar_plus_alpha();
+        let details_open = self.details_sidebar_open(cx);
+        let details_now = if details_open {
+            self.eval_tween(self.details_tween, self.details_target(cx))
+        } else {
+            0.0
+        };
+        let right_open = self.right_pane_open(cx);
+        let right_now = if right_open {
+            self.eval_tween(self.right_tween, self.right_target(cx))
+        } else {
+            0.0
+        };
+        let capture_action = (right_open
+            && !on_canvas
+            && titlebar_capabilities(
+                SidebarMode::Orchestrator,
+                !self.active_chat.is_empty(),
+                false,
+            )
+            .capture)
+            .then(|| {
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(orchestrator_capture_right_offset(
+                        right_open,
+                        right_now,
+                        details_now,
+                    )))
+                    .occlude()
+                    .child(self.render_orchestrator_capture_button(&theme, cx))
+            });
 
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
@@ -211,6 +243,13 @@ impl Shell {
                     // strip below.
                     .pl(px(8.0))
                     .child(self.render_orchestrator_capture_button(&theme, cx))
+                    .when(!details_open && self.details_context(cx).is_some(), |el| {
+                        el.child(self.render_details_sidebar_button(
+                            "orchestrator-toggle-details-sidebar-with-panel",
+                            &theme,
+                            cx,
+                        ))
+                    })
                     // Clipped: a long base-ref name must truncate inside the
                     // controls, never paint under the buttons to the right.
                     .child(
@@ -251,6 +290,13 @@ impl Shell {
                     .when(capabilities.capture, |el| {
                         el.child(self.render_orchestrator_capture_button(&theme, cx))
                     })
+                    .when(!details_open && self.details_context(cx).is_some(), |el| {
+                        el.child(self.render_details_sidebar_button(
+                            "orchestrator-toggle-details-sidebar",
+                            &theme,
+                            cx,
+                        ))
+                    })
                     .into_any_element(),
             )
         };
@@ -264,7 +310,8 @@ impl Shell {
             .pr(px(titlebar_right_padding(
                 cfg!(target_os = "windows"),
                 Theme::SPACE_LG,
-            )))
+            ) + details_now
+                + right_now))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
@@ -353,7 +400,13 @@ impl Shell {
         // The unified window titlebar: full-width on the glass shell, ABOVE
         // the inset card. No bottom border — the card's own hairline is the
         // separation; the glass gutter shows between.
-        let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+        let bar = div()
+            .relative()
+            .h(px(Theme::TITLEBAR_HEIGHT))
+            .flex_none()
+            .child(inner)
+            .children(panel_header)
+            .children(capture_action);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
     }

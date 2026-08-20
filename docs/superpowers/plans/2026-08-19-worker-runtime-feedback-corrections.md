@@ -121,4 +121,3 @@
 - [ ] Stop/restart only the exact dev main process after checking active Workers; never use `pkill -x zeron`.
 - [ ] Verify provider configs reference only `~/.zeron/workers/hooks`, then remove `~/.unpeel/hooks`.
 - [ ] Reproduce one delegated task with an active background process and confirm zero premature notifications, followed by one final notification.
-
