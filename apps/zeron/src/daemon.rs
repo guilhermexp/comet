@@ -403,12 +403,85 @@ mod tests {
 
     #[test]
     fn curl_installer_always_starts_the_local_capable_service() {
-        let installer = include_str!("../../../edge/src/install.sh");
-        assert!(!installer.contains("session.json"));
-        assert!(installer.contains("StartLimitIntervalSec=60\n"));
-        assert!(installer.contains("StartLimitBurst=5\n"));
-        assert!(installer.contains("systemctl --user enable zeron"));
-        assert!(installer.contains("systemctl --user restart zeron"));
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn write_executable(path: &Path, source: &str) {
+            std::fs::write(path, source).unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let shims = temp.path().join("bin");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        write_executable(
+            &shims.join("uname"),
+            "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n",
+        );
+        write_executable(
+            &shims.join("curl"),
+            "#!/bin/sh\ncase \"$*\" in *latest.txt*) echo 9.9.9; exit 0 ;; esac\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = -o ]; then shift; : >\"$1\"; exit 0; fi; shift; done\nexit 1\n",
+        );
+        write_executable(
+            &shims.join("tar"),
+            "#!/bin/sh\ndest=\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = -C ]; then shift; dest=$1; fi; shift; done\nmkdir -p \"$dest\"\nprintf '#!/bin/sh\\nexit 0\\n' >\"$dest/zeron\"\nchmod +x \"$dest/zeron\"\n",
+        );
+        for command in ["systemctl", "loginctl"] {
+            write_executable(
+                &shims.join(command),
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$ZERON_TEST_LOG\"\n",
+            );
+        }
+        let command_log = temp.path().join("commands.log");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../edge/src/install.sh");
+        let output = Command::new("sh")
+            .arg(installer)
+            .env("HOME", &home)
+            .env("USER", "fixture")
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("ZERON_BASE_URL", "https://fixture.invalid")
+            .env("ZERON_TEST_LOG", &command_log)
+            .env("PATH", format!("{}:/usr/bin:/bin", shims.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "installer failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let unit = std::fs::read_to_string(home.join(".config/systemd/user/zeron.service"))
+            .unwrap();
+        let properties = unit
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(properties.get("StartLimitIntervalSec"), Some(&"60"));
+        assert_eq!(properties.get("StartLimitBurst"), Some(&"5"));
+        assert_eq!(
+            properties.get("ExecStart"),
+            Some(&"%h/.zeron/app/current/zeron headless")
+        );
+        assert_eq!(properties.get("Restart"), Some(&"on-failure"));
+        assert!(!properties.contains_key("ConditionPathExists"));
+
+        let commands = std::fs::read_to_string(command_log).unwrap();
+        assert_eq!(
+            commands.lines().collect::<Vec<_>>(),
+            [
+                "--user daemon-reload",
+                "--user enable zeron",
+                "--user restart zeron",
+                "enable-linger fixture",
+            ]
+        );
     }
 
     #[test]

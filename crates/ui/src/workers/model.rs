@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{Context, Entity, Task};
 use zeron_doc::SessionCommandPayload;
@@ -230,15 +230,38 @@ fn claim_parent_notification_delivery(in_flight: &mut HashSet<String>, id: &str)
     in_flight.insert(id.to_owned())
 }
 
-const MAX_PARENT_NOTIFICATION_RETRIES: u8 = 5;
-
-fn parent_notification_retry_allowed(failures: &HashMap<String, u8>, id: &str) -> bool {
-    failures.get(id).copied().unwrap_or(0) < MAX_PARENT_NOTIFICATION_RETRIES
+#[derive(Debug, Clone, Copy)]
+struct ParentNotificationRetry {
+    failures: u8,
+    retry_at: Instant,
 }
 
-fn note_parent_notification_failure(failures: &mut HashMap<String, u8>, id: &str) {
-    let count = failures.entry(id.to_owned()).or_default();
-    *count = count.saturating_add(1);
+fn parent_notification_retry_allowed(
+    failures: &HashMap<String, ParentNotificationRetry>,
+    id: &str,
+    now: Instant,
+) -> bool {
+    failures.get(id).is_none_or(|retry| now >= retry.retry_at)
+}
+
+fn note_parent_notification_failure(
+    failures: &mut HashMap<String, ParentNotificationRetry>,
+    id: &str,
+    now: Instant,
+) {
+    let failure_count = failures
+        .get(id)
+        .map(|retry| retry.failures)
+        .unwrap_or_default()
+        .saturating_add(1);
+    let exponent = failure_count.saturating_sub(1).min(5);
+    failures.insert(
+        id.to_owned(),
+        ParentNotificationRetry {
+            failures: failure_count,
+            retry_at: now + Duration::from_secs(1_u64 << exponent),
+        },
+    );
 }
 
 fn parent_notification_rpc_params(
@@ -739,6 +762,7 @@ impl WorkersModel {
             if !parent_notification_retry_allowed(
                 &self.parent_notification_failures,
                 &notification_id,
+                Instant::now(),
             ) {
                 continue;
             }
@@ -771,6 +795,7 @@ impl WorkersModel {
                         note_parent_notification_failure(
                             &mut model.parent_notification_failures,
                             &notification_id,
+                            Instant::now(),
                         );
                     }
                 })
@@ -1784,18 +1809,22 @@ mod tests {
     }
 
     #[test]
-    fn worker_parent_notification_retries_are_bounded_per_app_run() {
+    fn worker_parent_notification_retries_remain_eligible_after_backoff() {
         let mut failures = HashMap::new();
-        for _ in 0..5 {
+        let start = std::time::Instant::now();
+        for attempt in 0..8 {
+            let now = start + std::time::Duration::from_secs(64 * attempt);
             assert!(parent_notification_retry_allowed(
                 &failures,
-                "worker-notify:worker-1"
+                "worker-notify:worker-1",
+                now,
             ));
-            note_parent_notification_failure(&mut failures, "worker-notify:worker-1");
+            note_parent_notification_failure(&mut failures, "worker-notify:worker-1", now);
         }
-        assert!(!parent_notification_retry_allowed(
+        assert!(parent_notification_retry_allowed(
             &failures,
-            "worker-notify:worker-1"
+            "worker-notify:worker-1",
+            start + std::time::Duration::from_secs(8 * 64),
         ));
     }
 

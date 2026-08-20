@@ -1,8 +1,8 @@
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, EventEmitter, Image, ImageFormat, IntoElement, ObjectFit,
-    Render, SharedString, StyledText, Task, Window, div, font, img, prelude::*, px,
+    AnyElement, ClipboardItem, Context, EventEmitter, Image, IntoElement, ObjectFit, Render,
+    SharedString, StyledText, Task, Window, div, font, img, prelude::*, px,
 };
 use zeron_syntax::HighlightedDocument;
 
@@ -10,57 +10,14 @@ use crate::{
     details_sidebar::files_view::material_icon_path,
     file_preview::{
         loader::{LoadedPreview, PreviewLoadError, load_preview},
-        model::{PreviewDisplayMode, PreviewKind, PreviewTabs, classify_preview_kind},
+        model::{PreviewDisplayMode, PreviewTabs},
     },
     icons,
-    markdown::{parser::BlockTree, render as markdown_render},
+    markdown::render as markdown_render,
     theme::Theme,
 };
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum PreparedPreview {
-    Markdown(BlockTree),
-    Code {
-        lines: Vec<String>,
-        highlights: Option<Arc<HighlightedDocument>>,
-    },
-    Html(String),
-    Data(Vec<Vec<String>>),
-    Unsupported,
-}
-
-pub fn prepare_text_preview(kind: PreviewKind, source: &str, path: &str) -> PreparedPreview {
-    match kind {
-        PreviewKind::Markdown => PreparedPreview::Markdown(crate::markdown::parse_full(source)),
-        PreviewKind::Code => PreparedPreview::Code {
-            lines: source.split('\n').map(str::to_owned).collect(),
-            highlights: zeron_syntax::highlight(zeron_syntax::HighlightRequest {
-                source,
-                path: Some(path),
-                fence_tag: None,
-            })
-            .ok()
-            .map(Arc::new),
-        },
-        PreviewKind::Html => PreparedPreview::Html(source.to_string()),
-        PreviewKind::Data => {
-            let separator = if path.to_ascii_lowercase().ends_with(".tsv") {
-                '\t'
-            } else {
-                ','
-            };
-            PreparedPreview::Data(
-                source
-                    .lines()
-                    .map(|line| line.split(separator).map(str::to_owned).collect())
-                    .collect(),
-            )
-        }
-        _ => PreparedPreview::Unsupported,
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum PreviewLoadState {
     Idle,
     Loading,
@@ -144,14 +101,34 @@ impl FilePreview {
         relative_path: String,
         cx: &mut Context<Self>,
     ) {
-        self.roots.insert(context_key.clone(), root);
-        self.tabs.open(&context_key, &relative_path);
-        self.active_context = Some(context_key.clone());
-        self.load_active(cx);
+        self.activate_surface(
+            context_key.clone(),
+            root,
+            relative_path.clone(),
+            cx,
+        );
         cx.emit(FilePreviewEvent::ActiveChanged {
             context_key,
             relative_path: Some(relative_path),
         });
+    }
+
+    pub fn activate_surface(
+        &mut self,
+        context_key: String,
+        root: PathBuf,
+        relative_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let already_active = self.active_context.as_deref() == Some(context_key.as_str())
+            && self.tabs.active_path(&context_key) == Some(relative_path.as_str())
+            && self.roots.get(&context_key) == Some(&root);
+        self.roots.insert(context_key.clone(), root);
+        self.tabs.open(&context_key, &relative_path);
+        self.active_context = Some(context_key);
+        if !already_active {
+            self.load_active(cx);
+        }
     }
 
     pub fn close_path(&mut self, context_key: &str, relative_path: &str, cx: &mut Context<Self>) {
@@ -369,10 +346,6 @@ impl FilePreview {
             .active_path(context_key)
             .unwrap_or_default()
             .to_string();
-        let kind = classify_preview_kind(&path);
-        if !matches!(kind, PreviewKind::Html | PreviewKind::Pdf) {
-            self.clear_native_document();
-        }
         let loaded = self.loaded.clone();
         match loaded {
             PreviewLoadState::Idle => gpui::Empty.into_any_element(),
@@ -381,44 +354,33 @@ impl FilePreview {
             PreviewLoadState::Ready(LoadedPreview::Unsupported) => {
                 centered_message("Cannot view this file", theme)
             }
-            PreviewLoadState::Ready(LoadedPreview::Binary(bytes)) => {
-                if kind == PreviewKind::Image {
-                    render_image(&path, &bytes, theme)
-                } else if kind == PreviewKind::Pdf {
-                    self.render_native_document(window, theme)
-                } else {
-                    centered_message("Open this file in its native app to preview it.", theme)
-                }
+            PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => div()
+                .id("file-preview-markdown-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .px(px(28.0))
+                .py(px(24.0))
+                .child(markdown_render::render_tree(
+                    tree.as_ref(),
+                    &markdown_render::RenderOptions::settled(
+                        format!("file-preview:{path}").into(),
+                    ),
+                    theme,
+                    window,
+                    &|_| None,
+                ))
+                .into_any_element(),
+            PreviewLoadState::Ready(LoadedPreview::Code { lines, highlights }) => {
+                render_code(lines, highlights, theme)
+            }
+            PreviewLoadState::Ready(LoadedPreview::Html(document)) => {
+                self.render_native_document(window, theme, Some(document.as_ref()))
+            }
+            PreviewLoadState::Ready(LoadedPreview::Image(image)) => render_image(image, theme),
+            PreviewLoadState::Ready(LoadedPreview::Pdf) => {
+                self.render_native_document(window, theme, None)
             }
             PreviewLoadState::Ready(LoadedPreview::Table(rows)) => render_data(rows, theme),
-            PreviewLoadState::Ready(LoadedPreview::Text(source)) => {
-                match prepare_text_preview(kind, &source, &path) {
-                    PreparedPreview::Markdown(tree) => div()
-                        .id("file-preview-markdown-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .px(px(28.0))
-                        .py(px(24.0))
-                        .child(markdown_render::render_tree(
-                            &tree,
-                            &markdown_render::RenderOptions::settled(
-                                format!("file-preview:{path}").into(),
-                            ),
-                            theme,
-                            window,
-                            &|_| None,
-                        ))
-                        .into_any_element(),
-                    PreparedPreview::Code { lines, highlights } => {
-                        render_code(lines, highlights.as_deref(), theme)
-                    }
-                    PreparedPreview::Html(_) => self.render_native_document(window, theme),
-                    PreparedPreview::Data(rows) => render_data(rows, theme),
-                    PreparedPreview::Unsupported => {
-                        centered_message("Cannot view this file", theme)
-                    }
-                }
-            }
         }
     }
 
@@ -429,7 +391,12 @@ impl FilePreview {
         }
     }
 
-    fn render_native_document(&mut self, window: &Window, theme: &Theme) -> AnyElement {
+    fn render_native_document(
+        &mut self,
+        window: &Window,
+        theme: &Theme,
+        html: Option<&str>,
+    ) -> AnyElement {
         #[cfg(target_os = "macos")]
         {
             let Some(context_key) = self.active_context.as_deref() else {
@@ -448,8 +415,13 @@ impl FilePreview {
                 .is_none_or(|(path, _)| path != &absolute);
             if needs_new {
                 self.clear_native_document();
-                let Some(view) = super::native_document::NativeDocumentView::open(&absolute, &root)
-                else {
+                let view = match html {
+                    Some(document) => {
+                        super::native_document::NativeDocumentView::open_html(document)
+                    }
+                    None => super::native_document::NativeDocumentView::open_pdf(&absolute),
+                };
+                let Some(view) = view else {
                     return centered_message("The native preview could not be opened.", theme);
                 };
                 self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
@@ -530,12 +502,14 @@ fn centered_message(message: impl Into<SharedString>, theme: &Theme) -> AnyEleme
 }
 
 fn render_code(
-    lines: Vec<String>,
-    highlights: Option<&HighlightedDocument>,
+    lines: Arc<[SharedString]>,
+    highlights: Option<Arc<HighlightedDocument>>,
     theme: &Theme,
 ) -> AnyElement {
     let mono = font(theme.font_mono.clone());
     let sampled = minimap_sample_indices(lines.len(), 240);
+    let minimap_lines = lines.clone();
+    let minimap_highlights = highlights.clone();
     let minimap = div()
         .w(px(72.0))
         .h_full()
@@ -549,10 +523,11 @@ fn render_code(
         .flex()
         .flex_col()
         .gap(px(1.0))
-        .children(sampled.into_iter().map(|index| {
-            let line = &lines[index];
+        .children(sampled.into_iter().map(move |index| {
+            let line = &minimap_lines[index];
             let width = (line.trim().chars().count() as f32 * 0.7).clamp(3.0, 62.0);
-            let color = highlights
+            let color = minimap_highlights
+                .as_deref()
                 .and_then(|document| document.lines.get(index))
                 .and_then(|spans| spans.first())
                 .map(|span| theme.syntax.color(span.kind).opacity(0.55))
@@ -575,6 +550,8 @@ fn render_code(
                 .border_color(theme.text_faint.opacity(0.18))
                 .bg(crate::theme::ink(0.025)),
         );
+    let code_lines = lines.clone();
+    let code_highlights = highlights;
     let code = div()
         .id("file-preview-code-scroll")
         .flex_1()
@@ -582,10 +559,12 @@ fn render_code(
         .h_full()
         .overflow_scroll()
         .py(px(10.0))
-        .children(lines.into_iter().enumerate().map(|(index, line)| {
+        .children((0..code_lines.len()).map(move |index| {
+            let line = code_lines[index].clone();
             let runs = markdown_render::runs_for_syntax_line_with_plain(
-                &line,
-                highlights
+                line.as_ref(),
+                code_highlights
+                    .as_deref()
                     .and_then(|document| document.lines.get(index))
                     .map(Vec::as_slice)
                     .unwrap_or_default(),
@@ -635,17 +614,17 @@ fn minimap_sample_indices(line_count: usize, limit: usize) -> Vec<usize> {
         .collect()
 }
 
-fn render_data(rows: Vec<Vec<String>>, theme: &Theme) -> AnyElement {
+fn render_data(rows: Arc<[Vec<SharedString>]>, theme: &Theme) -> AnyElement {
     div()
         .id("file-preview-data-scroll")
         .size_full()
         .overflow_scroll()
         .p(px(16.0))
         .children(
-            rows.into_iter()
-                .take(2_000)
+            (0..rows.len().min(2_000))
                 .enumerate()
-                .map(|(row_index, row)| {
+                .map(move |(row_index, source_index)| {
+                    let row = &rows[source_index];
                     div()
                         .h(px(28.0))
                         .flex()
@@ -657,7 +636,7 @@ fn render_data(rows: Vec<Vec<String>>, theme: &Theme) -> AnyElement {
                         } else {
                             gpui::transparent_black()
                         })
-                        .children(row.into_iter().take(100).map(|cell| {
+                        .children(row.iter().take(100).cloned().map(|cell| {
                             div()
                                 .w(px(180.0))
                                 .flex_none()
@@ -672,23 +651,7 @@ fn render_data(rows: Vec<Vec<String>>, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-fn render_image(path: &str, bytes: &[u8], theme: &Theme) -> AnyElement {
-    let extension = path
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase());
-    let format = match extension.as_deref() {
-        Some("png") => Some(ImageFormat::Png),
-        Some("jpg" | "jpeg") => Some(ImageFormat::Jpeg),
-        Some("gif") => Some(ImageFormat::Gif),
-        Some("webp") => Some(ImageFormat::Webp),
-        Some("svg") => Some(ImageFormat::Svg),
-        Some("bmp") => Some(ImageFormat::Bmp),
-        _ => None,
-    };
-    let Some(format) = format else {
-        return centered_message("Cannot decode this image.", theme);
-    };
-    let image = Arc::new(Image::from_bytes(format, bytes.to_vec()));
+fn render_image(image: Arc<Image>, _theme: &Theme) -> AnyElement {
     div()
         .size_full()
         .p(px(24.0))
@@ -706,33 +669,6 @@ fn render_image(path: &str, bytes: &[u8], theme: &Theme) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedPreview, prepare_text_preview};
-    use crate::file_preview::model::PreviewKind;
-
-    #[test]
-    fn markdown_is_prepared_as_a_render_tree() {
-        let prepared = prepare_text_preview(PreviewKind::Markdown, "# Title\n\nBody", "README.md");
-        assert!(matches!(prepared, PreparedPreview::Markdown(_)));
-    }
-
-    #[test]
-    fn code_keeps_lines_and_syntax_document() {
-        let prepared = prepare_text_preview(PreviewKind::Code, "fn main() {}\n", "main.rs");
-        let PreparedPreview::Code { lines, highlights } = prepared else {
-            panic!("expected code preview");
-        };
-        assert_eq!(lines, ["fn main() {}", ""]);
-        assert!(highlights.is_some());
-    }
-
-    #[test]
-    fn html_keeps_source_for_native_preview() {
-        assert_eq!(
-            prepare_text_preview(PreviewKind::Html, "<h1>Hello</h1>", "index.html"),
-            PreparedPreview::Html("<h1>Hello</h1>".into())
-        );
-    }
-
     #[test]
     fn code_minimap_is_bounded_for_large_files() {
         assert_eq!(

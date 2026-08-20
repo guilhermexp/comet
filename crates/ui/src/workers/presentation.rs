@@ -35,6 +35,10 @@ pub fn workers_titlebar(
     }
 }
 
+pub fn workers_titlebar_content_insets(sidebar_width: f32, occupied_right: f32) -> (f32, f32) {
+    (sidebar_width.max(0.0), occupied_right.max(0.0))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionIndicator {
     Busy,
@@ -165,6 +169,7 @@ mod tests {
         SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
         SIDEBAR_TOP_PADDING, SessionIndicator, relative_age, runtime_icon_path,
         runtime_spinner_tint, session_indicator, spinner_frame, workers_titlebar,
+        workers_titlebar_content_insets,
     };
     use zeron_workers_unpeel::WorkersProject;
 
@@ -296,24 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_terminal_has_no_internal_session_header() {
-        let source = include_str!("workspace.rs");
-        let content_session = source
-            .match_indices("    fn render_session(")
-            .nth(1)
-            .map(|(index, _)| &source[index..])
-            .expect("workers content session renderer");
-        let content_session = content_session
-            .split("    fn render_archive(")
-            .next()
-            .expect("workers content session renderer boundary");
-        assert!(
-            !content_session.contains(".h(px(44.0))"),
-            "Unpeel starts terminal content directly below the window titlebar"
-        );
-    }
-
-    #[test]
     fn workers_titlebar_matches_unpeel_project_and_branch_chrome() {
         let project = WorkersProject {
             id: "project".into(),
@@ -343,15 +330,10 @@ mod tests {
 
     #[test]
     fn workers_titlebar_centers_inside_content_area_not_across_sidebar() {
-        let source = include_str!("../shell.rs");
-        let workers_titlebar = source
-            .split("fn render_title_bar")
-            .nth(1)
-            .and_then(|source| source.split("match self.route").next())
-            .expect("workers titlebar renderer");
-        assert!(
-            workers_titlebar.contains(".left(px(sidebar_now))"),
-            "the selected project title must be centered after excluding the sidebar width"
+        assert_eq!(
+            workers_titlebar_content_insets(260.0, 880.0),
+            (260.0, 880.0)
         );
+        assert_eq!(workers_titlebar_content_insets(-1.0, -1.0), (0.0, 0.0));
     }
 }

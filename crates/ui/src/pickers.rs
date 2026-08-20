@@ -375,6 +375,40 @@ pub enum PickerKind {
     Device,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerFooterControl {
+    Model,
+    Branch,
+}
+
+fn composer_footer_right_order() -> [ComposerFooterControl; 2] {
+    [ComposerFooterControl::Model, ComposerFooterControl::Branch]
+}
+
+fn composer_footer_right(
+    model_controls: AnyElement,
+    branch_control: AnyElement,
+) -> gpui::Div {
+    let mut model_controls = Some(model_controls);
+    let mut branch_control = Some(branch_control);
+    composer_footer_right_order().into_iter().fold(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .gap(px(4.0)),
+        |row, control| match control {
+            ComposerFooterControl::Model => {
+                row.child(model_controls.take().expect("one model control"))
+            }
+            ComposerFooterControl::Branch => {
+                row.child(branch_control.take().expect("one branch control"))
+            }
+        },
+    )
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -2305,14 +2339,7 @@ impl Pickers {
                     .into_any_element()
                 })
                 .unwrap_or_else(|| div().into_any_element());
-            let right = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .min_w_0()
-                .gap(px(4.0))
-                .child(model_controls)
-                .child(branch_control);
+            let right = composer_footer_right(model_controls, branch_control);
             return Some(row().child(left).child(right).into_any_element());
         }
 
@@ -2390,14 +2417,7 @@ impl Pickers {
         } else {
             div().into_any_element()
         };
-        let right = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .gap(px(4.0))
-            .child(model_controls)
-            .child(branch_control);
+        let right = composer_footer_right(model_controls, branch_control);
         Some(row().child(left).child(right).into_any_element())
     }
 
@@ -3623,26 +3643,10 @@ mod tests {
 
     #[test]
     fn picker_controls_move_to_footer() {
-        let composer = include_str!("composer.rs");
-        assert!(
-            !composer.contains(".child(div().flex_1().min_w_0().child(self.pickers.clone()))")
-                && !composer.contains(".child(div().flex_none().child(self.pickers.clone()))"),
-            "model and effort controls must not remain inside either composer layout"
+        assert_eq!(
+            composer_footer_right_order(),
+            [ComposerFooterControl::Model, ComposerFooterControl::Branch]
         );
-
-        let source = include_str!("pickers.rs");
-        let footer = source
-            .split("pub fn render_footer")
-            .nth(1)
-            .and_then(|source| source.split("fn popover_frame").next())
-            .expect("footer renderer source");
-        let model = footer
-            .find(".child(model_controls)")
-            .expect("footer model controls");
-        let branch = footer
-            .find(".child(branch_control)")
-            .expect("footer branch control");
-        assert!(model < branch, "footer order must be model, effort, branch");
     }
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
 

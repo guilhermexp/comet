@@ -32,7 +32,9 @@ use zeron_workers_unpeel::WorkersLaunchRequest;
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::details_sidebar::{
-    context::{DetailsContext, context_for_orchestrator, context_for_worker},
+    context::{
+        DetailsContext, context_for_orchestrator, context_for_worker, worker_context_key,
+    },
     view::{DetailsSidebar, DetailsSidebarEvent},
 };
 use crate::file_preview::view::{FilePreview, FilePreviewEvent};
@@ -61,7 +63,7 @@ use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, 
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 use crate::workers::model::{WorkersModel, WorkersRoute};
-use crate::workers::presentation::workers_titlebar;
+use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
 use crate::workers::session_gallery;
 #[cfg(target_os = "macos")]
 use crate::workers::session_gallery::native as native_session_gallery;
@@ -288,6 +290,7 @@ fn right_columns_width(
 }
 
 const RESPONSIVE_MAIN_PANE_MIN: f32 = 320.0;
+const RESPONSIVE_COLUMN_GUTTER: f32 = 10.0;
 
 fn responsive_right_column_widths(
     viewport: f32,
@@ -300,12 +303,51 @@ fn responsive_right_column_widths(
     let right = right_open.then_some(requested_right).unwrap_or(0.0);
     let details = details_open.then_some(requested_details).unwrap_or(0.0);
     let requested_total = right + details;
-    let budget = (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN).max(0.0);
+    let budget =
+        (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN - RESPONSIVE_COLUMN_GUTTER).max(0.0);
     if requested_total <= budget || requested_total <= f32::EPSILON {
         return (right, details);
     }
-    let scale = budget / requested_total;
-    (right * scale, details * scale)
+    match (right_open, details_open) {
+        (true, true) if budget >= RIGHT_PANE_MIN + DETAILS_SIDEBAR_MIN => {
+            let right_extra = (right - RIGHT_PANE_MIN).max(0.0);
+            let details_extra = (details - DETAILS_SIDEBAR_MIN).max(0.0);
+            let requested_extra = right_extra + details_extra;
+            if requested_extra <= f32::EPSILON {
+                return (RIGHT_PANE_MIN, DETAILS_SIDEBAR_MIN);
+            }
+            let extra_scale =
+                ((budget - RIGHT_PANE_MIN - DETAILS_SIDEBAR_MIN) / requested_extra).min(1.0);
+            (
+                RIGHT_PANE_MIN + right_extra * extra_scale,
+                DETAILS_SIDEBAR_MIN + details_extra * extra_scale,
+            )
+        }
+        (true, _) if budget >= RIGHT_PANE_MIN => {
+            (right.clamp(RIGHT_PANE_MIN, budget), 0.0)
+        }
+        (false, true) if budget >= DETAILS_SIDEBAR_MIN => {
+            (0.0, details.clamp(DETAILS_SIDEBAR_MIN, budget))
+        }
+        _ => (0.0, 0.0),
+    }
+}
+
+fn expanded_right_column_widths(
+    viewport: f32,
+    sidebar: f32,
+    details_open: bool,
+    requested_details: f32,
+) -> (f32, f32) {
+    let budget = (viewport - sidebar).max(0.0);
+    if budget < RIGHT_PANE_MIN {
+        return (0.0, 0.0);
+    }
+    if details_open && budget >= RIGHT_PANE_MIN + DETAILS_SIDEBAR_MIN {
+        let details = requested_details.clamp(DETAILS_SIDEBAR_MIN, budget - RIGHT_PANE_MIN);
+        return (budget - details, details);
+    }
+    (budget, 0.0)
 }
 
 fn orchestrator_capture_right_offset(
@@ -314,12 +356,6 @@ fn orchestrator_capture_right_offset(
     details_width: f32,
 ) -> f32 {
     (if right_open { right_width } else { 0.0 }) + details_width + 10.0
-}
-
-fn workers_panel_key(session_id: Option<&str>, project_id: &str) -> String {
-    session_id
-        .map(|session_id| format!("workers-session:{session_id}"))
-        .unwrap_or_else(|| format!("workers-project:{project_id}"))
 }
 
 /// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
@@ -366,6 +402,17 @@ fn register_preview_surface(
         },
     );
     (RightSurface::Preview(id), true)
+}
+
+fn remove_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> RightSurface {
+    let Some(index) = tabs.iter().position(|tab| *tab == surface) else {
+        return RightSurface::Picker;
+    };
+    tabs.remove(index);
+    tabs.get(index.saturating_sub(1))
+        .or_else(|| tabs.first())
+        .copied()
+        .unwrap_or(RightSurface::Picker)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1708,7 +1755,7 @@ impl Shell {
                     .find(|project| project.id == session.project_id)
             })
             .or_else(|| model.selected_project())?;
-        let key = workers_panel_key(session.map(|session| session.id.as_str()), &project.id);
+        let key = worker_context_key(project, session);
         Some(WorkersPanelContext {
             key,
             cwd: project.path.clone(),
@@ -1757,14 +1804,15 @@ impl Shell {
     fn right_target(&self, cx: &App) -> f32 {
         if !self.right_pane_open(cx) {
             0.0
-        } else if self.right_pane_expanded
-            && self.active_utility_pane(cx) == Some(UtilityPane::Changes)
-        {
-            // Takeover: everything right of the sidebar; the conversation
-            // column (flex_1) collapses to zero behind it. Rides the sidebar's
-            // width tween so a sidebar toggle mid-takeover stays seamless.
+        } else if self.right_pane_expanded {
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
+            expanded_right_column_widths(
+                self.viewport_width,
+                sidebar_now,
+                self.details_sidebar_open(cx),
+                self.settings.details_sidebar_width,
+            )
+            .0
         } else {
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
             responsive_right_column_widths(
@@ -1828,7 +1876,14 @@ impl Shell {
             return 0.0;
         }
         if self.right_pane_expanded {
-            return self.settings.details_sidebar_width;
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            return expanded_right_column_widths(
+                self.viewport_width,
+                sidebar_now,
+                true,
+                self.settings.details_sidebar_width,
+            )
+            .1;
         }
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         responsive_right_column_widths(
@@ -2144,20 +2199,22 @@ impl Shell {
             return;
         };
         let surface = RightSurface::Preview(id);
+        let was_active = self.resolved_right_active(cx) == surface;
         self.preview_surfaces.remove(&id);
         let key = self.panel_key(cx);
-        if let Some(tabs) = self.right_tabs.get_mut(&key) {
-            tabs.retain(|tab| *tab != surface);
-        }
+        let next = self
+            .right_tabs
+            .get_mut(&key)
+            .map(|tabs| remove_right_surface(tabs, surface))
+            .unwrap_or(RightSurface::Picker);
         self.file_preview.update(cx, |preview, cx| {
             preview.close_path(context_key, relative_path, cx)
         });
-        self.panels.update(&key, |panels| {
-            if panels.right_active == surface {
-                panels.right_active = RightSurface::Picker;
-            }
-        });
-        cx.notify();
+        if was_active {
+            self.set_right_active(next, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
@@ -2184,8 +2241,6 @@ impl Shell {
         }
     }
 
-    /// A surface tab's ✕. The active fallback happens naturally through
-    /// [`Self::resolved_right_active`] on the next frame.
     fn close_right_surface(
         &mut self,
         surface: RightSurface,
@@ -2193,9 +2248,12 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let key = self.panel_key(cx);
-        if let Some(tabs) = self.right_tabs.get_mut(&key) {
-            tabs.retain(|s| *s != surface);
-        }
+        let was_active = self.resolved_right_active(cx) == surface;
+        let next = self
+            .right_tabs
+            .get_mut(&key)
+            .map(|tabs| remove_right_surface(tabs, surface))
+            .unwrap_or(RightSurface::Picker);
         match surface {
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
@@ -2221,12 +2279,11 @@ impl Shell {
             }
             RightSurface::Picker => {}
         }
-        self.panels.update(&key, |p| {
-            if p.right_active == surface {
-                p.right_active = RightSurface::Picker;
-            }
-        });
-        cx.notify();
+        if was_active {
+            self.set_right_active(next, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn changes_pane(&mut self, cx: &mut Context<Self>) -> Entity<Changes> {
@@ -3500,6 +3557,8 @@ impl Shell {
                 0.0
             };
             let occupied_right = right_now + details_now;
+            let (title_left, title_right) =
+                workers_titlebar_content_insets(sidebar_now, occupied_right);
             let drag_bar = div()
                 .absolute()
                 .top_0()
@@ -3517,8 +3576,8 @@ impl Shell {
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .left(px(sidebar_now))
-                        .right(px(occupied_right))
+                        .left(px(title_left))
+                        .right(px(title_right))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -8486,32 +8545,49 @@ mod tests {
     }
 
     #[test]
-    fn right_columns_shrink_together_before_the_chat_can_overlap() {
+    fn right_columns_preserve_minimums_and_prioritize_the_surface_when_narrow() {
         assert_eq!(
             responsive_right_column_widths(1600.0, 260.0, true, 520.0, true, 360.0),
             (520.0, 360.0)
         );
         let (right, details) =
-            responsive_right_column_widths(1200.0, 260.0, true, 520.0, true, 360.0);
-        assert!((right + details - 620.0).abs() < 0.01);
-        assert!((right / details - 520.0 / 360.0).abs() < 0.01);
+            responsive_right_column_widths(1300.0, 260.0, true, 520.0, true, 360.0);
+        assert!((right + details - 710.0).abs() < 0.01);
+        assert!(right >= RIGHT_PANE_MIN);
+        assert!(details >= DETAILS_SIDEBAR_MIN);
+        assert_eq!(
+            responsive_right_column_widths(1200.0, 260.0, true, 520.0, true, 360.0),
+            (520.0, 0.0)
+        );
         assert_eq!(
             responsive_right_column_widths(1000.0, 260.0, true, 520.0, false, 360.0),
-            (420.0, 0.0)
+            (410.0, 0.0)
         );
     }
 
     #[test]
-    fn workers_panel_keys_never_alias_orchestrator_chat_ids() {
+    fn expanded_surface_reserves_the_effective_details_column() {
         assert_eq!(
-            workers_panel_key(Some("session-1"), "project-1"),
-            "workers-session:session-1"
+            expanded_right_column_widths(1400.0, 260.0, true, 500.0),
+            (640.0, 500.0)
         );
         assert_eq!(
-            workers_panel_key(None, "project-1"),
-            "workers-project:project-1"
+            expanded_right_column_widths(850.0, 260.0, true, 500.0),
+            (590.0, 0.0)
         );
-        assert_ne!(workers_panel_key(Some("chat-1"), "project-1"), "chat-1");
+    }
+
+    #[test]
+    fn closing_an_active_surface_selects_its_previous_neighbor() {
+        let terminal = RightSurface::Terminal(1);
+        let first = RightSurface::Preview(2);
+        let second = RightSurface::Preview(3);
+        let mut tabs = vec![terminal, first, second];
+
+        assert_eq!(remove_right_surface(&mut tabs, second), first);
+        assert_eq!(tabs, [terminal, first]);
+        assert_eq!(remove_right_surface(&mut tabs, terminal), first);
+        assert_eq!(tabs, [first]);
     }
 
     #[test]

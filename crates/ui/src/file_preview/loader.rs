@@ -1,20 +1,30 @@
 use std::{
     fs,
     path::{Component, Path},
+    sync::Arc,
 };
 
 use calamine::{Data, Range, Reader, open_workbook_auto};
+use gpui::{Image, ImageFormat, SharedString};
+use zeron_syntax::HighlightedDocument;
 
 use super::model::{PreviewKind, classify_preview_kind};
+use crate::markdown::parser::BlockTree;
 
 const MAX_TEXT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 32 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum LoadedPreview {
-    Text(String),
-    Binary(Vec<u8>),
-    Table(Vec<Vec<String>>),
+    Markdown(Arc<BlockTree>),
+    Code {
+        lines: Arc<[SharedString]>,
+        highlights: Option<Arc<HighlightedDocument>>,
+    },
+    Html(Arc<str>),
+    Image(Arc<Image>),
+    Pdf,
+    Table(Arc<[Vec<SharedString>]>),
     Unsupported,
 }
 
@@ -25,6 +35,43 @@ pub enum PreviewLoadError {
     TooLarge,
     InvalidUtf8,
     Io(String),
+}
+
+pub fn isolated_html_document(source: &str) -> String {
+    let constrained = format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; connect-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline'; font-src data:; object-src 'none'; base-uri 'none'; form-action 'none'\">{source}"
+    );
+    let escaped = constrained
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\0', "\u{fffd}");
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><style>html,body,iframe{{width:100%;height:100%;margin:0;border:0}}iframe{{display:block}}</style></head><body><iframe sandbox referrerpolicy=\"no-referrer\" srcdoc=\"{escaped}\"></iframe></body></html>"
+    )
+}
+
+fn image_format(path: &Path) -> Option<ImageFormat> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some(ImageFormat::Png),
+        Some("jpg" | "jpeg") => Some(ImageFormat::Jpeg),
+        Some("gif") => Some(ImageFormat::Gif),
+        Some("webp") => Some(ImageFormat::Webp),
+        Some("svg") => Some(ImageFormat::Svg),
+        Some("bmp") => Some(ImageFormat::Bmp),
+        _ => None,
+    }
+}
+
+fn shared_rows(rows: Vec<Vec<String>>) -> Arc<[Vec<SharedString>]> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(SharedString::from).collect())
+        .collect::<Vec<_>>()
+        .into()
 }
 
 pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, PreviewLoadError> {
@@ -74,15 +121,62 @@ pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, 
         let range = workbook
             .worksheet_range(&sheet)
             .map_err(|error| PreviewLoadError::Io(error.to_string()))?;
-        return Ok(LoadedPreview::Table(workbook_rows(&range, 2_000, 100)));
+        return Ok(LoadedPreview::Table(shared_rows(workbook_rows(
+            &range, 2_000, 100,
+        ))));
     }
-    let bytes = fs::read(path).map_err(|error| PreviewLoadError::Io(error.to_string()))?;
-    if binary {
-        Ok(LoadedPreview::Binary(bytes))
-    } else {
-        String::from_utf8(bytes)
-            .map(LoadedPreview::Text)
-            .map_err(|_| PreviewLoadError::InvalidUtf8)
+    if kind == PreviewKind::Pdf {
+        return Ok(LoadedPreview::Pdf);
+    }
+    let bytes = fs::read(&path).map_err(|error| PreviewLoadError::Io(error.to_string()))?;
+    if kind == PreviewKind::Image {
+        let format = image_format(&path).ok_or_else(|| {
+            PreviewLoadError::Io("the image format is not supported".to_owned())
+        })?;
+        return Ok(LoadedPreview::Image(Arc::new(Image::from_bytes(
+            format, bytes,
+        ))));
+    }
+    let source = String::from_utf8(bytes).map_err(|_| PreviewLoadError::InvalidUtf8)?;
+    let path = path.to_string_lossy();
+    match kind {
+        PreviewKind::Markdown => Ok(LoadedPreview::Markdown(Arc::new(
+            crate::markdown::parse_full(&source),
+        ))),
+        PreviewKind::Code => Ok(LoadedPreview::Code {
+            lines: source
+                .split('\n')
+                .map(SharedString::from)
+                .collect::<Vec<_>>()
+                .into(),
+            highlights: zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                source: &source,
+                path: Some(path.as_ref()),
+                fence_tag: None,
+            })
+            .ok()
+            .map(Arc::new),
+        }),
+        PreviewKind::Html => Ok(LoadedPreview::Html(
+            isolated_html_document(&source).into(),
+        )),
+        PreviewKind::Data => {
+            let separator = if path.to_ascii_lowercase().ends_with(".tsv") {
+                '\t'
+            } else {
+                ','
+            };
+            Ok(LoadedPreview::Table(
+                source
+                    .lines()
+                    .map(|line| line.split(separator).map(SharedString::from).collect())
+                    .collect::<Vec<_>>()
+                    .into(),
+            ))
+        }
+        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Unsupported => {
+            Ok(LoadedPreview::Unsupported)
+        }
     }
 }
 
@@ -103,17 +197,17 @@ pub fn workbook_rows(range: &Range<Data>, max_rows: usize, max_columns: usize) -
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{LoadedPreview, PreviewLoadError, load_preview};
+    use super::{LoadedPreview, PreviewLoadError, isolated_html_document, load_preview};
     use calamine::{Data, Range};
 
     #[test]
-    fn reads_utf8_inside_checkout() {
+    fn prepares_markdown_inside_checkout() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("README.md"), "# Hello").unwrap();
-        assert_eq!(
+        assert!(matches!(
             load_preview(temp.path(), Path::new("README.md")).unwrap(),
-            LoadedPreview::Text("# Hello".into())
-        );
+            LoadedPreview::Markdown(_)
+        ));
     }
 
     #[test]
@@ -161,5 +255,29 @@ mod tests {
                 vec!["Total".to_string(), "42.5".to_string()],
             ]
         );
+    }
+
+    #[test]
+    fn prepares_code_lines_and_highlights_before_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let LoadedPreview::Code { lines, highlights } =
+            load_preview(temp.path(), Path::new("main.rs")).unwrap()
+        else {
+            panic!("expected prepared code preview");
+        };
+        assert_eq!(lines.as_ref(), ["fn main() {}", ""]);
+        assert!(highlights.is_some());
+    }
+
+    #[test]
+    fn isolated_html_is_serialized_into_a_sandboxed_document() {
+        let document = isolated_html_document(
+            "<script>window.top.location='https://example.com'</script><h1>Preview</h1>",
+        );
+        assert!(document.contains("<iframe sandbox referrerpolicy=\"no-referrer\""));
+        assert!(document.contains("default-src 'none'"));
+        assert!(document.contains("&quot;https://example.com&quot;"));
+        assert!(!document.contains("<script>window.top"));
     }
 }

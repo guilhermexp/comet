@@ -3037,9 +3037,7 @@ impl WorkersContent {
 
     fn render_session(&self, session: WorkersSession, theme: &Theme) -> AnyElement {
         let live = session.is_live();
-        div()
-            .size_full()
-            .bg(crate::terminal::view::terminal_panel_bg(theme))
+        workers_session_surface(theme)
             .when(live, |el| el.child(self.terminal.clone()))
             .when(!live, |el| {
                 el.flex()
@@ -3504,6 +3502,12 @@ fn workers_content_outlet() -> gpui::Div {
     div().flex_1().min_w_0().min_h_0().overflow_hidden()
 }
 
+fn workers_session_surface(theme: &Theme) -> gpui::Div {
+    div()
+        .size_full()
+        .bg(crate::terminal::view::terminal_panel_bg(theme))
+}
+
 fn workers_viewport_layer() -> gpui::Div {
     div()
         .absolute()
@@ -3764,7 +3768,7 @@ mod layout_tests {
 
     use super::{
         gallery_artifact_key, gallery_session_matches, project_folder_tint, workers_content_outlet,
-        workers_viewport_layer, worktree_branch_slug,
+        workers_session_surface, workers_viewport_layer, worktree_branch_slug,
     };
     use std::path::PathBuf;
     use zeron_workers_unpeel::WorkersArtifact;
@@ -3807,6 +3811,17 @@ mod layout_tests {
         assert_eq!(style.flex_grow, Some(1.0));
         assert_eq!(style.flex_shrink, Some(1.0));
         assert!(style.min_size.height.is_some());
+    }
+
+    #[test]
+    fn worker_terminal_surface_adds_no_second_header_or_top_inset() {
+        let mut surface = workers_session_surface(&crate::theme::Theme::dark());
+        let style = surface.style();
+
+        assert!(style.size.width.is_some());
+        assert!(style.size.height.is_some());
+        assert!(style.padding.top.is_none());
+        assert!(style.inset.top.is_none());
     }
 
     #[test]

@@ -28,6 +28,23 @@ pub struct DetailsContext {
     pub mode: DetailsMode,
 }
 
+fn rooted_context_key(kind: &str, id: &str, device_id: Option<&str>, root: &str) -> String {
+    format!(
+        "{kind}:{id}:device:{}:root:{root}",
+        device_id.unwrap_or("local")
+    )
+}
+
+pub fn worker_context_key(
+    project: &WorkersProject,
+    session: Option<&WorkersSession>,
+) -> String {
+    let (kind, id) = session
+        .map(|session| ("workers-session", session.id.as_str()))
+        .unwrap_or(("workers-project", project.id.as_str()));
+    rooted_context_key(kind, id, None, &project.path)
+}
+
 pub fn context_for_orchestrator(
     chat: Option<&Chat>,
     space: Option<&Space>,
@@ -38,7 +55,12 @@ pub fn context_for_orchestrator(
             .as_deref()
             .or_else(|| space.map(|space| space.path.as_str()))?;
         return Some(DetailsContext {
-            key: format!("orchestrator-chat:{}", chat.id),
+            key: rooted_context_key(
+                "orchestrator-chat",
+                &chat.id,
+                Some(&chat.device_id),
+                cwd,
+            ),
             cwd: PathBuf::from(cwd),
             branch: chat.branch.clone(),
             chat_id: Some(chat.id.clone()),
@@ -48,7 +70,12 @@ pub fn context_for_orchestrator(
     }
 
     space.map(|space| DetailsContext {
-        key: format!("orchestrator-space:{}", space.id),
+        key: rooted_context_key(
+            "orchestrator-space",
+            &space.id,
+            Some(&space.device_id),
+            &space.path,
+        ),
         cwd: PathBuf::from(&space.path),
         branch: None,
         chat_id: None,
@@ -62,27 +89,21 @@ pub fn context_for_worker(
     session: Option<&WorkersSession>,
 ) -> Option<DetailsContext> {
     let project = project?;
-    let (key, branch) = if let Some(session) = session {
-        (
-            format!("workers-session:{}", session.id),
-            session
-                .worktree_branch
-                .clone()
-                .or_else(|| project.worktree_branch.clone())
-                .or_else(|| project.git_branch.clone()),
-        )
+    let branch = if let Some(session) = session {
+        session
+            .worktree_branch
+            .clone()
+            .or_else(|| project.worktree_branch.clone())
+            .or_else(|| project.git_branch.clone())
     } else {
-        (
-            format!("workers-project:{}", project.id),
-            project
-                .worktree_branch
-                .clone()
-                .or_else(|| project.git_branch.clone()),
-        )
+        project
+            .worktree_branch
+            .clone()
+            .or_else(|| project.git_branch.clone())
     };
 
     Some(DetailsContext {
-        key,
+        key: worker_context_key(project, session),
         cwd: PathBuf::from(&project.path),
         branch,
         chat_id: None,
@@ -200,7 +221,10 @@ mod tests {
     #[test]
     fn selected_chat_is_the_orchestrator_context() {
         let context = context_for_orchestrator(Some(&chat()), Some(&space())).unwrap();
-        assert_eq!(context.key, "orchestrator-chat:chat-1");
+        assert_eq!(
+            context.key,
+            "orchestrator-chat:chat-1:device:device-1:root:/tmp/project/worktree"
+        );
         assert_eq!(context.cwd.to_string_lossy(), "/tmp/project/worktree");
         assert_eq!(context.branch.as_deref(), Some("feature/details"));
         assert_eq!(context.chat_id.as_deref(), Some("chat-1"));
@@ -210,7 +234,10 @@ mod tests {
     #[test]
     fn new_chat_uses_the_selected_project() {
         let context = context_for_orchestrator(None, Some(&space())).unwrap();
-        assert_eq!(context.key, "orchestrator-space:space-1");
+        assert_eq!(
+            context.key,
+            "orchestrator-space:space-1:device:device-1:root:/tmp/project"
+        );
         assert_eq!(context.cwd.to_string_lossy(), "/tmp/project");
         assert_eq!(context.chat_id, None);
     }
@@ -218,7 +245,10 @@ mod tests {
     #[test]
     fn worker_session_scopes_state_without_changing_the_project_root() {
         let context = context_for_worker(Some(&project()), Some(&session())).unwrap();
-        assert_eq!(context.key, "workers-session:session-1");
+        assert_eq!(
+            context.key,
+            "workers-session:session-1:device:local:root:/tmp/workers-project"
+        );
         assert_eq!(context.cwd.to_string_lossy(), "/tmp/workers-project");
         assert_eq!(context.branch.as_deref(), Some("worker/fix"));
         assert_eq!(context.mode, DetailsMode::Workers);
@@ -227,8 +257,22 @@ mod tests {
     #[test]
     fn worker_project_without_session_still_has_details() {
         let context = context_for_worker(Some(&project()), None).unwrap();
-        assert_eq!(context.key, "workers-project:project-1");
+        assert_eq!(
+            context.key,
+            "workers-project:project-1:device:local:root:/tmp/workers-project"
+        );
         assert_eq!(context.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn moving_a_worker_session_to_another_root_changes_its_context_identity() {
+        let first = context_for_worker(Some(&project()), Some(&session())).unwrap();
+        let mut moved = project();
+        moved.path = "/tmp/another-checkout".into();
+        let second = context_for_worker(Some(&moved), Some(&session())).unwrap();
+
+        assert_ne!(first.key, second.key);
+        assert_ne!(first.cwd, second.cwd);
     }
 
     #[test]

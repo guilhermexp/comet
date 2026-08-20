@@ -43,8 +43,7 @@ impl DetailsSidebarState {
     }
 
     pub fn set_context(&mut self, context: Option<DetailsContext>) -> u64 {
-        if self.context.as_ref().map(|value| &value.key) != context.as_ref().map(|value| &value.key)
-        {
+        if self.context.as_ref() != context.as_ref() {
             self.load_generation = self.load_generation.wrapping_add(1);
             self.context = context;
         }
@@ -151,6 +150,22 @@ use crate::{
 const FILE_SCAN_LIMIT: usize = 5_000;
 const RENDERED_FILE_ROW_LIMIT: usize = 800;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextFileAccess {
+    Local,
+    Remote,
+    WaitingForDevice,
+}
+
+fn context_file_access(context: &DetailsContext, local_device_id: Option<&str>) -> ContextFileAccess {
+    match (context.target_device_id.as_deref(), local_device_id) {
+        (None, _) => ContextFileAccess::Local,
+        (Some(target), Some(local)) if target == local => ContextFileAccess::Local,
+        (Some(_), Some(_)) => ContextFileAccess::Remote,
+        (Some(_), None) => ContextFileAccess::WaitingForDevice,
+    }
+}
+
 fn details_sidebar_background(_theme: &Theme) -> Option<gpui::Hsla> {
     None
 }
@@ -205,10 +220,20 @@ impl DetailsSidebar {
             }
         });
         let state_observe = cx.observe(&app_state, |this, state, cx| {
-            if state.read(cx).engine().is_some()
-                && matches!(this.usage, LoadState::Idle | LoadState::Error(_))
-            {
+            let (engine_connected, local_device_id) = {
+                let state = state.read(cx);
+                (state.engine().is_some(), state.local_device_id.clone())
+            };
+            if engine_connected && matches!(this.usage, LoadState::Idle | LoadState::Error(_)) {
                 this.load_usage(cx);
+            }
+            let local_files_became_available = matches!(this.files, LoadState::Error(_))
+                && this.sidebar.context().is_some_and(|context| {
+                    context_file_access(context, local_device_id.as_deref())
+                        == ContextFileAccess::Local
+                });
+            if local_files_became_available {
+                this.reload_files(cx);
             }
             cx.notify();
         });
@@ -284,6 +309,24 @@ impl DetailsSidebar {
         };
         let generation = self.sidebar.load_generation();
         let context_key = context.key.clone();
+        let local_device_id = self.app_state.read(cx).local_device_id.clone();
+        match context_file_access(&context, local_device_id.as_deref()) {
+            ContextFileAccess::Local => {}
+            ContextFileAccess::Remote => {
+                self.files = LoadState::Error(
+                    "Files are unavailable for projects hosted on another device.".into(),
+                );
+                self.file_task = None;
+                cx.notify();
+                return;
+            }
+            ContextFileAccess::WaitingForDevice => {
+                self.files = LoadState::Error("Waiting for the project device connection…".into());
+                self.file_task = None;
+                cx.notify();
+                return;
+            }
+        }
         let show_hidden = self.sidebar.show_hidden();
         let query = self.search.read(cx).text().to_string();
         self.files = LoadState::Loading;
@@ -342,6 +385,10 @@ impl DetailsSidebar {
         let Some(context) = self.sidebar.context().cloned() else {
             return;
         };
+        let local_device_id = self.app_state.read(cx).local_device_id.clone();
+        if context_file_access(&context, local_device_id.as_deref()) != ContextFileAccess::Local {
+            return;
+        }
         if context.branch.is_some() {
             return;
         }
@@ -1034,8 +1081,8 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use super::{
-        DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
-        details_sidebar_background,
+        ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
+        context_file_access, details_sidebar_background,
     };
     use crate::details_sidebar::context::{DetailsContext, DetailsMode, DetailsTab};
     use crate::theme::Theme;
@@ -1104,5 +1151,24 @@ mod tests {
         assert!(first < second);
         assert!(!state.accept_file_load(first, "one"));
         assert!(state.accept_file_load(second, "two"));
+    }
+
+    #[test]
+    fn remote_contexts_never_fall_back_to_the_local_filesystem() {
+        let mut remote = context("remote");
+        remote.target_device_id = Some("device-b".into());
+
+        assert_eq!(
+            context_file_access(&remote, Some("device-a")),
+            ContextFileAccess::Remote
+        );
+        assert_eq!(
+            context_file_access(&remote, None),
+            ContextFileAccess::WaitingForDevice
+        );
+        assert_eq!(
+            context_file_access(&remote, Some("device-b")),
+            ContextFileAccess::Local
+        );
     }
 }
