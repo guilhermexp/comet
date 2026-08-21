@@ -40,6 +40,7 @@ pub mod state;
 pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
+pub mod tool_icons;
 pub mod transcript;
 pub mod workers;
 
