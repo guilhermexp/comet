@@ -112,6 +112,7 @@ impl WorkersBridge {
             })?;
         let definition = json!({
             "name": name,
+            "loadMode": "essential",
             "description": tool
                 .get("description")
                 .and_then(Value::as_str)

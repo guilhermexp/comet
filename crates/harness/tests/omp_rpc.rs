@@ -303,6 +303,7 @@ async fn workers_host_tool_is_registered_only_when_enabled() {
     .unwrap()
     .unwrap();
     assert_eq!(enabled.definition()["name"], "workers");
+    assert_eq!(enabled.definition()["loadMode"], "essential");
     let result = enabled
         .handle_call("omp-call-1", "workers", json!({ "action": "help" }))
         .await;

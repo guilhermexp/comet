@@ -4084,6 +4084,30 @@ mod tests {
     }
 
     #[test]
+    fn offered_catalog_keeps_pi_and_omp_as_separate_rails() {
+        let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
+            id,
+            name: name.into(),
+            supports_steering: true,
+            steering_mode: zeron_proto::SteeringMode::StepBoundary,
+            reasoning_levels: vec![],
+            installed: true,
+            enabled: Some(true),
+        };
+        let offered = offered_harnesses_impl(
+            &[
+                descriptor(HarnessId::Pi, "Pi"),
+                descriptor(HarnessId::Omp, "OMP"),
+            ],
+            false,
+        );
+        assert_eq!(
+            offered.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![HarnessId::Pi, HarnessId::Omp]
+        );
+    }
+
+    #[test]
     fn picker_controls_move_to_footer() {
         assert_eq!(
             composer_footer_right_order(),
