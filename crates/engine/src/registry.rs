@@ -496,6 +496,29 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
+    // Oh My Pi is a separate native runtime from Pi/`pi-acp`. It speaks the
+    // installed `omp` CLI's rpc-ui wire directly and therefore supports
+    // step-boundary steering plus its live provider/model catalog.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Omp,
+            name: "OMP".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::OmpHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::OmpHarness::new()) as Arc<dyn Harness>)),
+    );
     // opencode over ACP (`opencode acp`), same lazy pattern: the static
     // descriptor mirrors AcpHarness::opencode() exactly. No steering
     // extension (turn boundaries) and no effort ladder — opencode exposes no
@@ -577,6 +600,7 @@ mod tests {
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
+                HarnessId::Omp,
                 HarnessId::Opencode
             ]
         );
@@ -631,6 +655,21 @@ mod tests {
         assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
         assert_eq!(
             pi.reasoning_levels(),
+            &[
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+        let omp = registry.resolve(HarnessId::Omp).unwrap();
+        assert_eq!(omp.id(), HarnessId::Omp);
+        assert_eq!(omp.display_name(), "OMP");
+        assert_eq!(omp.steering_mode(), SteeringMode::StepBoundary);
+        assert_eq!(
+            omp.reasoning_levels(),
             &[
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
