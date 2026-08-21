@@ -105,6 +105,7 @@ pub mod comet_bin;
 pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
+pub mod omp;
 pub mod shell_env;
 pub mod worker_tools;
 
