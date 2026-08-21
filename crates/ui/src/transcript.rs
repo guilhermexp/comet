@@ -40,7 +40,7 @@ use gpui::{
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
-use zeron_proto::ToolCall;
+use zeron_proto::{ToolCall, view::tool_presentation};
 
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
@@ -1142,6 +1142,40 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
     zeron_proto::view::tool_group_summary(&pairs)
+}
+
+fn tool_detail_default_open(
+    call: &ToolCall,
+    resolved: bool,
+    active_group: bool,
+    is_last: bool,
+) -> bool {
+    active_group
+        && matches!(
+            call,
+            ToolCall::Exec { .. } | ToolCall::WriteFile { .. } | ToolCall::EditFile { .. }
+        )
+        && (!resolved || is_last)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolHeaderState {
+    Pending,
+    Success,
+    Failed,
+    Quiet,
+}
+
+fn tool_header_state(resolved: bool, is_error: bool, show_outcome_label: bool) -> ToolHeaderState {
+    if !resolved {
+        ToolHeaderState::Pending
+    } else if is_error {
+        ToolHeaderState::Failed
+    } else if show_outcome_label {
+        ToolHeaderState::Success
+    } else {
+        ToolHeaderState::Quiet
+    }
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
@@ -3766,9 +3800,10 @@ impl Transcript {
         // the FINAL state; a mid-tween detail already counts as its target).
         let detail_folds: Vec<FoldState> = details
             .iter()
+            .zip(&invocations)
             .enumerate()
-            .map(|(ix, detail)| {
-                if detail.is_none() {
+            .map(|(ix, (detail, invocation))| {
+                if detail.is_none() && invocation.is_none() {
                     return FoldState::default();
                 }
                 self.tool_details
@@ -3777,10 +3812,26 @@ impl Transcript {
                     .unwrap_or_default()
             })
             .collect();
+        let detail_defaults: Vec<bool> = tools
+            .iter()
+            .enumerate()
+            .map(|(ix, tool)| {
+                tool_detail_default_open(
+                    &tool.call,
+                    tool.resolved,
+                    auto_open,
+                    ix + 1 == tools.len(),
+                )
+            })
+            .collect();
         let detail_opens: Vec<bool> = details
             .iter()
+            .zip(&invocations)
             .zip(&detail_folds)
-            .map(|(detail, fold)| detail.is_some() && fold.open.unwrap_or(false))
+            .zip(&detail_defaults)
+            .map(|(((detail, invocation), fold), default_open)| {
+                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(*default_open)
+            })
             .collect();
         let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
             .iter()
@@ -3795,11 +3846,13 @@ impl Transcript {
         let open_height = chips_height(tools.len())
             + details
                 .iter()
+                .zip(&invocations)
                 .zip(&affordances)
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
-                .map(|((detail, affordance), _)| {
-                    detail.as_deref().map_or(0.0, detail_height)
+                .map(|(((detail, invocation), affordance), _)| {
+                    invocation.as_deref().map_or(0.0, detail_height)
+                        + detail.as_deref().map_or(0.0, detail_height)
                         + if affordance.is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
@@ -3904,6 +3957,7 @@ impl Transcript {
                     0.0
                 };
                 let open = detail_opens[ix];
+                let default_open = detail_defaults[ix];
                 let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
                 // Expandable chip: ONE card whose header row is the chip and
@@ -3952,7 +4006,7 @@ impl Transcript {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let entry =
                                     this.tool_details.entry(toggle_key.clone()).or_default();
-                                let currently_open = entry.open.unwrap_or(false);
+                                let currently_open = entry.open.unwrap_or(default_open);
                                 entry.from = if currently_open { open_h } else { closed_h };
                                 entry.open = Some(!currently_open);
                                 entry.epoch += 1;
@@ -3988,7 +4042,14 @@ impl Transcript {
                                     .flex_none()
                                     .bg(crate::theme::hairline(0.06)),
                             )
-                            .child(detail_body(invocation, None, theme));
+                            .child(detail_body(
+                                invocation,
+                                None,
+                                DetailRole::Invocation {
+                                    command: matches!(tool.call, ToolCall::Exec { .. }),
+                                },
+                                theme,
+                            ));
                     }
                     if let Some(detail) = detail.as_deref() {
                         card = card
@@ -3998,7 +4059,14 @@ impl Transcript {
                                     .flex_none()
                                     .bg(crate::theme::hairline(0.06)),
                             )
-                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                            .child(detail_body(
+                                detail,
+                                detail_highlights[ix].clone(),
+                                DetailRole::Result {
+                                    failed: tool.is_error,
+                                },
+                                theme,
+                            ));
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
                         let loading = matches!(
@@ -4429,9 +4497,16 @@ fn tool_icon(call: &ToolCall, theme: &Theme) -> AnyElement {
 /// syntax runs — so an inline tool diff is indistinguishable from the
 /// checkout diff sidebar. Output renders as a code block: verbatim mono
 /// lines, indentation intact, counted-tail truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailRole {
+    Invocation { command: bool },
+    Result { failed: bool },
+}
+
 fn detail_body(
     detail: &ToolDetail,
     diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    role: DetailRole,
     theme: &Theme,
 ) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
@@ -4483,34 +4558,50 @@ fn detail_body(
         ToolDetail::Output {
             lines,
             truncated_by,
-        } => body
-            .py(px(6.0))
-            .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
-            .children(lines.iter().map(|line| {
-                div()
-                    .h(px(OUTPUT_LINE_HEIGHT))
-                    .w_full()
-                    .min_w_0()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text.opacity(0.85))
-                    .child(div().w_full().min_w_0().truncate().child(line.clone()))
-            }))
-            .when(*truncated_by > 0, |block| {
-                block.child(
+        } => {
+            let text_color = match role {
+                DetailRole::Invocation { .. } => theme.text.opacity(0.95),
+                DetailRole::Result { failed: true } => theme.danger_muted,
+                DetailRole::Result { failed: false } => theme.text_muted,
+            };
+            let command = matches!(role, DetailRole::Invocation { command: true });
+            body.py(px(6.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .children(lines.iter().enumerate().map(|(ix, line)| {
                     div()
                         .h(px(OUTPUT_LINE_HEIGHT))
+                        .w_full()
+                        .min_w_0()
                         .px(px(12.0))
                         .flex()
                         .items_center()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("… {truncated_by} more lines"))),
-                )
-            })
-            .into_any_element(),
+                        .gap(px(6.0))
+                        .text_color(text_color)
+                        .when(command && ix == 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(theme.syntax.number)
+                                    .child(SharedString::from("$")),
+                            )
+                        })
+                        .child(div().w_full().min_w_0().truncate().child(line.clone()))
+                }))
+                .when(*truncated_by > 0, |block| {
+                    block.child(
+                        div()
+                            .h(px(OUTPUT_LINE_HEIGHT))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!("… {truncated_by} more lines"))),
+                    )
+                })
+                .into_any_element()
+        }
     }
 }
 
@@ -4539,7 +4630,12 @@ fn chip_header_row(
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    let (label, detail) = tool_chip_content(&tool.call);
+    let presentation = tool_presentation(&tool.call, tool.resolved, tool.is_error);
+    let (label, detail) = if is_agent_tool(tool) {
+        tool_chip_content(&tool.call)
+    } else {
+        (presentation.label, presentation.detail)
+    };
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -4549,6 +4645,20 @@ fn chip_header_row(
         theme.danger
     } else {
         theme.text_muted
+    };
+    let header_state = if is_agent_tool(tool) {
+        ToolHeaderState::Quiet
+    } else {
+        tool_header_state(
+            tool.resolved,
+            tool.is_error,
+            presentation.show_outcome_label,
+        )
+    };
+    let trail = if header_state == ToolHeaderState::Pending {
+        None
+    } else {
+        trail
     };
     div()
         .h(px(CHIP_HEADER_HEIGHT))
@@ -4616,6 +4726,63 @@ fn chip_header_row(
                     )),
             )
         })
+        .when(
+            header_state == ToolHeaderState::Pending && !running,
+            |row| {
+                row.child(
+                    div()
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            "tool-pending",
+                            2.0,
+                            theme.text_muted,
+                            view,
+                            cx,
+                        )),
+                )
+            },
+        )
+        .when(
+            matches!(
+                header_state,
+                ToolHeaderState::Success | ToolHeaderState::Failed
+            ),
+            |row| {
+                let failed = header_state == ToolHeaderState::Failed;
+                let color = if failed {
+                    theme.danger
+                } else {
+                    theme.text_muted
+                };
+                row.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .text_size(px(12.0))
+                        .text_color(color)
+                        .child(
+                            crate::icons::icon(if failed {
+                                crate::icons::CLOSE
+                            } else {
+                                crate::icons::CHECK
+                            })
+                            .size(px(11.0))
+                            .text_color(color),
+                        )
+                        .child(SharedString::from(if failed {
+                            "Failed"
+                        } else {
+                            "Success"
+                        })),
+                )
+            },
+        )
         .when_some(trail, |row, trail| {
             // Trailing tile matching the group header's: a chevron for the
             // output/diff accordion, or the open-arrow for spawn chips.
@@ -5869,6 +6036,44 @@ mod tests {
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
+    }
+
+    #[test]
+    fn active_command_details_open_only_for_the_live_tail() {
+        let exec = ToolCall::Exec {
+            command: "cargo test".into(),
+        };
+        let edit = ToolCall::EditFile {
+            path: "src/lib.rs".into(),
+            old_string: None,
+            new_string: None,
+        };
+        let read = ToolCall::ReadFile {
+            path: "src/lib.rs".into(),
+        };
+
+        assert!(tool_detail_default_open(&exec, false, true, true));
+        assert!(tool_detail_default_open(&exec, true, true, true));
+        assert!(tool_detail_default_open(&edit, false, true, false));
+        assert!(!tool_detail_default_open(&exec, true, false, true));
+        assert!(!tool_detail_default_open(&read, false, true, true));
+    }
+
+    #[test]
+    fn command_header_state_uses_resolution_and_error_truth() {
+        assert_eq!(
+            tool_header_state(false, false, true),
+            ToolHeaderState::Pending
+        );
+        assert_eq!(
+            tool_header_state(true, false, true),
+            ToolHeaderState::Success
+        );
+        assert_eq!(tool_header_state(true, true, true), ToolHeaderState::Failed);
+        assert_eq!(
+            tool_header_state(true, false, false),
+            ToolHeaderState::Quiet
+        );
     }
 
     #[test]
