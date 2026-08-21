@@ -609,6 +609,11 @@ pub enum RowKind {
         tree: Arc<BlockTree>,
         block_ix: usize,
     },
+    Reasoning {
+        tree: Arc<BlockTree>,
+        active: bool,
+        duration_ms: Option<u64>,
+    },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
@@ -956,7 +961,33 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
-                    MessagePart::Reasoning { .. } => {}
+                    MessagePart::Reasoning {
+                        id: part_id,
+                        text,
+                        completed,
+                        duration_ms,
+                    } => {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        let key = format!("{}#{}", entry.id, part_id);
+                        let active = streaming && !*completed;
+                        let tree = parse(&key, text);
+                        let mut version = fnv1a(text.as_bytes()) << 1 | active as u64;
+                        version ^= duration_ms.unwrap_or_default().rotate_left(17);
+                        rows.push(Row {
+                            id: key.into(),
+                            version,
+                            turn_start: false,
+                            kind: RowKind::Reasoning {
+                                tree,
+                                active,
+                                duration_ms: *duration_ms,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
                 }
@@ -1193,6 +1224,34 @@ fn format_execution_duration(duration_ms: u64) -> String {
         let seconds = duration_ms / 1_000;
         format!("{}m {:02}s", seconds / 60, seconds % 60)
     }
+}
+
+fn format_reasoning_elapsed(duration_ms: u64) -> String {
+    format_execution_duration(duration_ms)
+}
+
+fn format_thought_duration(duration_ms: Option<u64>) -> Option<String> {
+    let duration_ms = duration_ms.filter(|duration| *duration >= 1_000)?;
+    let seconds = (duration_ms / 1_000).max(1);
+    let minutes = seconds / 60;
+    let remainder = seconds % 60;
+    if minutes == 0 {
+        return Some(format!(
+            "Thought for {seconds} {}",
+            if seconds == 1 { "second" } else { "seconds" }
+        ));
+    }
+    let mut label = format!(
+        "Thought for {minutes} {}",
+        if minutes == 1 { "minute" } else { "minutes" }
+    );
+    if remainder > 0 {
+        label.push_str(&format!(
+            " {remainder} {}",
+            if remainder == 1 { "second" } else { "seconds" }
+        ));
+    }
+    Some(label)
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
@@ -1570,6 +1629,9 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
+    /// Render-local clocks for live reasoning rows. The mounted spinner
+    /// already drives repaint ticks, so these only retain each row's epoch.
+    reasoning_started: HashMap<SharedString, Instant>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1777,6 +1839,7 @@ impl Transcript {
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
             tool_details: HashMap::new(),
+            reasoning_started: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -2563,6 +2626,7 @@ impl Transcript {
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.reasoning_started.clear();
             self.user_message_overflow.clear();
             self.user_message_preview = None;
             self.veils.clear();
@@ -3509,6 +3573,11 @@ impl Transcript {
                 }
                 el
             }
+            RowKind::Reasoning {
+                tree,
+                active,
+                duration_ms,
+            } => self.render_reasoning(&row.id, tree, *active, *duration_ms, window, &theme, cx),
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
             }
@@ -3707,6 +3776,126 @@ impl Transcript {
             None => None,
         };
         Some(Arc::new(crate::changes::DiffHighlights { old, new }))
+    }
+
+    fn render_reasoning(
+        &mut self,
+        row_id: &SharedString,
+        tree: &Arc<BlockTree>,
+        active: bool,
+        duration_ms: Option<u64>,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self
+            .folds
+            .get(row_id)
+            .and_then(|fold| fold.open)
+            .unwrap_or(active);
+        let label = if active {
+            let started = *self
+                .reasoning_started
+                .entry(row_id.clone())
+                .or_insert_with(Instant::now);
+            format!(
+                "Thinking · {}",
+                format_reasoning_elapsed(started.elapsed().as_millis() as u64)
+            )
+        } else {
+            self.reasoning_started.remove(row_id);
+            format_thought_duration(duration_ms).unwrap_or_else(|| "Thought".into())
+        };
+        let toggle_id = row_id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{row_id}-reasoning-header")))
+            .w_full()
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(4.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.035)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
+                cx.notify();
+            }))
+            .child(
+                crate::icons::icon(crate::icons::STAR_BOLD)
+                    .size(px(13.0))
+                    .text_color(if active {
+                        theme.text_muted
+                    } else {
+                        theme.text_faint
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(label)),
+            )
+            .when(active, |row| {
+                row.child(crate::loaders::mini_mono_spinner(
+                    format!("{row_id}-reasoning"),
+                    1.8,
+                    theme.text_muted,
+                    cx.entity_id(),
+                    cx,
+                ))
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .size(px(18.0))
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.05))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(if open {
+                            crate::icons::ALT_ARROW_DOWN
+                        } else {
+                            crate::icons::ALT_ARROW_RIGHT
+                        })
+                        .size(px(11.0))
+                        .text_color(theme.text_faint),
+                    ),
+            );
+
+        let mut column = div().w_full().flex().flex_col().child(header);
+        if open {
+            let opts = RenderOptions {
+                row_key: SharedString::from(format!("{row_id}-reasoning")),
+                veil: None,
+                cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                now: Instant::now(),
+                copy: None,
+            };
+            let highlights = self.code_highlight_for(row_id, tree, None, cx);
+            let mut trace_theme = theme.clone();
+            trace_theme.text = theme.text_muted;
+            trace_theme.text_muted = theme.text_faint;
+            let content = render::render_tree(tree, &opts, &trace_theme, window, &|ix| {
+                highlights.get(&ix).cloned().flatten()
+            });
+            column = column.child(
+                div()
+                    .ml(px(7.0))
+                    .mt(px(3.0))
+                    .pl(px(18.0))
+                    .py(px(4.0))
+                    .border_l_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    .text_size(px(12.5))
+                    .child(content),
+            );
+        }
+        column.into_any_element()
     }
 
     fn render_tool_group(
@@ -6119,6 +6308,84 @@ mod tests {
         assert_eq!(format_execution_duration(80), "0.1s");
         assert_eq!(format_execution_duration(4_868), "4.9s");
         assert_eq!(format_execution_duration(65_000), "1m 05s");
+    }
+
+    #[test]
+    fn reasoning_rows_keep_identity_across_live_to_settled_transition() {
+        let live = assistant(
+            "m-reasoning",
+            MessageStatus::Streaming,
+            vec![MessagePart::Reasoning {
+                id: "r0".into(),
+                text: "checking the result".into(),
+                completed: false,
+                duration_ms: None,
+            }],
+        );
+        let settled = assistant(
+            "m-reasoning",
+            MessageStatus::Complete,
+            vec![MessagePart::Reasoning {
+                id: "r0".into(),
+                text: "checking the result".into(),
+                completed: true,
+                duration_ms: Some(4_100),
+            }],
+        );
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let settled_rows = rows_for_entry(&settled, false, &mut parse);
+        assert_eq!(live_rows.len(), 1);
+        assert_eq!(settled_rows.len(), 1);
+        assert_eq!(live_rows[0].id, settled_rows[0].id);
+        assert_ne!(live_rows[0].version, settled_rows[0].version);
+        assert!(matches!(
+            &live_rows[0].kind,
+            RowKind::Reasoning { active: true, .. }
+        ));
+        assert!(matches!(
+            &settled_rows[0].kind,
+            RowKind::Reasoning {
+                active: false,
+                duration_ms: Some(4_100),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_reasoning_creates_no_transcript_row() {
+        let entry = assistant(
+            "m-empty-reasoning",
+            MessageStatus::Streaming,
+            vec![MessagePart::Reasoning {
+                id: "r0".into(),
+                text: String::new(),
+                completed: false,
+                duration_ms: None,
+            }],
+        );
+        assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn thought_duration_uses_honest_measured_seconds() {
+        assert_eq!(format_thought_duration(Some(900)), None);
+        assert_eq!(
+            format_thought_duration(Some(4_100)).as_deref(),
+            Some("Thought for 4 seconds")
+        );
+        assert_eq!(
+            format_thought_duration(Some(65_000)).as_deref(),
+            Some("Thought for 1 minute 5 seconds")
+        );
+        assert_eq!(format_thought_duration(None), None);
+    }
+
+    #[test]
+    fn live_reasoning_elapsed_uses_tenths_then_minutes() {
+        assert_eq!(format_reasoning_elapsed(0), "0.0s");
+        assert_eq!(format_reasoning_elapsed(4_100), "4.1s");
+        assert_eq!(format_reasoning_elapsed(65_000), "1m 05s");
     }
 
     #[test]
