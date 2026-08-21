@@ -77,6 +77,7 @@ fn mock_script() -> Vec<AgentEvent> {
             is_error: false,
             output: None,
             diff: None,
+            execution: None,
         },
         done(DoneStatus::Completed),
     ]
@@ -2088,6 +2089,7 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
             is_error: false,
             output: None,
             diff: None,
+            execution: None,
         },
         AgentEvent::TextDelta { text: "two".into() },
         done(DoneStatus::Completed),

@@ -280,6 +280,7 @@ impl Harness for MockHarness {
                     is_error: false,
                     output: None,
                     diff: None,
+                    execution: None,
                 };
                 let done = AgentEvent::Done {
                     status: DoneStatus::Completed,
@@ -445,6 +446,7 @@ impl Harness for MockHarness {
                         is_error: false,
                         output: None,
                         diff: None,
+                        execution: None,
                     },
                 ]
             })

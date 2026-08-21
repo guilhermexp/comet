@@ -272,6 +272,7 @@ fn tool_end(frame: &Value) -> Option<AgentEvent> {
         is_error: frame.get("isError").and_then(Value::as_bool) == Some(true),
         output: result.and_then(tool_output),
         diff: result.and_then(tool_diff),
+        execution: None,
     })
 }
 

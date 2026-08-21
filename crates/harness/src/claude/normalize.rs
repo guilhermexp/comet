@@ -438,6 +438,7 @@ impl Normalizer {
                                     is_error: b.is_error.unwrap_or(false),
                                     output: None,
                                     diff: None,
+                                    execution: None,
                                 },
                             )
                         })
@@ -466,6 +467,7 @@ impl Normalizer {
                         is_error: b.is_error.unwrap_or(false),
                         output: None,
                         diff: None,
+                        execution: None,
                     })
                     .collect()
             }
@@ -754,6 +756,7 @@ mod tests {
                     is_error: false,
                     output: None,
                     diff: None,
+                    execution: None,
                 }),
             }]
         );

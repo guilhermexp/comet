@@ -283,6 +283,7 @@ pub struct ToolItem {
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    pub execution: Option<zeron_proto::ToolExecutionMeta>,
     /// Expandable detail: a code-block of output lines, or a real diff
     /// section rendered by the changes pane's component (ACP harnesses).
     /// Precomputed here because rows are cached by fingerprint — diffing and
@@ -676,6 +677,10 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         acc.extend_from_slice(label.as_bytes());
         acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
+        if let Some(execution) = t.execution {
+            acc.extend_from_slice(&execution.exit_code.unwrap_or_default().to_le_bytes());
+            acc.extend_from_slice(&execution.duration_ms.unwrap_or_default().to_le_bytes());
+        }
         // Detail payload arriving (or growing) must re-splice the row even
         // when the resolved bit didn't change.
         match t.detail.as_deref() {
@@ -818,6 +823,7 @@ pub fn rows_for_entry(
                 call,
                 is_error,
                 resolved,
+                execution,
                 output,
                 diff,
                 output_ref,
@@ -833,6 +839,7 @@ pub fn rows_for_entry(
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
+                    execution: *execution,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
@@ -5407,6 +5414,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            execution: None,
             output: None,
             diff: None,
             output_ref: None,
@@ -5529,6 +5537,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            execution: None,
             output: None,
             diff: None,
             output_ref: None,
@@ -5952,6 +5961,7 @@ mod tests {
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
+            execution: None,
             detail: None,
             output_ref: None,
             output_bytes: None,
@@ -5968,6 +5978,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            execution: None,
             detail: None,
             output_ref: None,
             output_bytes: None,
@@ -6000,6 +6011,7 @@ mod tests {
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
+                execution: None,
                 detail: None,
                 output_ref: None,
                 output_bytes: None,
@@ -6014,6 +6026,7 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                execution: None,
                 detail: None,
                 output_ref: None,
                 output_bytes: None,
@@ -6026,6 +6039,7 @@ mod tests {
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
+                execution: None,
                 detail: None,
                 output_ref: None,
                 output_bytes: None,

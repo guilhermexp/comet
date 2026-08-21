@@ -104,6 +104,7 @@ fn tool_lifecycle(phase: Phase, id: String, call: ToolCall, is_error: bool) -> V
                 is_error,
                 output: None,
                 diff: None,
+                execution: None,
             },
         ],
     }
@@ -157,6 +158,7 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                     is_error: status == "failed" || exit_code != 0,
                     output: None,
                     diff: None,
+                    execution: None,
                 }]
             }
         },
@@ -201,6 +203,7 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 is_error: status == "failed",
                 output: None,
                 diff: None,
+                execution: None,
             }],
         },
         "webSearch" | "web_search" => tool_lifecycle(
@@ -418,6 +421,7 @@ mod tests {
                 is_error: true,
                 output: None,
                 diff: None,
+                execution: None,
             }]
         );
     }
@@ -459,6 +463,7 @@ mod tests {
                     is_error: true,
                     output: None,
                     diff: None,
+                    execution: None,
                 },
             ]
         );

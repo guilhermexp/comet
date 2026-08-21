@@ -822,6 +822,7 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                             is_error,
                             output: None,
                             diff: None,
+                            execution: None,
                         }),
                     ];
                     // A finished task IS the subagent finishing: the SDK has

@@ -71,6 +71,7 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                execution: None,
                 output: None,
                 diff: None,
                 output_ref: None,

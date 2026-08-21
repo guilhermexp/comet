@@ -150,6 +150,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: true,
         output: None,
         diff: None,
+        execution: None,
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -172,6 +173,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: false,
         output: None,
         diff: None,
+        execution: None,
     }));
 
     // mcpToolCall with failed status.
@@ -188,6 +190,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: true,
         output: None,
         diff: None,
+        execution: None,
     }));
 
     // webSearch lifecycle.
@@ -202,6 +205,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: false,
         output: None,
         diff: None,
+        execution: None,
     }));
 
     // Completion-only todoList still opens and closes the lifecycle.
@@ -225,6 +229,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: false,
         output: None,
         diff: None,
+        execution: None,
     }));
 
     // Streamed agentMessage must not re-emit its completed text…
@@ -668,6 +673,7 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
             is_error: false,
             output: None,
             diff: None,
+            execution: None,
         }),
     }));
     // The parent's steer (a userMessage item on the CHILD thread) arrives as

@@ -167,6 +167,7 @@ mod tests {
                     },
                     is_error: false,
                     resolved: true,
+                    execution: None,
                     output: Some(fat_output()), // ~4KB fat inline, incompressible
                     diff: Some(ToolDiff {
                         path: "/w/a.rs".into(),

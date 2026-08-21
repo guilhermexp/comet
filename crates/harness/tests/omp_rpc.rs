@@ -281,7 +281,8 @@ fn normalizer_maps_text_reasoning_and_tools() {
             id: "tool-1".into(),
             is_error: false,
             output: Some("ok".into()),
-            diff: None
+            diff: None,
+            execution: None,
         }]
     );
     assert_eq!(
@@ -305,6 +306,7 @@ fn normalizer_maps_text_reasoning_and_tools() {
                 old_text: Some("old".into()),
                 new_text: "new".into(),
             }),
+            execution: None,
         }]
     );
 }

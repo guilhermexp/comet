@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
+use zeron_proto::{AgentEvent, ToolCall, ToolDiff, ToolExecutionMeta, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -136,6 +136,8 @@ pub enum MessagePart {
         /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<ToolExecutionMeta>,
         /// One-line tool output summary ([`summarize_tool_output`]). Old
         /// entries (pre-strip) still carry up to 4KB here; old app versions
         /// render this field either way, so the strip is invisible to them.
@@ -205,12 +207,16 @@ impl MessagePart {
             MessagePart::Text { text, .. } => text.len(),
             MessagePart::Tool {
                 call,
+                execution,
                 output,
                 diff,
                 diff_stats,
                 ..
             } => {
                 serde_json::to_vec(call).map_or(0, |v| v.len())
+                    + execution
+                        .as_ref()
+                        .map_or(0, |m| serde_json::to_vec(m).map_or(0, |v| v.len()))
                     + output.as_ref().map_or(0, String::len)
                     + diff
                         .as_ref()
@@ -273,6 +279,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     call: call.clone(),
                     is_error: false,
                     resolved: false,
+                    execution: None,
                     output: None,
                     diff: None,
                     output_ref: None,
@@ -290,12 +297,14 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             is_error,
             output,
             diff,
+            execution,
         } => {
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id: pid,
                     is_error: e,
                     resolved,
+                    execution: execution_slot,
                     output: out_slot,
                     diff: diff_slot,
                     output_bytes,
@@ -306,6 +315,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
+                    *execution_slot = *execution;
                     // Keep only the bounded summary in the replicated doc so
                     // an expanded card explains what the tool returned. Full
                     // output remains journal-only while the R2 sidecar is
@@ -652,6 +662,7 @@ mod tests {
                 is_error: true,
                 output: None,
                 diff: None,
+                execution: None,
             },
         );
         match &parts[0] {
@@ -663,6 +674,41 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_result_preserves_optional_execution_metadata() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "exec".into(),
+                call: ToolCall::Exec {
+                    command: "cargo test".into(),
+                },
+            },
+        );
+        let metadata = zeron_proto::ToolExecutionMeta {
+            exit_code: Some(0),
+            duration_ms: Some(1_250),
+        };
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "exec".into(),
+                is_error: false,
+                output: Some("ok".into()),
+                diff: None,
+                execution: Some(metadata),
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                execution: Some(actual),
+                ..
+            } if *actual == metadata
+        ));
     }
 
     #[test]
@@ -688,6 +734,7 @@ mod tests {
                     r#"{"session_id":"worker-1","launched":true,"briefing_submitted":true}"#.into(),
                 ),
                 diff: None,
+                execution: None,
             },
         );
 
@@ -733,6 +780,7 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                execution: None,
                 output: None,
                 diff: None,
                 output_ref: None,
@@ -851,6 +899,7 @@ mod tests {
                     old_text: Some("a\n".into()),
                     new_text: "b\n".into(),
                 }),
+                execution: None,
             },
         );
         match &parts[0] {
@@ -908,6 +957,7 @@ mod tests {
                     old_text: None,
                     new_text: "x\n".into(),
                 }),
+                execution: None,
             },
         );
         apply_sidecar_refs("chat-9", &mut parts);
@@ -1008,6 +1058,7 @@ mod tests {
                 is_error: false,
                 output: Some("   \n".into()),
                 diff: None,
+                execution: None,
             }),
             None,
             "blank output uploads nothing"
@@ -1017,6 +1068,7 @@ mod tests {
             is_error: true,
             output: Some("full output".into()),
             diff: None,
+            execution: None,
         })
         .unwrap();
         assert_eq!(payload.part_id, "t");

@@ -1226,6 +1226,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 call,
                 is_error,
                 resolved,
+                execution,
                 output,
                 diff,
                 output_ref,
@@ -1240,6 +1241,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
+                execution: *execution,
                 // Output summaries, diff stats, and sidecar refs are
                 // deliberately kept: unlike raw tool inputs they are the
                 // transcript's record of what happened, and the strip already

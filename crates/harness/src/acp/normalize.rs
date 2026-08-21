@@ -423,6 +423,7 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                     is_error: false,
                     output: None,
                     diff: None,
+                    execution: None,
                 },
             ]
         }
@@ -472,6 +473,7 @@ fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
         is_error,
         output: tool_output(update),
         diff: tool_diff(update),
+        execution: None,
     })
 }
 
@@ -572,6 +574,7 @@ mod tests {
                     is_error: false,
                     output: Some("total 0".into()),
                     diff: None,
+                    execution: None,
                 },
             ]
         );
@@ -615,6 +618,7 @@ mod tests {
                     old_text: Some("fn old() {}".into()),
                     new_text: "fn new() {}".into(),
                 }),
+                execution: None,
             }
         );
     }
@@ -653,6 +657,7 @@ mod tests {
                 is_error: true,
                 output: None,
                 diff: None,
+                execution: None,
             }]
         );
     }

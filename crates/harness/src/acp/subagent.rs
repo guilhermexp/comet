@@ -445,6 +445,7 @@ fn entry_events(entry: &Value) -> Vec<AgentEvent> {
                     is_error: false,
                     output,
                     diff: None,
+                    execution: None,
                 });
             }
         }

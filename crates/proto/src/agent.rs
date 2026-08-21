@@ -283,6 +283,17 @@ pub struct ContextUsage {
     pub context_window: u64,
 }
 
+/// Optional execution facts reported by command-shaped tools. Absence means the
+/// runtime did not expose the field; consumers must never infer a zero value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -327,6 +338,8 @@ pub enum AgentEvent {
         /// Inline file diff for edit-shaped tools (ACP `Diff` content).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<ToolExecutionMeta>,
     },
     /// Turn usage plus an optional current-context snapshot. The event itself
     /// stays out of transcripts; the engine mirrors only `context_usage` onto
@@ -408,6 +421,36 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn tool_execution_metadata_is_additive_and_round_trips() {
+        let old: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "toolResult",
+            "id": "c1",
+            "isError": false,
+            "output": "ok"
+        }))
+        .unwrap();
+        let AgentEvent::ToolResult { execution, .. } = old else {
+            panic!("tool result")
+        };
+        assert_eq!(execution, None);
+
+        let event = AgentEvent::ToolResult {
+            id: "c1".into(),
+            is_error: false,
+            output: Some("ok".into()),
+            diff: None,
+            execution: Some(ToolExecutionMeta {
+                exit_code: Some(0),
+                duration_ms: Some(1_250),
+            }),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["execution"]["exitCode"], 0);
+        assert_eq!(value["execution"]["durationMs"], 1_250);
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
     }
 
     #[test]

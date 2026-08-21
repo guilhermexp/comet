@@ -751,6 +751,7 @@ fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent>
                     is_error: status == "error",
                     output,
                     diff: None,
+                    execution: None,
                 });
             }
             events

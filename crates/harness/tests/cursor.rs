@@ -108,6 +108,7 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
         is_error: false,
         output: None,
         diff: None,
+        execution: None,
     }));
 
     // The task spawn is a parent chip; its interior arrives tagged, never bare.

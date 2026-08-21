@@ -70,6 +70,8 @@ struct DocPartJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution: Option<zeron_proto::ToolExecutionMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
@@ -115,6 +117,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             call,
             is_error,
             resolved,
+            execution,
             output,
             diff,
             output_ref,
@@ -131,6 +134,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             // TS shape parity: `isError` is written only once the tool result arrived;
             // its presence IS the resolution marker.
             is_error: if *resolved { Some(*is_error) } else { None },
+            execution: *execution,
             output: output.clone(),
             diff: diff.as_ref().map(serde_json::to_value).transpose()?,
             output_ref: output_ref.clone(),
@@ -179,6 +183,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 call,
                 is_error: p.is_error.unwrap_or(false),
                 resolved: p.is_error.is_some(),
+                execution: p.execution,
                 output: p.output,
                 diff: p.diff.and_then(|d| serde_json::from_value(d).ok()),
                 output_ref: p.output_ref,
@@ -630,6 +635,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(resolved) = doc_part.resolved {
         map.insert("resolved", resolved)?;
     }
+    if let Some(execution) = &doc_part.execution {
+        map.insert(
+            "execution",
+            loro_value_from_json(&serde_json::to_value(execution)?),
+        )?;
+    }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
@@ -785,6 +796,10 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
                 .get("resolved")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true),
+            execution: obj
+                .get("execution")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
             output: obj
                 .get("output")
                 .and_then(|x| x.as_str())
@@ -1011,6 +1026,12 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(resolved) = doc_part.resolved {
         map.insert("resolved", resolved)?;
     }
+    if let Some(execution) = &doc_part.execution {
+        map.insert(
+            "execution",
+            loro_value_from_json(&serde_json::to_value(execution)?),
+        )?;
+    }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
@@ -1141,6 +1162,7 @@ mod tests {
             },
             is_error: false,
             resolved: false,
+            execution: None,
             output: None,
             diff: None,
             output_ref: None,
@@ -1279,6 +1301,7 @@ mod tests {
                 is_error: false,
                 output: None,
                 diff: None,
+                execution: None,
             },
         );
         writer.sync(&folded).unwrap();
@@ -1334,6 +1357,7 @@ mod tests {
                     old_text: Some("old\n".into()),
                     new_text: "new\n".into(),
                 }),
+                execution: None,
             },
         );
         crate::parts::apply_sidecar_refs("chat-2", &mut folded);
@@ -1383,6 +1407,7 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                execution: None,
                 output: Some("full inline output\nline 2".into()),
                 diff: Some(zeron_proto::ToolDiff {
                     path: "/w/a.rs".into(),
@@ -1411,6 +1436,51 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_execution_metadata_round_trips_additively() {
+        let doc = SessionDoc::init("chat-execution").unwrap();
+        let metadata = zeron_proto::ToolExecutionMeta {
+            exit_code: Some(0),
+            duration_ms: Some(1_250),
+        };
+        doc.push_message(&SessionMessageEntry {
+            id: "m-execution".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "exec".into(),
+                call: ToolCall::Exec {
+                    command: "cargo test".into(),
+                },
+                is_error: false,
+                resolved: true,
+                execution: Some(metadata),
+                output: Some("ok".into()),
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert!(matches!(
+            &entries[0].parts[0],
+            MessagePart::Tool {
+                execution: Some(actual),
+                ..
+            } if *actual == metadata
+        ));
     }
 
     #[test]
