@@ -31,6 +31,14 @@ pub(super) fn cycle_target(
     Some(order[next].clone())
 }
 
+pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
+    if expanded {
+        icons::COLLAPSE_ARROWS
+    } else {
+        icons::EXPAND_ARROWS
+    }
+}
+
 impl Shell {
     /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
     /// the order it is drawn. Selection is immediate (no MRU overlay held open
@@ -268,7 +276,7 @@ impl Shell {
                     })
                     .child(header_icon_button(
                         "expand-changes",
-                        icons::EXPAND_ARROWS,
+                        right_pane_expand_icon(self.right_pane_expanded),
                         takeover,
                         &theme,
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
