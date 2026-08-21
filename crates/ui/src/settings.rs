@@ -582,6 +582,8 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            ui_font_family: crate::typography::UiFontFamily::System,
+            ui_font_size: crate::typography::UiFontSize::default(),
             theme_selection: zeron_theme::ThemeSelection {
                 light: "catppuccin-latte".into(),
                 dark: "catppuccin-mocha".into(),
@@ -610,7 +612,7 @@ mod tests {
         store.revision += 1;
         let (stale, stale_revision) = store.snapshot();
 
-        store.current.ui_font_family = crate::typography::UiFontFamily::Inter;
+        store.current.ui_font_family = crate::typography::UiFontFamily::Installed("Inter".into());
         store.revision += 1;
         stale.save(dir.path()).unwrap();
         assert!(!store.mark_saved(stale_revision));
@@ -622,7 +624,7 @@ mod tests {
         assert_eq!(reloaded.sidebar_width, 300.0);
         assert_eq!(
             reloaded.ui_font_family,
-            crate::typography::UiFontFamily::Inter
+            crate::typography::UiFontFamily::Installed("Inter".into())
         );
     }
 
