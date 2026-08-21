@@ -8,6 +8,8 @@ use zeron_proto::{Model, ReasoningLevel, SlashCommand};
 use crate::HarnessError;
 
 #[doc(hidden)]
+pub mod normalize;
+#[doc(hidden)]
 pub mod process;
 #[doc(hidden)]
 pub mod protocol;

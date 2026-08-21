@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{MAX_INBOUND_BYTES, parse_frame, sanitize_diagnostic};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
-use zeron_proto::ReasoningLevel;
+use zeron_proto::{AgentEvent, DoneStatus, ReasoningLevel, ToolCall};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp-rpc.sh")
@@ -87,4 +88,113 @@ async fn commands_are_discovered_from_the_rpc_runtime() {
         .unwrap();
     assert_eq!(commands[0].name, "model");
     assert_eq!(commands[0].input_hint.as_deref(), Some("provider/model"));
+}
+
+#[test]
+fn normalizer_maps_text_reasoning_and_tools() {
+    let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+    assert_eq!(
+        normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "text_delta", "delta": "hello" }
+        })),
+        vec![AgentEvent::TextDelta {
+            text: "hello".into()
+        }]
+    );
+    assert_eq!(
+        normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "thinking_delta", "delta": "checking" }
+        })),
+        vec![AgentEvent::ReasoningDelta {
+            text: "checking".into()
+        }]
+    );
+    assert_eq!(
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "tool-1",
+            "toolName": "bash",
+            "args": { "command": "cargo test" }
+        })),
+        vec![AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: ToolCall::Exec {
+                command: "cargo test".into()
+            }
+        }]
+    );
+    assert_eq!(
+        normalizer.push(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "tool-1",
+            "toolName": "bash",
+            "result": { "content": [{ "type": "text", "text": "ok" }] },
+            "isError": false
+        })),
+        vec![AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            is_error: false,
+            output: Some("ok".into()),
+            diff: None
+        }]
+    );
+}
+
+#[test]
+fn normalizer_attributes_subagent_lifecycle() {
+    let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+    let started = normalizer.push(json!({
+        "type": "subagent_lifecycle",
+        "payload": {
+            "id": "child-1",
+            "parentToolCallId": "task-1",
+            "status": "running",
+            "agent": "explore",
+            "sessionFile": "/tmp/child.jsonl"
+        }
+    }));
+    assert!(matches!(
+        started.as_slice(),
+        [AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "task-1"
+                && matches!(event.as_ref(), AgentEvent::SessionStarted { session_id, .. } if session_id == "/tmp/child.jsonl")
+    ));
+    assert_eq!(normalizer.active_subagents(), 1);
+
+    let finished = normalizer.push(json!({
+        "type": "subagent_lifecycle",
+        "payload": {
+            "id": "child-1",
+            "parentToolCallId": "task-1",
+            "status": "completed"
+        }
+    }));
+    assert!(matches!(
+        finished.as_slice(),
+        [AgentEvent::Subagent { event, .. }]
+            if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+    ));
+    assert_eq!(normalizer.active_subagents(), 0);
+}
+
+#[test]
+fn normalizer_classifies_only_terminal_agent_ends() {
+    let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+    assert_eq!(
+        normalizer.classify_agent_end(&json!({ "type": "agent_end", "isTerminal": false })),
+        AgentEndDisposition::Continue
+    );
+    assert_eq!(
+        normalizer.classify_agent_end(&json!({
+            "type": "agent_end",
+            "messages": [{ "role": "assistant", "stopReason": "error", "errorMessage": "provider failed" }]
+        })),
+        AgentEndDisposition::Error("provider failed".into())
+    );
+    assert_eq!(
+        normalizer.classify_agent_end(&json!({ "type": "agent_end", "messages": [] })),
+        AgentEndDisposition::Complete
+    );
 }
