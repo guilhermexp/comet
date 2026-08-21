@@ -14,6 +14,8 @@ pub enum HarnessId {
     Hermes,
     /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
     Pi,
+    /// Oh My Pi, driven through the installed `omp` CLI's native RPC mode.
+    Omp,
     /// SST's opencode agent, driven over ACP (`opencode acp`).
     Opencode,
     /// Test harness; never shown in production pickers.
@@ -473,6 +475,11 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
+        );
+        assert_eq!(serde_json::to_string(&HarnessId::Omp).unwrap(), "\"omp\"");
+        assert_eq!(
+            serde_json::from_str::<HarnessId>("\"omp\"").unwrap(),
+            HarnessId::Omp
         );
     }
 }

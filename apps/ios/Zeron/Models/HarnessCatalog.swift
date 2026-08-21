@@ -37,6 +37,7 @@ enum HarnessCatalog {
         "grok": "Grok",
         "hermes": "Hermes",
         "pi": "Pi",
+        "omp": "OMP",
         "cursor": "Cursor",
         "mock": "Mock",
     ]

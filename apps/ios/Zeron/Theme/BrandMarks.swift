@@ -6,8 +6,8 @@
 
 import SwiftUI
 
-enum BrandMark {
-    case claude, openai, cursor, grok, hermes, pi
+enum BrandMark: Equatable {
+    case claude, openai, cursor, grok, hermes, pi, omp
 
     var viewBox: CGSize {
         switch self {
@@ -17,6 +17,7 @@ enum BrandMark {
         case .grok: return CGSize(width: 16, height: 16)
         case .hermes: return CGSize(width: 24, height: 24)
         case .pi: return CGSize(width: 800, height: 800)
+        case .omp: return CGSize(width: 24, height: 24)
         }
     }
 
@@ -43,6 +44,8 @@ enum BrandMark {
             return HermesMarkData.pathData
         case .pi:
             return "M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65ZM517.36 400H634.72V634.72H517.36Z"
+        case .omp:
+            return "M2 4h20l-1.5 4H18v9h2.5v3H13v-3h2V8H9v9h2v3H3.5v-3H6V8H3.5L2 4Z"
         }
     }
 
@@ -53,6 +56,7 @@ enum BrandMark {
         case "grok": return .grok
         case "hermes": return .hermes
         case "pi": return .pi
+        case "omp": return .omp
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }
     }

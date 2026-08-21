@@ -3757,6 +3757,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
+        HarnessId::Omp => (crate::icons::WORKER_OMP, None),
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
     }
@@ -4074,6 +4075,13 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omp_uses_its_own_existing_worker_mark() {
+        let (path, tint) = harness_brand_icon(HarnessId::Omp);
+        assert_eq!(path, crate::icons::WORKER_OMP);
+        assert_eq!(tint, None);
+    }
 
     #[test]
     fn picker_controls_move_to_footer() {
