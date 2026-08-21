@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{cell::RefCell, collections::HashMap, path::Path, sync::Arc};
 
 use gpui::SharedString;
 use serde_json::Value;
@@ -12,12 +12,26 @@ pub(crate) enum ToolIconDescriptor {
     Solar(&'static str),
 }
 
+thread_local! {
+    static MATERIAL_IMAGES: RefCell<HashMap<SharedString, Arc<gpui::Image>>> =
+        RefCell::new(HashMap::new());
+}
+
 impl ToolIconDescriptor {
-    pub(crate) fn material_image(&self) -> Option<std::sync::Arc<gpui::Image>> {
-        match self {
-            Self::Material(path) => crate::icons::material_file_icon_image(path.as_ref()),
-            Self::Solar(_) => None,
-        }
+    pub(crate) fn material_image(&self) -> Option<Arc<gpui::Image>> {
+        let Self::Material(path) = self else {
+            return None;
+        };
+        Some(MATERIAL_IMAGES.with(|images| {
+            images
+                .borrow_mut()
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    crate::icons::material_file_icon_image(path.as_ref())
+                        .expect("resolved tool icon is embedded")
+                })
+                .clone()
+        }))
     }
 }
 
@@ -408,5 +422,15 @@ mod tests {
                 "missing embedded asset {path}",
             );
         }
+    }
+
+    #[test]
+    fn material_images_are_cached_per_thread() {
+        let descriptor = tool_icon_descriptor(&ToolCall::Exec {
+            command: "git status".into(),
+        });
+        let first = descriptor.material_image().expect("embedded Git icon");
+        let second = descriptor.material_image().expect("cached Git icon");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 }
