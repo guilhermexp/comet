@@ -47,7 +47,7 @@ For a fresh or resumed run, the harness:
 3. Resumes `RunRequest.resume` with `switch_session` when present.
 4. Registers the `workers` host tool only when `enable_workers_mcp` is true.
 5. Applies `set_model` and `set_thinking_level`.
-6. Reads `get_state`, emits `SessionStarted`, and sends `prompt` with inline images.
+6. Reads `get_state`, emits `SessionStarted`, preflights prompt plus inline images against the aggregate 2 MiB outbound frame limit, and sends `prompt`.
 7. Multiplexes OMP frames, Comet steering, interactive answers, cancellation, and child exit.
 
 Follow-ups routed to the live harness use OMP's `steer` command and emit `AgentEvent::Steered`. Configuration changes continue to restart the runtime through the engine's existing `RuntimeConfig` equality gate.
@@ -91,3 +91,15 @@ The ACP injection path is untouched.
 - A new OMP chat streams text, reasoning, tools, questions, Workers calls, and subagent activity through the existing Comet transcript.
 - Steering, interruption, persisted resume, configuration restart, and terminal completion behave deterministically.
 - No existing harness behavior or persisted Pi configuration changes.
+
+## Implementation verification — 2026-08-20
+
+Implemented on `feat/native-omp-rpc-runtime` as an additive native RPC harness. The existing Pi rail remains registered through `pi-acp`; no Pi, Claude, Codex, Cursor, Grok, Hermes, or OpenCode source file has a delivery diff.
+
+Validated locally with the installed `omp/17.4.0` runtime:
+
+- OMP RPC fixture suite: all 22 deterministic tests pass; the separate authenticated real-runtime smoke also passes a first turn and a persisted-session follow-up.
+- Protocol hardening covers bounded pre-newline reads, outbound attachment budget, response correlation, diagnostic redaction, missing session identity, abandoned subagents, interactive timeout/remote cancellation, Workers call cancellation/limits, and stream-consumer teardown.
+- `cargo check --workspace`, `cargo build -p zeron`, the 21-test proto suite, focused engine session/registry tests, the separate Pi-versus-OMP picker assertion, and the Workers controller MCP test pass.
+- The complete harness library suite remains at the known baseline: 81 pass and the pre-existing `shell_env::unix::tests::falls_back_when_interactive_attempt_hangs` fails at `shell_env.rs:330`.
+- A packaged macOS smoke showed separate enabled `Pi` and `OMP` settings rows with independent marks. No full Xcode installation exists on this machine (`xcode-select` points to CommandLineTools), so the iOS `xcodebuild` gate remains unavailable.

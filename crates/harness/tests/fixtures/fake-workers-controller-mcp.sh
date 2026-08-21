@@ -14,7 +14,15 @@ while IFS= read -r line; do
       emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"tools\":[{\"name\":\"workers\",\"description\":\"Coordinate test workers\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"action\"],\"properties\":{\"action\":{\"type\":\"string\"}}}}]}}"
       ;;
     *'"method":"tools/call"'*)
-      emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"worker help\"}],\"isError\":false}}"
+      case "$line" in
+        *'"action":"hang"'*) sleep 60 ;;
+        *'"action":"oversized"'*)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"' "$(rid "$line")"
+          dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\000' x
+          printf '"}],"isError":false}}\n'
+          ;;
+        *) emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"worker help\"}],\"isError\":false}}" ;;
+      esac
       ;;
   esac
 done

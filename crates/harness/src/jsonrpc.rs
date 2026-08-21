@@ -14,11 +14,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::HarnessError;
 
@@ -41,6 +43,17 @@ pub(crate) enum Incoming {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+
+struct PendingGuard {
+    pending: Pending,
+    id: i64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending lock").remove(&self.id);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct RpcClient {
@@ -80,14 +93,60 @@ impl RpcClient {
                 "{method}: app-server stdin closed"
             )));
         }
-        match rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
-            // Sender dropped: the reader hit EOF and failed all pending.
-            Err(_) => Err(HarnessError::Protocol(format!(
-                "{method}: app-server exited before responding"
-            ))),
+        resolve_request(method, rx).await
+    }
+
+    /// Send a request with host cancellation and a hard deadline. Cancellation
+    /// is forwarded using the MCP `notifications/cancelled` notification and
+    /// dropping the guard removes the local response waiter immediately.
+    pub async fn request_bounded(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: CancellationToken,
+        timeout: Duration,
+    ) -> Result<Value, HarnessError> {
+        let (id, rx, _guard) = self.start_request(method, params)?;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                self.notify(
+                    "notifications/cancelled",
+                    Some(json!({ "requestId": id, "reason": "host cancelled" })),
+                );
+                Err(HarnessError::Protocol(format!("{method}: request cancelled")))
+            }
+            _ = tokio::time::sleep(timeout) => {
+                self.notify(
+                    "notifications/cancelled",
+                    Some(json!({ "requestId": id, "reason": "host timeout" })),
+                );
+                Err(HarnessError::Protocol(format!("{method}: request timed out")))
+            }
+            result = resolve_request(method, rx) => result,
         }
+    }
+
+    fn start_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(i64, oneshot::Receiver<Result<Value, String>>, PendingGuard), HarnessError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().expect("pending lock").insert(id, tx);
+        let pending_guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
+        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        if self.writer.send(line.to_string()).is_err() {
+            self.pending.lock().expect("pending lock").remove(&id);
+            return Err(HarnessError::Protocol(format!(
+                "{method}: app-server stdin closed"
+            )));
+        }
+        Ok((id, rx, pending_guard))
     }
 
     /// Fire a notification (no id, no response).
@@ -113,6 +172,20 @@ impl RpcClient {
             "error": { "code": code, "message": message },
         });
         let _ = self.writer.send(line.to_string());
+    }
+}
+
+async fn resolve_request(
+    method: &str,
+    rx: oneshot::Receiver<Result<Value, String>>,
+) -> Result<Value, HarnessError> {
+    match rx.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
+        // Sender dropped: the reader hit EOF and failed all pending.
+        Err(_) => Err(HarnessError::Protocol(format!(
+            "{method}: app-server exited before responding"
+        ))),
     }
 }
 

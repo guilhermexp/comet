@@ -964,7 +964,7 @@ Start/register `WorkersBridge` only when enabled. Request `get_state`, require a
 
 - [ ] **Step 5: Implement prompt, images, and multiplexed control**
 
-Load PNG/JPEG/GIF/WebP attachments up to 25 MiB each and send:
+Load PNG/JPEG/GIF/WebP attachments only when the aggregate prompt frame fits the native 2 MiB outbound RPC limit. Preflight the exact UTF-8 JSON envelope plus base64 expansion before reading full image bytes, matching the implemented `Orchestrator.dev` OMP boundary, then send:
 
 ```rust
 json!({

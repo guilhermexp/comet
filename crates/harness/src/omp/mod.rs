@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures::{StreamExt as _, stream::BoxStream};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
@@ -17,6 +18,7 @@ use zeron_proto::{
 
 use self::normalize::{AgentEndDisposition, OmpNormalizer};
 use self::process::{OmpLaunch, OmpProcess};
+use self::protocol::MAX_OUTBOUND_BYTES;
 use self::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use crate::{Harness, HarnessError, RunControls, SteerMessage};
 
@@ -37,6 +39,24 @@ const OMP_REASONING_LEVELS: &[ReasoningLevel] = &[
     ReasoningLevel::XHigh,
     ReasoningLevel::Max,
 ];
+const MAX_PENDING_INTERACTIVE_REQUESTS: usize = 32;
+const MAX_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+type RequestInputFn = dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
+    + Send
+    + Sync;
+
+struct InteractiveResolution {
+    id: String,
+    response: Value,
+    cancel_host_input: bool,
+}
+
+#[derive(Clone, Copy)]
+enum InteractiveMethod {
+    Confirm,
+    Value,
+}
 
 pub struct OmpHarness {
     executable: Option<PathBuf>,
@@ -249,7 +269,9 @@ impl Harness for OmpHarness {
             .clone()
             .or_else(|| state_model(&state))
             .unwrap_or_default();
-        let session_id = state_session_id(&state).unwrap_or_default();
+        let session_id = state_session_id(&state).ok_or_else(|| {
+            HarnessError::Protocol("OMP state omitted its session identity".into())
+        })?;
         let tools = state
             .get("dumpTools")
             .and_then(Value::as_array)
@@ -261,7 +283,7 @@ impl Harness for OmpHarness {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let images = load_images(&request.attachments).await;
+        let images = load_images(&request.attachments, &request.prompt).await?;
         let mut prompt = json!({ "type": "prompt", "message": request.prompt });
         if !images.is_empty() {
             prompt["images"] = Value::Array(images);
@@ -397,7 +419,8 @@ fn map_models(state: &Value, response: &Value) -> Result<Vec<Model>, HarnessErro
     if let Some(current) = current
         && let Some(index) = models.iter().position(|model| model.id == current)
     {
-        models.rotate_left(index);
+        let current = models.remove(index);
+        models.insert(0, current);
     }
     Ok(models)
 }
@@ -506,11 +529,10 @@ async fn run_session(
         mut steering,
         interrupt,
     } = controls;
-    let request_input: Arc<
-        dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
-            + Send
-            + Sync,
-    > = request_input.into();
+    let request_input: Arc<RequestInputFn> = request_input.into();
+    let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
+    let mut pending_interactive: HashMap<String, tokio_util::sync::CancellationToken> =
+        HashMap::new();
     let mut normalizer = OmpNormalizer::new(cwd, model);
     let mut pending_agent_end: Option<Value> = None;
     let mut steering_open = true;
@@ -518,6 +540,13 @@ async fn run_session(
 
     while !finished {
         tokio::select! {
+            _ = event_tx.closed() => {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    process.request(json!({ "type": "abort" })),
+                ).await;
+                finished = true;
+            }
             _ = interrupt.cancelled() => {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(500),
@@ -530,6 +559,22 @@ async fn run_session(
                     session_id: Some(session_id.clone()),
                 }).await;
                 finished = true;
+            }
+            resolution = interactive_rx.recv() => {
+                let Some(resolution) = resolution else {
+                    continue;
+                };
+                if pending_interactive.remove(&resolution.id).is_some() {
+                    if resolution.cancel_host_input {
+                        let _ = emit(&event_tx, AgentEvent::InputResolved {
+                            request_id: resolution.id.clone(),
+                        }).await;
+                    }
+                    if let Err(error) = process.send_control(resolution.response) {
+                        let message = protocol::sanitize_diagnostic(&error.to_string());
+                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                    }
+                }
             }
             steer = steering.recv(), if steering_open => {
                 match steer {
@@ -545,7 +590,8 @@ async fn run_session(
                                     }).await;
                                 }
                                 Err(error) => {
-                                    let _ = emit(&steer_events, AgentEvent::Error { message: error.to_string() }).await;
+                                    let message = protocol::sanitize_diagnostic(&error.to_string());
+                                    let _ = emit(&steer_events, AgentEvent::Error { message }).await;
                                 }
                             }
                         });
@@ -570,22 +616,115 @@ async fn run_session(
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
                         let tool = frame.get("toolName").and_then(Value::as_str).unwrap_or_default();
                         let arguments = frame.get("arguments").cloned().unwrap_or(Value::Null);
-                        let result = match &workers {
-                            Some(workers) => workers.handle_call(id, tool, arguments).await,
-                            None => json!({
+                        match &workers {
+                            Some(workers) => match workers.begin_call(id, tool, arguments) {
+                                Ok(result) => {
+                                    let tool_process = process.clone();
+                                    let tool_events = event_tx.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(result) = result.await {
+                                            let id = result
+                                                .get("id")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_owned();
+                                            if let Err(error) = tool_process.send_control(result) {
+                                                let message = protocol::sanitize_diagnostic(&error.to_string());
+                                                let fallback = json!({
+                                                    "type": "host_tool_result",
+                                                    "id": id,
+                                                    "result": { "content": [{
+                                                        "type": "text",
+                                                        "text": "Workers result exceeded the OMP RPC frame budget"
+                                                    }] },
+                                                    "isError": true
+                                                });
+                                                if tool_process.send_control(fallback).is_err() {
+                                                    let _ = emit(&tool_events, AgentEvent::Error { message }).await;
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(result) => {
+                                    if let Err(error) = process.send_control(result) {
+                                        let message = protocol::sanitize_diagnostic(&error.to_string());
+                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                    }
+                                }
+                            },
+                            None => {
+                                let result = json!({
                                 "type": "host_tool_result",
                                 "id": id,
                                 "result": { "content": [{ "type": "text", "text": "Workers are disabled for this run" }] },
                                 "isError": true
-                            }),
-                        };
-                        if let Err(error) = process.send_control(result) {
-                            let _ = emit(&event_tx, AgentEvent::Error { message: error.to_string() }).await;
+                                });
+                                if let Err(error) = process.send_control(result) {
+                                    let message = protocol::sanitize_diagnostic(&error.to_string());
+                                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                }
+                            }
+                        }
+                    }
+                    Some("host_tool_cancel") => {
+                        if let Some(target_id) = frame.get("targetId").and_then(Value::as_str)
+                            && let Some(workers) = &workers
+                        {
+                            workers.cancel_call(target_id);
                         }
                     }
                     Some("extension_ui_request") => {
-                        if answer_interactive_request(&process, &request_input, &interrupt, &frame).await {
-                            finished = true;
+                        let method = frame.get("method").and_then(Value::as_str).unwrap_or_default();
+                        if method == "cancel" {
+                            if let Some(target_id) = frame
+                                .get("targetId")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                && let Some(token) = pending_interactive.remove(target_id)
+                            {
+                                token.cancel();
+                                let _ = emit(&event_tx, AgentEvent::InputResolved {
+                                    request_id: target_id.to_owned(),
+                                }).await;
+                            }
+                        } else if matches!(method, "select" | "confirm" | "input" | "editor") {
+                            match interactive_question(&frame) {
+                                Ok((id, method, question, timeout)) => {
+                                    if let Some(previous) = pending_interactive.remove(&id) {
+                                        previous.cancel();
+                                        let message = "OMP interactive request used a duplicate id".to_owned();
+                                        let _ = process.send_control(cancelled_interactive_response(&id, false));
+                                        let _ = emit(&event_tx, AgentEvent::InputResolved {
+                                            request_id: id.clone(),
+                                        }).await;
+                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                    } else if pending_interactive.len() >= MAX_PENDING_INTERACTIVE_REQUESTS {
+                                        let message = "OMP interactive pending-request limit exceeded".to_owned();
+                                        let _ = process.send_control(cancelled_interactive_response(&id, false));
+                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                    } else {
+                                        let answers = (request_input)(vec![question]);
+                                        let cancellation = tokio_util::sync::CancellationToken::new();
+                                        pending_interactive.insert(id.clone(), cancellation.clone());
+                                        spawn_interactive_answer(
+                                            id,
+                                            method,
+                                            timeout,
+                                            answers,
+                                            cancellation,
+                                            interrupt.clone(),
+                                            interactive_tx.clone(),
+                                        );
+                                    }
+                                }
+                                Err(message) => {
+                                    if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                                        let _ = process.send_control(cancelled_interactive_response(id, false));
+                                    }
+                                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                }
+                            }
                         }
                     }
                     Some("agent_end") => {
@@ -627,6 +766,10 @@ async fn run_session(
                 }
             }
         }
+    }
+
+    for (_, cancellation) in pending_interactive.drain() {
+        cancellation.cancel();
     }
 
     if let Some(workers) = workers {
@@ -697,19 +840,14 @@ async fn emit(
     event_tx.send(Ok(event)).await.is_ok()
 }
 
-async fn answer_interactive_request(
-    process: &OmpProcess,
-    request_input: &Arc<
-        dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
-            + Send
-            + Sync,
-    >,
-    interrupt: &tokio_util::sync::CancellationToken,
+fn interactive_question(
     frame: &Value,
-) -> bool {
-    let Some(id) = frame.get("id").and_then(Value::as_str) else {
-        return false;
-    };
+) -> Result<(String, InteractiveMethod, UserInputQuestion, Duration), String> {
+    let id = frame
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 256)
+        .ok_or_else(|| "OMP interactive request omitted a valid id".to_owned())?;
     let method = frame
         .get("method")
         .and_then(Value::as_str)
@@ -724,29 +862,38 @@ async fn answer_interactive_request(
         .or_else(|| frame.get("prefill"))
         .and_then(Value::as_str)
         .unwrap_or(title);
-    let options = match method {
-        "select" => frame
-            .get("options")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        "confirm" => vec!["Yes".into(), "No".into()],
-        "input" | "editor" => Vec::new(),
-        _ => {
-            let _ = process.send_control(json!({
-                "type": "extension_ui_response",
-                "id": id,
-                "cancelled": true
-            }));
-            return false;
-        }
+    let (kind, options) = match method {
+        "select" => (
+            InteractiveMethod::Value,
+            frame
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        "confirm" => (InteractiveMethod::Confirm, vec!["Yes".into(), "No".into()]),
+        "input" | "editor" => (InteractiveMethod::Value, Vec::new()),
+        _ => return Err("OMP emitted an unsupported blocking interactive request".into()),
     };
+    if method == "select" && (options.is_empty() || options.len() > 100) {
+        return Err("OMP interactive select options are missing or invalid".into());
+    }
+    let timeout = frame
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .filter(|milliseconds| milliseconds.is_finite() && *milliseconds > 0.0)
+        .map(|milliseconds| {
+            let milliseconds = milliseconds.clamp(1.0, MAX_INTERACTIVE_TIMEOUT.as_millis() as f64);
+            Duration::from_secs_f64(milliseconds / 1_000.0)
+        })
+        .unwrap_or(MAX_INTERACTIVE_TIMEOUT)
+        .clamp(Duration::from_millis(1), MAX_INTERACTIVE_TIMEOUT);
     let question = UserInputQuestion {
         id: id.to_owned(),
         header: truncate_text(title, 80),
@@ -754,49 +901,118 @@ async fn answer_interactive_request(
         options,
         multi_select: false,
     };
-    let answers = tokio::select! {
-        answers = (request_input)(vec![question]) => answers.ok(),
-        _ = interrupt.cancelled() => None,
-    };
-    let label = answers
-        .as_ref()
-        .and_then(|answers| answers.first())
-        .and_then(|answer| answer.labels.first());
-    let response = match (method, label) {
-        ("confirm", Some(label)) => json!({
+    Ok((id.to_owned(), kind, question, timeout))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_interactive_answer(
+    id: String,
+    method: InteractiveMethod,
+    timeout: Duration,
+    mut answers: tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    interrupt: tokio_util::sync::CancellationToken,
+    resolved: mpsc::UnboundedSender<InteractiveResolution>,
+) {
+    tokio::spawn(async move {
+        let (response, cancel_host_input) = tokio::select! {
+            answer = &mut answers => {
+                let label = answer
+                    .ok()
+                    .and_then(|answers| answers.into_iter().next())
+                    .and_then(|answer| answer.labels.into_iter().next());
+                match (method, label) {
+                    (InteractiveMethod::Confirm, Some(label)) => (json!({
             "type": "extension_ui_response",
             "id": id,
             "confirmed": label.eq_ignore_ascii_case("yes")
-        }),
-        ("select" | "input" | "editor", Some(label)) => json!({
+                    }), false),
+                    (InteractiveMethod::Value, Some(label)) => (json!({
             "type": "extension_ui_response",
             "id": id,
-            "value": label
-        }),
-        _ => json!({
-            "type": "extension_ui_response",
-            "id": id,
-            "cancelled": true
-        }),
-    };
-    let _ = process.send_control(response);
-    interrupt.is_cancelled()
+            "value": truncate_text(&label, 20_000)
+                    }), false),
+                    _ => (cancelled_interactive_response(&id, false), true),
+                }
+            }
+            _ = tokio::time::sleep(timeout) => (cancelled_interactive_response(&id, true), true),
+            _ = cancellation.cancelled() => return,
+            _ = interrupt.cancelled() => return,
+        };
+        let _ = resolved.send(InteractiveResolution {
+            id,
+            response,
+            cancel_host_input,
+        });
+    });
 }
 
-async fn load_images(paths: &[String]) -> Vec<Value> {
-    const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
-    let mut images = Vec::new();
+fn cancelled_interactive_response(id: &str, timed_out: bool) -> Value {
+    json!({
+            "type": "extension_ui_response",
+            "id": id,
+            "cancelled": true,
+            "timedOut": timed_out
+    })
+}
+
+async fn load_images(paths: &[String], prompt: &str) -> Result<Vec<Value>, HarnessError> {
+    let mut candidates = Vec::new();
     for path in paths {
         let Ok(metadata) = tokio::fs::metadata(path).await else {
             continue;
         };
-        if metadata.len() > MAX_IMAGE_BYTES {
-            continue;
-        }
-        let Ok(bytes) = tokio::fs::read(path).await else {
+        let Ok(size) = usize::try_from(metadata.len()) else {
+            return Err(HarnessError::Protocol(
+                "OMP attachment exceeds the RPC frame budget".into(),
+            ));
+        };
+        let Some(mime_type) = detect_image_mime(path).await else {
             continue;
         };
-        let Some(mime_type) = image_mime_type(path, &bytes) else {
+        candidates.push((path, size, mime_type));
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Match Orchestrator.dev's native OMP preflight: count the exact JSON
+    // envelope, UTF-8 prompt bytes, worst plausible request id, and base64
+    // expansion before materializing any attachment into memory.
+    let skeleton = json!({
+        "type": "prompt",
+        "message": prompt,
+        "images": candidates
+            .iter()
+            .map(|(_, _, mime_type)| json!({
+                "type": "image",
+                "data": "",
+                "mimeType": mime_type
+            }))
+            .collect::<Vec<_>>(),
+        "id": format!("comet-{}", "9".repeat(20))
+    });
+    let envelope_bytes = serde_json::to_vec(&skeleton)
+        .map_err(|error| HarnessError::Protocol(format!("OMP image preflight failed: {error}")))?
+        .len();
+    let total_bytes = candidates
+        .iter()
+        .try_fold(envelope_bytes, |total, (_, size, _)| {
+            let encoded = size
+                .checked_add(2)
+                .and_then(|size| size.checked_div(3))
+                .and_then(|size| size.checked_mul(4))?;
+            total.checked_add(encoded)
+        });
+    if total_bytes.is_none_or(|total| total > MAX_OUTBOUND_BYTES) {
+        return Err(HarnessError::Protocol(
+            "OMP image attachments exceed the RPC frame budget".into(),
+        ));
+    }
+
+    let mut images = Vec::with_capacity(candidates.len());
+    for (path, _, mime_type) in candidates {
+        let Ok(bytes) = tokio::fs::read(path).await else {
             continue;
         };
         images.push(json!({
@@ -805,7 +1021,17 @@ async fn load_images(paths: &[String]) -> Vec<Value> {
             "mimeType": mime_type
         }));
     }
-    images
+    Ok(images)
+}
+
+async fn detect_image_mime(path: &str) -> Option<&'static str> {
+    if let Some(mime_type) = image_mime_type(path, &[]) {
+        return Some(mime_type);
+    }
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut header = [0_u8; 16];
+    let read = file.read(&mut header).await.ok()?;
+    image_mime_type(path, &header[..read])
 }
 
 fn image_mime_type(path: &str, bytes: &[u8]) -> Option<&'static str> {

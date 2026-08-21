@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall};
+use zeron_proto::{AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall, ToolDiff};
+
+use super::protocol::sanitize_diagnostic;
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -50,7 +52,7 @@ impl OmpNormalizer {
                 .and_then(Value::as_str)
                 .filter(|message| !message.is_empty())
                 .map(|message| AgentEvent::Error {
-                    message: truncate(message, 1_024),
+                    message: truncate(&sanitize_diagnostic(message), 1_024),
                 })
                 .into_iter()
                 .collect(),
@@ -78,7 +80,7 @@ impl OmpNormalizer {
             .filter(|message| message.get("stopReason").and_then(Value::as_str) == Some("error"))
             .and_then(|message| message.get("errorMessage").and_then(Value::as_str))
             .filter(|message| !message.is_empty())
-            .map(|message| truncate(message, 1_024));
+            .map(|message| truncate(&sanitize_diagnostic(message), 1_024));
         failure
             .map(AgentEndDisposition::Error)
             .unwrap_or(AgentEndDisposition::Complete)
@@ -159,15 +161,20 @@ impl OmpNormalizer {
                 }),
             }];
         }
-        if matches!(status, "completed" | "failed" | "errored" | "cancelled")
-            && let Some(context) = self.subagents.remove(id)
+        if matches!(
+            status,
+            "completed" | "failed" | "errored" | "cancelled" | "aborted"
+        ) && let Some(context) = self.subagents.remove(id)
         {
             let failed = matches!(status, "failed" | "errored");
+            let interrupted = matches!(status, "cancelled" | "aborted");
             return vec![AgentEvent::Subagent {
                 parent_tool_use_id: context.parent_tool_use_id,
                 event: Box::new(AgentEvent::Done {
                     status: if failed {
                         DoneStatus::Errored
+                    } else if interrupted {
+                        DoneStatus::Interrupted
                     } else {
                         DoneStatus::Completed
                     },
@@ -176,7 +183,7 @@ impl OmpNormalizer {
                         payload
                             .get("error")
                             .and_then(Value::as_str)
-                            .map(|error| truncate(error, 1_024))
+                            .map(|error| truncate(&sanitize_diagnostic(error), 1_024))
                             .unwrap_or_else(|| format!("OMP {} subagent failed", context.agent))
                     }),
                     session_id: Some(context.session_id),
@@ -259,11 +266,30 @@ fn tool_start(frame: &Value) -> Option<AgentEvent> {
 
 fn tool_end(frame: &Value) -> Option<AgentEvent> {
     let id = frame.get("toolCallId")?.as_str()?;
+    let result = frame.get("result");
     Some(AgentEvent::ToolResult {
         id: id.to_owned(),
         is_error: frame.get("isError").and_then(Value::as_bool) == Some(true),
-        output: frame.get("result").and_then(tool_output),
-        diff: None,
+        output: result.and_then(tool_output),
+        diff: result.and_then(tool_diff),
+    })
+}
+
+fn tool_diff(result: &Value) -> Option<ToolDiff> {
+    let path = result.get("path")?.as_str()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(ToolDiff {
+        path: truncate(path, 4_096),
+        old_text: result
+            .get("oldText")
+            .and_then(Value::as_str)
+            .map(|text| truncate(text, MAX_TOOL_OUTPUT_BYTES)),
+        new_text: result
+            .get("newText")
+            .and_then(Value::as_str)
+            .map(|text| truncate(text, MAX_TOOL_OUTPUT_BYTES))?,
     })
 }
 

@@ -1,9 +1,14 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::protocol::sanitize_diagnostic;
 use crate::HarnessError;
@@ -20,8 +25,13 @@ pub struct WorkersBridge {
     client: RpcClient,
     child: tokio::sync::Mutex<Child>,
     definition: Value,
-    _incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Incoming>>,
+    pending: Arc<Mutex<HashMap<String, Arc<CancellationToken>>>>,
+    request_timeout: Duration,
 }
+
+const MAX_PENDING_CALLS: usize = 64;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 impl WorkersBridge {
     pub async fn start(options: WorkersBridgeOptions) -> Result<Option<Self>, HarnessError> {
@@ -77,13 +87,31 @@ impl WorkersBridge {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::omp", "workers stderr: {line}");
+                    let diagnostic = sanitize_diagnostic(&line);
+                    if !diagnostic.is_empty() {
+                        tracing::debug!(target: "zeron_harness::omp", "workers stderr: {diagnostic}");
+                    }
                 }
             });
         }
-        let (client, incoming) = RpcClient::new(stdin, stdout);
-        client
-            .request(
+        let (client, mut incoming) = RpcClient::new(stdin, stdout);
+        let incoming_client = client.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = incoming.recv().await {
+                match frame {
+                    Incoming::Request { id, method, .. } => incoming_client.respond_error(
+                        &id,
+                        -32601,
+                        &format!("Unsupported Workers controller request: {method}"),
+                    ),
+                    Incoming::Notification { .. } => {}
+                    Incoming::Eof => break,
+                }
+            }
+        });
+        tokio::time::timeout(
+            STARTUP_TIMEOUT,
+            client.request(
                 "initialize",
                 json!({
                     "protocolVersion": "2024-11-05",
@@ -93,9 +121,15 @@ impl WorkersBridge {
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }),
-            )
-            .await?;
-        let tools = client.request("tools/list", json!({})).await?;
+            ),
+        )
+        .await
+        .map_err(|_| HarnessError::Protocol("Workers controller initialize timed out".into()))??;
+        let tools = tokio::time::timeout(STARTUP_TIMEOUT, client.request("tools/list", json!({})))
+            .await
+            .map_err(|_| {
+                HarnessError::Protocol("Workers controller tools/list timed out".into())
+            })??;
         let tool = tools
             .get("tools")
             .and_then(Value::as_array)
@@ -126,7 +160,8 @@ impl WorkersBridge {
             client,
             child: tokio::sync::Mutex::new(child),
             definition,
-            _incoming: tokio::sync::Mutex::new(incoming),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            request_timeout: TOOL_CALL_TIMEOUT,
         }))
     }
 
@@ -135,32 +170,105 @@ impl WorkersBridge {
     }
 
     pub async fn handle_call(&self, id: &str, tool_name: &str, arguments: Value) -> Value {
-        if tool_name != "workers" {
-            return error_result(id, "Unknown OMP host tool");
+        match self.begin_call(id, tool_name, arguments) {
+            Ok(receiver) => receiver
+                .await
+                .unwrap_or_else(|_| error_result(id, "OMP host tool was cancelled")),
+            Err(result) => result,
         }
-        match self
-            .client
-            .request(
-                "tools/call",
-                json!({ "name": tool_name, "arguments": arguments }),
-            )
-            .await
+    }
+
+    pub fn begin_call(
+        &self,
+        id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<oneshot::Receiver<Value>, Value> {
+        if id.is_empty() || id.len() > 256 {
+            return Err(error_result(id, "OMP host tool request has an invalid id"));
+        }
+        if tool_name != "workers" {
+            return Err(error_result(id, "Unknown OMP host tool"));
+        }
+        if !arguments.is_object() {
+            return Err(error_result(id, "Invalid Workers tool arguments"));
+        }
+
+        let cancellation = Arc::new(CancellationToken::new());
         {
-            Ok(result) => {
-                let content = result.get("content").cloned().unwrap_or_else(|| json!([]));
-                let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
-                json!({
-                    "type": "host_tool_result",
-                    "id": id,
-                    "result": { "content": content },
-                    "isError": is_error,
-                })
+            let mut pending = lock(&self.pending);
+            if let Some(previous) = pending.remove(id) {
+                previous.cancel();
+                return Err(error_result(id, "Duplicate OMP host-tool request id"));
             }
-            Err(error) => error_result(id, &sanitize_diagnostic(&error.to_string())),
+            if pending.len() >= MAX_PENDING_CALLS {
+                return Err(error_result(
+                    id,
+                    "OMP host-tool pending-call limit exceeded",
+                ));
+            }
+            pending.insert(id.to_owned(), Arc::clone(&cancellation));
+        }
+
+        let client = self.client.clone();
+        let pending = Arc::clone(&self.pending);
+        let request_timeout = self.request_timeout;
+        let id = id.to_owned();
+        let tool_name = tool_name.to_owned();
+        let (resolved, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = client
+                .request_bounded(
+                    "tools/call",
+                    json!({ "name": tool_name, "arguments": arguments }),
+                    cancellation.as_ref().clone(),
+                    request_timeout,
+                )
+                .await;
+            let outcome = Some(match outcome {
+                Ok(result) => {
+                    let content = result.get("content").cloned().unwrap_or_else(|| json!([]));
+                    let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+                    json!({
+                        "type": "host_tool_result",
+                        "id": id,
+                        "result": { "content": content },
+                        "isError": is_error,
+                    })
+                }
+                Err(error) => error_result(&id, &sanitize_diagnostic(&error.to_string())),
+            });
+            let active = {
+                let mut pending = lock(&pending);
+                let active = pending
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cancellation));
+                if active {
+                    pending.remove(&id);
+                }
+                active
+            };
+            if active && let Some(result) = outcome {
+                let _ = resolved.send(result);
+            }
+        });
+        Ok(receiver)
+    }
+
+    pub fn cancel_call(&self, id: &str) -> bool {
+        let cancellation = lock(&self.pending).remove(id);
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            true
+        } else {
+            false
         }
     }
 
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, cancellation) in lock(&self.pending).drain() {
+            cancellation.cancel();
+        }
         let mut child = self.child.lock().await;
         if child.try_wait()?.is_some() {
             return Ok(());
@@ -169,6 +277,10 @@ impl WorkersBridge {
         let _ = child.wait().await;
         Ok(())
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn error_result(id: &str, message: &str) -> Value {

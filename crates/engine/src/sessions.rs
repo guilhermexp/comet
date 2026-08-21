@@ -55,7 +55,28 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
-type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+struct PendingInput {
+    question_ids: Vec<String>,
+    resolver: oneshot::Sender<Vec<UserInputAnswer>>,
+}
+
+type PendingInputs = Arc<Mutex<HashMap<String, PendingInput>>>;
+
+fn resolve_pending_question(pending: &PendingInputs, question_id: &str) -> Option<String> {
+    let mut pending = lock(pending);
+    if pending.contains_key(question_id) {
+        return None;
+    }
+    let request_id = pending.iter().find_map(|(request_id, input)| {
+        input
+            .question_ids
+            .iter()
+            .any(|id| id == question_id)
+            .then(|| request_id.clone())
+    })?;
+    pending.remove(&request_id);
+    Some(request_id)
+}
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -433,7 +454,17 @@ impl SessionsEngine {
             Box::new(move |questions: Vec<UserInputQuestion>| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), tx);
+                let question_ids = questions
+                    .iter()
+                    .map(|question| question.id.clone())
+                    .collect();
+                lock(&pending).insert(
+                    request_id.clone(),
+                    PendingInput {
+                        question_ids,
+                        resolver: tx,
+                    },
+                );
                 let _ = engine_tx.send(AgentEvent::InputRequested {
                     request_id,
                     questions,
@@ -580,9 +611,12 @@ impl SessionsEngine {
         };
         // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
-        for tx in parked {
-            let _ = tx.send(Vec::new());
+        let parked: Vec<_> = lock(&pending)
+            .drain()
+            .map(|(_, pending_input)| pending_input)
+            .collect();
+        for pending_input in parked {
+            let _ = pending_input.resolver.send(Vec::new());
         }
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
@@ -613,10 +647,10 @@ impl SessionsEngine {
         let Some((pending, engine_tx)) = target else {
             return Ok(false);
         };
-        let Some(resolver) = lock(&pending).remove(request_id) else {
+        let Some(pending_input) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(answers);
+        let _ = pending_input.resolver.send(answers);
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
         });
@@ -1414,7 +1448,7 @@ async fn drive_run(
         std::collections::HashMap::new();
 
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
+        let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
@@ -1710,6 +1744,21 @@ async fn drive_run(
         // push the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
         last_stream_activity = tokio::time::Instant::now();
+        // Native runtimes can cancel one of their own question ids (OMP's
+        // `extension_ui_request.cancel` and timeout). Translate that runtime
+        // question id back to the engine-owned request id, remove the parked
+        // resolver, and let the normal InputResolved fold close the UI chip.
+        if let AgentEvent::InputResolved { request_id } = &event {
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .map(|handle| handle.pending_inputs.clone());
+            if let Some(request_id) = pending
+                .as_ref()
+                .and_then(|pending| resolve_pending_question(pending, request_id))
+            {
+                event = AgentEvent::InputResolved { request_id };
+            }
+        }
         // The engine's input bridge is the sole authority on input requests:
         // it mints the id and parks the resolver BEFORE emitting the event,
         // so a legitimate id is always pending here. A harness emitting its
@@ -1798,8 +1847,8 @@ async fn drive_run(
                         let resolver = lock(&inner.runs)
                             .get(&chat_id)
                             .and_then(|h| lock(&h.pending_inputs).remove(request_id));
-                        if let Some(tx) = resolver {
-                            let _ = tx.send(Vec::new());
+                        if let Some(pending_input) = resolver {
+                            let _ = pending_input.resolver.send(Vec::new());
                         }
                         tracing::debug!(chat = %chat_id, "parked session: post-turn input request auto-declined");
                         continue;
@@ -1999,8 +2048,8 @@ async fn drive_run(
                 .filter(|h| h.run_id == run_id)
                 .map(|h| h.pending_inputs.clone());
             if let Some(pending) = pending {
-                for (_, tx) in lock(&pending).drain() {
-                    let _ = tx.send(Vec::new());
+                for (_, pending_input) in lock(&pending).drain() {
+                    let _ = pending_input.resolver.send(Vec::new());
                 }
             }
             let message_status = match status {
@@ -2141,7 +2190,11 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeConfig, subagent_doc_id};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use super::{PendingInput, RuntimeConfig, resolve_pending_question, subagent_doc_id};
+    use tokio::sync::oneshot;
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 
     fn request() -> RunRequest {
@@ -2158,6 +2211,25 @@ mod tests {
             attachments: Vec::new(),
             worktree: None,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_question_cancellation_resolves_the_engine_request() {
+        let (resolver, receiver) = oneshot::channel();
+        let pending = Arc::new(Mutex::new(HashMap::from([(
+            "engine-request".to_owned(),
+            PendingInput {
+                question_ids: vec!["runtime-question".to_owned()],
+                resolver,
+            },
+        )])));
+
+        assert_eq!(
+            resolve_pending_question(&pending, "runtime-question").as_deref(),
+            Some("engine-request")
+        );
+        assert!(receiver.await.is_err());
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]

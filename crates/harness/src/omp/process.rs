@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::protocol::{MAX_PENDING_REQUESTS, parse_frame, serialize_frame};
+use super::protocol::{
+    MAX_INBOUND_BYTES, MAX_PENDING_REQUESTS, parse_frame, sanitize_diagnostic, serialize_frame,
+};
 use crate::HarnessError;
 
 pub struct OmpLaunch {
@@ -130,9 +132,21 @@ impl OmpProcess {
 
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::omp", "stderr: {line}");
+                let mut reader = BufReader::new(stderr);
+                loop {
+                    match read_bounded_line(&mut reader, 64 * 1024).await {
+                        Ok(Some(line)) => {
+                            let diagnostic = sanitize_diagnostic(&String::from_utf8_lossy(&line));
+                            if !diagnostic.is_empty() {
+                                tracing::debug!(target: "zeron_harness::omp", "stderr: {diagnostic}");
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(target: "zeron_harness::omp", "stderr reader stopped: {}", sanitize_diagnostic(&error));
+                            break;
+                        }
+                    }
                 }
             });
         }
@@ -189,6 +203,12 @@ impl OmpProcess {
             "comet-{}",
             self.inner.sequence.fetch_add(1, Ordering::Relaxed) + 1
         );
+        let mut frame = command;
+        frame
+            .as_object_mut()
+            .expect("command type check requires an object")
+            .insert("id".into(), Value::String(id.clone()));
+        let serialized = serialize_frame(&frame)?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = lock(&self.inner.pending);
@@ -205,12 +225,6 @@ impl OmpProcess {
                 },
             );
         }
-        let mut frame = command;
-        frame
-            .as_object_mut()
-            .expect("command type check requires an object")
-            .insert("id".into(), Value::String(id.clone()));
-        let serialized = serialize_frame(&frame)?;
         if self
             .inner
             .writer
@@ -277,8 +291,30 @@ async fn read_stdout(
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
     let mut ready_tx = Some(ready_tx);
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_INBOUND_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(message) => {
+                fail(&inner, message.clone());
+                if let Some(ready) = ready_tx.take() {
+                    let _ = ready.send(Err(message));
+                }
+                return;
+            }
+        };
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) => line,
+            Err(_) => {
+                let message = "OMP RPC emitted non-UTF-8 JSONL".to_owned();
+                fail(&inner, message.clone());
+                if let Some(ready) = ready_tx.take() {
+                    let _ = ready.send(Err(message));
+                }
+                return;
+            }
+        };
         let frame = match parse_frame(line.trim()) {
             Ok(frame) => frame,
             Err(error) => {
@@ -314,6 +350,45 @@ async fn read_stdout(
     }
 }
 
+async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> Result<Option<Vec<u8>>, String>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let (consumed, complete) = {
+            let available = reader
+                .fill_buf()
+                .await
+                .map_err(|error| format!("OMP RPC read failed: {error}"))?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(line));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |position| position + 1);
+            let payload_bytes = consumed.saturating_sub(usize::from(newline.is_some()));
+            if line.len().saturating_add(payload_bytes) > max_bytes {
+                return Err(format!("OMP RPC frame exceeded {max_bytes} bytes"));
+            }
+            line.extend_from_slice(&available[..consumed]);
+            (consumed, newline.is_some())
+        };
+        reader.consume(consumed);
+        if complete {
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
+}
+
 fn route_response(inner: &Inner, frame: Value) {
     let Some(id) = frame.get("id").and_then(Value::as_str) else {
         return;
@@ -329,11 +404,12 @@ fn route_response(inner: &Inner, frame: Value) {
         return;
     }
     if frame.get("success").and_then(Value::as_bool) != Some(true) {
-        let message = frame
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("OMP RPC request failed")
-            .to_owned();
+        let message = sanitize_diagnostic(
+            frame
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("OMP RPC request failed"),
+        );
         let _ = pending.resolve.send(Err(message));
         return;
     }

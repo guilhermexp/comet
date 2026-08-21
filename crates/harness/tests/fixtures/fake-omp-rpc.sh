@@ -16,11 +16,18 @@ respond() {
 }
 
 scenario=${FAKE_OMP_SCENARIO:-normal}
+[ -z "${FAKE_OMP_PID_FILE:-}" ] || printf '%s\n' "$$" > "$FAKE_OMP_PID_FILE"
 if [ "$scenario" = "early-exit" ]; then
   exit 9
 fi
 
 emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
+
+if [ "$scenario" = "oversized-no-newline" ]; then
+  dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\000' x
+  sleep 5
+  exit 0
+fi
 
 if [ "$scenario" = "malformed" ]; then
   emit 'not-json'
@@ -39,10 +46,14 @@ fi
 while IFS= read -r line; do
   case "$(field type "$line")" in
     get_state)
-      respond "$line" '{"sessionId":"s-1","sessionFile":"/tmp/omp-session.jsonl","thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true},"dumpTools":[{"name":"bash","description":"Run commands","parameters":{"type":"object"}}]}'
+      if [ "$scenario" = "missing-session" ]; then
+        respond "$line" '{"thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
+      else
+        respond "$line" '{"sessionId":"s-1","sessionFile":"/tmp/omp-session.jsonl","thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true},"dumpTools":[{"name":"bash","description":"Run commands","parameters":{"type":"object"}}]}'
+      fi
       ;;
     get_available_models)
-      respond "$line" '{"models":[{"provider":"anthropic","id":"shared","name":"Claude Shared","reasoning":false},{"provider":"openai-codex","id":"shared","name":"Codex Shared","reasoning":true},{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"contextWindow":400000}]}'
+      respond "$line" '{"models":[{"provider":"anthropic","id":"shared","name":"Claude Shared","reasoning":false},{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"contextWindow":400000},{"provider":"openai-codex","id":"shared","name":"Codex Shared","reasoning":true}]}'
       ;;
     get_available_commands)
       respond "$line" '{"commands":[{"name":"model","description":"Select model","input":{"hint":"provider/model"}},{"name":"compact","description":"Compact context"}]}'
@@ -116,6 +127,34 @@ while IFS= read -r line; do
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "provider-error" ]; then
         emit '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"provider failed"}]}'
+      elif [ "$scenario" = "interactive-cancel" ]; then
+        emit '{"type":"extension_ui_request","id":"question-pending","method":"input","title":"Value","placeholder":"Type"}'
+        emit '{"type":"extension_ui_request","id":"cancel-1","method":"cancel","targetId":"question-pending"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after cancel"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "interactive-timeout" ]; then
+        emit '{"type":"extension_ui_request","id":"question-timeout","method":"input","title":"Value","placeholder":"Type","timeout":25}'
+        read -r timeout_response
+        if has "$timeout_response" '"type":"extension_ui_response"' && has "$timeout_response" '"id":"question-timeout"' && has "$timeout_response" '"cancelled":true' && has "$timeout_response" '"timedOut":true'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after timeout"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage timeout 28
+        fi
+      elif [ "$scenario" = "workers-cancel" ]; then
+        emit '{"type":"host_tool_call","id":"host-hang","toolCallId":"workers-hang","toolName":"workers","arguments":{"action":"hang"}}'
+        emit '{"type":"host_tool_cancel","id":"cancel-host","targetId":"host-hang"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after workers cancel"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "workers-oversized" ]; then
+        emit '{"type":"host_tool_call","id":"host-large","toolCallId":"workers-large","toolName":"workers","arguments":{"action":"oversized"}}'
+        read -r host_result
+        if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-large"' && has "$host_result" '"isError":true'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after oversized workers result"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage workers_oversized 29
+        fi
       elif [ "$scenario" = "wait" ]; then
         sleep 60
       fi
