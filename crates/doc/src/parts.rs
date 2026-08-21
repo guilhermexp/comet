@@ -127,6 +127,14 @@ pub enum MessagePart {
         id: String,
         text: String,
     },
+    Reasoning {
+        id: String,
+        text: String,
+        #[serde(default)]
+        completed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     #[serde(rename_all = "camelCase")]
     Tool {
         id: String,
@@ -196,6 +204,7 @@ impl MessagePart {
     pub fn id(&self) -> &str {
         match self {
             MessagePart::Text { id, .. }
+            | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. } => id,
@@ -205,6 +214,7 @@ impl MessagePart {
     pub fn byte_len(&self) -> usize {
         match self {
             MessagePart::Text { text, .. } => text.len(),
+            MessagePart::Reasoning { text, .. } => text.len(),
             MessagePart::Tool {
                 call,
                 execution,
@@ -233,6 +243,12 @@ impl MessagePart {
     }
 }
 
+fn complete_trailing_reasoning(parts: &mut [MessagePart]) {
+    if let Some(MessagePart::Reasoning { completed, .. }) = parts.last_mut() {
+        *completed = true;
+    }
+}
+
 /// Fold one agent event into a parts accumulator, in place.
 ///
 /// In place because the fold runs once per streamed event: rebuilding the
@@ -247,6 +263,19 @@ impl MessagePart {
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
 /// - `Error` and `Done{error}` become visible error parts.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
+    let closes_reasoning = match event {
+        AgentEvent::TextDelta { text } | AgentEvent::Error { message: text } => !text.is_empty(),
+        AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::InputRequested { .. }
+        | AgentEvent::Done { .. }
+        | AgentEvent::UserMessage { .. } => true,
+        _ => false,
+    };
+    if closes_reasoning {
+        complete_trailing_reasoning(out);
+    }
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
             out.clear();
@@ -262,8 +291,26 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::ReasoningDelta { .. } => {
-            // Reasoning is not rendered as a transcript part (matches zeron).
+        AgentEvent::ReasoningDelta { text } => {
+            if text.is_empty() {
+                return;
+            }
+            if let Some(MessagePart::Reasoning {
+                text: tail,
+                completed: false,
+                ..
+            }) = out.last_mut()
+            {
+                tail.push_str(text);
+            } else {
+                let id = format!("r{}", out.len());
+                out.push(MessagePart::Reasoning {
+                    id,
+                    text: text.clone(),
+                    completed: false,
+                    duration_ms: None,
+                });
+            }
         }
         AgentEvent::ToolCall { id, call } => {
             if let Some(existing) = out.iter_mut().find_map(|p| match p {
@@ -568,6 +615,38 @@ pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
                     piece += 1;
                 }
             }
+            MessagePart::Reasoning {
+                id,
+                text,
+                completed,
+                duration_ms,
+            } if text.len() > MSG_INLINE_MAX => {
+                let mut start = 0usize;
+                let mut piece = 0usize;
+                while start < text.len() {
+                    let mut end = (start + MSG_INLINE_MAX).min(text.len());
+                    while end < text.len() && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if end <= start {
+                        end = text.len();
+                    }
+                    let is_last = end == text.len();
+                    let sub = MessagePart::Reasoning {
+                        id: if piece == 0 {
+                            id.clone()
+                        } else {
+                            format!("{id}~{piece}")
+                        },
+                        text: text[start..end].to_string(),
+                        completed: is_last && *completed,
+                        duration_ms: is_last.then_some(*duration_ms).flatten(),
+                    };
+                    push_part(&mut chunks, &mut current_bytes, sub);
+                    start = end;
+                    piece += 1;
+                }
+            }
             other => push_part(&mut chunks, &mut current_bytes, other.clone()),
         }
     }
@@ -608,6 +687,73 @@ mod tests {
             MessagePart::Text { text, .. } => assert_eq!(text, "after"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn reasoning_deltas_append_and_close_before_the_next_visible_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta { text: "one".into() },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: " two".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "c1".into(),
+                call: ToolCall::Exec {
+                    command: "pwd".into(),
+                },
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Reasoning {
+                text,
+                completed: true,
+                ..
+            } if text == "one two"
+        ));
+        assert!(matches!(&parts[1], MessagePart::Tool { .. }));
+    }
+
+    #[test]
+    fn empty_reasoning_is_a_heartbeat_and_done_closes_a_live_trace() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: String::new(),
+            },
+        );
+        assert!(parts.is_empty());
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "checking".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Reasoning {
+                completed: true,
+                ..
+            }
+        ));
     }
 
     #[test]

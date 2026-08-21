@@ -62,6 +62,10 @@ struct DocPartJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     call: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     is_error: Option<bool>,
@@ -110,6 +114,19 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             id: id.clone(),
             kind: "text".into(),
             text: Some(text.clone()),
+            ..Default::default()
+        },
+        MessagePart::Reasoning {
+            id,
+            text,
+            completed,
+            duration_ms,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "reasoning".into(),
+            text: Some(text.clone()),
+            completed: Some(*completed),
+            duration_ms: *duration_ms,
             ..Default::default()
         },
         MessagePart::Tool {
@@ -177,6 +194,12 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
+        "reasoning" => MessagePart::Reasoning {
+            id: p.id,
+            text: p.text.unwrap_or_default(),
+            completed: p.completed.unwrap_or(false),
+            duration_ms: p.duration_ms,
+        },
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
                 id: p.id,
@@ -623,6 +646,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         let t = map.insert_container("text", LoroText::new())?;
         t.insert(0, text)?;
     }
+    if let Some(completed) = doc_part.completed {
+        map.insert("completed", completed)?;
+    }
+    if let Some(duration_ms) = doc_part.duration_ms {
+        map.insert("durationMs", duration_ms as i64)?;
+    }
     if let Some(call) = &doc_part.call {
         map.insert("call", loro_value_from_json(call))?;
     }
@@ -775,6 +804,21 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         .and_then(|x| x.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{entry_id}#recovered-{ix}"));
+    if obj.get("kind").and_then(|x| x.as_str()) == Some("reasoning") {
+        return Some(MessagePart::Reasoning {
+            id,
+            text: obj
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            completed: obj
+                .get("completed")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            duration_ms: obj.get("durationMs").and_then(|x| x.as_u64()),
+        });
+    }
     if let Some(text) = obj.get("text").and_then(|x| x.as_str()) {
         return Some(MessagePart::Text {
             id,
@@ -974,6 +1018,30 @@ impl<'a> SegmentWriter<'a> {
                                 dirty = true;
                             }
                         }
+                        (
+                            MessagePart::Reasoning { text: old, .. },
+                            MessagePart::Reasoning { text: new, .. },
+                        ) if new.starts_with(old.as_str()) => {
+                            let part_map = part_map_at(&parts, i)?;
+                            let delta = &new[old.len()..];
+                            if !delta.is_empty() {
+                                match part_map.get("text") {
+                                    Some(loro::ValueOrContainer::Container(
+                                        loro::Container::Text(t),
+                                    )) => {
+                                        let len = t.len_unicode();
+                                        t.insert(len, delta)?;
+                                    }
+                                    _ => {
+                                        return Err(DocError::Schema(
+                                            "reasoning part missing LoroText".into(),
+                                        ));
+                                    }
+                                }
+                            }
+                            update_part_fields(&part_map, part)?;
+                            dirty = true;
+                        }
                         _ => {
                             // Field-level update (tool refresh/resolve, input resolve, or a
                             // non-append text rewrite, which the fold shouldn't produce —
@@ -1014,6 +1082,12 @@ fn part_map_at(parts: &LoroList, index: usize) -> Result<LoroMap, DocError> {
 /// In-place field refresh for tool/input parts (and defensive text rewrite).
 fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError> {
     let doc_part = to_doc_part(part)?;
+    if let Some(completed) = doc_part.completed {
+        map.insert("completed", completed)?;
+    }
+    if let Some(duration_ms) = doc_part.duration_ms {
+        map.insert("durationMs", duration_ms as i64)?;
+    }
     if let Some(call) = &doc_part.call {
         map.insert("call", loro_value_from_json(call))?;
     }
@@ -1480,6 +1554,42 @@ mod tests {
                 execution: Some(actual),
                 ..
             } if *actual == metadata
+        ));
+    }
+
+    #[test]
+    fn reasoning_parts_stream_and_round_trip_their_settled_state() {
+        let doc = SessionDoc::init("chat-reasoning").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "m-reasoning", "dev-a", 1).unwrap();
+        let mut parts = vec![MessagePart::Reasoning {
+            id: "r0".into(),
+            text: "checking".into(),
+            completed: false,
+            duration_ms: None,
+        }];
+        writer.sync(&parts).unwrap();
+        if let MessagePart::Reasoning {
+            text,
+            completed,
+            duration_ms,
+            ..
+        } = &mut parts[0]
+        {
+            text.push_str(" the result");
+            *completed = true;
+            *duration_ms = Some(4_100);
+        }
+        writer.finish(&parts, MessageStatus::Complete).unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert!(matches!(
+            &entries[0].parts[0],
+            MessagePart::Reasoning {
+                text,
+                completed: true,
+                duration_ms: Some(4_100),
+                ..
+            } if text == "checking the result"
         ));
     }
 

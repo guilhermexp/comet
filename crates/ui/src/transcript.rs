@@ -956,6 +956,7 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
+                    MessagePart::Reasoning { .. } => {}
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
                 }
