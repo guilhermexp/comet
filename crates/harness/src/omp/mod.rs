@@ -13,6 +13,8 @@ pub mod normalize;
 pub mod process;
 #[doc(hidden)]
 pub mod protocol;
+#[doc(hidden)]
+pub mod workers_bridge;
 
 const OMP_REASONING_LEVELS: &[ReasoningLevel] = &[
     ReasoningLevel::Minimal,

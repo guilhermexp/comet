@@ -6,11 +6,16 @@ use serde_json::{Value, json};
 use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{MAX_INBOUND_BYTES, parse_frame, sanitize_diagnostic};
+use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
 use zeron_proto::{AgentEvent, DoneStatus, ReasoningLevel, ToolCall};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp-rpc.sh")
+}
+
+fn fake_workers_controller_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-workers-controller-mcp.sh")
 }
 
 fn fake_env(scenario: &str) -> HashMap<String, String> {
@@ -197,4 +202,34 @@ fn normalizer_classifies_only_terminal_agent_ends() {
         normalizer.classify_agent_end(&json!({ "type": "agent_end", "messages": [] })),
         AgentEndDisposition::Complete
     );
+}
+
+#[tokio::test]
+async fn workers_host_tool_is_registered_only_when_enabled() {
+    let disabled = WorkersBridge::start(WorkersBridgeOptions {
+        enabled: false,
+        executable: fake_workers_controller_path(),
+        parent_chat_id: Some("chat-1".into()),
+    })
+    .await
+    .unwrap();
+    assert!(disabled.is_none());
+
+    let enabled = WorkersBridge::start(WorkersBridgeOptions {
+        enabled: true,
+        executable: fake_workers_controller_path(),
+        parent_chat_id: Some("chat-1".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(enabled.definition()["name"], "workers");
+    let result = enabled
+        .handle_call("omp-call-1", "workers", json!({ "action": "help" }))
+        .await;
+    assert_eq!(result["type"], "host_tool_result");
+    assert_eq!(result["id"], "omp-call-1");
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["result"]["content"][0]["text"], "worker help");
+    enabled.shutdown().await.unwrap();
 }
