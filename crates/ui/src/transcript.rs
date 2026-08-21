@@ -141,6 +141,10 @@ fn user_message_attachment_summary(count: usize) -> Option<SharedString> {
     }
 }
 
+fn user_message_card_background(theme: &Theme) -> gpui::Hsla {
+    theme.input_glass_bg()
+}
+
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
 // which follows the shape of stackblitz/use-stick-to-bottom)
@@ -3291,9 +3295,9 @@ impl Transcript {
                         .overflow_hidden()
                         .rounded(px(USER_MESSAGE_CARD_RADIUS))
                         .border_1()
-                        .border_color(theme.border_strong)
-                        .bg(theme.bg)
-                        .shadow_sm()
+                        .border_color(theme.border)
+                        .bg(user_message_card_background(&theme))
+                        .when(!theme.is_frost(), |el| el.shadow_lg())
                         .px(px(12.0))
                         .py(px(USER_MESSAGE_CARD_PAD_Y))
                         .text_size(px(14.0))
@@ -3321,7 +3325,7 @@ impl Transcript {
                         .id(SharedString::from(format!("{}#user-card", row.id)));
                     if overflow {
                         let weak = cx.weak_entity();
-                        let fade_bg = theme.bg;
+                        let fade_bg = user_message_card_background(&theme);
                         let hover_border = theme.accent.opacity(0.40);
                         card = card
                             .cursor_pointer()
@@ -3356,9 +3360,9 @@ impl Transcript {
                             .w_full()
                             .rounded(px(USER_MESSAGE_CARD_RADIUS))
                             .border_1()
-                            .border_color(theme.border_strong)
-                            .bg(theme.bg)
-                            .shadow_sm()
+                            .border_color(theme.border)
+                            .bg(user_message_card_background(&theme))
+                            .when(!theme.is_frost(), |el| el.shadow_lg())
                             .px(px(12.0))
                             .py(px(USER_MESSAGE_CARD_PAD_Y))
                             .text_size(px(14.0))
@@ -5608,6 +5612,12 @@ mod tests {
         let (max_width, max_height) = full_message_dialog_limits(viewport);
         assert_eq!(max_width, px(672.0));
         assert_eq!(max_height, px(640.0));
+    }
+
+    #[test]
+    fn user_message_card_matches_the_composer_background() {
+        let theme = Theme::dark();
+        assert_eq!(user_message_card_background(&theme), theme.input_glass_bg());
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
