@@ -43,8 +43,18 @@ struct Inner {
 
 pub struct OmpProcess {
     inner: Arc<Inner>,
-    child: tokio::sync::Mutex<Child>,
-    events: Mutex<Option<mpsc::Receiver<Value>>>,
+    child: Arc<tokio::sync::Mutex<Child>>,
+    events: Arc<Mutex<Option<mpsc::Receiver<Value>>>>,
+}
+
+impl Clone for OmpProcess {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            child: Arc::clone(&self.child),
+            events: Arc::clone(&self.events),
+        }
+    }
 }
 
 impl std::fmt::Debug for OmpProcess {
@@ -57,7 +67,13 @@ impl OmpProcess {
     pub async fn start(launch: OmpLaunch) -> Result<Self, HarnessError> {
         let mut command = Command::new(&launch.executable);
         command
-            .args(["--mode", "rpc-ui", "--auto-approve", "--no-extensions"])
+            .args([
+                "--mode",
+                "rpc-ui",
+                "--auto-approve",
+                "--no-extensions",
+                "--allow-home",
+            ])
             .arg("--cwd")
             .arg(&launch.cwd);
         if launch.ephemeral {
@@ -136,8 +152,8 @@ impl OmpProcess {
 
         let process = Self {
             inner,
-            child: tokio::sync::Mutex::new(child),
-            events: Mutex::new(Some(event_rx)),
+            child: Arc::new(tokio::sync::Mutex::new(child)),
+            events: Arc::new(Mutex::new(Some(event_rx))),
         };
         match tokio::time::timeout(launch.handshake_timeout, ready_rx).await {
             Ok(Ok(Ok(()))) => Ok(process),

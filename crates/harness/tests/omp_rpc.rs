@@ -2,13 +2,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::{StreamExt as _, stream::BoxStream};
 use serde_json::{Value, json};
 use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{MAX_INBOUND_BYTES, parse_frame, sanitize_diagnostic};
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
-use zeron_proto::{AgentEvent, DoneStatus, ReasoningLevel, ToolCall};
+use zeron_harness::{
+    CancellationToken, Harness, HarnessError, OmpHarness, RunControls, SteerMessage,
+};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer,
+};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp-rpc.sh")
@@ -37,6 +44,78 @@ fn fake_launch(scenario: &str) -> OmpLaunch {
         handshake_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(1),
     }
+}
+
+fn fake_harness(scenario: &str) -> OmpHarness {
+    OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(fake_env(scenario))
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+}
+
+fn request(prompt: &str) -> RunRequest {
+    RunRequest {
+        prompt: prompt.to_owned(),
+        harness: Some(HarnessId::Omp),
+        model: None,
+        reasoning: None,
+        model_options: serde_json::Map::new(),
+        cwd: std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: false,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
+        resume: None,
+        attachments: Vec::new(),
+        worktree: None,
+    }
+}
+
+fn controls_with_answer(
+    label: &'static str,
+) -> (
+    RunControls,
+    tokio::sync::mpsc::Sender<SteerMessage>,
+    CancellationToken,
+) {
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
+    let interrupt = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let answers = questions
+                .into_iter()
+                .map(|question| UserInputAnswer {
+                    question_id: question.id,
+                    labels: vec![label.to_owned()],
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: interrupt.clone(),
+    };
+    (controls, steer_tx, interrupt)
+}
+
+async fn collect_until_done(
+    stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    events
 }
 
 #[test]
@@ -232,4 +311,89 @@ async fn workers_host_tool_is_registered_only_when_enabled() {
     assert_eq!(result["isError"], false);
     assert_eq!(result["result"]["content"][0]["text"], "worker help");
     enabled.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_streams_resumes_steers_answers_and_completes_once() {
+    let harness = fake_harness("full-run");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut request = request("hello");
+    request.model = Some("openai-codex/gpt-5.6-sol".into());
+    request.reasoning = Some(ReasoningLevel::High);
+    request.resume = Some("/tmp/omp-session.jsonl".into());
+    request.enable_workers_mcp = true;
+    request.workers_parent_chat_id = Some("chat-1".into());
+
+    let mut stream = harness.run(request, controls).await.unwrap();
+    steer
+        .send(SteerMessage {
+            prompt: "next".into(),
+            message_id: Some("m2".into()),
+        })
+        .await
+        .unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Omp,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { text } if text == " after steer"
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Steered { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCall { call: ToolCall::Exec { command }, .. } if command == "cargo test"
+    )));
+}
+
+#[tokio::test]
+async fn run_reports_provider_error_honestly() {
+    let harness = fake_harness("provider-error");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut request = request("fail");
+    request.model = Some("openai-codex/gpt-5.6-sol".into());
+    request.reasoning = Some(ReasoningLevel::High);
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), .. }
+            if error == "provider failed"
+    )));
+}
+
+#[tokio::test]
+async fn run_interrupts_a_waiting_rpc_turn() {
+    let harness = fake_harness("wait");
+    let (controls, _steer, interrupt) = controls_with_answer("Yes");
+    let mut request = request("wait");
+    request.model = Some("openai-codex/gpt-5.6-sol".into());
+    request.reasoning = Some(ReasoningLevel::High);
+    let mut stream = harness.run(request, controls).await.unwrap();
+    interrupt.cancel();
+    let events = collect_until_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        }
+    )));
 }
