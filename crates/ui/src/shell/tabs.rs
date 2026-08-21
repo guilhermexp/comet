@@ -1,9 +1,8 @@
 //! Session navigation — the horizontal tab strip is gone (wing 2026-08-10):
 //! the activity sidebar IS the session list, and the titlebar names the
-//! selected session (harness brand icon + title). When the sidebar is
-//! collapsed, a `+` new-session button fades into the titlebar's left end
-//! (riding the sidebar width tween). `UiSettings.open_tabs` is legacy — no
-//! longer read or written.
+//! selected session (harness brand icon + title). A `+` new-session button
+//! lives in the titlebar's left control cluster while an existing session is
+//! selected. `UiSettings.open_tabs` is legacy — no longer read or written.
 
 use super::*;
 
@@ -92,10 +91,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// `+` (sidebar header, or the titlebar while the sidebar is collapsed):
-    /// open the new-session canvas. A set sidebar filter re-homes the canvas
-    /// onto that project; under "All" the current pick (the last selected
-    /// project, restored from composer defaults) stands.
+    /// `+` in the titlebar: open the new-session canvas. A set sidebar filter
+    /// re-homes the canvas onto that project; under "All" the current pick
+    /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         if self.sidebar_mode == SidebarMode::Workers {
             self.workers_model.update(cx, |model, cx| {
@@ -141,7 +139,7 @@ impl Shell {
     }
 
     /// The unified titlebar in chat mode:
-    /// `[fading +] [harness icon + session title] … [utility controls]`.
+    /// `[new-session +] [harness icon + session title] … [utility controls]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, terminal and utility-panel controls).
     pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -187,12 +185,11 @@ impl Shell {
         let terminal_active =
             pane_open && matches!(self.resolved_right_active(cx), RightSurface::Terminal(_));
 
-        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER while the
-        // sidebar is collapsed (`render_titlebar_cluster`) — this row only
-        // budgets for it: the title's left inset grows by one button slot as
-        // the + fades in, so the text never sits under it.
+        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
+        // session is selected (`render_titlebar_cluster`) — this row budgets
+        // one button slot so the title never sits under it.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha();
+        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
         let details_open = self.details_sidebar_open(cx);
         let details_now = if details_open {
             self.eval_tween(self.details_tween, self.details_target(cx))
