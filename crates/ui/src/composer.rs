@@ -65,6 +65,8 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// `max-w-3xl`: stable outer width of the centered composer column.
 const COMPOSER_MAX_WIDTH: f32 = 768.0;
+/// Main composer pill: slightly softer than a card without reading as a capsule.
+const COMPOSER_CORNER_RADIUS: f32 = 22.0;
 /// Ignore subpixel noise when the shell reports the conversation width.
 const COMPOSER_WIDTH_EPSILON: f32 = 0.5;
 /// Below this pill input width the composer always expands.
@@ -5915,7 +5917,7 @@ impl Render for Composer {
         let strip = self.render_attachment_strip(&theme, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // The pill chrome (zeron composer.tsx): `rounded-[26px] border
+        // The pill chrome: 22px corners, border
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Attach and the
         // send circle live inside; model/effort now belong to the footer.
@@ -5924,7 +5926,7 @@ impl Render for Composer {
         // shows through as an inner glow (theme.rs's card_selected_shadows
         // lesson; user report).
         let pill = div()
-            .rounded(px(26.0))
+            .rounded(px(COMPOSER_CORNER_RADIUS))
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
@@ -6092,6 +6094,11 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_composer_uses_the_refined_corner_radius() {
+        assert_eq!(COMPOSER_CORNER_RADIUS, 22.0);
+    }
 
     #[test]
     fn empty_new_chat_uses_compact_composer() {
