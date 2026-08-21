@@ -1465,6 +1465,25 @@ struct OwnTurnAnchor {
     positioned: bool,
 }
 
+#[derive(Clone)]
+struct UserMessagePreview {
+    row_id: SharedString,
+    text: SharedString,
+    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+}
+
+fn user_message_preview(
+    row_id: SharedString,
+    text: SharedString,
+    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+) -> UserMessagePreview {
+    UserMessagePreview {
+        row_id,
+        text,
+        mentions,
+    }
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
@@ -1575,6 +1594,12 @@ pub struct Transcript {
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
     attachment_preview_focus: gpui::FocusHandle,
+    /// Shaped-content overflow for each user card, reported after prepaint.
+    user_message_overflow: HashMap<SharedString, bool>,
+    /// Full text opened from a clipped user-message card.
+    user_message_preview: Option<UserMessagePreview>,
+    /// Focused while the full-message overlay is open so Escape reaches it.
+    user_message_preview_focus: gpui::FocusHandle,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
     /// source; results land in the global attachment cache.
     attachment_loads: HashMap<(String, String), Task<()>>,
@@ -1726,6 +1751,9 @@ impl Transcript {
             copied_clear: None,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
+            user_message_overflow: HashMap::new(),
+            user_message_preview: None,
+            user_message_preview_focus: cx.focus_handle(),
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -2480,6 +2508,8 @@ impl Transcript {
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.user_message_overflow.clear();
+            self.user_message_preview = None;
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -2863,7 +2893,7 @@ impl Transcript {
             .h(px(ATT_STRIP_H))
             .flex()
             .flex_row()
-            .justify_end()
+            .justify_start()
             .items_start()
             .gap(px(8.0))
             .overflow_hidden()
@@ -2918,6 +2948,7 @@ impl Transcript {
                         .bg(crate::theme::ink(0.035))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            this.user_message_preview = None;
                             this.attachment_preview = Some(preview.clone());
                             window.focus(&this.attachment_preview_focus, cx);
                             cx.notify();
@@ -3215,9 +3246,9 @@ impl Transcript {
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
-                // Attachment thumbnails ride ABOVE the bubble, right-aligned
-                // (chat-view.tsx RowView: UserAttachmentStrip then the text
-                // HStack); image-only sends show no bubble at all.
+                // Attachment thumbnails and context badges ride above the
+                // full-width user card, aligned to the transcript's leading
+                // edge like Orchestrator.dev's AgentUserMessageBubble.
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
@@ -3229,7 +3260,7 @@ impl Transcript {
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .justify_end()
+                            .justify_start()
                             .items_center()
                             .gap(px(6.0))
                             .pb(px(6.0))
@@ -3243,27 +3274,98 @@ impl Transcript {
                     );
                 }
                 if !text.is_empty() {
-                    // `min_w_0` is load-bearing: gpui text answers min/max-content
-                    // probes with its UNWRAPPED width, so without it the bubble's
-                    // automatic min-size is the full single-line width — the flex
-                    // item can't shrink, `justify_end` pushes the overflow off the
-                    // left edge, and long prompts render as one clipped line
-                    // instead of wrapping inside the 80% column cap.
+                    let overflow = self
+                        .user_message_overflow
+                        .get(&row.id)
+                        .copied()
+                        .unwrap_or(false);
+                    let overflow_key = row.id.clone();
+                    let weak = cx.weak_entity();
+                    let preview =
+                        user_message_preview(row.id.clone(), text.clone(), mentions.clone());
+                    let mut card = div()
+                        .relative()
+                        .min_w_0()
+                        .w_full()
+                        .max_h(px(USER_MESSAGE_CARD_MAX_HEIGHT))
+                        .overflow_hidden()
+                        .rounded(px(USER_MESSAGE_CARD_RADIUS))
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .bg(theme.bg)
+                        .shadow_sm()
+                        .px(px(12.0))
+                        .py(px(USER_MESSAGE_CARD_PAD_Y))
+                        .text_size(px(14.0))
+                        .line_height(px(22.0))
+                        .text_color(theme.text)
+                        .when(pending, |el| el.opacity(0.65))
+                        .child(user_bubble_text(&row.id, text, mentions, &theme))
+                        .on_children_prepainted(move |bounds, _, cx| {
+                            let measured = bounds
+                                .first()
+                                .map(|bounds| f32::from(bounds.size.height))
+                                .unwrap_or(0.0);
+                            let next = user_message_overflows(measured);
+                            weak.update(cx, |this, cx| {
+                                if this
+                                    .user_message_overflow
+                                    .insert(overflow_key.clone(), next)
+                                    != Some(next)
+                                {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .id(SharedString::from(format!("{}#user-card", row.id)));
+                    if overflow {
+                        let weak = cx.weak_entity();
+                        let fade_bg = theme.bg;
+                        let hover_border = theme.accent.opacity(0.40);
+                        card = card
+                            .cursor_pointer()
+                            .hover(move |style| style.border_color(hover_border))
+                            .on_click(move |_, window, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.attachment_preview = None;
+                                    this.user_message_preview = Some(preview.clone());
+                                    window.focus(&this.user_message_preview_focus, cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(USER_MESSAGE_FADE_HEIGHT))
+                                    .bg(gpui::linear_gradient(
+                                        0.0,
+                                        gpui::linear_color_stop(fade_bg, 0.0),
+                                        gpui::linear_color_stop(fade_bg.opacity(0.0), 1.0),
+                                    )),
+                            );
+                    }
+                    column = column.child(card);
+                } else if let Some(summary) = user_message_attachment_summary(attachments.len()) {
                     column = column.child(
-                        div().w_full().flex().justify_end().child(
-                            div()
-                                .min_w_0()
-                                .max_w(px(MAX_CONTENT_WIDTH * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
-                                .rounded(px(Theme::BUBBLE_RADIUS))
-                                .px(px(16.0))
-                                .py(px(10.0))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
-                                .text_color(theme.text)
-                                .when(pending, |el| el.opacity(0.65))
-                                .child(user_bubble_text(&row.id, text, mentions, &theme)),
-                        ),
+                        div()
+                            .w_full()
+                            .rounded(px(USER_MESSAGE_CARD_RADIUS))
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .bg(theme.bg)
+                            .shadow_sm()
+                            .px(px(12.0))
+                            .py(px(USER_MESSAGE_CARD_PAD_Y))
+                            .text_size(px(14.0))
+                            .text_color(theme.text_muted)
+                            .italic()
+                            .when(pending, |el| el.opacity(0.65))
+                            .child(summary),
                     );
                 }
                 column.into_any_element()
@@ -5378,6 +5480,19 @@ mod tests {
             user_message_attachment_summary(3).as_deref(),
             Some("Using 3 images"),
         );
+    }
+
+    #[test]
+    fn user_message_preview_preserves_text_and_mentions() {
+        let mentions = Arc::new(vec![crate::composer::SentMentionSpan {
+            range: 0..7,
+            path: "src/lib.rs".into(),
+            is_dir: false,
+        }]);
+        let preview = user_message_preview("row-1".into(), "src/lib".into(), mentions.clone());
+        assert_eq!(preview.row_id, "row-1");
+        assert_eq!(preview.text, "src/lib");
+        assert_eq!(preview.mentions, mentions);
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
