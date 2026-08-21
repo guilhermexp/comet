@@ -436,6 +436,85 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     }
 }
 
+/// Runtime-neutral lifecycle state for one transcript tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Pending,
+    Success,
+    Failed,
+}
+
+/// Presentation copy and detail for one tool at a specific lifecycle point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPresentation {
+    pub label: &'static str,
+    pub detail: String,
+    pub outcome: ToolOutcome,
+    /// Commands get an explicit Success/Failed trail; quieter tool rows rely on
+    /// their completed verb and error tint instead.
+    pub show_outcome_label: bool,
+}
+
+/// Derive live/completed copy from the shared tool lifecycle. Harnesses report
+/// only shape + resolution; every viewport should narrate that state the same
+/// way instead of adding provider-specific labels.
+pub fn tool_presentation(
+    call: &crate::ToolCall,
+    resolved: bool,
+    is_error: bool,
+) -> ToolPresentation {
+    use crate::ToolCall;
+    let label = match (call, resolved) {
+        (ToolCall::Exec { .. }, false) => "Running command",
+        (ToolCall::Exec { .. }, true) => "Ran command",
+        (ToolCall::ReadFile { .. }, false) => "Reading",
+        (ToolCall::ReadFile { .. }, true) => "Read",
+        (ToolCall::WriteFile { .. }, false) => "Creating",
+        (ToolCall::WriteFile { .. }, true) => "Created",
+        (ToolCall::EditFile { .. }, false) => "Editing",
+        (ToolCall::EditFile { .. }, true) => "Edited",
+        (ToolCall::ApplyPatch { .. }, false) => "Applying patch",
+        (ToolCall::ApplyPatch { .. }, true) => "Applied patch",
+        (ToolCall::Search { .. }, false) => "Searching",
+        (ToolCall::Search { .. }, true) => "Searched",
+        (ToolCall::Glob { .. }, false) => "Exploring files",
+        (ToolCall::Glob { .. }, true) => "Explored files",
+        (ToolCall::WebFetch { .. }, false) => "Fetching",
+        (ToolCall::WebFetch { .. }, true) => "Fetched",
+        (ToolCall::WebSearch { .. }, false) => "Searching web",
+        (ToolCall::WebSearch { .. }, true) => "Searched web",
+        (ToolCall::Todo { .. }, false) => "Updating todos",
+        (ToolCall::Todo { .. }, true) => "Updated todos",
+        (ToolCall::Mcp { .. }, false) => "Calling tool",
+        (ToolCall::Mcp { .. }, true) => "Called tool",
+        (ToolCall::Unknown { name, .. }, false)
+            if name == "Agent" || name.starts_with("Agent: ") =>
+        {
+            "Running agent"
+        }
+        (ToolCall::Unknown { name, .. }, true)
+            if name == "Agent" || name.starts_with("Agent: ") =>
+        {
+            "Agent completed"
+        }
+        (ToolCall::Unknown { .. }, false) => "Running tool",
+        (ToolCall::Unknown { .. }, true) => "Ran tool",
+    };
+    let (_, detail) = tool_chip_content_raw(call);
+    ToolPresentation {
+        label,
+        detail: single_line(&detail),
+        outcome: if !resolved {
+            ToolOutcome::Pending
+        } else if is_error {
+            ToolOutcome::Failed
+        } else {
+            ToolOutcome::Success
+        },
+        show_outcome_label: resolved && matches!(call, ToolCall::Exec { .. }),
+    }
+}
+
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
 /// Takes `(call, is_error)` pairs so each viewport can keep its own row model;
@@ -511,6 +590,71 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         summary.replace_range(0..1, &upper);
     }
     summary
+}
+
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+    use crate::ToolCall;
+
+    #[test]
+    fn exec_presentation_tracks_running_success_and_failure() {
+        let call = ToolCall::Exec {
+            command: "cargo test".into(),
+        };
+        let running = tool_presentation(&call, false, false);
+        assert_eq!(running.label, "Running command");
+        assert_eq!(running.detail, "cargo test");
+        assert_eq!(running.outcome, ToolOutcome::Pending);
+        assert!(!running.show_outcome_label);
+
+        let success = tool_presentation(&call, true, false);
+        assert_eq!(success.label, "Ran command");
+        assert_eq!(success.outcome, ToolOutcome::Success);
+        assert!(success.show_outcome_label);
+
+        let failed = tool_presentation(&call, true, true);
+        assert_eq!(failed.label, "Ran command");
+        assert_eq!(failed.outcome, ToolOutcome::Failed);
+        assert!(failed.show_outcome_label);
+    }
+
+    #[test]
+    fn non_exec_tools_use_active_and_completed_verbs_without_outcome_badges() {
+        let cases = [
+            (
+                ToolCall::ReadFile {
+                    path: "src/lib.rs".into(),
+                },
+                "Reading",
+                "Read",
+            ),
+            (
+                ToolCall::EditFile {
+                    path: "src/lib.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+                "Editing",
+                "Edited",
+            ),
+            (
+                ToolCall::Search {
+                    pattern: "needle".into(),
+                    path: None,
+                },
+                "Searching",
+                "Searched",
+            ),
+        ];
+        for (call, active, completed) in cases {
+            assert_eq!(tool_presentation(&call, false, false).label, active);
+            let settled = tool_presentation(&call, true, false);
+            assert_eq!(settled.label, completed);
+            assert_eq!(settled.outcome, ToolOutcome::Success);
+            assert!(!settled.show_outcome_label);
+        }
+    }
 }
 
 /// The status-dot palette, as oklch triples (L, C, H°).
