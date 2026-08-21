@@ -37,10 +37,13 @@ fi
 while IFS= read -r line; do
   case "$(field type "$line")" in
     get_state)
-      respond "$line" '{"sessionId":"s-1","thinkingLevel":"high"}'
+      respond "$line" '{"sessionId":"s-1","thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
       ;;
     get_available_models)
-      respond "$line" '{"models":[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}]}'
+      respond "$line" '{"models":[{"provider":"anthropic","id":"shared","name":"Claude Shared","reasoning":false},{"provider":"openai-codex","id":"shared","name":"Codex Shared","reasoning":true},{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"contextWindow":400000}]}'
+      ;;
+    get_available_commands)
+      respond "$line" '{"commands":[{"name":"model","description":"Select model","input":{"hint":"provider/model"}},{"name":"compact","description":"Compact context"}]}'
       ;;
     *)
       respond "$line" '{}'
