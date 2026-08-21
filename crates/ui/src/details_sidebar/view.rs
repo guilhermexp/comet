@@ -1405,7 +1405,9 @@ impl DetailsSidebar {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let key = row.label.to_string();
-        let expanded = self.usage_expanded.contains(&key);
+        let expandable = row.state == ProviderUsageState::Ready
+            && (!row.windows.is_empty() || !row.usage_lines.is_empty());
+        let expanded = expandable && self.usage_expanded.contains(&key);
         let icon_path = if row.harness == HarnessId::ClaudeCode {
             icons::CLAUDE_MARK
         } else {
@@ -1421,6 +1423,7 @@ impl DetailsSidebar {
             ProviderUsageState::NotSignedIn => "Not signed in".into(),
         };
         let windows = row.windows.clone();
+        let usage_lines = row.usage_lines.clone();
         div()
             .border_t_1()
             .border_color(theme.border.opacity(0.55))
@@ -1432,13 +1435,16 @@ impl DetailsSidebar {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.usage_expanded.remove(&key) {
-                            this.usage_expanded.insert(key.clone());
-                        }
-                        cx.notify();
-                    }))
+                    .when(expandable, |header| {
+                        header
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.usage_expanded.remove(&key) {
+                                    this.usage_expanded.insert(key.clone());
+                                }
+                                cx.notify();
+                            }))
+                    })
                     .child(icons::icon(icon_path).size(px(15.0)).text_color(
                         if row.harness == HarnessId::ClaudeCode {
                             icons::claude_brand()
@@ -1461,31 +1467,156 @@ impl DetailsSidebar {
                             .text_color(theme.text_muted)
                             .child(summary),
                     )
-                    .child(
-                        icons::icon(icons::ALT_ARROW_DOWN)
+                    .when(expandable, |header| {
+                        header.child(
+                            icons::icon(if expanded {
+                                icons::ALT_ARROW_UP
+                            } else {
+                                icons::ALT_ARROW_DOWN
+                            })
                             .size(px(13.0))
                             .text_color(theme.text_muted),
-                    ),
+                        )
+                    }),
             )
             .when(expanded, |container| {
-                container.child(div().children(windows.into_iter().map(|window| {
+                container.child(
                     div()
-                        .h(px(30.0))
-                        .px(px(10.0))
                         .border_t_1()
                         .border_color(theme.border.opacity(0.4))
-                        .flex()
-                        .items_center()
-                        .text_size(px(11.5))
-                        .text_color(theme.text_muted)
-                        .child(window.label)
-                        .child(
+                        .px(px(10.0))
+                        .py(px(9.0))
+                        .children(windows.into_iter().map(|window| {
+                            let remaining = 1.0 - window.used_fraction;
+                            let fill = if window.remaining_percent <= 10 {
+                                theme.danger
+                            } else if window.remaining_percent <= 25 {
+                                theme.warning
+                            } else {
+                                theme.success
+                            };
+                            let label = if window.label.to_lowercase().contains("week") {
+                                "Weekly".to_string()
+                            } else if window.label.to_lowercase().contains("session") {
+                                "5h".to_string()
+                            } else {
+                                window.label.clone()
+                            };
+                            let pace = window.pace.clone();
                             div()
-                                .flex_1()
-                                .text_right()
-                                .child(format!("{}%", window.remaining_percent)),
-                        )
-                })))
+                                .pb(px(8.0))
+                                .text_size(px(11.5))
+                                .text_color(theme.text_muted)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(theme.text)
+                                                .child(format!(
+                                                    "{label}  {}% left",
+                                                    window.remaining_percent
+                                                )),
+                                        )
+                                        .child(div().flex_1())
+                                        .when_some(window.reset_text.clone(), |el, reset| {
+                                            el.child(reset)
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(5.0))
+                                        .h(px(6.0))
+                                        .w_full()
+                                        .rounded_full()
+                                        .overflow_hidden()
+                                        .relative()
+                                        .bg(crate::theme::ink(0.08))
+                                        .when(remaining > 0.0, |track| {
+                                            track.child(
+                                                div()
+                                                    .h_full()
+                                                    .w(gpui::relative(remaining))
+                                                    .rounded_full()
+                                                    .bg(fill),
+                                            )
+                                        })
+                                        .when_some(pace.clone(), |track, pace| {
+                                            track.child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left(gpui::relative(
+                                                        pace.expected_remaining_fraction,
+                                                    ))
+                                                    .w(px(2.0))
+                                                    .bg(
+                                                        if pace.amount_text.as_deref().is_some_and(
+                                                            |text| text.contains("deficit"),
+                                                        ) {
+                                                            theme.danger
+                                                        } else {
+                                                            theme.success
+                                                        },
+                                                    ),
+                                            )
+                                        }),
+                                )
+                                .when_some(pace, |el, pace| {
+                                    el.child(
+                                        div()
+                                            .mt(px(5.0))
+                                            .flex()
+                                            .items_center()
+                                            .child(pace.amount_text.unwrap_or_default())
+                                            .child(div().flex_1())
+                                            .child(pace.eta_text.unwrap_or_default()),
+                                    )
+                                })
+                        }))
+                        .when(!usage_lines.is_empty(), |body| {
+                            body.child(
+                                div()
+                                    .border_t_1()
+                                    .border_color(theme.border.opacity(0.4))
+                                    .pt(px(8.0))
+                                    .children(usage_lines.into_iter().map(|line| {
+                                        div()
+                                            .pb(px(7.0))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_size(px(11.5))
+                                                    .child(
+                                                        div()
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(theme.text)
+                                                            .child(line.label),
+                                                    )
+                                                    .child(div().flex_1())
+                                                    .child(
+                                                        div()
+                                                            .text_color(theme.text_muted)
+                                                            .child(line.value),
+                                                    ),
+                                            )
+                                            .when_some(line.subtitle, |el, subtitle| {
+                                                el.child(
+                                                    div()
+                                                        .mt(px(2.0))
+                                                        .text_size(px(11.0))
+                                                        .text_color(theme.text_muted.opacity(0.75))
+                                                        .child(subtitle),
+                                                )
+                                            })
+                                    })),
+                            )
+                        }),
+                )
             })
     }
 

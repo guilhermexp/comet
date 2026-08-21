@@ -295,6 +295,22 @@ impl AgentAccounts {
         let mut warnings: Vec<AgentAccountWarning> = Vec::new();
         let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
         let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
+        let mut local_usage = HashMap::new();
+        if force_usage {
+            let codex_root = self.inner.config.codex_home.join("sessions");
+            let claude_root = self.inner.config.claude_config_dir.join("projects");
+            let now = Utc::now();
+            let (codex, claude) = tokio::join!(
+                tokio::task::spawn_blocking(move || {
+                    crate::provider_usage_archive::codex_usage_lines(&codex_root, now)
+                }),
+                tokio::task::spawn_blocking(move || {
+                    crate::provider_usage_archive::claude_usage_lines(&claude_root, now)
+                }),
+            );
+            local_usage.insert(HarnessId::Codex, codex.unwrap_or_default());
+            local_usage.insert(HarnessId::ClaudeCode, claude.unwrap_or_default());
+        }
 
         let (claude, claude_warning) = self.detect_claude().await;
         if let Some(message) = claude_warning {
@@ -351,6 +367,7 @@ impl AgentAccounts {
                         .or_else(|| slot.profile.plan.clone()),
                     active,
                     usage_windows: usage.map(|usage| usage.windows).unwrap_or_default(),
+                    usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
                     display_name: slot.profile.display_name.clone(),
                     organization: slot.profile.organization.clone(),
                     auth_kind: Some(slot.profile.auth_kind),
@@ -370,6 +387,7 @@ impl AgentAccounts {
                     plan_label: u.profile.plan.clone(),
                     active: true,
                     usage_windows: Vec::new(),
+                    usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
                     display_name: u.profile.display_name.clone(),
                     organization: u.profile.organization.clone(),
                     auth_kind: Some(u.profile.auth_kind),

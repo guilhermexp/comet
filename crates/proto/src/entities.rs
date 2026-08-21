@@ -457,6 +457,9 @@ pub struct AgentAccount {
     pub active: bool,
     #[serde(default)]
     pub usage_windows: Vec<AgentUsageWindow>,
+    /// Local provider transcript/session archive totals (24h, 7d, 30d).
+    #[serde(default)]
+    pub usage_lines: Vec<AgentUsageLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,6 +542,15 @@ pub struct AgentUsageWindow {
     /// 0.0..=1.0
     pub used_fraction: f32,
     pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsageLine {
+    pub label: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
 }
 
 /// An open PTY session on the owning device (`OpenTerminal` reply).

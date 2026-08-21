@@ -1563,6 +1563,7 @@ mod tests {
             plan_label: None,
             active,
             usage_windows: vec![],
+            usage_lines: vec![],
             display_name: None,
             organization: None,
             auth_kind: None,
