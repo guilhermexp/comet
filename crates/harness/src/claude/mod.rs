@@ -111,6 +111,19 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     }
 }
 
+fn claude_context_window(request: &RunRequest) -> u64 {
+    if request
+        .model_options
+        .get("contextWindow")
+        .and_then(Value::as_str)
+        == Some("1m")
+    {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
 fn claude_workers_mcp_config_for(
     executable: &std::path::Path,
     request: &RunRequest,
@@ -526,6 +539,7 @@ impl Harness for ClaudeHarness {
             event_tx,
             controls,
             reasoning: request.reasoning,
+            context_window: claude_context_window(&request),
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -649,6 +663,7 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
+    context_window: u64,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
@@ -665,6 +680,7 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         reasoning,
+        context_window,
         interrupt_grace,
         kill_grace,
         stderr_tail,
@@ -676,7 +692,7 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = Arc::new(request_input);
 
-    let mut norm = Normalizer::new();
+    let mut norm = Normalizer::with_context_window(context_window);
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;

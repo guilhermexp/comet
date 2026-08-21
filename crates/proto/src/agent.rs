@@ -274,6 +274,15 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// The active prompt context reported by a runtime. This is a point-in-time
+/// snapshot, never a cumulative sum of historical turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub tokens: u64,
+    pub context_window: u64,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -319,11 +328,15 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
     },
-    /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
+    /// Turn usage plus an optional current-context snapshot. The event itself
+    /// stays out of transcripts; the engine mirrors only `context_usage` onto
+    /// the live session row for the composer gauge.
     #[serde(rename_all = "camelCase")]
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_usage: Option<ContextUsage>,
     },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
@@ -395,6 +408,33 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn usage_context_is_additive_and_round_trips() {
+        let old: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "usage",
+            "inputTokens": 12,
+            "outputTokens": 3
+        }))
+        .unwrap();
+        let AgentEvent::Usage { context_usage, .. } = old else {
+            panic!("usage event")
+        };
+        assert_eq!(context_usage, None);
+
+        let usage = AgentEvent::Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            context_usage: Some(ContextUsage {
+                tokens: 392_000,
+                context_window: 828_000,
+            }),
+        };
+        let value = serde_json::to_value(&usage).unwrap();
+        assert_eq!(value["contextUsage"]["tokens"], 392_000);
+        assert_eq!(value["contextUsage"]["contextWindow"], 828_000);
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), usage);
     }
 
     #[test]

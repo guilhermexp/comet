@@ -35,7 +35,7 @@ case "$first" in
   emit '{"ev":"tool","phase":"end","id":"task1","name":"task","args":{"description":"scan repo"},"error":false}'
   # Unknown frame kinds must be tolerated.
   emit '{"ev":"someNewThing","x":1}'
-  emit '{"ev":"usage","input":11,"output":5}'
+  emit '{"ev":"usage","input":11,"output":5,"contextTokens":16000,"contextWindow":200000}'
   emit '{"ev":"turn","status":"finished"}'
   # Parked: wait for a follow-up or stdin EOF.
   read -r next || exit 0

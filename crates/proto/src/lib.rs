@@ -1,8 +1,8 @@
 //! zeron-proto — wire types shared by engine, UI, and RPC.
 //!
 //! Ported from zeron's `packages/control/src/wire.ts` + `packages/harness/src/types.ts`.
-//! Token-usage *display* types are excluded by design; the `Usage` agent event is kept as a
-//! harness-level passthrough (rate-limit meters), never persisted into docs.
+//! Provider quota display types stay separate; the `Usage` agent event carries
+//! per-turn tokens plus an optional current-context snapshot mirrored onto live sessions.
 
 pub mod agent;
 pub mod entities;

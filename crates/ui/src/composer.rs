@@ -14,11 +14,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
-    DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
-    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
+    AnyElement, AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context,
+    CursorStyle, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels,
+    Point, ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
     prelude::*, px, quad, relative, size,
 };
@@ -78,6 +78,71 @@ pub const INPUT_TEXT_SIZE: f32 = 14.0;
 pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextIndicatorLevel {
+    Neutral,
+    Normal,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ContextIndicatorState {
+    used_fraction: f32,
+    used_percent: Option<u32>,
+    remaining_percent: Option<u32>,
+    detail: SharedString,
+    level: ContextIndicatorLevel,
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        let value = tokens as f64 / 1_000_000.0;
+        if tokens.is_multiple_of(1_000_000) {
+            format!("{value:.0}m")
+        } else {
+            format!("{value:.1}m")
+        }
+    } else if tokens >= 1_000 {
+        format!("{}k", ((tokens as f64) / 1_000.0).round() as u64)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn context_indicator_state(usage: Option<zeron_proto::ContextUsage>) -> ContextIndicatorState {
+    let Some(usage) = usage.filter(|usage| usage.context_window > 0) else {
+        return ContextIndicatorState {
+            used_fraction: 0.0,
+            used_percent: None,
+            remaining_percent: None,
+            detail: "Aguardando primeiro turno".into(),
+            level: ContextIndicatorLevel::Neutral,
+        };
+    };
+    let used_fraction = (usage.tokens as f64 / usage.context_window as f64).clamp(0.0, 1.0) as f32;
+    let used_percent = (used_fraction * 100.0).round() as u32;
+    let level = if used_fraction >= 0.95 {
+        ContextIndicatorLevel::Critical
+    } else if used_fraction >= 0.80 {
+        ContextIndicatorLevel::Warning
+    } else {
+        ContextIndicatorLevel::Normal
+    };
+    ContextIndicatorState {
+        used_fraction,
+        used_percent: Some(used_percent),
+        remaining_percent: Some(100 - used_percent),
+        detail: format!(
+            "{} / {} tokens",
+            compact_token_count(usage.tokens),
+            compact_token_count(usage.context_window)
+        )
+        .into(),
+        level,
+    }
+}
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -2767,6 +2832,56 @@ struct MentionPathTooltip {
     /// Stable for one `Waiting → Visible` promotion; a later activation gets
     /// a new key and therefore exactly one fresh fade-in.
     activation: u64,
+}
+
+struct ContextUsageTooltip {
+    state: ContextIndicatorState,
+}
+
+impl Render for ContextUsageTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .w(px(220.0))
+            .px(px(14.0))
+            .py(px(12.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(3.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_center()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child("Janela de contexto"),
+            )
+            .when_some(
+                self.state.used_percent.zip(self.state.remaining_percent),
+                |el, (used, remaining)| {
+                    el.child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(format!(
+                                "{used}% usado ({remaining}% restante)"
+                            ))),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.82))
+                    .child(self.state.detail.clone()),
+            )
+    }
 }
 
 impl Render for MentionPathTooltip {
@@ -5571,6 +5686,46 @@ impl Composer {
             }
         }
     }
+
+    fn render_context_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let usage = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_deref()
+                .and_then(|chat_id| state.session_for(chat_id))
+                .and_then(|session| session.context_usage)
+        };
+        let indicator = context_indicator_state(usage);
+        let fill = match indicator.level {
+            ContextIndicatorLevel::Neutral => theme.text_muted.opacity(0.28),
+            ContextIndicatorLevel::Normal => theme.text_muted.opacity(0.82),
+            ContextIndicatorLevel::Warning => theme.warning.opacity(0.9),
+            ContextIndicatorLevel::Critical => theme.danger.opacity(0.9),
+        };
+        let tooltip = indicator.clone();
+        div()
+            .id("composer-context-window")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .tooltip(move |_, cx| {
+                cx.new(|_| ContextUsageTooltip {
+                    state: tooltip.clone(),
+                })
+                .into()
+            })
+            .tooltip_show_delay(Duration::from_millis(180))
+            .child(crate::loaders::context_progress_ring(
+                indicator.used_fraction,
+                18.0,
+                theme.text_muted.opacity(0.16),
+                fill,
+            ))
+            .into_any_element()
+    }
 }
 
 /// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
@@ -5885,6 +6040,7 @@ impl Render for Composer {
         self.last_rendered_height = pill_height;
 
         let send_button = self.render_send_button(mode, cx);
+        let context_indicator = self.render_context_indicator(&theme, cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. `ml-1` per the source cluster — chips→attach reads
@@ -5985,6 +6141,7 @@ impl Render for Composer {
                         .pt(px(4.0))
                         .pb(px(10.0))
                         .child(div().flex_1().min_w_0())
+                        .child(context_indicator)
                         .child(attach)
                         .child(send_button),
                 )
@@ -6039,6 +6196,7 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .child(context_indicator)
                                 .child(attach)
                                 .child(send_button),
                         ),
@@ -6094,6 +6252,41 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_indicator_formats_neutral_and_reported_snapshots() {
+        let neutral = context_indicator_state(None);
+        assert_eq!(neutral.level, ContextIndicatorLevel::Neutral);
+        assert_eq!(neutral.used_fraction, 0.0);
+        assert_eq!(neutral.detail.as_ref(), "Aguardando primeiro turno");
+
+        let ready = context_indicator_state(Some(zeron_proto::ContextUsage {
+            tokens: 392_000,
+            context_window: 828_000,
+        }));
+        assert_eq!(ready.level, ContextIndicatorLevel::Normal);
+        assert_eq!(ready.used_percent, Some(47));
+        assert_eq!(ready.remaining_percent, Some(53));
+        assert_eq!(ready.detail.as_ref(), "392k / 828k tokens");
+    }
+
+    #[test]
+    fn context_indicator_clamps_and_uses_shared_thresholds() {
+        let warning = context_indicator_state(Some(zeron_proto::ContextUsage {
+            tokens: 800,
+            context_window: 1_000,
+        }));
+        assert_eq!(warning.level, ContextIndicatorLevel::Warning);
+
+        let critical = context_indicator_state(Some(zeron_proto::ContextUsage {
+            tokens: 2_000,
+            context_window: 1_000,
+        }));
+        assert_eq!(critical.level, ContextIndicatorLevel::Critical);
+        assert_eq!(critical.used_fraction, 1.0);
+        assert_eq!(critical.used_percent, Some(100));
+        assert_eq!(critical.remaining_percent, Some(0));
+    }
 
     #[test]
     fn main_composer_matches_the_user_message_card_radius() {

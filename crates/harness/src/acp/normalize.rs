@@ -9,7 +9,7 @@
 //! statuses are snake_case).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, ContextUsage, SlashCommand, TodoItem, ToolCall, ToolDiff};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only
@@ -430,12 +430,30 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             let commands = parse_commands(update.get("availableCommands"));
             vec![AgentEvent::AvailableCommands { commands }]
         }
-        // Context-window gauge, not per-turn input/output tokens — zeron's
-        // Usage event feeds rate-limit probes, so a wrong mapping is worse
-        // than none. Mode/config/session-info updates carry nothing we render.
-        "usage_update" | "current_mode_update" | "config_option_update" | "session_info_update" => {
-            Vec::new()
+        "usage_update" => {
+            let tokens = update
+                .get("used")
+                .or_else(|| update.get("tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let context_window = update
+                .get("size")
+                .or_else(|| update.get("contextWindow"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            (context_window > 0)
+                .then(|| AgentEvent::Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    context_usage: Some(ContextUsage {
+                        tokens,
+                        context_window,
+                    }),
+                })
+                .into_iter()
+                .collect()
         }
+        "current_mode_update" | "config_option_update" | "session_info_update" => Vec::new(),
         _ => Vec::new(),
     }
 }

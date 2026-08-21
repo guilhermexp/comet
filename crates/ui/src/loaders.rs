@@ -216,6 +216,51 @@ const RING_STROKE: f32 = 2.5;
 /// Polyline segments for a full circle — plenty for a ≤40px ring.
 const RING_SEGMENTS: f32 = 64.0;
 
+/// Small informational progress ring used by the composer context gauge.
+/// Unlike the upload ring it carries no centered text and accepts semantic
+/// theme colors, so it remains quiet until the tooltip is requested.
+pub fn context_progress_ring(
+    fraction: f32,
+    diameter: f32,
+    track: gpui::Hsla,
+    fill: gpui::Hsla,
+) -> AnyElement {
+    let fraction = fraction.clamp(0.0, 1.0);
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius = diameter / 2.0 - 2.0;
+            let mut paint_arc = |sweep: f32, color: gpui::Hsla| {
+                if sweep <= 0.0 {
+                    return;
+                }
+                let steps = ((RING_SEGMENTS * sweep).ceil() as usize).max(2);
+                let at = |i: usize| {
+                    let theta = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * sweep * (i as f32 / steps as f32);
+                    point(
+                        center.x + px(radius * theta.cos()),
+                        center.y + px(radius * theta.sin()),
+                    )
+                };
+                let mut builder = PathBuilder::stroke(px(2.0));
+                builder.move_to(at(0));
+                for i in 1..=steps {
+                    builder.line_to(at(i));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            paint_arc(1.0, track);
+            paint_arc(fraction, fill);
+        },
+    )
+    .size(px(diameter))
+    .into_any_element()
+}
+
 /// Radial upload-progress ring with the percent centered — overlaid on a
 /// sending echo's attachment thumbnail while its bytes cross the relay
 /// (2026-08-18 "Sending… forever" report; the thumbnail is where the wait

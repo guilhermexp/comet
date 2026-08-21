@@ -219,8 +219,15 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         },
     }));
 
-    // usage_update maps to nothing (context gauge, not per-turn tokens).
-    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
+    // ACP's usage_update is the context gauge, kept separate from turn usage.
+    assert!(events.contains(&AgentEvent::Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_usage: Some(zeron_proto::ContextUsage {
+            tokens: 1_200,
+            context_window: 500_000,
+        }),
+    }));
 
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
@@ -823,7 +830,8 @@ async fn stale_prompt_complete_never_settles_a_newer_turn() {
     // Grok-style `_meta` usage on the response is captured.
     assert!(events.contains(&AgentEvent::Usage {
         input_tokens: 9,
-        output_tokens: 4
+        output_tokens: 4,
+        context_usage: None,
     }));
 }
 

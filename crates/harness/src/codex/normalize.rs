@@ -62,15 +62,29 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
 /// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
 /// turn's tokens (held by the session loop, emitted before `Done`).
 pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
-    let last = field(params, &["tokenUsage", "token_usage"])?.get("last")?;
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let last = usage.get("last")?;
     let count = |keys: &[&str]| {
         field(last, keys)
             .and_then(Value::as_u64)
             .unwrap_or_default()
     };
+    let input_tokens = count(&["inputTokens", "input_tokens"]);
+    let output_tokens = count(&["outputTokens", "output_tokens"]);
+    let tokens = field(last, &["totalTokens", "total_tokens"])
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    let context_window = field(usage, &["modelContextWindow", "model_context_window"])
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let context_usage = (tokens > 0 && context_window > 0).then_some(zeron_proto::ContextUsage {
+        tokens,
+        context_window,
+    });
     Some(AgentEvent::Usage {
-        input_tokens: count(&["inputTokens", "input_tokens"]),
-        output_tokens: count(&["outputTokens", "output_tokens"]),
+        input_tokens,
+        output_tokens,
+        context_usage,
     })
 }
 
@@ -465,17 +479,31 @@ mod tests {
     #[test]
     fn usage_reads_last_snapshot_under_both_spellings() {
         assert_eq!(
-            usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
+            usage_event(&json!({"tokenUsage": {
+                "last": {"inputTokens": 42, "outputTokens": 7, "totalTokens": 49},
+                "modelContextWindow": 258_400
+            }})),
             Some(AgentEvent::Usage {
                 input_tokens: 42,
-                output_tokens: 7
+                output_tokens: 7,
+                context_usage: Some(zeron_proto::ContextUsage {
+                    tokens: 49,
+                    context_window: 258_400,
+                }),
             })
         );
         assert_eq!(
-            usage_event(&json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}})),
+            usage_event(&json!({"token_usage": {
+                "last": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "model_context_window": 128_000
+            }})),
             Some(AgentEvent::Usage {
                 input_tokens: 1,
-                output_tokens: 2
+                output_tokens: 2,
+                context_usage: Some(zeron_proto::ContextUsage {
+                    tokens: 3,
+                    context_window: 128_000,
+                }),
             })
         );
         assert_eq!(usage_event(&json!({})), None);

@@ -527,6 +527,16 @@ async fn run_streams_resumes_steers_answers_and_completes_once() {
         event,
         AgentEvent::TextDelta { text } if text == " after steer"
     )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Usage {
+            context_usage: Some(zeron_proto::ContextUsage {
+                tokens: 392_000,
+                context_window: 828_000,
+            }),
+            ..
+        }
+    )));
     assert!(
         events
             .iter()

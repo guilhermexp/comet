@@ -175,6 +175,7 @@ pub(crate) struct Normalizer {
     assistant_message_id: String,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
+    context_window: Option<u64>,
 }
 
 impl Normalizer {
@@ -184,6 +185,14 @@ impl Normalizer {
             agent_tasks: std::collections::HashMap::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
+            context_window: None,
+        }
+    }
+
+    pub fn with_context_window(context_window: u64) -> Self {
+        Self {
+            context_window: Some(context_window),
+            ..Self::new()
         }
     }
 
@@ -483,6 +492,18 @@ impl Normalizer {
                 let usage = AgentEvent::Usage {
                     input_tokens: f.usage.input_tokens,
                     output_tokens: f.usage.output_tokens,
+                    context_usage: self.context_window.and_then(|context_window| {
+                        let tokens = f
+                            .usage
+                            .input_tokens
+                            .saturating_add(f.usage.cache_read_input_tokens)
+                            .saturating_add(f.usage.cache_creation_input_tokens)
+                            .saturating_add(f.usage.output_tokens);
+                        (tokens > 0 && context_window > 0).then_some(zeron_proto::ContextUsage {
+                            tokens,
+                            context_window,
+                        })
+                    }),
                 };
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
@@ -613,6 +634,26 @@ mod tests {
         let events = normalize_one(raw);
         assert_eq!(events.len(), 2, "usage + done");
         events.into_iter().nth(1).expect("done event")
+    }
+
+    #[test]
+    fn result_usage_reports_current_context_including_cache_tokens() {
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"cache_read_input_tokens":80,"cache_creation_input_tokens":5,"output_tokens":7}}"#,
+        )
+        .unwrap();
+        let events = Normalizer::with_context_window(200_000).normalize(frame, false);
+        assert_eq!(
+            events.first(),
+            Some(&AgentEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 7,
+                context_usage: Some(zeron_proto::ContextUsage {
+                    tokens: 102,
+                    context_window: 200_000,
+                }),
+            })
+        );
     }
 
     #[test]

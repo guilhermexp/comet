@@ -12,7 +12,7 @@
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
-//!   updatedAt}
+//!   updatedAt, contextTokens?, contextWindow?}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
 //!
 //! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
@@ -438,6 +438,22 @@ impl WorkspaceDoc {
         row.insert("status", status_str(session.status))?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
+        match session.context_usage {
+            Some(usage) => {
+                row.insert(
+                    "contextTokens",
+                    i64::try_from(usage.tokens).unwrap_or(i64::MAX),
+                )?;
+                row.insert(
+                    "contextWindow",
+                    i64::try_from(usage.context_window).unwrap_or(i64::MAX),
+                )?;
+            }
+            None => {
+                row.delete("contextTokens")?;
+                row.delete("contextWindow")?;
+            }
+        }
         self.doc.commit();
         Ok(())
     }
@@ -684,6 +700,10 @@ pub(crate) struct RawSession {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
+    #[serde(default)]
+    context_tokens: Option<i64>,
+    #[serde(default)]
+    context_window: Option<i64>,
 }
 
 impl From<RawSession> for Session {
@@ -694,6 +714,16 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            context_usage: raw
+                .context_tokens
+                .zip(raw.context_window)
+                .and_then(|(tokens, context_window)| {
+                    Some(zeron_proto::ContextUsage {
+                        tokens: u64::try_from(tokens).ok()?,
+                        context_window: u64::try_from(context_window).ok()?,
+                    })
+                })
+                .filter(|usage| usage.context_window > 0),
         }
     }
 }
@@ -765,7 +795,20 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            context_usage: None,
         }
+    }
+
+    #[test]
+    fn session_context_usage_round_trips_through_workspace_rows() {
+        let ws = WorkspaceDoc::new();
+        let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+        row.context_usage = Some(zeron_proto::ContextUsage {
+            tokens: 392_000,
+            context_window: 828_000,
+        });
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row]);
     }
 
     fn cross_sync(a: &WorkspaceDoc, b: &WorkspaceDoc) {

@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{ContextUsage, HarnessId, ReasoningLevel, SandboxLevel};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +191,8 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -633,6 +635,31 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn session_context_is_additive_and_round_trips() {
+        let old: Session = serde_json::from_value(serde_json::json!({
+            "chatId": "chat-1",
+            "deviceId": "device-1",
+            "status": "idle",
+            "startedAt": null,
+            "updatedAt": "2026-08-21T12:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(old.context_usage, None);
+
+        let session = Session {
+            context_usage: Some(crate::ContextUsage {
+                tokens: 392_000,
+                context_window: 828_000,
+            }),
+            ..old
+        };
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["contextUsage"]["tokens"], 392_000);
+        assert_eq!(value["contextUsage"]["contextWindow"], 828_000);
+        assert_eq!(serde_json::from_value::<Session>(value).unwrap(), session);
+    }
 
     #[test]
     fn checkout_change_request_status_round_trips_all_states_as_camel_case() {

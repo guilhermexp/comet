@@ -851,6 +851,15 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
         "usage" => vec![AgentEvent::Usage {
             input_tokens: frame.get("input").and_then(Value::as_u64).unwrap_or(0),
             output_tokens: frame.get("output").and_then(Value::as_u64).unwrap_or(0),
+            context_usage: frame
+                .get("contextTokens")
+                .and_then(Value::as_u64)
+                .zip(frame.get("contextWindow").and_then(Value::as_u64))
+                .filter(|(_, context_window)| *context_window > 0)
+                .map(|(tokens, context_window)| zeron_proto::ContextUsage {
+                    tokens,
+                    context_window,
+                }),
         }],
         "turn" => {
             let status = frame.get("status").and_then(Value::as_str).unwrap_or("");

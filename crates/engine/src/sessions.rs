@@ -123,6 +123,17 @@ impl RuntimeConfig {
     }
 }
 
+fn apply_context_usage_to_session(
+    session: &mut Session,
+    context_usage: Option<zeron_proto::ContextUsage>,
+) -> bool {
+    if session.context_usage == context_usage {
+        return false;
+    }
+    session.context_usage = context_usage;
+    true
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
@@ -420,6 +431,10 @@ impl SessionsEngine {
             // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
         }
+
+        // This turn needs a fresh process. Until that runtime reports its own
+        // snapshot, the previous process's context measurement is stale.
+        self.inner.set_context_usage(chat_id, None);
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
@@ -870,6 +885,7 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    context_usage: None,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -902,6 +918,28 @@ impl Inner {
         };
         // Mirror the transition into the workspace doc's session-status row so
         // remote devices' sidebars show this run (staleness-checked client-side).
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
+    fn set_context_usage(&self, chat_id: &str, context_usage: Option<zeron_proto::ContextUsage>) {
+        let now = Utc::now();
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if !apply_context_usage_to_session(entry, context_usage) {
+                return;
+            }
+            entry.updated_at = now;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
         if let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
@@ -2018,6 +2056,12 @@ async fn drive_run(
             AgentEvent::InputResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
             }
+            AgentEvent::Usage {
+                context_usage: Some(context_usage),
+                ..
+            } => {
+                inner.set_context_usage(&chat_id, Some(*context_usage));
+            }
             _ => {}
         }
 
@@ -2193,9 +2237,35 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use super::{PendingInput, RuntimeConfig, resolve_pending_question, subagent_doc_id};
+    use super::{
+        PendingInput, RuntimeConfig, apply_context_usage_to_session, resolve_pending_question,
+        subagent_doc_id,
+    };
+    use chrono::Utc;
     use tokio::sync::oneshot;
-    use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+    use zeron_proto::{ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus};
+
+    #[test]
+    fn context_snapshot_updates_deduplicates_and_resets() {
+        let mut session = Session {
+            chat_id: "chat-1".into(),
+            device_id: "device-1".into(),
+            status: SessionStatus::Idle,
+            started_at: None,
+            updated_at: Utc::now(),
+            context_usage: None,
+        };
+        let usage = ContextUsage {
+            tokens: 392_000,
+            context_window: 828_000,
+        };
+        assert!(apply_context_usage_to_session(&mut session, Some(usage)));
+        assert_eq!(session.context_usage, Some(usage));
+        assert!(!apply_context_usage_to_session(&mut session, Some(usage)));
+        assert!(apply_context_usage_to_session(&mut session, None));
+        assert_eq!(session.context_usage, None);
+        assert!(!apply_context_usage_to_session(&mut session, None));
+    }
 
     fn request() -> RunRequest {
         RunRequest {

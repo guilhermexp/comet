@@ -513,6 +513,16 @@ fn state_session_id(state: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn context_usage_from_state(state: &Value) -> Option<zeron_proto::ContextUsage> {
+    let usage = state.get("contextUsage")?;
+    let tokens = usage.get("tokens").and_then(Value::as_u64)?;
+    let context_window = usage.get("contextWindow").and_then(Value::as_u64)?;
+    (context_window > 0).then_some(zeron_proto::ContextUsage {
+        tokens,
+        context_window,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     process: OmpProcess,
@@ -787,10 +797,21 @@ async fn finish_agent_end(
     if disposition == AgentEndDisposition::Continue {
         return false;
     }
-    if let Ok(state) = process.request(json!({ "type": "get_state" })).await
-        && let Some(current) = state_session_id(&state)
-    {
-        *session_id = current;
+    if let Ok(state) = process.request(json!({ "type": "get_state" })).await {
+        if let Some(current) = state_session_id(&state) {
+            *session_id = current;
+        }
+        if let Some(context_usage) = context_usage_from_state(&state) {
+            let _ = emit(
+                event_tx,
+                AgentEvent::Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    context_usage: Some(context_usage),
+                },
+            )
+            .await;
+        }
     }
     match disposition {
         AgentEndDisposition::Complete => {

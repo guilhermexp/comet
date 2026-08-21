@@ -49,7 +49,7 @@ while IFS= read -r line; do
       if [ "$scenario" = "missing-session" ]; then
         respond "$line" '{"thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
       else
-        respond "$line" '{"sessionId":"s-1","sessionFile":"/tmp/omp-session.jsonl","thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true},"dumpTools":[{"name":"bash","description":"Run commands","parameters":{"type":"object"}}]}'
+        respond "$line" '{"sessionId":"s-1","sessionFile":"/tmp/omp-session.jsonl","thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true},"contextUsage":{"tokens":392000,"contextWindow":828000,"percent":47.34},"dumpTools":[{"name":"bash","description":"Run commands","parameters":{"type":"object"}}]}'
       fi
       ;;
     get_available_models)

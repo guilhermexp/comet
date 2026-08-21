@@ -150,7 +150,11 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
 
     assert!(events.contains(&AgentEvent::Usage {
         input_tokens: 11,
-        output_tokens: 5
+        output_tokens: 5,
+        context_usage: Some(zeron_proto::ContextUsage {
+            tokens: 16_000,
+            context_window: 200_000,
+        }),
     }));
     assert!(matches!(
         events.last(),
