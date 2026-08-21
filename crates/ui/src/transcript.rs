@@ -852,6 +852,8 @@ pub struct Row {
     /// LAST row of a completed entry (user rows always; assistant rows only
     /// once streaming ends — "the turn isn't at a time yet", chat-view.tsx).
     pub timestamp: Option<i64>,
+    /// Authored entry text copied by the hover action on the final settled row.
+    pub copy_text: Option<SharedString>,
 }
 
 struct ProjectedRow {
@@ -1195,6 +1197,19 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool)
     fnv1a(&acc)
 }
 
+fn assistant_copy_text(entry: &SessionMessageEntry) -> Option<SharedString> {
+    let text = entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then(|| text.into())
+}
+
 fn inline_image_version(paths: &[String]) -> u64 {
     let mut bytes = Vec::new();
     for path in paths {
@@ -1423,6 +1438,7 @@ fn rows_for_entry_with_todo_history(
             // User rows always carry the strip (chat-view.tsx: whenever
             // `createdAt` exists — the optimistic echo included).
             timestamp: Some(entry.created_at),
+            copy_text: (!raw.trim().is_empty()).then(|| raw.trim().to_owned().into()),
         }];
     }
 
@@ -1470,6 +1486,7 @@ fn rows_for_entry_with_todo_history(
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
+                copy_text: None,
             },
         });
         if !image_paths.is_empty() {
@@ -1485,6 +1502,7 @@ fn rows_for_entry_with_todo_history(
                     },
                     entry_id: entry.id.clone().into(),
                     timestamp: None,
+                    copy_text: None,
                 },
             });
         }
@@ -1552,6 +1570,7 @@ fn rows_for_entry_with_todo_history(
                             },
                             entry_id: entry.id.clone().into(),
                             timestamp: None,
+                            copy_text: None,
                         },
                     });
                     todo_history.clone_from(items);
@@ -1613,6 +1632,7 @@ fn rows_for_entry_with_todo_history(
                             kind: RowKind::FileChange { tool: item },
                             entry_id: entry.id.clone().into(),
                             timestamp: None,
+                            copy_text: None,
                         },
                     });
                     continue;
@@ -1680,6 +1700,7 @@ fn rows_for_entry_with_todo_history(
                                     turn_start: false,
                                     entry_id: entry_id.clone(),
                                     timestamp: None,
+                                    copy_text: None,
                                     kind: if streaming {
                                         RowKind::LiveMarkdown {
                                             tree: tree.clone(),
@@ -1708,6 +1729,7 @@ fn rows_for_entry_with_todo_history(
                                     },
                                     entry_id: entry_id.clone(),
                                     timestamp: None,
+                                    copy_text: None,
                                 },
                             });
                         }
@@ -1739,6 +1761,7 @@ fn rows_for_entry_with_todo_history(
                                 },
                                 entry_id: entry_id.clone(),
                                 timestamp: None,
+                                copy_text: None,
                             },
                         });
                     }
@@ -1759,6 +1782,7 @@ fn rows_for_entry_with_todo_history(
                                 },
                                 entry_id: entry_id.clone(),
                                 timestamp: None,
+                                copy_text: None,
                             },
                         });
                     }
@@ -1790,6 +1814,7 @@ fn rows_for_entry_with_todo_history(
                                 },
                                 entry_id: entry_id.clone(),
                                 timestamp: None,
+                                copy_text: None,
                             },
                         });
                     }
@@ -1821,6 +1846,7 @@ fn rows_for_entry_with_todo_history(
             .find(|row| !matches!(row.row.kind, RowKind::InlineImages { .. }))
     {
         last.row.timestamp = Some(entry.created_at);
+        last.row.copy_text = assistant_copy_text(entry);
         last.row.version ^= 1 << 62;
     }
 
@@ -1860,6 +1886,7 @@ fn rows_for_entry_with_todo_history(
         },
         entry_id: entry_id.clone(),
         timestamp: None,
+        copy_text: None,
     };
 
     std::iter::once(steps)
@@ -2983,6 +3010,8 @@ pub struct Transcript {
     /// the companion task after ~1.2s.
     copied_code: Option<(SharedString, usize)>,
     copied_clear: Option<Task<()>>,
+    copied_message: Option<SharedString>,
+    copied_message_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -3272,6 +3301,8 @@ impl Transcript {
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
+            copied_message: None,
+            copied_message_clear: None,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             user_message_overflow: HashMap::new(),
@@ -4241,6 +4272,8 @@ impl Transcript {
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
+            self.copied_message = None;
+            self.copied_message_clear = None;
             self.list.reset(0);
             self.pending_viewport = None;
             self.viewport_generation = self.viewport_generation.wrapping_add(1);
@@ -5693,27 +5726,63 @@ impl Transcript {
             .then(|| (row.id.clone(), self.sticky_scroll_y));
         let inner = self.render_row_body(&row, user_geometry, window, &theme, cx);
 
-        // Hover-revealed timestamp strip (zeron chat-view.tsx `Timestamp`):
-        // a RESERVED 16px lane under the entry's last row — the label only
-        // flips opacity, so revealing it never shifts the virtualizer's
-        // layout. User entries align end (under the bubble), assistant start.
+        // Reserved metadata lane: timestamp plus entry-level copy action.
         let is_user_row = matches!(row.kind, RowKind::User { .. });
         let hovered = self
             .hovered_entry
             .as_ref()
             .is_some_and(|(_, entry)| entry == &row.entry_id);
-        // Vertical breathing room from the source: assistant text blocks sit
-        // in a `VStack padding={4}` (chat-view.tsx:183), so the strip starts
-        // 4px below the message text — the native markdown column has no such
-        // bottom padding, so the strip carries it as top inset (grown into the
-        // reserved height: reveal still never shifts layout). User rows are
-        // flush: the Timestamp follows the bubble HStack directly (VStack gap
-        // defaults to 0 in mugen), the label's centering inside the 16px lane
-        // is all the gap the original has.
+        let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
+        let copy_text = row.copy_text.clone();
+        let copy_entry_id = row.entry_id.clone();
         let strip = row.timestamp.map(|ms| {
+            let timestamp = div()
+                .text_size(px(12.0))
+                .text_color(theme.text_muted.opacity(0.55))
+                .child(SharedString::from(format_timestamp(ms, &chrono::Local)));
+            let copy = copy_text.map(|text| {
+                let entry_id = copy_entry_id.clone();
+                let fade_key = format!("copy-message-hover-{entry_id}");
+                div()
+                    .id(SharedString::from(format!("copy-message-{entry_id}")))
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &fade_key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    ))
+                    .on_hover(motion::hover_listener(fade_key))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_message(entry_id.clone(), text.clone(), cx)
+                    }))
+                    .child(
+                        crate::icons::icon(if copied_message {
+                            crate::icons::CHECK
+                        } else {
+                            crate::icons::COPY
+                        })
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                    )
+            });
+            let metadata = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_SM));
+            let metadata = if is_user_row {
+                metadata.child(timestamp).children(copy)
+            } else {
+                metadata.children(copy).child(timestamp)
+            };
             div()
-                .h(px(if is_user_row { 16.0 } else { 20.0 }))
-                .when(!is_user_row, |el| el.pt(px(4.0)))
+                .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
+                .pt(px(Theme::SPACE_SM))
                 .w_full()
                 .flex()
                 .items_center()
@@ -5727,11 +5796,8 @@ impl Transcript {
                 .when(is_user_row, |el| el.justify_end())
                 .when(hovered, |el| {
                     el.child(motion::fade_quick(
-                        SharedString::from(format!("ts-{}", row.id)),
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.55))
-                            .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
+                        SharedString::from(format!("meta-{}", row.id)),
+                        metadata,
                     ))
                 })
         });
@@ -6580,6 +6646,24 @@ impl Transcript {
             );
         }
         disclosure.into_any_element()
+    }
+
+    fn copy_message(&mut self, entry_id: SharedString, text: SharedString, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        self.copied_message = Some(entry_id);
+        self.copied_message_clear = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            this.update(cx, |this, cx| {
+                this.copied_message = None;
+                this.copied_message_clear = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
@@ -9373,6 +9457,7 @@ mod tests {
             },
             entry_id: entry_id.into(),
             timestamp: None,
+            copy_text: None,
         }
     }
 
@@ -9410,6 +9495,23 @@ mod tests {
         let echo_only = vec![viewport_row("echo", "echo-entry")];
         assert!(saved.resolve(&echo_only, false).is_none());
         assert!(saved.resolve(&echo_only, true).is_some());
+    }
+
+    #[test]
+    fn message_copy_keeps_authored_text_and_excludes_tool_traces() {
+        let entry = assistant(
+            "a-copy",
+            MessageStatus::Complete,
+            vec![
+                text_part("p1", "First **paragraph**."),
+                tool_part("tool", "printf hidden"),
+                text_part("p2", "Second paragraph."),
+            ],
+        );
+        assert_eq!(
+            assistant_copy_text(&entry).as_deref(),
+            Some("First **paragraph**.\n\nSecond paragraph.")
+        );
     }
 
     fn user_entry(id: &str) -> SessionMessageEntry {
