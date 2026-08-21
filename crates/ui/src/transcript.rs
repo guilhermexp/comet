@@ -4182,6 +4182,96 @@ fn user_bubble_text(
         .into_any_element()
 }
 
+fn full_message_dialog_limits(viewport: gpui::Size<Pixels>) -> (Pixels, Pixels) {
+    (
+        px((f32::from(viewport.width) - 32.0).clamp(0.0, 672.0)),
+        px(f32::from(viewport.height) * 0.80),
+    )
+}
+
+fn user_message_dialog(
+    viewport: gpui::Size<Pixels>,
+    preview: &UserMessagePreview,
+    focus: &gpui::FocusHandle,
+    theme: &Theme,
+    on_close: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let (max_w, max_h) = full_message_dialog_limits(viewport);
+    let on_close = Rc::new(on_close);
+    let close_on_key = on_close.clone();
+    let close_on_scrim = on_close.clone();
+    let message = user_bubble_text(
+        &SharedString::from(format!("{}#full", preview.row_id)),
+        preview.text.clone(),
+        preview.mentions.clone(),
+        theme,
+    );
+
+    gpui::deferred(
+        gpui::anchored()
+            .position(gpui::point(px(0.0), px(0.0)))
+            .child(
+                div()
+                    .id("full-user-message-scrim")
+                    .occlude()
+                    .track_focus(focus)
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .bg(crate::popover::scrim_alpha(0.70))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            close_on_key(window, cx);
+                        }
+                    })
+                    .on_click(move |_, window, cx| close_on_scrim(window, cx))
+                    .child(
+                        div()
+                            .id("full-user-message-card")
+                            .w(max_w)
+                            .max_h(max_h)
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .rounded(px(USER_MESSAGE_CARD_RADIUS))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.surface_dialog)
+                            .shadow_lg()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(16.0))
+                                    .pt(px(16.0))
+                                    .pb(px(10.0))
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted)
+                                    .child("Full message"),
+                            )
+                            .child(
+                                div()
+                                    .id("full-user-message-scroll")
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .px(px(16.0))
+                                    .pb(px(16.0))
+                                    .text_size(px(14.0))
+                                    .line_height(px(22.0))
+                                    .text_color(theme.text)
+                                    .child(message),
+                            ),
+                    ),
+            ),
+    )
+    .into_any_element()
+}
+
 /// The transcript ErrorChip — a port of zeron chat-view.tsx `ErrorChip`
 /// (34px-minimum row, `rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
@@ -4871,6 +4961,23 @@ impl Render for Transcript {
                 },
             ));
         }
+        if let Some(preview) = self.user_message_preview.clone() {
+            let weak = cx.weak_entity();
+            let theme = Theme::of(cx).clone();
+            return root.child(user_message_dialog(
+                window.viewport_size(),
+                &preview,
+                &self.user_message_preview_focus,
+                &theme,
+                move |_, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.user_message_preview = None;
+                        cx.notify();
+                    })
+                    .ok();
+                },
+            ));
+        }
         root
     }
 }
@@ -5493,6 +5600,14 @@ mod tests {
         assert_eq!(preview.row_id, "row-1");
         assert_eq!(preview.text, "src/lib");
         assert_eq!(preview.mentions, mentions);
+    }
+
+    #[test]
+    fn full_message_dialog_respects_the_reference_viewport_cap() {
+        let viewport = gpui::size(px(1200.0), px(800.0));
+        let (max_width, max_height) = full_message_dialog_limits(viewport);
+        assert_eq!(max_width, px(672.0));
+        assert_eq!(max_height, px(640.0));
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
