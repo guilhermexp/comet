@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/syntax",
+    "crates/theme",
     "crates/proto",
     "crates/doc",
     "crates/sync",
@@ -37,6 +38,7 @@ zeron-update = { path = "crates/update" }
 zeron-workers-unpeel = { path = "crates/workers-unpeel" }
 zeron-ui = { path = "crates/ui" }
 unpeel-core = { path = "third_party/unpeel/crates/unpeel-core" }
+zeron-theme = { path = "crates/theme" }
 
 # CRDT
 loro = "1.13"
@@ -89,6 +91,8 @@ async-trait = "0.1"
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+json5 = "0.4"
+plist = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # storage

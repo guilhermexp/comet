@@ -17,6 +17,7 @@ zeron-harness.workspace = true
 zeron-rpc.workspace = true
 comet-syntax.workspace = true
 zeron-workers-unpeel.workspace = true
+zeron-theme.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
