@@ -4191,21 +4191,23 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
-/// A small glyph standing in for the tool's icon (zeron uses an icon set; a
-/// quiet monochrome character keeps the tile without shipping SVGs).
-/// The glyph for a tool call (zeron tool-chip.tsx `toolIcon`, Solar set).
-fn tool_icon_path(call: &ToolCall) -> &'static str {
-    match call {
-        ToolCall::Exec { .. } => crate::icons::COMMAND,
-        ToolCall::ReadFile { .. } | ToolCall::ApplyPatch { .. } => crate::icons::DOCUMENT,
-        ToolCall::WriteFile { .. } => crate::icons::DOCUMENT_ADD,
-        ToolCall::EditFile { .. } => crate::icons::PEN,
-        ToolCall::Search { .. } => crate::icons::MAGNIFER,
-        ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
-        ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
-        ToolCall::Todo { .. } => crate::icons::CHECKLIST,
-        call if is_agent_call(call) => crate::icons::BOT,
-        ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
+fn tool_icon(call: &ToolCall, theme: &Theme) -> AnyElement {
+    let descriptor = crate::tool_icons::tool_icon_descriptor(call);
+    match &descriptor {
+        crate::tool_icons::ToolIconDescriptor::Material(_) => {
+            let image = descriptor
+                .material_image()
+                .expect("resolved tool icon is embedded");
+            img(image)
+                .size(px(12.0))
+                .object_fit(ObjectFit::Contain)
+                .flex_none()
+                .into_any_element()
+        }
+        crate::tool_icons::ToolIconDescriptor::Solar(path) => crate::icons::icon(*path)
+            .size(px(12.0))
+            .text_color(theme.text_muted)
+            .into_any_element(),
     }
 }
 
@@ -4358,11 +4360,7 @@ fn chip_header_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    crate::icons::icon(tool_icon_path(&tool.call))
-                        .size(px(12.0))
-                        .text_color(theme.text_muted),
-                ),
+                .child(tool_icon(&tool.call, theme)),
         )
         .child(
             div()

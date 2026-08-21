@@ -12,6 +12,15 @@ pub(crate) enum ToolIconDescriptor {
     Solar(&'static str),
 }
 
+impl ToolIconDescriptor {
+    pub(crate) fn material_image(&self) -> Option<std::sync::Arc<gpui::Image>> {
+        match self {
+            Self::Material(path) => crate::icons::material_file_icon_image(path.as_ref()),
+            Self::Solar(_) => None,
+        }
+    }
+}
+
 const COMMAND_ICONS: &[(&str, &str)] = &[
     ("bash", "console"),
     ("bun", "bun"),
@@ -370,5 +379,34 @@ mod tests {
             tool_icon_descriptor(&ToolCall::ApplyPatch { path: None }),
             ToolIconDescriptor::Solar(crate::icons::PEN),
         );
+    }
+
+    #[test]
+    fn every_material_descriptor_used_by_representative_calls_is_embedded() {
+        let calls = [
+            ToolCall::Exec {
+                command: "git status".into(),
+            },
+            ToolCall::Exec {
+                command: "python3 -m pytest".into(),
+            },
+            ToolCall::ReadFile {
+                path: "package.json".into(),
+            },
+            ToolCall::Unknown {
+                name: "browser_tool".into(),
+                input: None,
+            },
+        ];
+        for call in calls {
+            let descriptor = tool_icon_descriptor(&call);
+            let ToolIconDescriptor::Material(path) = &descriptor else {
+                panic!("representative call did not resolve to Material: {call:?}");
+            };
+            assert!(
+                descriptor.material_image().is_some(),
+                "missing embedded asset {path}",
+            );
+        }
     }
 }
