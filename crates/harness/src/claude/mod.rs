@@ -111,6 +111,61 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     }
 }
 
+fn claude_workers_mcp_config_for(
+    executable: &std::path::Path,
+    request: &RunRequest,
+    disabled_by_environment: bool,
+) -> Option<String> {
+    let server = crate::acp::workers_mcp_servers_for(
+        executable,
+        request.enable_workers_mcp,
+        disabled_by_environment,
+        request.workers_parent_chat_id.as_deref(),
+    )
+    .into_iter()
+    .next()?;
+    let name = server.get("name")?.as_str()?;
+    let command = server.get("command")?.clone();
+    let args = server
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let env = server
+        .get("env")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some((
+                row.get("name")?.as_str()?.to_owned(),
+                row.get("value")?.clone(),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Some(
+        serde_json::json!({
+            "mcpServers": {
+                name: {
+                    "command": command,
+                    "args": args,
+                    "env": env,
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn claude_workers_mcp_config(request: &RunRequest) -> Option<String> {
+    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
+        .ok()
+        .is_some_and(|value| value == "1");
+    let executable = std::env::var_os("ZERON_WORKERS_MCP_BIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())?;
+    claude_workers_mcp_config_for(&executable, request, disabled)
+}
+
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
@@ -220,6 +275,9 @@ impl ClaudeHarness {
         }
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
+        }
+        if let Some(config) = claude_workers_mcp_config(request) {
+            cmd.args(["--mcp-config", &config]);
         }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
@@ -867,6 +925,77 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+
+    fn workers_request(enabled: bool) -> RunRequest {
+        RunRequest {
+            prompt: "test".into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp/project".into(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            enable_workers_mcp: enabled,
+            workers_parent_chat_id: Some("parent-chat".into()),
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn native_workers_mcp_config_mounts_the_controller_without_persistence() {
+        let config = claude_workers_mcp_config_for(
+            Path::new("/absolute/zeron"),
+            &workers_request(true),
+            false,
+        )
+        .expect("Workers config");
+        let config: Value = serde_json::from_str(&config).expect("valid JSON");
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["command"],
+            "/absolute/zeron"
+        );
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["args"],
+            json!(["__workers_mcp__"])
+        );
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["env"]["COMET_WORKERS_CONTROLLER"],
+            "1"
+        );
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["env"]["COMET_WORKERS_PARENT_CHAT_ID"],
+            "parent-chat"
+        );
+        assert!(
+            claude_workers_mcp_config_for(
+                Path::new("/absolute/zeron"),
+                &workers_request(false),
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_workers_mcp_is_added_to_the_claude_process() {
+        let harness = ClaudeHarness::new();
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/claude"), &workers_request(true));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--mcp-config"));
+
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/claude"), &workers_request(false));
+        assert!(command.as_std().get_args().all(|arg| arg != "--mcp-config"));
+    }
 
     #[test]
     fn parses_questions_tolerantly() {

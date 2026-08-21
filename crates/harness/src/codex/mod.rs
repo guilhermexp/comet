@@ -107,6 +107,57 @@ fn resolve_codex_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+fn codex_workers_mcp_overrides_for(
+    executable: &std::path::Path,
+    request: &RunRequest,
+    disabled_by_environment: bool,
+) -> Vec<String> {
+    let Some(server) = crate::acp::workers_mcp_servers_for(
+        executable,
+        request.enable_workers_mcp,
+        disabled_by_environment,
+        request.workers_parent_chat_id.as_deref(),
+    )
+    .into_iter()
+    .next() else {
+        return Vec::new();
+    };
+    let Some(command) = server.get("command").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let mut overrides = vec![format!(
+        "mcp_servers.comet-workers.command={}",
+        serde_json::to_string(command).expect("string serialization cannot fail")
+    )];
+    if let Some(args) = server.get("args") {
+        overrides.push(format!("mcp_servers.comet-workers.args={args}"));
+    }
+    if let Some(environment) = server.get("env").and_then(Value::as_array) {
+        overrides.extend(environment.iter().filter_map(|row| {
+            let name = row.get("name")?.as_str()?;
+            let value = row.get("value")?.as_str()?;
+            Some(format!(
+                "mcp_servers.comet-workers.env.{name}={}",
+                serde_json::to_string(value).expect("string serialization cannot fail")
+            ))
+        }));
+    }
+    overrides
+}
+
+fn codex_workers_mcp_overrides(request: &RunRequest) -> Vec<String> {
+    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
+        .ok()
+        .is_some_and(|value| value == "1");
+    let Some(executable) = std::env::var_os("ZERON_WORKERS_MCP_BIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
+        return Vec::new();
+    };
+    codex_workers_mcp_overrides_for(&executable, request, disabled)
+}
+
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {
@@ -147,6 +198,23 @@ impl CodexHarness {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
         self
+    }
+
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+        let mut cmd = Command::new(exe);
+        cmd.arg("app-server");
+        for value in codex_workers_mcp_overrides(request) {
+            cmd.args(["-c", &value]);
+        }
+        crate::compose_child_path(&mut cmd, exe);
+        if !request.cwd.is_empty() {
+            cmd.current_dir(&request.cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
     }
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
@@ -328,16 +396,7 @@ impl Harness for CodexHarness {
         // worktree on a slash-named branch derives a malformed mount that
         // kills every command.
         request.sandbox = zeron_proto::SandboxLevel::DangerFullAccess;
-        let mut cmd = Command::new(&exe);
-        cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut cmd = self.build_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -1496,6 +1555,82 @@ use crate::{Signal, send_signal, shutdown_child};
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+
+    fn workers_request(enabled: bool) -> RunRequest {
+        RunRequest {
+            prompt: "test".into(),
+            harness: None,
+            model: Some("gpt-5.6-sol".into()),
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp/project".into(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            enable_workers_mcp: enabled,
+            workers_parent_chat_id: Some("parent-chat".into()),
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn native_workers_mcp_overrides_mount_the_controller_without_persistence() {
+        let overrides = codex_workers_mcp_overrides_for(
+            Path::new("/absolute/zeron"),
+            &workers_request(true),
+            false,
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|value| value == "mcp_servers.comet-workers.command=\"/absolute/zeron\"")
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|value| value == "mcp_servers.comet-workers.args=[\"__workers_mcp__\"]")
+        );
+        assert!(overrides.iter().any(|value| {
+            value == "mcp_servers.comet-workers.env.COMET_WORKERS_CONTROLLER=\"1\""
+        }));
+        assert!(overrides.iter().any(|value| {
+            value == "mcp_servers.comet-workers.env.COMET_WORKERS_PARENT_CHAT_ID=\"parent-chat\""
+        }));
+        assert!(
+            codex_workers_mcp_overrides_for(
+                Path::new("/absolute/zeron"),
+                &workers_request(false),
+                false,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_workers_mcp_is_added_to_the_codex_app_server_process() {
+        let harness = CodexHarness::new();
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/codex"), &workers_request(true));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "-c" && pair[1].starts_with("mcp_servers.comet-workers.command=")
+        }));
+
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/codex"), &workers_request(false));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg.contains("comet-workers")));
+    }
 
     #[test]
     fn approval_questions_are_yes_no() {
