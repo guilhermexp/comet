@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall, ToolDiff};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall, ToolDiff, ToolExecutionMeta,
+};
 
 use super::protocol::sanitize_diagnostic;
 
@@ -272,7 +274,24 @@ fn tool_end(frame: &Value) -> Option<AgentEvent> {
         is_error: frame.get("isError").and_then(Value::as_bool) == Some(true),
         output: result.and_then(tool_output),
         diff: result.and_then(tool_diff),
-        execution: None,
+        execution: result.and_then(execution_meta),
+    })
+}
+
+fn execution_meta(result: &Value) -> Option<ToolExecutionMeta> {
+    let details = result.get("details").unwrap_or(result);
+    let exit_code = details
+        .get("exitCode")
+        .or_else(|| details.get("exit_code"))
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
+    let duration_ms = details
+        .get("durationMs")
+        .or_else(|| details.get("duration_ms"))
+        .and_then(Value::as_u64);
+    (exit_code.is_some() || duration_ms.is_some()).then_some(ToolExecutionMeta {
+        exit_code,
+        duration_ms,
     })
 }
 

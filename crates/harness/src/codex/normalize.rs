@@ -5,8 +5,8 @@
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
 //! types) are accepted, and unknown item types map to nothing.
 
-use zeron_proto::{AgentEvent, TodoItem, ToolCall};
 use serde_json::Value;
+use zeron_proto::{AgentEvent, TodoItem, ToolCall, ToolExecutionMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -150,15 +150,28 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 },
             }],
             Phase::Completed => {
-                let exit_code = field(item, &["exitCode", "exit_code"])
+                let reported_exit_code = field(item, &["exitCode", "exit_code"])
                     .and_then(Value::as_i64)
-                    .unwrap_or(0);
+                    .and_then(|code| i32::try_from(code).ok());
+                let exit_code = reported_exit_code.unwrap_or(0);
+                let duration_ms =
+                    field(item, &["durationMs", "duration_ms"]).and_then(Value::as_u64);
+                let output = field(item, &["aggregatedOutput", "aggregated_output"])
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned);
+                let execution = (reported_exit_code.is_some() || duration_ms.is_some()).then_some(
+                    ToolExecutionMeta {
+                        exit_code: reported_exit_code,
+                        duration_ms,
+                    },
+                );
                 vec![AgentEvent::ToolResult {
                     id,
                     is_error: status == "failed" || exit_code != 0,
-                    output: None,
+                    output,
                     diff: None,
-                    execution: None,
+                    execution,
                 }]
             }
         },
@@ -412,16 +425,26 @@ mod tests {
         );
         let completed = map_item(
             Phase::Completed,
-            &json!({"type": "command_execution", "id": "c1", "status": "completed", "exit_code": 2}),
+            &json!({
+                "type": "command_execution",
+                "id": "c1",
+                "status": "completed",
+                "exit_code": 2,
+                "aggregated_output": "permission denied\n",
+                "duration_ms": 4868
+            }),
         );
         assert_eq!(
             completed,
             vec![AgentEvent::ToolResult {
                 id: "c1".into(),
                 is_error: true,
-                output: None,
+                output: Some("permission denied\n".into()),
                 diff: None,
-                execution: None,
+                execution: Some(zeron_proto::ToolExecutionMeta {
+                    exit_code: Some(2),
+                    duration_ms: Some(4868),
+                }),
             }]
         );
     }

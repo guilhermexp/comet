@@ -1185,6 +1185,15 @@ fn tool_header_state(resolved: bool, is_error: bool, show_outcome_label: bool) -
     }
 }
 
+fn format_execution_duration(duration_ms: u64) -> String {
+    if duration_ms < 60_000 {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
+    } else {
+        let seconds = duration_ms / 1_000;
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
 // `single_line` and the per-kind chip label/detail are shared with the terminal
 // viewport (`zeron_proto::view`): a tool must be named identically on every
 // surface, and the one-line collapse is needed for the same reason in both (a
@@ -4786,7 +4795,21 @@ fn chip_header_row(
                             "Failed"
                         } else {
                             "Success"
-                        })),
+                        }))
+                        .when_some(
+                            tool.execution.and_then(|meta| meta.duration_ms),
+                            |status, duration_ms| {
+                                status.child(
+                                    div()
+                                        .font_family(theme.font_mono.clone())
+                                        .text_size(px(10.5))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(format_execution_duration(
+                                            duration_ms,
+                                        ))),
+                                )
+                            },
+                        ),
                 )
             },
         )
@@ -6088,6 +6111,13 @@ mod tests {
             tool_header_state(true, false, false),
             ToolHeaderState::Quiet
         );
+    }
+
+    #[test]
+    fn command_duration_formats_compactly_for_the_status_trail() {
+        assert_eq!(format_execution_duration(80), "0.1s");
+        assert_eq!(format_execution_duration(4_868), "4.9s");
+        assert_eq!(format_execution_duration(65_000), "1m 05s");
     }
 
     #[test]

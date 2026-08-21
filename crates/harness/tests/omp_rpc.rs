@@ -274,7 +274,10 @@ fn normalizer_maps_text_reasoning_and_tools() {
             "type": "tool_execution_end",
             "toolCallId": "tool-1",
             "toolName": "bash",
-            "result": { "content": [{ "type": "text", "text": "ok" }] },
+            "result": {
+                "content": [{ "type": "text", "text": "ok" }],
+                "details": { "exitCode": 0, "durationMs": 250 }
+            },
             "isError": false
         })),
         vec![AgentEvent::ToolResult {
@@ -282,7 +285,10 @@ fn normalizer_maps_text_reasoning_and_tools() {
             is_error: false,
             output: Some("ok".into()),
             diff: None,
-            execution: None,
+            execution: Some(zeron_proto::ToolExecutionMeta {
+                exit_code: Some(0),
+                duration_ms: Some(250),
+            }),
         }]
     );
     assert_eq!(

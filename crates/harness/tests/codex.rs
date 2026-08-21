@@ -150,7 +150,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: true,
         output: None,
         diff: None,
-        execution: None,
+        execution: Some(zeron_proto::ToolExecutionMeta {
+            exit_code: Some(1),
+            duration_ms: None,
+        }),
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -673,7 +676,10 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
             is_error: false,
             output: None,
             diff: None,
-            execution: None,
+            execution: Some(zeron_proto::ToolExecutionMeta {
+                exit_code: Some(0),
+                duration_ms: None,
+            }),
         }),
     }));
     // The parent's steer (a userMessage item on the CHILD thread) arrives as

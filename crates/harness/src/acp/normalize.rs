@@ -9,7 +9,9 @@
 //! statuses are snake_case).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, ContextUsage, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use zeron_proto::{
+    AgentEvent, ContextUsage, SlashCommand, TodoItem, ToolCall, ToolDiff, ToolExecutionMeta,
+};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only
@@ -65,6 +67,32 @@ fn tool_output(update: &Value) -> Option<String> {
         return None;
     }
     Some(cap_text(&parts.join("\n"), OUTPUT_CAP))
+}
+
+fn execution_meta(update: &Value) -> Option<ToolExecutionMeta> {
+    let candidates = [
+        Some(update),
+        update.get("rawOutput"),
+        update.get("details"),
+        update.get("rawOutput").and_then(|raw| raw.get("details")),
+    ];
+    let exit_code = candidates.iter().flatten().find_map(|value| {
+        value
+            .get("exitCode")
+            .or_else(|| value.get("exit_code"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+    });
+    let duration_ms = candidates.iter().flatten().find_map(|value| {
+        value
+            .get("durationMs")
+            .or_else(|| value.get("duration_ms"))
+            .and_then(Value::as_u64)
+    });
+    (exit_code.is_some() || duration_ms.is_some()).then_some(ToolExecutionMeta {
+        exit_code,
+        duration_ms,
+    })
 }
 
 /// First `{type: "diff"}` entry of a tool call's `content` array.
@@ -473,7 +501,7 @@ fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
         is_error,
         output: tool_output(update),
         diff: tool_diff(update),
-        execution: None,
+        execution: execution_meta(update),
     })
 }
 
@@ -518,6 +546,20 @@ pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn execution_metadata_reads_only_reported_numeric_fields() {
+        assert_eq!(
+            execution_meta(&json!({
+                "rawOutput": { "exitCode": 3, "durationMs": 900 }
+            })),
+            Some(zeron_proto::ToolExecutionMeta {
+                exit_code: Some(3),
+                duration_ms: Some(900),
+            })
+        );
+        assert_eq!(execution_meta(&json!({"rawOutput": {"text": "ok"}})), None);
+    }
 
     #[test]
     fn message_and_thought_chunks_map_to_deltas() {

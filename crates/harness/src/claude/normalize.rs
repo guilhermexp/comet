@@ -67,6 +67,38 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+const TOOL_RESULT_OUTPUT_MAX: usize = 64 * 1024;
+
+fn tool_result_output(block: &ContentBlock) -> Option<String> {
+    let text = if let Some(text) = block.content.as_str() {
+        text.to_owned()
+    } else {
+        block
+            .content
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    if text.trim().is_empty()
+        || text.contains("internal metadata — never quote")
+        || (text.contains("agentId:") && text.contains("output_file:"))
+    {
+        return None;
+    }
+    let mut end = text.len().min(TOOL_RESULT_OUTPUT_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(text[..end].to_owned())
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -436,7 +468,7 @@ impl Normalizer {
                                 AgentEvent::ToolResult {
                                     id: b.tool_use_id.clone(),
                                     is_error: b.is_error.unwrap_or(false),
-                                    output: None,
+                                    output: tool_result_output(&b),
                                     diff: None,
                                     execution: None,
                                 },
@@ -465,7 +497,7 @@ impl Normalizer {
                     .map(|b| AgentEvent::ToolResult {
                         id: b.tool_use_id.clone(),
                         is_error: b.is_error.unwrap_or(false),
-                        output: None,
+                        output: tool_result_output(&b),
                         diff: None,
                         execution: None,
                     })
@@ -758,6 +790,25 @@ mod tests {
                     diff: None,
                     execution: None,
                 }),
+            }]
+        );
+    }
+
+    #[test]
+    fn top_level_tool_result_preserves_renderable_text_content() {
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t-output","is_error":false,"content":"11 alpha.txt\n"}]}}"#,
+        )
+        .expect("parses");
+        let events = Normalizer::new().normalize(frame, false);
+        assert_eq!(
+            events,
+            vec![AgentEvent::ToolResult {
+                id: "t-output".into(),
+                is_error: false,
+                output: Some("11 alpha.txt\n".into()),
+                diff: None,
+                execution: None,
             }]
         );
     }
