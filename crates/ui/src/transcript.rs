@@ -124,6 +124,22 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+pub const USER_MESSAGE_CARD_MAX_HEIGHT: f32 = 100.0;
+pub const USER_MESSAGE_CARD_PAD_Y: f32 = 8.0;
+pub const USER_MESSAGE_CARD_RADIUS: f32 = 12.0;
+pub const USER_MESSAGE_FADE_HEIGHT: f32 = 40.0;
+
+fn user_message_overflows(content_height: f32) -> bool {
+    content_height > USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0
+}
+
+fn user_message_attachment_summary(count: usize) -> Option<SharedString> {
+    match count {
+        0 => None,
+        1 => Some("Using image".into()),
+        count => Some(format!("Using {count} images").into()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -5342,6 +5358,26 @@ mod tests {
         };
         assert_eq!(text.as_ref(), "");
         assert_eq!(attachments.len(), 1);
+    }
+
+    #[test]
+    fn user_message_overflow_uses_the_measured_content_height() {
+        let content_limit = USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0;
+        assert!(!user_message_overflows(content_limit));
+        assert!(user_message_overflows(content_limit + 0.5));
+    }
+
+    #[test]
+    fn image_only_user_messages_receive_the_reference_summary() {
+        assert_eq!(user_message_attachment_summary(0), None);
+        assert_eq!(
+            user_message_attachment_summary(1).as_deref(),
+            Some("Using image")
+        );
+        assert_eq!(
+            user_message_attachment_summary(3).as_deref(),
+            Some("Using 3 images"),
+        );
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
