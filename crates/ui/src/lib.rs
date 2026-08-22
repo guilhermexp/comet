@@ -26,6 +26,7 @@ pub mod file_preview;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub mod inline_media;
 pub mod loaders;
 pub mod markdown;
 pub mod motion;
