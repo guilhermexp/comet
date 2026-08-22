@@ -294,6 +294,75 @@ pub struct ToolExecutionMeta {
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_uses: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WorkflowProgressNode {
+    Phase {
+        index: u32,
+        title: String,
+    },
+    Agent {
+        index: u32,
+        label: String,
+        phase_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_preview: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowTaskUpdate {
+    pub task_id: String,
+    pub status: WorkflowTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<WorkflowUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<WorkflowProgressNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -357,6 +426,11 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     AvailableCommands {
         commands: Vec<SlashCommand>,
+    },
+    /// Provider-independent workflow lifecycle/progress for chat activity.
+    #[serde(rename_all = "camelCase")]
+    WorkflowTask {
+        task: WorkflowTaskUpdate,
     },
     Error {
         message: String,
@@ -478,6 +552,38 @@ mod tests {
         assert_eq!(value["contextUsage"]["tokens"], 392_000);
         assert_eq!(value["contextUsage"]["contextWindow"], 828_000);
         assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), usage);
+    }
+
+    #[test]
+    fn workflow_task_event_is_additive_and_round_trips() {
+        let minimal: WorkflowTaskUpdate = serde_json::from_value(serde_json::json!({
+            "taskId": "task-1", "status": "running"
+        }))
+        .unwrap();
+        assert_eq!(minimal.workflow_name, None);
+
+        let event = AgentEvent::WorkflowTask {
+            task: WorkflowTaskUpdate {
+                task_id: "task-1".into(),
+                status: WorkflowTaskStatus::Completed,
+                workflow_name: Some("Audit".into()),
+                description: Some("Review repository".into()),
+                usage: Some(WorkflowUsage {
+                    total_tokens: Some(1_200),
+                    tool_uses: Some(4),
+                    duration_ms: Some(2_500),
+                }),
+                progress: vec![WorkflowProgressNode::Phase {
+                    index: 0,
+                    title: "Review".into(),
+                }],
+                agent_count: Some(1),
+                task_type: Some("local_workflow".into()),
+                subagent_type: None,
+            },
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
     }
 
     #[test]
