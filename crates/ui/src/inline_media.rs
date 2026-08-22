@@ -11,8 +11,9 @@ use crate::markdown::parser::Block;
 
 const MAX_INLINE_IMAGES: usize = 6;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
-const MAX_MERMAID_BYTES: usize = 256 * 1024;
+const MAX_MERMAID_BYTES: usize = 64 * 1024;
 const MAX_MERMAID_LINES: usize = 2_000;
+const MAX_MERMAID_STRUCTURE: usize = 4_000;
 const MAX_MERMAID_SVG_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LoadedInlineImage {
@@ -172,50 +173,13 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<RenderedMermaid, S
     if source.lines().count() > MAX_MERMAID_LINES {
         return Err("diagram has too many lines".into());
     }
-    let mut lines = source.lines().map(str::trim).peekable();
-    while lines.peek().is_some_and(|line| line.is_empty()) {
-        lines.next();
-    }
-    if lines.peek().is_some_and(|line| *line == "---") {
-        lines.next();
-        for line in lines.by_ref() {
-            if line == "---" {
-                break;
-            }
-        }
-    }
-    let declaration = lines
-        .find(|line| !line.is_empty() && !line.starts_with("%%"))
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(
-        declaration.as_str(),
-        "graph"
-            | "flowchart"
-            | "sequencediagram"
-            | "classdiagram"
-            | "classdiagram-v2"
-            | "statediagram"
-            | "statediagram-v2"
-            | "erdiagram"
-            | "journey"
-            | "gantt"
-            | "pie"
-            | "gitgraph"
-            | "mindmap"
-            | "timeline"
-            | "quadrantchart"
-            | "requirementdiagram"
-            | "c4context"
-            | "sankey-beta"
-            | "xychart-beta"
-            | "block-beta"
-            | "architecture-beta"
-            | "packet-beta"
-            | "kanban"
-    ) {
-        return Err("diagram declaration is not recognized".into());
+    let structure = source.lines().count()
+        + source.matches("-->").count()
+        + source.matches("->>").count()
+        + source.matches("---").count()
+        + source.matches(';').count();
+    if structure > MAX_MERMAID_STRUCTURE {
+        return Err("diagram is too complex".into());
     }
     let options = mermaid_rs_renderer::RenderOptions {
         theme: if dark {
@@ -337,7 +301,7 @@ mod tests {
         assert!(
             render_mermaid_svg("---\ntitle: Example\n---\nflowchart LR\nA --> B", true).is_ok()
         );
-        assert!(render_mermaid_svg("not-a-diagram", true).is_err());
+        assert!(render_mermaid_svg("notMermaid\nA --> B", true).is_err());
         assert!(render_mermaid_svg("   ", true).is_err());
         let oversized = format!("flowchart LR\n{}", "A --> B\n".repeat(10_000));
         assert!(render_mermaid_svg(&oversized, true).is_err());

@@ -69,8 +69,12 @@ const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
 const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
 const INLINE_IMAGE_CACHE_MAX_ENTRIES: usize = 24;
 const INLINE_IMAGE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const INLINE_IMAGE_CACHE_MAX_TOTAL: usize = 32;
+const INLINE_IMAGE_MAX_INFLIGHT: usize = 4;
 const MERMAID_CACHE_MAX_ENTRIES: usize = 16;
 const MERMAID_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MERMAID_CACHE_MAX_TOTAL: usize = 20;
+const MERMAID_MAX_INFLIGHT: usize = 2;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
@@ -1326,6 +1330,15 @@ fn should_render_mermaid(block: &Block, streaming: bool) -> bool {
     !streaming && crate::inline_media::mermaid_source(block).is_some()
 }
 
+fn media_task_admitted(
+    inflight: usize,
+    total: usize,
+    max_inflight: usize,
+    max_total: usize,
+) -> bool {
+    inflight < max_inflight && total < max_total
+}
+
 fn format_thought_duration(duration_ms: Option<u64>) -> Option<String> {
     let duration_ms = duration_ms.filter(|duration| *duration >= 1_000)?;
     let seconds = (duration_ms / 1_000).max(1);
@@ -1733,9 +1746,11 @@ pub struct Transcript {
     /// Agent-referenced checkout images load once per root/path and survive
     /// virtualized row remounts for the attached chat.
     inline_images: HashMap<String, InlineImageLoad>,
+    validated_inline_images: std::collections::HashSet<String>,
     /// Settled Mermaid fences render once off-thread and survive row
     /// virtualization for the attached chat.
     mermaid: HashMap<String, MermaidLoad>,
+    validated_mermaid: std::collections::HashSet<String>,
     media_clock: u64,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
@@ -1862,6 +1877,7 @@ enum InlineImageLoad {
 
 enum InlineImageSnapshot {
     Loading,
+    Reloading,
     Failed,
     Ready {
         name: SharedString,
@@ -1883,6 +1899,7 @@ enum MermaidLoad {
 
 enum MermaidSnapshot {
     Loading,
+    Reloading,
     Failed,
     Ready(Arc<gpui::Image>),
 }
@@ -1985,7 +2002,9 @@ impl Transcript {
             reasoning_started: HashMap::new(),
             reasoning_tick: None,
             inline_images: HashMap::new(),
+            validated_inline_images: std::collections::HashSet::new(),
             mermaid: HashMap::new(),
+            validated_mermaid: std::collections::HashSet::new(),
             media_clock: 0,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
@@ -2776,7 +2795,9 @@ impl Transcript {
             self.reasoning_started.clear();
             self.reasoning_tick = None;
             self.inline_images.clear();
+            self.validated_inline_images.clear();
             self.mermaid.clear();
+            self.validated_mermaid.clear();
             self.media_clock = 0;
             self.user_message_overflow.clear();
             self.user_message_preview = None;
@@ -3185,7 +3206,10 @@ impl Transcript {
                     _ => None,
                 })
                 .sum();
-            if settled <= INLINE_IMAGE_CACHE_MAX_ENTRIES && bytes <= INLINE_IMAGE_CACHE_MAX_BYTES {
+            if self.inline_images.len() <= INLINE_IMAGE_CACHE_MAX_TOTAL
+                && settled <= INLINE_IMAGE_CACHE_MAX_ENTRIES
+                && bytes <= INLINE_IMAGE_CACHE_MAX_BYTES
+            {
                 break;
             }
             let oldest = self
@@ -3218,7 +3242,10 @@ impl Transcript {
                     _ => None,
                 })
                 .sum();
-            if settled <= MERMAID_CACHE_MAX_ENTRIES && bytes <= MERMAID_CACHE_MAX_BYTES {
+            if self.mermaid.len() <= MERMAID_CACHE_MAX_TOTAL
+                && settled <= MERMAID_CACHE_MAX_ENTRIES
+                && bytes <= MERMAID_CACHE_MAX_BYTES
+            {
                 break;
             }
             let oldest = self
@@ -3264,6 +3291,26 @@ impl Transcript {
             None => {}
         }
 
+        self.trim_inline_image_cache();
+        let previously_ready = self.validated_inline_images.contains(&key);
+        let inflight = self
+            .inline_images
+            .values()
+            .filter(|entry| matches!(entry, InlineImageLoad::Loading(_)))
+            .count();
+        if !media_task_admitted(
+            inflight,
+            self.inline_images.len(),
+            INLINE_IMAGE_MAX_INFLIGHT,
+            INLINE_IMAGE_CACHE_MAX_TOTAL,
+        ) {
+            return if previously_ready {
+                InlineImageSnapshot::Reloading
+            } else {
+                InlineImageSnapshot::Failed
+            };
+        }
+
         let task_key = key.clone();
         let root = root.to_path_buf();
         let candidate = candidate.to_owned();
@@ -3274,6 +3321,11 @@ impl Transcript {
                 .await;
             this.update(cx, |transcript, cx| {
                 let used_at = transcript.next_media_use();
+                if result.is_ok() {
+                    transcript.validated_inline_images.insert(task_key.clone());
+                } else {
+                    transcript.validated_inline_images.remove(&task_key);
+                }
                 transcript.inline_images.insert(
                     task_key,
                     match result {
@@ -3288,7 +3340,11 @@ impl Transcript {
         });
         self.inline_images
             .insert(key, InlineImageLoad::Loading(task));
-        InlineImageSnapshot::Loading
+        if previously_ready {
+            InlineImageSnapshot::Reloading
+        } else {
+            InlineImageSnapshot::Loading
+        }
     }
 
     fn render_inline_image_gallery(
@@ -3317,6 +3373,20 @@ impl Transcript {
             match self.inline_image_snapshot(&root, path, cx) {
                 InlineImageSnapshot::Failed => {}
                 InlineImageSnapshot::Loading => {}
+                InlineImageSnapshot::Reloading => cards.push(
+                    frame
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            format!("inline-image-reload-{row_id}-{ix}"),
+                            2.0,
+                            theme.text_muted,
+                            cx.entity_id(),
+                            cx,
+                        ))
+                        .into_any_element(),
+                ),
                 InlineImageSnapshot::Ready { name, image } => {
                     let preview = crate::attachments::PreviewImage {
                         name: name.clone(),
@@ -4304,6 +4374,26 @@ impl Transcript {
             None => {}
         }
 
+        self.trim_mermaid_cache();
+        let previously_ready = self.validated_mermaid.contains(&key);
+        let inflight = self
+            .mermaid
+            .values()
+            .filter(|entry| matches!(entry, MermaidLoad::Loading(_)))
+            .count();
+        if !media_task_admitted(
+            inflight,
+            self.mermaid.len(),
+            MERMAID_MAX_INFLIGHT,
+            MERMAID_CACHE_MAX_TOTAL,
+        ) {
+            return if previously_ready {
+                MermaidSnapshot::Reloading
+            } else {
+                MermaidSnapshot::Failed
+            };
+        }
+
         let task_key = key.clone();
         let render_source = source.to_owned();
         let task = cx.spawn(async move |this, cx| {
@@ -4318,6 +4408,11 @@ impl Transcript {
                 .await;
             this.update(cx, |transcript, cx| {
                 let used_at = transcript.next_media_use();
+                if result.is_ok() {
+                    transcript.validated_mermaid.insert(task_key.clone());
+                } else {
+                    transcript.validated_mermaid.remove(&task_key);
+                }
                 transcript.mermaid.insert(
                     task_key,
                     match result {
@@ -4335,7 +4430,11 @@ impl Transcript {
             .ok();
         });
         self.mermaid.insert(key, MermaidLoad::Loading(task));
-        MermaidSnapshot::Loading
+        if previously_ready {
+            MermaidSnapshot::Reloading
+        } else {
+            MermaidSnapshot::Loading
+        }
     }
 
     fn render_mermaid_block(
@@ -4360,7 +4459,8 @@ impl Transcript {
             .get(&source_key)
             .and_then(|fold| fold.open)
             .unwrap_or(false);
-        let show_source = source_open || !matches!(&state, MermaidSnapshot::Ready(_));
+        let show_source =
+            source_open || matches!(&state, MermaidSnapshot::Loading | MermaidSnapshot::Failed);
         let opts = RenderOptions {
             row_key: SharedString::from(format!("{row_id}#mermaid-code")),
             veil: None,
@@ -4400,7 +4500,7 @@ impl Transcript {
                     .text_color(theme.text_muted),
             );
         header = match &state {
-            MermaidSnapshot::Loading => header
+            MermaidSnapshot::Loading | MermaidSnapshot::Reloading => header
                 .child("Rendering diagram…")
                 .child(div().flex_1())
                 .child(crate::loaders::mini_mono_spinner(
@@ -4455,28 +4555,50 @@ impl Transcript {
             .border_color(crate::theme::hairline(0.08))
             .bg(crate::theme::ink(0.028))
             .child(header);
-        if let MermaidSnapshot::Ready(image) = state {
-            let preview = crate::attachments::PreviewImage {
-                name: "Mermaid diagram".into(),
-                image: image.clone(),
-            };
-            card = card.child(
-                div()
-                    .id(SharedString::from(format!("{row_id}#mermaid-preview")))
-                    .w_full()
-                    .h(px(320.0))
-                    .border_t_1()
-                    .border_color(crate::theme::hairline(0.06))
-                    .p(px(14.0))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.user_message_preview = None;
-                        this.attachment_preview = Some(preview.clone());
-                        window.focus(&this.attachment_preview_focus, cx);
-                        cx.notify();
-                    }))
-                    .child(img(image).w_full().h_full().object_fit(ObjectFit::Contain)),
-            );
+        match state {
+            MermaidSnapshot::Ready(image) => {
+                let preview = crate::attachments::PreviewImage {
+                    name: "Mermaid diagram".into(),
+                    image: image.clone(),
+                };
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!("{row_id}#mermaid-preview")))
+                        .w_full()
+                        .h(px(320.0))
+                        .border_t_1()
+                        .border_color(crate::theme::hairline(0.06))
+                        .p(px(14.0))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.user_message_preview = None;
+                            this.attachment_preview = Some(preview.clone());
+                            window.focus(&this.attachment_preview_focus, cx);
+                            cx.notify();
+                        }))
+                        .child(img(image).w_full().h_full().object_fit(ObjectFit::Contain)),
+                );
+            }
+            MermaidSnapshot::Reloading => {
+                card = card.child(
+                    div()
+                        .w_full()
+                        .h(px(320.0))
+                        .border_t_1()
+                        .border_color(crate::theme::hairline(0.06))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            format!("mermaid-reload-{row_id}"),
+                            2.0,
+                            theme.text_muted,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                );
+            }
+            MermaidSnapshot::Loading | MermaidSnapshot::Failed => {}
         }
         if let Some(source_block) = source_block {
             card = card.child(
@@ -6408,6 +6530,13 @@ mod tests {
         assert!(should_render_mermaid(&alias, false));
         assert!(!should_render_mermaid(&mermaid, true));
         assert!(!should_render_mermaid(&rust, false));
+    }
+
+    #[test]
+    fn inline_media_admission_bounds_inflight_and_total_work() {
+        assert!(media_task_admitted(3, 20, 4, 32));
+        assert!(!media_task_admitted(4, 20, 4, 32));
+        assert!(!media_task_admitted(1, 32, 4, 32));
     }
 
     #[test]
