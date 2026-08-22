@@ -17,7 +17,7 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -31,7 +31,7 @@ use zeron_doc::{
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    UserInputQuestion, WorkflowTaskStatus, WorkflowTaskUpdate,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -1261,6 +1261,41 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
         .collect()
 }
 
+/// Project the latest durable workflow snapshot for every task without
+/// mutating transcript history. Active tasks are never bounded; only the
+/// newest `settled_limit` terminal tasks are retained.
+pub fn workflow_tasks_from_entries(
+    entries: &[SessionMessageEntry],
+    settled_limit: usize,
+) -> Vec<WorkflowTaskUpdate> {
+    let mut seen = HashSet::new();
+    let mut settled = 0usize;
+    let mut selected = Vec::new();
+
+    for part in entries
+        .iter()
+        .rev()
+        .flat_map(|entry| entry.parts.iter().rev())
+    {
+        let MessagePart::WorkflowTask { task, .. } = part else {
+            continue;
+        };
+        if !seen.insert(task.task_id.as_str()) {
+            continue;
+        }
+        if task.status != WorkflowTaskStatus::Running {
+            if settled >= settled_limit {
+                continue;
+            }
+            settled += 1;
+        }
+        selected.push(task.clone());
+    }
+
+    selected.reverse();
+    selected
+}
+
 /// The persisted assistant text of a folded segment (workspace preview source).
 fn folded_text(parts: &[MessagePart]) -> String {
     parts
@@ -2241,11 +2276,67 @@ mod tests {
 
     use super::{
         PendingInput, RuntimeConfig, apply_context_usage_to_session, resolve_pending_question,
-        subagent_doc_id,
+        subagent_doc_id, workflow_tasks_from_entries,
     };
     use chrono::Utc;
     use tokio::sync::oneshot;
-    use zeron_proto::{ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus};
+    use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+    use zeron_proto::{
+        ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus,
+        WorkflowTaskStatus, WorkflowTaskUpdate,
+    };
+
+    fn workflow_entry(index: usize, status: WorkflowTaskStatus) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: format!("entry-{index}"),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::WorkflowTask {
+                id: format!("workflow-task-{index}"),
+                task: WorkflowTaskUpdate {
+                    task_id: format!("task-{index}"),
+                    status,
+                    workflow_name: None,
+                    description: None,
+                    usage: None,
+                    progress: Vec::new(),
+                    agent_count: None,
+                    task_type: None,
+                    subagent_type: None,
+                },
+            }],
+            created_at: index as i64,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn workflow_projection_bounds_only_settled_history() {
+        let mut entries = Vec::new();
+        entries.push(workflow_entry(10_000, WorkflowTaskStatus::Running));
+        entries.extend((0..102).map(|index| {
+            let status = match index % 3 {
+                0 => WorkflowTaskStatus::Completed,
+                1 => WorkflowTaskStatus::Failed,
+                _ => WorkflowTaskStatus::Cancelled,
+            };
+            workflow_entry(index, status)
+        }));
+        entries.push(workflow_entry(10_001, WorkflowTaskStatus::Running));
+
+        let projected = workflow_tasks_from_entries(&entries, 100);
+        let ids = projected
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(projected.len(), 102);
+        assert_eq!(ids.first(), Some(&"task-10000"));
+        assert!(!ids.contains(&"task-0"));
+        assert!(!ids.contains(&"task-1"));
+        assert_eq!(ids.get(1), Some(&"task-2"));
+        assert_eq!(ids.last(), Some(&"task-10001"));
+    }
 
     #[test]
     fn context_snapshot_updates_deduplicates_and_resets() {

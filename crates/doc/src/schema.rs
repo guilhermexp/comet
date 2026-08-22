@@ -7,9 +7,10 @@
 //! - `commands`: LoroList of LoroMap {
 //!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
 //!
-//! Part maps: { id, kind: "text"|"tool"|"input"|"error", text?: LoroText, call?: json,
-//! isError?, questions?: json, resolved?, message? }. Text bodies are **LoroText** so streaming
-//! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites).
+//! Part maps: { id, kind: "text"|"tool"|"input"|"error"|"workflowTask", text?: LoroText,
+//! call?: json, isError?, questions?: json, resolved?, message?, task?: json }. Text bodies are
+//! **LoroText** so streaming appends RLE-merge (1.03x oplog overhead vs 125x for whole-value
+//! rewrites).
 
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,9 @@ struct DocPartJson {
     /// One-line live tail of the subagent's output (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_tail: Option<String>,
+    /// Durable workflow activity snapshot (additive and non-rendered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<zeron_proto::WorkflowTaskUpdate>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -188,6 +192,12 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::WorkflowTask { id, task } => DocPartJson {
+            id: id.clone(),
+            kind: "workflowTask".into(),
+            task: Some(task.clone()),
+            ..Default::default()
+        },
     })
 }
 
@@ -239,6 +249,13 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+        },
+        "workflowTask" => match p.task {
+            Some(task) => MessagePart::WorkflowTask { id: p.id, task },
+            None => MessagePart::Text {
+                id: p.id,
+                text: String::new(),
+            },
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -700,6 +717,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
     }
+    if let Some(task) = &doc_part.task {
+        map.insert("task", loro_value_from_json(&serde_json::to_value(task)?))?;
+    }
     Ok(())
 }
 
@@ -857,6 +877,14 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             subagent_status: None,
             subagent_tail: None,
         });
+    }
+    if obj.get("kind").and_then(|x| x.as_str()) == Some("workflowTask")
+        && let Some(task) = obj
+            .get("task")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    {
+        return Some(MessagePart::WorkflowTask { id, task });
     }
     if let Some(message) = obj.get("message").and_then(|x| x.as_str()) {
         return Some(MessagePart::Error {
@@ -1136,6 +1164,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
     }
+    if let Some(task) = &doc_part.task {
+        map.insert("task", loro_value_from_json(&serde_json::to_value(task)?))?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -1187,7 +1218,7 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
-    use zeron_proto::{AgentEvent, ToolCall};
+    use zeron_proto::{AgentEvent, ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate};
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -1219,6 +1250,39 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn segment_sync_persists_workflow_activity_updates() {
+        let doc = SessionDoc::init("chat-workflow").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "entry-1", "dev", 1).unwrap();
+        let running = MessagePart::WorkflowTask {
+            id: "workflow-wf-1".into(),
+            task: WorkflowTaskUpdate {
+                task_id: "wf-1".into(),
+                status: WorkflowTaskStatus::Running,
+                workflow_name: Some("Audit".into()),
+                description: None,
+                usage: None,
+                progress: Vec::new(),
+                agent_count: None,
+                task_type: Some("local_workflow".into()),
+                subagent_type: None,
+            },
+        };
+        writer.sync(std::slice::from_ref(&running)).unwrap();
+
+        let mut completed = running.clone();
+        let MessagePart::WorkflowTask { task, .. } = &mut completed else {
+            unreachable!()
+        };
+        task.status = WorkflowTaskStatus::Completed;
+        writer
+            .finish(std::slice::from_ref(&completed), MessageStatus::Complete)
+            .unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, vec![completed]);
     }
 
     #[test]

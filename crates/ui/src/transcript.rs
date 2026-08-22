@@ -852,7 +852,11 @@ pub fn rows_for_entry(
     // Assistant/system: split parts into block rows, folding consecutive
     // ordinary tools. Agent/spawn chips flush into their own group so they
     // never share a collapse with Reads/Runs.
-    let last_part_ix = entry.parts.len().saturating_sub(1);
+    let last_part_ix = entry
+        .parts
+        .iter()
+        .rposition(|part| !matches!(part, MessagePart::WorkflowTask { .. }))
+        .unwrap_or_default();
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
     let mut group_last_part_ix = 0usize;
@@ -940,6 +944,10 @@ pub fn rows_for_entry(
                 pending_group.push(item);
                 group_last_part_ix = part_ix;
             }
+            // Durable activity feeds the Details Workers widget only. Ignore
+            // it before the visible-part branch so it cannot split rows or
+            // tool groups in the transcript.
+            MessagePart::WorkflowTask { .. } => {}
             other => {
                 flush_group(
                     &mut rows,
@@ -1072,7 +1080,7 @@ pub fn rows_for_entry(
                         });
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
-                    MessagePart::Tool { .. } => {}
+                    MessagePart::Tool { .. } | MessagePart::WorkflowTask { .. } => {}
                 }
             }
         }
@@ -6397,6 +6405,96 @@ mod tests {
             id: id.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn workflow_activity_does_not_create_a_transcript_row() {
+        let entry = assistant(
+            "workflow-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::WorkflowTask {
+                id: "workflow-wf-1".into(),
+                task: zeron_proto::WorkflowTaskUpdate {
+                    task_id: "wf-1".into(),
+                    status: zeron_proto::WorkflowTaskStatus::Running,
+                    workflow_name: Some("Audit".into()),
+                    description: None,
+                    usage: None,
+                    progress: Vec::new(),
+                    agent_count: None,
+                    task_type: Some("local_workflow".into()),
+                    subagent_type: None,
+                },
+            }],
+        );
+
+        assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn workflow_activity_does_not_split_transcript_tool_groups() {
+        let workflow = MessagePart::WorkflowTask {
+            id: "workflow-wf-1".into(),
+            task: zeron_proto::WorkflowTaskUpdate {
+                task_id: "wf-1".into(),
+                status: zeron_proto::WorkflowTaskStatus::Running,
+                workflow_name: Some("Audit".into()),
+                description: None,
+                usage: None,
+                progress: Vec::new(),
+                agent_count: None,
+                task_type: Some("local_workflow".into()),
+                subagent_type: None,
+            },
+        };
+        let entry = assistant(
+            "workflow-between-tools",
+            MessageStatus::Complete,
+            vec![
+                tool_part("tool-1", "pwd"),
+                workflow,
+                tool_part("tool-2", "ls"),
+            ],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup { tools, .. } if tools.len() == 2
+        ));
+    }
+
+    #[test]
+    fn trailing_workflow_activity_keeps_last_tool_group_auto_open() {
+        let workflow = MessagePart::WorkflowTask {
+            id: "workflow-wf-1".into(),
+            task: zeron_proto::WorkflowTaskUpdate {
+                task_id: "wf-1".into(),
+                status: zeron_proto::WorkflowTaskStatus::Running,
+                workflow_name: Some("Audit".into()),
+                description: None,
+                usage: None,
+                progress: Vec::new(),
+                agent_count: None,
+                task_type: Some("local_workflow".into()),
+                subagent_type: None,
+            },
+        };
+        let entry = assistant(
+            "workflow-after-tool",
+            MessageStatus::Streaming,
+            vec![tool_part("tool-1", "pwd"), workflow],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup {
+                auto_open: true,
+                ..
+            }
+        ));
     }
 
     fn tool_part(id: &str, command: &str) -> MessagePart {

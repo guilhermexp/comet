@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, ToolCall, ToolDiff, ToolExecutionMeta, UserInputQuestion};
+use zeron_proto::{
+    AgentEvent, ToolCall, ToolDiff, ToolExecutionMeta, UserInputQuestion, WorkflowProgressNode,
+    WorkflowTaskUpdate, WorkflowUsage,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -198,6 +201,12 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    /// Durable provider activity used by the chat Workers projection. This
+    /// part is persisted and synchronized, but transcript rendering filters it.
+    WorkflowTask {
+        id: String,
+        task: WorkflowTaskUpdate,
+    },
 }
 
 impl MessagePart {
@@ -207,7 +216,8 @@ impl MessagePart {
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Error { id, .. } => id,
+            | MessagePart::Error { id, .. }
+            | MessagePart::WorkflowTask { id, .. } => id,
         }
     }
 
@@ -239,13 +249,155 @@ impl MessagePart {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::WorkflowTask { task, .. } => {
+                serde_json::to_vec(task).map_or(0, |value| value.len())
+            }
         }
     }
 }
 
+fn last_transcript_part_mut(parts: &mut [MessagePart]) -> Option<&mut MessagePart> {
+    parts
+        .iter_mut()
+        .rev()
+        .find(|part| !matches!(part, MessagePart::WorkflowTask { .. }))
+}
+
 fn complete_trailing_reasoning(parts: &mut [MessagePart]) {
-    if let Some(MessagePart::Reasoning { completed, .. }) = parts.last_mut() {
+    if let Some(MessagePart::Reasoning { completed, .. }) = last_transcript_part_mut(parts) {
         *completed = true;
+    }
+}
+
+fn replace_non_empty(slot: &mut Option<String>, incoming: &Option<String>) {
+    if incoming
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        *slot = incoming.clone();
+    }
+}
+
+fn merge_workflow_usage(slot: &mut Option<WorkflowUsage>, incoming: Option<WorkflowUsage>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    match slot {
+        Some(current) => {
+            if incoming.total_tokens.is_some() {
+                current.total_tokens = incoming.total_tokens;
+            }
+            if incoming.tool_uses.is_some() {
+                current.tool_uses = incoming.tool_uses;
+            }
+            if incoming.duration_ms.is_some() {
+                current.duration_ms = incoming.duration_ms;
+            }
+        }
+        None => *slot = Some(incoming),
+    }
+}
+
+fn same_progress_node(left: &WorkflowProgressNode, right: &WorkflowProgressNode) -> bool {
+    match (left, right) {
+        (
+            WorkflowProgressNode::Phase { index: left, .. },
+            WorkflowProgressNode::Phase { index: right, .. },
+        ) => left == right,
+        (
+            WorkflowProgressNode::Agent {
+                index: left_index,
+                phase_index: left_phase,
+                agent_id: left_id,
+                ..
+            },
+            WorkflowProgressNode::Agent {
+                index: right_index,
+                phase_index: right_phase,
+                agent_id: right_id,
+                ..
+            },
+        ) => match (left_id.as_deref(), right_id.as_deref()) {
+            (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => left == right,
+            _ => left_phase == right_phase && left_index == right_index,
+        },
+        _ => false,
+    }
+}
+
+fn merge_progress_node(current: &mut WorkflowProgressNode, incoming: &WorkflowProgressNode) {
+    match (current, incoming) {
+        (
+            WorkflowProgressNode::Phase { title, .. },
+            WorkflowProgressNode::Phase {
+                title: incoming_title,
+                ..
+            },
+        ) => {
+            if !incoming_title.trim().is_empty() {
+                *title = incoming_title.clone();
+            }
+        }
+        (
+            WorkflowProgressNode::Agent {
+                index,
+                label,
+                phase_index,
+                phase_title,
+                agent_id,
+                model,
+                state,
+                prompt_preview,
+                ..
+            },
+            WorkflowProgressNode::Agent {
+                index: incoming_index,
+                label: incoming_label,
+                phase_index: incoming_phase_index,
+                phase_title: incoming_phase_title,
+                agent_id: incoming_agent_id,
+                model: incoming_model,
+                state: incoming_state,
+                prompt_preview: incoming_prompt_preview,
+                ..
+            },
+        ) => {
+            *index = *incoming_index;
+            *phase_index = *incoming_phase_index;
+            if !incoming_label.trim().is_empty() {
+                *label = incoming_label.clone();
+            }
+            replace_non_empty(phase_title, incoming_phase_title);
+            replace_non_empty(agent_id, incoming_agent_id);
+            replace_non_empty(model, incoming_model);
+            replace_non_empty(state, incoming_state);
+            replace_non_empty(prompt_preview, incoming_prompt_preview);
+        }
+        _ => {}
+    }
+}
+
+fn merge_workflow_task(current: &mut WorkflowTaskUpdate, incoming: &WorkflowTaskUpdate) {
+    current.status = incoming.status;
+    replace_non_empty(&mut current.workflow_name, &incoming.workflow_name);
+    replace_non_empty(&mut current.description, &incoming.description);
+    merge_workflow_usage(&mut current.usage, incoming.usage);
+    if incoming.agent_count.is_some() {
+        current.agent_count = incoming.agent_count;
+    }
+    replace_non_empty(&mut current.task_type, &incoming.task_type);
+    replace_non_empty(&mut current.subagent_type, &incoming.subagent_type);
+
+    for incoming_node in &incoming.progress {
+        if let Some(current_node) = current
+            .progress
+            .iter_mut()
+            .find(|node| same_progress_node(node, incoming_node))
+        {
+            merge_progress_node(current_node, incoming_node);
+        } else {
+            current.progress.push(incoming_node.clone());
+        }
     }
 }
 
@@ -278,7 +430,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             out.clear();
         }
         AgentEvent::TextDelta { text } => {
-            if let Some(MessagePart::Text { text: tail, .. }) = out.last_mut() {
+            if let Some(MessagePart::Text { text: tail, .. }) = last_transcript_part_mut(out) {
                 tail.push_str(text);
             } else {
                 let id = format!("t{}", out.len());
@@ -296,7 +448,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 text: tail,
                 completed: false,
                 ..
-            }) = out.last_mut()
+            }) = last_transcript_part_mut(out)
             {
                 tail.push_str(text);
             } else {
@@ -411,6 +563,23 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 out.push(MessagePart::Error {
                     id,
                     message: message.clone(),
+                });
+            }
+        }
+        AgentEvent::WorkflowTask { task } => {
+            if let Some(current) = out.iter_mut().find_map(|part| match part {
+                MessagePart::WorkflowTask { task: current, .. }
+                    if current.task_id == task.task_id =>
+                {
+                    Some(current)
+                }
+                _ => None,
+            }) {
+                merge_workflow_task(current, task);
+            } else {
+                out.push(MessagePart::WorkflowTask {
+                    id: format!("workflow-{}", task.task_id),
+                    task: task.clone(),
                 });
             }
         }
@@ -658,9 +827,171 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_proto::{
+        WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
+    };
 
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
+    }
+
+    #[test]
+    fn workflow_updates_preserve_richer_fields() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::WorkflowTask {
+                task: WorkflowTaskUpdate {
+                    task_id: "wf-1".into(),
+                    status: WorkflowTaskStatus::Running,
+                    workflow_name: Some("Audit".into()),
+                    description: Some("Review repository".into()),
+                    usage: Some(WorkflowUsage {
+                        total_tokens: Some(1_200),
+                        tool_uses: Some(4),
+                        duration_ms: None,
+                    }),
+                    progress: vec![
+                        WorkflowProgressNode::Phase {
+                            index: 0,
+                            title: "Review".into(),
+                        },
+                        WorkflowProgressNode::Agent {
+                            index: 0,
+                            label: "Reviewer".into(),
+                            phase_index: 0,
+                            phase_title: Some("Review".into()),
+                            agent_id: Some("agent-1".into()),
+                            model: Some("sonnet".into()),
+                            state: Some("running".into()),
+                            prompt_preview: Some("Inspect the repository".into()),
+                        },
+                    ],
+                    agent_count: Some(1),
+                    task_type: Some("local_workflow".into()),
+                    subagent_type: None,
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::WorkflowTask {
+                task: WorkflowTaskUpdate {
+                    task_id: "wf-1".into(),
+                    status: WorkflowTaskStatus::Completed,
+                    workflow_name: None,
+                    description: None,
+                    usage: Some(WorkflowUsage {
+                        total_tokens: None,
+                        tool_uses: None,
+                        duration_ms: Some(2_500),
+                    }),
+                    progress: vec![WorkflowProgressNode::Agent {
+                        index: 1,
+                        label: "   ".into(),
+                        phase_index: 1,
+                        phase_title: None,
+                        agent_id: Some("agent-1".into()),
+                        model: None,
+                        state: Some("completed".into()),
+                        prompt_preview: None,
+                    }],
+                    agent_count: None,
+                    task_type: None,
+                    subagent_type: None,
+                },
+            },
+        );
+
+        let MessagePart::WorkflowTask { task, .. } = &parts[0] else {
+            panic!("expected workflow activity part")
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(task.status, WorkflowTaskStatus::Completed);
+        assert_eq!(task.workflow_name.as_deref(), Some("Audit"));
+        assert_eq!(task.description.as_deref(), Some("Review repository"));
+        assert_eq!(
+            task.usage,
+            Some(WorkflowUsage {
+                total_tokens: Some(1_200),
+                tool_uses: Some(4),
+                duration_ms: Some(2_500),
+            })
+        );
+        assert_eq!(task.progress.len(), 2);
+        assert!(matches!(
+            &task.progress[1],
+            WorkflowProgressNode::Agent {
+                index,
+                label,
+                phase_index,
+                model,
+                state,
+                prompt_preview,
+                ..
+            }
+                if label == "Reviewer"
+                    && *index == 1
+                    && *phase_index == 1
+                    && model.as_deref() == Some("sonnet")
+                    && state.as_deref() == Some("completed")
+                    && prompt_preview.as_deref() == Some("Inspect the repository")
+        ));
+    }
+
+    #[test]
+    fn workflow_activity_does_not_split_reasoning() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "Reviewing".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::WorkflowTask {
+                task: WorkflowTaskUpdate {
+                    task_id: "wf-1".into(),
+                    status: WorkflowTaskStatus::Running,
+                    workflow_name: Some("Audit".into()),
+                    description: None,
+                    usage: None,
+                    progress: Vec::new(),
+                    agent_count: None,
+                    task_type: Some("local_workflow".into()),
+                    subagent_type: None,
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: " repository".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "tool-1".into(),
+                call: ToolCall::Exec {
+                    command: "git status".into(),
+                },
+            },
+        );
+
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| matches!(part, MessagePart::Reasoning { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Reasoning { text, completed: true, .. }
+                if text == "Reviewing repository"
+        ));
     }
 
     #[test]
