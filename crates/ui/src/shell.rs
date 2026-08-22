@@ -110,6 +110,42 @@ struct ChatMenuState {
     position: Point<Pixels>,
     page: ChatMenuPage,
 }
+/// Interruptible height tween for the sidebar's device/archive disclosures.
+/// The rendered element owns the frame clock; this state preserves the current
+/// interpolated height when a second click reverses an in-flight transition.
+#[derive(Clone, Copy)]
+pub(super) struct SidebarDisclosureMotion {
+    pub(super) epoch: u64,
+    pub(super) from: f32,
+    pub(super) to: f32,
+    started: std::time::Instant,
+}
+
+impl SidebarDisclosureMotion {
+    fn new(epoch: u64, from: f32, to: f32) -> Self {
+        Self {
+            epoch,
+            from,
+            to,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn current(self) -> f32 {
+        let total = motion::COLLAPSE.total().as_secs_f32();
+        let raw = if total > 0.0 {
+            self.started.elapsed().as_secs_f32() / total
+        } else {
+            1.0
+        };
+        motion::lerp(self.from, self.to, motion::COLLAPSE.progress(raw))
+    }
+
+    fn animating(self) -> bool {
+        self.started.elapsed() < motion::COLLAPSE.total() + spaces::SIDEBAR_DISCLOSURE_TWEEN_GRACE
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -1311,6 +1347,9 @@ pub struct Shell {
     /// Lazy panes: no entity (and no RPC) until first opened. The right pane's
     /// terminal host is embedded (own PTYs, own grid geometry; one panel can
     /// only size one visible grid at a time).
+    /// In-flight disclosure tweens, shared by device groups and Archived.
+    pub(super) sidebar_disclosure_motion:
+        std::collections::HashMap<String, SidebarDisclosureMotion>,
     right_terminal: Option<Entity<TerminalPanel>>,
     /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
     right_plus: popover::Popup<()>,
@@ -1752,6 +1791,7 @@ impl Shell {
             archived_hover: None,
             jump_hints: false,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
+            sidebar_disclosure_motion: std::collections::HashMap::new(),
             right_terminal: None,
             right_plus: popover::Popup::default(),
             right_tab_revealed: None,
@@ -10093,5 +10133,13 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(combo, "cmd-alt-i");
         }
+    }
+
+    #[test]
+    fn sidebar_disclosure_motion_lands_exactly_on_its_target() {
+        let mut tween = SidebarDisclosureMotion::new(1, 240.0, 0.0);
+        tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
+        assert_eq!(tween.current(), 0.0);
+        assert!(!tween.animating());
     }
 }
