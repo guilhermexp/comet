@@ -614,6 +614,9 @@ pub enum RowKind {
         active: bool,
         duration_ms: Option<u64>,
     },
+    InlineImages {
+        paths: Arc<Vec<String>>,
+    },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
@@ -738,6 +741,51 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
     fnv1a(&acc)
 }
 
+fn inline_image_version(paths: &[String]) -> u64 {
+    let mut bytes = Vec::new();
+    for path in paths {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+    }
+    fnv1a(&bytes)
+}
+
+fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tool in tools {
+        let mut sources = Vec::new();
+        if let Ok(call) = serde_json::to_string(&tool.call) {
+            sources.push(call);
+        }
+        for detail in [tool.invocation.as_deref(), tool.detail.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let ToolDetail::Output { lines, .. } = detail {
+                sources.push(
+                    lines
+                        .iter()
+                        .map(SharedString::as_ref)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        for source in sources {
+            for path in crate::inline_media::extract_image_paths(&source) {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                    if out.len() == 6 {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Build the block rows of one (already continuation-joined) entry.
 ///
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
@@ -807,9 +855,11 @@ pub fn rows_for_entry(
                 return;
             }
             let tools = std::mem::take(group);
+            let image_paths = tool_image_paths(&tools);
             let auto_open = streaming && last_ix == last_part_ix;
+            let current_group = *group_ix;
             rows.push(Row {
-                id: format!("{}#g{}", entry.id, group_ix).into(),
+                id: format!("{}#g{}", entry.id, current_group).into(),
                 version: tool_fingerprint(&tools, auto_open),
                 turn_start: false,
                 kind: RowKind::ToolGroup {
@@ -819,6 +869,18 @@ pub fn rows_for_entry(
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
             });
+            if !image_paths.is_empty() {
+                rows.push(Row {
+                    id: format!("{}#g{}.images", entry.id, current_group).into(),
+                    version: inline_image_version(&image_paths),
+                    turn_start: false,
+                    kind: RowKind::InlineImages {
+                        paths: Arc::new(image_paths),
+                    },
+                    entry_id: entry.id.clone().into(),
+                    timestamp: None,
+                });
+            }
             *group_ix += 1;
         };
 
@@ -916,6 +978,19 @@ pub fn rows_for_entry(
                                         block_ix,
                                     }
                                 },
+                            });
+                        }
+                        let image_paths = crate::inline_media::extract_image_paths(text);
+                        if !image_paths.is_empty() {
+                            rows.push(Row {
+                                id: format!("{key}.images").into(),
+                                version: inline_image_version(&image_paths),
+                                turn_start: false,
+                                kind: RowKind::InlineImages {
+                                    paths: Arc::new(image_paths),
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
                             });
                         }
                     }
@@ -1639,6 +1714,9 @@ pub struct Transcript {
     /// Independent of motion settings: Reduced Motion stops the spinner,
     /// not the honest elapsed-time label beside it.
     reasoning_tick: Option<Task<()>>,
+    /// Agent-referenced checkout images load once per root/path and survive
+    /// virtualized row remounts for the attached chat.
+    inline_images: HashMap<String, InlineImageLoad>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1751,6 +1829,21 @@ enum BlobFetch {
     Ready(Arc<ToolDetail>),
 }
 
+enum InlineImageLoad {
+    Loading(#[allow(dead_code)] Task<()>),
+    Failed,
+    Ready(crate::inline_media::LoadedInlineImage),
+}
+
+enum InlineImageSnapshot {
+    Loading,
+    Failed,
+    Ready {
+        name: SharedString,
+        image: Arc<gpui::Image>,
+    },
+}
+
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
@@ -1848,6 +1941,7 @@ impl Transcript {
             tool_details: HashMap::new(),
             reasoning_started: HashMap::new(),
             reasoning_tick: None,
+            inline_images: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -2636,6 +2730,7 @@ impl Transcript {
             self.folds.clear();
             self.reasoning_started.clear();
             self.reasoning_tick = None;
+            self.inline_images.clear();
             self.user_message_overflow.clear();
             self.user_message_preview = None;
             self.veils.clear();
@@ -3010,6 +3105,153 @@ impl Transcript {
             .ok();
         });
         self.attachment_retries.insert(key, task);
+    }
+
+    fn inline_image_root(&self, cx: &gpui::App) -> Option<std::path::PathBuf> {
+        let state = self.state.read(cx);
+        let chat = state.selected_chat_row()?;
+        if let Some(local_device) = state.local_device_id.as_deref()
+            && chat.device_id != local_device
+        {
+            return None;
+        }
+        chat.cwd.as_deref().map(std::path::PathBuf::from)
+    }
+
+    fn inline_image_snapshot(
+        &mut self,
+        root: &std::path::Path,
+        candidate: &str,
+        cx: &mut Context<Self>,
+    ) -> InlineImageSnapshot {
+        let key = format!("{}\0{candidate}", root.display());
+        match self.inline_images.get(&key) {
+            Some(InlineImageLoad::Loading(_)) => return InlineImageSnapshot::Loading,
+            Some(InlineImageLoad::Failed) => return InlineImageSnapshot::Failed,
+            Some(InlineImageLoad::Ready(image)) => {
+                return InlineImageSnapshot::Ready {
+                    name: image.name.clone(),
+                    image: image.image.clone(),
+                };
+            }
+            None => {}
+        }
+
+        let task_key = key.clone();
+        let root = root.to_path_buf();
+        let candidate = candidate.to_owned();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::inline_media::load_checkout_image(&root, &candidate) })
+                .await;
+            this.update(cx, |transcript, cx| {
+                transcript.inline_images.insert(
+                    task_key,
+                    match result {
+                        Ok(image) => InlineImageLoad::Ready(image),
+                        Err(_) => InlineImageLoad::Failed,
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        });
+        self.inline_images
+            .insert(key, InlineImageLoad::Loading(task));
+        InlineImageSnapshot::Loading
+    }
+
+    fn render_inline_image_gallery(
+        &mut self,
+        row_id: &SharedString,
+        paths: &[String],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(root) = self.inline_image_root(cx) else {
+            return gpui::Empty.into_any_element();
+        };
+        let mut cards = Vec::new();
+        for (ix, path) in paths.iter().enumerate() {
+            let frame = div()
+                .id(SharedString::from(format!("{row_id}#inline-image-{ix}")))
+                .w(px(288.0))
+                .max_w_full()
+                .h(px(192.0))
+                .flex_none()
+                .overflow_hidden()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.09))
+                .bg(crate::theme::ink(0.035));
+            match self.inline_image_snapshot(&root, path, cx) {
+                InlineImageSnapshot::Failed => {}
+                InlineImageSnapshot::Loading => cards.push(
+                    frame
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            format!("inline-image-{row_id}-{ix}"),
+                            2.2,
+                            theme.text_muted,
+                            cx.entity_id(),
+                            cx,
+                        ))
+                        .into_any_element(),
+                ),
+                InlineImageSnapshot::Ready { name, image } => {
+                    let preview = crate::attachments::PreviewImage {
+                        name: name.clone(),
+                        image: image.clone(),
+                    };
+                    cards.push(
+                        frame
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(crate::theme::hairline(0.18)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.user_message_preview = None;
+                                this.attachment_preview = Some(preview.clone());
+                                window.focus(&this.attachment_preview_focus, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                img(image)
+                                    .w_full()
+                                    .h(px(164.0))
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                            .child(
+                                div()
+                                    .h(px(27.0))
+                                    .border_t_1()
+                                    .border_color(crate::theme::hairline(0.07))
+                                    .px(px(9.0))
+                                    .flex()
+                                    .items_center()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child(name),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if cards.is_empty() {
+            gpui::Empty.into_any_element()
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .children(cards)
+                .into_any_element()
+        }
     }
 
     /// The right-aligned thumbnail strip above a user bubble.
@@ -3592,6 +3834,9 @@ impl Transcript {
                 active,
                 duration_ms,
             } => self.render_reasoning(&row.id, tree, *active, *duration_ms, window, &theme, cx),
+            RowKind::InlineImages { paths } => {
+                self.render_inline_image_gallery(&row.id, paths, &theme, cx)
+            }
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
             }
@@ -5733,6 +5978,81 @@ mod tests {
         assert_eq!(r1[1].version, r2[1].version, "settled block untouched");
         assert_ne!(r1[2].version, r2[2].version, "tail block respliced");
         assert_eq!(diff_rows(&r1, &r2), Some((2..3, 1)));
+    }
+
+    #[test]
+    fn assistant_image_references_add_one_stable_deduplicated_gallery_row() {
+        let text = "Rendered ![chart](artifacts/chart.png). Same: artifacts/chart.png";
+        let live = assistant(
+            "media",
+            MessageStatus::Streaming,
+            vec![text_part("t0", text)],
+        );
+        let done = assistant(
+            "media",
+            MessageStatus::Complete,
+            vec![text_part("t0", text)],
+        );
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+
+        assert_eq!(live_rows.len(), 2);
+        assert_eq!(done_rows.len(), 2);
+        assert_eq!(live_rows[1].id, done_rows[1].id);
+        assert!(matches!(
+            &done_rows[1].kind,
+            RowKind::InlineImages { paths }
+                if paths.as_slice() == ["artifacts/chart.png"]
+        ));
+    }
+
+    #[test]
+    fn assistant_image_tool_outputs_add_a_gallery_after_the_tool_group() {
+        let mut tool = tool_part("render", "python render.py");
+        let MessagePart::Tool { output, .. } = &mut tool else {
+            unreachable!();
+        };
+        *output = Some("saved artifacts/final.webp".into());
+        let entry = assistant("tool-media", MessageStatus::Complete, vec![tool]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::InlineImages { paths }
+                if paths.as_slice() == ["artifacts/final.webp"]
+        ));
+    }
+
+    #[test]
+    fn assistant_image_read_tool_adds_a_gallery_without_output_text() {
+        let tool = MessagePart::Tool {
+            id: "read-image".into(),
+            call: ToolCall::ReadFile {
+                path: "artifacts/screenshot.png".into(),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let entry = assistant("read-media", MessageStatus::Complete, vec![tool]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::InlineImages { paths }
+                if paths.as_slice() == ["artifacts/screenshot.png"]
+        ));
     }
 
     #[test]
