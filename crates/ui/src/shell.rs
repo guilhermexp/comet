@@ -85,7 +85,8 @@ actions!(
         AddSpacePalette,
         NewSession,
         NextSession,
-        PrevSession
+        PrevSession,
+        ArchiveSession
     ]
 );
 
@@ -205,6 +206,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
                 crate::settings::ShortcutId::PrevSession.default_combo(),
             ),
             PrevSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.archive_session, "mod-shift-a"),
+            ArchiveSession,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -3384,6 +3390,21 @@ impl Shell {
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.set_chat_archived(chat_id, true, cx);
+    }
+
+    /// The Archive session shortcut. With no chat open, or with an already
+    /// archived one, it does nothing — the shortcut archives, it never
+    /// unarchives.
+    fn archive_selected_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .archivable_selected_chat()
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.archive_chat(chat_id, cx);
     }
 
     pub(super) fn set_chat_archived(
