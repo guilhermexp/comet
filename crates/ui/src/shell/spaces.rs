@@ -1132,7 +1132,6 @@ impl Shell {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
                 let harness = self
                     .settings
                     .sidebar_show_harness
@@ -1146,6 +1145,18 @@ impl Shell {
                 } else {
                     None
                 };
+                let shows_working_spinner = if status == ChatIndicator::Working {
+                    let state = self.state.read(cx);
+                    !state.send_queued(&chat.id, now) && !state.send_undelivered(&chat.id, now)
+                } else {
+                    false
+                };
+                let height = super::chat_row_height(
+                    harness.is_some(),
+                    branch.is_some(),
+                    change_request.is_some(),
+                    shows_working_spinner,
+                );
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
