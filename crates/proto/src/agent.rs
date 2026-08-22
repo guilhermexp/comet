@@ -20,7 +20,9 @@ pub enum HarnessId {
     Pi,
     /// Oh My Pi, driven through the installed `omp` CLI's native RPC mode.
     Omp,
-    /// SST's opencode agent, driven over ACP (`opencode acp`).
+    /// SST's opencode agent, driven natively over its own HTTP/SSE server
+    /// protocol (`opencode serve` — the same wire the opencode desktop app
+    /// speaks).
     Opencode,
     /// Test harness; never shown in production pickers.
     Mock,
