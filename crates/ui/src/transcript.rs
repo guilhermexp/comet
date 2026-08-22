@@ -1339,6 +1339,20 @@ fn media_task_admitted(
     inflight < max_inflight && total < max_total
 }
 
+fn remember_validated(cache: &mut HashMap<u64, u64>, key: u64, used_at: u64, limit: usize) {
+    cache.insert(key, used_at);
+    while cache.len() > limit {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, stamp)| **stamp)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
 fn format_thought_duration(duration_ms: Option<u64>) -> Option<String> {
     let duration_ms = duration_ms.filter(|duration| *duration >= 1_000)?;
     let seconds = (duration_ms / 1_000).max(1);
@@ -1746,11 +1760,11 @@ pub struct Transcript {
     /// Agent-referenced checkout images load once per root/path and survive
     /// virtualized row remounts for the attached chat.
     inline_images: HashMap<String, InlineImageLoad>,
-    validated_inline_images: std::collections::HashSet<String>,
+    validated_inline_images: HashMap<u64, u64>,
     /// Settled Mermaid fences render once off-thread and survive row
     /// virtualization for the attached chat.
     mermaid: HashMap<String, MermaidLoad>,
-    validated_mermaid: std::collections::HashSet<String>,
+    validated_mermaid: HashMap<u64, u64>,
     media_clock: u64,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
@@ -2002,9 +2016,9 @@ impl Transcript {
             reasoning_started: HashMap::new(),
             reasoning_tick: None,
             inline_images: HashMap::new(),
-            validated_inline_images: std::collections::HashSet::new(),
+            validated_inline_images: HashMap::new(),
             mermaid: HashMap::new(),
-            validated_mermaid: std::collections::HashSet::new(),
+            validated_mermaid: HashMap::new(),
             media_clock: 0,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
@@ -3292,7 +3306,14 @@ impl Transcript {
         }
 
         self.trim_inline_image_cache();
-        let previously_ready = self.validated_inline_images.contains(&key);
+        let validation_key = fnv1a(key.as_bytes());
+        let previously_ready =
+            if let Some(stamp) = self.validated_inline_images.get_mut(&validation_key) {
+                *stamp = used_at;
+                true
+            } else {
+                false
+            };
         let inflight = self
             .inline_images
             .values()
@@ -3322,9 +3343,14 @@ impl Transcript {
             this.update(cx, |transcript, cx| {
                 let used_at = transcript.next_media_use();
                 if result.is_ok() {
-                    transcript.validated_inline_images.insert(task_key.clone());
+                    remember_validated(
+                        &mut transcript.validated_inline_images,
+                        validation_key,
+                        used_at,
+                        INLINE_IMAGE_CACHE_MAX_TOTAL,
+                    );
                 } else {
-                    transcript.validated_inline_images.remove(&task_key);
+                    transcript.validated_inline_images.remove(&validation_key);
                 }
                 transcript.inline_images.insert(
                     task_key,
@@ -4375,7 +4401,14 @@ impl Transcript {
         }
 
         self.trim_mermaid_cache();
-        let previously_ready = self.validated_mermaid.contains(&key);
+        let validation_key = fnv1a(key.as_bytes());
+        let previously_ready = if let Some(stamp) = self.validated_mermaid.get_mut(&validation_key)
+        {
+            *stamp = used_at;
+            true
+        } else {
+            false
+        };
         let inflight = self
             .mermaid
             .values()
@@ -4409,9 +4442,14 @@ impl Transcript {
             this.update(cx, |transcript, cx| {
                 let used_at = transcript.next_media_use();
                 if result.is_ok() {
-                    transcript.validated_mermaid.insert(task_key.clone());
+                    remember_validated(
+                        &mut transcript.validated_mermaid,
+                        validation_key,
+                        used_at,
+                        MERMAID_CACHE_MAX_TOTAL,
+                    );
                 } else {
-                    transcript.validated_mermaid.remove(&task_key);
+                    transcript.validated_mermaid.remove(&validation_key);
                 }
                 transcript.mermaid.insert(
                     task_key,
@@ -6537,6 +6575,17 @@ mod tests {
         assert!(media_task_admitted(3, 20, 4, 32));
         assert!(!media_task_admitted(4, 20, 4, 32));
         assert!(!media_task_admitted(1, 32, 4, 32));
+    }
+
+    #[test]
+    fn validated_media_metadata_evicts_the_oldest_compact_key() {
+        let mut cache = HashMap::new();
+        remember_validated(&mut cache, 11, 1, 2);
+        remember_validated(&mut cache, 22, 2, 2);
+        remember_validated(&mut cache, 33, 3, 2);
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key(&11));
+        assert!(cache.contains_key(&22) && cache.contains_key(&33));
     }
 
     #[test]

@@ -13,7 +13,7 @@ const MAX_INLINE_IMAGES: usize = 6;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
 const MAX_MERMAID_BYTES: usize = 64 * 1024;
 const MAX_MERMAID_LINES: usize = 2_000;
-const MAX_MERMAID_STRUCTURE: usize = 4_000;
+const MAX_MERMAID_ELEMENTS: usize = 1_200;
 const MAX_MERMAID_SVG_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LoadedInlineImage {
@@ -173,14 +173,6 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<RenderedMermaid, S
     if source.lines().count() > MAX_MERMAID_LINES {
         return Err("diagram has too many lines".into());
     }
-    let structure = source.lines().count()
-        + source.matches("-->").count()
-        + source.matches("->>").count()
-        + source.matches("---").count()
-        + source.matches(';').count();
-    if structure > MAX_MERMAID_STRUCTURE {
-        return Err("diagram is too complex".into());
-    }
     let options = mermaid_rs_renderer::RenderOptions {
         theme: if dark {
             mermaid_rs_renderer::Theme::dark()
@@ -189,8 +181,45 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<RenderedMermaid, S
         },
         ..Default::default()
     };
-    let svg = mermaid_rs_renderer::render_with_options(source, options)
-        .map_err(|error| error.to_string())?;
+    let parsed = mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
+    let graph = &parsed.graph;
+    let elements = graph.nodes.len()
+        + graph.edges.len()
+        + graph.subgraphs.len()
+        + graph.sequence_participants.len()
+        + graph.sequence_frames.len()
+        + graph.sequence_notes.len()
+        + graph.sequence_activations.len()
+        + graph.sequence_boxes.len()
+        + graph.state_notes.len()
+        + graph.pie_slices.len()
+        + graph.quadrant.points.len()
+        + graph.gantt_tasks.len()
+        + graph.gitgraph.commits.len()
+        + graph.gitgraph.branches.len()
+        + graph.c4.shapes.len()
+        + graph.c4.boundaries.len()
+        + graph.c4.rels.len()
+        + graph.mindmap.nodes.len()
+        + graph
+            .xychart
+            .series
+            .iter()
+            .map(|series| series.values.len().max(1))
+            .sum::<usize>()
+        + graph
+            .timeline
+            .events
+            .iter()
+            .map(|event| event.events.len().max(1))
+            .sum::<usize>()
+        + graph.block.as_ref().map_or(0, |block| block.nodes.len());
+    if elements > MAX_MERMAID_ELEMENTS {
+        return Err("diagram has too many elements".into());
+    }
+    let layout =
+        mermaid_rs_renderer::compute_layout(&parsed.graph, &options.theme, &options.layout);
+    let svg = mermaid_rs_renderer::render_svg(&layout, &options.theme, &options.layout);
     if svg.len() > MAX_MERMAID_SVG_BYTES {
         return Err("rendered diagram is too large".into());
     }
