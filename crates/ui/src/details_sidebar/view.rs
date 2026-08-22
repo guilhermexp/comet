@@ -229,6 +229,16 @@ fn open_worker_event(worker: &ChatWorkerRow) -> DetailsSidebarEvent {
     }
 }
 
+fn worker_click_event(
+    event: DetailsSidebarEvent,
+    _still_available_in_sidebar_snapshot: bool,
+) -> DetailsSidebarEvent {
+    // The sidebar snapshot is advisory. Shell owns the final lookup against
+    // the latest WorkersModel snapshot and refreshes when this identity raced
+    // with session removal.
+    event
+}
+
 pub struct DetailsSidebar {
     app_state: Entity<AppState>,
     workers_model: Entity<WorkersModel>,
@@ -1030,9 +1040,7 @@ impl DetailsSidebar {
                     .read(cx)
                     .sessions_for_parent_chat(&chat_id)
                     .is_ok_and(|sessions| sessions.iter().any(|row| row.id == session_id));
-                if still_available {
-                    cx.emit(event.clone());
-                }
+                cx.emit(worker_click_event(event.clone(), still_available));
             }))
             .child(
                 icons::icon(runtime_icon)
@@ -1687,6 +1695,7 @@ mod tests {
     use super::{
         ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
         context_file_access, details_sidebar_background, open_subagent_event, open_worker_event,
+        worker_click_event,
     };
     use crate::details_sidebar::chat_workers::{ChatActivityRow, ChatWorkerRow, WorkerSemantic};
     use crate::details_sidebar::context::{DetailsContext, DetailsMode, DetailsTab};
@@ -1788,6 +1797,29 @@ mod tests {
 
         let DetailsSidebarEvent::OpenWorkerSession { session_id, title } =
             open_worker_event(&worker)
+        else {
+            panic!("expected worker action");
+        };
+        assert_eq!(session_id, "worker-42");
+        assert_eq!(title, "Fix tests");
+    }
+
+    #[test]
+    fn stale_worker_click_still_reaches_shell_for_final_revalidation() {
+        let worker = ChatWorkerRow {
+            session_id: "worker-42".into(),
+            project_id: "project-1".into(),
+            title: "Fix tests".into(),
+            command: "codex".into(),
+            provider_id: Some("codex".into()),
+            semantic: WorkerSemantic::Disconnected,
+            state: "disconnected".into(),
+            activity: "disconnected".into(),
+            updated_at_unix_ms: 42,
+        };
+
+        let DetailsSidebarEvent::OpenWorkerSession { session_id, title } =
+            worker_click_event(open_worker_event(&worker), false)
         else {
             panic!("expected worker action");
         };

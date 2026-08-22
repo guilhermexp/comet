@@ -66,6 +66,7 @@ use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_in
 use crate::workers::session_gallery;
 #[cfg(target_os = "macos")]
 use crate::workers::session_gallery::native as native_session_gallery;
+use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
 use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
 #[cfg(target_os = "macos")]
@@ -399,9 +400,52 @@ pub enum RightSurface {
     Diff(u64),
     Terminal(u64),
     Preview(u64),
+    /// A view attached to an existing terminal-backed Worker session. The
+    /// handle keys [`Shell::worker_terminal_tabs`].
+    Worker(u64),
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+}
+
+struct WorkerTerminalTab<T = Entity<WorkersTerminal>> {
+    title: SharedString,
+    view: WorkersTerminalView<T>,
+}
+
+fn register_worker_surface<T>(
+    surfaces: &mut std::collections::HashMap<u64, WorkerTerminalTab<T>>,
+    sequence: &mut u64,
+    session_id: &str,
+    title: &str,
+    create_terminal: impl FnOnce() -> T,
+) -> (RightSurface, bool) {
+    if let Some((id, _)) = surfaces
+        .iter()
+        .find(|(_, tab)| tab.view.session_id() == session_id)
+    {
+        return (RightSurface::Worker(*id), false);
+    }
+    *sequence = sequence.wrapping_add(1);
+    let id = *sequence;
+    surfaces.insert(
+        id,
+        WorkerTerminalTab {
+            title: title.to_string().into(),
+            view: WorkersTerminalView::new(session_id, create_terminal()),
+        },
+    );
+    (RightSurface::Worker(id), true)
+}
+
+fn resolve_worker_session_identity<'a>(
+    session_ids: impl IntoIterator<Item = &'a str>,
+    requested: &str,
+) -> Option<String> {
+    session_ids
+        .into_iter()
+        .find(|session_id| *session_id == requested)
+        .map(str::to_owned)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,6 +1149,10 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    /// Worker terminal views keyed independently from the stable external
+    /// session id. A session gets at most one entity while its tab is open.
+    worker_terminal_tabs: std::collections::HashMap<u64, WorkerTerminalTab>,
+    worker_terminal_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1390,9 +1438,7 @@ impl Shell {
                     );
                 }
                 DetailsSidebarEvent::OpenWorkerSession { session_id, title } => {
-                    // Task 6 owns the terminal split. Keep the typed identity
-                    // wired here without launching or selecting any runtime.
-                    let _ = (session_id, title);
+                    this.add_worker_surface(session_id, title, cx);
                 }
             },
         );
@@ -1485,6 +1531,8 @@ impl Shell {
             preview_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            worker_terminal_tabs: std::collections::HashMap::new(),
+            worker_terminal_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -2177,6 +2225,10 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone())),
+                RightSurface::Worker(id) => self
+                    .worker_terminal_tabs
+                    .get(id)
+                    .map(|tab| (*surface, tab.title.clone())),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2268,6 +2320,13 @@ impl Shell {
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
             RightSurface::Subagent(_) => {}
+            RightSurface::Worker(id) => {
+                if let Some(tab) = self.worker_terminal_tabs.get(&id) {
+                    tab.view
+                        .terminal()
+                        .update(cx, |terminal, cx| terminal.focus(cx));
+                }
+            }
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -2404,6 +2463,47 @@ impl Shell {
                 .push(RightSurface::Terminal(tab));
             self.set_right_active(RightSurface::Terminal(tab), cx);
         }
+    }
+
+    /// Attach the right split to the exact worker session currently present in
+    /// the latest model snapshot. This path never launches or mutates a worker.
+    fn add_worker_surface(&mut self, session_id: &str, title: &str, cx: &mut Context<Self>) {
+        let Some(session_id) = resolve_worker_session_identity(
+            self.workers_model
+                .read(cx)
+                .sessions()
+                .iter()
+                .map(|session| session.id.as_str()),
+            session_id,
+        ) else {
+            self.workers_model.update(cx, |model, cx| model.refresh(cx));
+            return;
+        };
+
+        if !self.right_pane_open(cx) {
+            let from = self.right_target(cx);
+            let key = self.panel_key(cx);
+            self.panels.show_changes(&key);
+            self.finish_right_transition(from, cx);
+        }
+        let (surface, inserted) = register_worker_surface(
+            &mut self.worker_terminal_tabs,
+            &mut self.worker_terminal_seq,
+            &session_id,
+            title,
+            || {
+                let terminal = cx.new(WorkersTerminal::new);
+                terminal.update(cx, |terminal, cx| {
+                    terminal.set_session(Some(session_id.clone()), cx)
+                });
+                terminal
+            },
+        );
+        let key = self.panel_key(cx);
+        if inserted {
+            self.right_tabs.entry(key).or_default().push(surface);
+        }
+        self.set_right_active(surface, cx);
     }
 
     /// Spawn-chip events from the primary transcript AND from subagent-tab
@@ -2576,6 +2676,11 @@ impl Shell {
                 if let Some(tab) = self.subagent_tabs.remove(&id) {
                     self.state
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
+                }
+            }
+            RightSurface::Worker(id) => {
+                if let Some(tab) = self.worker_terminal_tabs.remove(&id) {
+                    tab.view.detach();
                 }
             }
             RightSurface::Picker => {}
@@ -7009,25 +7114,87 @@ impl Shell {
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let active = self.active_utility_pane(cx);
-        let tab_strip = match active {
-            Some(_) => self.render_utility_tab_strip(cx),
-            None => gpui::Empty.into_any_element(),
+        let surface = self.resolved_right_active(cx);
+        let tab_strip = match surface {
+            RightSurface::Picker => match active {
+                Some(_) => self.render_utility_tab_strip(cx),
+                None => gpui::Empty.into_any_element(),
+            },
+            _ => self.render_right_tab_strip(cx),
         };
-        let content: AnyElement = match active {
-            Some(UtilityPane::Terminal) => {
+        let content: AnyElement = match surface {
+            RightSurface::Diff(id) => self
+                .diffs
+                .get(&id)
+                .cloned()
+                .map(|changes| {
+                    changes.update(cx, |changes, cx| changes.ensure_content(cx));
+                    changes.into_any_element()
+                })
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
+            RightSurface::Terminal(tab) => {
+                let panel = self.right_terminal_panel(cx);
+                let resize_suspended = self.tween_active(self.right_tween);
+                panel.update(cx, |panel, cx| {
+                    panel.set_resize_suspended(resize_suspended);
+                    panel.select_tab_by_key(tab, cx);
+                });
+                panel.into_any_element()
+            }
+            RightSurface::Preview(_) => self.file_preview.clone().into_any_element(),
+            RightSurface::Subagent(id) => {
+                let transcript = self
+                    .subagent_tabs
+                    .get(&id)
+                    .expect("resolved subagent surface")
+                    .transcript
+                    .clone();
+                let pill = transcript.read(cx).jump_button_shown().then(|| {
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(self.jump_pill(
+                            "subagent-jump-to-bottom",
+                            "subagent-jump-pill",
+                            transcript.clone(),
+                            cx,
+                        ))
+                });
+                div()
+                    .size_full()
+                    .relative()
+                    .child(transcript)
+                    .children(pill)
+                    .into_any_element()
+            }
+            RightSurface::Worker(id) => self
+                .worker_terminal_tabs
+                .get(&id)
+                .expect("resolved worker surface")
+                .view
+                .terminal()
+                .clone()
+                .into_any_element(),
+            RightSurface::Picker => match active {
+                Some(UtilityPane::Terminal) => {
                 let panel = self.terminal_panel(cx);
                 let resize_suspended = self.tween_active(self.right_tween);
                 panel.update(cx, |panel, _| {
                     panel.set_resize_suspended(resize_suspended)
                 });
                 panel.into_any_element()
-            }
-            Some(UtilityPane::Changes) => {
-                let changes = self.changes_pane(cx);
-                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-                changes.into_any_element()
-            }
-            None => gpui::Empty.into_any_element(),
+                }
+                Some(UtilityPane::Changes) => {
+                    let changes = self.changes_pane(cx);
+                    changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                    changes.into_any_element()
+                }
+                None => gpui::Empty.into_any_element(),
+            },
         };
         // Flush panel (user request — the inset card is gone): full window
         // height with a left hairline, glass-friendly for either utility
@@ -7341,6 +7508,10 @@ impl Shell {
                             .into_any_element()
                     }),
                 RightSurface::Subagent(_) => icon(icons::BOT)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+                RightSurface::Worker(_) => icon(icons::TERMINAL)
                     .size(px(12.0))
                     .text_color(theme.text_muted)
                     .into_any_element(),
@@ -9497,6 +9668,38 @@ mod tests {
         );
         assert!(inserted);
         assert_eq!(other, RightSurface::Preview(2));
+    }
+
+    #[test]
+    fn worker_surface_reuses_exact_session_identity() {
+        let mut sequence = 0;
+        let mut surfaces = std::collections::HashMap::new();
+        let mut created_views = 0;
+
+        let (first, created) =
+            register_worker_surface(&mut surfaces, &mut sequence, "session-1", "Audit", || {
+                created_views += 1;
+            });
+        assert!(created);
+
+        let (second, created) =
+            register_worker_surface(&mut surfaces, &mut sequence, "session-1", "Renamed", || {
+                created_views += 1;
+            });
+
+        assert!(!created);
+        assert_eq!(first, second);
+        assert_eq!(created_views, 1);
+    }
+
+    #[test]
+    fn missing_worker_session_does_not_resolve_another_identity() {
+        let session_ids = ["session-1", "session-2"];
+
+        assert_eq!(
+            resolve_worker_session_identity(session_ids.into_iter(), "missing"),
+            None
+        );
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

@@ -190,6 +190,35 @@ impl ResizeSync {
     }
 }
 
+/// A UI attachment to an already-running worker session. Dropping or
+/// detaching this value owns only the local view; worker lifecycle authority
+/// remains exclusively with [`WorkersModel`](crate::workers::model::WorkersModel).
+pub(crate) struct WorkersTerminalView<T> {
+    session_id: String,
+    terminal: T,
+}
+
+impl<T> WorkersTerminalView<T> {
+    pub(crate) fn new(session_id: impl Into<String>, terminal: T) -> Self {
+        Self {
+            session_id: session_id.into(),
+            terminal,
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn terminal(&self) -> &T {
+        &self.terminal
+    }
+
+    pub(crate) fn detach(self) {
+        drop(self.terminal);
+    }
+}
+
 pub struct WorkersTerminal {
     client: LocalWorkersClient,
     session_id: Option<String>,
@@ -372,6 +401,13 @@ impl WorkersTerminal {
         self.coalescer.take();
         self.selection_drag = None;
         cx.notify();
+    }
+
+    pub fn focus(&mut self, cx: &mut Context<Self>) {
+        if self.session_id.is_some() {
+            self.focus_pending = true;
+            cx.notify();
+        }
     }
 
     pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
@@ -748,6 +784,11 @@ impl Render for WorkersTerminal {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use gpui::Modifiers;
     use zeron_workers_unpeel::WorkersViewportInputModes;
 
@@ -755,8 +796,38 @@ mod tests {
 
     use super::{
         HistoricalReplay, MouseReportKind, RemoteGridTracker, ResizeSync, TerminalRefresh,
-        TerminalScrollAction, mouse_report_bytes, scroll_action, terminal_refresh,
+        TerminalScrollAction, WorkersTerminalView, mouse_report_bytes, scroll_action,
+        terminal_refresh,
     };
+
+    struct ViewDropProbe {
+        view_drops: Arc<AtomicUsize>,
+        _lifecycle_mutations: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ViewDropProbe {
+        fn drop(&mut self) {
+            self.view_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn workers_terminal_detach_is_view_only() {
+        let view_drops = Arc::new(AtomicUsize::new(0));
+        let lifecycle_mutations = Arc::new(AtomicUsize::new(0));
+        let view = WorkersTerminalView::new(
+            "session-1",
+            ViewDropProbe {
+                view_drops: Arc::clone(&view_drops),
+                _lifecycle_mutations: Arc::clone(&lifecycle_mutations),
+            },
+        );
+
+        view.detach();
+
+        assert_eq!(view_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle_mutations.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn terminal_refresh_reuses_the_existing_emulator_for_incremental_output() {
