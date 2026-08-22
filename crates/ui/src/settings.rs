@@ -183,6 +183,8 @@ fn flush_latest(cx: &mut App) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarOrganization {
+    /// Legacy persisted value. Project scope now belongs exclusively to the
+    /// project selector and is normalized to [`Self::InOneList`] on load.
     ByProject,
     ByDevice,
     #[default]
@@ -697,6 +699,9 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
 impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
+        if self.sidebar_organization == SidebarOrganization::ByProject {
+            self.sidebar_organization = SidebarOrganization::InOneList;
+        }
         self.sidebar_width = clamp_or(
             self.sidebar_width,
             SIDEBAR_MIN,
@@ -861,6 +866,21 @@ mod tests {
         assert_eq!(
             reloaded.ui_font_family,
             crate::typography::UiFontFamily::Installed("Inter".into())
+        );
+    }
+
+    #[test]
+    fn legacy_project_organization_normalizes_to_one_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarOrganization":"byProject"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            UiSettings::load(dir.path()).sidebar_organization,
+            SidebarOrganization::InOneList
         );
     }
 
