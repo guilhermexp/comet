@@ -19,9 +19,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, SharedString,
-    Subscription, Task, Window, WindowControlArea, actions, div, img, prelude::*, px,
+    Action, AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
+    Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels,
+    Point, Render, SharedString, Subscription, Task, Window, WindowControlArea, actions, div, img,
+    prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -53,8 +54,9 @@ use crate::settings::projects::ProjectsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
-    SavePolicy, UiSettings, platform_combo,
+    JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX,
+    SIDEBAR_MIN, SavePolicy, ShortcutId, UiSettings, display_combo, jump_hints_visible,
+    platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -90,6 +92,11 @@ actions!(
     ]
 );
 
+/// Open the session at `slot` (zero-based) of the sidebar's active list. One
+/// action carrying the slot, rather than nine near-identical action types.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct JumpSession(pub usize);
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -217,6 +224,20 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
     ]);
+    // Cmd+1..Cmd+9 open the sidebar's first nine rows. A slot left unbound
+    // binds nothing rather than falling back: the user cleared it on purpose.
+    cx.bind_keys((0..JUMP_SLOTS).filter_map(|slot| {
+        let id = ShortcutId::JumpSession(slot);
+        let combo = keymap.get(id);
+        if combo.is_empty() {
+            return None;
+        }
+        Some(KeyBinding::new(
+            &valid_or_default(combo, id.default_combo()),
+            JumpSession(slot),
+            None,
+        ))
+    }));
     #[cfg(debug_assertions)]
     cx.bind_keys([KeyBinding::new(
         &platform_combo("mod-alt-i"),
@@ -1269,6 +1290,9 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
+    /// The jump-hint overlay is visible while the held modifiers exactly
+    /// match a jump shortcut. Window deactivation clears it.
+    pub(super) jump_hints: bool,
     /// Lazy panes: no entity (and no RPC) until first opened. The right pane's
     /// terminal host is embedded (own PTYs, own grid geometry; one panel can
     /// only size one visible grid at a time).
@@ -1441,6 +1465,9 @@ pub struct Shell {
     /// with nothing focused they go dead. Initial focus lands on the composer
     /// and focus lost with no successor routes back there.
     focus_sub: Option<Subscription>,
+    /// Clears the jump hints when the window deactivates: a Cmd+Tab away
+    /// swallows the key-up, so without this the chips stay on screen for good.
+    activation_sub: Option<Subscription>,
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
@@ -1703,6 +1730,7 @@ impl Shell {
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
+            jump_hints: false,
             right_terminal: None,
             right_plus: popover::Popup::default(),
             right_tab_revealed: None,
@@ -1795,6 +1823,7 @@ impl Shell {
             splash: SplashPhase::Visible,
             splash_task: None,
             focus_sub: None,
+            activation_sub: None,
             _ticker: ticker,
             _state_observation: observation,
             _workers_observation: workers_observation,
@@ -3419,6 +3448,42 @@ impl Shell {
             cx,
         );
         cx.notify();
+    }
+
+    /// A jump shortcut: open the sidebar row at `slot`. A slot past the end of
+    /// a short list does nothing.
+    fn jump_to_session(&mut self, slot: usize, cx: &mut Context<Self>) {
+        let filter = self.settings.space_filter.clone();
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .jump_target(Utc::now(), filter.as_deref(), slot)
+        else {
+            return;
+        };
+        // Same path a click on that row takes.
+        self.open_chat(chat_id, cx);
+    }
+
+    /// Track the held modifiers so the sidebar can show its jump hints. Only a
+    /// change in visibility repaints — modifier traffic is otherwise constant.
+    fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
+        let mods = &event.modifiers;
+        let primary = if cfg!(target_os = "macos") {
+            mods.platform
+        } else {
+            mods.control
+        };
+        let visible = matches!(self.route, Route::Chat)
+            && jump_hints_visible(&self.settings.keymap, primary, mods.alt, mods.shift);
+        self.set_jump_hints(visible, cx);
+    }
+
+    pub(super) fn set_jump_hints(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.jump_hints != visible {
+            self.jump_hints = visible;
+            cx.notify();
+        }
     }
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -5194,6 +5259,11 @@ impl Shell {
         status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
+        // This row's jump combo while the hint overlay is up. It takes the
+        // corner outright — above hover and above the status word — so all
+        // nine chips appear together instead of leaving a hole on whichever
+        // row is busy or under the pointer.
+        jump_label: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -5237,7 +5307,25 @@ impl Shell {
             }
         };
         let queued = queued && !undelivered;
-        let corner_body: AnyElement = if corner_hovered {
+        let corner_body: AnyElement = if let Some(label) = jump_label {
+            // t3code's jump chip: a small key-cap in the corner the time-ago
+            // normally holds, so the overlay reflows nothing.
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(18.0))
+                .px(px(5.0))
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.surface_raised)
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(label)
+                .into_any_element()
+        } else if corner_hovered {
             div()
                 .flex()
                 .flex_row()
@@ -8487,6 +8575,17 @@ impl Render for Shell {
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
 
+        if self.activation_sub.is_none() {
+            self.activation_sub = Some(cx.observe_window_activation(
+                window,
+                |this: &mut Shell, window, cx| {
+                    if !window.is_window_active() {
+                        this.set_jump_hints(false, cx);
+                    }
+                },
+            ));
+        }
+
         // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
         // composer, and whenever focus is lost with no successor (e.g. the
@@ -8562,9 +8661,7 @@ impl Render for Shell {
             // forward the slot instead of eating it.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
                 let pickers = this.composer.read(cx).pickers().clone();
-                let handled = pickers.update(cx, |pickers, cx| {
-                    pickers.jump_model_slot(jump.0, cx)
-                });
+                let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
                 }
@@ -8961,7 +9058,7 @@ mod tests {
                 "{} default {combo:?} does not parse",
                 id.label()
             );
-    }
+        }
     }
 
     #[tokio::test]
