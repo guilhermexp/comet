@@ -12,11 +12,19 @@ use crate::markdown::parser::Block;
 const MAX_INLINE_IMAGES: usize = 6;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
 const MAX_MERMAID_BYTES: usize = 256 * 1024;
+const MAX_MERMAID_LINES: usize = 2_000;
+const MAX_MERMAID_SVG_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LoadedInlineImage {
     pub relative_path: String,
     pub name: SharedString,
     pub image: Arc<Image>,
+    pub bytes: u64,
+}
+
+pub struct RenderedMermaid {
+    pub image: Arc<Image>,
+    pub bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +126,9 @@ pub fn load_checkout_image(
     candidate: &str,
 ) -> Result<LoadedInlineImage, InlineImageError> {
     let (root, relative) = canonical_candidate(root, candidate)?;
+    let bytes = std::fs::metadata(root.join(&relative))
+        .map_err(|error| InlineImageError::Load(PreviewLoadError::Io(error.to_string())))?
+        .len();
     let relative_path = relative.to_string_lossy().into_owned();
     let name = relative
         .file_name()
@@ -129,6 +140,7 @@ pub fn load_checkout_image(
             relative_path,
             name: name.into(),
             image,
+            bytes,
         }),
         _ => Err(InlineImageError::Unsupported),
     }
@@ -149,7 +161,7 @@ pub fn mermaid_source(block: &Block) -> Option<&str> {
     .then_some(code.as_str())
 }
 
-pub fn render_mermaid_svg(source: &str) -> Result<Arc<Image>, String> {
+pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<RenderedMermaid, String> {
     let source = source.trim();
     if source.is_empty() {
         return Err("diagram source is empty".into());
@@ -157,9 +169,24 @@ pub fn render_mermaid_svg(source: &str) -> Result<Arc<Image>, String> {
     if source.len() > MAX_MERMAID_BYTES {
         return Err("diagram source is too large".into());
     }
-    let declaration = source
-        .lines()
-        .find_map(|line| line.split_whitespace().next())
+    if source.lines().count() > MAX_MERMAID_LINES {
+        return Err("diagram has too many lines".into());
+    }
+    let mut lines = source.lines().map(str::trim).peekable();
+    while lines.peek().is_some_and(|line| line.is_empty()) {
+        lines.next();
+    }
+    if lines.peek().is_some_and(|line| *line == "---") {
+        lines.next();
+        for line in lines.by_ref() {
+            if line == "---" {
+                break;
+            }
+        }
+    }
+    let declaration = lines
+        .find(|line| !line.is_empty() && !line.starts_with("%%"))
+        .and_then(|line| line.split_whitespace().next())
         .unwrap_or_default()
         .to_ascii_lowercase();
     if !matches!(
@@ -191,15 +218,23 @@ pub fn render_mermaid_svg(source: &str) -> Result<Arc<Image>, String> {
         return Err("diagram declaration is not recognized".into());
     }
     let options = mermaid_rs_renderer::RenderOptions {
-        theme: mermaid_rs_renderer::Theme::dark(),
+        theme: if dark {
+            mermaid_rs_renderer::Theme::dark()
+        } else {
+            mermaid_rs_renderer::Theme::mermaid_default()
+        },
         ..Default::default()
     };
     let svg = mermaid_rs_renderer::render_with_options(source, options)
         .map_err(|error| error.to_string())?;
-    Ok(Arc::new(Image::from_bytes(
-        ImageFormat::Svg,
-        svg.into_bytes(),
-    )))
+    if svg.len() > MAX_MERMAID_SVG_BYTES {
+        return Err("rendered diagram is too large".into());
+    }
+    let bytes = svg.len();
+    Ok(RenderedMermaid {
+        image: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
+        bytes,
+    })
 }
 
 #[cfg(test)]
@@ -289,8 +324,22 @@ mod tests {
 
     #[test]
     fn mermaid_renderer_returns_svg_images_and_rejects_invalid_source() {
-        assert!(render_mermaid_svg("flowchart LR\nA --> B").is_ok());
-        assert!(render_mermaid_svg("not-a-diagram").is_err());
-        assert!(render_mermaid_svg("   ").is_err());
+        assert!(render_mermaid_svg("flowchart LR\nA --> B", true).is_ok());
+        assert!(render_mermaid_svg("flowchart LR\nA --> B", false).is_ok());
+        assert!(
+            render_mermaid_svg(
+                "%%{init: {'flowchart': {'curve': 'linear'}}}%%\nflowchart LR\nA --> B",
+                true,
+            )
+            .is_ok()
+        );
+        assert!(render_mermaid_svg("%% generated diagram\nflowchart LR\nA --> B", true).is_ok());
+        assert!(
+            render_mermaid_svg("---\ntitle: Example\n---\nflowchart LR\nA --> B", true).is_ok()
+        );
+        assert!(render_mermaid_svg("not-a-diagram", true).is_err());
+        assert!(render_mermaid_svg("   ", true).is_err());
+        let oversized = format!("flowchart LR\n{}", "A --> B\n".repeat(10_000));
+        assert!(render_mermaid_svg(&oversized, true).is_err());
     }
 }

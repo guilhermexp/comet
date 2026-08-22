@@ -67,6 +67,10 @@ pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
 const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
 const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
+const INLINE_IMAGE_CACHE_MAX_ENTRIES: usize = 24;
+const INLINE_IMAGE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const MERMAID_CACHE_MAX_ENTRIES: usize = 16;
+const MERMAID_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
@@ -1083,7 +1087,12 @@ pub fn rows_for_entry(
     // (chat-view.tsx: "No timestamp hover mid-stream"). The version bit keeps
     // the diff key honest for last-row kinds whose own version wouldn't
     // change when streaming flips off (chips).
-    if !streaming && let Some(last) = rows.last_mut() {
+    if !streaming
+        && let Some(last) = rows
+            .iter_mut()
+            .rev()
+            .find(|row| !matches!(row.kind, RowKind::InlineImages { .. }))
+    {
         last.timestamp = Some(entry.created_at);
         last.version ^= 1 << 62;
     }
@@ -1211,6 +1220,9 @@ fn part_prefix(id: &str) -> &str {
 /// part — matching the live row's internal spacing exactly, so the
 /// live→split handoff cannot shift a pixel; the block gap otherwise.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
+    if matches!(row.kind, RowKind::InlineImages { .. }) {
+        return 0.0;
+    }
     if row.turn_start {
         return GAP_TURN;
     }
@@ -1724,6 +1736,7 @@ pub struct Transcript {
     /// Settled Mermaid fences render once off-thread and survive row
     /// virtualization for the attached chat.
     mermaid: HashMap<String, MermaidLoad>,
+    media_clock: u64,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1838,8 +1851,13 @@ enum BlobFetch {
 
 enum InlineImageLoad {
     Loading(#[allow(dead_code)] Task<()>),
-    Failed,
-    Ready(crate::inline_media::LoadedInlineImage),
+    Failed {
+        used_at: u64,
+    },
+    Ready {
+        image: crate::inline_media::LoadedInlineImage,
+        used_at: u64,
+    },
 }
 
 enum InlineImageSnapshot {
@@ -1853,8 +1871,14 @@ enum InlineImageSnapshot {
 
 enum MermaidLoad {
     Loading(#[allow(dead_code)] Task<()>),
-    Failed,
-    Ready(Arc<gpui::Image>),
+    Failed {
+        used_at: u64,
+    },
+    Ready {
+        image: Arc<gpui::Image>,
+        bytes: usize,
+        used_at: u64,
+    },
 }
 
 enum MermaidSnapshot {
@@ -1962,6 +1986,7 @@ impl Transcript {
             reasoning_tick: None,
             inline_images: HashMap::new(),
             mermaid: HashMap::new(),
+            media_clock: 0,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -2752,6 +2777,7 @@ impl Transcript {
             self.reasoning_tick = None;
             self.inline_images.clear();
             self.mermaid.clear();
+            self.media_clock = 0;
             self.user_message_overflow.clear();
             self.user_message_preview = None;
             self.veils.clear();
@@ -3139,6 +3165,78 @@ impl Transcript {
         chat.cwd.as_deref().map(std::path::PathBuf::from)
     }
 
+    fn next_media_use(&mut self) -> u64 {
+        self.media_clock = self.media_clock.wrapping_add(1).max(1);
+        self.media_clock
+    }
+
+    fn trim_inline_image_cache(&mut self) {
+        loop {
+            let settled = self
+                .inline_images
+                .values()
+                .filter(|entry| !matches!(entry, InlineImageLoad::Loading(_)))
+                .count();
+            let bytes: u64 = self
+                .inline_images
+                .values()
+                .filter_map(|entry| match entry {
+                    InlineImageLoad::Ready { image, .. } => Some(image.bytes),
+                    _ => None,
+                })
+                .sum();
+            if settled <= INLINE_IMAGE_CACHE_MAX_ENTRIES && bytes <= INLINE_IMAGE_CACHE_MAX_BYTES {
+                break;
+            }
+            let oldest = self
+                .inline_images
+                .iter()
+                .filter_map(|(key, entry)| match entry {
+                    InlineImageLoad::Failed { used_at }
+                    | InlineImageLoad::Ready { used_at, .. } => Some((key.clone(), *used_at)),
+                    InlineImageLoad::Loading(_) => None,
+                })
+                .min_by_key(|(_, used_at)| *used_at)
+                .map(|(key, _)| key);
+            let Some(oldest) = oldest else { break };
+            self.inline_images.remove(&oldest);
+        }
+    }
+
+    fn trim_mermaid_cache(&mut self) {
+        loop {
+            let settled = self
+                .mermaid
+                .values()
+                .filter(|entry| !matches!(entry, MermaidLoad::Loading(_)))
+                .count();
+            let bytes: usize = self
+                .mermaid
+                .values()
+                .filter_map(|entry| match entry {
+                    MermaidLoad::Ready { bytes, .. } => Some(*bytes),
+                    _ => None,
+                })
+                .sum();
+            if settled <= MERMAID_CACHE_MAX_ENTRIES && bytes <= MERMAID_CACHE_MAX_BYTES {
+                break;
+            }
+            let oldest = self
+                .mermaid
+                .iter()
+                .filter_map(|(key, entry)| match entry {
+                    MermaidLoad::Failed { used_at } | MermaidLoad::Ready { used_at, .. } => {
+                        Some((key.clone(), *used_at))
+                    }
+                    MermaidLoad::Loading(_) => None,
+                })
+                .min_by_key(|(_, used_at)| *used_at)
+                .map(|(key, _)| key);
+            let Some(oldest) = oldest else { break };
+            self.mermaid.remove(&oldest);
+        }
+    }
+
     fn inline_image_snapshot(
         &mut self,
         root: &std::path::Path,
@@ -3146,10 +3244,18 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> InlineImageSnapshot {
         let key = format!("{}\0{candidate}", root.display());
-        match self.inline_images.get(&key) {
+        let used_at = self.next_media_use();
+        match self.inline_images.get_mut(&key) {
             Some(InlineImageLoad::Loading(_)) => return InlineImageSnapshot::Loading,
-            Some(InlineImageLoad::Failed) => return InlineImageSnapshot::Failed,
-            Some(InlineImageLoad::Ready(image)) => {
+            Some(InlineImageLoad::Failed { used_at: stamp }) => {
+                *stamp = used_at;
+                return InlineImageSnapshot::Failed;
+            }
+            Some(InlineImageLoad::Ready {
+                image,
+                used_at: stamp,
+            }) => {
+                *stamp = used_at;
                 return InlineImageSnapshot::Ready {
                     name: image.name.clone(),
                     image: image.image.clone(),
@@ -3167,13 +3273,15 @@ impl Transcript {
                 .spawn(async move { crate::inline_media::load_checkout_image(&root, &candidate) })
                 .await;
             this.update(cx, |transcript, cx| {
+                let used_at = transcript.next_media_use();
                 transcript.inline_images.insert(
                     task_key,
                     match result {
-                        Ok(image) => InlineImageLoad::Ready(image),
-                        Err(_) => InlineImageLoad::Failed,
+                        Ok(image) => InlineImageLoad::Ready { image, used_at },
+                        Err(_) => InlineImageLoad::Failed { used_at },
                     },
                 );
+                transcript.trim_inline_image_cache();
                 cx.notify();
             })
             .ok();
@@ -3208,20 +3316,7 @@ impl Transcript {
                 .bg(crate::theme::ink(0.035));
             match self.inline_image_snapshot(&root, path, cx) {
                 InlineImageSnapshot::Failed => {}
-                InlineImageSnapshot::Loading => cards.push(
-                    frame
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(crate::loaders::mini_mono_spinner(
-                            format!("inline-image-{row_id}-{ix}"),
-                            2.2,
-                            theme.text_muted,
-                            cx.entity_id(),
-                            cx,
-                        ))
-                        .into_any_element(),
-                ),
+                InlineImageSnapshot::Loading => {}
                 InlineImageSnapshot::Ready { name, image } => {
                     let preview = crate::attachments::PreviewImage {
                         name: name.clone(),
@@ -3266,6 +3361,7 @@ impl Transcript {
         } else {
             div()
                 .w_full()
+                .pt(px(GAP_BLOCK))
                 .flex()
                 .flex_row()
                 .flex_wrap()
@@ -4183,35 +4279,57 @@ impl Transcript {
         column.into_any_element()
     }
 
-    fn mermaid_snapshot(&mut self, source: &str, cx: &mut Context<Self>) -> MermaidSnapshot {
-        match self.mermaid.get(source) {
+    fn mermaid_snapshot(
+        &mut self,
+        source: &str,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) -> MermaidSnapshot {
+        let key = format!("{}\0{source}", if dark { "dark" } else { "light" });
+        let used_at = self.next_media_use();
+        match self.mermaid.get_mut(&key) {
             Some(MermaidLoad::Loading(_)) => return MermaidSnapshot::Loading,
-            Some(MermaidLoad::Failed) => return MermaidSnapshot::Failed,
-            Some(MermaidLoad::Ready(image)) => return MermaidSnapshot::Ready(image.clone()),
+            Some(MermaidLoad::Failed { used_at: stamp }) => {
+                *stamp = used_at;
+                return MermaidSnapshot::Failed;
+            }
+            Some(MermaidLoad::Ready {
+                image,
+                used_at: stamp,
+                ..
+            }) => {
+                *stamp = used_at;
+                return MermaidSnapshot::Ready(image.clone());
+            }
             None => {}
         }
 
-        let key = source.to_owned();
         let task_key = key.clone();
-        let render_source = key.clone();
+        let render_source = source.to_owned();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::inline_media::render_mermaid_svg(&render_source)
+                        crate::inline_media::render_mermaid_svg(&render_source, dark)
                     }))
                     .unwrap_or_else(|_| Err("diagram renderer failed".into()))
                 })
                 .await;
             this.update(cx, |transcript, cx| {
+                let used_at = transcript.next_media_use();
                 transcript.mermaid.insert(
                     task_key,
                     match result {
-                        Ok(image) => MermaidLoad::Ready(image),
-                        Err(_) => MermaidLoad::Failed,
+                        Ok(rendered) => MermaidLoad::Ready {
+                            image: rendered.image,
+                            bytes: rendered.bytes,
+                            used_at,
+                        },
+                        Err(_) => MermaidLoad::Failed { used_at },
                     },
                 );
+                transcript.trim_mermaid_cache();
                 cx.notify();
             })
             .ok();
@@ -4235,7 +4353,7 @@ impl Transcript {
         let Some(source) = crate::inline_media::mermaid_source(&top.block) else {
             return gpui::Empty.into_any_element();
         };
-        let state = self.mermaid_snapshot(source, cx);
+        let state = self.mermaid_snapshot(source, theme.appearance.is_dark(), cx);
         let source_key: SharedString = format!("{row_id}#mermaid-source").into();
         let source_open = self
             .folds
@@ -6217,6 +6335,9 @@ mod tests {
             RowKind::InlineImages { paths }
                 if paths.as_slice() == ["artifacts/chart.png"]
         ));
+        assert_eq!(top_gap_for(Some(&done_rows[0]), &done_rows[1]), 0.0);
+        assert!(done_rows[0].timestamp.is_some());
+        assert!(done_rows[1].timestamp.is_none());
     }
 
     #[test]
