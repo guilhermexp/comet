@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    Action, AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
-    Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels,
-    Point, Render, SharedString, Subscription, Task, Window, WindowControlArea, actions, div, img,
-    prelude::*, px,
+    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, IntoElement,
+    KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent,
+    ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window, WindowControlArea,
+    actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -55,8 +55,8 @@ use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
     JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX,
-    SIDEBAR_MIN, SavePolicy, ShortcutId, UiSettings, badge_combo, jump_hints_visible,
-    platform_combo,
+    SIDEBAR_MIN, SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, UiSettings, badge_combo,
+    jump_hints_visible, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -97,6 +97,19 @@ actions!(
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
+
+#[derive(Clone, Copy)]
+enum ChatMenuPage {
+    Root,
+    Copy,
+}
+
+#[derive(Clone)]
+struct ChatMenuState {
+    chat_id: String,
+    position: Point<Pixels>,
+    page: ChatMenuPage,
+}
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -1293,6 +1306,8 @@ pub struct Shell {
     /// The jump-hint overlay is visible while the held modifiers exactly
     /// match a jump shortcut. Window deactivation clears it.
     pub(super) jump_hints: bool,
+    /// Ephemeral collapsed project/device sections, keyed by organization + id.
+    pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
     /// Lazy panes: no entity (and no RPC) until first opened. The right pane's
     /// terminal host is embedded (own PTYs, own grid geometry; one panel can
     /// only size one visible grid at a time).
@@ -1355,8 +1370,8 @@ pub struct Shell {
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
-    /// Session-row context menu: (chat id, window position).
-    chat_menu: popover::Popup<(String, Point<Pixels>)>,
+    /// Session-row context menu, including the Copy submenu.
+    chat_menu: popover::Popup<ChatMenuState>,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
@@ -1370,6 +1385,8 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
+    /// Persisted organization/sort/metadata controls beside the project filter.
+    sidebar_view_menu: popover::Popup<spaces::SidebarViewMenu>,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -1555,6 +1572,9 @@ impl Shell {
         });
         let data_dir = boot.data_dir.clone();
         let settings = settings::current(cx);
+        state.update(cx, |state, cx| {
+            state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
+        });
         let details_sidebar = cx.new({
             let state = state.clone();
             let workers_model = workers_model.clone();
@@ -1731,6 +1751,7 @@ impl Shell {
             archived_shown: 0,
             archived_hover: None,
             jump_hints: false,
+            sidebar_collapsed_groups: std::collections::HashSet::new(),
             right_terminal: None,
             right_plus: popover::Popup::default(),
             right_tab_revealed: None,
@@ -1780,6 +1801,7 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             spaces_menu: popover::Popup::default(),
+            sidebar_view_menu: popover::Popup::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
@@ -1835,6 +1857,9 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
+            self.sidebar_notice = Some(SidebarNotice::failure(notice));
+        }
         let next_sync_flow = {
             let state = state.read(cx);
             sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
@@ -3058,6 +3083,66 @@ impl Shell {
         }
     }
 
+    fn open_chat_copy_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.chat_menu.open_mut() {
+            menu.page = ChatMenuPage::Copy;
+            cx.notify();
+        }
+    }
+
+    fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let link = {
+            let state = self.state.read(cx);
+            crate::links::workspace_locator(
+                state.workspace_scope,
+                state.auth.as_ref(),
+                state.local_device_id.as_deref(),
+            )
+            .map(|workspace| crate::links::zeron_conversation_link(chat_id, &workspace))
+        };
+        if let Some(link) = link {
+            cx.write_to_clipboard(ClipboardItem::new_string(link));
+            self.sidebar_notice = Some(SidebarNotice::success("Zeron conversation link copied"));
+        } else {
+            self.sidebar_notice =
+                Some(SidebarNotice::failure("Conversation link is not ready yet"));
+        }
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn copy_harness_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let link = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(crate::links::harness_conversation_link);
+        if let Some(link) = link {
+            cx.write_to_clipboard(ClipboardItem::new_string(link.url));
+            self.sidebar_notice = Some(SidebarNotice::success(format!("{} copied", link.label)));
+        }
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn copy_harness_session_id(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let id = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.harness_session_id.clone());
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(id));
+            self.sidebar_notice = Some(SidebarNotice::success("Harness session ID copied"));
+        }
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
@@ -3465,6 +3550,11 @@ impl Shell {
         self.open_chat(chat_id, cx);
     }
 
+    /// Keyboard-owning overlays suppress session navigation shortcuts.
+    pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
+        self.add_space.is_some() || self.composer.read(cx).pickers().read(cx).is_open()
+    }
+
     /// Track the held modifiers so the sidebar can show its jump hints. Only a
     /// change in visibility repaints — modifier traffic is otherwise constant.
     fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
@@ -3475,6 +3565,7 @@ impl Shell {
             mods.control
         };
         let visible = matches!(self.route, Route::Chat)
+            && !self.overlay_owns_keyboard(cx)
             && jump_hints_visible(&self.settings.keymap, primary, mods.alt, mods.shift);
         self.set_jump_hints(visible, cx);
     }
@@ -5501,7 +5592,11 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.chat_menu.open((menu_id.clone(), event.position));
+                    this.chat_menu.open(ChatMenuState {
+                        chat_id: menu_id.clone(),
+                        position: event.position,
+                        page: ChatMenuPage::Root,
+                    });
                     cx.notify();
                 }),
             )
@@ -6442,7 +6537,9 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let mut overlays: Vec<AnyElement> = Vec::new();
 
-        if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
+        if let Some(menu_state) = self.chat_menu.get().cloned() {
+            let chat_id = menu_state.chat_id;
+            let position = menu_state.position;
             let chat_menu_closing = self.chat_menu.closing_since();
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
@@ -6454,59 +6551,169 @@ impl Shell {
                     this.close_chat_menu(cx);
                 }))
                 .flex()
-                .flex_col()
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
-                        .id("chat-menu-rename")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_rename_chat(rename_id.clone(), cx)
-                        }))
-                        .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                        .child(SharedString::from("Rename…")),
-                )
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
-                        .id("chat-menu-archive")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.archive_chat(archive_id.clone(), cx)
-                        }))
-                        .child(
-                            icon(icons::ARCHIVE_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
+                .flex_col();
+            let menu = match menu_state.page {
+                ChatMenuPage::Root => menu
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+                            .id("chat-menu-rename")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_rename_chat(rename_id.clone(), cx)
+                            }))
+                            .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                            .child(SharedString::from("Rename…")),
+                    )
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                            .id("chat-menu-archive")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.archive_chat(archive_id.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::ARCHIVE_MINIMALISTIC)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Archive")),
+                    )
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
+                            .id("chat-menu-copy")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)))
+                            .child(
+                                icon(icons::COPY)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_1().child(SharedString::from("Copy")))
+                            .child(
+                                icon(icons::ALT_ARROW_RIGHT)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.7)),
+                            ),
+                    )
+                    .child(popover::menu_separator())
+                    .child(popover::menu_heading(&theme, "Export"))
+                    .children(EXPORT_MENU_ITEMS.iter().map(|item| {
+                        let export_id = chat_id.clone();
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-{}-{chat_id}", item.key),
                         )
-                        .child(SharedString::from("Archive")),
-                )
-                .child(popover::menu_separator())
-                .child(popover::menu_heading(&theme, "Export"))
-                .children(EXPORT_MENU_ITEMS.iter().map(|item| {
-                    let export_id = chat_id.clone();
-                    popover::menu_row(&theme, false, format!("chat-menu-{}-{chat_id}", item.key))
                         .id(item.key)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.export_chat(export_id.clone(), item.format, item.delivery, cx)
                         }))
                         .child(icon(item.glyph).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from(item.label))
-                }))
-                .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
-                        .id("chat-menu-delete")
-                        .text_color(theme.danger)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_chat_menu(cx);
-                            this.delete_confirm = Some(delete_id.clone());
-                            cx.notify();
-                        }))
-                        .child(
-                            icon(icons::TRASH_BIN_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.danger),
+                    }))
+                    .child(popover::menu_separator())
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                            .id("chat-menu-delete")
+                            .text_color(theme.danger)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.delete_confirm = Some(delete_id.clone());
+                                cx.notify();
+                            }))
+                            .child(
+                                icon(icons::TRASH_BIN_MINIMALISTIC)
+                                    .size(px(16.0))
+                                    .text_color(theme.danger),
+                            )
+                            .child(SharedString::from("Delete…")),
+                    ),
+                ChatMenuPage::Copy => {
+                    let chat = self
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == chat_id)
+                        .cloned();
+                    let harness_link = chat
+                        .as_ref()
+                        .and_then(crate::links::harness_conversation_link);
+                    let session_id = chat
+                        .as_ref()
+                        .and_then(|chat| chat.harness_session_id.as_deref())
+                        .is_some_and(|id| !id.trim().is_empty());
+                    let zeron_id = chat_id.clone();
+                    let harness_id = chat_id.clone();
+                    let session_chat_id = chat_id.clone();
+                    menu.child(
+                        popover::menu_row(&theme, false, format!("chat-copy-back-{chat_id}"))
+                            .id("chat-copy-back")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(menu) = this.chat_menu.open_mut() {
+                                    menu.page = ChatMenuPage::Root;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                icon(icons::ALT_ARROW_LEFT)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Back")),
+                    )
+                    .child(popover::menu_separator())
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
+                            .id("chat-copy-zeron")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_zeron_conversation_link(&zeron_id, cx)
+                            }))
+                            .child(
+                                icon(icons::COPY)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Zeron conversation link")),
+                    )
+                    .when_some(harness_link, |menu, link| {
+                        menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-copy-harness-{chat_id}"),
+                            )
+                            .id("chat-copy-harness")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_harness_conversation_link(&harness_id, cx)
+                            }))
+                            .child(
+                                icon(icons::COPY)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from(link.label)),
                         )
-                        .child(SharedString::from("Delete…")),
-                )
-                .into_any_element();
+                    })
+                    .when(session_id, |menu| {
+                        menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-copy-session-{chat_id}"),
+                            )
+                            .id("chat-copy-session")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_harness_session_id(&session_chat_id, cx)
+                            }))
+                            .child(
+                                icon(icons::COPY)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Harness session ID")),
+                        )
+                    })
+                }
+            }
+            .into_any_element();
             overlays.push(popover::menu_at(
                 "chat-context-menu",
                 position,

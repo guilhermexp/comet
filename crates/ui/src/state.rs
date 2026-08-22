@@ -17,7 +17,7 @@
 //! Pure logic (sort order, staleness, gate phase) lives in free functions with
 //! unit tests; rendering reads them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -615,6 +615,8 @@ pub struct AppState {
     /// judge by the empty pre-sync lists.
     pub chats_synced: bool,
     pub spaces_synced: bool,
+    pending_deep_link: Option<crate::links::ConversationDeepLink>,
+    deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
     /// The selected chat's opening `WatchDocMessages` reset has landed. An
@@ -644,6 +646,9 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    change_requests: ChangeRequestClientState,
+    change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
+    change_requests_visible: bool,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
     /// feed must survive chat switches — the tab itself is what scopes it.
@@ -653,8 +658,6 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
-    change_requests: ChangeRequestClientState,
-    change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
 }
 
 impl Default for AppState {
@@ -690,13 +693,16 @@ impl AppState {
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
-            sub_transcripts: HashMap::new(),
-            sub_watch_tasks: HashMap::new(),
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
+            change_requests_visible: true,
+            sub_transcripts: HashMap::new(),
+            sub_watch_tasks: HashMap::new(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
+            pending_deep_link: None,
+            deep_link_notice: None,
         }
     }
 
@@ -1495,9 +1501,13 @@ impl AppState {
             self.change_request_tasks.clear();
             return;
         };
-        let targets = desired_watch_targets(&self.chats, &self.spaces, |device| {
-            !self.change_requests.is_supported(device)
-        });
+        let targets = if self.change_requests_visible {
+            desired_watch_targets(&self.chats, &self.spaces, |device| {
+                !self.change_requests.is_supported(device)
+            })
+        } else {
+            HashSet::new()
+        };
 
         self.change_request_tasks
             .retain(|target, _| targets.contains(target));
@@ -1516,6 +1526,54 @@ impl AppState {
             );
             self.change_request_tasks.insert(target, task);
         }
+    }
+
+    pub fn set_change_requests_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.change_requests_visible != visible {
+            self.change_requests_visible = visible;
+            self.reconcile_change_request_watches(cx);
+        }
+    }
+
+    pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        match crate::links::parse_zeron_conversation_link(url) {
+            Ok(link) => {
+                self.pending_deep_link = Some(link);
+                self.apply_pending_deep_link(cx);
+            }
+            Err(error) => self.deep_link_notice = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn apply_pending_deep_link(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.pending_deep_link.clone() else {
+            return;
+        };
+        let Some(locator) = crate::links::workspace_locator(
+            self.workspace_scope,
+            self.auth.as_ref(),
+            self.local_device_id.as_deref(),
+        ) else {
+            return;
+        };
+        if locator != link.workspace {
+            self.pending_deep_link = None;
+            self.deep_link_notice =
+                Some("This conversation link belongs to another workspace".into());
+            return;
+        }
+        if self.chats.iter().any(|chat| chat.id == link.chat_id) {
+            self.pending_deep_link = None;
+            self.select_chat(Some(link.chat_id), cx);
+        } else if self.chats_synced {
+            self.pending_deep_link = None;
+            self.deep_link_notice = Some("The linked conversation was not found".into());
+        }
+    }
+
+    pub fn take_deep_link_notice(&mut self) -> Option<String> {
+        self.deep_link_notice.take()
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -1683,6 +1741,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 };
                 let alive = this.update(cx, |state, cx| {
                     state.apply_chats(parsed);
+                    state.apply_pending_deep_link(cx);
                     state.reconcile_change_request_watches(cx);
                     cx.notify();
                 });
@@ -1829,6 +1888,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 };
                 let alive = this.update(cx, |state, cx| {
                     apply(state, parsed);
+                    state.apply_pending_deep_link(cx);
                     if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
                         state.reconcile_change_request_watches(cx);
                     }
@@ -1867,6 +1927,11 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
         if let Some(id) = id {
             this.update(cx, |state, cx| {
                 state.local_device_id = Some(id);
+                state.apply_pending_deep_link(cx);
+                // Watches opened before this probe conservatively route through
+                // targetDeviceId. Recreate them now that local routing is known.
+                state.change_request_tasks.clear();
+                state.reconcile_change_request_watches(cx);
                 cx.notify();
             })
             .ok();
@@ -2545,6 +2610,7 @@ mod tests {
             cwd: None,
             branch: None,
             checkout_id: None,
+            source_context: None,
             config: None,
             last_message_preview: None,
             last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),

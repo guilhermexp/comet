@@ -887,6 +887,11 @@ impl Pickers {
         self.open.as_open().copied()
     }
 
+    /// Whether a picker currently owns keyboard interaction.
+    pub fn is_open(&self) -> bool {
+        self.open.as_open().is_some()
+    }
+
     /// The picker to render: open or mid-exit.
     fn mounted_kind(&self) -> Option<PickerKind> {
         self.open.get().copied()
