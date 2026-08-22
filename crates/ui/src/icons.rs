@@ -213,6 +213,10 @@ icon_assets![
     (WORKER_UNPEEL_LOGO, "workers/unpeel-logo"),
 ];
 
+/// Details-card glyph for the chat-scoped workflow/subagent/worker projection.
+/// The existing widget asset already matches the connected-node visual language.
+pub const DETAILS_WORKERS: &str = WIDGET;
+
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {

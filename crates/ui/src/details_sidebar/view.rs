@@ -127,24 +127,35 @@ impl DetailsSidebarState {
 }
 
 use gpui::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, Focusable, Image,
-    IntoElement, ObjectFit, Render, SharedString, Subscription, Task, div, img, prelude::*, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, Focusable,
+    Image, IntoElement, ObjectFit, Render, SharedString, Subscription, Task, div, img, prelude::*,
+    px,
 };
-use zeron_proto::{AgentAccountsSnapshot, HarnessId};
+use zeron_proto::{
+    AgentAccountsSnapshot, HarnessId,
+    agent::{WorkflowProgressNode, WorkflowTaskStatus},
+};
 
 use crate::{
     composer::{ComposerInput, ComposerInputEvent},
     details_sidebar::{
+        chat_workers::{
+            ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
+            activity_tasks_from_entries, project_chat_workers,
+        },
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, scan_checkout},
         files_view::{file_glyph, material_icon_path},
         todos::latest_todos,
         usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows},
-        widgets::{property_row, widget_card},
+        widgets::{
+            ChatWorkersTab, ChatWorkersWidgetState, property_row, widget_card, workers_tab_presence,
+        },
     },
     icons,
     state::AppState,
     theme::Theme,
+    workers::{model::WorkersModel, presentation::runtime_icon_path},
 };
 
 const FILE_SCAN_LIMIT: usize = 5_000;
@@ -190,11 +201,39 @@ pub enum DetailsSidebarEvent {
         root: std::path::PathBuf,
         relative_path: String,
     },
+    OpenSubagent {
+        chat_id: String,
+        doc_id: String,
+        title: String,
+        frozen: bool,
+    },
+    OpenWorkerSession {
+        session_id: String,
+        title: String,
+    },
+}
+
+fn open_subagent_event(chat_id: &str, row: &ChatActivityRow) -> DetailsSidebarEvent {
+    DetailsSidebarEvent::OpenSubagent {
+        chat_id: chat_id.to_owned(),
+        doc_id: row.id.clone(),
+        title: row.title.clone(),
+        frozen: row.status != WorkflowTaskStatus::Running,
+    }
+}
+
+fn open_worker_event(worker: &ChatWorkerRow) -> DetailsSidebarEvent {
+    DetailsSidebarEvent::OpenWorkerSession {
+        session_id: worker.session_id.clone(),
+        title: worker.title.clone(),
+    }
 }
 
 pub struct DetailsSidebar {
     app_state: Entity<AppState>,
+    workers_model: Entity<WorkersModel>,
     sidebar: DetailsSidebarState,
+    chat_workers: ChatWorkersWidgetState,
     files: LoadState<Vec<FileNode>>,
     usage: LoadState<Vec<ProviderUsageRow>>,
     search: Entity<ComposerInput>,
@@ -207,12 +246,14 @@ pub struct DetailsSidebar {
     branch_task: Option<Task<()>>,
     usage_task: Option<Task<()>>,
     _state_observe: Subscription,
+    _workers_observe: Subscription,
     _search_events: Subscription,
 }
 
 impl DetailsSidebar {
     pub fn new(
         app_state: Entity<AppState>,
+        workers_model: Entity<WorkersModel>,
         preferences: DetailsSidebarPreferences,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -240,9 +281,12 @@ impl DetailsSidebar {
             }
             cx.notify();
         });
+        let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
         let mut sidebar = Self {
             app_state,
+            workers_model,
             sidebar: DetailsSidebarState::new(preferences),
+            chat_workers: ChatWorkersWidgetState::default(),
             files: LoadState::Idle,
             usage: LoadState::Idle,
             search,
@@ -255,6 +299,7 @@ impl DetailsSidebar {
             branch_task: None,
             usage_task: None,
             _state_observe: state_observe,
+            _workers_observe: workers_observe,
             _search_events: search_events,
         };
         sidebar.load_usage(cx);
@@ -272,6 +317,8 @@ impl DetailsSidebar {
         let before = self.sidebar.load_generation();
         let after = self.sidebar.set_context(context);
         if before != after {
+            self.chat_workers
+                .sync_context(self.sidebar.context().map(|context| context.key.as_str()));
             self.active_file = None;
             self.resolved_branch = self
                 .sidebar
@@ -597,6 +644,541 @@ impl DetailsSidebar {
             )
     }
 
+    fn current_chat_workers(
+        &self,
+        chat_id: &str,
+        cx: &App,
+    ) -> (ChatWorkersSnapshot, Option<SharedString>) {
+        let tasks = activity_tasks_from_entries(&self.app_state.read(cx).transcript);
+        match self
+            .workers_model
+            .read(cx)
+            .sessions_for_parent_chat(chat_id)
+        {
+            Ok(workers) => (
+                project_chat_workers(tasks, workers.into_iter().cloned().collect()),
+                None,
+            ),
+            Err(error) => (project_chat_workers(tasks, Vec::new()), Some(error.into())),
+        }
+    }
+
+    fn render_activity_status(
+        &self,
+        status: WorkflowTaskStatus,
+        key: SharedString,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match status {
+            WorkflowTaskStatus::Running => {
+                crate::loaders::mini_mono_spinner(key, 2.0, theme.accent, cx.entity_id(), cx)
+                    .into_any_element()
+            }
+            WorkflowTaskStatus::Completed => icons::icon(icons::CHECK)
+                .size(px(13.0))
+                .text_color(theme.success)
+                .into_any_element(),
+            WorkflowTaskStatus::Failed => icons::icon(icons::CLOSE_CIRCLE)
+                .size(px(13.0))
+                .text_color(theme.danger)
+                .into_any_element(),
+            WorkflowTaskStatus::Cancelled => icons::icon(icons::CLOSE_CIRCLE)
+                .size(px(13.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+        }
+    }
+
+    fn render_worker_status(
+        &self,
+        worker: &ChatWorkerRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match worker.semantic {
+            WorkerSemantic::Starting | WorkerSemantic::Working => {
+                crate::loaders::mini_mono_spinner(
+                    SharedString::from(format!("chat-worker-status-{}", worker.session_id)),
+                    2.0,
+                    theme.accent,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element()
+            }
+            WorkerSemantic::Blocked => icons::icon(icons::INFO_CIRCLE)
+                .size(px(13.0))
+                .text_color(theme.warning)
+                .into_any_element(),
+            WorkerSemantic::Terminal if worker.activity == "failed" => {
+                icons::icon(icons::CLOSE_CIRCLE)
+                    .size(px(13.0))
+                    .text_color(theme.danger)
+                    .into_any_element()
+            }
+            WorkerSemantic::Terminal if worker.activity == "cancelled" => {
+                icons::icon(icons::CLOSE_CIRCLE)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element()
+            }
+            WorkerSemantic::Terminal => icons::icon(icons::CHECK)
+                .size(px(13.0))
+                .text_color(theme.success)
+                .into_any_element(),
+            WorkerSemantic::Idle => div()
+                .size(px(7.0))
+                .rounded_full()
+                .bg(theme.text_muted.opacity(0.65))
+                .into_any_element(),
+            WorkerSemantic::Recovery => icons::icon(icons::RESTART)
+                .size(px(13.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+            WorkerSemantic::Disconnected => icons::icon(icons::WIFI_OFF)
+                .size(px(13.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+        }
+    }
+
+    fn render_workers_tab(
+        &mut self,
+        tab: ChatWorkersTab,
+        label: &'static str,
+        count: usize,
+        active: ChatWorkersTab,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(format!("chat-workers-tab-{label}")))
+            .h(px(24.0))
+            .px(px(7.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .text_size(px(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(if active == tab {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .when(active == tab, |pill| pill.bg(crate::theme::ink(0.08)))
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.chat_workers.select(tab);
+                cx.notify();
+            }))
+            .child(label)
+            .when(count > 0, |pill| {
+                pill.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(count.to_string()),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_workflow_progress(&self, row: &ChatActivityRow, theme: &Theme) -> gpui::Div {
+        let mut body = div();
+        if let Some(usage) = &row.usage {
+            body = body.child(
+                div()
+                    .ml(px(25.0))
+                    .pb(px(4.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.75))
+                    .child(usage.clone()),
+            );
+        }
+        let mut current_phase = None;
+        for node in &row.progress {
+            match node {
+                WorkflowProgressNode::Phase { index, title } => {
+                    current_phase = Some(*index);
+                    body = body.child(
+                        div()
+                            .ml(px(12.0))
+                            .pl(px(9.0))
+                            .py(px(3.0))
+                            .border_l_1()
+                            .border_color(theme.border.opacity(0.55))
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted)
+                            .child(title.clone()),
+                    );
+                }
+                WorkflowProgressNode::Agent {
+                    label,
+                    phase_index,
+                    model,
+                    state,
+                    ..
+                } => {
+                    let state_color = match state.as_deref() {
+                        Some("done") => theme.success,
+                        Some("error" | "failed") => theme.danger,
+                        Some("start" | "running") => theme.accent,
+                        _ => theme.text_muted,
+                    };
+                    let indent = if current_phase == Some(*phase_index) {
+                        21.0
+                    } else {
+                        12.0
+                    };
+                    body = body.child(
+                        div()
+                            .ml(px(indent))
+                            .h(px(22.0))
+                            .pl(px(9.0))
+                            .border_l_1()
+                            .border_color(theme.border.opacity(0.55))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().size(px(6.0)).rounded_full().bg(state_color))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text)
+                                    .child(label.clone()),
+                            )
+                            .when_some(model.clone(), |line, model| {
+                                line.child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted.opacity(0.75))
+                                        .child(model.trim_start_matches("claude-").to_owned()),
+                                )
+                            }),
+                    );
+                }
+            }
+        }
+        body
+    }
+
+    fn render_workflow_row(
+        &mut self,
+        row: ChatActivityRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let collapsible = row.usage.is_some() || !row.progress.is_empty();
+        let expanded = self
+            .chat_workers
+            .workflow_expanded_with_default(&row.id, false);
+        let row_id = row.id.clone();
+        let status = self.render_activity_status(
+            row.status,
+            SharedString::from(format!("workflow-status-{}", row.id)),
+            theme,
+            cx,
+        );
+        let header = div()
+            .h(px(30.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when(collapsible, |header| {
+                header.child(
+                    div()
+                        .id(SharedString::from(format!("workflow-expand-{}", row.id)))
+                        .size(px(18.0))
+                        .rounded(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.05)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chat_workers
+                                .toggle_workflow_with_default(&row_id, false);
+                            cx.notify();
+                        }))
+                        .child(
+                            icons::icon(if expanded {
+                                icons::ALT_ARROW_DOWN
+                            } else {
+                                icons::ALT_ARROW_RIGHT
+                            })
+                            .size(px(11.0))
+                            .text_color(theme.text_muted),
+                        ),
+                )
+            })
+            .when(!collapsible, |header| header.child(div().w(px(18.0))))
+            .child(status)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(row.title.clone()),
+            );
+        div()
+            .border_t_1()
+            .border_color(theme.border.opacity(0.45))
+            .child(header)
+            .when(expanded, |item| {
+                item.child(self.render_workflow_progress(&row, theme))
+            })
+            .into_any_element()
+    }
+
+    fn render_subagent_row(
+        &self,
+        row: ChatActivityRow,
+        chat_id: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let event = open_subagent_event(&chat_id, &row);
+        let doc_id = row.id.clone();
+        let status = self.render_activity_status(
+            row.status,
+            SharedString::from(format!("subagent-status-{}", row.id)),
+            theme,
+            cx,
+        );
+        div()
+            .id(SharedString::from(format!("chat-subagent-{}", row.id)))
+            .min_h(px(32.0))
+            .px(px(8.0))
+            .py(px(5.0))
+            .border_t_1()
+            .border_color(theme.border.opacity(0.45))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let still_available = project_chat_workers(
+                    activity_tasks_from_entries(&this.app_state.read(cx).transcript),
+                    Vec::new(),
+                )
+                .subagents
+                .iter()
+                .any(|row| row.id == doc_id);
+                if still_available {
+                    cx.emit(event.clone());
+                }
+            }))
+            .child(
+                icons::icon(icons::BOT)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(row.title),
+            )
+            .child(status)
+            .into_any_element()
+    }
+
+    fn render_worker_row(
+        &self,
+        worker: ChatWorkerRow,
+        chat_id: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let event = open_worker_event(&worker);
+        let session_id = worker.session_id.clone();
+        let status = self.render_worker_status(&worker, theme, cx);
+        let runtime_icon = runtime_icon_path(worker.provider_id.as_deref(), Some(&worker.command));
+        div()
+            .id(SharedString::from(format!(
+                "chat-worker-{}",
+                worker.session_id
+            )))
+            .min_h(px(38.0))
+            .px(px(8.0))
+            .py(px(5.0))
+            .border_t_1()
+            .border_color(theme.border.opacity(0.45))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let still_available = this
+                    .workers_model
+                    .read(cx)
+                    .sessions_for_parent_chat(&chat_id)
+                    .is_ok_and(|sessions| sessions.iter().any(|row| row.id == session_id));
+                if still_available {
+                    cx.emit(event.clone());
+                }
+            }))
+            .child(
+                icons::icon(runtime_icon)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(worker.title),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted)
+                            .child(worker.command),
+                    ),
+            )
+            .child(status)
+            .into_any_element()
+    }
+
+    fn render_chat_workers(
+        &mut self,
+        chat_id: String,
+        snapshot: ChatWorkersSnapshot,
+        workers_error: Option<SharedString>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let workflows = snapshot.workflows.len();
+        let subagents = snapshot.subagents.len();
+        let workers = snapshot.workers.len();
+        self.chat_workers
+            .sync_workflows(snapshot.workflows.iter().map(|row| row.id.as_str()));
+        let active = self.chat_workers.active_tab(
+            workflows,
+            subagents,
+            workers_tab_presence(workers, workers_error.is_some()),
+        );
+        let tabs = div()
+            .h(px(34.0))
+            .px(px(7.0))
+            .flex()
+            .items_center()
+            .gap(px(3.0))
+            .border_b_1()
+            .border_color(theme.border.opacity(0.55))
+            .child(self.render_workers_tab(
+                ChatWorkersTab::Workflows,
+                "Workflows",
+                workflows,
+                active,
+                theme,
+                cx,
+            ))
+            .child(self.render_workers_tab(
+                ChatWorkersTab::Subagents,
+                "Subagents",
+                subagents,
+                active,
+                theme,
+                cx,
+            ))
+            .child(self.render_workers_tab(
+                ChatWorkersTab::Workers,
+                "Workers",
+                workers,
+                active,
+                theme,
+                cx,
+            ));
+        let body = match active {
+            ChatWorkersTab::Workflows if workflows > 0 => div().children(
+                snapshot
+                    .workflows
+                    .into_iter()
+                    .map(|row| self.render_workflow_row(row, theme, cx)),
+            ),
+            ChatWorkersTab::Subagents if subagents > 0 => div().children(
+                snapshot
+                    .subagents
+                    .into_iter()
+                    .map(|row| self.render_subagent_row(row, chat_id.clone(), theme, cx)),
+            ),
+            ChatWorkersTab::Workers if workers > 0 => div().children(
+                snapshot
+                    .workers
+                    .into_iter()
+                    .map(|worker| self.render_worker_row(worker, chat_id.clone(), theme, cx)),
+            ),
+            ChatWorkersTab::Workflows => Self::render_workers_empty("workflows", theme),
+            ChatWorkersTab::Subagents => Self::render_workers_empty("subagents", theme),
+            ChatWorkersTab::Workers => workers_error.map_or_else(
+                || Self::render_workers_empty("workers", theme),
+                |error| Self::render_workers_error(error, theme),
+            ),
+        };
+        widget_card(
+            "chat-workers-widget",
+            icons::DETAILS_WORKERS,
+            "Workers",
+            div().child(tabs).child(
+                div()
+                    .id("chat-workers-body")
+                    .max_h(px(152.0))
+                    .overflow_y_scroll()
+                    .child(body),
+            ),
+            theme,
+        )
+    }
+
+    fn render_workers_empty(label: &'static str, theme: &Theme) -> gpui::Div {
+        div()
+            .px(px(9.0))
+            .py(px(12.0))
+            .text_size(px(12.0))
+            .text_color(theme.text_muted.opacity(0.75))
+            .child(format!("No {label} yet."))
+    }
+
+    fn render_workers_error(error: SharedString, theme: &Theme) -> gpui::Div {
+        div()
+            .px(px(9.0))
+            .py(px(12.0))
+            .text_size(px(12.0))
+            .text_color(theme.warning)
+            .child("Workers unavailable")
+            .child(
+                div()
+                    .mt(px(3.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted)
+                    .child(error),
+            )
+    }
+
     fn render_details(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let Some(context) = self.sidebar.context().cloned() else {
             return div()
@@ -631,6 +1213,25 @@ impl DetailsSidebar {
                 workspace_body,
                 theme,
             ));
+
+        if context.mode == super::context::DetailsMode::Orchestrator
+            && let Some(chat_id) = context.chat_id.clone()
+        {
+            let (snapshot, workers_error) = self.current_chat_workers(&chat_id, cx);
+            if !snapshot.workflows.is_empty()
+                || !snapshot.subagents.is_empty()
+                || !snapshot.workers.is_empty()
+                || workers_error.is_some()
+            {
+                content = content.child(self.render_chat_workers(
+                    chat_id,
+                    snapshot,
+                    workers_error,
+                    theme,
+                    cx,
+                ));
+            }
+        }
 
         if context.mode == super::context::DetailsMode::Orchestrator
             && let Some(todos) = latest_todos(&self.app_state.read(cx).transcript)
@@ -1085,10 +1686,12 @@ mod tests {
 
     use super::{
         ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
-        context_file_access, details_sidebar_background,
+        context_file_access, details_sidebar_background, open_subagent_event, open_worker_event,
     };
+    use crate::details_sidebar::chat_workers::{ChatActivityRow, ChatWorkerRow, WorkerSemantic};
     use crate::details_sidebar::context::{DetailsContext, DetailsMode, DetailsTab};
     use crate::theme::Theme;
+    use zeron_proto::agent::WorkflowTaskStatus;
 
     fn context(key: &str) -> DetailsContext {
         DetailsContext {
@@ -1144,6 +1747,52 @@ mod tests {
         assert_eq!(context_key, "project");
         assert_eq!(root, PathBuf::from("/tmp/project"));
         assert_eq!(relative_path, "README.md");
+    }
+
+    #[test]
+    fn workers_widget_actions_preserve_stable_target_identity() {
+        let subagent = ChatActivityRow {
+            id: "chat--sub--review".into(),
+            title: "Review parser".into(),
+            description: None,
+            status: WorkflowTaskStatus::Completed,
+            usage: None,
+            progress: Vec::new(),
+            subagent_type: Some("reviewer".into()),
+        };
+        let worker = ChatWorkerRow {
+            session_id: "worker-42".into(),
+            project_id: "project-1".into(),
+            title: "Fix tests".into(),
+            command: "codex".into(),
+            provider_id: Some("codex".into()),
+            semantic: WorkerSemantic::Working,
+            state: "running".into(),
+            activity: "working".into(),
+            updated_at_unix_ms: 42,
+        };
+
+        let DetailsSidebarEvent::OpenSubagent {
+            chat_id,
+            doc_id,
+            title,
+            frozen,
+        } = open_subagent_event("chat-1", &subagent)
+        else {
+            panic!("expected subagent action");
+        };
+        assert_eq!(chat_id, "chat-1");
+        assert_eq!(doc_id, "chat--sub--review");
+        assert_eq!(title, "Review parser");
+        assert!(frozen);
+
+        let DetailsSidebarEvent::OpenWorkerSession { session_id, title } =
+            open_worker_event(&worker)
+        else {
+            panic!("expected worker action");
+        };
+        assert_eq!(session_id, "worker-42");
+        assert_eq!(title, "Fix tests");
     }
 
     #[test]

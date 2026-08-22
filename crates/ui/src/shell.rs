@@ -1344,8 +1344,9 @@ impl Shell {
         let settings = UiSettings::load(&data_dir);
         let details_sidebar = cx.new({
             let state = state.clone();
+            let workers_model = workers_model.clone();
             let preferences = settings.details_sidebar_preferences.clone();
-            move |cx| DetailsSidebar::new(state, preferences, cx)
+            move |cx| DetailsSidebar::new(state, workers_model, preferences, cx)
         });
         let file_preview = cx.new(|_| FilePreview::new());
         let details_sub = cx.subscribe(
@@ -1373,6 +1374,25 @@ impl Shell {
                         relative_path.clone(),
                         cx,
                     );
+                }
+                DetailsSidebarEvent::OpenSubagent {
+                    chat_id,
+                    doc_id,
+                    title,
+                    frozen,
+                } => {
+                    this.add_subagent_surface(
+                        chat_id.clone(),
+                        doc_id.clone(),
+                        title.clone(),
+                        *frozen,
+                        cx,
+                    );
+                }
+                DetailsSidebarEvent::OpenWorkerSession { session_id, title } => {
+                    // Task 6 owns the terminal split. Keep the typed identity
+                    // wired here without launching or selecting any runtime.
+                    let _ = (session_id, title);
                 }
             },
         );
