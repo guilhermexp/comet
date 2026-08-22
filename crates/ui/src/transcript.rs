@@ -1310,6 +1310,10 @@ fn format_reasoning_elapsed(duration_ms: u64) -> String {
     format_execution_duration(duration_ms)
 }
 
+fn should_render_mermaid(block: &Block, streaming: bool) -> bool {
+    !streaming && crate::inline_media::mermaid_source(block).is_some()
+}
+
 fn format_thought_duration(duration_ms: Option<u64>) -> Option<String> {
     let duration_ms = duration_ms.filter(|duration| *duration >= 1_000)?;
     let seconds = (duration_ms / 1_000).max(1);
@@ -1717,6 +1721,9 @@ pub struct Transcript {
     /// Agent-referenced checkout images load once per root/path and survive
     /// virtualized row remounts for the attached chat.
     inline_images: HashMap<String, InlineImageLoad>,
+    /// Settled Mermaid fences render once off-thread and survive row
+    /// virtualization for the attached chat.
+    mermaid: HashMap<String, MermaidLoad>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1844,6 +1851,18 @@ enum InlineImageSnapshot {
     },
 }
 
+enum MermaidLoad {
+    Loading(#[allow(dead_code)] Task<()>),
+    Failed,
+    Ready(Arc<gpui::Image>),
+}
+
+enum MermaidSnapshot {
+    Loading,
+    Failed,
+    Ready(Arc<gpui::Image>),
+}
+
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
@@ -1942,6 +1961,7 @@ impl Transcript {
             reasoning_started: HashMap::new(),
             reasoning_tick: None,
             inline_images: HashMap::new(),
+            mermaid: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -2731,6 +2751,7 @@ impl Transcript {
             self.reasoning_started.clear();
             self.reasoning_tick = None;
             self.inline_images.clear();
+            self.mermaid.clear();
             self.user_message_overflow.clear();
             self.user_message_preview = None;
             self.veils.clear();
@@ -3746,29 +3767,33 @@ impl Transcript {
                 column.into_any_element()
             }
             RowKind::Markdown { tree, block_ix } => {
-                let opts = RenderOptions {
-                    row_key: row.id.clone(),
-                    veil: None,
-                    cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
-                    now: Instant::now(),
-                    copy: Some(self.copy_ui_for(&row.id, cx)),
-                };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
                 };
-                render::render_block(
-                    &top.block,
-                    *block_ix,
-                    *block_ix,
-                    &opts,
-                    &theme,
-                    window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|document| document.lines.as_slice()),
-                )
+                if should_render_mermaid(&top.block, false) {
+                    self.render_mermaid_block(&row.id, tree, *block_ix, window, &theme, cx)
+                } else {
+                    let opts = RenderOptions {
+                        row_key: row.id.clone(),
+                        veil: None,
+                        cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                        now: Instant::now(),
+                        copy: Some(self.copy_ui_for(&row.id, cx)),
+                    };
+                    let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                    render::render_block(
+                        &top.block,
+                        *block_ix,
+                        *block_ix,
+                        &opts,
+                        &theme,
+                        window,
+                        highlight
+                            .get(block_ix)
+                            .and_then(|o| o.as_deref())
+                            .map(|document| document.lines.as_slice()),
+                    )
+                }
             }
             RowKind::LiveMarkdown { tree, block_ix } => {
                 // Per-appended-chunk fade veil (opacity only — layout commits
@@ -4156,6 +4181,194 @@ impl Transcript {
             );
         }
         column.into_any_element()
+    }
+
+    fn mermaid_snapshot(&mut self, source: &str, cx: &mut Context<Self>) -> MermaidSnapshot {
+        match self.mermaid.get(source) {
+            Some(MermaidLoad::Loading(_)) => return MermaidSnapshot::Loading,
+            Some(MermaidLoad::Failed) => return MermaidSnapshot::Failed,
+            Some(MermaidLoad::Ready(image)) => return MermaidSnapshot::Ready(image.clone()),
+            None => {}
+        }
+
+        let key = source.to_owned();
+        let task_key = key.clone();
+        let render_source = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::inline_media::render_mermaid_svg(&render_source)
+                    }))
+                    .unwrap_or_else(|_| Err("diagram renderer failed".into()))
+                })
+                .await;
+            this.update(cx, |transcript, cx| {
+                transcript.mermaid.insert(
+                    task_key,
+                    match result {
+                        Ok(image) => MermaidLoad::Ready(image),
+                        Err(_) => MermaidLoad::Failed,
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        });
+        self.mermaid.insert(key, MermaidLoad::Loading(task));
+        MermaidSnapshot::Loading
+    }
+
+    fn render_mermaid_block(
+        &mut self,
+        row_id: &SharedString,
+        tree: &Arc<BlockTree>,
+        block_ix: usize,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(top) = tree.blocks.get(block_ix) else {
+            return gpui::Empty.into_any_element();
+        };
+        let Some(source) = crate::inline_media::mermaid_source(&top.block) else {
+            return gpui::Empty.into_any_element();
+        };
+        let state = self.mermaid_snapshot(source, cx);
+        let source_key: SharedString = format!("{row_id}#mermaid-source").into();
+        let source_open = self
+            .folds
+            .get(&source_key)
+            .and_then(|fold| fold.open)
+            .unwrap_or(false);
+        let show_source = source_open || !matches!(&state, MermaidSnapshot::Ready(_));
+        let opts = RenderOptions {
+            row_key: SharedString::from(format!("{row_id}#mermaid-code")),
+            veil: None,
+            cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+            now: Instant::now(),
+            copy: Some(self.copy_ui_for(row_id, cx)),
+        };
+        let source_block = show_source.then(|| {
+            let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
+            render::render_block(
+                &top.block,
+                block_ix,
+                block_ix,
+                &opts,
+                theme,
+                window,
+                highlight
+                    .get(&block_ix)
+                    .and_then(|value| value.as_deref())
+                    .map(|document| document.lines.as_slice()),
+            )
+        });
+
+        let mut header = div()
+            .h(px(32.0))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .text_size(px(11.5))
+            .text_color(theme.text_muted)
+            .child(
+                crate::icons::icon(crate::icons::WIDGET)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted),
+            );
+        header = match &state {
+            MermaidSnapshot::Loading => header
+                .child("Rendering diagram…")
+                .child(div().flex_1())
+                .child(crate::loaders::mini_mono_spinner(
+                    format!("mermaid-{row_id}"),
+                    1.8,
+                    theme.text_muted,
+                    cx.entity_id(),
+                    cx,
+                )),
+            MermaidSnapshot::Failed => header
+                .child("Could not render diagram")
+                .text_color(theme.danger_muted),
+            MermaidSnapshot::Ready(_) => {
+                let toggle_key = source_key.clone();
+                header.child("Diagram").child(div().flex_1()).child(
+                    div()
+                        .id(SharedString::from(format!("{row_id}#mermaid-toggle")))
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.06)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.folds.entry(toggle_key.clone()).or_default().open =
+                                Some(!source_open);
+                            cx.notify();
+                        }))
+                        .child("Source")
+                        .child(
+                            crate::icons::icon(if source_open {
+                                crate::icons::ALT_ARROW_DOWN
+                            } else {
+                                crate::icons::ALT_ARROW_RIGHT
+                            })
+                            .size(px(10.0))
+                            .text_color(theme.text_faint),
+                        ),
+                )
+            }
+        };
+
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.08))
+            .bg(crate::theme::ink(0.028))
+            .child(header);
+        if let MermaidSnapshot::Ready(image) = state {
+            let preview = crate::attachments::PreviewImage {
+                name: "Mermaid diagram".into(),
+                image: image.clone(),
+            };
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!("{row_id}#mermaid-preview")))
+                    .w_full()
+                    .h(px(320.0))
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .p(px(14.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.user_message_preview = None;
+                        this.attachment_preview = Some(preview.clone());
+                        window.focus(&this.attachment_preview_focus, cx);
+                        cx.notify();
+                    }))
+                    .child(img(image).w_full().h_full().object_fit(ObjectFit::Contain)),
+            );
+        }
+        if let Some(source_block) = source_block {
+            card = card.child(
+                div()
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .child(source_block),
+            );
+        }
+        card.into_any_element()
     }
 
     fn ensure_reasoning_tick(&mut self, cx: &mut Context<Self>) {
@@ -6053,6 +6266,27 @@ mod tests {
             RowKind::InlineImages { paths }
                 if paths.as_slice() == ["artifacts/screenshot.png"]
         ));
+    }
+
+    #[test]
+    fn mermaid_blocks_render_only_after_the_markdown_row_settles() {
+        let mermaid = Block::CodeBlock {
+            language: Some("mermaid".into()),
+            code: "flowchart LR\nA --> B".into(),
+        };
+        let alias = Block::CodeBlock {
+            language: Some("mmd".into()),
+            code: "flowchart TD\nA --> B".into(),
+        };
+        let rust = Block::CodeBlock {
+            language: Some("rust".into()),
+            code: "fn main() {}".into(),
+        };
+
+        assert!(should_render_mermaid(&mermaid, false));
+        assert!(should_render_mermaid(&alias, false));
+        assert!(!should_render_mermaid(&mermaid, true));
+        assert!(!should_render_mermaid(&rust, false));
     }
 
     #[test]
