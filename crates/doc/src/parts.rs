@@ -377,7 +377,11 @@ fn merge_progress_node(current: &mut WorkflowProgressNode, incoming: &WorkflowPr
     }
 }
 
-fn merge_workflow_task(current: &mut WorkflowTaskUpdate, incoming: &WorkflowTaskUpdate) {
+/// Merge a newer workflow snapshot into an older, richer snapshot.
+///
+/// Lifecycle status always follows `incoming`; absent optional metadata keeps
+/// the value already present in `current`.
+pub fn merge_workflow_task(current: &mut WorkflowTaskUpdate, incoming: &WorkflowTaskUpdate) {
     current.status = incoming.status;
     replace_non_empty(&mut current.workflow_name, &incoming.workflow_name);
     replace_non_empty(&mut current.description, &incoming.description);

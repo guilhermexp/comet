@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{Div, SharedString, div, prelude::*, px};
 
@@ -55,6 +55,10 @@ impl ChatWorkersWidgetState {
     }
 
     pub fn sync_workflows<'a>(&mut self, workflow_ids: impl IntoIterator<Item = &'a str>) {
+        let workflow_ids = workflow_ids.into_iter().collect::<Vec<_>>();
+        let present = workflow_ids.iter().copied().collect::<HashSet<_>>();
+        self.workflow_expansion
+            .retain(|workflow_id, _| present.contains(workflow_id.as_str()));
         let expand_first = self.workflow_expansion.is_empty();
         for (index, workflow_id) in workflow_ids.into_iter().enumerate() {
             self.workflow_expansion
@@ -204,6 +208,18 @@ mod tests {
         assert!(state.workflow_expanded_with_default("workflow-a", false));
         assert!(!state.workflow_expanded_with_default("workflow-b", false));
         assert!(!state.workflow_expanded_with_default("workflow-c", false));
+    }
+
+    #[test]
+    fn workers_widget_prunes_expansion_state_for_absent_workflows() {
+        let mut state = ChatWorkersWidgetState::default();
+        state.sync_workflows(["workflow-a", "workflow-b"]);
+        assert!(state.workflow_expanded_with_default("workflow-a", false));
+
+        state.sync_workflows(["workflow-b"]);
+        state.sync_workflows(["workflow-b", "workflow-a"]);
+
+        assert!(!state.workflow_expanded_with_default("workflow-a", false));
     }
 
     #[test]

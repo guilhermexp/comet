@@ -4,9 +4,11 @@ use zeron_doc::parts::{MessagePart, SubagentStatus};
 use zeron_doc::schema::SessionMessageEntry;
 use zeron_engine::sessions::workflow_tasks_from_entries;
 use zeron_proto::agent::{
-    ToolCall, WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
+    WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
 };
 use zeron_workers_unpeel::WorkersSession;
+
+use crate::transcript::subagent_tab_title;
 
 const SETTLED_ACTIVITY_LIMIT: usize = 100;
 
@@ -113,11 +115,23 @@ fn subagent_task(task: &WorkflowTaskUpdate) -> bool {
 }
 
 fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
-    let title = task
-        .workflow_name
-        .clone()
-        .or_else(|| task.description.clone())
-        .unwrap_or_else(|| task.task_id.clone());
+    let is_subagent = task.task_type.as_deref() == Some("subagent");
+    let title = if is_subagent {
+        task.subagent_type
+            .clone()
+            .or_else(|| task.description.clone())
+    } else {
+        task.workflow_name
+            .clone()
+            .or_else(|| task.description.clone())
+    }
+    .unwrap_or_else(|| {
+        if is_subagent {
+            "Subagent".into()
+        } else {
+            task.task_id.clone()
+        }
+    });
     ChatActivityRow {
         id: task.task_id,
         title,
@@ -218,11 +232,7 @@ pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<Workf
                 subagent_tail,
                 ..
             } if seen_spawn_refs.insert(subagent_ref.clone()) => {
-                let label = match call {
-                    ToolCall::Unknown { name, .. } => name.clone(),
-                    ToolCall::Mcp { tool, .. } => tool.clone(),
-                    _ => "Subagent".into(),
-                };
+                let label = subagent_tab_title(call).to_string();
                 let status = match subagent_status {
                     Some(SubagentStatus::Done) => WorkflowTaskStatus::Completed,
                     Some(SubagentStatus::Failed) => WorkflowTaskStatus::Failed,
@@ -361,6 +371,17 @@ mod tests {
     }
 
     #[test]
+    fn opaque_subagent_identity_falls_back_to_generic_title() {
+        let mut task = subagent_task("chat--sub--opaque-7f91");
+        task.description = None;
+        task.subagent_type = None;
+
+        let snapshot = project_chat_workers(vec![task], Vec::new());
+
+        assert_eq!(snapshot.subagents[0].title, "Subagent");
+    }
+
+    #[test]
     fn durable_spawn_chips_become_subagents_without_admitting_generic_tools() {
         let entry = SessionMessageEntry {
             id: "entry-1".into(),
@@ -397,6 +418,7 @@ mod tests {
 
         assert_eq!(snapshot.subagents.len(), 1);
         assert_eq!(snapshot.subagents[0].id, "chat--sub--spawn-1");
+        assert_eq!(snapshot.subagents[0].title, "reviewer");
         assert_eq!(
             snapshot.subagents[0].description.as_deref(),
             Some("Reviewed parser")
@@ -433,6 +455,42 @@ mod tests {
             snapshot.subagents[0].description.as_deref(),
             Some("Reviewed parser")
         );
+    }
+
+    #[test]
+    fn durable_spawn_without_tail_uses_human_tool_title_not_document_id() {
+        let entry = SessionMessageEntry {
+            id: "entry-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "spawn-opaque-7f91".into(),
+                call: ToolCall::Unknown {
+                    name: "Agent: review parser".into(),
+                    input: None,
+                },
+                is_error: false,
+                resolved: false,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: Some("chat--sub--opaque-7f91".into()),
+                subagent_status: Some(SubagentStatus::Running),
+                subagent_tail: None,
+            }],
+            created_at: 1,
+            device_id: "device-1".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        };
+
+        let snapshot = project_chat_workers(activity_tasks_from_entries(&[entry]), Vec::new());
+
+        assert_eq!(snapshot.subagents[0].title, "review parser");
+        assert_ne!(snapshot.subagents[0].title, "chat--sub--opaque-7f91");
     }
 
     #[test]

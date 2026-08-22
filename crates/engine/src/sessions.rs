@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
+    SessionMessageEntry, fold_event_into_parts, merge_workflow_task, sanitize_tool_call,
 };
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
@@ -1270,7 +1270,8 @@ pub fn workflow_tasks_from_entries(
 ) -> Vec<WorkflowTaskUpdate> {
     let mut seen = HashSet::new();
     let mut settled = 0usize;
-    let mut selected = Vec::new();
+    let mut selected: Vec<WorkflowTaskUpdate> = Vec::new();
+    let mut selected_by_id: HashMap<String, usize> = HashMap::new();
 
     for part in entries
         .iter()
@@ -1281,6 +1282,12 @@ pub fn workflow_tasks_from_entries(
             continue;
         };
         if !seen.insert(task.task_id.as_str()) {
+            if let Some(index) = selected_by_id.get(&task.task_id).copied() {
+                let newest = selected[index].clone();
+                let mut merged = task.clone();
+                merge_workflow_task(&mut merged, &newest);
+                selected[index] = merged;
+            }
             continue;
         }
         if task.status != WorkflowTaskStatus::Running {
@@ -1289,6 +1296,7 @@ pub fn workflow_tasks_from_entries(
             }
             settled += 1;
         }
+        selected_by_id.insert(task.task_id.clone(), selected.len());
         selected.push(task.clone());
     }
 
@@ -2336,6 +2344,50 @@ mod tests {
         assert!(!ids.contains(&"task-1"));
         assert_eq!(ids.get(1), Some(&"task-2"));
         assert_eq!(ids.last(), Some(&"task-10001"));
+    }
+
+    #[test]
+    fn workflow_projection_merges_rich_older_and_sparse_newest_snapshots() {
+        let mut older = workflow_entry(1, WorkflowTaskStatus::Running);
+        let MessagePart::WorkflowTask { task, .. } = &mut older.parts[0] else {
+            panic!("workflow task");
+        };
+        task.task_id = "task-shared".into();
+        task.workflow_name = Some("Audit".into());
+        task.description = Some("Review repository".into());
+        task.usage = Some(zeron_proto::WorkflowUsage {
+            total_tokens: Some(1_200),
+            tool_uses: Some(4),
+            duration_ms: Some(2_500),
+        });
+        task.progress = vec![zeron_proto::WorkflowProgressNode::Phase {
+            index: 0,
+            title: "Review".into(),
+        }];
+
+        let mut newest = workflow_entry(2, WorkflowTaskStatus::Completed);
+        let MessagePart::WorkflowTask { task, .. } = &mut newest.parts[0] else {
+            panic!("workflow task");
+        };
+        task.task_id = "task-shared".into();
+
+        let projected = workflow_tasks_from_entries(&[older, newest], 100);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].status, WorkflowTaskStatus::Completed);
+        assert_eq!(projected[0].workflow_name.as_deref(), Some("Audit"));
+        assert_eq!(
+            projected[0].description.as_deref(),
+            Some("Review repository")
+        );
+        assert_eq!(projected[0].progress.len(), 1);
+        assert_eq!(
+            projected[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(1_200)
+        );
     }
 
     #[test]

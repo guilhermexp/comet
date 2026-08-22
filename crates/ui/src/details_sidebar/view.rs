@@ -208,6 +208,7 @@ pub enum DetailsSidebarEvent {
         frozen: bool,
     },
     OpenWorkerSession {
+        chat_id: String,
         session_id: String,
         title: String,
     },
@@ -222,8 +223,9 @@ fn open_subagent_event(chat_id: &str, row: &ChatActivityRow) -> DetailsSidebarEv
     }
 }
 
-fn open_worker_event(worker: &ChatWorkerRow) -> DetailsSidebarEvent {
+fn open_worker_event(chat_id: &str, worker: &ChatWorkerRow) -> DetailsSidebarEvent {
     DetailsSidebarEvent::OpenWorkerSession {
+        chat_id: chat_id.to_owned(),
         session_id: worker.session_id.clone(),
         title: worker.title.clone(),
     }
@@ -1015,7 +1017,7 @@ impl DetailsSidebar {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let event = open_worker_event(&worker);
+        let event = open_worker_event(&chat_id, &worker);
         let session_id = worker.session_id.clone();
         let status = self.render_worker_status(&worker, theme, cx);
         let runtime_icon = runtime_icon_path(worker.provider_id.as_deref(), Some(&worker.command));
@@ -1795,11 +1797,15 @@ mod tests {
         assert_eq!(title, "Review parser");
         assert!(frozen);
 
-        let DetailsSidebarEvent::OpenWorkerSession { session_id, title } =
-            open_worker_event(&worker)
+        let DetailsSidebarEvent::OpenWorkerSession {
+            chat_id,
+            session_id,
+            title,
+        } = open_worker_event("chat-1", &worker)
         else {
             panic!("expected worker action");
         };
+        assert_eq!(chat_id, "chat-1");
         assert_eq!(session_id, "worker-42");
         assert_eq!(title, "Fix tests");
     }
@@ -1818,11 +1824,15 @@ mod tests {
             updated_at_unix_ms: 42,
         };
 
-        let DetailsSidebarEvent::OpenWorkerSession { session_id, title } =
-            worker_click_event(open_worker_event(&worker), false)
+        let DetailsSidebarEvent::OpenWorkerSession {
+            chat_id,
+            session_id,
+            title,
+        } = worker_click_event(open_worker_event("chat-1", &worker), false)
         else {
             panic!("expected worker action");
         };
+        assert_eq!(chat_id, "chat-1");
         assert_eq!(session_id, "worker-42");
         assert_eq!(title, "Fix tests");
     }

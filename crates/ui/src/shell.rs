@@ -448,6 +448,27 @@ fn resolve_worker_session_identity<'a>(
         .map(str::to_owned)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatWorkerOpenDecision {
+    Open,
+    Refresh,
+    IgnoreStaleChat,
+}
+
+fn chat_worker_open_decision(
+    selected_chat: Option<&str>,
+    event_chat_id: &str,
+    session_available: Result<bool, ()>,
+) -> ChatWorkerOpenDecision {
+    if selected_chat != Some(event_chat_id) {
+        return ChatWorkerOpenDecision::IgnoreStaleChat;
+    }
+    match session_available {
+        Ok(true) => ChatWorkerOpenDecision::Open,
+        Ok(false) | Err(()) => ChatWorkerOpenDecision::Refresh,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewSurfaceInfo {
     context_key: String,
@@ -1437,8 +1458,36 @@ impl Shell {
                         cx,
                     );
                 }
-                DetailsSidebarEvent::OpenWorkerSession { session_id, title } => {
-                    this.add_worker_surface(session_id, title, cx);
+                DetailsSidebarEvent::OpenWorkerSession {
+                    chat_id,
+                    session_id,
+                    title,
+                } => {
+                    let selected_chat = this.state.read(cx).selected_chat.clone();
+                    let session_available = if selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        this.workers_model
+                            .read(cx)
+                            .sessions_for_parent_chat(chat_id)
+                            .map(|sessions| {
+                                sessions.iter().any(|session| session.id == *session_id)
+                            })
+                            .map_err(|_| ())
+                    } else {
+                        Ok(false)
+                    };
+                    match chat_worker_open_decision(
+                        selected_chat.as_deref(),
+                        chat_id,
+                        session_available,
+                    ) {
+                        ChatWorkerOpenDecision::Open => {
+                            this.add_worker_surface(session_id, title, cx)
+                        }
+                        ChatWorkerOpenDecision::Refresh => {
+                            this.workers_model.update(cx, |model, cx| model.refresh(cx));
+                        }
+                        ChatWorkerOpenDecision::IgnoreStaleChat => {}
+                    }
                 }
             },
         );
@@ -9699,6 +9748,26 @@ mod tests {
         assert_eq!(
             resolve_worker_session_identity(session_ids.into_iter(), "missing"),
             None
+        );
+    }
+
+    #[test]
+    fn worker_open_revalidates_chat_and_parent_binding_before_opening() {
+        assert_eq!(
+            chat_worker_open_decision(Some("chat-b"), "chat-a", Ok(true)),
+            ChatWorkerOpenDecision::IgnoreStaleChat
+        );
+        assert_eq!(
+            chat_worker_open_decision(Some("chat-a"), "chat-a", Ok(false)),
+            ChatWorkerOpenDecision::Refresh
+        );
+        assert_eq!(
+            chat_worker_open_decision(Some("chat-a"), "chat-a", Err(())),
+            ChatWorkerOpenDecision::Refresh
+        );
+        assert_eq!(
+            chat_worker_open_decision(Some("chat-a"), "chat-a", Ok(true)),
+            ChatWorkerOpenDecision::Open
         );
     }
 
