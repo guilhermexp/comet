@@ -330,10 +330,13 @@ fn normalizer_attributes_subagent_lifecycle() {
             "sessionFile": "/tmp/child.jsonl"
         }
     }));
+    // Fan-out routing: the spawn opens a synthetic chip, then its tagged
+    // session, both keyed by the compound id — never the shared tool-call id.
     assert!(matches!(
         started.as_slice(),
-        [AgentEvent::Subagent { parent_tool_use_id, event }]
-            if parent_tool_use_id == "task-1"
+        [AgentEvent::ToolCall { id, .. }, AgentEvent::Subagent { parent_tool_use_id, event }]
+            if id == "task-1--child-1"
+                && parent_tool_use_id == "task-1--child-1"
                 && matches!(event.as_ref(), AgentEvent::SessionStarted { session_id, .. } if session_id == "/tmp/child.jsonl")
     ));
     assert_eq!(normalizer.active_subagents(), 1);
@@ -348,8 +351,10 @@ fn normalizer_attributes_subagent_lifecycle() {
     }));
     assert!(matches!(
         finished.as_slice(),
-        [AgentEvent::Subagent { event, .. }]
-            if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        [AgentEvent::ToolResult { id, .. }, AgentEvent::Subagent { parent_tool_use_id, event }]
+            if id == "task-1--child-1"
+                && parent_tool_use_id == "task-1--child-1"
+                && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
     ));
     assert_eq!(normalizer.active_subagents(), 0);
 }
@@ -378,8 +383,9 @@ fn normalizer_settles_aborted_subagent_as_interrupted() {
     }));
     assert!(matches!(
         settled.as_slice(),
-        [AgentEvent::Subagent { event, .. }]
-            if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Interrupted, .. })
+        [AgentEvent::ToolResult { .. }, AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "task-1--child-1"
+                && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Interrupted, .. })
     ));
     assert_eq!(normalizer.active_subagents(), 0);
     assert_eq!(

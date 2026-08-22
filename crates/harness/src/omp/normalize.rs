@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall, ToolDiff, ToolExecutionMeta,
     WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
@@ -175,7 +175,14 @@ impl OmpNormalizer {
                     description: description.clone(),
                 },
             );
-            let mut events = Vec::with_capacity(2);
+            // Fan-out routing: one `task` tool call spawns N subagents, so the
+            // bare parent id cannot key docs/chips — each subagent gets a
+            // compound id and its own synthetic spawn chip (first sight only).
+            let compound = compound_parent_id(&parent_tool_use_id, id);
+            let mut events = Vec::with_capacity(3);
+            if previous.is_none() {
+                events.push(spawn_chip(&compound, &agent, description.as_deref()));
+            }
             if description.is_some() {
                 events.push(subagent_workflow_update(
                     id,
@@ -187,7 +194,7 @@ impl OmpNormalizer {
                 ));
             }
             events.push(AgentEvent::Subagent {
-                parent_tool_use_id,
+                parent_tool_use_id: compound,
                 event: Box::new(AgentEvent::SessionStarted {
                     harness: HarnessId::Omp,
                     model: self.model.clone(),
@@ -213,7 +220,15 @@ impl OmpNormalizer {
             } else {
                 WorkflowTaskStatus::Completed
             };
-            let mut events = Vec::with_capacity(2);
+            let error = failed.then(|| {
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|error| truncate(&sanitize_diagnostic(error), 1_024))
+                    .unwrap_or_else(|| format!("OMP {} subagent failed", context.agent))
+            });
+            let compound = compound_parent_id(&context.parent_tool_use_id, id);
+            let mut events = Vec::with_capacity(3);
             if context.description.is_some() {
                 events.push(subagent_workflow_update(
                     id,
@@ -224,8 +239,16 @@ impl OmpNormalizer {
                     &context.agent,
                 ));
             }
+            // Resolve the synthetic spawn chip so it never spins forever.
+            events.push(AgentEvent::ToolResult {
+                id: compound.clone(),
+                is_error: failed,
+                output: Some(error.clone().unwrap_or_else(|| status.to_owned())),
+                diff: None,
+                execution: None,
+            });
             events.push(AgentEvent::Subagent {
-                parent_tool_use_id: context.parent_tool_use_id,
+                parent_tool_use_id: compound,
                 event: Box::new(AgentEvent::Done {
                     status: if failed {
                         DoneStatus::Errored
@@ -235,13 +258,7 @@ impl OmpNormalizer {
                         DoneStatus::Completed
                     },
                     result: None,
-                    error: failed.then(|| {
-                        payload
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .map(|error| truncate(&sanitize_diagnostic(error), 1_024))
-                            .unwrap_or_else(|| format!("OMP {} subagent failed", context.agent))
-                    }),
+                    error,
                     session_id: Some(context.session_id),
                 }),
             });
@@ -310,13 +327,24 @@ impl OmpNormalizer {
         self.subagents.insert(
             id.to_owned(),
             SubagentContext {
-                parent_tool_use_id,
+                parent_tool_use_id: parent_tool_use_id.clone(),
                 session_id,
                 agent: agent.clone(),
                 index,
                 description: Some(description.clone()),
             },
         );
+        // A progress frame can be the subagent's first sight: open its chip
+        // here too, or a fast run that settles before any lifecycle frame
+        // would leave the parent transcript chipless.
+        let mut events = Vec::with_capacity(2);
+        if previous.is_none() {
+            events.push(spawn_chip(
+                &compound_parent_id(&parent_tool_use_id, id),
+                &agent,
+                Some(&description),
+            ));
+        }
         let usage = WorkflowUsage {
             total_tokens: progress.get("tokens").and_then(Value::as_u64),
             tool_uses: progress.get("toolCount").and_then(Value::as_u64),
@@ -336,14 +364,15 @@ impl OmpNormalizer {
             state: Some(workflow_status_name(status).to_owned()),
             prompt_preview: Some(description.clone()),
         };
-        vec![subagent_workflow_update(
+        events.push(subagent_workflow_update(
             id,
             status,
             Some(description),
             usage,
             vec![node],
             &agent,
-        )]
+        ));
+        events
     }
 
     fn subagent_event(&mut self, frame: &Value) -> Vec<AgentEvent> {
@@ -361,11 +390,38 @@ impl OmpNormalizer {
         };
         nested_event(event)
             .map(|event| AgentEvent::Subagent {
-                parent_tool_use_id: context.parent_tool_use_id,
+                parent_tool_use_id: compound_parent_id(&context.parent_tool_use_id, id),
                 event: Box::new(event),
             })
             .into_iter()
             .collect()
+    }
+}
+
+/// Per-subagent routing id: OMP's `task` tool fans out N subagents under ONE
+/// tool call, so the bare parent id cannot key a doc/chip per subagent (every
+/// subagent would collide on `chat--sub--{toolUseId}` — one doc, one chip,
+/// one UI row). The compound id gives each subagent its own spawn chip and
+/// transcript doc, the 1-chip-per-subagent invariant other harnesses keep.
+fn compound_parent_id(parent: &str, id: &str) -> String {
+    format!("{parent}--{id}")
+}
+
+/// The synthetic spawn chip folded into the parent transcript for a fanned-out
+/// subagent: named after the task (claude-driver parity), so the chip — and
+/// the tab it opens — says what the subagent does.
+fn spawn_chip(compound_id: &str, agent: &str, description: Option<&str>) -> AgentEvent {
+    let label = description
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(agent);
+    let name = truncate(&label.split_whitespace().collect::<Vec<_>>().join(" "), 96);
+    AgentEvent::ToolCall {
+        id: compound_id.to_owned(),
+        call: ToolCall::Unknown {
+            name: format!("Agent: {name}"),
+            input: description.map(|text| json!({ "description": text })),
+        },
     }
 }
 
@@ -643,6 +699,12 @@ mod tests {
                 "sessionFile": "/tmp/sub-1.jsonl"
             }
         }));
+        // First sight opens the synthetic spawn chip under the compound id.
+        assert!(matches!(
+            &started[0],
+            AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+                if id == "call_task|fc_parent--sub-1" && name.starts_with("Agent: ")
+        ));
         assert!(started.iter().any(|event| matches!(
             event,
             AgentEvent::WorkflowTask { task }
@@ -653,8 +715,9 @@ mod tests {
         )));
         assert!(started.iter().any(|event| matches!(
             event,
-            AgentEvent::Subagent { event, .. }
-                if matches!(event.as_ref(), AgentEvent::SessionStarted { .. })
+            AgentEvent::Subagent { parent_tool_use_id, event }
+                if parent_tool_use_id == "call_task|fc_parent--sub-1"
+                    && matches!(event.as_ref(), AgentEvent::SessionStarted { .. })
         )));
 
         let progress = normalizer.push(json!({
@@ -704,8 +767,9 @@ mod tests {
         }));
         assert!(matches!(
             &nested[..],
-            [AgentEvent::Subagent { event, .. }]
-                if matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "found auth")
+            [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "call_task|fc_parent--sub-1"
+                    && matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "found auth")
         ));
 
         let completed = normalizer.push(json!({
@@ -719,9 +783,70 @@ mod tests {
         )));
         assert!(completed.iter().any(|event| matches!(
             event,
-            AgentEvent::Subagent { event, .. }
-                if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+            AgentEvent::ToolResult { id, is_error: false, .. }
+                if id == "call_task|fc_parent--sub-1"
         )));
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            AgentEvent::Subagent { parent_tool_use_id, event }
+                if parent_tool_use_id == "call_task|fc_parent--sub-1"
+                    && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        )));
+    }
+
+    #[test]
+    fn omp_batch_subagents_get_distinct_chips_and_routing() {
+        // OMP's task tool fans out N subagents under ONE tool call: each must
+        // get its own synthetic chip and compound routing id, or every
+        // subagent collides on `chat--sub--{toolUseId}` (one doc, one UI row).
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        let spawn = |id: &str| {
+            json!({
+                "type": "subagent_lifecycle",
+                "payload": {
+                    "id": id,
+                    "agent": "task",
+                    "description": format!("Research {id}"),
+                    "status": "started",
+                    "parentToolCallId": "tool_batch",
+                    "sessionFile": format!("/tmp/{id}.jsonl")
+                }
+            })
+        };
+        let parent_of = |events: &[AgentEvent]| {
+            events
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::Subagent {
+                        parent_tool_use_id, ..
+                    } => Some(parent_tool_use_id.clone()),
+                    _ => None,
+                })
+                .expect("tagged event")
+        };
+        let alpha = normalizer.push(spawn("Alpha"));
+        let beta = normalizer.push(spawn("Beta"));
+        assert!(matches!(&alpha[0], AgentEvent::ToolCall { id, .. } if id == "tool_batch--Alpha"));
+        assert!(matches!(&beta[0], AgentEvent::ToolCall { id, .. } if id == "tool_batch--Beta"));
+        assert_eq!(parent_of(&alpha), "tool_batch--Alpha");
+        assert_eq!(parent_of(&beta), "tool_batch--Beta");
+        assert_eq!(normalizer.active_subagents(), 2);
+
+        let done = normalizer.push(json!({
+            "type": "subagent_lifecycle",
+            "payload": { "id": "Alpha", "status": "completed" }
+        }));
+        assert_eq!(parent_of(&done), "tool_batch--Alpha");
+        assert!(done.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, .. } if id == "tool_batch--Alpha"
+        )));
+        // Beta still runs: the turn must not complete yet.
+        assert_eq!(
+            normalizer.classify_agent_end(&json!({ "type": "agent_end", "messages": [] })),
+            AgentEndDisposition::Continue
+        );
+        assert_eq!(normalizer.active_subagents(), 1);
     }
 
     #[test]
