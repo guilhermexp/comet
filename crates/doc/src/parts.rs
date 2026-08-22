@@ -266,11 +266,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     let closes_reasoning = match event {
         AgentEvent::TextDelta { text } | AgentEvent::Error { message: text } => !text.is_empty(),
         AgentEvent::ToolCall { .. }
-        | AgentEvent::ToolResult { .. }
-        | AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::InputRequested { .. }
-        | AgentEvent::Done { .. }
-        | AgentEvent::UserMessage { .. } => true,
+        | AgentEvent::Done { .. } => true,
         _ => false,
     };
     if closes_reasoning {
@@ -720,6 +717,58 @@ mod tests {
             } if text == "one two"
         ));
         assert!(matches!(&parts[1], MessagePart::Tool { .. }));
+    }
+
+    #[test]
+    fn tool_result_does_not_split_concurrent_reasoning() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "c1".into(),
+                call: ToolCall::Exec {
+                    command: "sleep 1".into(),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "waiting".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "c1".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: None,
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: " done".into(),
+            },
+        );
+
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Reasoning {
+                text,
+                completed: false,
+                ..
+            } if text == "waiting done"
+        ));
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| matches!(part, MessagePart::Reasoning { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

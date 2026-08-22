@@ -1192,7 +1192,10 @@ fn tool_detail_default_open(
     active_group
         && matches!(
             call,
-            ToolCall::Exec { .. } | ToolCall::WriteFile { .. } | ToolCall::EditFile { .. }
+            ToolCall::Exec { .. }
+                | ToolCall::WriteFile { .. }
+                | ToolCall::EditFile { .. }
+                | ToolCall::ApplyPatch { .. }
         )
         && (!resolved || is_last)
 }
@@ -1208,10 +1211,12 @@ enum ToolHeaderState {
 fn tool_header_state(resolved: bool, is_error: bool, show_outcome_label: bool) -> ToolHeaderState {
     if !resolved {
         ToolHeaderState::Pending
-    } else if is_error {
-        ToolHeaderState::Failed
     } else if show_outcome_label {
-        ToolHeaderState::Success
+        if is_error {
+            ToolHeaderState::Failed
+        } else {
+            ToolHeaderState::Success
+        }
     } else {
         ToolHeaderState::Quiet
     }
@@ -1629,9 +1634,11 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
-    /// Render-local clocks for live reasoning rows. The mounted spinner
-    /// already drives repaint ticks, so these only retain each row's epoch.
+    /// Render-local epochs for live reasoning rows.
     reasoning_started: HashMap<SharedString, Instant>,
+    /// Independent of motion settings: Reduced Motion stops the spinner,
+    /// not the honest elapsed-time label beside it.
+    reasoning_tick: Option<Task<()>>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1840,6 +1847,7 @@ impl Transcript {
             folds: HashMap::new(),
             tool_details: HashMap::new(),
             reasoning_started: HashMap::new(),
+            reasoning_tick: None,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -2627,6 +2635,7 @@ impl Transcript {
             self.tree_cache.clear();
             self.folds.clear();
             self.reasoning_started.clear();
+            self.reasoning_tick = None;
             self.user_message_overflow.clear();
             self.user_message_preview = None;
             self.veils.clear();
@@ -2648,6 +2657,11 @@ impl Transcript {
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true));
         }
+        self.reasoning_started.retain(|id, _| {
+            new_rows.iter().any(|row| {
+                row.id == *id && matches!(&row.kind, RowKind::Reasoning { active: true, .. })
+            })
+        });
 
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
@@ -3798,6 +3812,7 @@ impl Transcript {
                 .reasoning_started
                 .entry(row_id.clone())
                 .or_insert_with(Instant::now);
+            self.ensure_reasoning_tick(cx);
             format!(
                 "Thinking · {}",
                 format_reasoning_elapsed(started.elapsed().as_millis() as u64)
@@ -3896,6 +3911,35 @@ impl Transcript {
             );
         }
         column.into_any_element()
+    }
+
+    fn ensure_reasoning_tick(&mut self, cx: &mut Context<Self>) {
+        if self.reasoning_tick.is_some() {
+            return;
+        }
+        self.reasoning_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let keep_ticking = this
+                    .update(cx, |transcript, cx| {
+                        let active = transcript.rows.iter().any(|row| {
+                            matches!(&row.kind, RowKind::Reasoning { active: true, .. })
+                        });
+                        if active {
+                            cx.notify();
+                        }
+                        active
+                    })
+                    .unwrap_or(false);
+                if !keep_ticking {
+                    break;
+                }
+            }
+            this.update(cx, |transcript, _| transcript.reasoning_tick = None)
+                .ok();
+        }));
     }
 
     fn render_tool_group(
@@ -6278,10 +6322,12 @@ mod tests {
         let read = ToolCall::ReadFile {
             path: "src/lib.rs".into(),
         };
+        let patch = ToolCall::ApplyPatch { path: None };
 
         assert!(tool_detail_default_open(&exec, false, true, true));
         assert!(tool_detail_default_open(&exec, true, true, true));
         assert!(tool_detail_default_open(&edit, false, true, false));
+        assert!(tool_detail_default_open(&patch, false, true, false));
         assert!(!tool_detail_default_open(&exec, true, false, true));
         assert!(!tool_detail_default_open(&read, false, true, true));
     }
@@ -6301,6 +6347,7 @@ mod tests {
             tool_header_state(true, false, false),
             ToolHeaderState::Quiet
         );
+        assert_eq!(tool_header_state(true, true, false), ToolHeaderState::Quiet);
     }
 
     #[test]
