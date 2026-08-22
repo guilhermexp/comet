@@ -181,7 +181,8 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<RenderedMermaid, S
         },
         ..Default::default()
     };
-    let parsed = mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
+    let parsed =
+        mermaid_rs_renderer::parse_mermaid_strict(source).map_err(|error| error.to_string())?;
     let graph = &parsed.graph;
     let elements = graph.nodes.len()
         + graph.edges.len()
@@ -331,6 +332,7 @@ mod tests {
             render_mermaid_svg("---\ntitle: Example\n---\nflowchart LR\nA --> B", true).is_ok()
         );
         assert!(render_mermaid_svg("notMermaid\nA --> B", true).is_err());
+        assert!(render_mermaid_svg("flowchart LR\nsubgraph orphan\nA --> B", true).is_err());
         assert!(render_mermaid_svg("   ", true).is_err());
         let oversized = format!("flowchart LR\n{}", "A --> B\n".repeat(10_000));
         assert!(render_mermaid_svg(&oversized, true).is_err());
