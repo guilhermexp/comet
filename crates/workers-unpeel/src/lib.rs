@@ -12,14 +12,15 @@ pub use controller_mcp::CONTROLLER_MCP_ARG;
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;
 pub use parent_notifications::{
-    WorkerCompletionEvidence, WorkerParentNotification, WorkerParentNotificationKind,
-    ack_worker_parent_notification, ack_worker_parent_notification_at, activate_worker_parent_task,
-    activate_worker_parent_task_at, begin_worker_parent_task, begin_worker_parent_task_at,
-    build_worker_parent_notification_prompt, cancel_worker_parent_task,
-    cancel_worker_parent_task_at, confirm_worker_parent_task_submission,
+    WorkerCompletionEvidence, WorkerParentLink, WorkerParentNotification,
+    WorkerParentNotificationKind, ack_worker_parent_notification,
+    ack_worker_parent_notification_at, activate_worker_parent_task, activate_worker_parent_task_at,
+    begin_worker_parent_task, begin_worker_parent_task_at, build_worker_parent_notification_prompt,
+    cancel_worker_parent_task, cancel_worker_parent_task_at, confirm_worker_parent_task_submission,
     pending_worker_parent_notifications, pending_worker_parent_notifications_at,
     pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
     prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
+    worker_parent_links, worker_parent_links_at,
 };
 
 use std::path::{Path, PathBuf};

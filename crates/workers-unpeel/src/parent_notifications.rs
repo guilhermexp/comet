@@ -31,6 +31,13 @@ struct WorkerParentBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerParentLink {
+    pub worker_session_id: String,
+    pub parent_chat_id: String,
+    pub registered_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCompletionEvidence {
     pub inspection_complete: bool,
     pub output_quiescent: bool,
@@ -237,6 +244,30 @@ fn read_bindings(state: &Value) -> Result<HashMap<String, WorkerParentBinding>, 
         return Err(format!("{BINDINGS_KEY} must be an object"));
     }
     serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+}
+
+fn parent_links_from_state(state: &Value) -> Result<Vec<WorkerParentLink>, String> {
+    let mut links = read_bindings(state)?
+        .into_iter()
+        .map(|(worker_session_id, binding)| WorkerParentLink {
+            worker_session_id,
+            parent_chat_id: binding.parent_chat_id,
+            registered_at_unix_ms: binding.registered_at_unix_ms,
+        })
+        .collect::<Vec<_>>();
+    links.sort_by(|left, right| left.worker_session_id.cmp(&right.worker_session_id));
+    Ok(links)
+}
+
+pub fn worker_parent_links() -> Result<Vec<WorkerParentLink>, String> {
+    let state = unpeel_core::app_state::load()?;
+    parent_links_from_state(&state)
+}
+
+#[doc(hidden)]
+pub fn worker_parent_links_at(path: &Path) -> Result<Vec<WorkerParentLink>, String> {
+    let state = unpeel_core::app_state::load_for_edit_at(path)?;
+    parent_links_from_state(&state)
 }
 
 fn write_binding(

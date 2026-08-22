@@ -6,13 +6,14 @@ use gpui::{Context, Entity, Task};
 use zeron_doc::SessionCommandPayload;
 use zeron_rpc::methods;
 use zeron_workers_unpeel::{
-    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch,
+    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch, WorkerParentLink,
     WorkerParentNotification, WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap,
     WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
     WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
     WorkersResourceSettings, WorkersSession, WorkersSessionSort, WorkersSettingsSnapshot,
     WorkersTranscriptSettings, ack_worker_parent_notification,
     build_worker_parent_notification_prompt, pending_worker_parent_notifications,
+    worker_parent_links,
 };
 
 use crate::state::AppState;
@@ -140,6 +141,22 @@ pub fn sessions_for_project<'a>(
     sessions
         .iter()
         .filter(|session| session.project_id == project_id && !session.archived)
+        .collect()
+}
+
+fn sessions_for_parent_chat_from_links<'a>(
+    sessions: &'a [WorkersSession],
+    links: &[WorkerParentLink],
+    parent_chat_id: &str,
+) -> Vec<&'a WorkersSession> {
+    let session_ids = links
+        .iter()
+        .filter(|link| link.parent_chat_id == parent_chat_id)
+        .map(|link| link.worker_session_id.as_str())
+        .collect::<HashSet<_>>();
+    sessions
+        .iter()
+        .filter(|session| session_ids.contains(session.id.as_str()))
         .collect()
 }
 
@@ -424,6 +441,18 @@ impl WorkersModel {
             .as_ref()
             .map(|snapshot| snapshot.sessions.as_slice())
             .unwrap_or_default()
+    }
+
+    pub fn sessions_for_parent_chat(
+        &self,
+        parent_chat_id: &str,
+    ) -> Result<Vec<&WorkersSession>, String> {
+        let links = worker_parent_links()?;
+        Ok(sessions_for_parent_chat_from_links(
+            self.sessions(),
+            &links,
+            parent_chat_id,
+        ))
     }
 
     pub fn presets(&self) -> &[WorkersPreset] {
@@ -1749,8 +1778,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use zeron_workers_unpeel::{
-        WorkerParentNotification, WorkerParentNotificationKind, WorkersNotificationSettings,
-        WorkersSession, WorkersSessionCapabilities, WorkersSettingsSnapshot,
+        WorkerParentLink, WorkerParentNotification, WorkerParentNotificationKind,
+        WorkersNotificationSettings, WorkersSession, WorkersSessionCapabilities,
+        WorkersSettingsSnapshot,
     };
 
     use super::{
@@ -1759,7 +1789,8 @@ mod tests {
         note_parent_notification_failure, notification_settings_for_snapshot,
         parent_notification_retry_allowed, parent_notification_rpc_params, reconcile_selection,
         reconcile_selection_with_pending, replacement_selection, resolve_session_target,
-        selection_after_remove, sessions_for_project, toggle_expanded,
+        selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
+        toggle_expanded,
     };
 
     fn parent_notification() -> WorkerParentNotification {
@@ -1896,6 +1927,42 @@ mod tests {
             updated_at_unix_ms: 1,
             capabilities: WorkersSessionCapabilities::default(),
         }
+    }
+
+    #[test]
+    fn worker_parent_filter_is_exact_and_ignores_stale_session_ids() {
+        let sessions = vec![
+            session("worker-a", "project", true),
+            session("worker-b", "project", true),
+            session("unbound", "project", true),
+        ];
+        let links = vec![
+            WorkerParentLink {
+                worker_session_id: "worker-b".into(),
+                parent_chat_id: "chat-2".into(),
+                registered_at_unix_ms: 2,
+            },
+            WorkerParentLink {
+                worker_session_id: "stale".into(),
+                parent_chat_id: "chat-1".into(),
+                registered_at_unix_ms: 3,
+            },
+            WorkerParentLink {
+                worker_session_id: "worker-a".into(),
+                parent_chat_id: "chat-1".into(),
+                registered_at_unix_ms: 1,
+            },
+        ];
+
+        let filtered = sessions_for_parent_chat_from_links(&sessions, &links, "chat-1");
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worker-a"]
+        );
     }
 
     #[test]

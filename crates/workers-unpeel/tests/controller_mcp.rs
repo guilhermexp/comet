@@ -11,8 +11,27 @@ use zeron_workers_unpeel::{
     controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
     controller_mcp_sanitize_text, controller_mcp_startup_prompt_response,
     controller_mcp_take_parent_chat_id, controller_mcp_tracks_task_episode,
-    ensure_controller_mcp_host_launcher, is_session_host_mode,
+    ensure_controller_mcp_host_launcher, is_session_host_mode, register_worker_parent_at,
+    worker_parent_links_at,
 };
+
+#[test]
+fn worker_parent_links_are_read_only_and_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app-state.json");
+    register_worker_parent_at(&path, "worker-z", "chat-2", 200).unwrap();
+    register_worker_parent_at(&path, "worker-a", "chat-1", 100).unwrap();
+
+    let links = worker_parent_links_at(&path).unwrap();
+
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].worker_session_id, "worker-a");
+    assert_eq!(links[0].parent_chat_id, "chat-1");
+    assert_eq!(links[0].registered_at_unix_ms, 100);
+    assert_eq!(links[1].worker_session_id, "worker-z");
+    assert_eq!(links[1].parent_chat_id, "chat-2");
+    assert_eq!(links[1].registered_at_unix_ms, 200);
+}
 
 #[test]
 fn controller_mode_is_claimed_without_claiming_normal_cli_commands() {
