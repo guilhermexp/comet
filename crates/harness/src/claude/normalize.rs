@@ -2,9 +2,12 @@
 //! decoding, error-code mapping).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall, WorkflowProgressNode,
+    WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
+};
 
-use super::wire::{ContentBlock, Frame};
+use super::wire::{ContentBlock, Frame, SystemFrame};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -185,6 +188,98 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
     }
 }
 
+fn non_empty(value: Option<&String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty()).cloned()
+}
+
+fn workflow_status(frame: &SystemFrame) -> WorkflowTaskStatus {
+    let raw = frame
+        .patch
+        .as_ref()
+        .and_then(|patch| patch.get("status"))
+        .and_then(Value::as_str)
+        .or(frame.status.as_deref())
+        .unwrap_or("running");
+    match raw {
+        "completed" | "complete" | "succeeded" | "success" => WorkflowTaskStatus::Completed,
+        "failed" | "errored" | "error" => WorkflowTaskStatus::Failed,
+        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
+            WorkflowTaskStatus::Cancelled
+        }
+        _ => WorkflowTaskStatus::Running,
+    }
+}
+
+fn u64_field(value: &Value, snake_case: &str, camel_case: &str) -> Option<u64> {
+    value
+        .get(snake_case)
+        .or_else(|| value.get(camel_case))
+        .and_then(Value::as_u64)
+}
+
+fn workflow_usage(value: Option<&Value>) -> Option<WorkflowUsage> {
+    let value = value?.as_object()?;
+    let value = Value::Object(value.clone());
+    let usage = WorkflowUsage {
+        total_tokens: u64_field(&value, "total_tokens", "totalTokens"),
+        tool_uses: u64_field(&value, "tool_uses", "toolUses"),
+        duration_ms: u64_field(&value, "duration_ms", "durationMs"),
+    };
+    (usage.total_tokens.is_some() || usage.tool_uses.is_some() || usage.duration_ms.is_some())
+        .then_some(usage)
+}
+
+fn u32_field(value: &Value, snake_case: &str, camel_case: &str) -> Option<u32> {
+    u64_field(value, snake_case, camel_case).and_then(|number| u32::try_from(number).ok())
+}
+
+fn workflow_progress(value: Option<&Value>) -> Vec<WorkflowProgressNode> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| match node.get("type").and_then(Value::as_str) {
+            Some("workflow_phase" | "phase") => Some(WorkflowProgressNode::Phase {
+                index: u32_field(node, "index", "index")?,
+                title: node.get("title")?.as_str()?.to_owned(),
+            }),
+            Some("workflow_agent" | "agent") => Some(WorkflowProgressNode::Agent {
+                index: u32_field(node, "index", "index")?,
+                label: node.get("label")?.as_str()?.to_owned(),
+                phase_index: u32_field(node, "phase_index", "phaseIndex")?,
+                phase_title: node
+                    .get("phase_title")
+                    .or_else(|| node.get("phaseTitle"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                agent_id: node
+                    .get("agent_id")
+                    .or_else(|| node.get("agentId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                model: node.get("model").and_then(Value::as_str).map(str::to_owned),
+                state: node.get("state").and_then(Value::as_str).map(str::to_owned),
+                prompt_preview: node
+                    .get("prompt_preview")
+                    .or_else(|| node.get("promptPreview"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn agent_count(summary: Option<&Value>) -> Option<u32> {
+    let summary = match summary? {
+        Value::String(summary) => summary.clone(),
+        value => serde_json::to_string(value).ok()?,
+    };
+    let start = summary.find("<agent_count>")? + "<agent_count>".len();
+    let end = summary[start..].find("</agent_count>")? + start;
+    summary[start..end].parse().ok()
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -202,6 +297,9 @@ pub(crate) struct Normalizer {
     /// re-keys them onto the spawn chip's feed (the wire never echoes the
     /// steer on the child feed — live-verified 2.1.228).
     agent_tasks: std::collections::HashMap<String, String>,
+    /// Structured task ids already observed. Later lifecycle frames can be
+    /// sparse, so identity is the only provider context retained here.
+    workflow_tasks: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -215,6 +313,7 @@ impl Normalizer {
         Self {
             saw_init: false,
             agent_tasks: std::collections::HashMap::new(),
+            workflow_tasks: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
             context_window: None,
@@ -240,6 +339,38 @@ impl Normalizer {
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
             Frame::System(f) => {
+                let is_task_lifecycle = matches!(
+                    f.subtype.as_str(),
+                    "task_started" | "task_updated" | "task_progress" | "task_notification"
+                );
+                let task_id = f.task_id.as_deref().filter(|task| !task.is_empty());
+                let explicitly_structured = f.task_type.as_deref() == Some("local_workflow")
+                    || f.workflow_name
+                        .as_ref()
+                        .is_some_and(|name| !name.is_empty())
+                    || f.workflow_progress.as_ref().is_some_and(Value::is_array);
+                let excluded =
+                    matches!(f.task_type.as_deref(), Some("local_bash" | "local_command"));
+                let workflow = (is_task_lifecycle && !excluded)
+                    .then_some(task_id)
+                    .flatten()
+                    .filter(|task| explicitly_structured || self.workflow_tasks.contains(*task))
+                    .map(|task| {
+                        self.workflow_tasks.insert(task.to_owned());
+                        AgentEvent::WorkflowTask {
+                            task: WorkflowTaskUpdate {
+                                task_id: task.to_owned(),
+                                status: workflow_status(&f),
+                                workflow_name: non_empty(f.workflow_name.as_ref()),
+                                description: non_empty(f.description.as_ref()),
+                                usage: workflow_usage(f.usage.as_ref()),
+                                progress: workflow_progress(f.workflow_progress.as_ref()),
+                                agent_count: agent_count(f.summary.as_ref()),
+                                task_type: non_empty(f.task_type.as_ref()),
+                                subagent_type: non_empty(f.subagent_type.as_ref()),
+                            },
+                        }
+                    });
                 // A background subagent's completion arrives as an UNTAGGED
                 // `task_notification` carrying the spawning tool's id — the
                 // wire's only terminal signal for it (live-verified 2.1.228:
@@ -247,29 +378,32 @@ impl Normalizer {
                 // Surface it as the subagent's tagged Done so the chip flips
                 // done/failed and the transcript freezes.
                 if f.subtype == "task_notification" {
-                    let Some(parent) = f.tool_use_id.as_deref().filter(|t| !t.is_empty()) else {
-                        return Vec::new();
-                    };
-                    let status = match f.status.as_deref().unwrap_or("") {
-                        "completed" | "complete" | "succeeded" | "success" => {
-                            DoneStatus::Completed
-                        }
-                        "failed" | "errored" | "error" => DoneStatus::Errored,
-                        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
-                            DoneStatus::Interrupted
-                        }
-                        // Non-terminal notification shapes: nothing to close.
-                        _ => return Vec::new(),
-                    };
-                    return vec![tag(
-                        parent,
-                        AgentEvent::Done {
-                            status,
-                            result: None,
-                            error: None,
-                            session_id: None,
-                        },
-                    )];
+                    let done =
+                        f.tool_use_id
+                            .as_deref()
+                            .filter(|tool| !tool.is_empty())
+                            .and_then(|parent| {
+                                let status = match f.status.as_deref().unwrap_or("") {
+                                    "completed" | "complete" | "succeeded" | "success" => {
+                                        DoneStatus::Completed
+                                    }
+                                    "failed" | "errored" | "error" => DoneStatus::Errored,
+                                    "killed" | "cancelled" | "canceled" | "stopped"
+                                    | "interrupted" => DoneStatus::Interrupted,
+                                    // Non-terminal notification shapes: nothing to close.
+                                    _ => return None,
+                                };
+                                Some(tag(
+                                    parent,
+                                    AgentEvent::Done {
+                                        status,
+                                        result: None,
+                                        error: None,
+                                        session_id: None,
+                                    },
+                                ))
+                            });
+                    return workflow.into_iter().chain(done).collect();
                 }
                 // An AGENT task starting (subagent_type present — subagent-
                 // owned shell tasks carry the same subtype without it):
@@ -282,10 +416,10 @@ impl Normalizer {
                     )
                 {
                     self.agent_tasks.insert(task.to_owned(), tool.to_owned());
-                    return Vec::new();
+                    return workflow.into_iter().collect();
                 }
                 if f.subtype != "init" || self.saw_init {
-                    return Vec::new();
+                    return workflow.into_iter().collect();
                 }
                 self.saw_init = true;
                 self.session_id = Some(f.session_id.clone());
@@ -967,6 +1101,87 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
         )
         .is_empty());
+    }
+
+    #[test]
+    fn claude_task_progress_emits_workflow_activity() {
+        let events = normalize_one(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf-1","task_type":"local_workflow","workflow_name":"Audit","description":"Review repository","usage":{"total_tokens":1200,"tool_uses":4,"duration_ms":2500},"workflow_progress":[{"type":"workflow_phase","index":0,"title":"Review"},{"type":"workflow_agent","index":0,"label":"Repository reviewer","phaseIndex":0,"phaseTitle":"Review","agentId":"agent-1","model":"claude-opus-4-1","state":"running","promptPreview":"Inspect the repository"}],"summary":"<usage><agent_count>1</agent_count></usage>"}"#,
+        );
+
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::WorkflowTask { task }]
+                if task.task_id == "wf-1"
+                    && task.workflow_name.as_deref() == Some("Audit")
+                    && task.description.as_deref() == Some("Review repository")
+                    && task.usage == Some(zeron_proto::WorkflowUsage {
+                        total_tokens: Some(1_200),
+                        tool_uses: Some(4),
+                        duration_ms: Some(2_500),
+                    })
+                    && task.progress.len() == 2
+                    && task.agent_count == Some(1)
+                    && task.task_type.as_deref() == Some("local_workflow")
+        ));
+    }
+
+    #[test]
+    fn claude_sparse_terminal_notification_preserves_subagent_done() {
+        let mut normalizer = Normalizer::new();
+        let started = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"wf-1","task_type":"local_workflow","workflow_name":"Audit"}"#,
+        )
+        .expect("start parses");
+        assert!(matches!(
+            normalizer.normalize(started, false).as_slice(),
+            [AgentEvent::WorkflowTask { .. }]
+        ));
+        let completed = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"wf-1","tool_use_id":"toolu_agent","status":"completed"}"#,
+        )
+        .expect("terminal notification parses");
+        let events = normalizer.normalize(completed, false);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowTask { task }
+                if task.task_id == "wf-1"
+                    && task.status == zeron_proto::WorkflowTaskStatus::Completed
+                    && task.workflow_name.is_none()
+                    && task.progress.is_empty()
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Subagent { parent_tool_use_id, event }
+                if parent_tool_use_id == "toolu_agent"
+                    && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        )));
+    }
+
+    #[test]
+    fn claude_local_bash_and_malformed_tasks_emit_no_workflow_activity() {
+        for frame in [
+            r#"{"type":"system","subtype":"task_started","task_id":"bash-1","task_type":"local_bash","description":"sleep 10"}"#,
+            r#"{"type":"system","subtype":"task_progress","task_type":"local_workflow","workflow_name":"Missing id"}"#,
+        ] {
+            let events = normalize_one(frame);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::WorkflowTask { .. })),
+                "frame should be ignored: {frame}; events: {events:?}"
+            );
+        }
+
+        let events = normalize_one(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf-1","task_type":"local_workflow","workflow_progress":"not-an-array","usage":42}"#,
+        );
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::WorkflowTask { task }]
+                if task.task_id == "wf-1" && task.progress.is_empty() && task.usage.is_none()
+        ));
     }
 
     #[test]

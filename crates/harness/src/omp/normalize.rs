@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall, ToolDiff, ToolExecutionMeta,
+    WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
 };
 
 use super::protocol::sanitize_diagnostic;
@@ -21,6 +22,8 @@ struct SubagentContext {
     parent_tool_use_id: String,
     session_id: String,
     agent: String,
+    index: u32,
+    description: Option<String>,
 }
 
 pub struct OmpNormalizer {
@@ -48,6 +51,7 @@ impl OmpNormalizer {
                 .into_iter()
                 .collect(),
             Some("subagent_lifecycle") => self.subagent_lifecycle(&frame),
+            Some("subagent_progress") => self.subagent_progress(&frame),
             Some("subagent_event") => self.subagent_event(&frame),
             Some("notice") if frame.get("level").and_then(Value::as_str) == Some("error") => frame
                 .get("message")
@@ -124,10 +128,17 @@ impl OmpNormalizer {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if matches!(status, "running" | "started" | "pending") {
+            let previous = self.subagents.get(id).cloned();
             let Some(parent_tool_use_id) = payload
                 .get("parentToolCallId")
                 .and_then(Value::as_str)
                 .filter(|parent| !parent.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    previous
+                        .as_ref()
+                        .map(|context| context.parent_tool_use_id.clone())
+                })
             else {
                 return Vec::new();
             };
@@ -135,24 +146,48 @@ impl OmpNormalizer {
                 .get("sessionFile")
                 .and_then(Value::as_str)
                 .filter(|session| !session.is_empty())
-                .unwrap_or(id)
-                .to_owned();
+                .map(str::to_owned)
+                .or_else(|| previous.as_ref().map(|context| context.session_id.clone()))
+                .unwrap_or_else(|| id.to_owned());
             let agent = payload
                 .get("agent")
                 .and_then(Value::as_str)
                 .filter(|agent| !agent.is_empty())
-                .unwrap_or("task")
-                .to_owned();
+                .map(str::to_owned)
+                .or_else(|| previous.as_ref().map(|context| context.agent.clone()))
+                .unwrap_or_else(|| "task".to_owned());
+            let index = u32_value(payload.get("index"))
+                .or_else(|| previous.as_ref().map(|context| context.index))
+                .unwrap_or(0);
+            let description = first_string(payload, &["description", "assignment", "task"])
+                .or_else(|| {
+                    previous
+                        .as_ref()
+                        .and_then(|context| context.description.clone())
+                });
             self.subagents.insert(
                 id.to_owned(),
                 SubagentContext {
-                    parent_tool_use_id: parent_tool_use_id.to_owned(),
+                    parent_tool_use_id: parent_tool_use_id.clone(),
                     session_id: session_id.clone(),
-                    agent,
+                    agent: agent.clone(),
+                    index,
+                    description: description.clone(),
                 },
             );
-            return vec![AgentEvent::Subagent {
-                parent_tool_use_id: parent_tool_use_id.to_owned(),
+            let mut events = Vec::with_capacity(2);
+            if description.is_some() {
+                events.push(subagent_workflow_update(
+                    id,
+                    WorkflowTaskStatus::Running,
+                    description,
+                    None,
+                    Vec::new(),
+                    &agent,
+                ));
+            }
+            events.push(AgentEvent::Subagent {
+                parent_tool_use_id,
                 event: Box::new(AgentEvent::SessionStarted {
                     harness: HarnessId::Omp,
                     model: self.model.clone(),
@@ -161,7 +196,8 @@ impl OmpNormalizer {
                     session_id,
                     assistant_message_id: format!("omp-subagent-{id}"),
                 }),
-            }];
+            });
+            return events;
         }
         if matches!(
             status,
@@ -170,7 +206,25 @@ impl OmpNormalizer {
         {
             let failed = matches!(status, "failed" | "errored");
             let interrupted = matches!(status, "cancelled" | "aborted");
-            return vec![AgentEvent::Subagent {
+            let workflow_status = if failed {
+                WorkflowTaskStatus::Failed
+            } else if interrupted {
+                WorkflowTaskStatus::Cancelled
+            } else {
+                WorkflowTaskStatus::Completed
+            };
+            let mut events = Vec::with_capacity(2);
+            if context.description.is_some() {
+                events.push(subagent_workflow_update(
+                    id,
+                    workflow_status,
+                    context.description,
+                    None,
+                    Vec::new(),
+                    &context.agent,
+                ));
+            }
+            events.push(AgentEvent::Subagent {
                 parent_tool_use_id: context.parent_tool_use_id,
                 event: Box::new(AgentEvent::Done {
                     status: if failed {
@@ -190,9 +244,106 @@ impl OmpNormalizer {
                     }),
                     session_id: Some(context.session_id),
                 }),
-            }];
+            });
+            return events;
         }
         Vec::new()
+    }
+
+    fn subagent_progress(&mut self, frame: &Value) -> Vec<AgentEvent> {
+        let Some(payload) = frame.get("payload").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let payload = Value::Object(payload.clone());
+        let Some(progress) = payload.get("progress").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let progress = Value::Object(progress.clone());
+        let Some(id) = progress
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Vec::new();
+        };
+        let Some(status) = progress
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(workflow_task_status)
+        else {
+            return Vec::new();
+        };
+        let previous = self.subagents.get(id).cloned();
+        let Some(parent_tool_use_id) = payload
+            .get("parentToolCallId")
+            .and_then(Value::as_str)
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|context| context.parent_tool_use_id.clone())
+            })
+        else {
+            return Vec::new();
+        };
+        let agent = first_string(&payload, &["agent"])
+            .or_else(|| first_string(&progress, &["agent"]))
+            .or_else(|| previous.as_ref().map(|context| context.agent.clone()))
+            .unwrap_or_else(|| "task".to_owned());
+        let index = u32_value(progress.get("index"))
+            .or_else(|| u32_value(payload.get("index")))
+            .or_else(|| previous.as_ref().map(|context| context.index))
+            .unwrap_or(0);
+        let description = first_string(&payload, &["assignment", "task", "description"])
+            .or_else(|| first_string(&progress, &["assignment", "task", "description"]))
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|context| context.description.clone())
+            })
+            .unwrap_or_else(|| agent.clone());
+        let session_id = previous
+            .as_ref()
+            .map(|context| context.session_id.clone())
+            .unwrap_or_else(|| id.to_owned());
+        self.subagents.insert(
+            id.to_owned(),
+            SubagentContext {
+                parent_tool_use_id,
+                session_id,
+                agent: agent.clone(),
+                index,
+                description: Some(description.clone()),
+            },
+        );
+        let usage = WorkflowUsage {
+            total_tokens: progress.get("tokens").and_then(Value::as_u64),
+            tool_uses: progress.get("toolCount").and_then(Value::as_u64),
+            duration_ms: progress.get("durationMs").and_then(Value::as_u64),
+        };
+        let usage = (usage.total_tokens.is_some()
+            || usage.tool_uses.is_some()
+            || usage.duration_ms.is_some())
+        .then_some(usage);
+        let node = WorkflowProgressNode::Agent {
+            index,
+            label: description.clone(),
+            phase_index: 0,
+            phase_title: Some("OMP subagents".to_owned()),
+            agent_id: Some(id.to_owned()),
+            model: first_string(&progress, &["resolvedModel"]),
+            state: Some(workflow_status_name(status).to_owned()),
+            prompt_preview: Some(description.clone()),
+        };
+        vec![subagent_workflow_update(
+            id,
+            status,
+            Some(description),
+            usage,
+            vec![node],
+            &agent,
+        )]
     }
 
     fn subagent_event(&mut self, frame: &Value) -> Vec<AgentEvent> {
@@ -215,6 +366,61 @@ impl OmpNormalizer {
             })
             .into_iter()
             .collect()
+    }
+}
+
+fn workflow_task_status(status: &str) -> Option<WorkflowTaskStatus> {
+    match status {
+        "started" | "pending" | "running" => Some(WorkflowTaskStatus::Running),
+        "completed" => Some(WorkflowTaskStatus::Completed),
+        "failed" | "errored" => Some(WorkflowTaskStatus::Failed),
+        "aborted" | "cancelled" => Some(WorkflowTaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn workflow_status_name(status: WorkflowTaskStatus) -> &'static str {
+    match status {
+        WorkflowTaskStatus::Running => "running",
+        WorkflowTaskStatus::Completed => "completed",
+        WorkflowTaskStatus::Failed => "failed",
+        WorkflowTaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_str))
+        .find(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn u32_value(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn subagent_workflow_update(
+    id: &str,
+    status: WorkflowTaskStatus,
+    description: Option<String>,
+    usage: Option<WorkflowUsage>,
+    progress: Vec<WorkflowProgressNode>,
+    agent: &str,
+) -> AgentEvent {
+    AgentEvent::WorkflowTask {
+        task: WorkflowTaskUpdate {
+            task_id: id.to_owned(),
+            status,
+            workflow_name: None,
+            description,
+            usage,
+            progress,
+            agent_count: Some(1),
+            task_type: Some("subagent".to_owned()),
+            subagent_type: Some(agent.to_owned()),
+        },
     }
 }
 
@@ -414,4 +620,137 @@ fn truncate(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
+
+    #[test]
+    fn omp_subagent_progress_emits_workflow_activity() {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        let started = normalizer.push(json!({
+            "type": "subagent_lifecycle",
+            "payload": {
+                "id": "sub-1",
+                "index": 0,
+                "agent": "scout",
+                "description": "Inspect authentication paths.",
+                "status": "started",
+                "parentToolCallId": "call_task|fc_parent",
+                "sessionFile": "/tmp/sub-1.jsonl"
+            }
+        }));
+        assert!(started.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowTask { task }
+                if task.task_id == "sub-1"
+                    && task.status == WorkflowTaskStatus::Running
+                    && task.task_type.as_deref() == Some("subagent")
+                    && task.subagent_type.as_deref() == Some("scout")
+        )));
+        assert!(started.iter().any(|event| matches!(
+            event,
+            AgentEvent::Subagent { event, .. }
+                if matches!(event.as_ref(), AgentEvent::SessionStarted { .. })
+        )));
+
+        let progress = normalizer.push(json!({
+            "type": "subagent_progress",
+            "payload": {
+                "parentToolCallId": "call_task|fc_parent",
+                "agent": "scout",
+                "progress": {
+                    "id": "sub-1",
+                    "index": 0,
+                    "status": "running",
+                    "task": "Inspect authentication paths.",
+                    "toolCount": 2,
+                    "tokens": 120,
+                    "durationMs": 1000,
+                    "resolvedModel": "openai-codex/gpt-5.6-sol:high"
+                }
+            }
+        }));
+        assert!(matches!(
+            &progress[..],
+            [AgentEvent::WorkflowTask { task }]
+                if task.task_id == "sub-1"
+                    && task.status == WorkflowTaskStatus::Running
+                    && task.description.as_deref() == Some("Inspect authentication paths.")
+                    && task.usage == Some(WorkflowUsage {
+                        total_tokens: Some(120),
+                        tool_uses: Some(2),
+                        duration_ms: Some(1_000),
+                    })
+                    && matches!(task.progress.as_slice(), [WorkflowProgressNode::Agent { agent_id, model, .. }]
+                        if agent_id.as_deref() == Some("sub-1")
+                            && model.as_deref() == Some("openai-codex/gpt-5.6-sol:high"))
+                    && task.task_type.as_deref() == Some("subagent")
+                    && task.subagent_type.as_deref() == Some("scout")
+        ));
+
+        let nested = normalizer.push(json!({
+            "type": "subagent_event",
+            "payload": {
+                "id": "sub-1",
+                "event": {
+                    "type": "message_update",
+                    "assistantMessageEvent": { "type": "text_delta", "delta": "found auth" }
+                }
+            }
+        }));
+        assert!(matches!(
+            &nested[..],
+            [AgentEvent::Subagent { event, .. }]
+                if matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "found auth")
+        ));
+
+        let completed = normalizer.push(json!({
+            "type": "subagent_lifecycle",
+            "payload": { "id": "sub-1", "status": "completed" }
+        }));
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowTask { task }
+                if task.task_id == "sub-1" && task.status == WorkflowTaskStatus::Completed
+        )));
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            AgentEvent::Subagent { event, .. }
+                if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        )));
+    }
+
+    #[test]
+    fn omp_malformed_progress_is_ignored_without_losing_subagent_context() {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        normalizer.push(json!({
+            "type": "subagent_lifecycle",
+            "payload": {
+                "id": "sub-1",
+                "agent": "scout",
+                "status": "running",
+                "parentToolCallId": "task-1"
+            }
+        }));
+        assert!(
+            normalizer
+                .push(json!({ "type": "subagent_progress", "payload": { "progress": "bad" } }))
+                .is_empty()
+        );
+        let nested = normalizer.push(json!({
+            "type": "subagent_event",
+            "payload": {
+                "id": "sub-1",
+                "event": {
+                    "type": "message_update",
+                    "assistantMessageEvent": { "type": "text_delta", "delta": "still alive" }
+                }
+            }
+        }));
+        assert!(matches!(&nested[..], [AgentEvent::Subagent { .. }]));
+    }
 }
