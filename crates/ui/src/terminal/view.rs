@@ -324,6 +324,9 @@ pub fn keystroke_bytes(
         return Some(out);
     }
     if mods.control {
+        if key == "end" {
+            return Some(b"\x1b[1;5F".to_vec());
+        }
         return control_bytes(key);
     }
 
@@ -967,6 +970,10 @@ mod tests {
         assert_eq!(
             keystroke_bytes("c", Some("c"), &ctrl, false),
             Some(vec![0x03])
+        );
+        assert_eq!(
+            keystroke_bytes("end", None, &ctrl, false),
+            Some(b"\x1b[1;5F".to_vec())
         );
         assert_eq!(keystroke_bytes("z", None, &ctrl, false), Some(vec![0x1a]));
         assert_eq!(

@@ -1231,7 +1231,11 @@ impl WorkersContent {
                 match monitor.pressure_action() {
                     PressureAction::None => {}
                     PressureAction::TrimCaches | PressureAction::TrimAggressively => {
-                        terminal.update(cx, |terminal, cx| terminal.shed_scrollback(cx));
+                        let include_active =
+                            matches!(monitor.pressure_action(), PressureAction::TrimAggressively);
+                        terminal.update(cx, |terminal, cx| {
+                            terminal.shed_scrollback(include_active, cx)
+                        });
                         if this.gallery_open {
                             this.close_session_gallery(cx);
                         } else {

@@ -20,8 +20,7 @@ use base64::Engine as _;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollDelta, ScrollHandle, SharedString, Subscription, Task, Window, actions, div, prelude::*,
-    px,
+    ScrollHandle, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -32,6 +31,11 @@ use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
+use super::scroll::{
+    MouseProtocol, SCROLLBAR_HIT_WIDTH, SCROLLBAR_HOVER_THUMB_WIDTH, SCROLLBAR_THUMB_WIDTH,
+    SCROLLBAR_TRACK_INSET, ScrollbarMetrics, TerminalScrollAction, TerminalScrollGesture,
+    TerminalScrollModes, scrollbar_metrics, terminal_scroll_action,
+};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
     cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
@@ -41,11 +45,6 @@ use super::view::{
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
-const SCROLLBAR_TRACK_INSET: f32 = 4.0;
-const SCROLLBAR_HIT_WIDTH: f32 = 10.0;
-const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
-const SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 4.5;
-const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 actions!(terminal, [ToggleTerminal]);
 
@@ -219,50 +218,6 @@ struct ScrollbarDrag {
     grab_offset: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ScrollbarMetrics {
-    track_top: f32,
-    track_height: f32,
-    thumb_top: f32,
-    thumb_height: f32,
-    history_lines: usize,
-}
-
-impl ScrollbarMetrics {
-    fn travel(self) -> f32 {
-        (self.track_height - self.thumb_height).max(0.0)
-    }
-}
-
-fn scrollbar_metrics(
-    bounds: gpui::Bounds<Pixels>,
-    rows: usize,
-    history_lines: usize,
-    display_offset: usize,
-) -> Option<ScrollbarMetrics> {
-    if history_lines == 0 {
-        return None;
-    }
-    let track_height = (f32::from(bounds.size.height) - SCROLLBAR_TRACK_INSET * 2.0).max(0.0);
-    if track_height <= 0.0 {
-        return None;
-    }
-    let total_lines = history_lines.saturating_add(rows).max(1);
-    let thumb_height = (track_height * rows as f32 / total_lines as f32)
-        .max(SCROLLBAR_MIN_THUMB)
-        .min(track_height);
-    let travel = (track_height - thumb_height).max(0.0);
-    let offset = display_offset.min(history_lines);
-    let progress_from_top = 1.0 - offset as f32 / history_lines as f32;
-    Some(ScrollbarMetrics {
-        track_top: f32::from(bounds.top()) + SCROLLBAR_TRACK_INSET,
-        track_height,
-        thumb_top: travel * progress_from_top,
-        thumb_height,
-        history_lines,
-    })
-}
-
 /// Terminal scroll direction for a selection near the grid edge.
 ///
 /// Alacritty uses positive deltas for history (up) and negative deltas for the
@@ -384,6 +339,7 @@ pub struct TerminalPanel {
     /// rather than a permanently painted rail beside the panel.
     terminal_hovered: bool,
     scrollbar_hovered: bool,
+    scroll_gesture: TerminalScrollGesture,
     _observe: Subscription,
 }
 
@@ -410,6 +366,7 @@ impl TerminalPanel {
             scrollbar_drag: None,
             terminal_hovered: false,
             scrollbar_hovered: false,
+            scroll_gesture: TerminalScrollGesture::default(),
             _observe: observe,
         }
     }
@@ -1225,6 +1182,48 @@ impl TerminalPanel {
         }
     }
 
+    fn on_scroll_wheel(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        let hit = cell_at(
+            f32::from(event.position.x - geometry.origin.x),
+            f32::from(event.position.y - geometry.origin.y),
+            geometry.cell_w,
+            geometry.line_h,
+            geometry.cols as usize,
+            geometry.rows as usize,
+        );
+        let steps = self.scroll_gesture.steps(
+            event.delta,
+            event.touch_phase,
+            px(super::view::TERM_LINE_HEIGHT),
+        );
+        if steps == 0 {
+            return;
+        }
+        let Some(tab) = self.active_tab(cx) else {
+            return;
+        };
+        let modes = TerminalScrollModes {
+            mouse_reporting: tab.emulator.mouse_reporting_mode(),
+            mouse_protocol: if tab.emulator.sgr_mouse_mode() {
+                MouseProtocol::Sgr
+            } else if tab.emulator.utf8_mouse_mode() {
+                MouseProtocol::Utf8
+            } else {
+                MouseProtocol::Normal
+            },
+            alternate_screen: tab.emulator.alternate_screen_mode(),
+            mouse_alternate_scroll: tab.emulator.mouse_alternate_scroll_mode(),
+            application_cursor: tab.emulator.app_cursor_mode(),
+        };
+        match terminal_scroll_action(modes, steps, hit.col, hit.row) {
+            TerminalScrollAction::Write(bytes) => self.queue_input(&bytes, cx),
+            TerminalScrollAction::Scrollback => self.scroll_active(steps, cx),
+        }
+    }
+
     fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
         if self.selection_scroll_task.is_some() {
             return;
@@ -1284,13 +1283,7 @@ impl TerminalPanel {
         let Some(metrics) = self.active_scrollbar_metrics(cx) else {
             return;
         };
-        let thumb_top =
-            (f32::from(pointer_y) - metrics.track_top - grab_offset).clamp(0.0, metrics.travel());
-        let offset = if metrics.travel() <= 0.0 {
-            0
-        } else {
-            ((1.0 - thumb_top / metrics.travel()) * metrics.history_lines as f32).round() as usize
-        };
+        let offset = metrics.offset_for_pointer(pointer_y, grab_offset);
         self.with_active_emulator(cx, |emu| emu.scroll_to_offset(offset));
         cx.notify();
     }
@@ -1737,14 +1730,7 @@ impl Render for TerminalPanel {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-                        let lines = match event.delta {
-                            ScrollDelta::Lines(delta) => delta.y,
-                            ScrollDelta::Pixels(delta) => {
-                                f32::from(delta.y) / super::view::TERM_LINE_HEIGHT
-                            }
-                        };
-                        let step = lines.round() as i32;
-                        this.scroll_active(step, cx);
+                        this.on_scroll_wheel(event, cx)
                     }))
                     .child(TerminalElement::new(cx.entity(), focused))
                     .children(scrollbar),

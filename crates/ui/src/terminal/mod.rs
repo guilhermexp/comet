@@ -13,4 +13,5 @@
 
 pub mod emulator;
 pub mod panel;
+pub mod scroll;
 pub mod view;

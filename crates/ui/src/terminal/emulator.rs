@@ -241,6 +241,34 @@ impl Emulator {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    pub fn mouse_reporting_mode(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    pub fn mouse_button_motion_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::MOUSE_DRAG)
+    }
+
+    pub fn mouse_any_motion_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::MOUSE_MOTION)
+    }
+
+    pub fn sgr_mouse_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    pub fn utf8_mouse_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::UTF8_MOUSE)
+    }
+
+    pub fn alternate_screen_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    pub fn mouse_alternate_scroll_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::ALTERNATE_SCROLL)
+    }
+
     /// Lines scrolled back into history (0 = pinned to the live bottom).
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
@@ -258,6 +286,12 @@ impl Emulator {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Drop retained history without replacing the active screen or VT modes.
+    pub fn clear_scrollback(&mut self) {
+        let _ = self.feed(b"\x1b[3J");
+        self.scroll_to_bottom();
     }
 
     /// Set the scrollback offset directly (0 = live bottom).
@@ -737,6 +771,37 @@ mod tests {
         e.feed(&bytes[..1]);
         e.feed(&bytes[1..]);
         assert_eq!(e.row_text(0), "é");
+    }
+
+    #[test]
+    fn input_modes_follow_incremental_vt_sequences() {
+        let mut e = emu(10, 2);
+        e.feed(b"\x1b[?1049h\x1b[?1002h\x1b[?1007h");
+
+        assert!(e.alternate_screen_mode());
+        assert!(e.mouse_reporting_mode());
+        assert!(e.mouse_button_motion_mode());
+        assert!(!e.mouse_any_motion_mode());
+        assert!(e.mouse_alternate_scroll_mode());
+        assert!(!e.sgr_mouse_mode());
+        assert!(!e.utf8_mouse_mode());
+
+        e.feed(b"\x1b[?1003h\x1b[?1006h");
+        assert!(e.mouse_any_motion_mode());
+        assert!(e.sgr_mouse_mode());
+    }
+
+    #[test]
+    fn clearing_scrollback_preserves_the_visible_screen() {
+        let mut e = emu(10, 2);
+        e.feed(b"one\r\ntwo\r\nthree");
+        let before = e.lines();
+        assert!(e.history_lines() > 0);
+
+        e.clear_scrollback();
+
+        assert_eq!(e.history_lines(), 0);
+        assert_eq!(e.lines(), before);
     }
 }
 
