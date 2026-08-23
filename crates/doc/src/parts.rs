@@ -80,6 +80,126 @@ pub struct ToolDiffStat {
     pub deletions: u64,
 }
 
+pub const FILE_PREVIEW_MAX_LINES: usize = 15;
+pub const FILE_PREVIEW_MAX_LINE_CHARS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChangeKind {
+    Write,
+    Edit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChangeLineKind {
+    Added,
+    Removed,
+    Context,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeLine {
+    pub kind: FileChangeLineKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangePreview {
+    pub kind: FileChangeKind,
+    pub lines: Vec<FileChangeLine>,
+    pub total_lines: u32,
+    pub additions: u32,
+    pub deletions: u32,
+    pub truncated_before: u32,
+}
+
+fn capped_file_change_line(kind: FileChangeLineKind, text: &str) -> FileChangeLine {
+    FileChangeLine {
+        kind,
+        text: text
+            .trim_end_matches('\n')
+            .chars()
+            .take(FILE_PREVIEW_MAX_LINE_CHARS)
+            .collect(),
+    }
+}
+
+pub fn file_change_preview(
+    call: &ToolCall,
+    authoritative_diff: Option<&ToolDiff>,
+) -> Option<FileChangePreview> {
+    let (kind, old_text, new_text) = match (call, authoritative_diff) {
+        (ToolCall::WriteFile { .. }, Some(diff)) => (
+            FileChangeKind::Write,
+            diff.old_text.as_deref(),
+            diff.new_text.as_str(),
+        ),
+        (ToolCall::EditFile { .. }, Some(diff)) => (
+            FileChangeKind::Edit,
+            diff.old_text.as_deref(),
+            diff.new_text.as_str(),
+        ),
+        (ToolCall::WriteFile { content, .. }, None) => {
+            (FileChangeKind::Write, None, content.as_deref()?)
+        }
+        (
+            ToolCall::EditFile {
+                old_string,
+                new_string,
+                ..
+            },
+            None,
+        ) => (
+            FileChangeKind::Edit,
+            Some(old_string.as_deref()?),
+            new_string.as_deref()?,
+        ),
+        _ => return None,
+    };
+
+    let mut lines = Vec::new();
+    let (mut additions, mut deletions) = (0u32, 0u32);
+    if let Some(old_text) = old_text {
+        let diff = similar::TextDiff::from_lines(old_text, new_text);
+        for change in diff.iter_all_changes() {
+            let kind = match change.tag() {
+                similar::ChangeTag::Insert => {
+                    additions += 1;
+                    FileChangeLineKind::Added
+                }
+                similar::ChangeTag::Delete => {
+                    deletions += 1;
+                    FileChangeLineKind::Removed
+                }
+                similar::ChangeTag::Equal => FileChangeLineKind::Context,
+            };
+            lines.push(capped_file_change_line(kind, change.value()));
+        }
+    } else {
+        for line in new_text.lines() {
+            additions += 1;
+            lines.push(capped_file_change_line(FileChangeLineKind::Added, line));
+        }
+    }
+
+    let total_lines = lines.len() as u32;
+    let truncated_before = lines.len().saturating_sub(FILE_PREVIEW_MAX_LINES) as u32;
+    if truncated_before > 0 {
+        lines.drain(..truncated_before as usize);
+    }
+    Some(FileChangePreview {
+        kind,
+        lines,
+        total_lines,
+        additions,
+        deletions,
+        truncated_before,
+    })
+}
+
 /// Line-level add/delete counts for one file's diff.
 pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
     let (additions, deletions) = match &diff.old_text {
@@ -172,6 +292,10 @@ pub enum MessagePart {
         /// Per-file diff stats (additive replacement for inline `diff`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_stats: Option<Vec<ToolDiffStat>>,
+        /// Bounded semantic file preview derived before full Write/Edit input
+        /// is stripped from the synchronized document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_preview: Option<FileChangePreview>,
         /// The SUBAGENT doc id this spawn chip indexes (additive; stamped by
         /// the engine like the sidecar refs — the fold is chat-agnostic).
         /// The chip IS the index: the client learns the doc/blob id from it,
@@ -231,6 +355,7 @@ impl MessagePart {
                 output,
                 diff,
                 diff_stats,
+                file_preview,
                 ..
             } => {
                 serde_json::to_vec(call).map_or(0, |v| v.len())
@@ -244,6 +369,9 @@ impl MessagePart {
                     + diff_stats
                         .as_ref()
                         .map_or(0, |s| serde_json::to_vec(s).map_or(0, |v| v.len()))
+                    + file_preview
+                        .as_ref()
+                        .map_or(0, |p| serde_json::to_vec(p).map_or(0, |v| v.len()))
             }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
@@ -466,13 +594,19 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             }
         }
         AgentEvent::ToolCall { id, call } => {
-            if let Some(existing) = out.iter_mut().find_map(|p| match p {
+            if let Some((existing, preview)) = out.iter_mut().find_map(|p| match p {
                 MessagePart::Tool {
-                    id: pid, call: c, ..
-                } if pid == id => Some(c),
+                    id: pid,
+                    call: existing,
+                    file_preview,
+                    ..
+                } if pid == id => Some((existing, file_preview)),
                 _ => None,
             }) {
                 *existing = call.clone();
+                if let Some(next_preview) = file_change_preview(call, None) {
+                    *preview = Some(next_preview);
+                }
             } else {
                 out.push(MessagePart::Tool {
                     id: id.clone(),
@@ -486,6 +620,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     output_bytes: None,
                     diff_ref: None,
                     diff_stats: None,
+                    file_preview: file_change_preview(call, None),
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
@@ -509,6 +644,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     diff: diff_slot,
                     output_bytes,
                     diff_stats,
+                    file_preview,
+                    call,
                     ..
                 } = p
                     && pid == id
@@ -524,6 +661,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
+                    if let Some(diff) = diff.as_ref() {
+                        *file_preview = file_change_preview(call, Some(diff));
+                    }
                 }
             }
         }
@@ -1317,6 +1457,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -1403,6 +1544,220 @@ mod tests {
             new_text: "one\ntwo\n".into(),
         });
         assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    #[test]
+    fn file_change_preview_keeps_bounded_tail_for_large_write() {
+        let content = (1..=75)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = file_change_preview(
+            &ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: Some(content),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(preview.kind, FileChangeKind::Write);
+        assert_eq!(preview.total_lines, 75);
+        assert_eq!(preview.additions, 75);
+        assert_eq!(preview.deletions, 0);
+        assert_eq!(preview.lines.len(), 15);
+        assert_eq!(preview.truncated_before, 60);
+        assert_eq!(preview.lines.first().unwrap().text, "line 61");
+        assert_eq!(preview.lines.last().unwrap().text, "line 75");
+        assert!(
+            preview
+                .lines
+                .iter()
+                .all(|line| line.kind == FileChangeLineKind::Added)
+        );
+    }
+
+    #[test]
+    fn file_change_preview_preserves_edit_semantics_and_prefers_result_diff() {
+        let call = ToolCall::EditFile {
+            path: "src/main.rs".into(),
+            old_string: Some("same\nold\ntail".into()),
+            new_string: Some("same\nnew\ntail".into()),
+        };
+        let preview = file_change_preview(&call, None).unwrap();
+        assert_eq!(preview.kind, FileChangeKind::Edit);
+        assert_eq!((preview.additions, preview.deletions), (1, 1));
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .map(|line| (line.kind, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (FileChangeLineKind::Context, "same"),
+                (FileChangeLineKind::Removed, "old"),
+                (FileChangeLineKind::Added, "new"),
+                (FileChangeLineKind::Context, "tail"),
+            ]
+        );
+
+        let authoritative = ToolDiff {
+            path: "src/authoritative.rs".into(),
+            old_text: Some("before\n".into()),
+            new_text: "after\nextra\n".into(),
+        };
+        let preview = file_change_preview(&call, Some(&authoritative)).unwrap();
+        assert_eq!((preview.additions, preview.deletions), (2, 1));
+        assert!(preview.lines.iter().any(|line| line.text == "extra"));
+        assert!(!preview.lines.iter().any(|line| line.text == "same"));
+    }
+
+    #[test]
+    fn file_change_preview_caps_each_line_on_unicode_scalar_boundaries() {
+        let preview = file_change_preview(
+            &ToolCall::WriteFile {
+                path: "wide.txt".into(),
+                content: Some("é".repeat(600)),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(preview.lines.len(), 1);
+        assert_eq!(preview.lines[0].text.chars().count(), 512);
+        assert!(
+            preview.lines[0]
+                .text
+                .is_char_boundary(preview.lines[0].text.len())
+        );
+    }
+
+    #[test]
+    fn file_change_preview_does_not_invent_path_only_content() {
+        assert_eq!(
+            file_change_preview(
+                &ToolCall::WriteFile {
+                    path: "path-only.txt".into(),
+                    content: None,
+                },
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fold_refreshes_bounded_file_preview_before_sanitizing_call() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "write-1".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes/new.txt".into(),
+                    content: Some("first".into()),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "write-1".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes/new.txt".into(),
+                    content: Some("first\nsecond".into()),
+                },
+            },
+        );
+
+        let MessagePart::Tool {
+            call, file_preview, ..
+        } = &parts[0]
+        else {
+            panic!("expected tool part")
+        };
+        assert_eq!(
+            call,
+            &ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: Some("first\nsecond".into()),
+            }
+        );
+        let preview = file_preview.as_ref().unwrap();
+        assert_eq!(preview.total_lines, 2);
+        assert_eq!(preview.lines[1].text, "second");
+    }
+
+    #[test]
+    fn path_only_refresh_does_not_erase_a_richer_file_preview() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "write-1".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes/new.txt".into(),
+                    content: Some("first\nsecond".into()),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "write-1".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes/new.txt".into(),
+                    content: None,
+                },
+            },
+        );
+
+        let MessagePart::Tool { file_preview, .. } = &parts[0] else {
+            panic!("expected tool part")
+        };
+        assert_eq!(file_preview.as_ref().unwrap().total_lines, 2);
+    }
+
+    #[test]
+    fn fold_replaces_speculative_preview_with_authoritative_result_diff() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "edit-1".into(),
+                call: ToolCall::EditFile {
+                    path: "src/main.rs".into(),
+                    old_string: Some("old".into()),
+                    new_string: Some("speculative".into()),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "edit-1".into(),
+                is_error: false,
+                output: None,
+                diff: Some(ToolDiff {
+                    path: "src/main.rs".into(),
+                    old_text: Some("old".into()),
+                    new_text: "authoritative".into(),
+                }),
+                execution: None,
+            },
+        );
+
+        let MessagePart::Tool { file_preview, .. } = &parts[0] else {
+            panic!("expected tool part")
+        };
+        let preview = file_preview.as_ref().unwrap();
+        assert!(
+            preview
+                .lines
+                .iter()
+                .any(|line| line.text == "authoritative")
+        );
+        assert!(!preview.lines.iter().any(|line| line.text == "speculative"));
     }
 
     #[test]

@@ -39,7 +39,9 @@ use gpui::{
     div, img, list, prelude::*, px, quad,
 };
 
-use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
+use zeron_doc::{
+    FileChangePreview, MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus,
+};
 use zeron_proto::{TodoItem, ToolCall, view::tool_presentation};
 
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -305,6 +307,9 @@ pub struct ToolItem {
     pub output_bytes: Option<u64>,
     /// Sidecar key of the full diff (doc carries only per-file stats).
     pub diff_ref: Option<SharedString>,
+    /// Bounded semantic preview carried by the synchronized doc. Full bodies
+    /// are fetched from the owning device only when the completed card opens.
+    pub file_preview: Option<Arc<FileChangePreview>>,
     /// The spawned SUBAGENT's doc id — the chip IS the index (there is no
     /// listing endpoint); with it the chip offers "Open subagent".
     pub subagent_ref: Option<SharedString>,
@@ -631,6 +636,9 @@ pub enum RowKind {
         auto_open: bool,
         detail_auto_open: bool,
     },
+    FileChange {
+        tool: ToolItem,
+    },
     TurnSteps {
         rows: Arc<Vec<Row>>,
         summary: SharedString,
@@ -903,6 +911,21 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool)
         // Sidecar refs arriving after the resolve tick must re-splice too —
         // they add the fetch affordance without changing the detail payload.
         acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
+        if let Some(preview) = &t.file_preview {
+            acc.extend_from_slice(&(preview.total_lines as u64).to_le_bytes());
+            acc.extend_from_slice(&(preview.additions as u64).to_le_bytes());
+            acc.extend_from_slice(&(preview.deletions as u64).to_le_bytes());
+            acc.extend_from_slice(&(preview.truncated_before as u64).to_le_bytes());
+            for line in &preview.lines {
+                acc.push(match line.kind {
+                    zeron_doc::FileChangeLineKind::Added => 1,
+                    zeron_doc::FileChangeLineKind::Removed => 2,
+                    zeron_doc::FileChangeLineKind::Context => 3,
+                });
+                acc.extend_from_slice(line.text.as_bytes());
+                acc.push(0);
+            }
+        }
         // Subagent lifecycle mutates the chip in place (status flips, the
         // live tail grows) — hash it so the row re-splices on every change.
         acc.push(
@@ -1191,6 +1214,7 @@ fn rows_for_entry_with_todo_history(
                 output_bytes,
                 diff_ref,
                 diff_stats,
+                file_preview,
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
@@ -1255,10 +1279,37 @@ fn rows_for_entry_with_todo_history(
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
+                    file_preview: file_preview.clone().map(Arc::new),
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                 };
+                let is_file_change =
+                    matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. })
+                        && (item.file_preview.is_some() || streaming);
+                if is_file_change {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                    let version = tool_fingerprint(std::slice::from_ref(&item), false, false);
+                    rows.push(ProjectedRow {
+                        source_start: part_ix,
+                        source_end: part_ix,
+                        row: Row {
+                            id: format!("{}#{}", entry.id, tool_id).into(),
+                            version,
+                            turn_start: false,
+                            kind: RowKind::FileChange { tool: item },
+                            entry_id: entry.id.clone().into(),
+                            timestamp: None,
+                        },
+                    });
+                    continue;
+                }
                 // Agent chips don't share a fold with ordinary tools: flush
                 // whenever the genus flips so each group is uniform.
                 if pending_group
@@ -4595,6 +4646,14 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
+            RowKind::FileChange { tool } => self.render_tool_group(
+                &row.id,
+                &Arc::new(vec![tool.clone()]),
+                !tool.resolved,
+                !tool.resolved,
+                &theme,
+                cx,
+            ),
             RowKind::TurnSteps {
                 rows,
                 summary,
@@ -7128,6 +7187,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -7285,6 +7345,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -7320,6 +7381,150 @@ mod tests {
         );
         assert!(children.iter().all(|row| row.timestamp.is_none()));
         assert_eq!(done_rows.last().unwrap().timestamp, Some(done.created_at));
+    }
+
+    fn write_file_part(
+        id: &str,
+        resolved: bool,
+        preview: Option<zeron_doc::FileChangePreview>,
+    ) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: None,
+            },
+            is_error: false,
+            resolved,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: preview,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }
+    }
+
+    fn two_line_write_preview() -> zeron_doc::FileChangePreview {
+        zeron_doc::FileChangePreview {
+            kind: zeron_doc::FileChangeKind::Write,
+            lines: vec![
+                zeron_doc::FileChangeLine {
+                    kind: zeron_doc::FileChangeLineKind::Added,
+                    text: "first".into(),
+                },
+                zeron_doc::FileChangeLine {
+                    kind: zeron_doc::FileChangeLineKind::Added,
+                    text: "second".into(),
+                },
+            ],
+            total_lines: 2,
+            additions: 2,
+            deletions: 0,
+            truncated_before: 0,
+        }
+    }
+
+    #[test]
+    fn file_change_projects_one_stable_specialized_row_across_live_refreshes() {
+        let first = assistant(
+            "file-change-live",
+            MessageStatus::Streaming,
+            vec![write_file_part(
+                "write-1",
+                false,
+                Some(two_line_write_preview()),
+            )],
+        );
+        let mut grown_preview = two_line_write_preview();
+        grown_preview.lines.push(zeron_doc::FileChangeLine {
+            kind: zeron_doc::FileChangeLineKind::Added,
+            text: "third".into(),
+        });
+        grown_preview.total_lines = 3;
+        grown_preview.additions = 3;
+        let second = assistant(
+            "file-change-live",
+            MessageStatus::Streaming,
+            vec![write_file_part("write-1", false, Some(grown_preview))],
+        );
+
+        let first_rows = rows_for_entry(&first, false, &mut parse);
+        let second_rows = rows_for_entry(&second, false, &mut parse);
+        assert_eq!(first_rows.len(), 1);
+        assert_eq!(second_rows.len(), 1);
+        assert_eq!(first_rows[0].id.as_ref(), "file-change-live#write-1");
+        assert_eq!(first_rows[0].id, second_rows[0].id);
+        assert_ne!(first_rows[0].version, second_rows[0].version);
+        assert!(matches!(
+            &second_rows[0].kind,
+            RowKind::FileChange { tool }
+                if tool.file_preview.as_ref().is_some_and(|preview| preview.total_lines == 3)
+        ));
+    }
+
+    #[test]
+    fn resolved_file_change_moves_inside_turn_steps_without_changing_identity() {
+        let live = assistant(
+            "file-change-turn",
+            MessageStatus::Streaming,
+            vec![write_file_part(
+                "write-1",
+                false,
+                Some(two_line_write_preview()),
+            )],
+        );
+        let done = assistant(
+            "file-change-turn",
+            MessageStatus::Complete,
+            vec![
+                write_file_part("write-1", true, Some(two_line_write_preview())),
+                text_part("answer", "Created the file."),
+            ],
+        );
+
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        assert!(matches!(live_rows[0].kind, RowKind::FileChange { .. }));
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+        let RowKind::TurnSteps { rows, .. } = &done_rows[0].kind else {
+            panic!("resolved file change should be folded with completed work")
+        };
+        assert_eq!(rows[0].id, live_rows[0].id);
+        assert!(matches!(rows[0].kind, RowKind::FileChange { .. }));
+    }
+
+    #[test]
+    fn path_only_write_does_not_invent_preview_lines() {
+        let entry = assistant(
+            "file-change-path-only",
+            MessageStatus::Streaming,
+            vec![write_file_part("write-1", false, None)],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::FileChange { tool } if tool.file_preview.is_none()
+        ));
+    }
+
+    #[test]
+    fn legacy_completed_path_only_write_keeps_generic_fallback() {
+        let entry = assistant(
+            "legacy-file-change",
+            MessageStatus::Complete,
+            vec![write_file_part("write-1", true, None)],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup { tools, .. }
+                if tools.len() == 1 && tools[0].file_preview.is_none()
+        ));
     }
 
     #[test]
@@ -7681,6 +7886,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -7715,6 +7921,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -7814,6 +8021,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -7855,6 +8063,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -8014,6 +8223,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -8145,6 +8355,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: Some(format!("chat--sub--{id}")),
             subagent_status: Some(SubagentStatus::Running),
             subagent_tail: None,
@@ -8600,6 +8811,7 @@ mod tests {
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -8617,6 +8829,7 @@ mod tests {
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -8650,6 +8863,7 @@ mod tests {
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -8665,6 +8879,7 @@ mod tests {
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -8678,6 +8893,7 @@ mod tests {
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,

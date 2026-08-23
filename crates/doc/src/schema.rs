@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
-use crate::parts::{MessagePart, MessageStatus, SubagentStatus};
+use crate::parts::{FileChangePreview, MessagePart, MessageStatus, SubagentStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -100,6 +100,9 @@ struct DocPartJson {
     /// Per-file diff stats (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff_stats: Option<serde_json::Value>,
+    /// Bounded semantic Write/Edit preview (full bodies stay journal-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_preview: Option<serde_json::Value>,
     /// Subagent doc/blob ref carried by a spawn chip (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_ref: Option<String>,
@@ -148,6 +151,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             output_bytes,
             diff_ref,
             diff_stats,
+            file_preview,
             subagent_ref,
             subagent_status,
             subagent_tail,
@@ -165,6 +169,10 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             output_bytes: *output_bytes,
             diff_ref: diff_ref.clone(),
             diff_stats: diff_stats.as_ref().map(serde_json::to_value).transpose()?,
+            file_preview: file_preview
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
             subagent_ref: subagent_ref.clone(),
             subagent_status: subagent_status.map(|s| {
                 match s {
@@ -226,6 +234,9 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 output_bytes: p.output_bytes,
                 diff_ref: p.diff_ref,
                 diff_stats: p.diff_stats.and_then(|s| serde_json::from_value(s).ok()),
+                file_preview: p
+                    .file_preview
+                    .and_then(|preview| serde_json::from_value(preview).ok()),
                 subagent_ref: p.subagent_ref,
                 subagent_status: p.subagent_status.as_deref().and_then(|s| match s {
                     "running" => Some(SubagentStatus::Running),
@@ -714,6 +725,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(diff_stats) = &doc_part.diff_stats {
         map.insert("diffStats", loro_value_from_json(diff_stats))?;
     }
+    if let Some(file_preview) = &doc_part.file_preview {
+        map.insert("filePreview", loro_value_from_json(file_preview))?;
+    }
     if let Some(subagent_ref) = &doc_part.subagent_ref {
         map.insert("subagentRef", subagent_ref.as_str())?;
     }
@@ -883,6 +897,10 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: obj
+                .get("filePreview")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<FileChangePreview>(value).ok()),
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -1177,6 +1195,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(diff_stats) = &doc_part.diff_stats {
         map.insert("diffStats", loro_value_from_json(diff_stats))?;
     }
+    if let Some(file_preview) = &doc_part.file_preview {
+        map.insert("filePreview", loro_value_from_json(file_preview))?;
+    }
     if let Some(subagent_ref) = &doc_part.subagent_ref {
         map.insert("subagentRef", subagent_ref.as_str())?;
     }
@@ -1382,6 +1403,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -1413,6 +1435,87 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn segment_sync_round_trips_and_refreshes_bounded_file_preview() {
+        use crate::{FileChangeKind, FileChangeLine, FileChangeLineKind, FileChangePreview};
+
+        let doc = SessionDoc::init("file-preview").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "entry-1", "dev", 1).unwrap();
+        let mut part = MessagePart::Tool {
+            id: "write-1".into(),
+            call: ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: None,
+            },
+            is_error: false,
+            resolved: false,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: Some(FileChangePreview {
+                kind: FileChangeKind::Write,
+                lines: vec![FileChangeLine {
+                    kind: FileChangeLineKind::Added,
+                    text: "first".into(),
+                }],
+                total_lines: 1,
+                additions: 1,
+                deletions: 0,
+                truncated_before: 0,
+            }),
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        writer.sync(std::slice::from_ref(&part)).unwrap();
+        let MessagePart::Tool { file_preview, .. } = &mut part else {
+            unreachable!()
+        };
+        *file_preview = Some(FileChangePreview {
+            kind: FileChangeKind::Write,
+            lines: vec![
+                FileChangeLine {
+                    kind: FileChangeLineKind::Added,
+                    text: "first".into(),
+                },
+                FileChangeLine {
+                    kind: FileChangeLineKind::Added,
+                    text: "second".into(),
+                },
+            ],
+            total_lines: 2,
+            additions: 2,
+            deletions: 0,
+            truncated_before: 0,
+        });
+        writer
+            .finish(std::slice::from_ref(&part), MessageStatus::Complete, None)
+            .unwrap();
+
+        assert_eq!(doc.read_entries().unwrap()[0].parts, vec![part]);
+    }
+
+    #[test]
+    fn legacy_tool_part_without_file_preview_reads_as_none() {
+        let part: DocPartJson = serde_json::from_value(serde_json::json!({
+            "id": "write-1",
+            "kind": "tool",
+            "call": {"kind": "writeFile", "path": "notes/new.txt"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            from_doc_part(part),
+            MessagePart::Tool {
+                file_preview: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1636,6 +1739,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
@@ -1681,6 +1785,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                file_preview: None,
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,

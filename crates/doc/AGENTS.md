@@ -16,6 +16,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 - Command ledger segue as regras 1–3: entradas append-only por device; outcome só do host; dedupe/TTL/supersede avaliados na leitura.
 - Constantes carregadas do comet original (`STREAM_COMMIT_MS=120`, `DO_FLUSH_MS=5s`, compactação em 8MB, retenção 30d, tail 64) são compatibilidade, não preferência — mudar exige olhar o lado do edge.
 - Split de continuação em 256KB. Tool parts renderizáveis vão pro doc; inputs completos ficam no run journal local do host.
+- Write/Edit nunca sincronizam o corpo completo: o doc guarda só preview semântico limitado a 15 linhas × 512 escalares Unicode; o input histórico integral fica no run journal local do host.
 - `SessionMessageEntry.duration_ms` é metadata aditiva de segmento assistant: `SegmentWriter::finish` só carimba quando a engine tem uma fronteira confiável; docs legados e recovery sem medição mantêm `None`.
 - Mudança de nome/shape de container é **destrutiva cross-device** (foi o motivo do `2` em `ws2/{orgId}`). Vai por OpenSpec.
 

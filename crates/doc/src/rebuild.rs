@@ -14,7 +14,10 @@
 //! the epoch check makes re-entry a no-op.
 
 use crate::SessionCommandStatus;
-use crate::parts::{MessagePart, SidecarPayload, diff_stat, summarize_tool_output};
+use crate::parts::{
+    MessagePart, SidecarPayload, diff_stat, file_change_preview, sanitize_tool_call,
+    summarize_tool_output,
+};
 use crate::schema::{DocError, SessionDoc};
 
 /// Doc lineage epoch written by [`rebuild_thin_doc`]. Pre-migration s2 docs
@@ -89,12 +92,14 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
 fn strip_part(chat_id: &str, part: &mut MessagePart) -> Option<SidecarPayload> {
     let MessagePart::Tool {
         id,
+        call,
         output,
         diff,
         output_ref,
         output_bytes,
         diff_ref,
         diff_stats,
+        file_preview,
         ..
     } = part
     else {
@@ -105,6 +110,10 @@ fn strip_part(chat_id: &str, part: &mut MessagePart) -> Option<SidecarPayload> {
         output: None,
         diff: None,
     };
+    if file_preview.is_none() {
+        *file_preview = file_change_preview(call, diff.as_ref());
+    }
+    *call = sanitize_tool_call(call);
     // Fat inline output = text with no sidecar ref (the new fold always
     // stamps `output_ref` beside a summary). Blank output just drops.
     if output_ref.is_none()
@@ -178,6 +187,7 @@ mod tests {
                     output_bytes: None,
                     diff_ref: None,
                     diff_stats: None,
+                    file_preview: None,
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
@@ -283,5 +293,52 @@ mod tests {
             first.doc.read_entries().unwrap(),
             second.doc.read_entries().unwrap()
         );
+    }
+
+    #[test]
+    fn rebuild_derives_preview_before_stripping_legacy_file_input() {
+        let source = SessionDoc::init("chat-file").unwrap();
+        let mut entry = fat_entry("m-file");
+        entry.parts = vec![MessagePart::Tool {
+            id: "edit-1".into(),
+            call: ToolCall::EditFile {
+                path: "src/main.rs".into(),
+                old_string: Some("before\n".into()),
+                new_string: Some("after\nextra\n".into()),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }];
+        source.push_message(&entry).unwrap();
+
+        let rebuilt = rebuild_thin_doc(&source).unwrap();
+        let entries = rebuilt.doc.read_entries().unwrap();
+        let MessagePart::Tool {
+            call, file_preview, ..
+        } = &entries[0].parts[0]
+        else {
+            panic!("expected tool")
+        };
+        assert_eq!(
+            call,
+            &ToolCall::EditFile {
+                path: "src/main.rs".into(),
+                old_string: None,
+                new_string: None,
+            }
+        );
+        let preview = file_preview.as_ref().expect("bounded preview survives");
+        assert_eq!((preview.additions, preview.deletions), (2, 1));
     }
 }

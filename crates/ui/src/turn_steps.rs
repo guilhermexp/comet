@@ -289,6 +289,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            file_preview: None,
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
