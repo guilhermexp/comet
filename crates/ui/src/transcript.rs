@@ -40,7 +40,7 @@ use gpui::{
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
-use zeron_proto::{ToolCall, view::tool_presentation};
+use zeron_proto::{TodoItem, ToolCall, view::tool_presentation};
 
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
@@ -630,6 +630,12 @@ pub enum RowKind {
         auto_open: bool,
         detail_auto_open: bool,
     },
+    TaskSnapshot {
+        items: Arc<Vec<TaskSnapshotItem>>,
+        created: bool,
+        resolved: bool,
+        is_error: bool,
+    },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
         /// chip shows it; unresolved shows "Awaiting your answer…" — which
@@ -642,6 +648,23 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskChange {
+    Created,
+    Started,
+    Completed,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshotItem {
+    ordinal: usize,
+    text: String,
+    done: bool,
+    current: bool,
+    change: Option<TaskChange>,
 }
 
 /// A transcript row: stable id + content version (diff key) + block payload.
@@ -685,6 +708,115 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x1_0000_01b3);
     }
     hash
+}
+
+fn append_todo_snapshot_bytes(bytes: &mut Vec<u8>, items: &[TodoItem]) {
+    bytes.extend_from_slice(&(items.len() as u64).to_le_bytes());
+    for item in items {
+        bytes.extend_from_slice(&(item.text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(item.text.as_bytes());
+        bytes.push(item.done as u8);
+    }
+}
+
+fn todo_snapshot_version(
+    previous: &[TodoItem],
+    items: &[TodoItem],
+    resolved: bool,
+    is_error: bool,
+    created: bool,
+) -> u64 {
+    let mut bytes = Vec::new();
+    append_todo_snapshot_bytes(&mut bytes, previous);
+    append_todo_snapshot_bytes(&mut bytes, items);
+    bytes.push(resolved as u8 | (is_error as u8) << 1 | (created as u8) << 2);
+    fnv1a(&bytes)
+}
+
+fn task_snapshot_items(
+    previous: &[TodoItem],
+    current: &[TodoItem],
+    created: bool,
+) -> Vec<TaskSnapshotItem> {
+    let current_index = current.iter().position(|item| !item.done);
+    if created {
+        return current
+            .iter()
+            .enumerate()
+            .map(|(index, item)| TaskSnapshotItem {
+                ordinal: index + 1,
+                text: item.text.clone(),
+                done: item.done,
+                current: current_index == Some(index),
+                change: None,
+            })
+            .collect();
+    }
+
+    let previous_by_text: HashMap<&str, &TodoItem> = previous
+        .iter()
+        .map(|item| (item.text.as_str(), item))
+        .collect();
+    let current_by_text: HashMap<&str, &TodoItem> = current
+        .iter()
+        .map(|item| (item.text.as_str(), item))
+        .collect();
+    let previous_current = previous
+        .iter()
+        .find(|item| !item.done)
+        .map(|item| item.text.as_str());
+    let current_current = current_index.map(|index| current[index].text.as_str());
+
+    let mut changes = Vec::new();
+    for (index, item) in current.iter().enumerate() {
+        let change = match previous_by_text.get(item.text.as_str()) {
+            None => Some(TaskChange::Created),
+            Some(previous) if previous.done != item.done => Some(if item.done {
+                TaskChange::Completed
+            } else {
+                TaskChange::Started
+            }),
+            Some(_)
+                if current_current == Some(item.text.as_str())
+                    && previous_current != current_current =>
+            {
+                Some(TaskChange::Started)
+            }
+            Some(_) => None,
+        };
+        if let Some(change) = change {
+            changes.push(TaskSnapshotItem {
+                ordinal: index + 1,
+                text: item.text.clone(),
+                done: item.done,
+                current: current_current == Some(item.text.as_str()),
+                change: Some(change),
+            });
+        }
+    }
+    for (index, item) in previous.iter().enumerate() {
+        if !current_by_text.contains_key(item.text.as_str()) {
+            changes.push(TaskSnapshotItem {
+                ordinal: index + 1,
+                text: item.text.clone(),
+                done: item.done,
+                current: false,
+                change: Some(TaskChange::Deleted),
+            });
+        }
+    }
+    changes.sort_by_key(|item| item.ordinal);
+    changes
+}
+
+fn last_todo_snapshot(entry: &SessionMessageEntry) -> Option<&[TodoItem]> {
+    entry.parts.iter().rev().find_map(|part| match part {
+        MessagePart::Tool {
+            call: ToolCall::Todo { items },
+            ..
+        } => Some(items.as_slice()),
+        _ => None,
+    })
 }
 
 fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool) -> u64 {
@@ -805,7 +937,17 @@ pub fn rows_for_entry(
     pending: bool,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
 ) -> Vec<Row> {
+    rows_for_entry_with_todo_history(entry, pending, &[], parse)
+}
+
+fn rows_for_entry_with_todo_history(
+    entry: &SessionMessageEntry,
+    pending: bool,
+    previous_todos: &[TodoItem],
+    parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
+) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
+    let mut todo_history = previous_todos.to_vec();
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
 
@@ -902,6 +1044,7 @@ pub fn rows_for_entry(
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
             MessagePart::Tool {
+                id: tool_id,
                 call,
                 is_error,
                 resolved,
@@ -917,6 +1060,38 @@ pub fn rows_for_entry(
                 subagent_tail,
                 ..
             } => {
+                if let ToolCall::Todo { items } = call
+                    && !items.is_empty()
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_last_part_ix,
+                    );
+                    let created = todo_history.is_empty();
+                    let version =
+                        todo_snapshot_version(&todo_history, items, *resolved, *is_error, created);
+                    let display_items = task_snapshot_items(&todo_history, items, created);
+                    rows.push(Row {
+                        id: format!("{}#{}", entry.id, tool_id).into(),
+                        version,
+                        turn_start: false,
+                        kind: RowKind::TaskSnapshot {
+                            items: Arc::new(display_items),
+                            created,
+                            resolved: *resolved,
+                            is_error: *is_error,
+                        },
+                        entry_id: entry.id.clone().into(),
+                        timestamp: None,
+                    });
+                    todo_history.clone_from(items);
+                    continue;
+                }
+                if matches!(call, ToolCall::Todo { .. }) {
+                    todo_history.clear();
+                }
                 let item = ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
@@ -2843,11 +3018,12 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
+        let mut todo_history = Vec::new();
         for entry in &entries {
-            new_rows.extend(self.rows_for(entry, false));
+            new_rows.extend(self.rows_for(entry, false, &mut todo_history));
         }
         for echo in &echoes {
-            new_rows.extend(self.rows_for(echo, true));
+            new_rows.extend(self.rows_for(echo, true, &mut todo_history));
         }
         self.reasoning_started.retain(|id, _| {
             new_rows.iter().any(|row| {
@@ -2961,13 +3137,27 @@ impl Transcript {
     }
 
     /// Cached row build for one entry (streaming entries bypass the cache).
-    fn rows_for(&mut self, entry: &SessionMessageEntry, pending: bool) -> Vec<Row> {
+    fn rows_for(
+        &mut self,
+        entry: &SessionMessageEntry,
+        pending: bool,
+        todo_history: &mut Vec<TodoItem>,
+    ) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
-        let fingerprint = entry_fingerprint(entry, pending);
+        let next_todos = last_todo_snapshot(entry).map(<[TodoItem]>::to_vec);
+        let mut fingerprint = entry_fingerprint(entry, pending);
+        if next_todos.is_some() {
+            let mut context = Vec::new();
+            append_todo_snapshot_bytes(&mut context, todo_history);
+            fingerprint ^= fnv1a(&context).rotate_left(17);
+        }
         if !streaming
             && let Some(cached) = self.row_cache.get(&entry.id)
             && cached.fingerprint == fingerprint
         {
+            if let Some(next_todos) = next_todos {
+                *todo_history = next_todos;
+            }
             return cached.rows.clone();
         }
 
@@ -2978,7 +3168,11 @@ impl Transcript {
             // rows whose content hash changed are spliced — the reparsed tail).
             parse_for_row(streaming, key, text, live_parsers, tree_cache).0
         };
-        let rows = rows_for_entry(entry, pending, &mut parse);
+        let rows = rows_for_entry_with_todo_history(entry, pending, todo_history, &mut parse);
+
+        if let Some(next_todos) = next_todos {
+            *todo_history = next_todos;
+        }
 
         if !streaming {
             self.row_cache.insert(
@@ -4074,6 +4268,12 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
+            RowKind::TaskSnapshot {
+                items,
+                created,
+                resolved,
+                is_error,
+            } => task_snapshot_card(items, *created, *resolved, *is_error, &theme),
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
@@ -5895,6 +6095,157 @@ pub(crate) fn subagent_tab_title(call: &ToolCall) -> SharedString {
     "Subagent".into()
 }
 
+fn task_snapshot_card(
+    items: &Arc<Vec<TaskSnapshotItem>>,
+    created: bool,
+    resolved: bool,
+    is_error: bool,
+    theme: &Theme,
+) -> AnyElement {
+    let title = task_snapshot_title(items, created, resolved, is_error);
+
+    div()
+        .w_full()
+        .overflow_hidden()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface_card)
+        .child(
+            div()
+                .h(px(36.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    crate::icons::icon(crate::icons::CHECKLIST)
+                        .size(px(15.0))
+                        .text_color(if is_error {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if is_error {
+                            theme.danger_muted
+                        } else {
+                            theme.text
+                        })
+                        .child(title),
+                ),
+        )
+        .children(items.iter().map(|item| {
+            let change_label = item.change.map(|change| match change {
+                TaskChange::Created => "Created",
+                TaskChange::Started => "Started",
+                TaskChange::Completed => "Completed",
+                TaskChange::Deleted => "Deleted",
+            });
+            div()
+                .h(px(36.0))
+                .px(px(12.0))
+                .border_t_1()
+                .border_color(theme.border.opacity(0.55))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .child(
+                    div()
+                        .size(px(15.0))
+                        .flex_none()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if item.current {
+                            theme.text
+                        } else {
+                            theme.border_strong
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(item.current, |dot| {
+                            dot.bg(theme.text).child(
+                                crate::icons::icon(crate::icons::ARROW_RIGHT)
+                                    .size(px(9.0))
+                                    .text_color(theme.bg),
+                            )
+                        })
+                        .when(item.done, |dot| {
+                            dot.bg(crate::theme::ink(0.08)).child(
+                                crate::icons::icon(crate::icons::CHECK)
+                                    .size(px(9.0))
+                                    .text_color(theme.text_muted),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(if item.done {
+                            theme.text_muted
+                        } else {
+                            theme.text
+                        })
+                        .child(format!("{}. {}", item.ordinal, item.text)),
+                )
+                .when_some(change_label, |row, label| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child(label),
+                    )
+                })
+        }))
+        .into_any_element()
+}
+
+fn task_snapshot_title(
+    items: &[TaskSnapshotItem],
+    created: bool,
+    resolved: bool,
+    is_error: bool,
+) -> String {
+    let count = items.len();
+    if is_error {
+        "Todo update failed".to_owned()
+    } else if !resolved {
+        "Updating tasks".to_owned()
+    } else if created {
+        format!(
+            "Created {count} {}",
+            if count == 1 { "task" } else { "tasks" }
+        )
+    } else if count == 0 {
+        "Updated tasks".to_owned()
+    } else if items
+        .iter()
+        .all(|item| item.change == Some(TaskChange::Completed))
+    {
+        format!(
+            "Completed {count} {}",
+            if count == 1 { "task" } else { "tasks" }
+        )
+    } else {
+        format!(
+            "{count} task {}",
+            if count == 1 { "update" } else { "updates" }
+        )
+    }
+}
+
 /// A plain (non-expandable) chip: bordered card, plus the group guide rail
 /// when the chip lives under a collapsible header.
 fn tool_chip(
@@ -6537,6 +6888,218 @@ mod tests {
             subagent_status: None,
             subagent_tail: None,
         }
+    }
+
+    #[test]
+    fn todo_snapshot_renders_outside_the_generic_tool_group() {
+        let entry = assistant(
+            "todo-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::Tool {
+                id: "todo-1".into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        zeron_proto::TodoItem {
+                            text: "Inspect state".into(),
+                            done: false,
+                        },
+                        zeron_proto::TodoItem {
+                            text: "Run gates".into(),
+                            done: false,
+                        },
+                    ],
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            matches!(
+                &rows[0].kind,
+                RowKind::TaskSnapshot {
+                    items,
+                    created: true,
+                    resolved: true,
+                    is_error: false,
+                } if items.len() == 2
+            ),
+            "todo snapshot lost its dedicated inline card or payload"
+        );
+    }
+
+    #[test]
+    fn task_snapshot_title_reflects_lifecycle_and_progress() {
+        let pending = [
+            zeron_proto::TodoItem {
+                text: "Inspect state".into(),
+                done: false,
+            },
+            zeron_proto::TodoItem {
+                text: "Run gates".into(),
+                done: false,
+            },
+        ];
+        let created_pending = task_snapshot_items(&[], &pending, true);
+        assert_eq!(
+            task_snapshot_title(&created_pending, true, false, false),
+            "Updating tasks"
+        );
+        assert_eq!(
+            task_snapshot_title(&created_pending, true, true, false),
+            "Created 2 tasks"
+        );
+        let unchanged = task_snapshot_items(&pending, &pending, false);
+        assert_eq!(
+            task_snapshot_title(&unchanged, false, true, false),
+            "Updated tasks"
+        );
+
+        let updated = [
+            zeron_proto::TodoItem {
+                text: "Inspect state".into(),
+                done: true,
+            },
+            zeron_proto::TodoItem {
+                text: "Run gates".into(),
+                done: false,
+            },
+        ];
+        let update_rows = task_snapshot_items(&pending, &updated, false);
+        assert_eq!(
+            task_snapshot_title(&update_rows, false, true, false),
+            "2 task updates"
+        );
+        assert_eq!(
+            task_snapshot_title(&update_rows, false, true, true),
+            "Todo update failed"
+        );
+    }
+
+    #[test]
+    fn prior_snapshot_marks_pending_append_as_an_update() {
+        let previous = vec![zeron_proto::TodoItem {
+            text: "Inspect state".into(),
+            done: false,
+        }];
+        let entry = assistant(
+            "todo-append-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::Tool {
+                id: "todo-append".into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        previous[0].clone(),
+                        zeron_proto::TodoItem {
+                            text: "Run gates".into(),
+                            done: false,
+                        },
+                    ],
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+        );
+
+        let rows = rows_for_entry_with_todo_history(&entry, false, &previous, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::TaskSnapshot { created: false, .. }
+        ));
+    }
+
+    #[test]
+    fn updated_snapshot_card_contains_only_changed_tasks() {
+        let make_items = |completed: usize| {
+            (1..=7)
+                .map(|index| zeron_proto::TodoItem {
+                    text: format!("Task {index}"),
+                    done: index <= completed,
+                })
+                .collect::<Vec<_>>()
+        };
+        let previous = make_items(2);
+        let entry = assistant(
+            "todo-progress-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::Tool {
+                id: "todo-progress".into(),
+                call: ToolCall::Todo {
+                    items: make_items(3),
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+        );
+
+        let rows = rows_for_entry_with_todo_history(&entry, false, &previous, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::TaskSnapshot {
+                items,
+                created: false,
+                ..
+            } if items.len() == 2
+                && items[0].text == "Task 3" && items[0].done
+                && items[0].change == Some(TaskChange::Completed)
+                && items[1].text == "Task 4" && !items[1].done
+                && items[1].current
+                && items[1].change == Some(TaskChange::Started)
+        ));
+    }
+
+    #[test]
+    fn todo_snapshot_version_delimits_item_boundaries() {
+        let split = vec![
+            zeron_proto::TodoItem {
+                text: "a".into(),
+                done: false,
+            },
+            zeron_proto::TodoItem {
+                text: "b".into(),
+                done: false,
+            },
+        ];
+        let joined = vec![zeron_proto::TodoItem {
+            text: "a\0b".into(),
+            done: false,
+        }];
+        assert_ne!(
+            todo_snapshot_version(&[], &split, true, false, false),
+            todo_snapshot_version(&[], &joined, true, false, false)
+        );
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
