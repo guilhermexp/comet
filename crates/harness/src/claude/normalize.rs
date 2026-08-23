@@ -8,7 +8,7 @@ use zeron_proto::{
 };
 
 use super::wire::{ContentBlock, Frame, SystemFrame};
-use crate::partial_tool_input::partial_file_tool_call;
+use crate::partial_tool_input::{cap_partial_json, partial_file_tool_call};
 
 const MAX_STREAMING_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 
@@ -357,12 +357,14 @@ impl Normalizer {
         if !matches!(block.name.to_ascii_lowercase().as_str(), "write" | "edit") {
             return None;
         }
-        let raw_json = block
-            .input
-            .as_object()
-            .filter(|input| !input.is_empty())
-            .and_then(|_| serde_json::to_string(&block.input).ok())
-            .unwrap_or_default();
+        let raw_json = cap_partial_json(
+            block
+                .input
+                .as_object()
+                .filter(|input| !input.is_empty())
+                .and_then(|_| serde_json::to_string(&block.input).ok())
+                .unwrap_or_default(),
+        );
         let call = partial_file_tool_call(&block.name, &raw_json);
         self.streaming_tools.insert(
             index,
@@ -998,6 +1000,27 @@ mod tests {
                 content: Some("first\nsecond".into()),
             })
         );
+    }
+
+    #[test]
+    fn initial_claude_tool_input_is_unicode_safely_capped() {
+        let mut normalizer = Normalizer::new();
+        let oversized = "€".repeat((MAX_STREAMING_TOOL_INPUT_BYTES / 3) + 32);
+        normalizer.start_streaming_tool(
+            7,
+            ContentBlock {
+                kind: "tool_use".into(),
+                id: "large-write".into(),
+                name: "Write".into(),
+                input: json!({ "file_path": "large.txt", "content": oversized }),
+                ..ContentBlock::default()
+            },
+            None,
+        );
+
+        let stored = &normalizer.streaming_tools[&7].raw_json;
+        assert!(stored.len() <= MAX_STREAMING_TOOL_INPUT_BYTES);
+        assert!(stored.is_char_boundary(stored.len()));
     }
 
     #[test]

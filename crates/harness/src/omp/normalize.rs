@@ -7,7 +7,7 @@ use zeron_proto::{
 };
 
 use super::protocol::sanitize_diagnostic;
-use crate::partial_tool_input::partial_file_tool_call;
+use crate::partial_tool_input::{cap_partial_json, partial_file_tool_call};
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_STREAMING_TOOL_INPUT_BYTES: usize = 1024 * 1024;
@@ -60,6 +60,10 @@ impl OmpNormalizer {
     pub fn push(&mut self, frame: Value) -> Vec<AgentEvent> {
         match frame.get("type").and_then(Value::as_str) {
             Some("message_update") => self.message_update(&frame),
+            Some("message_start" | "message_end") => {
+                self.streaming_tools.clear();
+                Vec::new()
+            }
             Some("tool_execution_start") => self.tool_start(&frame).into_iter().collect(),
             Some("tool_execution_end") => self.tool_end(&frame),
             Some("available_commands_update") => available_commands(&frame)
@@ -186,17 +190,13 @@ impl OmpNormalizer {
                 }
                 event_tool_call(event).into_iter().collect()
             }
-            Some("message_start" | "message_end") => {
-                self.streaming_tools.clear();
-                Vec::new()
-            }
             _ => Vec::new(),
         }
     }
 
     fn start_streaming_tool(&mut self, event: &Value) -> Option<AgentEvent> {
         let index = content_index(event)?;
-        let call = event.get("toolCall").unwrap_or(event);
+        let call = event_tool_call_value(event)?;
         let id = call
             .get("id")
             .or_else(|| call.get("toolCallId"))?
@@ -210,12 +210,13 @@ impl OmpNormalizer {
         if !matches!(name.to_ascii_lowercase().as_str(), "write" | "edit") {
             return None;
         }
-        let raw_json = call
-            .get("arguments")
-            .or_else(|| call.get("args"))
-            .filter(|value| !value.is_null())
-            .and_then(|value| serde_json::to_string(value).ok())
-            .unwrap_or_default();
+        let raw_json = cap_partial_json(
+            call.get("arguments")
+                .or_else(|| call.get("args"))
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::to_string(value).ok())
+                .unwrap_or_default(),
+        );
         let typed = partial_file_tool_call(&name, &raw_json);
         self.streaming_tools.insert(
             index,
@@ -639,7 +640,7 @@ fn nested_event(frame: &Value) -> Option<AgentEvent> {
 }
 
 fn event_tool_call(event: &Value) -> Option<AgentEvent> {
-    let call = event.get("toolCall").unwrap_or(event);
+    let call = event_tool_call_value(event)?;
     let id = call
         .get("id")
         .or_else(|| call.get("toolCallId"))?
@@ -656,6 +657,20 @@ fn event_tool_call(event: &Value) -> Option<AgentEvent> {
     Some(AgentEvent::ToolCall {
         id: id.to_owned(),
         call: normalize_tool(name, &input),
+    })
+}
+
+/// OMP exposes an authoritative `toolCall` directly on `toolcall_end`; start
+/// and delta snapshots keep the same record under
+/// `partial.content[contentIndex]`. Read both lifecycle shapes through one
+/// boundary so ids/names never diverge by event phase.
+fn event_tool_call_value(event: &Value) -> Option<&Value> {
+    event.get("toolCall").or_else(|| {
+        event
+            .get("partial")?
+            .get("content")?
+            .as_array()?
+            .get(content_index(event)?)
     })
 }
 
@@ -885,6 +900,136 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
+
+    #[test]
+    fn captured_partial_content_shape_streams_progressive_write() {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        let events = include_str!("../../tests/fixtures/omp/live-progressive-write.jsonl")
+            .lines()
+            .flat_map(|line| {
+                let frame: Value = serde_json::from_str(line).expect("captured frame parses");
+                normalizer.push(frame)
+            })
+            .collect::<Vec<_>>();
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall { id, call } => Some((id, call)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.len() >= 4, "events: {events:#?}");
+        assert!(calls.iter().all(|(id, _)| id.as_str() == "omp-real-write"));
+        assert_eq!(
+            calls.last().map(|(_, call)| *call),
+            Some(&ToolCall::WriteFile {
+                path: "notes/real.txt".into(),
+                content: Some("first\nsecond".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn top_level_message_boundaries_clear_reused_content_index() {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "partial": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "first-write",
+                        "name": "write",
+                        "arguments": {}
+                    }]
+                }
+            }
+        }));
+        assert!(matches!(
+            normalizer.push(json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_delta",
+                    "contentIndex": 0,
+                    "delta": "{\"path\":\"first.txt\",\"content\":\"one"
+                }
+            })).as_slice(),
+            [AgentEvent::ToolCall { id, .. }] if id == "first-write"
+        ));
+
+        normalizer.push(json!({ "type": "message_end", "message": {} }));
+        normalizer.push(json!({ "type": "message_start", "message": {} }));
+        let leaked = normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_delta",
+                "contentIndex": 0,
+                "delta": " stale"
+            }
+        }));
+        assert!(
+            leaked.is_empty(),
+            "stale first message state leaked: {leaked:#?}"
+        );
+
+        normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "partial": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "second-write",
+                        "name": "write",
+                        "arguments": {}
+                    }]
+                }
+            }
+        }));
+        assert!(matches!(
+            normalizer.push(json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_delta",
+                    "contentIndex": 0,
+                    "delta": "{\"path\":\"second.txt\",\"content\":\"two"
+                }
+            })).as_slice(),
+            [AgentEvent::ToolCall { id, .. }] if id == "second-write"
+        ));
+    }
+
+    #[test]
+    fn initial_omp_tool_input_is_unicode_safely_capped() {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        let oversized = "€".repeat((MAX_STREAMING_TOOL_INPUT_BYTES / 3) + 32);
+        normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "partial": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "large-omp-write",
+                        "name": "write",
+                        "arguments": { "path": "large.txt", "content": oversized }
+                    }]
+                }
+            }
+        }));
+
+        let stored = &normalizer.streaming_tools[&0].raw_json;
+        assert!(stored.len() <= MAX_STREAMING_TOOL_INPUT_BYTES);
+        assert!(stored.is_char_boundary(stored.len()));
+    }
 
     #[test]
     fn progressive_write_input_refreshes_same_id_before_authoritative_start() {

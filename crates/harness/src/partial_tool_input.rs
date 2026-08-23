@@ -2,6 +2,18 @@ use zeron_proto::ToolCall;
 
 const MAX_PARTIAL_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 
+pub(crate) fn cap_partial_json(mut raw: String) -> String {
+    if raw.len() <= MAX_PARTIAL_TOOL_INPUT_BYTES {
+        return raw;
+    }
+    let mut end = MAX_PARTIAL_TOOL_INPUT_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw.truncate(end);
+    raw
+}
+
 /// Decode a named JSON string from a possibly incomplete tool-input object.
 ///
 /// This deliberately recognizes only string keys followed by string values;
