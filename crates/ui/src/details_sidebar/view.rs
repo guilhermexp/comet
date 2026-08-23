@@ -1017,7 +1017,11 @@ impl DetailsSidebar {
                     cx.emit(event.clone());
                 }
             }))
-            .child(icons::icon(avatar_path).size(px(14.0)))
+            .child(
+                img(avatar_path)
+                    .size(px(14.0))
+                    .object_fit(ObjectFit::Contain),
+            )
             .child(status)
             .child(
                 div()

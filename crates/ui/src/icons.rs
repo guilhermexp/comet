@@ -281,6 +281,9 @@ mod tests {
             let svg = std::str::from_utf8(&bytes).expect("avatar svg is utf-8");
             assert!(svg.contains("<svg"), "{path}");
             assert!(svg.contains("viewBox"), "{path}");
+            Image::from_bytes(ImageFormat::Svg, bytes.to_vec())
+                .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+                .unwrap_or_else(|error| panic!("avatar {path} failed GPUI rendering: {error}"));
         }
     }
 
