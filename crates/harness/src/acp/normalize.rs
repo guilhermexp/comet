@@ -256,17 +256,37 @@ fn typed_call(update: &Value) -> ToolCall {
                     }
                 }
             } else {
-                match raw_str("path")
+                let path = raw_str("path")
                     .or_else(|| raw_str("file_path"))
                     .or_else(|| raw_str("filePath"))
-                    .or_else(|| first_location(update))
+                    .or_else(|| first_location(update));
+                let has_edit_strings = raw.is_some_and(|input| {
+                    ["old_string", "oldText", "new_string", "newText"]
+                        .iter()
+                        .any(|key| input.get(*key).is_some())
+                });
+                let content = raw
+                    .and_then(|input| input.get("content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let (Some(path), Some(content)) = (path.clone(), content)
+                    && !has_edit_strings
                 {
-                    Some(path) if kind == "edit" => ToolCall::EditFile {
+                    ToolCall::WriteFile {
                         path,
-                        old_string: None,
-                        new_string: None,
-                    },
-                    path => ToolCall::ApplyPatch { path },
+                        content: Some(content),
+                    }
+                } else if kind == "edit" {
+                    match path.clone() {
+                        Some(path) => ToolCall::EditFile {
+                            path,
+                            old_string: raw_str("old_string").or_else(|| raw_str("oldText")),
+                            new_string: raw_str("new_string").or_else(|| raw_str("newText")),
+                        },
+                        None => ToolCall::ApplyPatch { path },
+                    }
+                } else {
+                    ToolCall::ApplyPatch { path }
                 }
             }
         }
@@ -680,6 +700,51 @@ mod tests {
                 call: ToolCall::WriteFile {
                     path: "/w/new.rs".into(),
                     content: None
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn growing_raw_input_refreshes_same_write_call_id() {
+        let first = map_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "write-growing",
+            "kind": "edit",
+            "title": "Write notes/new.txt",
+            "rawInput": {
+                "path": "notes/new.txt",
+                "content": ""
+            }
+        }));
+        let second = map_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "write-growing",
+            "kind": "edit",
+            "title": "Write notes/new.txt",
+            "rawInput": {
+                "path": "notes/new.txt",
+                "content": "first\nsecond"
+            }
+        }));
+
+        assert_eq!(
+            first,
+            vec![AgentEvent::ToolCall {
+                id: "write-growing".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes/new.txt".into(),
+                    content: Some(String::new()),
+                },
+            }]
+        );
+        assert_eq!(
+            second,
+            vec![AgentEvent::ToolCall {
+                id: "write-growing".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes/new.txt".into(),
+                    content: Some("first\nsecond".into()),
                 },
             }]
         );

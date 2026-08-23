@@ -7,8 +7,10 @@ use zeron_proto::{
 };
 
 use super::protocol::sanitize_diagnostic;
+use crate::partial_tool_input::partial_file_tool_call;
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_STREAMING_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEndDisposition {
@@ -26,12 +28,21 @@ struct SubagentContext {
     description: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct StreamingToolInput {
+    id: String,
+    name: String,
+    raw_json: String,
+    last_emitted: Option<ToolCall>,
+}
+
 pub struct OmpNormalizer {
     cwd: String,
     model: String,
     subagents: HashMap<String, SubagentContext>,
     todos: Vec<TodoItem>,
     todo_previous: HashMap<String, Vec<TodoItem>>,
+    streaming_tools: HashMap<usize, StreamingToolInput>,
 }
 
 impl OmpNormalizer {
@@ -42,6 +53,7 @@ impl OmpNormalizer {
             subagents: HashMap::new(),
             todos: Vec::new(),
             todo_previous: HashMap::new(),
+            streaming_tools: HashMap::new(),
         }
     }
 
@@ -151,7 +163,7 @@ impl OmpNormalizer {
             .unwrap_or(AgentEndDisposition::Complete)
     }
 
-    fn message_update(&self, frame: &Value) -> Vec<AgentEvent> {
+    fn message_update(&mut self, frame: &Value) -> Vec<AgentEvent> {
         let Some(event) = frame.get("assistantMessageEvent") else {
             return Vec::new();
         };
@@ -166,9 +178,82 @@ impl OmpNormalizer {
             Some("thinking_delta") if !delta.is_empty() => vec![AgentEvent::ReasoningDelta {
                 text: delta.to_owned(),
             }],
-            Some("toolcall_end") => event_tool_call(event).into_iter().collect(),
+            Some("toolcall_start") => self.start_streaming_tool(event).into_iter().collect(),
+            Some("toolcall_delta") => self.update_streaming_tool(event).into_iter().collect(),
+            Some("toolcall_end") => {
+                if let Some(index) = content_index(event) {
+                    self.streaming_tools.remove(&index);
+                }
+                event_tool_call(event).into_iter().collect()
+            }
+            Some("message_start" | "message_end") => {
+                self.streaming_tools.clear();
+                Vec::new()
+            }
             _ => Vec::new(),
         }
+    }
+
+    fn start_streaming_tool(&mut self, event: &Value) -> Option<AgentEvent> {
+        let index = content_index(event)?;
+        let call = event.get("toolCall").unwrap_or(event);
+        let id = call
+            .get("id")
+            .or_else(|| call.get("toolCallId"))?
+            .as_str()?
+            .to_owned();
+        let name = call
+            .get("name")
+            .or_else(|| call.get("toolName"))?
+            .as_str()?
+            .to_owned();
+        if !matches!(name.to_ascii_lowercase().as_str(), "write" | "edit") {
+            return None;
+        }
+        let raw_json = call
+            .get("arguments")
+            .or_else(|| call.get("args"))
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_default();
+        let typed = partial_file_tool_call(&name, &raw_json);
+        self.streaming_tools.insert(
+            index,
+            StreamingToolInput {
+                id: id.clone(),
+                name,
+                raw_json,
+                last_emitted: typed.clone(),
+            },
+        );
+        typed.map(|call| AgentEvent::ToolCall { id, call })
+    }
+
+    fn update_streaming_tool(&mut self, event: &Value) -> Option<AgentEvent> {
+        let state = self.streaming_tools.get_mut(&content_index(event)?)?;
+        let delta = event
+            .get("delta")
+            .or_else(|| event.get("partialJson"))
+            .or_else(|| event.get("partial_json"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let remaining = MAX_STREAMING_TOOL_INPUT_BYTES.saturating_sub(state.raw_json.len());
+        if remaining > 0 {
+            let mut end = delta.len().min(remaining);
+            while !delta.is_char_boundary(end) {
+                end -= 1;
+            }
+            state.raw_json.push_str(&delta[..end]);
+        }
+        let call = partial_file_tool_call(&state.name, &state.raw_json)?;
+        if state.last_emitted.as_ref() == Some(&call) {
+            return None;
+        }
+        state.last_emitted = Some(call.clone());
+        Some(AgentEvent::ToolCall {
+            id: state.id.clone(),
+            call,
+        })
     }
 
     fn subagent_lifecycle(&mut self, frame: &Value) -> Vec<AgentEvent> {
@@ -574,6 +659,15 @@ fn event_tool_call(event: &Value) -> Option<AgentEvent> {
     })
 }
 
+fn content_index(event: &Value) -> Option<usize> {
+    event
+        .get("contentIndex")
+        .or_else(|| event.get("content_index"))
+        .or_else(|| event.get("index"))
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+}
+
 fn tool_start(frame: &Value) -> Option<AgentEvent> {
     let id = frame.get("toolCallId")?.as_str()?;
     let name = frame.get("toolName")?.as_str()?;
@@ -791,6 +885,77 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
+
+    #[test]
+    fn progressive_write_input_refreshes_same_id_before_authoritative_start() {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        let frames = [
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_start",
+                    "contentIndex": 3,
+                    "toolCall": { "id": "omp-write", "name": "write" }
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_delta",
+                    "contentIndex": 3,
+                    "delta": "{\"path\":\"notes/new.txt\",\"content\":\"first"
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_delta",
+                    "contentIndex": 3,
+                    "delta": "\\nsecond\"}"
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    "contentIndex": 3,
+                    "toolCall": {
+                        "id": "omp-write",
+                        "name": "write",
+                        "arguments": { "path": "notes/new.txt", "content": "first\nsecond" }
+                    }
+                }
+            }),
+            json!({
+                "type": "tool_execution_start",
+                "toolCallId": "omp-write",
+                "toolName": "write",
+                "args": { "path": "notes/new.txt", "content": "first\nsecond" }
+            }),
+        ];
+
+        let events = frames
+            .into_iter()
+            .flat_map(|frame| normalizer.push(frame))
+            .collect::<Vec<_>>();
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall { id, call } => Some((id, call)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.len() >= 4, "events: {events:#?}");
+        assert!(calls.iter().all(|(id, _)| id.as_str() == "omp-write"));
+        assert_eq!(
+            calls.last().map(|(_, call)| *call),
+            Some(&ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: Some("first\nsecond".into()),
+            })
+        );
+    }
 
     #[test]
     fn omp_subagent_progress_emits_workflow_activity() {

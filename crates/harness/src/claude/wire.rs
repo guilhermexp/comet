@@ -78,6 +78,10 @@ pub(crate) struct StreamEventBody {
     #[serde(rename = "type", default)]
     pub kind: String,
     #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub content_block: Option<ContentBlock>,
+    #[serde(default)]
     pub delta: Delta,
 }
 
@@ -89,6 +93,8 @@ pub(crate) struct Delta {
     pub text: String,
     #[serde(default)]
     pub thinking: String,
+    #[serde(default)]
+    pub partial_json: String,
 }
 
 /// An `assistant` or `user` frame (an Anthropic API message envelope).
@@ -121,7 +127,7 @@ impl MessageBody {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ContentBlock {
     #[serde(rename = "type", default)]
     pub kind: String,

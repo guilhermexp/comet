@@ -8,6 +8,18 @@ use zeron_proto::{
 };
 
 use super::wire::{ContentBlock, Frame, SystemFrame};
+use crate::partial_tool_input::partial_file_tool_call;
+
+const MAX_STREAMING_TOOL_INPUT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct StreamingToolInput {
+    id: String,
+    name: String,
+    raw_json: String,
+    last_emitted: Option<ToolCall>,
+    parent_tool_use_id: Option<String>,
+}
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -306,6 +318,7 @@ pub(crate) struct Normalizer {
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
     context_window: Option<u64>,
+    streaming_tools: std::collections::HashMap<usize, StreamingToolInput>,
 }
 
 impl Normalizer {
@@ -317,6 +330,7 @@ impl Normalizer {
             assistant_message_id: new_message_id(),
             session_id: None,
             context_window: None,
+            streaming_tools: std::collections::HashMap::new(),
         }
     }
 
@@ -332,6 +346,69 @@ impl Normalizer {
     pub fn rotate_for_steer(&mut self) -> (String, String) {
         let prev = std::mem::replace(&mut self.assistant_message_id, new_message_id());
         (prev, self.assistant_message_id.clone())
+    }
+
+    fn start_streaming_tool(
+        &mut self,
+        index: usize,
+        block: ContentBlock,
+        parent_tool_use_id: Option<String>,
+    ) -> Option<AgentEvent> {
+        if !matches!(block.name.to_ascii_lowercase().as_str(), "write" | "edit") {
+            return None;
+        }
+        let raw_json = block
+            .input
+            .as_object()
+            .filter(|input| !input.is_empty())
+            .and_then(|_| serde_json::to_string(&block.input).ok())
+            .unwrap_or_default();
+        let call = partial_file_tool_call(&block.name, &raw_json);
+        self.streaming_tools.insert(
+            index,
+            StreamingToolInput {
+                id: block.id.clone(),
+                name: block.name,
+                raw_json,
+                last_emitted: call.clone(),
+                parent_tool_use_id: parent_tool_use_id.clone(),
+            },
+        );
+        call.map(|call| {
+            let event = AgentEvent::ToolCall { id: block.id, call };
+            parent_tool_use_id
+                .as_deref()
+                .map(|parent| tag(parent, event.clone()))
+                .unwrap_or(event)
+        })
+    }
+
+    fn update_streaming_tool(&mut self, index: usize, delta: &str) -> Option<AgentEvent> {
+        let state = self.streaming_tools.get_mut(&index)?;
+        let remaining = MAX_STREAMING_TOOL_INPUT_BYTES.saturating_sub(state.raw_json.len());
+        if remaining > 0 {
+            let mut end = delta.len().min(remaining);
+            while !delta.is_char_boundary(end) {
+                end -= 1;
+            }
+            state.raw_json.push_str(&delta[..end]);
+        }
+        let call = partial_file_tool_call(&state.name, &state.raw_json)?;
+        if state.last_emitted.as_ref() == Some(&call) {
+            return None;
+        }
+        state.last_emitted = Some(call.clone());
+        let event = AgentEvent::ToolCall {
+            id: state.id.clone(),
+            call,
+        };
+        Some(
+            state
+                .parent_tool_use_id
+                .as_deref()
+                .map(|parent| tag(parent, event.clone()))
+                .unwrap_or(event),
+        )
     }
 
     /// Normalize one stdout frame into 0+ unified events. `interrupted` folds
@@ -442,8 +519,29 @@ impl Normalizer {
             // `AgentEvent::Subagent` instead — the engine routes them to the
             // subagent's own doc.
             Frame::StreamEvent(f) => {
+                if f.event.kind == "content_block_start" {
+                    return f
+                        .event
+                        .content_block
+                        .and_then(|block| {
+                            self.start_streaming_tool(f.event.index, block, f.parent_tool_use_id)
+                        })
+                        .into_iter()
+                        .collect();
+                }
+                if f.event.kind == "content_block_stop" {
+                    self.streaming_tools.remove(&f.event.index);
+                    return Vec::new();
+                }
                 if f.event.kind != "content_block_delta" {
                     return Vec::new();
+                }
+                if f.event.delta.kind == "input_json_delta" {
+                    let progressive =
+                        self.update_streaming_tool(f.event.index, &f.event.delta.partial_json);
+                    if progressive.is_some() {
+                        return progressive.into_iter().collect();
+                    }
                 }
                 if let Some(parent) = &f.parent_tool_use_id {
                     return match f.event.delta.kind.as_str() {
@@ -518,6 +616,8 @@ impl Normalizer {
                             },
                         ));
                     }
+                    self.streaming_tools
+                        .retain(|_, tool| tool.parent_tool_use_id.as_deref() != Some(parent));
                     return out;
                 }
                 let mut out: Vec<AgentEvent> = f
@@ -579,6 +679,8 @@ impl Normalizer {
                         message: assistant_error_text(code),
                     });
                 }
+                self.streaming_tools
+                    .retain(|_, tool| tool.parent_tool_use_id.is_some());
                 // The enclosing assistant frame closes the streamed message
                 // item; rotate so post-boundary deltas get a fresh id.
                 let (prev, _next) = self.rotate_for_steer();
@@ -859,6 +961,79 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"abc"}}}"#,
         );
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn progressive_write_input_refreshes_one_tool_id_until_authoritative_frame() {
+        let mut normalizer = Normalizer::new();
+        let frames = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool-write","name":"Write","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"notes/new.txt\",\"content\":\"first"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\\nsecond\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":2}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-write","name":"Write","input":{"file_path":"notes/new.txt","content":"first\nsecond"}}]}}"#,
+        ];
+
+        let events = frames
+            .into_iter()
+            .flat_map(|raw| {
+                let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+                normalizer.normalize(frame, false)
+            })
+            .collect::<Vec<_>>();
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall { id, call } => Some((id, call)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.len() >= 3, "events: {events:#?}");
+        assert!(calls.iter().all(|(id, _)| id.as_str() == "tool-write"));
+        assert_eq!(
+            calls.last().map(|(_, call)| *call),
+            Some(&ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: Some("first\nsecond".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn progressive_edit_input_preserves_growing_new_string() {
+        let mut normalizer = Normalizer::new();
+        let frames = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"tool-edit","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"src/a.rs\",\"old_string\":\"old\",\"new_string\":\"new"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":" value\"}"}}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-edit","name":"Edit","input":{"file_path":"src/a.rs","old_string":"old","new_string":"new value"}}]}}"#,
+        ];
+
+        let events = frames
+            .into_iter()
+            .flat_map(|raw| {
+                let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+                normalizer.normalize(frame, false)
+            })
+            .collect::<Vec<_>>();
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall { id, call } if id == "tool-edit" => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.len() >= 3, "events: {events:#?}");
+        assert_eq!(
+            calls.last().copied(),
+            Some(&ToolCall::EditFile {
+                path: "src/a.rs".into(),
+                old_string: Some("old".into()),
+                new_string: Some("new value".into()),
+            })
+        );
     }
 
     #[test]

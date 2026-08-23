@@ -505,6 +505,29 @@ mod tests {
     }
 
     #[test]
+    fn path_only_file_change_does_not_invent_write_content() {
+        let events = map_item(
+            Phase::Started,
+            &json!({
+                "type": "fileChange",
+                "id": "path-only-write",
+                "changes": [{ "path": "/repo/generated.txt", "kind": "add" }]
+            }),
+        );
+
+        assert_eq!(
+            events,
+            vec![AgentEvent::ToolCall {
+                id: "path-only-write".into(),
+                call: ToolCall::WriteFile {
+                    path: "/repo/generated.txt".into(),
+                    content: None,
+                },
+            }]
+        );
+    }
+
+    #[test]
     fn usage_reads_last_snapshot_under_both_spellings() {
         assert_eq!(
             usage_event(&json!({"tokenUsage": {
