@@ -40,7 +40,7 @@ fn controller_mode_is_claimed_without_claiming_normal_cli_commands() {
 }
 
 #[test]
-fn initialize_and_tools_list_advertise_one_compact_workers_tool() {
+fn initialize_advertises_orchestrator_direction_and_one_compact_workers_tool() {
     let initialize = controller_mcp_handle_request(json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -49,6 +49,28 @@ fn initialize_and_tools_list_advertise_one_compact_workers_tool() {
     }))
     .expect("initialize responds");
     assert_eq!(initialize["result"]["serverInfo"]["name"], "comet-workers");
+    let instructions = initialize["result"]["instructions"]
+        .as_str()
+        .expect("initialize advertises orchestrator instructions");
+    assert!(instructions.starts_with("# Orchestrator Control\n"));
+    assert!(instructions.contains("provider-agnostic `workers` tool"));
+    assert!(
+        instructions.contains("You are the orchestrator, not the primary implementation worker.")
+    );
+    assert!(instructions.contains("Communication:"));
+    assert!(instructions.contains("Lead with the conclusion, decision, or blocker."));
+    assert!(instructions.contains("Challenge incorrect assumptions directly"));
+    assert!(instructions.contains("Operational boundaries:"));
+    assert!(instructions.contains("Deliver only what was requested at the intended scope."));
+    assert!(
+        instructions
+            .contains("Do not introduce abstractions for hypothetical future requirements.")
+    );
+    assert!(!instructions.contains("AGENTS.md"));
+    assert!(!instructions.contains("OMP.md"));
+    assert!(!instructions.contains("SOUL.md"));
+    assert!(!instructions.contains("Claude"));
+    assert!(!instructions.contains("Codex"));
 
     let tools = controller_mcp_handle_request(json!({
         "jsonrpc": "2.0",
