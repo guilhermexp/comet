@@ -10,8 +10,8 @@
 
 **must_haves:** Kimi is a device-local account/usage identity; the native harness registry remains unchanged; wire encodings are pinned.
 
-- [ ] K1 Add the Kimi provider identity with serde and exhaustive-match coverage without registering a runnable Orchestrator harness. files: `crates/proto/src/agent.rs`, `crates/proto/src/entities.rs`. verify: `cargo test -p zeron-proto`.
-- [ ] K2 Extend device-local account snapshots and warnings for a non-switchable managed Kimi account. files: `crates/engine/src/agent_accounts.rs`. verify: `cargo test -p zeron-engine kimi`.
+- [ ] K1 Add the Kimi provider identity with serde and exhaustive-match coverage without registering a runnable Orchestrator harness. files: `crates/proto/src/agent.rs`, `crates/proto/src/entities.rs`, `crates/engine/src/registry.rs`, `crates/ui/src/pickers.rs`, `crates/ui/src/settings/harnesses.rs`. verify: `cargo test -p zeron-proto && cargo test -p zeron-engine registry && cargo test -p zeron-ui harness`.
+- [ ] K2 Extend device-local account snapshots and warnings for a non-switchable managed Kimi account. files: `crates/engine/src/agent_accounts.rs`, `crates/ui/src/settings/accounts.rs`. verify: `cargo test -p zeron-engine kimi && cargo test -p zeron-ui accounts`.
 
 ## 2. Credential lifecycle
 
@@ -30,7 +30,7 @@
 
 **must_haves:** order is Claude, Codex, Kimi; existing quota/pace UI is reused; Kimi brand assets are not duplicated; glossary and DOX agree.
 
-- [ ] Render Kimi after Codex with existing quota/reset/pace behavior and the embedded Kimi brand asset. files: `crates/ui/src/details_sidebar/usage.rs`, `crates/ui/src/details_sidebar/view.rs`, `crates/ui/src/icons.rs`. verify: `cargo test -p zeron-ui usage`.
+- [ ] Render Kimi after Codex with existing quota/reset/pace behavior and the embedded Kimi brand asset. files: `crates/ui/src/details_sidebar/usage.rs`, `crates/ui/src/details_sidebar/view.rs`, `crates/ui/src/icons.rs`, `crates/ui/src/settings/accounts.rs`. verify: `cargo test -p zeron-ui usage`.
 - [ ] Add the CONTEXT pointer and reconcile root/engine/proto/UI DOX plus project context. files: `AGENTS.md`, `crates/engine/AGENTS.md`, `crates/proto/AGENTS.md`, `crates/ui/AGENTS.md`, `openspec/project.md`. verify: `bash /Users/guilhermevarela/.orchestrator/scripts/openspec-doctor.sh /Users/guilhermevarela/Documents/Projetos/SelfHosting/comet --json`.
 
 ## 5. Verification
