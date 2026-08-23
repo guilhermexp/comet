@@ -42,7 +42,7 @@ Test: refresh error table asserting byte-identical persisted credentials and red
 
 ### Requirement: Fetch managed Kimi quota windows
 
-The system SHALL request `GET ${KIMI_CODE_BASE_URL:-https://api.kimi.com/coding/v1}/usages` with bearer authentication and an 8-second timeout, then normalize valid managed quota windows into device-local usage snapshots.
+The system SHALL request the canonical `GET https://api.kimi.com/coding/v1/usages` origin with bearer authentication and an 8-second timeout, SHALL reject cross-origin redirects, and SHALL normalize valid managed quota windows into device-local usage snapshots. Tests MAY inject an isolated loopback transport without using production environment overrides or credentials.
 
 #### Scenario: Weekly and rolling limits are returned
 Test: parser unit test covering string/numeric counters, weekly summary, 5-hour window, and one malformed sibling row.
@@ -61,7 +61,15 @@ Test: fetch error table for 401, 404, timeout, and invalid JSON/payload.
 - **THEN** the engine remains operational
 - **AND** Kimi Usage degrades to a redacted unavailable/no-usage state
 
+#### Scenario: Hostile environment cannot redirect the bearer
+Test: configuration unit test proving production ignores or rejects arbitrary base-URL environment values and cross-origin redirects.
+
+- **WHEN** the process environment or a redirect attempts to change the managed Usage origin
+- **THEN** Comet does not send the Kimi bearer token to the alternate origin
+- **AND** reports a redacted unavailable warning
+
 ### Requirement: Render Kimi in the Usage widget
+
 
 The Usage widget SHALL show providers in the order Claude, Codex, Kimi and SHALL reuse the existing quota, reset, pace, reserve/deficit, and projected-exhaustion presentation for Kimi windows.
 
