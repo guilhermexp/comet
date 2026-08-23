@@ -696,6 +696,34 @@ struct ProjectedRow {
     row: Row,
 }
 
+fn visit_row_ids(row: &Row, visit: &mut impl FnMut(&SharedString)) {
+    visit(&row.id);
+    if let RowKind::TurnSteps { rows, .. } = &row.kind {
+        for child in rows.iter() {
+            visit_row_ids(child, visit);
+        }
+    }
+}
+
+#[cfg(test)]
+fn row_render_ids(row: &Row) -> Vec<SharedString> {
+    let mut ids = Vec::new();
+    visit_row_ids(row, &mut |id| ids.push(id.clone()));
+    ids
+}
+
+fn live_turn_step_ids(rows: &[Row]) -> std::collections::HashSet<SharedString> {
+    rows.iter()
+        .filter(|row| matches!(row.kind, RowKind::TurnSteps { .. }))
+        .map(|row| row.id.clone())
+        .collect()
+}
+
+fn prune_turn_steps_state(state: &mut HashMap<SharedString, bool>, rows: &[Row]) {
+    let live = live_turn_step_ids(rows);
+    state.retain(|id, _| live.contains(id));
+}
+
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
 /// `formatTimestamp` shape (utils.ts: short month, numeric day, hour,
 /// 2-digit minutes, no leading zero on the hour). Pure over an explicit
@@ -3260,6 +3288,7 @@ impl Transcript {
                 .iter()
                 .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
         });
+        prune_turn_steps_state(&mut self.turn_steps_open, &new_rows);
 
         let was_empty = self.rows.is_empty();
         let old_last = self.rows.len().checked_sub(1);
@@ -3275,7 +3304,9 @@ impl Transcript {
                 // changed (the tail), this is O(changed rows) per commit, never
                 // O(reply).
                 for row in &self.rows[old_range.clone()] {
-                    self.render_cache.borrow_mut().invalidate_row(&row.id);
+                    visit_row_ids(row, &mut |id| {
+                        self.render_cache.borrow_mut().invalidate_row(id);
+                    });
                 }
                 if old_range.len() == count {
                     // In-place content change, same row count — notably the
@@ -6653,6 +6684,13 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         Some(MessageStatus::Aborted) => 3,
     });
     acc.push(pending as u8);
+    match entry.duration_ms {
+        Some(duration_ms) => {
+            acc.push(1);
+            acc.extend_from_slice(&duration_ms.to_le_bytes());
+        }
+        None => acc.push(0),
+    }
     for part in &entry.parts {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
@@ -7355,6 +7393,187 @@ mod tests {
         toggle_turn_steps_state(&mut outer, rows[0].id.clone());
         assert_eq!(nested_folds[&child_id].open, Some(true));
         assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+    }
+
+    #[test]
+    fn turn_steps_invalidation_visits_composite_before_changed_child() {
+        let entry = assistant(
+            "assistant",
+            MessageStatus::Complete,
+            vec![
+                text_part("text", "Inspecting."),
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Done."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let ids = row_render_ids(&rows[0]);
+        assert_eq!(
+            ids,
+            vec![
+                SharedString::from("assistant#steps"),
+                SharedString::from("assistant#text.0"),
+                SharedString::from("assistant#g0"),
+            ]
+        );
+
+        let mut replacement = rows[0].clone();
+        let RowKind::TurnSteps { rows: children, .. } = &mut replacement.kind else {
+            unreachable!();
+        };
+        Arc::make_mut(children)[0].version ^= 1;
+        replacement.version ^= 1;
+        assert_eq!(replacement.id, rows[0].id);
+        assert_ne!(replacement.version, rows[0].version);
+        assert!(row_render_ids(&rows[0]).contains(&SharedString::from("assistant#text.0")));
+    }
+
+    #[test]
+    fn turn_steps_transition_keeps_id_while_prefix_and_duration_change() {
+        let first = assistant(
+            "assistant-transition",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Working."),
+            ],
+        );
+        let grown = assistant(
+            "assistant-transition",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                tool_part("check", "cargo check"),
+                text_part("answer", "Working."),
+            ],
+        );
+        let first_rows = rows_for_entry(&first, false, &mut parse);
+        let grown_rows = rows_for_entry(&grown, false, &mut parse);
+        assert_eq!(first_rows[0].id, grown_rows[0].id);
+        assert_ne!(first_rows[0].version, grown_rows[0].version);
+
+        let mut settled = grown.clone();
+        settled.status = Some(MessageStatus::Complete);
+        let settled_rows = rows_for_entry(&settled, false, &mut parse);
+        assert_eq!(settled_rows[0].id, grown_rows[0].id);
+        assert!(matches!(grown_rows[1].kind, RowKind::LiveMarkdown { .. }));
+        assert!(matches!(settled_rows[1].kind, RowKind::Markdown { .. }));
+
+        let mut timed = settled.clone();
+        timed.duration_ms = Some(12_500);
+        let timed_rows = rows_for_entry(&timed, false, &mut parse);
+        assert_eq!(timed_rows[0].id, settled_rows[0].id);
+        assert_ne!(timed_rows[0].version, settled_rows[0].version);
+        assert_ne!(
+            entry_fingerprint(&timed, false),
+            entry_fingerprint(&settled, false)
+        );
+    }
+
+    #[test]
+    fn turn_steps_transition_settles_folded_markdown_and_owns_no_timestamp() {
+        let entry = assistant(
+            "assistant-veil",
+            MessageStatus::Streaming,
+            vec![
+                text_part("narration", "Inspecting."),
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Working."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("expected streaming disclosure");
+        };
+        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
+        assert!(children.iter().all(|child| child.timestamp.is_none()));
+        assert!(rows[0].timestamp.is_none());
+        assert!(rows[1].timestamp.is_none());
+    }
+
+    #[test]
+    fn turn_steps_state_prunes_removed_rows_and_keeps_consecutive_turns_independent() {
+        let first = assistant(
+            "assistant-a",
+            MessageStatus::Complete,
+            vec![tool_part("read", "ls"), text_part("answer", "A")],
+        );
+        let second = assistant(
+            "assistant-b",
+            MessageStatus::Complete,
+            vec![tool_part("read", "pwd"), text_part("answer", "B")],
+        );
+        let mut rows = rows_for_entry(&first, false, &mut parse);
+        rows.extend(rows_for_entry(&second, false, &mut parse));
+        let ids = live_turn_step_ids(&rows);
+        assert!(ids.contains("assistant-a#steps"));
+        assert!(ids.contains("assistant-b#steps"));
+
+        let mut state = HashMap::from([
+            (SharedString::from("assistant-a#steps"), true),
+            (SharedString::from("assistant-b#steps"), false),
+            (SharedString::from("stale#steps"), true),
+        ]);
+        prune_turn_steps_state(&mut state, &rows);
+        assert_eq!(state.len(), 2);
+        assert!(!state.contains_key("stale#steps"));
+
+        rows.retain(|row| row.entry_id.as_ref() == "assistant-b");
+        prune_turn_steps_state(&mut state, &rows);
+        assert_eq!(state.len(), 1);
+        assert!(state.contains_key("assistant-b#steps"));
+    }
+
+    #[test]
+    fn turn_steps_updates_do_not_rebuild_unrelated_rows_or_legacy_messages() {
+        let user = SessionMessageEntry {
+            id: "user".into(),
+            role: MessageRole::User,
+            parts: vec![text_part("prompt", "Hi")],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        };
+        let first = assistant(
+            "assistant-diff",
+            MessageStatus::Streaming,
+            vec![tool_part("read", "ls"), text_part("answer", "Working")],
+        );
+        let grown = assistant(
+            "assistant-diff",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "ls"),
+                tool_part("check", "pwd"),
+                text_part("answer", "Working"),
+            ],
+        );
+        let mut old = rows_for_entry(&user, false, &mut parse);
+        old.extend(rows_for_entry(&first, false, &mut parse));
+        let mut new = rows_for_entry(&user, false, &mut parse);
+        new.extend(rows_for_entry(&grown, false, &mut parse));
+        assert_eq!(diff_rows(&old, &new), Some((1..2, 1)));
+
+        let legacy = assistant(
+            "assistant-legacy",
+            MessageStatus::Complete,
+            vec![text_part("narration", "Inspecting"), tool_part("run", "ls")],
+        );
+        let legacy_rows = rows_for_entry(&legacy, false, &mut parse);
+        assert_eq!(
+            legacy_rows
+                .iter()
+                .map(|row| row.id.as_ref())
+                .collect::<Vec<_>>(),
+            ["assistant-legacy#narration.0", "assistant-legacy#g0"]
+        );
+        assert!(
+            legacy_rows
+                .iter()
+                .all(|row| !matches!(row.kind, RowKind::TurnSteps { .. }))
+        );
     }
 
     #[test]
