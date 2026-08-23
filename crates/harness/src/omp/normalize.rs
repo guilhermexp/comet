@@ -244,7 +244,7 @@ impl OmpNormalizer {
             }
             if description.is_some() {
                 events.push(subagent_workflow_update(
-                    id,
+                    &compound,
                     WorkflowTaskStatus::Running,
                     description,
                     None,
@@ -290,7 +290,7 @@ impl OmpNormalizer {
             let mut events = Vec::with_capacity(3);
             if context.description.is_some() {
                 events.push(subagent_workflow_update(
-                    id,
+                    &compound,
                     workflow_status,
                     context.description,
                     None,
@@ -396,13 +396,10 @@ impl OmpNormalizer {
         // A progress frame can be the subagent's first sight: open its chip
         // here too, or a fast run that settles before any lifecycle frame
         // would leave the parent transcript chipless.
+        let compound = compound_parent_id(&parent_tool_use_id, id);
         let mut events = Vec::with_capacity(2);
         if previous.is_none() {
-            events.push(spawn_chip(
-                &compound_parent_id(&parent_tool_use_id, id),
-                &agent,
-                Some(&description),
-            ));
+            events.push(spawn_chip(&compound, &agent, Some(&description)));
         }
         let usage = WorkflowUsage {
             total_tokens: progress.get("tokens").and_then(Value::as_u64),
@@ -424,7 +421,7 @@ impl OmpNormalizer {
             prompt_preview: Some(description.clone()),
         };
         events.push(subagent_workflow_update(
-            id,
+            &compound,
             status,
             Some(description),
             usage,
@@ -819,7 +816,7 @@ mod tests {
         assert!(started.iter().any(|event| matches!(
             event,
             AgentEvent::WorkflowTask { task }
-                if task.task_id == "sub-1"
+                if task.task_id == "call_task|fc_parent--sub-1"
                     && task.status == WorkflowTaskStatus::Running
                     && task.task_type.as_deref() == Some("subagent")
                     && task.subagent_type.as_deref() == Some("scout")
@@ -851,7 +848,7 @@ mod tests {
         assert!(matches!(
             &progress[..],
             [AgentEvent::WorkflowTask { task }]
-                if task.task_id == "sub-1"
+                if task.task_id == "call_task|fc_parent--sub-1"
                     && task.status == WorkflowTaskStatus::Running
                     && task.description.as_deref() == Some("Inspect authentication paths.")
                     && task.usage == Some(WorkflowUsage {
@@ -890,7 +887,8 @@ mod tests {
         assert!(completed.iter().any(|event| matches!(
             event,
             AgentEvent::WorkflowTask { task }
-                if task.task_id == "sub-1" && task.status == WorkflowTaskStatus::Completed
+                if task.task_id == "call_task|fc_parent--sub-1"
+                    && task.status == WorkflowTaskStatus::Completed
         )));
         assert!(completed.iter().any(|event| matches!(
             event,

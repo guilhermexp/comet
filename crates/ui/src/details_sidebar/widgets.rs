@@ -31,7 +31,7 @@ pub fn workers_tab_presence(worker_count: usize, bindings_unavailable: bool) -> 
 pub struct ChatWorkersWidgetState {
     context_key: Option<String>,
     selected_tab: Option<ChatWorkersTab>,
-    workflow_expansion: HashMap<String, bool>,
+    activity_expansion: HashMap<String, bool>,
 }
 
 impl ChatWorkersWidgetState {
@@ -41,7 +41,7 @@ impl ChatWorkersWidgetState {
         }
         self.context_key = context_key.map(str::to_owned);
         self.selected_tab = None;
-        self.workflow_expansion.clear();
+        self.activity_expansion.clear();
         true
     }
 
@@ -54,32 +54,32 @@ impl ChatWorkersWidgetState {
         self.selected_tab = Some(tab);
     }
 
-    pub fn sync_workflows<'a>(&mut self, workflow_ids: impl IntoIterator<Item = &'a str>) {
-        let workflow_ids = workflow_ids.into_iter().collect::<Vec<_>>();
-        let present = workflow_ids.iter().copied().collect::<HashSet<_>>();
-        self.workflow_expansion
-            .retain(|workflow_id, _| present.contains(workflow_id.as_str()));
-        let expand_first = self.workflow_expansion.is_empty();
-        for (index, workflow_id) in workflow_ids.into_iter().enumerate() {
-            self.workflow_expansion
-                .entry(workflow_id.to_owned())
+    pub fn sync_activities<'a>(&mut self, activity_ids: impl IntoIterator<Item = &'a str>) {
+        let activity_ids = activity_ids.into_iter().collect::<Vec<_>>();
+        let present = activity_ids.iter().copied().collect::<HashSet<_>>();
+        self.activity_expansion
+            .retain(|activity_id, _| present.contains(activity_id.as_str()));
+        let expand_first = self.activity_expansion.is_empty();
+        for (index, activity_id) in activity_ids.into_iter().enumerate() {
+            self.activity_expansion
+                .entry(activity_id.to_owned())
                 .or_insert(expand_first && index == 0);
         }
     }
 
-    pub fn toggle_workflow_with_default(&mut self, workflow_id: &str, default: bool) {
+    pub fn toggle_activity_with_default(&mut self, activity_id: &str, default: bool) {
         let expanded = self
-            .workflow_expansion
-            .get(workflow_id)
+            .activity_expansion
+            .get(activity_id)
             .copied()
             .unwrap_or(default);
-        self.workflow_expansion
-            .insert(workflow_id.to_owned(), !expanded);
+        self.activity_expansion
+            .insert(activity_id.to_owned(), !expanded);
     }
 
-    pub fn workflow_expanded_with_default(&self, workflow_id: &str, default: bool) -> bool {
-        self.workflow_expansion
-            .get(workflow_id)
+    pub fn activity_expanded_with_default(&self, activity_id: &str, default: bool) -> bool {
+        self.activity_expansion
+            .get(activity_id)
             .copied()
             .unwrap_or(default)
     }
@@ -187,39 +187,51 @@ mod tests {
     #[test]
     fn workers_widget_expands_workflows_independently() {
         let mut state = ChatWorkersWidgetState::default();
-        state.toggle_workflow_with_default("workflow-a", false);
-        state.toggle_workflow_with_default("workflow-b", false);
-        state.toggle_workflow_with_default("workflow-a", false);
+        state.toggle_activity_with_default("workflow-a", false);
+        state.toggle_activity_with_default("workflow-b", false);
+        state.toggle_activity_with_default("workflow-a", false);
 
-        assert!(!state.workflow_expanded_with_default("workflow-a", false));
-        assert!(state.workflow_expanded_with_default("workflow-b", false));
+        assert!(!state.activity_expanded_with_default("workflow-a", false));
+        assert!(state.activity_expanded_with_default("workflow-b", false));
     }
 
     #[test]
     fn workers_widget_keeps_expansion_bound_to_identity_after_reordering() {
         let mut state = ChatWorkersWidgetState::default();
-        state.sync_workflows(["workflow-a", "workflow-b"]);
+        state.sync_activities(["workflow-a", "workflow-b"]);
 
-        assert!(state.workflow_expanded_with_default("workflow-a", false));
-        assert!(!state.workflow_expanded_with_default("workflow-b", false));
+        assert!(state.activity_expanded_with_default("workflow-a", false));
+        assert!(!state.activity_expanded_with_default("workflow-b", false));
 
-        state.sync_workflows(["workflow-b", "workflow-a", "workflow-c"]);
+        state.sync_activities(["workflow-b", "workflow-a", "workflow-c"]);
 
-        assert!(state.workflow_expanded_with_default("workflow-a", false));
-        assert!(!state.workflow_expanded_with_default("workflow-b", false));
-        assert!(!state.workflow_expanded_with_default("workflow-c", false));
+        assert!(state.activity_expanded_with_default("workflow-a", false));
+        assert!(!state.activity_expanded_with_default("workflow-b", false));
+        assert!(!state.activity_expanded_with_default("workflow-c", false));
+    }
+
+    #[test]
+    fn workers_widget_keeps_subagent_expansion_bound_to_identity() {
+        let mut state = ChatWorkersWidgetState::default();
+        state.sync_activities(["workflow-a", "subagent-a", "subagent-b"]);
+        state.toggle_activity_with_default("subagent-b", false);
+
+        state.sync_activities(["subagent-b", "workflow-a", "subagent-a"]);
+
+        assert!(state.activity_expanded_with_default("subagent-b", false));
+        assert!(!state.activity_expanded_with_default("subagent-a", false));
     }
 
     #[test]
     fn workers_widget_prunes_expansion_state_for_absent_workflows() {
         let mut state = ChatWorkersWidgetState::default();
-        state.sync_workflows(["workflow-a", "workflow-b"]);
-        assert!(state.workflow_expanded_with_default("workflow-a", false));
+        state.sync_activities(["workflow-a", "workflow-b"]);
+        assert!(state.activity_expanded_with_default("workflow-a", false));
 
-        state.sync_workflows(["workflow-b"]);
-        state.sync_workflows(["workflow-b", "workflow-a"]);
+        state.sync_activities(["workflow-b"]);
+        state.sync_activities(["workflow-b", "workflow-a"]);
 
-        assert!(!state.workflow_expanded_with_default("workflow-a", false));
+        assert!(!state.activity_expanded_with_default("workflow-a", false));
     }
 
     #[test]
@@ -238,14 +250,14 @@ mod tests {
         let mut state = ChatWorkersWidgetState::default();
         assert!(state.sync_context(Some("chat-a")));
         state.select(ChatWorkersTab::Subagents);
-        state.toggle_workflow_with_default("workflow-a", false);
+        state.toggle_activity_with_default("workflow-a", false);
 
         assert!(!state.sync_context(Some("chat-a")));
         assert_eq!(state.active_tab(1, 1, 1), ChatWorkersTab::Subagents);
-        assert!(state.workflow_expanded_with_default("workflow-a", false));
+        assert!(state.activity_expanded_with_default("workflow-a", false));
 
         assert!(state.sync_context(Some("chat-b")));
         assert_eq!(state.active_tab(1, 1, 1), ChatWorkersTab::Workflows);
-        assert!(!state.workflow_expanded_with_default("workflow-a", false));
+        assert!(!state.activity_expanded_with_default("workflow-a", false));
     }
 }

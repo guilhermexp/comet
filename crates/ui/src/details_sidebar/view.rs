@@ -830,12 +830,29 @@ impl DetailsSidebar {
                 WorkflowProgressNode::Agent {
                     label,
                     phase_index,
+                    phase_title,
                     model,
                     state,
                     ..
                 } => {
+                    if current_phase != Some(*phase_index)
+                        && let Some(title) = phase_title
+                    {
+                        current_phase = Some(*phase_index);
+                        body = body.child(
+                            div()
+                                .ml(px(12.0))
+                                .pl(px(9.0))
+                                .py(px(3.0))
+                                .border_l_1()
+                                .border_color(theme.border.opacity(0.55))
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child(title.clone()),
+                        );
+                    }
                     let state_color = match state.as_deref() {
-                        Some("done") => theme.success,
+                        Some("done" | "completed") => theme.success,
                         Some("error" | "failed") => theme.danger,
                         Some("start" | "running") => theme.accent,
                         _ => theme.text_muted,
@@ -889,7 +906,7 @@ impl DetailsSidebar {
         let collapsible = row.usage.is_some() || !row.progress.is_empty();
         let expanded = self
             .chat_workers
-            .workflow_expanded_with_default(&row.id, false);
+            .activity_expanded_with_default(&row.id, false);
         let row_id = row.id.clone();
         let status = self.render_activity_status(
             row.status,
@@ -916,7 +933,7 @@ impl DetailsSidebar {
                         .hover(|style| style.bg(crate::theme::ink(0.05)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.chat_workers
-                                .toggle_workflow_with_default(&row_id, false);
+                                .toggle_activity_with_default(&row_id, false);
                             cx.notify();
                         }))
                         .child(
@@ -953,12 +970,17 @@ impl DetailsSidebar {
     }
 
     fn render_subagent_row(
-        &self,
+        &mut self,
         row: ChatActivityRow,
         chat_id: String,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let collapsible = row.usage.is_some() || !row.progress.is_empty();
+        let expanded = self
+            .chat_workers
+            .activity_expanded_with_default(&row.id, false);
+        let row_id = row.id.clone();
         let event = open_subagent_event(&chat_id, &row);
         let doc_id = row.id.clone();
         let status = self.render_activity_status(
@@ -967,13 +989,11 @@ impl DetailsSidebar {
             theme,
             cx,
         );
-        div()
-            .id(SharedString::from(format!("chat-subagent-{}", row.id)))
-            .min_h(px(32.0))
-            .px(px(8.0))
-            .py(px(5.0))
-            .border_t_1()
-            .border_color(theme.border.opacity(0.45))
+        let transcript = div()
+            .id(SharedString::from(format!("subagent-open-{}", row.id)))
+            .min_w_0()
+            .flex_1()
+            .h_full()
             .flex()
             .items_center()
             .gap(px(7.0))
@@ -996,6 +1016,7 @@ impl DetailsSidebar {
                     .size(px(14.0))
                     .text_color(theme.text_muted),
             )
+            .child(status)
             .child(
                 div()
                     .min_w_0()
@@ -1004,9 +1025,52 @@ impl DetailsSidebar {
                     .text_size(px(12.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text)
-                    .child(row.title),
+                    .child(row.title.clone()),
+            );
+        div()
+            .id(SharedString::from(format!("chat-subagent-{}", row.id)))
+            .border_t_1()
+            .border_color(theme.border.opacity(0.45))
+            .child(
+                div()
+                    .h(px(32.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .when(collapsible, |header| {
+                        header.child(
+                            div()
+                                .id(SharedString::from(format!("subagent-expand-{}", row.id)))
+                                .size(px(18.0))
+                                .rounded(px(4.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.chat_workers
+                                        .toggle_activity_with_default(&row_id, false);
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icons::icon(if expanded {
+                                        icons::ALT_ARROW_DOWN
+                                    } else {
+                                        icons::ALT_ARROW_RIGHT
+                                    })
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
+                    .when(!collapsible, |header| header.child(div().w(px(18.0))))
+                    .child(transcript),
             )
-            .child(status)
+            .when(expanded, |item| {
+                item.child(self.render_workflow_progress(&row, theme))
+            })
             .into_any_element()
     }
 
@@ -1084,8 +1148,13 @@ impl DetailsSidebar {
         let workflows = snapshot.workflows.len();
         let subagents = snapshot.subagents.len();
         let workers = snapshot.workers.len();
-        self.chat_workers
-            .sync_workflows(snapshot.workflows.iter().map(|row| row.id.as_str()));
+        self.chat_workers.sync_activities(
+            snapshot
+                .workflows
+                .iter()
+                .chain(snapshot.subagents.iter())
+                .map(|row| row.id.as_str()),
+        );
         let active = self.chat_workers.active_tab(
             workflows,
             subagents,

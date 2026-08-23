@@ -73,27 +73,32 @@ pub fn worker_semantic(state: &str, activity: &str) -> WorkerSemantic {
     }
 }
 
-pub fn format_usage(usage: Option<WorkflowUsage>) -> Option<String> {
-    let usage = usage?;
+pub fn format_usage(usage: Option<WorkflowUsage>, agent_count: Option<u32>) -> Option<String> {
     let mut metrics = Vec::new();
-    if let Some(tokens) = usage.total_tokens {
-        metrics.push(if tokens < 1_000 {
-            format!("{tokens} tokens")
-        } else {
-            format!("{:.1}k tokens", tokens as f64 / 1_000.0)
-        });
+    if let Some(agents) = agent_count.filter(|count| *count > 0) {
+        let noun = if agents == 1 { "agent" } else { "agents" };
+        metrics.push(format!("{agents} {noun}"));
     }
-    if let Some(tools) = usage.tool_uses {
-        let noun = if tools == 1 { "tool" } else { "tools" };
-        metrics.push(format!("{tools} {noun}"));
-    }
-    if let Some(duration_ms) = usage.duration_ms {
-        metrics.push(if duration_ms < 60_000 {
-            format!("{:.1}s", duration_ms as f64 / 1_000.0)
-        } else {
-            let seconds = duration_ms / 1_000;
-            format!("{}m {:02}s", seconds / 60, seconds % 60)
-        });
+    if let Some(usage) = usage {
+        if let Some(tokens) = usage.total_tokens {
+            metrics.push(if tokens < 1_000 {
+                format!("{tokens} tokens")
+            } else {
+                format!("{:.1}k tokens", tokens as f64 / 1_000.0)
+            });
+        }
+        if let Some(tools) = usage.tool_uses {
+            let noun = if tools == 1 { "tool" } else { "tools" };
+            metrics.push(format!("{tools} {noun}"));
+        }
+        if let Some(duration_ms) = usage.duration_ms {
+            metrics.push(if duration_ms < 60_000 {
+                format!("{:.1}s", duration_ms as f64 / 1_000.0)
+            } else {
+                let seconds = duration_ms / 1_000;
+                format!("{}m {:02}s", seconds / 60, seconds % 60)
+            });
+        }
     }
     (!metrics.is_empty()).then(|| metrics.join(" · "))
 }
@@ -117,9 +122,9 @@ fn subagent_task(task: &WorkflowTaskUpdate) -> bool {
 fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
     let is_subagent = task.task_type.as_deref() == Some("subagent");
     let title = if is_subagent {
-        task.subagent_type
+        task.description
             .clone()
-            .or_else(|| task.description.clone())
+            .or_else(|| task.subagent_type.clone())
     } else {
         task.workflow_name
             .clone()
@@ -137,7 +142,7 @@ fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
         title,
         description: task.description,
         status: task.status,
-        usage: format_usage(task.usage),
+        usage: format_usage(task.usage, task.agent_count),
         progress: task.progress,
         subagent_type: task.subagent_type,
     }
@@ -219,13 +224,14 @@ pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<Workf
     {
         match part {
             MessagePart::WorkflowTask { task, .. } => {
-                if let Some(latest) = latest_workflows.remove(&task.task_id)
-                    && workflow_task(&latest)
+                if workflow_task(task)
+                    && let Some(latest) = latest_workflows.remove(&task.task_id)
                 {
                     tasks.push(latest);
                 }
             }
             MessagePart::Tool {
+                id,
                 call,
                 subagent_ref: Some(subagent_ref),
                 subagent_status,
@@ -238,17 +244,32 @@ pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<Workf
                     Some(SubagentStatus::Failed) => WorkflowTaskStatus::Failed,
                     Some(SubagentStatus::Running) | None => WorkflowTaskStatus::Running,
                 };
-                tasks.push(WorkflowTaskUpdate {
-                    task_id: subagent_ref.clone(),
-                    status,
-                    workflow_name: None,
-                    description: subagent_tail.clone(),
-                    usage: None,
-                    progress: Vec::new(),
-                    agent_count: Some(1),
-                    task_type: Some("subagent".into()),
-                    subagent_type: Some(label),
-                });
+                let mut task = latest_workflows
+                    .remove(id)
+                    .filter(subagent_task)
+                    .unwrap_or_else(|| WorkflowTaskUpdate {
+                        task_id: id.clone(),
+                        status,
+                        workflow_name: None,
+                        description: None,
+                        usage: None,
+                        progress: Vec::new(),
+                        agent_count: None,
+                        task_type: Some("subagent".into()),
+                        subagent_type: None,
+                    });
+                task.task_id = subagent_ref.clone();
+                task.status = status;
+                if task.description.is_none() {
+                    task.description = subagent_tail.clone();
+                }
+                if task.agent_count.is_none() {
+                    task.agent_count = Some(1);
+                }
+                if task.subagent_type.is_none() {
+                    task.subagent_type = Some(label);
+                }
+                tasks.push(task);
             }
             _ => {}
         }
@@ -360,6 +381,37 @@ mod tests {
     }
 
     #[test]
+    fn omp_subagent_row_uses_description_and_native_stats() {
+        let mut task = subagent_task("omp-sub-1");
+        task.description = Some("Inspect target repository".into());
+        task.subagent_type = Some("task".into());
+        task.agent_count = Some(1);
+        task.usage = Some(WorkflowUsage {
+            total_tokens: None,
+            tool_uses: None,
+            duration_ms: Some(1_000),
+        });
+        task.progress = vec![WorkflowProgressNode::Agent {
+            index: 0,
+            label: "Inspect target repository".into(),
+            phase_index: 0,
+            phase_title: Some("OMP subagents".into()),
+            agent_id: Some("omp-sub-1".into()),
+            model: Some("anthropic/claude-fable-5:medium".into()),
+            state: Some("completed".into()),
+            prompt_preview: Some("Inspect target repository".into()),
+        }];
+
+        let snapshot = project_chat_workers(vec![task.clone()], Vec::new());
+        let row = &snapshot.subagents[0];
+
+        assert_eq!(row.title, "Inspect target repository");
+        assert_eq!(row.usage.as_deref(), Some("1 agent · 1.0s"));
+        assert_eq!(row.progress, task.progress);
+        assert_eq!(row.subagent_type.as_deref(), Some("task"));
+    }
+
+    #[test]
     fn generic_background_tasks_do_not_become_subagents() {
         let mut bash = subagent_task("bash-1");
         bash.task_type = Some("local_bash".into());
@@ -418,7 +470,7 @@ mod tests {
 
         assert_eq!(snapshot.subagents.len(), 1);
         assert_eq!(snapshot.subagents[0].id, "chat--sub--spawn-1");
-        assert_eq!(snapshot.subagents[0].title, "reviewer");
+        assert_eq!(snapshot.subagents[0].title, "Reviewed parser");
         assert_eq!(
             snapshot.subagents[0].description.as_deref(),
             Some("Reviewed parser")
@@ -495,13 +547,30 @@ mod tests {
 
     #[test]
     fn durable_spawn_identity_replaces_unjoinable_subagent_lifecycle_rows() {
+        let mut rich_subagent = subagent_task("call-parent-1");
+        rich_subagent.description = Some("Reviewed parser".into());
+        rich_subagent.usage = Some(WorkflowUsage {
+            total_tokens: Some(420),
+            tool_uses: Some(2),
+            duration_ms: Some(1_000),
+        });
+        rich_subagent.progress = vec![WorkflowProgressNode::Agent {
+            index: 0,
+            label: "Reviewed parser".into(),
+            phase_index: 0,
+            phase_title: Some("OMP subagents".into()),
+            agent_id: Some("provider-sub-1".into()),
+            model: Some("anthropic/claude-fable-5:medium".into()),
+            state: Some("completed".into()),
+            prompt_preview: Some("Reviewed parser".into()),
+        }];
         let entry = SessionMessageEntry {
             id: "entry-1".into(),
             role: MessageRole::Assistant,
             parts: vec![
                 MessagePart::WorkflowTask {
                     id: "workflow-sub-1".into(),
-                    task: subagent_task("provider-sub-1"),
+                    task: rich_subagent,
                 },
                 spawn_part("call-parent-1", SubagentStatus::Done, "Reviewed parser"),
             ],
@@ -515,6 +584,17 @@ mod tests {
 
         assert_eq!(snapshot.subagents.len(), 1);
         assert_eq!(snapshot.subagents[0].id, "chat--sub--call-parent-1");
+        assert_eq!(
+            snapshot.subagents[0].usage.as_deref(),
+            Some("1 agent · 420 tokens · 2 tools · 1.0s")
+        );
+        assert_eq!(snapshot.subagents[0].progress.len(), 1);
+        assert!(matches!(
+            &snapshot.subagents[0].progress[0],
+            WorkflowProgressNode::Agent { model, phase_title, .. }
+                if model.as_deref() == Some("anthropic/claude-fable-5:medium")
+                    && phase_title.as_deref() == Some("OMP subagents")
+        ));
     }
 
     #[test]
@@ -649,14 +729,17 @@ mod tests {
     #[test]
     fn usage_is_compact_and_omits_missing_metrics() {
         assert_eq!(
-            format_usage(Some(WorkflowUsage {
-                total_tokens: Some(1_200),
-                tool_uses: Some(4),
-                duration_ms: Some(2_500),
-            }))
+            format_usage(
+                Some(WorkflowUsage {
+                    total_tokens: Some(1_200),
+                    tool_uses: Some(4),
+                    duration_ms: Some(2_500),
+                }),
+                None,
+            )
             .as_deref(),
             Some("1.2k tokens · 4 tools · 2.5s")
         );
-        assert_eq!(format_usage(None), None);
+        assert_eq!(format_usage(None, None), None);
     }
 }
