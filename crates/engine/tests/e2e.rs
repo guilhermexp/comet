@@ -452,6 +452,57 @@ async fn interrupt_stamps_streaming_entry_aborted() {
 }
 
 #[tokio::test]
+async fn errored_done_persists_assistant_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::TextDelta {
+                    text: "partial before error".into(),
+                },
+                done(DoneStatus::Errored),
+            ],
+            step_delay: Duration::from_millis(10),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-error-duration",
+        SessionCommandPayload::Run {
+            request: run_request("fail after output"),
+            message_id: "m-error-duration".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            })
+        },
+        "errored assistant entry",
+    )
+    .await;
+
+    let assistant = entries(&core)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("assistant entry");
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    assert!(assistant.duration_ms.is_some_and(|duration| duration > 0));
+    assert_eq!(
+        core.sessions
+            .session_status(CHAT)
+            .map(|session| session.status),
+        Some(SessionStatus::Errored)
+    );
+}
+
+#[tokio::test]
 async fn steer_with_no_live_run_falls_back_to_new_turn() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
@@ -2252,6 +2303,10 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
         .filter(|entry| entry.role == MessageRole::Assistant)
         .collect::<Vec<_>>();
     assert_eq!(assistant_entries.len(), 2);
+    assert!(
+        assistant_entries[0].duration_ms.is_some(),
+        "the first completed segment must persist duration before the parked steer"
+    );
     assert!(
         assistant_entries[1]
             .duration_ms
