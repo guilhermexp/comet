@@ -39,7 +39,8 @@ replace or restyle it.
 ## Non-goals
 
 - Replacing or visually redesigning the composer.
-- Changing runtime protocols or harness adapters.
+- Changing external runtime protocols or inventing file contents a runtime did
+  not expose. Harness normalizers may preserve deltas already present upstream.
 - Collapsing the user's message bubble with the assistant work.
 - Introducing a second final-answer field into persisted messages.
 - Hiding active subagents or unresolved input requests.
@@ -112,6 +113,128 @@ entry terminal and cannot reconstruct its real start/end leave it `None` rather
 than inventing a duration.
 
 ## Architecture
+
+### Incremental file-change cards
+
+`WriteFile` and `EditFile` gain a specialized transcript presentation. They do
+not remain generic invocation code blocks when a file preview is available.
+The card lifecycle matches Orchestrator:
+
+- input starting without a path -> minimal `Creating`/`Editing` shimmer;
+- path/content arriving -> full card, filename shimmer, spinner, green/red
+  bounded preview;
+- resolved -> `+N/-N`, expand/collapse control, syntax highlighting;
+- collapsed -> fixed 72px preview;
+- expanded -> at most 200px with an independent vertical scrollbar and the
+  complete historical tool input when available.
+
+The filename remains a separate open-file action. Header/body/chevron toggle
+the inline preview only after resolution; active writes cannot be manually
+expanded while their input is still changing.
+
+#### Considered file-content approaches
+
+1. **Bounded durable preview plus journal-backed full expansion
+   (recommended).** Repeated ToolCall refreshes update a bounded 15-line
+   semantic preview in the doc. Expanding a completed card fetches the original
+   unsanitized Write/Edit input from the host run journal by chat/tool id. This
+   preserves historical correctness without replicating whole files.
+2. **Reuse generic `ToolDetail::Output`.** Rejected because it has neutral
+   output semantics, a 24-line truncation, no file lifecycle, and no independent
+   inner scroll surface.
+3. **Persist complete Write/Edit input in `SessionMessageEntry`.** Rejected
+   because the existing privacy policy deliberately strips file bodies from
+   synchronized docs; large generated files would restore the doc-size failure
+   that the policy prevents.
+
+#### Progressive normalization
+
+No new `AgentEvent` variant is required. `fold_event_into_parts` already
+refreshes an existing tool when another `AgentEvent::ToolCall` arrives with the
+same id. Normalizers use that contract:
+
+- Claude extends its stream-event wire shape with content-block index,
+  tool-use start metadata, and `partial_json`; it accumulates only the active
+  tool input and emits refreshed typed Write/Edit calls as path/content fields
+  become decodable;
+- OMP tracks `toolcall_start|delta|end` by content index and performs the same
+  refresh before the existing authoritative `tool_execution_start` call;
+- ACP already emits shape-bearing `tool_call_update` refreshes and needs
+  regression coverage, not a second path;
+- Codex remains path-only when its `fileChange` item exposes no content. It gets
+  the same card header/lifecycle but no fabricated body.
+
+A shared harness helper performs focused partial extraction for JSON string
+fields (`path|file_path`, `content`, `old_string|oldText`,
+`new_string|newText`). It decodes complete JSON escape sequences and returns
+the safely decoded prefix of an unterminated string. It is not a general JSON
+repair parser and never evaluates arbitrary JSON.
+
+Engine doc commits already coalesce at `STREAM_COMMIT_MS == 120`, so the native
+preview updates at approximately the reference's 100ms cadence without a
+second renderer timer.
+
+#### Bounded durable preview
+
+`MessagePart::Tool` gains:
+
+```rust
+pub enum FileChangeKind { Write, Edit }
+pub enum FileChangeLineKind { Added, Removed, Context }
+
+pub struct FileChangeLine {
+    pub kind: FileChangeLineKind,
+    pub text: String,
+}
+
+pub struct FileChangePreview {
+    pub kind: FileChangeKind,
+    pub lines: Vec<FileChangeLine>,
+    pub total_lines: u32,
+    pub additions: u32,
+    pub deletions: u32,
+    pub truncated_before: u32,
+}
+```
+
+The fold derives this preview before `sanitize_tool_call` removes full content.
+Write treats every line as added. Edit uses `similar::TextDiff` when both sides
+exist and an authoritative `ToolDiff` when the result supplies one. The doc
+retains at most the last 15 display lines, each capped at 512 Unicode scalar
+values. Counts cover the complete available input, not only retained lines.
+The preview is additive/backward-compatible and participates in part byte
+length, schema, fingerprints, transcript deltas, and row versions.
+
+Green means `Added`, not execution success. Tool lifecycle continues to own
+spinner/success/failure independently from diff colors.
+
+#### Historical full-input fetch
+
+Add relay-forwardable `FetchToolInput { chatId, toolCallId }`. The target
+engine scans that chat's append-only run journal newest-first for the matching
+`AgentEvent::ToolResult.diff` or `AgentEvent::ToolCall` and returns only a
+sanitized file-input snapshot:
+
+```rust
+pub struct FileToolInputSnapshot {
+    pub path: String,
+    pub content: Option<String>,
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    pub truncated: bool,
+}
+```
+
+The response is capped at 1 MiB and never returns arbitrary MCP/unknown inputs.
+The UI includes the chat's `targetDeviceId`, so a synced client asks the device
+that owns the journal. Missing/compacted journals leave the bounded preview in
+place and show a retryable `Full content unavailable` row; the UI does not read
+the current workspace file as a historical substitute.
+
+`Transcript` caches Loading/Ready/Failed fetch state and one `ScrollHandle` per
+expanded file row. Closed cards do not fetch. Reopening a Ready card performs
+no RPC and preserves its internal scroll position until the row/chat is
+removed.
 
 ### Pure turn policy
 
@@ -288,6 +411,11 @@ right-aligned immediately before the disclosure chevron.
 - Empty/whitespace text and `WorkflowTask` parts do not create boundaries.
 - A split with no visible prefix produces no disclosure.
 - Expanding an old disclosure cannot restart a live Markdown veil.
+- A live Write/Edit row remains outside `TurnSteps` as an unsettled tool. After
+  resolution it may enter the turn prefix; expanding the outer steps disclosure
+  restores the specialized file card and its independent inner fold state.
+- A runtime that reports only a path renders an honest path-only file card; it
+  never receives invented green lines or counts.
 - Old entries and recovery-finalized entries without a trustworthy elapsed time
   omit the duration label.
 
@@ -301,3 +429,6 @@ replacement. Final validation runs the full UI suite, native build, formatting,
 diff hygiene, and a real Claude/Codex/OMP smoke in the rebuilt app.
 Schema/engine tests additionally cover completed, interrupted, errored,
 quiesced, steered, subagent, legacy, continuation, and recovery duration paths.
+Harness/doc/UI tests cover partial Write/Edit refresh, bounded preview privacy,
+journal fetch authorization, 72px/200px disclosure geometry, inner scrolling,
+and composition with the outer turn disclosure.

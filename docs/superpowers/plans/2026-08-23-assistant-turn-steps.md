@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give every eligible Comet assistant message one Orchestrator-style operational disclosure that folds completed work while leaving current activity and the final answer expanded.
+**Goal:** Give every eligible Comet assistant message one Orchestrator-style operational disclosure and specialized live Write/Edit cards with bounded green/red previews, persisted turn duration, and journal-backed full-content expansion.
 
-**Architecture:** Persist engine-measured duration on each assistant message, add a pure `turn_steps` policy over durable `MessagePart` values, then project the completed prefix into a composite `RowKind::TurnSteps` without changing runtime protocols or the composer. Reuse all existing child renderers and stable row ids by separating transcript row-body rendering from top-level list chrome.
+**Architecture:** Persist engine-measured duration on each assistant message, preserve upstream Write/Edit input deltas as same-id ToolCall refreshes, and store only a bounded semantic file preview in the synchronized doc. Project completed work into `TurnSteps`; render active file changes through a specialized card whose full historical content is fetched lazily from the owning device's run journal.
 
 **Tech Stack:** Rust 2024, GPUI virtualized list, `zeron-doc` message parts, existing transcript/render cache/fold infrastructure, Cargo tests.
 
@@ -20,6 +20,11 @@
 - A running subagent, unresolved tool, active reasoning part, or unresolved input must never be folded.
 - Settled turns collapse only when a non-empty final text follows the last tool.
 - Keep specialized child renderers, child fold choices, inline images, Mermaid, todo cards, and tool sidecar affordances.
+- Preserve the existing privacy rule that strips complete Write/Edit bodies from
+  synchronized docs; full input is fetched only on explicit expansion.
+- Never fabricate file content for runtimes that expose only path/kind.
+- A live file preview retains at most 15 lines of 512 Unicode scalar values;
+  full-input RPC responses are capped at 1 MiB.
 - Preserve transcript virtualization, minimal row splices, stable ids, bottom pinning, own-turn runway, hover timestamps, and render caches.
 - Use TDD and commit each task locally. Do not push, release, or promote branches.
 
@@ -35,6 +40,21 @@
   subagent segment finish.
 - Modify existing `SessionMessageEntry` literals under `crates/`: initialize
   `duration_ms` explicitly in production constructors and fixtures.
+- Create `crates/harness/src/partial_tool_input.rs`: focused partial JSON string
+  extraction for Write/Edit fields.
+- Modify `crates/harness/src/claude/{wire.rs,normalize.rs}`: preserve tool-use
+  start metadata and incremental input JSON as same-id typed call refreshes.
+- Modify `crates/harness/src/omp/normalize.rs`: preserve OMP
+  `toolcall_start|delta|end` updates through the same typed refresh contract.
+- Test `crates/harness/src/acp/normalize.rs`: prove shape-bearing rawInput
+  updates refresh Write/Edit without a new adapter path.
+- Modify `crates/doc/src/parts.rs` and `crates/doc/src/schema.rs`: additive
+  bounded `FileChangePreview` derivation and persistence.
+- Modify `crates/engine/src/run_journal.rs`, `crates/engine/src/sessions.rs`,
+  `crates/engine/src/rpc.rs`, and `crates/rpc/src/lib.rs`: safe historical
+  `FetchToolInput` lookup on the owning device.
+- Create `crates/ui/src/file_change.rs`: preview geometry, duration-independent
+  file-card formatting, and pure line/render decisions.
 - Create `crates/ui/src/turn_steps.rs`: pure split policy, activity classification, summary formatting, and unit tests.
 - Modify `crates/ui/src/lib.rs`: register the private `turn_steps` module.
 - Modify `crates/ui/src/transcript.rs`: source-indexed row projection, composite row model/version, body renderer extraction, disclosure rendering/state, recursive cache invalidation, and transcript tests.
@@ -780,7 +800,478 @@ git add crates/ui/src/transcript.rs
 git commit -m "fix(ui): preserve turn steps through transcript updates"
 ```
 
-### Task 6: Full validation and parity documentation
+### Task 6: Preserve progressive Write/Edit inputs from capable runtimes
+
+**Files:**
+- Create: `crates/harness/src/partial_tool_input.rs`
+- Modify: `crates/harness/src/lib.rs`
+- Modify: `crates/harness/src/claude/wire.rs`
+- Modify: `crates/harness/src/claude/normalize.rs`
+- Modify: `crates/harness/src/omp/normalize.rs`
+- Test: `crates/harness/src/partial_tool_input.rs`
+- Test: `crates/harness/src/claude/normalize.rs`
+- Test: `crates/harness/src/omp/normalize.rs`
+- Test: `crates/harness/src/acp/normalize.rs`
+
+**Interfaces:**
+- Consumes: Claude `content_block_start`/`input_json_delta`, OMP
+  `toolcall_start|delta|end`, and ACP shape-bearing `tool_call_update` frames.
+- Produces: repeated `AgentEvent::ToolCall { id, call }` updates with the same
+  id and progressively decoded `WriteFile`/`EditFile` fields.
+
+- [ ] **Step 1: Write failing focused partial-field decoder tests**
+
+Create `crates/harness/src/partial_tool_input.rs` and tests for:
+
+```rust
+#[test]
+fn decodes_complete_and_unterminated_file_strings_without_general_json_repair() {
+    let raw = r#"{"file_path":"src/a.rs","content":"line 1\nline 2"#;
+    assert_eq!(partial_json_string_field(raw, &["file_path"]), Some("src/a.rs".into()));
+    assert_eq!(partial_json_string_field(raw, &["content"]), Some("line 1\nline 2".into()));
+}
+
+#[test]
+fn incomplete_escape_is_not_invented() {
+    assert_eq!(
+        partial_json_string_field(r#"{"content":"line\\"#, &["content"]),
+        Some("line".into()),
+    );
+}
+
+#[test]
+fn builds_only_file_calls_from_supported_names() {
+    assert!(matches!(
+        partial_file_tool_call("Write", r#"{"file_path":"a.txt","content":"hi"#),
+        Some(ToolCall::WriteFile { path, content: Some(content) })
+            if path == "a.txt" && content == "hi"
+    ));
+    assert_eq!(partial_file_tool_call("Bash", r#"{"command":"echo hi"#), None);
+}
+```
+
+The decoder must ignore matching text inside another JSON string, decode
+`\n|\r|\t|\\|\"` and complete `\uXXXX` escapes, and stop before an incomplete
+escape. It returns only the decoded prefix of the named string field.
+
+- [ ] **Step 2: Run decoder tests and verify RED**
+
+```bash
+cargo test -p zeron-harness partial_tool_input -- --nocapture
+```
+
+Expected: compile failure because the module/functions do not exist.
+
+- [ ] **Step 3: Implement the bounded partial decoder**
+
+Expose crate-private APIs:
+
+```rust
+pub(crate) fn partial_json_string_field(
+    raw: &str,
+    aliases: &[&str],
+) -> Option<String>;
+
+pub(crate) fn partial_file_tool_call(
+    tool_name: &str,
+    raw: &str,
+) -> Option<ToolCall>;
+```
+
+Use a byte scanner with `in_string`, `escaped`, and JSON-key/value states. Cap
+the accumulated raw input at 1 MiB; after the cap, retain the already decoded
+preview but stop growing the accumulator. Map `Write|write` to path/content and
+`Edit|edit` to path/old/new aliases. Do not add a JSON-repair dependency.
+
+- [ ] **Step 4: Write failing Claude progressive Write tests**
+
+Extend `StreamEventBody` fixtures with a tool-use start at `index: 2`, id
+`tool-write`, name `Write`, followed by two `input_json_delta` frames. Require
+the normalizer to emit at least two same-id calls, with the final refresh:
+
+```rust
+AgentEvent::ToolCall {
+    id: "tool-write".into(),
+    call: ToolCall::WriteFile {
+        path: "notes/new.txt".into(),
+        content: Some("first\nsecond".into()),
+    },
+}
+```
+
+Add an Edit case with `old_string` and a growing `new_string`. Assert that the
+later full assistant tool-use frame refreshes the same id with authoritative
+complete input rather than appending a second tool.
+
+- [ ] **Step 5: Extend Claude wire state and normalize progressively**
+
+Add to the wire structs:
+
+```rust
+pub index: usize,
+pub content_block: Option<ContentBlock>,
+pub partial_json: String,
+```
+
+Add `streaming_tools: HashMap<usize, StreamingToolInput>` to `Normalizer`, where
+`StreamingToolInput` stores id, name, and capped raw JSON. Handle
+`content_block_start`, `input_json_delta`, and `content_block_stop`; emit a
+same-id ToolCall only when `partial_file_tool_call` returns a shape different
+from the last emitted one. Keep empty input deltas as liveness for non-file
+tools and preserve the existing subagent routing.
+
+- [ ] **Step 6: Write and implement OMP progressive Write tests**
+
+Push `message_update` frames with `toolcall_start`, two `toolcall_delta` values,
+and `toolcall_end` under one `contentIndex`. Require same-id progressive
+`WriteFile` refreshes, followed by the authoritative existing
+`tool_execution_start` refresh. Store OMP partial state by content index and
+clear it on end/message boundary.
+
+- [ ] **Step 7: Lock ACP and Codex capability behavior**
+
+Add an ACP test where two `tool_call_update` frames carry growing `rawInput`;
+assert two same-id typed WriteFile calls. Add a Codex test confirming a path-only
+`fileChange add` remains `WriteFile { content: None }`; the normalizer must not
+read the filesystem or invent content.
+
+- [ ] **Step 8: Run all harness normalization tests GREEN**
+
+```bash
+cargo test -p zeron-harness partial_tool_input -- --nocapture
+cargo test -p zeron-harness claude -- --nocapture
+cargo test -p zeron-harness omp -- --nocapture
+cargo test -p zeron-harness acp -- --nocapture
+cargo test -p zeron-harness codex -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: capable runtimes refresh same-id file calls; Codex degrades honestly.
+
+- [ ] **Step 9: Commit progressive normalization**
+
+```bash
+git add \
+  crates/harness/src/lib.rs \
+  crates/harness/src/partial_tool_input.rs \
+  crates/harness/src/claude/wire.rs \
+  crates/harness/src/claude/normalize.rs \
+  crates/harness/src/omp/normalize.rs \
+  crates/harness/src/acp/normalize.rs \
+  crates/harness/src/codex/normalize.rs
+git commit -m "feat(harness): preserve progressive file tool input"
+```
+
+### Task 7: Persist a bounded semantic file-change preview
+
+**Files:**
+- Modify: `crates/doc/src/parts.rs`
+- Modify: `crates/doc/src/schema.rs`
+- Modify: `crates/doc/src/rebuild.rs`
+- Modify: `crates/ui/src/transcript.rs`
+- Test: `crates/doc/src/parts.rs`
+- Test: `crates/doc/src/schema.rs`
+- Test: `crates/ui/src/transcript.rs`
+
+**Interfaces:**
+- Consumes: same-id `ToolCall` refreshes and authoritative `ToolResult.diff`.
+- Produces: `FileChangeKind`, `FileChangeLineKind`, `FileChangeLine`,
+  `FileChangePreview`, `MessagePart::Tool.file_preview`, and
+  `RowKind::FileChange`.
+
+- [ ] **Step 1: Write failing bounded-preview tests**
+
+In `crates/doc/src/parts.rs`, build a 75-line `WriteFile` and require:
+
+```rust
+let preview = file_change_preview(&call, None).unwrap();
+assert_eq!(preview.kind, FileChangeKind::Write);
+assert_eq!(preview.total_lines, 75);
+assert_eq!(preview.additions, 75);
+assert_eq!(preview.deletions, 0);
+assert_eq!(preview.lines.len(), 15);
+assert_eq!(preview.truncated_before, 60);
+assert!(preview.lines.iter().all(|line| line.kind == FileChangeLineKind::Added));
+```
+
+Add Edit tests proving added/removed/context semantics from old/new strings and
+that a provided `ToolDiff` wins over speculative call input. Add a 600-character
+line test requiring exactly 512 retained Unicode scalar values.
+
+- [ ] **Step 2: Run preview tests and verify RED**
+
+```bash
+cargo test -p zeron-doc --lib file_change_preview -- --nocapture
+```
+
+Expected: the preview types/functions do not exist.
+
+- [ ] **Step 3: Implement preview types and derivation**
+
+Add serializable types and constants:
+
+```rust
+pub const FILE_PREVIEW_MAX_LINES: usize = 15;
+pub const FILE_PREVIEW_MAX_LINE_CHARS: usize = 512;
+
+pub fn file_change_preview(
+    call: &ToolCall,
+    authoritative_diff: Option<&ToolDiff>,
+) -> Option<FileChangePreview>;
+```
+
+Use `similar::TextDiff` for Edit input. Count the complete available diff,
+retain the last 15 display lines, and cap each retained line by Unicode scalar
+count. Path-only calls return `None`.
+
+- [ ] **Step 4: Add the preview to MessagePart and the event fold**
+
+Extend `MessagePart::Tool`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+file_preview: Option<FileChangePreview>,
+```
+
+On every ToolCall create/refresh, derive the preview before the call is
+sanitized. On ToolResult with a diff, replace it with the authoritative preview.
+`render_parts` keeps `file_preview` while continuing to strip Write/Edit bodies.
+Update every affected constructor/pattern explicitly with `file_preview: None`
+or `..`; do not weaken exhaustive matches globally.
+
+- [ ] **Step 5: Persist and diff the additive field**
+
+Thread `filePreview` through `DocPartJson`, Loro map read/write, salvage,
+continuation/rebuild, `byte_len`, and transcript-delta comparison. Add a legacy
+entry test with no field and a round-trip test with a 15-line preview.
+
+- [ ] **Step 6: Project specialized file rows**
+
+Add `file_preview: Option<Arc<FileChangePreview>>` to `ToolItem` and include it
+in `tool_fingerprint`. In `rows_for_entry_with_todo_history`, flush the pending
+generic group before a WriteFile/EditFile carrying a preview, then emit:
+
+```rust
+RowKind::FileChange {
+    tool: ToolItem,
+}
+```
+
+with id `{entry.id}#{tool_id}`. Path-only Write/Edit calls may use the same row
+for an honest header without a body. The row remains eligible as a child of
+`TurnSteps` after resolution.
+
+- [ ] **Step 7: Add transcript projection regressions**
+
+Require:
+
+- a live Write preview updates one stable FileChange row version;
+- the row stays outside TurnSteps while unresolved;
+- after resolution it can move inside TurnSteps without changing its id;
+- path-only Codex writes have no invented lines/counts;
+- generic Exec/Read grouping remains unchanged;
+- old docs without `filePreview` still render through the generic fallback.
+
+- [ ] **Step 8: Run doc and UI model tests GREEN**
+
+```bash
+cargo test -p zeron-doc --lib file_change -- --nocapture
+cargo test -p zeron-doc --lib
+cargo test -p zeron-ui --lib file_change -- --nocapture
+cargo test -p zeron-ui --lib transcript -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: bounded previews persist without full file bodies entering the doc.
+
+- [ ] **Step 9: Commit bounded preview persistence**
+
+```bash
+git add crates/doc/src/parts.rs crates/doc/src/schema.rs crates/doc/src/rebuild.rs crates/ui/src/transcript.rs
+git commit -m "feat(chat): persist bounded file change previews"
+```
+
+### Task 8: Render the native file card and fetch full historical input
+
+**Files:**
+- Create: `crates/ui/src/file_change.rs`
+- Modify: `crates/ui/src/lib.rs`
+- Modify: `crates/ui/src/transcript.rs`
+- Modify: `crates/proto/src/agent.rs`
+- Modify: `crates/rpc/src/lib.rs`
+- Modify: `crates/engine/src/run_journal.rs`
+- Modify: `crates/engine/src/sessions.rs`
+- Modify: `crates/engine/src/rpc.rs`
+- Test: `crates/ui/src/file_change.rs`
+- Test: `crates/ui/src/transcript.rs`
+- Test: `crates/engine/src/run_journal.rs`
+- Test: `crates/engine/src/rpc.rs`
+
+**Interfaces:**
+- Consumes: `RowKind::FileChange`, bounded preview, chat/tool id, owning device,
+  and the unsanitized host run journal.
+- Produces: `FileToolInputSnapshot`, relay-forwardable `FetchToolInput`,
+  `FileInputLoad`, stable expansion/scroll state, and the 72px/200px card.
+
+- [ ] **Step 1: Write failing historical journal lookup tests**
+
+Append two same-id progressive WriteFile calls and a Done to a test journal.
+Require newest-first lookup to return the complete final input:
+
+```rust
+let snapshot = journal.file_tool_input("chat", "write-1", 1_048_576).unwrap().unwrap();
+assert_eq!(snapshot.path, "notes/new.txt");
+assert_eq!(snapshot.content.as_deref(), Some("first\nsecond"));
+assert!(!snapshot.truncated);
+```
+
+Add cases proving Edit old/new fields, a newer matching `ToolResult.diff`
+overriding speculative ToolCall input, missing ids, non-file tools returning
+`None`, and content over 1 MiB returning a Unicode-safe truncated snapshot.
+
+- [ ] **Step 2: Implement the sanitized journal API**
+
+Add to `zeron-proto`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileToolInputSnapshot {
+    pub path: String,
+    pub content: Option<String>,
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    pub truncated: bool,
+}
+```
+
+Add `RunJournal::file_tool_input(chat_id, tool_call_id, max_chars)`. Scan replay
+newest-first: a matching ToolResult with `diff` returns its path/old/new text;
+otherwise use the newest matching WriteFile/EditFile call. Expose it through
+`SessionsEngine::file_tool_input`; never return raw MCP/Unknown inputs.
+
+- [ ] **Step 3: Add and secure the relay-forwardable RPC**
+
+Register `methods::FETCH_TOOL_INPUT`. Params are:
+
+```json
+{"chatId":"chat-id","toolCallId":"write-1","targetDeviceId":"host-device"}
+```
+
+Add it to the forwardable unary allowlist with a 20-second deadline. On the
+target engine, require the chat to exist and belong to `doc_host.device_id()`
+before calling the session lookup. Return `{ "snapshot": null }` when the
+journal/id is absent and the typed snapshot otherwise. Add tests for local
+success, wrong-device rejection, non-file rejection, forwarding classification,
+and the 1 MiB cap.
+
+- [ ] **Step 4: Define pure native card policy and geometry**
+
+Create `crates/ui/src/file_change.rs` with:
+
+```rust
+pub const FILE_CARD_HEADER_HEIGHT: f32 = 28.0;
+pub const FILE_CARD_COLLAPSED_BODY_HEIGHT: f32 = 72.0;
+pub const FILE_CARD_EXPANDED_MAX_HEIGHT: f32 = 200.0;
+
+pub fn file_card_action(kind: FileChangeKind, resolved: bool) -> &'static str;
+pub fn file_card_can_expand(resolved: bool, has_preview: bool) -> bool;
+pub fn file_card_body_height(expanded: bool, content_height: f32) -> f32;
+```
+
+Tests require `Creating/Created`, `Editing/Edited`, disabled expansion while
+unresolved, exactly 72px collapsed, and `min(content_height, 200)` expanded.
+
+- [ ] **Step 5: Add Transcript-owned expansion, fetch, and scroll state**
+
+Add:
+
+```rust
+file_change_open: HashMap<SharedString, bool>,
+file_change_inputs: HashMap<SharedString, FileInputLoad>,
+file_change_scrolls: HashMap<SharedString, gpui::ScrollHandle>,
+```
+
+`FileInputLoad` is `Loading(Task<()>) | Ready(Arc<FileToolInputSnapshot>) |
+Failed`. Toggle is keyed by stable row id. The first completed expansion calls
+`FetchToolInput` with `chatId`, `toolCallId`, and the chat's device id. Ready
+state and its `ScrollHandle` survive outer TurnSteps close/reopen and virtualized
+remounts. Prune all three maps when their rows disappear; clear on chat switch.
+
+- [ ] **Step 6: Render the specialized file-change card**
+
+Render:
+
+- 8–9px rounded card, hairline border, faint neutral wash;
+- fixed 28px header with contextual file icon and filename;
+- filename shimmer plus fixed-slot spinner while unresolved;
+- resolved `+N` green and `-N` red stats;
+- expand/collapse glyph only when resolved and preview/content exists;
+- Added rows with green translucent wash, green left rail and green text;
+- Removed rows with red equivalents; Context rows neutral;
+- no syntax highlighting while unresolved;
+- background `HighlightStore` request after resolution, keyed by row id/content;
+- 72px clipped body while closed;
+- expanded body capped at 200px with `.overflow_y_scroll()` and the row's
+  tracked `ScrollHandle`;
+- `truncated_before > 0` marker above the bounded tail while full input loads;
+- retryable `Full content unavailable` when journal fetch fails;
+- `Preview limited to 1 MiB` when the returned snapshot is truncated.
+
+Header/body/chevron toggle the inline fold only after resolution. A separate
+filename click opens the existing file preview and stops propagation.
+
+- [ ] **Step 7: Build full lines from the fetched snapshot**
+
+For Write, render every fetched content line as Added. For Edit, use
+`similar::TextDiff` over fetched old/new strings. If the fetch returns only a
+path or is unavailable, retain the bounded durable preview. Never substitute
+the current workspace file for historical tool input.
+
+- [ ] **Step 8: Add UI lifecycle and composition tests**
+
+Cover:
+
+- live 75-line Write shows the 15-line tail, spinner, no expand action;
+- resolved Write shows `+75`, expand action, and no success inference from green;
+- closed body is 72px; expanded body caps at 200px and owns a scroll handle;
+- first expansion fetches once; reopen uses cache and preserves scroll;
+- filename action does not toggle expansion;
+- failed/missing journal keeps bounded preview with retry affordance;
+- path-only Codex card has no fabricated green body;
+- outer TurnSteps close/reopen preserves inner file-card expansion;
+- transcript row/cache pruning removes fetch/scroll state.
+
+- [ ] **Step 9: Run focused, RPC, and full UI tests GREEN**
+
+```bash
+cargo test -p zeron-engine run_journal::tests -- --nocapture
+cargo test -p zeron-engine fetch_tool_input -- --nocapture
+cargo test -p zeron-ui --lib file_change -- --nocapture
+cargo test -p zeron-ui --lib transcript -- --nocapture
+cargo test -p zeron-ui --lib
+cargo fmt --all -- --check
+git diff --check
+```
+
+Expected: historical full expansion works without full file bodies in docs.
+
+- [ ] **Step 10: Commit the specialized card and fetch path**
+
+```bash
+git add \
+  crates/proto/src/agent.rs \
+  crates/rpc/src/lib.rs \
+  crates/engine/src/run_journal.rs \
+  crates/engine/src/sessions.rs \
+  crates/engine/src/rpc.rs \
+  crates/ui/src/lib.rs \
+  crates/ui/src/file_change.rs \
+  crates/ui/src/transcript.rs
+git commit -m "feat(ui): render live file change cards"
+```
+
+### Task 9: Full validation and parity documentation
 
 **Files:**
 - Modify: `docs/PARITY.md`
@@ -797,6 +1288,8 @@ git commit -m "fix(ui): preserve turn steps through transcript updates"
 cargo test -p zeron-proto --lib
 cargo test -p zeron-doc --lib
 cargo test -p zeron-engine segment_duration -- --nocapture
+cargo test -p zeron-engine fetch_tool_input -- --nocapture
+cargo test -p zeron-harness
 cargo test -p zeron-ui --lib
 cargo build -p zeron
 cargo fmt --all -- --check
@@ -822,7 +1315,8 @@ RUST_LOG=warn target/debug/zeron
 ```
 
 Exercise one agentic turn in Claude, Codex, and OMP containing narration, at
-least two tool categories, and a final text answer.
+least two tool categories, a text-file Write of more than 20 lines, an Edit,
+and a final text answer.
 
 - [ ] **Step 4: Verify the real UI behavior**
 
@@ -836,6 +1330,13 @@ For each runtime confirm:
 - the final answer stays expanded after completion;
 - completed/interrupted/errored turns with recorded duration show the compact
   time immediately before the chevron, and legacy turns omit it;
+- capable runtimes show a green/red file preview growing during Write/Edit;
+- the pending card shows spinner and does not expose expansion;
+- completion shows accurate `+N/-N`, enables expansion, and highlights only
+  after the live phase;
+- expanded file content is capped visually at 200px and scrolls internally;
+- closing/reopening the card and outer TurnSteps preserves its inner state;
+- Codex path-only changes remain honest rather than inventing file contents;
 - expanding shows original Thought/tool/todo/media components in order;
 - inner tool detail folds remain independently controllable;
 - stopping or aborting without a final answer does not invent a turn summary;
@@ -849,7 +1350,8 @@ In `docs/PARITY.md`, change the transcript line to explicitly include:
 ```markdown
 assistant-turn operational prefix disclosure with categorized summary,
 persisted duration, streaming current-activity preservation, and final-answer
-separation
+separation; live Write/Edit cards with bounded semantic preview and
+journal-backed full-content expansion
 ```
 
 Record only behavior observed in the rebuilt app; do not claim runtime parity
