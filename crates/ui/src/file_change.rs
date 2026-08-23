@@ -4,6 +4,14 @@ use zeron_proto::FileToolInputSnapshot;
 pub const FILE_CARD_HEADER_HEIGHT: f32 = 28.0;
 pub const FILE_CARD_COLLAPSED_BODY_HEIGHT: f32 = 72.0;
 pub const FILE_CARD_EXPANDED_MAX_HEIGHT: f32 = 200.0;
+pub const FILE_CARD_VIRTUALIZE_AFTER_LINES: usize = 64;
+
+pub struct DerivedFileInput {
+    pub preview: zeron_doc::FileChangePreview,
+    /// Syntax source is omitted when long logical lines were split into
+    /// bounded paint rows; token ranges no longer map 1:1 in that case.
+    pub source: Option<String>,
+}
 
 pub fn file_card_action(kind: FileChangeKind, resolved: bool, is_error: bool) -> &'static str {
     if is_error {
@@ -33,20 +41,23 @@ pub fn snapshot_preview(
     kind: FileChangeKind,
     snapshot: &FileToolInputSnapshot,
 ) -> Option<zeron_doc::FileChangePreview> {
-    let (old, new) = match kind {
-        FileChangeKind::Write if snapshot.content.is_some() => (None, snapshot.content.as_deref()?),
-        FileChangeKind::Write => (
-            snapshot.old_string.as_deref(),
-            snapshot.new_string.as_deref()?,
-        ),
-        FileChangeKind::Edit => (
-            Some(snapshot.old_string.as_deref()?),
-            snapshot.new_string.as_deref()?,
-        ),
-    };
     let mut lines = Vec::new();
     let (mut additions, mut deletions) = (0u32, 0u32);
-    if let Some(old) = old {
+    if kind == FileChangeKind::Write {
+        let new = snapshot
+            .content
+            .as_deref()
+            .or(snapshot.new_string.as_deref())?;
+        for line in zeron_doc::write_file_lines(new) {
+            additions += 1;
+            lines.push(zeron_doc::FileChangeLine {
+                kind: zeron_doc::FileChangeLineKind::Added,
+                text: line.to_owned(),
+            });
+        }
+    } else {
+        let old = snapshot.old_string.as_deref()?;
+        let new = snapshot.new_string.as_deref()?;
         let diff = similar::TextDiff::from_lines(old, new);
         for change in diff.iter_all_changes() {
             let kind = match change.tag() {
@@ -63,14 +74,6 @@ pub fn snapshot_preview(
             lines.push(zeron_doc::FileChangeLine {
                 kind,
                 text: change.value().trim_end_matches('\n').to_owned(),
-            });
-        }
-    } else {
-        for line in new.lines() {
-            additions += 1;
-            lines.push(zeron_doc::FileChangeLine {
-                kind: zeron_doc::FileChangeLineKind::Added,
-                text: line.to_owned(),
             });
         }
     }
@@ -105,6 +108,48 @@ pub fn effective_file_path<'a>(
     snapshot: Option<&'a FileToolInputSnapshot>,
 ) -> &'a str {
     snapshot.map_or(call_path, |snapshot| snapshot.path.as_str())
+}
+
+pub fn derive_file_input(
+    kind: FileChangeKind,
+    snapshot: &FileToolInputSnapshot,
+    durable: Option<&zeron_doc::FileChangePreview>,
+) -> Option<DerivedFileInput> {
+    let preview = display_snapshot_preview(kind, snapshot, durable)?;
+    let source = preview
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut paint_lines = Vec::new();
+    let mut chunked = false;
+    for line in &preview.lines {
+        let chars = line.text.chars().collect::<Vec<_>>();
+        if chars.len() <= zeron_doc::FILE_PREVIEW_MAX_LINE_CHARS {
+            paint_lines.push(line.clone());
+            continue;
+        }
+        chunked = true;
+        paint_lines.extend(
+            chars
+                .chunks(zeron_doc::FILE_PREVIEW_MAX_LINE_CHARS)
+                .map(|chunk| zeron_doc::FileChangeLine {
+                    kind: line.kind,
+                    text: chunk.iter().collect(),
+                }),
+        );
+    }
+    let mut preview = preview;
+    preview.lines = paint_lines;
+    Some(DerivedFileInput {
+        preview,
+        source: (!chunked).then_some(source),
+    })
+}
+
+pub fn file_card_should_virtualize(line_count: usize) -> bool {
+    line_count > FILE_CARD_VIRTUALIZE_AFTER_LINES
 }
 
 #[cfg(test)]
@@ -200,6 +245,25 @@ mod tests {
             ),
             (2, 0, 2)
         );
+
+        for (content, expected) in [("", 1), ("a\n", 2)] {
+            let preview = snapshot_preview(
+                FileChangeKind::Write,
+                &FileToolInputSnapshot {
+                    path: "notes.txt".into(),
+                    content: Some(content.into()),
+                    old_string: Some("must be ignored".into()),
+                    new_string: None,
+                    truncated: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                (preview.total_lines, preview.additions),
+                (expected, expected)
+            );
+            assert_eq!(preview.deletions, 0);
+        }
     }
 
     #[test]
@@ -263,6 +327,58 @@ mod tests {
         assert_eq!(
             effective_file_path("src/fallback.rs", None),
             "src/fallback.rs"
+        );
+    }
+
+    #[test]
+    fn large_full_snapshots_are_derived_once_and_require_virtualized_paint() {
+        let content = (0..1_000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snapshot = FileToolInputSnapshot {
+            path: "large.txt".into(),
+            content: Some(content.clone()),
+            old_string: None,
+            new_string: None,
+            truncated: false,
+        };
+        let derived = derive_file_input(FileChangeKind::Write, &snapshot, None).unwrap();
+        assert_eq!(derived.preview.lines.len(), 1_000);
+        assert_eq!(derived.source.as_deref(), Some(content.as_str()));
+        assert!(file_card_should_virtualize(derived.preview.lines.len()));
+        assert!(!file_card_should_virtualize(
+            FILE_CARD_VIRTUALIZE_AFTER_LINES
+        ));
+    }
+
+    #[test]
+    fn one_megabyte_single_line_is_chunked_into_virtualizable_paint_rows() {
+        let snapshot = FileToolInputSnapshot {
+            path: "minified.json".into(),
+            content: Some("x".repeat(1024 * 1024)),
+            old_string: None,
+            new_string: None,
+            truncated: false,
+        };
+        let derived = derive_file_input(FileChangeKind::Write, &snapshot, None).unwrap();
+        assert_eq!(derived.preview.total_lines, 1);
+        assert_eq!(derived.preview.additions, 1);
+        assert!(derived.source.is_none());
+        assert!(file_card_should_virtualize(derived.preview.lines.len()));
+        assert!(
+            derived.preview.lines.iter().all(|line| {
+                line.text.chars().count() <= zeron_doc::FILE_PREVIEW_MAX_LINE_CHARS
+            })
+        );
+        assert_eq!(
+            derived
+                .preview
+                .lines
+                .iter()
+                .map(|line| line.text.len())
+                .sum::<usize>(),
+            1024 * 1024
         );
     }
 }

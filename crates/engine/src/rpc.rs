@@ -318,7 +318,7 @@ struct FetchToolInputParams {
 }
 
 const FILE_TOOL_INPUT_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
-const FILE_TOOL_INPUT_ENVELOPE_RESERVE: usize = 32;
+const FILE_TOOL_INPUT_ENVELOPE_RESERVE: usize = 128;
 
 fn require_file_tool_input_owner(
     chat_device_id: Option<&str>,
@@ -2043,6 +2043,31 @@ mod tests {
         assert!(require_file_tool_input_owner(Some("dev-a"), "dev-a").is_ok());
         assert!(require_file_tool_input_owner(Some("dev-b"), "dev-a").is_err());
         assert!(require_file_tool_input_owner(None, "dev-a").is_err());
+    }
+
+    #[test]
+    fn fetch_tool_input_reserve_covers_the_complete_max_id_server_frame() {
+        assert!(FILE_TOOL_INPUT_ENVELOPE_RESERVE >= 64);
+        let snapshot = zeron_proto::FileToolInputSnapshot {
+            path: "quoted\"\\\u{0001}.txt".into(),
+            content: Some("\u{0001}\"\\".repeat(32)),
+            old_string: None,
+            new_string: None,
+            truncated: true,
+        };
+        let snapshot_len = serde_json::to_vec(&snapshot).unwrap().len();
+        let frame = zeron_rpc::ServerFrame {
+            id: u64::MAX,
+            ok: Some(serde_json::json!({ "snapshot": snapshot })),
+            ..Default::default()
+        };
+        let frame_len = serde_json::to_vec(&frame).unwrap().len();
+        let envelope = frame_len.saturating_sub(snapshot_len);
+        assert!(envelope <= FILE_TOOL_INPUT_ENVELOPE_RESERVE);
+        assert!(
+            FILE_TOOL_INPUT_RESPONSE_MAX_BYTES - FILE_TOOL_INPUT_ENVELOPE_RESERVE + envelope
+                <= FILE_TOOL_INPUT_RESPONSE_MAX_BYTES
+        );
     }
 
     #[test]

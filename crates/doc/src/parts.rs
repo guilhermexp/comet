@@ -83,6 +83,10 @@ pub struct ToolDiffStat {
 pub const FILE_PREVIEW_MAX_LINES: usize = 15;
 pub const FILE_PREVIEW_MAX_LINE_CHARS: usize = 512;
 
+pub fn write_file_lines(content: &str) -> impl Iterator<Item = &str> {
+    content.split('\n')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FileChangeKind {
@@ -114,6 +118,24 @@ pub struct FileChangePreview {
     pub additions: u32,
     pub deletions: u32,
     pub truncated_before: u32,
+}
+
+pub fn sanitize_file_change_preview(mut preview: FileChangePreview) -> FileChangePreview {
+    for line in &mut preview.lines {
+        line.text = line
+            .text
+            .chars()
+            .take(FILE_PREVIEW_MAX_LINE_CHARS)
+            .collect();
+    }
+    let dropped = preview.lines.len().saturating_sub(FILE_PREVIEW_MAX_LINES);
+    if dropped > 0 {
+        preview.lines.drain(..dropped);
+        preview.truncated_before = preview
+            .truncated_before
+            .saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX));
+    }
+    preview
 }
 
 fn capped_file_change_line(kind: FileChangeLineKind, text: &str) -> FileChangeLine {
@@ -162,7 +184,12 @@ pub fn file_change_preview(
 
     let mut lines = Vec::new();
     let (mut additions, mut deletions) = (0u32, 0u32);
-    if let Some(old_text) = old_text {
+    if kind == FileChangeKind::Write {
+        for line in write_file_lines(new_text) {
+            additions += 1;
+            lines.push(capped_file_change_line(FileChangeLineKind::Added, line));
+        }
+    } else if let Some(old_text) = old_text {
         let diff = similar::TextDiff::from_lines(old_text, new_text);
         for change in diff.iter_all_changes() {
             let kind = match change.tag() {
@@ -179,7 +206,7 @@ pub fn file_change_preview(
             lines.push(capped_file_change_line(kind, change.value()));
         }
     } else {
-        for line in new_text.lines() {
+        for line in write_file_lines(new_text) {
             additions += 1;
             lines.push(capped_file_change_line(FileChangeLineKind::Added, line));
         }
@@ -190,14 +217,14 @@ pub fn file_change_preview(
     if truncated_before > 0 {
         lines.drain(..truncated_before as usize);
     }
-    Some(FileChangePreview {
+    Some(sanitize_file_change_preview(FileChangePreview {
         kind,
         lines,
         total_lines,
         additions,
         deletions,
         truncated_before,
-    })
+    }))
 }
 
 /// Line-level add/delete counts for one file's diff.
@@ -662,6 +689,12 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
                     if let Some(diff) = diff.as_ref() {
+                        match call {
+                            ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+                                *path = diff.path.clone();
+                            }
+                            _ => {}
+                        }
                         *file_preview = file_change_preview(call, Some(diff));
                     }
                 }
@@ -1647,6 +1680,73 @@ mod tests {
     }
 
     #[test]
+    fn write_preview_counts_split_boundaries_and_ignores_old_text() {
+        for (content, expected) in [("", 1), ("a\n", 2), ("a\nb", 2)] {
+            let preview = file_change_preview(
+                &ToolCall::WriteFile {
+                    path: "notes.txt".into(),
+                    content: Some(content.into()),
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(preview.total_lines, expected);
+            assert_eq!(preview.additions, expected);
+            assert_eq!(preview.deletions, 0);
+            assert_eq!(preview.lines.len(), expected as usize);
+        }
+
+        let preview = file_change_preview(
+            &ToolCall::WriteFile {
+                path: "notes.txt".into(),
+                content: None,
+            },
+            Some(&ToolDiff {
+                path: "notes.txt".into(),
+                old_text: Some("old\ncontent".into()),
+                new_text: "new\ncontent\n".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            (preview.total_lines, preview.additions, preview.deletions),
+            (3, 3, 0)
+        );
+        assert!(
+            preview
+                .lines
+                .iter()
+                .all(|line| line.kind == FileChangeLineKind::Added)
+        );
+    }
+
+    #[test]
+    fn hostile_file_preview_is_canonicalized_to_the_doc_budget() {
+        let preview = sanitize_file_change_preview(FileChangePreview {
+            kind: FileChangeKind::Write,
+            lines: (0..75)
+                .map(|index| FileChangeLine {
+                    kind: FileChangeLineKind::Added,
+                    text: format!("{index}:{}", "é".repeat(600)),
+                })
+                .collect(),
+            total_lines: u32::MAX,
+            additions: u32::MAX,
+            deletions: u32::MAX,
+            truncated_before: 7,
+        });
+        assert_eq!(preview.lines.len(), FILE_PREVIEW_MAX_LINES);
+        assert_eq!(preview.truncated_before, 67);
+        assert!(
+            preview
+                .lines
+                .iter()
+                .all(|line| line.text.chars().count() == FILE_PREVIEW_MAX_LINE_CHARS)
+        );
+        assert_eq!(preview.total_lines, u32::MAX);
+    }
+
+    #[test]
     fn fold_refreshes_bounded_file_preview_before_sanitizing_call() {
         let mut parts = Vec::new();
         fold_event_into_parts(
@@ -1739,7 +1839,7 @@ mod tests {
                 is_error: false,
                 output: None,
                 diff: Some(ToolDiff {
-                    path: "src/main.rs".into(),
+                    path: "src/actual.rs".into(),
                     old_text: Some("old".into()),
                     new_text: "authoritative".into(),
                 }),
@@ -1747,9 +1847,16 @@ mod tests {
             },
         );
 
-        let MessagePart::Tool { file_preview, .. } = &parts[0] else {
+        let MessagePart::Tool {
+            call, file_preview, ..
+        } = &parts[0]
+        else {
             panic!("expected tool part")
         };
+        assert!(matches!(
+            call,
+            ToolCall::EditFile { path, .. } if path == "src/actual.rs"
+        ));
         let preview = file_preview.as_ref().unwrap();
         assert!(
             preview

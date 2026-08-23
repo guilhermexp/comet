@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
-use crate::parts::{FileChangePreview, MessagePart, MessageStatus, SubagentStatus};
+use crate::parts::{
+    FileChangePreview, MessagePart, MessageStatus, SubagentStatus, sanitize_file_change_preview,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -171,6 +173,9 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             diff_stats: diff_stats.as_ref().map(serde_json::to_value).transpose()?,
             file_preview: file_preview
                 .as_ref()
+                .cloned()
+                .map(sanitize_file_change_preview)
+                .as_ref()
                 .map(serde_json::to_value)
                 .transpose()?,
             subagent_ref: subagent_ref.clone(),
@@ -236,7 +241,8 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 diff_stats: p.diff_stats.and_then(|s| serde_json::from_value(s).ok()),
                 file_preview: p
                     .file_preview
-                    .and_then(|preview| serde_json::from_value(preview).ok()),
+                    .and_then(|preview| serde_json::from_value(preview).ok())
+                    .map(sanitize_file_change_preview),
                 subagent_ref: p.subagent_ref,
                 subagent_status: p.subagent_status.as_deref().and_then(|s| match s {
                     "running" => Some(SubagentStatus::Running),
@@ -900,7 +906,8 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             file_preview: obj
                 .get("filePreview")
                 .cloned()
-                .and_then(|value| serde_json::from_value::<FileChangePreview>(value).ok()),
+                .and_then(|value| serde_json::from_value::<FileChangePreview>(value).ok())
+                .map(sanitize_file_change_preview),
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
@@ -1516,6 +1523,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn hostile_preview() -> FileChangePreview {
+        use crate::{FileChangeKind, FileChangeLine, FileChangeLineKind};
+        FileChangePreview {
+            kind: FileChangeKind::Write,
+            lines: (0..75)
+                .map(|_| FileChangeLine {
+                    kind: FileChangeLineKind::Added,
+                    text: "é".repeat(600),
+                })
+                .collect(),
+            total_lines: 75,
+            additions: 75,
+            deletions: 0,
+            truncated_before: 0,
+        }
+    }
+
+    #[test]
+    fn schema_write_and_read_bound_hostile_file_previews() {
+        let doc = SessionDoc::init("hostile-preview").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "entry".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "write-1".into(),
+                call: ToolCall::WriteFile {
+                    path: "notes.txt".into(),
+                    content: None,
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                file_preview: Some(hostile_preview()),
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        })
+        .unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        let MessagePart::Tool {
+            file_preview: Some(preview),
+            ..
+        } = &entries[0].parts[0]
+        else {
+            panic!("preview")
+        };
+        assert_eq!(preview.lines.len(), crate::FILE_PREVIEW_MAX_LINES);
+        assert!(
+            preview
+                .lines
+                .iter()
+                .all(|line| line.text.chars().count() <= crate::FILE_PREVIEW_MAX_LINE_CHARS)
+        );
+    }
+
+    #[test]
+    fn salvage_bounds_hostile_file_preview() {
+        let part = serde_json::json!({
+            "id": "write-1",
+            "kind": "tool",
+            "call": {"kind": "writeFile", "path": "notes.txt"},
+            "filePreview": serde_json::to_value(hostile_preview()).unwrap(),
+        });
+        let MessagePart::Tool {
+            file_preview: Some(preview),
+            ..
+        } = salvage_part(&part, "entry", 0).unwrap()
+        else {
+            panic!("preview")
+        };
+        assert_eq!(preview.lines.len(), crate::FILE_PREVIEW_MAX_LINES);
+        assert!(
+            preview
+                .lines
+                .iter()
+                .all(|line| line.text.chars().count() <= 512)
+        );
     }
 
     #[test]

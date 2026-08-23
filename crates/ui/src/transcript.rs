@@ -36,7 +36,7 @@ use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
     ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
     Point, ScrollHandle, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
+    UniformListScrollHandle, Window, canvas, div, img, list, prelude::*, px, quad, uniform_list,
 };
 
 use zeron_doc::{
@@ -2390,7 +2390,7 @@ pub struct Transcript {
     blob_fetch_counter: u64,
     file_change_open: HashMap<SharedString, bool>,
     file_change_inputs: HashMap<SharedString, FileInputLoad>,
-    file_change_scrolls: HashMap<SharedString, ScrollHandle>,
+    file_change_scrolls: HashMap<SharedString, FileChangeScroll>,
     journal_chat_id: Option<String>,
     journal_parent_tool_use_id: Option<String>,
     _observe: Subscription,
@@ -2407,7 +2407,27 @@ enum BlobFetch {
 enum FileInputLoad {
     Loading(#[allow(dead_code)] Task<()>),
     Failed,
-    Ready(Arc<zeron_proto::FileToolInputSnapshot>),
+    Ready(Arc<FileInputReady>),
+}
+
+struct FileInputReady {
+    snapshot: Arc<zeron_proto::FileToolInputSnapshot>,
+    preview: Arc<FileChangePreview>,
+    highlight: Option<Arc<zeron_syntax::HighlightedDocument>>,
+}
+
+struct FileChangeScroll {
+    plain: ScrollHandle,
+    virtualized: UniformListScrollHandle,
+}
+
+impl Default for FileChangeScroll {
+    fn default() -> Self {
+        Self {
+            plain: ScrollHandle::new(),
+            virtualized: UniformListScrollHandle::new(),
+        }
+    }
 }
 
 fn file_input_should_fetch(load: Option<&FileInputLoad>) -> bool {
@@ -3630,6 +3650,8 @@ impl Transcript {
         tool_call_id: String,
         target_device_id: String,
         parent_tool_use_id: Option<String>,
+        kind: zeron_doc::FileChangeKind,
+        durable_preview: Option<Arc<FileChangePreview>>,
         cx: &mut Context<Self>,
     ) {
         if !file_input_should_fetch(self.file_change_inputs.get(&row_id)) {
@@ -3655,15 +3677,45 @@ impl Transcript {
                 Duration::from_secs(20),
             )
             .await;
-            let loaded = match reply {
+            let snapshot: Option<zeron_proto::FileToolInputSnapshot> = match reply {
                 Ok(value) => value
                     .get("snapshot")
                     .cloned()
                     .filter(|value| !value.is_null())
-                    .and_then(|value| serde_json::from_value(value).ok())
-                    .map(|snapshot| FileInputLoad::Ready(Arc::new(snapshot)))
-                    .unwrap_or(FileInputLoad::Failed),
-                Err(_) => FileInputLoad::Failed,
+                    .and_then(|value| serde_json::from_value(value).ok()),
+                Err(_) => None,
+            };
+            let loaded = if let Some(snapshot) = snapshot {
+                cx.background_executor()
+                    .spawn(async move {
+                        let derived = crate::file_change::derive_file_input(
+                            kind,
+                            &snapshot,
+                            durable_preview.as_deref(),
+                        )?;
+                        let highlight = derived.source.as_deref().and_then(|source| {
+                            zeron_syntax::language_for_path(&snapshot.path).and_then(|_language| {
+                                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                                    source,
+                                    path: Some(&snapshot.path),
+                                    fence_tag: None,
+                                })
+                                .ok()
+                                .map(Arc::new)
+                            })
+                        });
+                        Some(FileInputReady {
+                            snapshot: Arc::new(snapshot),
+                            preview: Arc::new(derived.preview),
+                            highlight,
+                        })
+                    })
+                    .await
+                    .map(Arc::new)
+                    .map(FileInputLoad::Ready)
+                    .unwrap_or(FileInputLoad::Failed)
+            } else {
+                FileInputLoad::Failed
             };
             this.update(cx, |this, cx| {
                 this.file_change_inputs.insert(fetch_key.clone(), loaded);
@@ -3681,6 +3733,8 @@ impl Transcript {
         row_id: SharedString,
         tool_call_id: String,
         can_expand: bool,
+        kind: zeron_doc::FileChangeKind,
+        durable_preview: Option<Arc<FileChangePreview>>,
         cx: &mut Context<Self>,
     ) {
         if !can_expand {
@@ -3688,9 +3742,7 @@ impl Transcript {
         }
         let open = self.file_change_open.get(&row_id).copied().unwrap_or(false);
         self.file_change_open.insert(row_id.clone(), !open);
-        self.file_change_scrolls
-            .entry(row_id.clone())
-            .or_insert_with(ScrollHandle::new);
+        self.file_change_scrolls.entry(row_id.clone()).or_default();
         if !open {
             let target = self.file_fetch_target(cx);
             if let Some((chat_id, target_device_id, parent_tool_use_id)) = target {
@@ -3700,6 +3752,8 @@ impl Transcript {
                     tool_call_id,
                     target_device_id,
                     parent_tool_use_id,
+                    kind,
+                    durable_preview,
                     cx,
                 );
             } else {
@@ -4889,8 +4943,8 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::file_change::{
-            FILE_CARD_HEADER_HEIGHT, display_snapshot_preview, effective_file_path,
-            file_card_action, file_card_body_height, file_card_can_expand,
+            FILE_CARD_HEADER_HEIGHT, effective_file_path, file_card_action, file_card_body_height,
+            file_card_can_expand, file_card_should_virtualize,
         };
 
         let Some(call_path) = file_change_path(&tool.call) else {
@@ -4905,16 +4959,17 @@ impl Transcript {
                 _ => zeron_doc::FileChangeKind::Write,
             });
         let loaded = self.file_change_inputs.get(row_id);
-        let loaded_snapshot = match loaded {
-            Some(FileInputLoad::Ready(snapshot)) => Some(snapshot.clone()),
+        let ready = match loaded {
+            Some(FileInputLoad::Ready(ready)) => Some(ready.clone()),
             _ => None,
         };
-        let path = effective_file_path(call_path, loaded_snapshot.as_deref());
-        let full_preview = loaded_snapshot.as_deref().and_then(|snapshot| {
-            display_snapshot_preview(kind, snapshot, tool.file_preview.as_deref())
-        });
-        let preview = full_preview
+        let path = effective_file_path(
+            call_path,
+            ready.as_ref().map(|ready| ready.snapshot.as_ref()),
+        );
+        let preview = ready
             .as_ref()
+            .map(|ready| ready.preview.as_ref())
             .or_else(|| tool.file_preview.as_deref());
         let can_expand = file_card_can_expand(tool.resolved, preview.is_some());
         let open = can_expand && self.file_change_open.get(row_id).copied().unwrap_or(false);
@@ -4932,6 +4987,7 @@ impl Transcript {
 
         let row_toggle = row_id.clone();
         let tool_id = tool.id.to_string();
+        let toggle_preview = tool.file_preview.clone();
         let mut header = div()
             .id(SharedString::from(format!("{row_id}#file-header")))
             .h(px(FILE_CARD_HEADER_HEIGHT))
@@ -4947,7 +5003,14 @@ impl Transcript {
                 gpui::CursorStyle::Arrow
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_file_change(row_toggle.clone(), tool_id.clone(), can_expand, cx)
+                this.toggle_file_change(
+                    row_toggle.clone(),
+                    tool_id.clone(),
+                    can_expand,
+                    kind,
+                    toggle_preview.clone(),
+                    cx,
+                )
             }))
             .child(
                 crate::icons::icon(crate::icons::DOCUMENT_ADD)
@@ -5048,32 +5111,38 @@ impl Transcript {
             };
             let content_height = marker_height + preview.lines.len() as f32 * line_height;
             let body_height = file_card_body_height(open, content_height);
-            let source = preview
-                .lines
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let highlights = if tool.resolved {
+            let bounded_source = (ready.is_none() && tool.resolved).then(|| {
+                preview
+                    .lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            let highlights = if let Some(ready) = &ready {
+                ready.highlight.clone()
+            } else if let Some(source) = bounded_source.as_deref() {
                 zeron_syntax::language_for_path(path).and_then(|language| {
                     self.highlights
-                        .request(row_id.clone(), 0, language, &source, cx)
+                        .request(row_id.clone(), 0, language, source, cx)
                 })
             } else {
                 None
             };
-            let scroll = self
-                .file_change_scrolls
-                .entry(row_id.clone())
-                .or_insert_with(ScrollHandle::new)
-                .clone();
+            let (plain_scroll, virtualized_scroll) = {
+                let scroll = self.file_change_scrolls.entry(row_id.clone()).or_default();
+                (scroll.plain.clone(), scroll.virtualized.clone())
+            };
             let body_toggle = row_id.clone();
             let body_tool = tool.id.to_string();
+            let body_preview = tool.file_preview.clone();
             let mut body = div()
                 .id(SharedString::from(format!("{row_id}#file-body")))
                 .h(px(body_height))
                 .min_h_0()
                 .w_full()
+                .flex()
+                .flex_col()
                 .border_t_1()
                 .border_color(crate::theme::hairline(0.07))
                 .font_family(theme.font_mono.clone())
@@ -5086,72 +5155,77 @@ impl Transcript {
                                 body_toggle.clone(),
                                 body_tool.clone(),
                                 true,
+                                kind,
+                                body_preview.clone(),
                                 cx,
                             )
                         }))
                 })
-                .when(open, |body| body.overflow_y_scroll().track_scroll(&scroll))
-                .when(!open, |body| body.overflow_hidden());
-            if !open && preview.truncated_before > 0 {
-                body = body.child(
-                    div()
-                        .h(px(line_height))
-                        .flex_none()
-                        .px(px(10.0))
-                        .text_color(theme.text_faint)
-                        .italic()
-                        .child(format!("… {} earlier lines", preview.truncated_before)),
-                );
-            }
-            body = body.children(preview.lines.iter().enumerate().map(|(index, line)| {
-                let (wash, rail, text_color) = match line.kind {
-                    zeron_doc::FileChangeLineKind::Added => (
-                        theme.success_muted.opacity(0.055),
-                        theme.success_muted.opacity(0.75),
-                        theme.success_muted,
-                    ),
-                    zeron_doc::FileChangeLineKind::Removed => (
-                        theme.danger_muted.opacity(0.055),
-                        theme.danger_muted.opacity(0.75),
-                        theme.danger_muted,
-                    ),
-                    zeron_doc::FileChangeLineKind::Context => (
-                        gpui::transparent_black(),
-                        gpui::transparent_black(),
-                        theme.text_muted,
-                    ),
+                .overflow_hidden();
+            let virtualized =
+                open && ready.is_some() && file_card_should_virtualize(preview.lines.len());
+            if virtualized {
+                let lines = ready.as_ref().unwrap().preview.clone();
+                let highlights = highlights.clone();
+                let theme = theme.clone();
+                let list_height = if ready.as_ref().is_some_and(|ready| ready.snapshot.truncated) {
+                    (body_height - 24.0).max(line_height)
+                } else {
+                    body_height
                 };
-                let spans = highlights
-                    .as_ref()
-                    .and_then(|document| document.lines.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let runs = render::runs_for_syntax_line_with_plain(
-                    &line.text,
-                    spans,
-                    &gpui::font(theme.font_mono.clone()),
-                    text_color,
-                    theme,
-                );
-                div()
-                    .h(px(line_height))
-                    .flex_none()
+                body = body.child(
+                    uniform_list(
+                        SharedString::from(format!("{row_id}#file-lines")),
+                        lines.lines.len(),
+                        move |range, _, _| {
+                            range
+                                .map(|index| {
+                                    let spans = highlights
+                                        .as_ref()
+                                        .and_then(|document| document.lines.get(index))
+                                        .map(Vec::as_slice)
+                                        .unwrap_or_default();
+                                    file_change_line_row(&lines.lines[index], spans, &theme)
+                                })
+                                .collect()
+                        },
+                    )
+                    .h(px(list_height))
                     .w_full()
-                    .flex()
-                    .items_center()
-                    .border_l_1()
-                    .border_color(rail)
-                    .bg(wash)
-                    .px(px(9.0))
-                    .overflow_hidden()
-                    .child(StyledText::new(line.text.clone()).with_runs(runs))
-            }));
+                    .track_scroll(&virtualized_scroll),
+                );
+            } else {
+                body = body
+                    .when(open, |body| {
+                        body.overflow_y_scroll().track_scroll(&plain_scroll)
+                    })
+                    .when(!open, |body| body.overflow_hidden());
+                if !open && preview.truncated_before > 0 {
+                    body = body.child(
+                        div()
+                            .h(px(line_height))
+                            .flex_none()
+                            .px(px(10.0))
+                            .text_color(theme.text_faint)
+                            .italic()
+                            .child(format!("… {} earlier lines", preview.truncated_before)),
+                    );
+                }
+                body = body.children(preview.lines.iter().enumerate().map(|(index, line)| {
+                    let spans = highlights
+                        .as_ref()
+                        .and_then(|document| document.lines.get(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    file_change_line_row(line, spans, theme)
+                }));
+            }
 
             if open {
                 let status = match loaded {
                     Some(FileInputLoad::Loading(_)) => Some(("Loading full content…", false)),
                     Some(FileInputLoad::Failed) => Some(("Full content unavailable · Retry", true)),
-                    Some(FileInputLoad::Ready(snapshot)) if snapshot.truncated => {
+                    Some(FileInputLoad::Ready(ready)) if ready.snapshot.truncated => {
                         Some(("Preview limited to 1 MiB", false))
                     }
                     _ => None,
@@ -5160,6 +5234,7 @@ impl Transcript {
                     let retry_row = row_id.clone();
                     let retry_tool = tool.id.to_string();
                     let retry_target = self.file_fetch_target(cx);
+                    let retry_preview = tool.file_preview.clone();
                     let mut status_row = div()
                         .id(SharedString::from(format!("{row_id}#file-status")))
                         .h(px(24.0))
@@ -5186,6 +5261,8 @@ impl Transcript {
                                         retry_tool.clone(),
                                         target_device_id,
                                         parent_tool_use_id,
+                                        kind,
+                                        retry_preview.clone(),
                                         cx,
                                     );
                                 }
@@ -7164,6 +7241,51 @@ fn task_snapshot_title(
     }
 }
 
+fn file_change_line_row(
+    line: &zeron_doc::FileChangeLine,
+    spans: &[zeron_syntax::HighlightSpan],
+    theme: &Theme,
+) -> AnyElement {
+    let line_height = 20.0;
+    let (wash, rail, text_color) = match line.kind {
+        zeron_doc::FileChangeLineKind::Added => (
+            theme.success_muted.opacity(0.055),
+            theme.success_muted.opacity(0.75),
+            theme.success_muted,
+        ),
+        zeron_doc::FileChangeLineKind::Removed => (
+            theme.danger_muted.opacity(0.055),
+            theme.danger_muted.opacity(0.75),
+            theme.danger_muted,
+        ),
+        zeron_doc::FileChangeLineKind::Context => (
+            gpui::transparent_black(),
+            gpui::transparent_black(),
+            theme.text_muted,
+        ),
+    };
+    let runs = render::runs_for_syntax_line_with_plain(
+        &line.text,
+        spans,
+        &gpui::font(theme.font_mono.clone()),
+        text_color,
+        theme,
+    );
+    div()
+        .h(px(line_height))
+        .flex_none()
+        .w_full()
+        .flex()
+        .items_center()
+        .border_l_1()
+        .border_color(rail)
+        .bg(wash)
+        .px(px(9.0))
+        .overflow_hidden()
+        .child(StyledText::new(line.text.clone()).with_runs(runs))
+        .into_any_element()
+}
+
 /// A plain (non-expandable) chip: bordered card, plus the group guide rail
 /// when the chip lives under a collapsible header.
 fn tool_chip(
@@ -8087,12 +8209,20 @@ mod tests {
     fn file_input_fetch_is_single_flight_cached_and_retryable() {
         assert!(file_input_should_fetch(None));
         assert!(file_input_should_fetch(Some(&FileInputLoad::Failed)));
-        let ready = FileInputLoad::Ready(Arc::new(zeron_proto::FileToolInputSnapshot {
+        let snapshot = zeron_proto::FileToolInputSnapshot {
             path: "notes/new.txt".into(),
             content: Some("body".into()),
             old_string: None,
             new_string: None,
             truncated: false,
+        };
+        let preview =
+            crate::file_change::snapshot_preview(zeron_doc::FileChangeKind::Write, &snapshot)
+                .unwrap();
+        let ready = FileInputLoad::Ready(Arc::new(FileInputReady {
+            snapshot: Arc::new(snapshot),
+            preview: Arc::new(preview),
+            highlight: None,
         }));
         assert!(!file_input_should_fetch(Some(&ready)));
     }

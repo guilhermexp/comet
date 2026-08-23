@@ -15,8 +15,8 @@
 
 use crate::SessionCommandStatus;
 use crate::parts::{
-    MessagePart, SidecarPayload, diff_stat, file_change_preview, sanitize_tool_call,
-    summarize_tool_output,
+    MessagePart, SidecarPayload, diff_stat, file_change_preview, sanitize_file_change_preview,
+    sanitize_tool_call, summarize_tool_output,
 };
 use crate::schema::{DocError, SessionDoc};
 
@@ -112,6 +112,9 @@ fn strip_part(chat_id: &str, part: &mut MessagePart) -> Option<SidecarPayload> {
     };
     if file_preview.is_none() {
         *file_preview = file_change_preview(call, diff.as_ref());
+    }
+    if let Some(preview) = file_preview.take() {
+        *file_preview = Some(sanitize_file_change_preview(preview));
     }
     *call = sanitize_tool_call(call);
     // Fat inline output = text with no sidecar ref (the new fold always
