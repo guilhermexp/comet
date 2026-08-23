@@ -138,6 +138,6 @@ Expected: all gates pass and the detector reports no unexplained finding.
 - [ ] **Step 6: Review and commit only avatar integration files**
 
 ```bash
-git add crates/ui/assets/icons/subagents/codex crates/ui/src/icons.rs crates/ui/src/details_sidebar/mod.rs crates/ui/src/details_sidebar/subagent_avatars.rs crates/ui/src/details_sidebar/view.rs
+git add crates/ui/build.rs crates/ui/assets/icons/subagents/codex crates/ui/src/icons.rs crates/ui/src/details_sidebar/mod.rs crates/ui/src/details_sidebar/subagent_avatars.rs crates/ui/src/details_sidebar/view.rs
 git commit -m "feat(ui): use Codex subagent avatars"
 ```

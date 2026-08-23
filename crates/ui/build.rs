@@ -29,4 +29,33 @@ fn main() {
     let output =
         PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("material_file_icon_assets.rs");
     fs::write(output, source).expect("write material icon asset table");
+
+    let avatars_dir = manifest_dir.join("assets/icons/subagents/codex");
+    println!("cargo:rerun-if-changed={}", avatars_dir.display());
+    let mut avatar_names: Vec<String> = fs::read_dir(&avatars_dir)
+        .expect("read Codex subagent avatar assets")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.ends_with(".svg").then_some(name)
+        })
+        .collect();
+    avatar_names.sort();
+
+    let mut avatar_source =
+        String::from("pub fn load(path: &str) -> Option<&'static [u8]> {\n    match path {\n");
+    for name in &avatar_names {
+        avatar_source.push_str(&format!(
+            "        \"icons/subagents/codex/{name}\" => Some(include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/assets/icons/subagents/codex/{name}\")).as_slice()),\n"
+        ));
+    }
+    avatar_source.push_str("        _ => None,\n    }\n}\n\npub const PATHS: &[&str] = &[\n");
+    for name in &avatar_names {
+        avatar_source.push_str(&format!("    \"icons/subagents/codex/{name}\",\n"));
+    }
+    avatar_source.push_str("];\n");
+
+    let avatar_output =
+        PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("codex_subagent_avatar_assets.rs");
+    fs::write(avatar_output, avatar_source).expect("write Codex subagent avatar asset table");
 }

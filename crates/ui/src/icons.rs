@@ -24,6 +24,10 @@ mod material_file_icon_assets {
     include!(concat!(env!("OUT_DIR"), "/material_file_icon_assets.rs"));
 }
 
+mod codex_subagent_avatar_assets {
+    include!(concat!(env!("OUT_DIR"), "/codex_subagent_avatar_assets.rs"));
+}
+
 macro_rules! icon_assets {
     ($(($const_name:ident, $path:literal)),+ $(,)?) => {
         $(pub const $const_name: &str = concat!("icons/", $path, ".svg");)+
@@ -34,6 +38,9 @@ macro_rules! icon_assets {
         impl AssetSource for Assets {
             fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
                 if let Some(bytes) = material_file_icon_assets::load(path) {
+                    return Ok(Some(Cow::Borrowed(bytes)));
+                }
+                if let Some(bytes) = codex_subagent_avatar_assets::load(path) {
                     return Ok(Some(Cow::Borrowed(bytes)));
                 }
                 Ok(match path {
@@ -47,9 +54,10 @@ macro_rules! icon_assets {
             fn list(&self, path: &str) -> Result<Vec<SharedString>> {
                 let all = [$(concat!("icons/", $path, ".svg")),+];
                 Ok(all
-                    .iter()
+                    .into_iter()
+                    .chain(codex_subagent_avatar_assets::PATHS.iter().copied())
                     .filter(|p| p.starts_with(path))
-                    .map(|p| SharedString::from(*p))
+                    .map(SharedString::from)
                     .collect())
             }
         }
@@ -261,6 +269,19 @@ mod tests {
     #[test]
     fn unknown_paths_are_none() {
         assert!(Assets.load("icons/nope.svg").unwrap().is_none());
+    }
+
+    #[test]
+    fn codex_subagent_avatar_assets_include_every_appearance_pair() {
+        let assets = Assets;
+        let paths = assets.list("icons/subagents/codex/").unwrap();
+        assert_eq!(paths.len(), 56);
+        for path in paths {
+            let bytes = assets.load(&path).unwrap().expect("embedded avatar");
+            let svg = std::str::from_utf8(&bytes).expect("avatar svg is utf-8");
+            assert!(svg.contains("<svg"), "{path}");
+            assert!(svg.contains("viewBox"), "{path}");
+        }
     }
 
     #[test]

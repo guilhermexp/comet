@@ -146,6 +146,7 @@ use crate::{
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, scan_checkout},
         files_view::{file_glyph, material_icon_path},
+        subagent_avatars::codex_subagent_avatar_path,
         todos::latest_todos,
         usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows},
         widgets::{
@@ -221,6 +222,10 @@ fn open_subagent_event(chat_id: &str, row: &ChatActivityRow) -> DetailsSidebarEv
         title: row.title.clone(),
         frozen: row.status != WorkflowTaskStatus::Running,
     }
+}
+
+fn subagent_row_avatar_path(row_id: &str, theme: &Theme) -> &'static str {
+    codex_subagent_avatar_path(row_id, theme.appearance)
 }
 
 fn open_worker_event(chat_id: &str, worker: &ChatWorkerRow) -> DetailsSidebarEvent {
@@ -983,6 +988,7 @@ impl DetailsSidebar {
         let row_id = row.id.clone();
         let event = open_subagent_event(&chat_id, &row);
         let doc_id = row.id.clone();
+        let avatar_path = subagent_row_avatar_path(&row.id, theme);
         let status = self.render_activity_status(
             row.status,
             SharedString::from(format!("subagent-status-{}", row.id)),
@@ -1011,11 +1017,7 @@ impl DetailsSidebar {
                     cx.emit(event.clone());
                 }
             }))
-            .child(
-                icons::icon(icons::BOT)
-                    .size(px(14.0))
-                    .text_color(theme.text_muted),
-            )
+            .child(icons::icon(avatar_path).size(px(14.0)))
             .child(status)
             .child(
                 div()
@@ -1766,7 +1768,7 @@ mod tests {
     use super::{
         ContextFileAccess, DetailsSidebarEvent, DetailsSidebarPreferences, DetailsSidebarState,
         context_file_access, details_sidebar_background, open_subagent_event, open_worker_event,
-        worker_click_event,
+        subagent_row_avatar_path, worker_click_event,
     };
     use crate::details_sidebar::chat_workers::{ChatActivityRow, ChatWorkerRow, WorkerSemantic};
     use crate::details_sidebar::context::{DetailsContext, DetailsMode, DetailsTab};
@@ -1788,6 +1790,16 @@ mod tests {
     fn sidebar_background_is_inherited_from_the_chat_surface() {
         assert_eq!(details_sidebar_background(&Theme::dark()), None);
         assert_eq!(details_sidebar_background(&Theme::light()), None);
+    }
+
+    #[test]
+    fn subagent_row_uses_seeded_codex_avatar() {
+        let dark = subagent_row_avatar_path("subagent-1", &Theme::dark());
+        let light = subagent_row_avatar_path("subagent-1", &Theme::light());
+
+        assert_eq!(dark, "icons/subagents/codex/23-dark.svg");
+        assert_eq!(light, "icons/subagents/codex/23-light.svg");
+        assert_ne!(dark, crate::icons::BOT);
     }
 
     #[test]
