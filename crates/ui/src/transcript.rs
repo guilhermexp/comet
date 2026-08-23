@@ -1334,6 +1334,10 @@ fn format_reasoning_elapsed(duration_ms: u64) -> String {
     format_execution_duration(duration_ms)
 }
 
+fn reasoning_is_open(pinned: Option<bool>, _active: bool) -> bool {
+    pinned.unwrap_or(true)
+}
+
 fn should_render_mermaid(block: &Block, streaming: bool) -> bool {
     !streaming && crate::inline_media::mermaid_source(block).is_some()
 }
@@ -4272,11 +4276,8 @@ impl Transcript {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self
-            .folds
-            .get(row_id)
-            .and_then(|fold| fold.open)
-            .unwrap_or(active);
+        let open = self.folds.get(row_id).and_then(|fold| fold.open);
+        let open = reasoning_is_open(open, active);
         let label = if active {
             let started = *self
                 .reasoning_started
@@ -4308,7 +4309,7 @@ impl Transcript {
                 cx.notify();
             }))
             .child(
-                crate::icons::icon(crate::icons::STAR_BOLD)
+                crate::icons::icon(crate::icons::THOUGHT_SPARKLE)
                     .size(px(13.0))
                     .text_color(if active {
                         theme.text_muted
@@ -6165,6 +6166,20 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use zeron_doc::MessagePart;
+
+    #[test]
+    fn reasoning_defaults_open() {
+        for (pinned, active, expected) in [
+            (None, true, true),
+            (None, false, true),
+            (Some(false), true, false),
+            (Some(false), false, false),
+            (Some(true), true, true),
+            (Some(true), false, true),
+        ] {
+            assert_eq!(reasoning_is_open(pinned, active), expected);
+        }
+    }
 
     #[test]
     fn selection_scroll_ramps_at_viewport_edges() {

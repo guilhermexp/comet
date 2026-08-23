@@ -166,6 +166,8 @@ icon_assets![
     // favorited state and the picker's favorites rail tab.
     (STAR, "star"),
     (STAR_BOLD, "star-bold"),
+    // Dedicated singular four-point sparkle for reasoning/Thought headers.
+    (THOUGHT_SPARKLE, "thought-sparkle"),
     (ZERON_LOGO, "zeron-logo"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
