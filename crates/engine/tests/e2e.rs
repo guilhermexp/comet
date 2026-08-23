@@ -2148,7 +2148,14 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
         done(DoneStatus::Completed),
     ];
     let dir = tempfile::tempdir().unwrap();
-    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script,
+            step_delay: Duration::from_millis(10),
+            hang_until_interrupt: false,
+        }),
+    );
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
         handle.doc(),
@@ -2170,6 +2177,10 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
     let all = entries(&core);
     // Segment one: text + the (unresolved-at-boundary) tool chip.
     assert_eq!(all[1].parts.len(), 2, "{:#?}", all[1].parts);
+    assert!(
+        all[1].duration_ms.is_some_and(|duration| duration > 0),
+        "the segment finalized by Steered must persist its elapsed duration"
+    );
     // Segment two: ONE contiguous text part, no spliced chip.
     assert_eq!(
         all[2].parts,
@@ -2303,10 +2314,6 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
         .filter(|entry| entry.role == MessageRole::Assistant)
         .collect::<Vec<_>>();
     assert_eq!(assistant_entries.len(), 2);
-    assert!(
-        assistant_entries[0].duration_ms.is_some(),
-        "the first completed segment must persist duration before the parked steer"
-    );
     assert!(
         assistant_entries[1]
             .duration_ms
