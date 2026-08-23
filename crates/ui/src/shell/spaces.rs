@@ -1325,9 +1325,7 @@ impl Shell {
                 .cloned()
                 .collect()
         };
-        rows.sort_by(|left, right| {
-            compare_sidebar_chats(self.settings.sidebar_sort, left, right)
-        });
+        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
         if rows.is_empty() {
             return None;
         }
