@@ -806,6 +806,87 @@ async fn deterministic_queue_command_id_is_returned_and_executes_once() {
 }
 
 #[tokio::test]
+async fn fetch_tool_input_returns_journal_body_only_for_the_local_chat_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
+        .unwrap();
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request("write the file"),
+            Some("fetch-input-user".into()),
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            })
+        },
+        "write tool to settle",
+    )
+    .await;
+
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .call(
+            zeron_rpc::methods::FETCH_TOOL_INPUT,
+            serde_json::json!({
+                "chatId": CHAT,
+                "toolCallId": "tool-1",
+                "targetDeviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply["snapshot"]["path"], "/tmp/x");
+    assert_eq!(reply["snapshot"]["content"], "SECRET");
+    let missing = client
+        .call(
+            zeron_rpc::methods::FETCH_TOOL_INPUT,
+            serde_json::json!({
+                "chatId": CHAT,
+                "toolCallId": "missing",
+                "targetDeviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(missing["snapshot"].is_null());
+
+    core.workspace
+        .create_chat(
+            "remote-chat",
+            None,
+            Some("other-device"),
+            None,
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let error = client
+        .call(
+            zeron_rpc::methods::FETCH_TOOL_INPUT,
+            serde_json::json!({
+                "chatId": "remote-chat",
+                "toolCallId": "tool-1",
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("another device"));
+}
+
+#[tokio::test]
 async fn worker_notification_rejects_a_deleted_parent_without_creating_an_orphan_doc() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(

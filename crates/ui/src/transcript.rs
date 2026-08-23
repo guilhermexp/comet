@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
     ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
-    Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas,
-    div, img, list, prelude::*, px, quad,
+    Point, ScrollHandle, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
+    Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{
@@ -291,6 +291,7 @@ impl StickSpring {
 /// One tool invocation inside a group row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolItem {
+    pub id: SharedString,
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
@@ -713,6 +714,13 @@ fn visit_row_ids(row: &Row, visit: &mut impl FnMut(&SharedString)) {
     }
 }
 
+fn row_contains_id(row: &Row, id: &SharedString) -> bool {
+    if &row.id == id {
+        return true;
+    }
+    matches!(&row.kind, RowKind::TurnSteps { rows, .. } if rows.iter().any(|row| row_contains_id(row, id)))
+}
+
 #[cfg(test)]
 fn row_render_ids(row: &Row) -> Vec<SharedString> {
     let mut ids = Vec::new();
@@ -730,6 +738,54 @@ fn live_turn_step_ids(rows: &[Row]) -> std::collections::HashSet<SharedString> {
 fn prune_turn_steps_state(state: &mut HashMap<SharedString, bool>, rows: &[Row]) {
     let live = live_turn_step_ids(rows);
     state.retain(|id, _| live.contains(id));
+}
+
+fn collect_file_change_ids(row: &Row, live: &mut std::collections::HashSet<SharedString>) {
+    match &row.kind {
+        RowKind::FileChange { .. } => {
+            live.insert(row.id.clone());
+        }
+        RowKind::TurnSteps { rows, .. } => {
+            for child in rows.iter() {
+                collect_file_change_ids(child, live);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn live_file_change_ids(rows: &[Row]) -> std::collections::HashSet<SharedString> {
+    let mut live = std::collections::HashSet::new();
+    for row in rows {
+        collect_file_change_ids(row, &mut live);
+    }
+    live
+}
+
+fn file_change_path(call: &ToolCall) -> Option<&str> {
+    match call {
+        ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+fn file_open_target(
+    context_key: &str,
+    cwd: &str,
+    path: &str,
+) -> Option<(String, std::path::PathBuf, String)> {
+    let root = std::path::PathBuf::from(cwd);
+    let candidate = std::path::Path::new(path);
+    let relative = if candidate.is_absolute() {
+        candidate
+            .strip_prefix(&root)
+            .ok()?
+            .to_string_lossy()
+            .to_string()
+    } else {
+        path.to_string()
+    };
+    Some((context_key.to_string(), root, relative))
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -870,6 +926,7 @@ fn last_todo_snapshot(entry: &SessionMessageEntry) -> Option<&[TodoItem]> {
 fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool) -> u64 {
     let mut acc = Vec::with_capacity(tools.len() * 8 + 2);
     for t in tools {
+        acc.extend_from_slice(t.id.as_bytes());
         let (label, detail) = tool_chip_content(&t.call);
         acc.extend_from_slice(label.as_bytes());
         acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
@@ -1270,6 +1327,7 @@ fn rows_for_entry_with_todo_history(
                     todo_history.clear();
                 }
                 let item = ToolItem {
+                    id: tool_id.clone().into(),
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
@@ -1285,8 +1343,7 @@ fn rows_for_entry_with_todo_history(
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                 };
                 let is_file_change =
-                    matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. })
-                        && (item.file_preview.is_some() || streaming);
+                    matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
                 if is_file_change {
                     flush_group(
                         &mut rows,
@@ -2331,6 +2388,11 @@ pub struct Transcript {
     /// recently (click "Show full output" after a diff → see the output).
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
+    file_change_open: HashMap<SharedString, bool>,
+    file_change_inputs: HashMap<SharedString, FileInputLoad>,
+    file_change_scrolls: HashMap<SharedString, ScrollHandle>,
+    journal_chat_id: Option<String>,
+    journal_parent_tool_use_id: Option<String>,
     _observe: Subscription,
 }
 
@@ -2340,6 +2402,16 @@ enum BlobFetch {
     /// Failed with the affordance re-armed as a retry.
     Failed,
     Ready(Arc<ToolDetail>),
+}
+
+enum FileInputLoad {
+    Loading(#[allow(dead_code)] Task<()>),
+    Failed,
+    Ready(Arc<zeron_proto::FileToolInputSnapshot>),
+}
+
+fn file_input_should_fetch(load: Option<&FileInputLoad>) -> bool {
+    matches!(load, None | Some(FileInputLoad::Failed))
 }
 
 enum InlineImageLoad {
@@ -2385,6 +2457,11 @@ enum MermaidSnapshot {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    OpenFile {
+        context_key: String,
+        root: std::path::PathBuf,
+        relative_path: String,
+    },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -2392,6 +2469,7 @@ pub enum TranscriptEvent {
     OpenSubagent {
         chat_id: String,
         doc_id: String,
+        parent_tool_use_id: String,
         title: String,
         frozen: bool,
     },
@@ -2401,7 +2479,7 @@ impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
 
 impl Transcript {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        Self::build(state, None, true, cx)
+        Self::build(state, None, None, None, true, cx)
     }
 
     /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
@@ -2412,16 +2490,27 @@ impl Transcript {
     /// at the end once, unpinned, and free-scrolls from there.
     pub fn for_doc(
         state: Entity<AppState>,
+        journal_chat_id: String,
+        parent_tool_use_id: String,
         doc_id: String,
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(doc_id), follow, cx)
+        Self::build(
+            state,
+            Some(doc_id),
+            Some(journal_chat_id),
+            Some(parent_tool_use_id),
+            follow,
+            cx,
+        )
     }
 
     fn build(
         state: Entity<AppState>,
         doc_override: Option<String>,
+        journal_chat_id: Option<String>,
+        journal_parent_tool_use_id: Option<String>,
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2522,6 +2611,11 @@ impl Transcript {
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
+            file_change_open: HashMap::new(),
+            file_change_inputs: HashMap::new(),
+            file_change_scrolls: HashMap::new(),
+            journal_chat_id,
+            journal_parent_tool_use_id,
             _observe: observe,
         };
         this.sync(cx);
@@ -3272,6 +3366,9 @@ impl Transcript {
             self.tree_cache.clear();
             self.folds.clear();
             self.turn_steps_open.clear();
+            self.file_change_open.clear();
+            self.file_change_inputs.clear();
+            self.file_change_scrolls.clear();
             self.reasoning_started.clear();
             self.reasoning_tick = None;
             self.inline_images.clear();
@@ -3340,6 +3437,13 @@ impl Transcript {
                 .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
         });
         prune_turn_steps_state(&mut self.turn_steps_open, &new_rows);
+        let live_file_changes = live_file_change_ids(&new_rows);
+        self.file_change_open
+            .retain(|id, _| live_file_changes.contains(id));
+        self.file_change_inputs
+            .retain(|id, _| live_file_changes.contains(id));
+        self.file_change_scrolls
+            .retain(|id, _| live_file_changes.contains(id));
 
         let was_empty = self.rows.is_empty();
         let old_last = self.rows.len().checked_sub(1);
@@ -3517,6 +3621,118 @@ impl Transcript {
             .ok();
         });
         self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
+    }
+
+    fn spawn_file_input_fetch(
+        &mut self,
+        row_id: SharedString,
+        chat_id: String,
+        tool_call_id: String,
+        target_device_id: String,
+        parent_tool_use_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !file_input_should_fetch(self.file_change_inputs.get(&row_id)) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.file_change_inputs
+                .insert(row_id, FileInputLoad::Failed);
+            return;
+        };
+        let fetch_key = row_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                zeron_rpc::methods::FETCH_TOOL_INPUT,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "toolCallId": tool_call_id,
+                    "targetDeviceId": target_device_id,
+                    "parentToolUseId": parent_tool_use_id,
+                }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let loaded = match reply {
+                Ok(value) => value
+                    .get("snapshot")
+                    .cloned()
+                    .filter(|value| !value.is_null())
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .map(|snapshot| FileInputLoad::Ready(Arc::new(snapshot)))
+                    .unwrap_or(FileInputLoad::Failed),
+                Err(_) => FileInputLoad::Failed,
+            };
+            this.update(cx, |this, cx| {
+                this.file_change_inputs.insert(fetch_key.clone(), loaded);
+                this.remeasure_row_containing(&fetch_key);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.file_change_inputs
+            .insert(row_id, FileInputLoad::Loading(task));
+    }
+
+    fn toggle_file_change(
+        &mut self,
+        row_id: SharedString,
+        tool_call_id: String,
+        can_expand: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !can_expand {
+            return;
+        }
+        let open = self.file_change_open.get(&row_id).copied().unwrap_or(false);
+        self.file_change_open.insert(row_id.clone(), !open);
+        self.file_change_scrolls
+            .entry(row_id.clone())
+            .or_insert_with(ScrollHandle::new);
+        if !open {
+            let target = self.file_fetch_target(cx);
+            if let Some((chat_id, target_device_id, parent_tool_use_id)) = target {
+                self.spawn_file_input_fetch(
+                    row_id.clone(),
+                    chat_id,
+                    tool_call_id,
+                    target_device_id,
+                    parent_tool_use_id,
+                    cx,
+                );
+            } else {
+                self.file_change_inputs
+                    .insert(row_id.clone(), FileInputLoad::Failed);
+            }
+        }
+        self.remeasure_row_containing(&row_id);
+        cx.notify();
+    }
+
+    fn file_fetch_target(&self, cx: &Context<Self>) -> Option<(String, String, Option<String>)> {
+        let state = self.state.read(cx);
+        let chat_id = self
+            .journal_chat_id
+            .as_deref()
+            .or(self.chat_id.as_deref())?;
+        let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
+        Some((
+            chat_id.to_string(),
+            chat.device_id.clone(),
+            self.journal_parent_tool_use_id.clone(),
+        ))
+    }
+
+    fn remeasure_row_containing(&mut self, row_id: &SharedString) {
+        if let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| row_contains_id(row, row_id))
+        {
+            self.list.remeasure_items(index..index + 1);
+        }
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
@@ -4646,14 +4862,7 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
-            RowKind::FileChange { tool } => self.render_tool_group(
-                &row.id,
-                &Arc::new(vec![tool.clone()]),
-                !tool.resolved,
-                !tool.resolved,
-                &theme,
-                cx,
-            ),
+            RowKind::FileChange { tool } => self.render_file_change(&row.id, tool, &theme, cx),
             RowKind::TurnSteps {
                 rows,
                 summary,
@@ -4670,6 +4879,325 @@ impl Transcript {
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         }
+    }
+
+    fn render_file_change(
+        &mut self,
+        row_id: &SharedString,
+        tool: &ToolItem,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::file_change::{
+            FILE_CARD_HEADER_HEIGHT, display_snapshot_preview, effective_file_path,
+            file_card_action, file_card_body_height, file_card_can_expand,
+        };
+
+        let Some(call_path) = file_change_path(&tool.call) else {
+            return gpui::Empty.into_any_element();
+        };
+        let kind = tool
+            .file_preview
+            .as_ref()
+            .map(|preview| preview.kind)
+            .unwrap_or_else(|| match tool.call {
+                ToolCall::EditFile { .. } => zeron_doc::FileChangeKind::Edit,
+                _ => zeron_doc::FileChangeKind::Write,
+            });
+        let loaded = self.file_change_inputs.get(row_id);
+        let loaded_snapshot = match loaded {
+            Some(FileInputLoad::Ready(snapshot)) => Some(snapshot.clone()),
+            _ => None,
+        };
+        let path = effective_file_path(call_path, loaded_snapshot.as_deref());
+        let full_preview = loaded_snapshot.as_deref().and_then(|snapshot| {
+            display_snapshot_preview(kind, snapshot, tool.file_preview.as_deref())
+        });
+        let preview = full_preview
+            .as_ref()
+            .or_else(|| tool.file_preview.as_deref());
+        let can_expand = file_card_can_expand(tool.resolved, preview.is_some());
+        let open = can_expand && self.file_change_open.get(row_id).copied().unwrap_or(false);
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let open_target = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .and_then(|chat| file_open_target(&chat.id, chat.cwd.as_deref()?, path))
+        };
+
+        let row_toggle = row_id.clone();
+        let tool_id = tool.id.to_string();
+        let mut header = div()
+            .id(SharedString::from(format!("{row_id}#file-header")))
+            .h(px(FILE_CARD_HEADER_HEIGHT))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(10.0))
+            .cursor(if can_expand {
+                gpui::CursorStyle::PointingHand
+            } else {
+                gpui::CursorStyle::Arrow
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_file_change(row_toggle.clone(), tool_id.clone(), can_expand, cx)
+            }))
+            .child(
+                crate::icons::icon(crate::icons::DOCUMENT_ADD)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            );
+        let file_label = div()
+            .id(SharedString::from(format!("{row_id}#filename")))
+            .min_w_0()
+            .flex_1()
+            .truncate()
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .cursor_pointer()
+            .when_some(open_target, |label, (context_key, root, relative_path)| {
+                label.on_click(cx.listener(move |_this, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(TranscriptEvent::OpenFile {
+                        context_key: context_key.clone(),
+                        root: root.clone(),
+                        relative_path: relative_path.clone(),
+                    });
+                }))
+            })
+            .child(filename);
+        header = header.child(file_label);
+        if tool.resolved {
+            if let Some(preview) = preview {
+                header = header
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(theme.success_muted)
+                            .child(format!("+{}", preview.additions)),
+                    )
+                    .when(preview.deletions > 0, |header| {
+                        header.child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.danger_muted)
+                                .child(format!("-{}", preview.deletions)),
+                        )
+                    });
+            }
+        } else {
+            header = header.child(crate::loaders::mini_mono_spinner(
+                format!("{row_id}#file-spinner"),
+                2.0,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ));
+        }
+        header = header.child(
+            div()
+                .flex_none()
+                .text_size(px(10.0))
+                .text_color(if tool.is_error {
+                    theme.danger_muted
+                } else {
+                    theme.text_muted
+                })
+                .child(file_card_action(kind, tool.resolved, tool.is_error)),
+        );
+        if can_expand {
+            header = header.child(
+                crate::icons::icon(if open {
+                    crate::icons::ALT_ARROW_DOWN
+                } else {
+                    crate::icons::ALT_ARROW_RIGHT
+                })
+                .size(px(13.0))
+                .text_color(theme.text_muted),
+            );
+        }
+
+        let mut card = div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.09))
+            .bg(crate::theme::ink(0.025))
+            .child(header);
+
+        if let Some(preview) = preview {
+            let line_height = 20.0;
+            let marker_height = if !open && preview.truncated_before > 0 {
+                line_height
+            } else {
+                0.0
+            };
+            let content_height = marker_height + preview.lines.len() as f32 * line_height;
+            let body_height = file_card_body_height(open, content_height);
+            let source = preview
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let highlights = if tool.resolved {
+                zeron_syntax::language_for_path(path).and_then(|language| {
+                    self.highlights
+                        .request(row_id.clone(), 0, language, &source, cx)
+                })
+            } else {
+                None
+            };
+            let scroll = self
+                .file_change_scrolls
+                .entry(row_id.clone())
+                .or_insert_with(ScrollHandle::new)
+                .clone();
+            let body_toggle = row_id.clone();
+            let body_tool = tool.id.to_string();
+            let mut body = div()
+                .id(SharedString::from(format!("{row_id}#file-body")))
+                .h(px(body_height))
+                .min_h_0()
+                .w_full()
+                .border_t_1()
+                .border_color(crate::theme::hairline(0.07))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .line_height(px(line_height))
+                .when(can_expand, |body| {
+                    body.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_file_change(
+                                body_toggle.clone(),
+                                body_tool.clone(),
+                                true,
+                                cx,
+                            )
+                        }))
+                })
+                .when(open, |body| body.overflow_y_scroll().track_scroll(&scroll))
+                .when(!open, |body| body.overflow_hidden());
+            if !open && preview.truncated_before > 0 {
+                body = body.child(
+                    div()
+                        .h(px(line_height))
+                        .flex_none()
+                        .px(px(10.0))
+                        .text_color(theme.text_faint)
+                        .italic()
+                        .child(format!("… {} earlier lines", preview.truncated_before)),
+                );
+            }
+            body = body.children(preview.lines.iter().enumerate().map(|(index, line)| {
+                let (wash, rail, text_color) = match line.kind {
+                    zeron_doc::FileChangeLineKind::Added => (
+                        theme.success_muted.opacity(0.055),
+                        theme.success_muted.opacity(0.75),
+                        theme.success_muted,
+                    ),
+                    zeron_doc::FileChangeLineKind::Removed => (
+                        theme.danger_muted.opacity(0.055),
+                        theme.danger_muted.opacity(0.75),
+                        theme.danger_muted,
+                    ),
+                    zeron_doc::FileChangeLineKind::Context => (
+                        gpui::transparent_black(),
+                        gpui::transparent_black(),
+                        theme.text_muted,
+                    ),
+                };
+                let spans = highlights
+                    .as_ref()
+                    .and_then(|document| document.lines.get(index))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let runs = render::runs_for_syntax_line_with_plain(
+                    &line.text,
+                    spans,
+                    &gpui::font(theme.font_mono.clone()),
+                    text_color,
+                    theme,
+                );
+                div()
+                    .h(px(line_height))
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .border_l_1()
+                    .border_color(rail)
+                    .bg(wash)
+                    .px(px(9.0))
+                    .overflow_hidden()
+                    .child(StyledText::new(line.text.clone()).with_runs(runs))
+            }));
+
+            if open {
+                let status = match loaded {
+                    Some(FileInputLoad::Loading(_)) => Some(("Loading full content…", false)),
+                    Some(FileInputLoad::Failed) => Some(("Full content unavailable · Retry", true)),
+                    Some(FileInputLoad::Ready(snapshot)) if snapshot.truncated => {
+                        Some(("Preview limited to 1 MiB", false))
+                    }
+                    _ => None,
+                };
+                if let Some((label, retry)) = status {
+                    let retry_row = row_id.clone();
+                    let retry_tool = tool.id.to_string();
+                    let retry_target = self.file_fetch_target(cx);
+                    let mut status_row = div()
+                        .id(SharedString::from(format!("{row_id}#file-status")))
+                        .h(px(24.0))
+                        .flex_none()
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.5))
+                        .text_color(if retry {
+                            theme.danger_muted
+                        } else {
+                            theme.text_faint
+                        });
+                    if retry {
+                        status_row = status_row.cursor_pointer().on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some((chat_id, target_device_id, parent_tool_use_id)) =
+                                    retry_target.clone()
+                                {
+                                    this.spawn_file_input_fetch(
+                                        retry_row.clone(),
+                                        chat_id,
+                                        retry_tool.clone(),
+                                        target_device_id,
+                                        parent_tool_use_id,
+                                        cx,
+                                    );
+                                }
+                            },
+                        ));
+                    }
+                    body = body.child(status_row.child(label));
+                }
+            }
+            card = card.child(body);
+        }
+        card.into_any_element()
     }
 
     fn render_turn_steps(
@@ -5506,8 +6034,13 @@ impl Transcript {
                 // subagent's transcript as a right-pane tab (the shell hosts
                 // the surface — the chip only announces which doc it indexes).
                 if let Some(doc_id) = &tool.subagent_ref {
-                    let chat_id = self.chat_id.clone().unwrap_or_default();
+                    let chat_id = self
+                        .journal_chat_id
+                        .clone()
+                        .or_else(|| self.chat_id.clone())
+                        .unwrap_or_default();
                     let doc_id = doc_id.clone();
+                    let parent_tool_use_id = tool.id.clone();
                     let title = subagent_tab_title(&tool.call);
                     let frozen = matches!(
                         tool.subagent_status,
@@ -5520,6 +6053,7 @@ impl Transcript {
                             cx.emit(TranscriptEvent::OpenSubagent {
                                 chat_id: chat_id.clone(),
                                 doc_id: doc_id.to_string(),
+                                parent_tool_use_id: parent_tool_use_id.to_string(),
                                 title: title.to_string(),
                                 frozen,
                             });
@@ -7513,7 +8047,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_completed_path_only_write_keeps_generic_fallback() {
+    fn completed_path_only_write_keeps_the_file_card_without_inventing_a_body() {
         let entry = assistant(
             "legacy-file-change",
             MessageStatus::Complete,
@@ -7522,9 +8056,54 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert!(matches!(
             &rows[0].kind,
-            RowKind::ToolGroup { tools, .. }
-                if tools.len() == 1 && tools[0].file_preview.is_none()
+            RowKind::FileChange { tool } if tool.file_preview.is_none()
         ));
+    }
+
+    #[test]
+    fn file_change_state_survives_inside_turn_steps_and_prunes_with_its_row() {
+        let entry = assistant(
+            "file-change-state",
+            MessageStatus::Complete,
+            vec![
+                write_file_part("write-1", true, Some(two_line_write_preview())),
+                text_part("answer", "Done."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let live = live_file_change_ids(&rows);
+        assert!(live.contains("file-change-state#write-1"));
+
+        let mut open = HashMap::from([
+            (SharedString::from("file-change-state#write-1"), true),
+            (SharedString::from("removed#write-2"), true),
+        ]);
+        open.retain(|id, _| live.contains(id));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open.get("file-change-state#write-1"), Some(&true));
+    }
+
+    #[test]
+    fn file_input_fetch_is_single_flight_cached_and_retryable() {
+        assert!(file_input_should_fetch(None));
+        assert!(file_input_should_fetch(Some(&FileInputLoad::Failed)));
+        let ready = FileInputLoad::Ready(Arc::new(zeron_proto::FileToolInputSnapshot {
+            path: "notes/new.txt".into(),
+            content: Some("body".into()),
+            old_string: None,
+            new_string: None,
+            truncated: false,
+        }));
+        assert!(!file_input_should_fetch(Some(&ready)));
+    }
+
+    #[test]
+    fn filename_open_target_is_workspace_jailed_and_separate_from_fold_state() {
+        let target = file_open_target("chat", "/repo", "src/main.rs").unwrap();
+        assert_eq!(target.0, "chat");
+        assert_eq!(target.1, std::path::PathBuf::from("/repo"));
+        assert_eq!(target.2, "src/main.rs");
+        assert!(file_open_target("chat", "/repo", "/outside/secret.txt").is_none());
     }
 
     #[test]
@@ -8803,6 +9382,7 @@ mod tests {
     #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
+            id: format!("exec-{c}").into(),
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
@@ -8817,6 +9397,7 @@ mod tests {
             subagent_tail: None,
         };
         let edit = |p: &str| ToolItem {
+            id: format!("edit-{p}").into(),
             call: ToolCall::EditFile {
                 path: p.into(),
                 old_string: None,
@@ -8855,6 +9436,7 @@ mod tests {
         // Reads / searches / misc.
         let tools = vec![
             ToolItem {
+                id: "read-x".into(),
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
@@ -8869,6 +9451,7 @@ mod tests {
                 subagent_tail: None,
             },
             ToolItem {
+                id: "glob-rs".into(),
                 call: ToolCall::Glob {
                     pattern: "*.rs".into(),
                 },
@@ -8885,6 +9468,7 @@ mod tests {
                 subagent_tail: None,
             },
             ToolItem {
+                id: "web-q".into(),
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,

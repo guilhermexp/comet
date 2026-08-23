@@ -308,6 +308,29 @@ struct FetchToolBlobParams {
     blob_ref: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchToolInputParams {
+    chat_id: String,
+    tool_call_id: String,
+    #[serde(default)]
+    parent_tool_use_id: Option<String>,
+}
+
+const FILE_TOOL_INPUT_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+const FILE_TOOL_INPUT_ENVELOPE_RESERVE: usize = 32;
+
+fn require_file_tool_input_owner(
+    chat_device_id: Option<&str>,
+    local_device_id: &str,
+) -> Result<(), RpcError> {
+    match chat_device_id {
+        Some(device_id) if device_id == local_device_id => Ok(()),
+        Some(_) => Err(RpcError::Failed("chat belongs to another device".into())),
+        None => Err(RpcError::Failed("chat not found".into())),
+    }
+}
+
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -890,6 +913,7 @@ fn forward_deadline(method: &str) -> std::time::Duration {
             Duration::from_secs(15 * 60)
         }
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        methods::FETCH_TOOL_INPUT => Duration::from_secs(20),
         _ => Duration::from_secs(30),
     }
 }
@@ -953,6 +977,7 @@ fn forwardable(method: &str) -> bool {
             | methods::UPLOAD_CHUNK
             | methods::UPLOAD_COMMIT
             | methods::READ_ATTACHMENT_CHUNK
+            | methods::FETCH_TOOL_INPUT
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
@@ -1926,6 +1951,27 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "text": text }))
             }
+            methods::FETCH_TOOL_INPUT => {
+                let p: FetchToolInputParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                require_file_tool_input_owner(
+                    chat.as_ref().map(|chat| chat.device_id.as_str()),
+                    self.doc_host.device_id(),
+                )?;
+                let snapshot = self
+                    .sessions
+                    .file_tool_input(
+                        &p.chat_id,
+                        &p.tool_call_id,
+                        p.parent_tool_use_id.as_deref(),
+                        FILE_TOOL_INPUT_RESPONSE_MAX_BYTES - FILE_TOOL_INPUT_ENVELOPE_RESERVE,
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "snapshot": snapshot }))
+            }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
@@ -1960,6 +2006,7 @@ mod tests {
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(forwardable(methods::FETCH_TOOL_INPUT));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
     }
 
@@ -1985,6 +2032,17 @@ mod tests {
             forward_deadline(methods::QUEUE_COMMAND),
             Duration::from_secs(30)
         );
+        assert_eq!(
+            forward_deadline(methods::FETCH_TOOL_INPUT),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn fetch_tool_input_owner_requires_an_existing_local_chat() {
+        assert!(require_file_tool_input_owner(Some("dev-a"), "dev-a").is_ok());
+        assert!(require_file_tool_input_owner(Some("dev-b"), "dev-a").is_err());
+        assert!(require_file_tool_input_owner(None, "dev-a").is_err());
     }
 
     #[test]

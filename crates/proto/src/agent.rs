@@ -248,6 +248,19 @@ pub struct ToolDiff {
     pub new_text: String,
 }
 
+/// Sanitized historical input for one Write/Edit tool call. This type crosses
+/// the engine/UI RPC boundary only; complete bodies never enter synchronized
+/// session documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileToolInputSnapshot {
+    pub path: String,
+    pub content: Option<String>,
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
@@ -525,6 +538,25 @@ mod tests {
         assert_eq!(value["execution"]["exitCode"], 0);
         assert_eq!(value["execution"]["durationMs"], 1_250);
         assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
+
+    #[test]
+    fn file_tool_input_snapshot_uses_camel_case_wire_fields() {
+        let snapshot = FileToolInputSnapshot {
+            path: "src/main.rs".into(),
+            content: None,
+            old_string: Some("before".into()),
+            new_string: Some("after".into()),
+            truncated: false,
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["oldString"], "before");
+        assert_eq!(value["newString"], "after");
+        assert!(value.get("old_string").is_none());
+        assert_eq!(
+            serde_json::from_value::<FileToolInputSnapshot>(value).unwrap(),
+            snapshot
+        );
     }
 
     #[test]

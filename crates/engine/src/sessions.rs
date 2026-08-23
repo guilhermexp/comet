@@ -229,6 +229,21 @@ impl SessionsEngine {
         }
     }
 
+    pub fn file_tool_input(
+        &self,
+        chat_id: &str,
+        tool_call_id: &str,
+        parent_tool_use_id: Option<&str>,
+        max_bytes: usize,
+    ) -> Result<Option<zeron_proto::FileToolInputSnapshot>, crate::run_journal::JournalError> {
+        self.inner.journal.file_tool_input_scoped(
+            chat_id,
+            tool_call_id,
+            parent_tool_use_id,
+            max_bytes,
+        )
+    }
+
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
     pub fn set_doc_host(&self, host: DocHost) {

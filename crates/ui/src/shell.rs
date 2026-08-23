@@ -1450,9 +1450,28 @@ impl Shell {
                     title,
                     frozen,
                 } => {
+                    let prefix = format!("{chat_id}--sub--");
+                    let parent_tool_use_id = {
+                        let state = this.state.read(cx);
+                        state
+                            .transcript
+                            .iter()
+                            .flat_map(|entry| entry.parts.iter())
+                            .find_map(|part| match part {
+                                zeron_doc::MessagePart::Tool {
+                                    id,
+                                    subagent_ref: Some(reference),
+                                    ..
+                                } if reference == doc_id => Some(id.clone()),
+                                _ => None,
+                            })
+                            .or_else(|| doc_id.strip_prefix(&prefix).map(str::to_owned))
+                            .unwrap_or_else(|| doc_id.clone())
+                    };
                     this.add_subagent_surface(
                         chat_id.clone(),
                         doc_id.clone(),
+                        parent_tool_use_id,
                         title.clone(),
                         *frozen,
                         cx,
@@ -2565,15 +2584,27 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match event {
+            TranscriptEvent::OpenFile {
+                context_key,
+                root,
+                relative_path,
+            } => self.open_preview_surface(
+                context_key.clone(),
+                root.clone(),
+                relative_path.clone(),
+                cx,
+            ),
             TranscriptEvent::OpenSubagent {
                 chat_id,
                 doc_id,
+                parent_tool_use_id,
                 title,
                 frozen,
             } => {
                 self.add_subagent_surface(
                     chat_id.clone(),
                     doc_id.clone(),
+                    parent_tool_use_id.clone(),
                     title.clone(),
                     *frozen,
                     cx,
@@ -2590,6 +2621,7 @@ impl Shell {
         &mut self,
         chat_id: String,
         doc_id: String,
+        parent_tool_use_id: String,
         title: String,
         frozen: bool,
         cx: &mut Context<Self>,
@@ -2614,8 +2646,19 @@ impl Shell {
         let id = self.subagent_seq;
         // A live subagent follows its streaming end (main-transcript feel);
         // a frozen one reads top-down.
-        let transcript =
-            cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
+        let transcript_chat_id = chat_id.clone();
+        let transcript_doc_id = doc_id.clone();
+        let transcript_state = self.state.clone();
+        let transcript = cx.new(move |cx| {
+            Transcript::for_doc(
+                transcript_state,
+                transcript_chat_id,
+                parent_tool_use_id,
+                transcript_doc_id,
+                !frozen,
+                cx,
+            )
+        });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
         let fetch = if frozen {
             self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)

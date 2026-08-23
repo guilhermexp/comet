@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-O vocabulário que todo mundo fala: `AgentEvent`, `ToolCall`, `RunRequest`, `Model`, entidades, snapshots device-local de usage (`AgentUsageWindow`/`AgentUsageLine`) e envelopes de RPC (serde, framing ndjson). Além dos tipos, o módulo `view` guarda as **derivações puras** que UI e engine precisam concordar — ordenação, gating de staleness, agrupamento, boot gate.
+O vocabulário que todo mundo fala: `AgentEvent`, `ToolCall`, `RunRequest`, `Model`, `FileToolInputSnapshot` sanitizado, entidades, snapshots device-local de usage (`AgentUsageWindow`/`AgentUsageLine`) e envelopes de RPC (serde, framing ndjson). Além dos tipos, o módulo `view` guarda as **derivações puras** que UI e engine precisam concordar — ordenação, gating de staleness, agrupamento, boot gate.
 
 ## Ownership
 

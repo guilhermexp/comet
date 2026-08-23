@@ -22,6 +22,7 @@ pub mod comments;
 pub mod composer;
 pub mod details_sidebar;
 pub mod edge_fade;
+pub mod file_change;
 pub mod file_preview;
 pub mod frost;
 pub mod history;

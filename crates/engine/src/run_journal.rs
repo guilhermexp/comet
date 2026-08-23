@@ -18,7 +18,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::AgentEvent;
+use zeron_proto::{AgentEvent, FileToolInputSnapshot, ToolCall, ToolDiff};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -170,6 +170,104 @@ impl RunJournal {
         Ok(read_lines(&path)?.into_iter().next_back())
     }
 
+    /// Return only the historical input fields needed to render a Write/Edit
+    /// card. The synchronized doc never carries these bodies; this lookup is
+    /// local to the device that owns the append-only journal.
+    pub fn file_tool_input(
+        &self,
+        chat_id: &str,
+        tool_call_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<FileToolInputSnapshot>, JournalError> {
+        self.file_tool_input_scoped(chat_id, tool_call_id, None, max_bytes)
+    }
+
+    pub fn file_tool_input_scoped(
+        &self,
+        chat_id: &str,
+        tool_call_id: &str,
+        parent_tool_use_id: Option<&str>,
+        max_bytes: usize,
+    ) -> Result<Option<FileToolInputSnapshot>, JournalError> {
+        let events = self.replay(chat_id, 0)?;
+        let mut authoritative_diff: Option<ToolDiff> = None;
+        let mut path_only_fallback: Option<FileToolInputSnapshot> = None;
+        for (_, event) in events.into_iter().rev() {
+            let event = match (parent_tool_use_id, event) {
+                (None, AgentEvent::Subagent { .. }) => continue,
+                (None, event) => event,
+                (Some(scope), event) => match event_in_subagent_scope(event, scope) {
+                    Some(event) => event,
+                    None => continue,
+                },
+            };
+            match event {
+                AgentEvent::ToolResult {
+                    id,
+                    diff: Some(diff),
+                    ..
+                } if id == tool_call_id && authoritative_diff.is_none() => {
+                    authoritative_diff = Some(diff);
+                }
+                AgentEvent::ToolCall { id, call } if id == tool_call_id => {
+                    let (mut snapshot, has_complete_body) = match call {
+                        ToolCall::WriteFile { path, content } => {
+                            let has_complete_body = content.is_some();
+                            (
+                                FileToolInputSnapshot {
+                                    path,
+                                    content,
+                                    old_string: None,
+                                    new_string: None,
+                                    truncated: false,
+                                },
+                                has_complete_body,
+                            )
+                        }
+                        ToolCall::EditFile {
+                            path,
+                            old_string,
+                            new_string,
+                        } => {
+                            let has_complete_body = old_string.is_some() && new_string.is_some();
+                            (
+                                FileToolInputSnapshot {
+                                    path,
+                                    content: None,
+                                    old_string,
+                                    new_string,
+                                    truncated: false,
+                                },
+                                has_complete_body,
+                            )
+                        }
+                        _ => return Ok(None),
+                    };
+                    if let Some(diff) = authoritative_diff.take() {
+                        snapshot.path = diff.path;
+                        snapshot.content = None;
+                        snapshot.old_string = diff.old_text;
+                        snapshot.new_string = Some(diff.new_text);
+                        cap_file_snapshot_serialized(&mut snapshot, max_bytes);
+                        return Ok(Some(snapshot));
+                    }
+                    if has_complete_body {
+                        cap_file_snapshot_serialized(&mut snapshot, max_bytes);
+                        return Ok(Some(snapshot));
+                    }
+                    path_only_fallback.get_or_insert(snapshot);
+                }
+                _ => {}
+            }
+        }
+        if let Some(mut snapshot) = path_only_fallback {
+            cap_file_snapshot_serialized(&mut snapshot, max_bytes);
+            Ok(Some(snapshot))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
@@ -201,6 +299,106 @@ impl RunJournal {
             std::fs::remove_file(path)?;
         }
         Ok(())
+    }
+}
+
+fn event_in_subagent_scope(event: AgentEvent, scope: &str) -> Option<AgentEvent> {
+    match event {
+        AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } if parent_tool_use_id == scope => Some(*event),
+        AgentEvent::Subagent { event, .. } => event_in_subagent_scope(*event, scope),
+        _ => None,
+    }
+}
+
+fn truncate_utf8_bytes(value: &mut String, max_bytes: usize) -> bool {
+    if value.len() <= max_bytes {
+        return false;
+    }
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    true
+}
+
+fn cap_file_snapshot(snapshot: &mut FileToolInputSnapshot, max_bytes: usize) {
+    if let Some(content) = snapshot.content.as_mut() {
+        snapshot.truncated |= truncate_utf8_bytes(content, max_bytes);
+        return;
+    }
+
+    match (snapshot.old_string.as_mut(), snapshot.new_string.as_mut()) {
+        (Some(old), Some(new)) => {
+            let total = old.len().saturating_add(new.len());
+            if total <= max_bytes {
+                return;
+            }
+            let old_budget = if total == 0 {
+                0
+            } else {
+                ((max_bytes as u128 * old.len() as u128) / total as u128) as usize
+            };
+            let new_budget = max_bytes.saturating_sub(old_budget);
+            snapshot.truncated |= truncate_utf8_bytes(old, old_budget);
+            snapshot.truncated |= truncate_utf8_bytes(new, new_budget);
+        }
+        (Some(old), None) => snapshot.truncated |= truncate_utf8_bytes(old, max_bytes),
+        (None, Some(new)) => snapshot.truncated |= truncate_utf8_bytes(new, max_bytes),
+        (None, None) => {}
+    }
+}
+
+fn cap_file_snapshot_serialized(snapshot: &mut FileToolInputSnapshot, max_bytes: usize) {
+    cap_file_snapshot(snapshot, max_bytes);
+    loop {
+        let serialized = serde_json::to_vec(snapshot).map_or(usize::MAX, |value| value.len());
+        if serialized <= max_bytes {
+            break;
+        }
+        let overflow = serialized.saturating_sub(max_bytes);
+        // JSON escaping expands one input byte by at most six bytes (`\u00XX`).
+        // Remove the minimum safe raw chunk and remeasure the actual envelope.
+        let reduction = overflow.div_ceil(6).max(1);
+        let lengths = [
+            snapshot.path.len(),
+            snapshot.content.as_ref().map_or(0, String::len),
+            snapshot.old_string.as_ref().map_or(0, String::len),
+            snapshot.new_string.as_ref().map_or(0, String::len),
+        ];
+        let Some((field, length)) = lengths
+            .into_iter()
+            .enumerate()
+            .max_by_key(|(_, length)| *length)
+        else {
+            break;
+        };
+        if length == 0 {
+            break;
+        }
+        let budget = length.saturating_sub(reduction);
+        let truncated = match field {
+            0 => truncate_utf8_bytes(&mut snapshot.path, budget),
+            1 => snapshot
+                .content
+                .as_mut()
+                .is_some_and(|value| truncate_utf8_bytes(value, budget)),
+            2 => snapshot
+                .old_string
+                .as_mut()
+                .is_some_and(|value| truncate_utf8_bytes(value, budget)),
+            _ => snapshot
+                .new_string
+                .as_mut()
+                .is_some_and(|value| truncate_utf8_bytes(value, budget)),
+        };
+        snapshot.truncated |= truncated;
+        if !truncated {
+            break;
+        }
     }
 }
 
@@ -347,5 +545,271 @@ mod tests {
         let all = journal.replay("chat-1", 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].0, 2);
+    }
+
+    #[test]
+    fn file_tool_input_returns_newest_progressive_write_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for content in ["first", "first\nsecond"] {
+            journal
+                .append(
+                    "chat",
+                    &AgentEvent::ToolCall {
+                        id: "write-1".into(),
+                        call: zeron_proto::ToolCall::WriteFile {
+                            path: "notes/new.txt".into(),
+                            content: Some(content.into()),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        journal.append("chat", &done()).unwrap();
+
+        let snapshot = journal
+            .file_tool_input("chat", "write-1", 1_048_576)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.path, "notes/new.txt");
+        assert_eq!(snapshot.content.as_deref(), Some("first\nsecond"));
+        assert!(!snapshot.truncated);
+    }
+
+    #[test]
+    fn file_tool_input_keeps_richer_progressive_body_after_path_only_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for content in [Some("first\nsecond"), None] {
+            journal
+                .append(
+                    "chat",
+                    &AgentEvent::ToolCall {
+                        id: "write-1".into(),
+                        call: zeron_proto::ToolCall::WriteFile {
+                            path: "notes/new.txt".into(),
+                            content: content.map(str::to_owned),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+
+        let snapshot = journal
+            .file_tool_input("chat", "write-1", 1_048_576)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.content.as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn file_tool_input_supports_edit_and_authoritative_result_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "edit-1".into(),
+                    call: zeron_proto::ToolCall::EditFile {
+                        path: "src/main.rs".into(),
+                        old_string: Some("before".into()),
+                        new_string: Some("speculative".into()),
+                    },
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolResult {
+                    id: "edit-1".into(),
+                    is_error: false,
+                    output: None,
+                    diff: Some(zeron_proto::ToolDiff {
+                        path: "src/main.rs".into(),
+                        old_text: Some("before".into()),
+                        new_text: "authoritative".into(),
+                    }),
+                    execution: None,
+                },
+            )
+            .unwrap();
+
+        let snapshot = journal
+            .file_tool_input("chat", "edit-1", 1_048_576)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.content, None);
+        assert_eq!(snapshot.old_string.as_deref(), Some("before"));
+        assert_eq!(snapshot.new_string.as_deref(), Some("authoritative"));
+    }
+
+    #[test]
+    fn file_tool_input_rejects_non_file_calls_and_missing_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "exec-1".into(),
+                    call: zeron_proto::ToolCall::Exec {
+                        command: "cat secret".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            journal
+                .file_tool_input("chat", "exec-1", 1_048_576)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            journal
+                .file_tool_input("chat", "missing", 1_048_576)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn file_tool_input_scopes_nested_subagent_tool_ids_by_parent_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for (parent, content) in [("spawn-a", "alpha"), ("spawn-b", "beta")] {
+            journal
+                .append(
+                    "chat",
+                    &AgentEvent::Subagent {
+                        parent_tool_use_id: parent.into(),
+                        event: Box::new(AgentEvent::ToolCall {
+                            id: "write-1".into(),
+                            call: zeron_proto::ToolCall::WriteFile {
+                                path: "notes/new.txt".into(),
+                                content: Some(content.into()),
+                            },
+                        }),
+                    },
+                )
+                .unwrap();
+        }
+        journal
+            .append(
+                "chat",
+                &AgentEvent::Subagent {
+                    parent_tool_use_id: "spawn-root".into(),
+                    event: Box::new(AgentEvent::Subagent {
+                        parent_tool_use_id: "spawn-nested".into(),
+                        event: Box::new(AgentEvent::ToolCall {
+                            id: "write-1".into(),
+                            call: zeron_proto::ToolCall::WriteFile {
+                                path: "notes/new.txt".into(),
+                                content: Some("gamma".into()),
+                            },
+                        }),
+                    }),
+                },
+            )
+            .unwrap();
+
+        let snapshot = journal
+            .file_tool_input_scoped("chat", "write-1", Some("spawn-a"), 1_048_576)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.content.as_deref(), Some("alpha"));
+        let nested = journal
+            .file_tool_input_scoped("chat", "write-1", Some("spawn-nested"), 1_048_576)
+            .unwrap()
+            .unwrap();
+        assert_eq!(nested.content.as_deref(), Some("gamma"));
+        assert_eq!(
+            journal
+                .file_tool_input("chat", "write-1", 1_048_576)
+                .unwrap(),
+            None,
+            "unscoped parent transcript lookup must not leak nested input"
+        );
+    }
+
+    #[test]
+    fn file_tool_input_caps_utf8_content_without_splitting_a_scalar() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "write-1".into(),
+                    call: zeron_proto::ToolCall::WriteFile {
+                        path: "wide.txt".into(),
+                        content: Some("é".repeat(100)),
+                    },
+                },
+            )
+            .unwrap();
+
+        let snapshot = journal
+            .file_tool_input("chat", "write-1", 128)
+            .unwrap()
+            .unwrap();
+        let content = snapshot.content.unwrap();
+        assert!(snapshot.truncated);
+        assert!(!content.is_empty());
+        assert!(content.len() <= 128);
+        assert!(content.is_char_boundary(content.len()));
+    }
+
+    #[test]
+    fn file_tool_input_enforces_the_one_mib_response_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "write-large".into(),
+                    call: zeron_proto::ToolCall::WriteFile {
+                        path: "large.txt".into(),
+                        content: Some("é".repeat(600_000)),
+                    },
+                },
+            )
+            .unwrap();
+
+        let snapshot = journal
+            .file_tool_input("chat", "write-large", 1_048_576)
+            .unwrap()
+            .unwrap();
+        let content = snapshot.content.unwrap();
+        assert!(snapshot.truncated);
+        assert!(content.len() <= 1_048_576);
+        assert!(content.is_char_boundary(content.len()));
+    }
+
+    #[test]
+    fn file_tool_input_caps_the_serialized_snapshot_not_only_raw_body_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "write-escaped".into(),
+                    call: zeron_proto::ToolCall::WriteFile {
+                        path: "escaped.txt".into(),
+                        content: Some("\u{0001}".repeat(1_000)),
+                    },
+                },
+            )
+            .unwrap();
+
+        let snapshot = journal
+            .file_tool_input("chat", "write-escaped", 1_024)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.truncated);
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= 1_024);
     }
 }
