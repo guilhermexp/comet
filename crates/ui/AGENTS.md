@@ -26,6 +26,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - `crates/ui/src/terminal/` é o **painel de terminal dentro do app**. Não confundir com o `crates/tui` deletado (viewport ratatui do upstream, removido).
 - Presença de terminal se reconcilia por `reconcile_terminal_presence` + evento. Dispatchar `ToggleTerminal` no fechamento da última aba (como o upstream faz) dispara em dobro aqui.
 - Provider autenticado fica expansível quando houver janela remota **ou** linha de usage local. `NoUsage` significa que ambas estão vazias; linhas locais de 24h/7d/30d continuam acessíveis sem quota remota. Providers managed renderam na ordem fixa Claude, Codex, Kimi; Kimi reusa a marca embutida `WORKER_KIMI` e não tem ação de login/add/switch em Accounts.
+- Overflow do widget Details: o card Workers mantém o viewport interno compacto de 152px de scroll. Labels de workflow, subagent e progresso precisam ser normalizados para uma linha visual antes de entrar em rows de altura fixa; label multilinha cru causa sobreposição de texto e é proibido.
 - Activities do widget Workers começam colapsadas; toggles explícitos permanecem keyed pelo id estável. Linhas de subagent preservam avatar e status lifecycle, incluindo spinner paint-only durante `Running`.
 - Linhas do To-dos usam um único slot circular não encolhível, com check/seta
   centralizados nos dois eixos e a mesma geometria `36/12/9` do card inline;

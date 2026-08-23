@@ -141,7 +141,7 @@ use crate::{
     details_sidebar::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
-            activity_tasks_from_entries, project_chat_workers,
+            activity_tasks_from_entries, compact_activity_label, project_chat_workers,
         },
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, scan_checkout},
@@ -829,7 +829,7 @@ impl DetailsSidebar {
                             .border_color(theme.border.opacity(0.55))
                             .text_size(px(10.0))
                             .text_color(theme.text_muted)
-                            .child(title.clone()),
+                            .child(compact_activity_label(title)),
                     );
                 }
                 WorkflowProgressNode::Agent {
@@ -853,7 +853,7 @@ impl DetailsSidebar {
                                 .border_color(theme.border.opacity(0.55))
                                 .text_size(px(10.0))
                                 .text_color(theme.text_muted)
-                                .child(title.clone()),
+                                .child(compact_activity_label(title)),
                         );
                     }
                     let state_color = match state.as_deref() {
@@ -885,7 +885,7 @@ impl DetailsSidebar {
                                     .truncate()
                                     .text_size(px(11.0))
                                     .text_color(theme.text)
-                                    .child(label.clone()),
+                                    .child(compact_activity_label(label)),
                             )
                             .when_some(model.clone(), |line, model| {
                                 line.child(
