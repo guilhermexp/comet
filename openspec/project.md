@@ -4,7 +4,7 @@
 
 Controlador multi-device de coding agents (Claude Code / Codex). Cada máquina roda uma **engine** (daemon Rust) que sincroniza sessões via CRDT **Loro** através de **Durable Objects** na Cloudflare: começa o agente num device, acompanha e dirige de outro; um daemon numa máquina always-on mantém o agente rodando com o laptop fechado.
 
-Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). É um rewrite nativo em Rust + gpui do comet original em TS/Electron. Paridade de features com o original **exceto display de token-usage**, excluído deliberadamente por encaixar mal em CRDT (`docs/PARITY.md`).
+Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). É um rewrite nativo em Rust + gpui do comet original em TS/Electron. O display de usage combina quotas remotas e totais locais de 24h/7d/30d como snapshots device-local de engine→UI; esses dados não entram no CRDT nem sincronizam pelo edge.
 
 ## Tech Stack
 
@@ -31,6 +31,7 @@ Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). É um rewrite n
 - **Comando é dado durável**, não chamada: send/steer/interrupt/respondInput viram entradas no ledger do session doc, executadas pelo device host do chat.
 - **Um protocolo só** para in-process, daemon local e device remoto — o modo in-process roda sobre duplex em memória sem atalho de serialização.
 - **Regra derivada compartilhada** entre UI e engine mora em `comet-proto::view`, nunca duplicada nos dois lados.
+- **Usage de provider fica fora do CRDT**: `AgentAccountsSnapshot` carrega janelas remotas e linhas locais apenas pelo RPC engine→UI.
 - Mapa de onde editar: `AGENTS.md` na raiz e por subárvore (DOX).
 
 ### Testing Strategy

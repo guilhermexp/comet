@@ -18,6 +18,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Terminal: `OpenTerminal` roda o **shell de login interativo**, que volta ao prompt em vez de sair. Sem terminar o shell, `TerminalEvent::Exit` nunca é carimbado e quem espera o fim nunca completa. Payload que funciona: `exec /bin/sh -c '<script quotado>'`.
 - Nada de bloqueio em contexto async (`rpc.rs`, `repos.rs` já cobraram esse preço). Trabalho síncrono vai pra `spawn_blocking` com timeout.
 - Auth passa pelo edge (WorkOS): a engine não guarda segredo de OAuth próprio.
+- Usage de providers combina janelas remotas com totais locais limitados de arquivos Claude/Codex. Esses snapshots são device-local e trafegam só no RPC engine→UI; nunca entram no session doc nem no sync.
 
 ## Work Guidance
 

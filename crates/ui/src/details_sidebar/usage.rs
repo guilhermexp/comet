@@ -189,7 +189,7 @@ pub fn provider_usage_rows(
             harness,
             label,
             account_id: Some(account.id.clone()),
-            state: if windows.is_empty() {
+            state: if windows.is_empty() && account.usage_lines.is_empty() {
                 ProviderUsageState::NoUsage
             } else {
                 ProviderUsageState::Ready
@@ -205,7 +205,9 @@ pub fn provider_usage_rows(
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use zeron_proto::{AgentAccount, AgentAccountsSnapshot, AgentUsageWindow, HarnessId};
+    use zeron_proto::{
+        AgentAccount, AgentAccountsSnapshot, AgentUsageLine, AgentUsageWindow, HarnessId,
+    };
 
     use super::{ProviderUsageState, derive_usage_pace, provider_usage_rows};
 
@@ -294,6 +296,29 @@ mod tests {
         assert_eq!(rows[0].weekly_summary.as_deref(), Some("Weekly 52%"));
         assert_eq!(rows[1].label, "Codex");
         assert_eq!(rows[1].weekly_summary.as_deref(), Some("Weekly 54%"));
+    }
+
+    #[test]
+    fn local_usage_lines_keep_provider_ready_without_remote_windows() {
+        let mut codex = account("codex-local", HarnessId::Codex, true, vec![]);
+        codex.usage_lines = vec![AgentUsageLine {
+            label: "24h".into(),
+            value: "12K tokens".into(),
+            subtitle: Some("2 recent sessions".into()),
+        }];
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![codex],
+            warnings: Vec::new(),
+        };
+
+        let rows = provider_usage_rows(&snapshot, Utc::now());
+        let codex = rows
+            .iter()
+            .find(|row| row.harness == HarnessId::Codex)
+            .unwrap();
+
+        assert_eq!(codex.state, ProviderUsageState::Ready);
+        assert_eq!(codex.usage_lines[0].label, "24h");
     }
 
     #[test]
