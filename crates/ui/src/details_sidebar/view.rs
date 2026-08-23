@@ -989,12 +989,6 @@ impl DetailsSidebar {
         let event = open_subagent_event(&chat_id, &row);
         let doc_id = row.id.clone();
         let avatar_path = subagent_row_avatar_path(&row.id, theme);
-        let status = self.render_activity_status(
-            row.status,
-            SharedString::from(format!("subagent-status-{}", row.id)),
-            theme,
-            cx,
-        );
         let transcript = div()
             .id(SharedString::from(format!("subagent-open-{}", row.id)))
             .min_w_0()
@@ -1022,7 +1016,6 @@ impl DetailsSidebar {
                     .size(px(14.0))
                     .object_fit(ObjectFit::Contain),
             )
-            .child(status)
             .child(
                 div()
                     .min_w_0()
