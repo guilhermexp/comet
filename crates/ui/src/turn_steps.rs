@@ -53,11 +53,15 @@ pub fn plan_turn_steps(
     if last_text <= last_tool {
         return None;
     }
+    let prefix = &parts[..last_text];
+    if prefix.iter().any(is_unsettled_part) {
+        return None;
+    }
 
     Some(TurnStepsPlan {
         split_before_part: last_text,
         mode: TurnStepsMode::FinalAnswer,
-        summary: turn_summary(&parts[..last_text]),
+        summary: turn_summary(prefix),
     })
 }
 
@@ -198,7 +202,7 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
         "agent" | "task" | "create_agent" | "spawn_agent" | "spawn_subagent" => {
             ActivityBucket::Agent
         }
-        name if name.starts_with("agent:") => ActivityBucket::Agent,
+        name if name.starts_with("agent:") || name.starts_with("task:") => ActivityBucket::Agent,
         "skill" => ActivityBucket::Skill,
         "read" | "grep" | "glob" | "search" => ActivityBucket::Read,
         "websearch" | "web_search" | "webfetch" | "web_fetch" => ActivityBucket::Search,
@@ -405,6 +409,33 @@ mod tests {
     }
 
     #[test]
+    fn settled_turn_never_folds_unsettled_prefix_activity() {
+        for status in [MessageStatus::Complete, MessageStatus::Aborted] {
+            let unresolved_cases = vec![
+                tool("active-tool", exec("cargo check"), false),
+                input("active-input", false),
+                reasoning("active-reasoning", false),
+                running_subagent("active-subagent"),
+            ];
+
+            for unsettled in unresolved_cases {
+                let parts = vec![
+                    tool("read", read("src/lib.rs"), true),
+                    unsettled,
+                    text("answer", "Final answer"),
+                ];
+
+                assert_eq!(
+                    plan_turn_steps(&parts, Some(status)),
+                    None,
+                    "settled {status:?} must keep {} visible",
+                    parts[1].id()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn streaming_turn_keeps_all_concurrent_unresolved_tools_visible() {
         let parts = vec![
             tool("old", exec("cargo check"), true),
@@ -583,6 +614,17 @@ mod tests {
         ];
 
         assert_eq!(activity_breakdown(&parts), "1 agent, 1 skill, 1 command");
+    }
+
+    #[test]
+    fn activity_breakdown_classifies_acp_task_description_as_agent() {
+        let parts = vec![tool(
+            "task",
+            unknown("Task: Inspect authentication paths", None),
+            true,
+        )];
+
+        assert_eq!(activity_breakdown(&parts), "1 agent");
     }
 
     #[test]
