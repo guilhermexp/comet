@@ -59,12 +59,6 @@ pub(crate) enum KimiUsageError {
     UsagePayload,
 }
 
-impl KimiUsageError {
-    fn warning(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Intentionally has no `Debug` or `Display`: those representations could
 /// accidentally expose the tokens. `raw` preserves forward-compatible fields
 /// when a refresh rotates the known OAuth values.
@@ -128,7 +122,7 @@ impl KimiUsageSnapshot {
         Self {
             present,
             usage_windows: Vec::new(),
-            warning: Some(error.warning()),
+            warning: Some(error.to_string()),
         }
     }
 }
@@ -675,27 +669,20 @@ impl CredentialLock {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|_| KimiUsageError::LockUnavailable)?;
 
-        for attempt in 0..=backoff.len() {
-            loop {
-                let result =
-                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if result == 0 {
-                    return Ok(Self { file });
+        let mut delays = backoff.iter();
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            match (error.raw_os_error(), delays.next()) {
+                (Some(code), Some(delay)) if code == libc::EINTR || code == libc::EWOULDBLOCK => {
+                    std::thread::sleep(*delay);
                 }
-                let error = std::io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(code)
-                        if (code == libc::EINTR || code == libc::EWOULDBLOCK)
-                            && attempt < backoff.len() =>
-                    {
-                        std::thread::sleep(backoff[attempt]);
-                        break;
-                    }
-                    _ => return Err(KimiUsageError::LockUnavailable),
-                }
+                _ => return Err(KimiUsageError::LockUnavailable),
             }
         }
-        Err(KimiUsageError::LockUnavailable)
     }
 
     #[cfg(not(unix))]

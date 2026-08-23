@@ -52,7 +52,7 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageLine, AgentUsageWindow, HarnessId,
 };
 
 use crate::kimi_usage::KimiUsage;
@@ -400,84 +400,119 @@ impl AgentAccounts {
             }
         }
 
+        let (claude_accounts, codex_accounts, cursor_accounts) = tokio::join!(
+            self.provider_accounts(
+                HarnessId::ClaudeCode,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+            self.provider_accounts(
+                HarnessId::Codex,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+            self.provider_accounts(
+                HarnessId::Cursor,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+        );
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
-        let mut accounts: Vec<AgentAccount> = Vec::new();
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Cursor] {
-            let active_key = active_keys.get(&harness).cloned();
-            let slots = self.read_slots(harness);
-            for slot in &slots {
-                let active = active_key.as_deref() == Some(slot.account_key.as_str());
-                let usage = self.usage_for(harness, slot, active, force_usage).await;
-                accounts.push(AgentAccount {
-                    id: slot.id.clone(),
-                    harness,
-                    email: Some(slot.profile.email.clone()),
-                    // A live plan from the usage probe (Codex `plan_type`)
-                    // supersedes the login-time snapshot; fall back to the
-                    // snapshot when the probe wasn't forced or failed.
-                    plan_label: usage
-                        .as_ref()
-                        .and_then(|usage| usage.plan_label.clone())
-                        .or_else(|| slot.profile.plan.clone()),
-                    active,
-                    usage_windows: usage.map(|usage| usage.windows).unwrap_or_default(),
-                    usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
-                    display_name: slot.profile.display_name.clone(),
-                    organization: slot.profile.organization.clone(),
-                    auth_kind: Some(slot.profile.auth_kind),
-                    switchable: true,
-                    saved_at: Some(slot.saved_at),
+        let mut accounts = claude_accounts;
+        accounts.extend(codex_accounts);
+        if let Some(kimi) = &kimi {
+            if let Some(message) = &kimi.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Kimi,
+                    message: message.clone(),
                 });
             }
-            // A live login whose credentials we couldn't read has no slot — still
-            // show it (active, but not re-activatable until the Keychain relents).
-            if let Some(u) = unreadable.get(&harness)
-                && !slots.iter().any(|s| s.account_key == u.account_key)
-            {
+            if kimi.present {
                 accounts.push(AgentAccount {
-                    id: slot_id_for(harness, &u.account_key),
-                    harness,
-                    email: Some(u.profile.email.clone()),
-                    plan_label: u.profile.plan.clone(),
+                    id: "kimi-code-managed".into(),
+                    harness: HarnessId::Kimi,
+                    email: None,
+                    plan_label: Some("Managed".into()),
                     active: true,
-                    usage_windows: Vec::new(),
-                    usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
-                    display_name: u.profile.display_name.clone(),
-                    organization: u.profile.organization.clone(),
-                    auth_kind: Some(u.profile.auth_kind),
+                    usage_windows: kimi.usage_windows.clone(),
+                    usage_lines: Vec::new(),
+                    display_name: Some("Kimi Code".into()),
+                    organization: None,
+                    auth_kind: Some(AgentAuthKind::Oauth),
                     switchable: false,
                     saved_at: None,
                 });
             }
-            if harness == HarnessId::Codex
-                && let Some(kimi) = &kimi
-            {
-                if let Some(message) = &kimi.warning {
-                    warnings.push(AgentAccountWarning {
-                        harness: HarnessId::Kimi,
-                        message: message.clone(),
-                    });
-                }
-                if kimi.present {
-                    accounts.push(AgentAccount {
-                        id: "kimi-code-managed".into(),
-                        harness: HarnessId::Kimi,
-                        email: None,
-                        plan_label: Some("Managed".into()),
-                        active: true,
-                        usage_windows: kimi.usage_windows.clone(),
-                        usage_lines: Vec::new(),
-                        display_name: Some("Kimi Code".into()),
-                        organization: None,
-                        auth_kind: Some(AgentAuthKind::Oauth),
-                        switchable: false,
-                        saved_at: None,
-                    });
-                }
-            }
         }
+        accounts.extend(cursor_accounts);
         Ok(AgentAccountsSnapshot { accounts, warnings })
+    }
+
+    async fn provider_accounts(
+        &self,
+        harness: HarnessId,
+        active_keys: &HashMap<HarnessId, String>,
+        unreadable: &HashMap<HarnessId, Detected>,
+        local_usage: &HashMap<HarnessId, Vec<AgentUsageLine>>,
+        force_usage: bool,
+    ) -> Vec<AgentAccount> {
+        let active_key = active_keys.get(&harness).cloned();
+        let slots = self.read_slots(harness);
+        let mut accounts = Vec::new();
+        for slot in &slots {
+            let active = active_key.as_deref() == Some(slot.account_key.as_str());
+            let usage = self.usage_for(harness, slot, active, force_usage).await;
+            accounts.push(AgentAccount {
+                id: slot.id.clone(),
+                harness,
+                email: Some(slot.profile.email.clone()),
+                // A live plan from the usage probe (Codex `plan_type`)
+                // supersedes the login-time snapshot; fall back to the
+                // snapshot when the probe wasn't forced or failed.
+                plan_label: usage
+                    .as_ref()
+                    .and_then(|usage| usage.plan_label.clone())
+                    .or_else(|| slot.profile.plan.clone()),
+                active,
+                usage_windows: usage.map(|usage| usage.windows).unwrap_or_default(),
+                usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
+                display_name: slot.profile.display_name.clone(),
+                organization: slot.profile.organization.clone(),
+                auth_kind: Some(slot.profile.auth_kind),
+                switchable: true,
+                saved_at: Some(slot.saved_at),
+            });
+        }
+        // A live login whose credentials we couldn't read has no slot — still
+        // show it (active, but not re-activatable until the Keychain relents).
+        if let Some(unreadable) = unreadable.get(&harness)
+            && !slots
+                .iter()
+                .any(|slot| slot.account_key == unreadable.account_key)
+        {
+            accounts.push(AgentAccount {
+                id: slot_id_for(harness, &unreadable.account_key),
+                harness,
+                email: Some(unreadable.profile.email.clone()),
+                plan_label: unreadable.profile.plan.clone(),
+                active: true,
+                usage_windows: Vec::new(),
+                usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
+                display_name: unreadable.profile.display_name.clone(),
+                organization: unreadable.profile.organization.clone(),
+                auth_kind: Some(unreadable.profile.auth_kind),
+                switchable: false,
+                saved_at: None,
+            });
+        }
+        accounts
     }
 
     // ── swap ────────────────────────────────────────────────────────────────
