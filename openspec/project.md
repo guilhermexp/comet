@@ -6,6 +6,11 @@ Controlador multi-device de coding agents (Claude Code / Codex). Cada máquina r
 
 Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). É um rewrite nativo em Rust + gpui do comet original em TS/Electron. O display de usage combina quotas remotas e totais locais de 24h/7d/30d como snapshots device-local de engine→UI; esses dados não entram no CRDT nem sincronizam pelo edge.
 
+Canonical domain terms live in `CONTEXT.md`. Kimi Code is Managed Provider Usage,
+not Moonshot Open Platform API billing: production fetches only
+`https://api.kimi.com/coding/v1/usages`, rejects redirects, and never exposes its
+local OAuth credential through snapshots or sync.
+
 ## Tech Stack
 
 - **Rust** edition 2024, workspace `crates/{proto,doc,sync,harness,engine,rpc,mcp,update,ui}` + `apps/comet`.
@@ -32,6 +37,7 @@ Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). É um rewrite n
 - **Um protocolo só** para in-process, daemon local e device remoto — o modo in-process roda sobre duplex em memória sem atalho de serialização.
 - **Regra derivada compartilhada** entre UI e engine mora em `comet-proto::view`, nunca duplicada nos dois lados.
 - **Usage de provider fica fora do CRDT**: `AgentAccountsSnapshot` carrega janelas remotas e linhas locais apenas pelo RPC engine→UI.
+- **Kimi Code é identidade de conta/Usage não executável** no `HarnessId`. A engine compartilha a credencial device-local restrita por permissão com locking cross-process limitado, re-leitura pós-lock e rotação atômica; janelas normalizadas com sucesso têm cache device-local de 60s.
 - Mapa de onde editar: `AGENTS.md` na raiz e por subárvore (DOX).
 
 ### Testing Strategy

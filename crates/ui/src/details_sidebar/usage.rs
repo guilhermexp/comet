@@ -35,6 +35,16 @@ pub struct ProviderUsageRow {
     pub usage_lines: Vec<AgentUsageLine>,
 }
 
+/// Provider mark plus whether the Claude brand tint applies. Kimi reuses the
+/// Workers Kimi asset; no duplicate SVG is embedded for Usage.
+pub fn usage_provider_icon(harness: HarnessId) -> (&'static str, bool) {
+    match harness {
+        HarnessId::ClaudeCode => (crate::icons::CLAUDE_MARK, true),
+        HarnessId::Kimi => (crate::icons::WORKER_KIMI, false),
+        _ => (crate::icons::OPENAI_MARK, false),
+    }
+}
+
 fn reset_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     let resets_at = resets_at?;
     let duration = resets_at.signed_duration_since(now);
@@ -134,6 +144,7 @@ pub fn provider_usage_rows(
     [
         (HarnessId::ClaudeCode, "Claude"),
         (HarnessId::Codex, "Codex"),
+        (HarnessId::Kimi, "Kimi"),
     ]
     .into_iter()
     .map(|(harness, label)| {
@@ -209,7 +220,7 @@ mod tests {
         AgentAccount, AgentAccountsSnapshot, AgentUsageLine, AgentUsageWindow, HarnessId,
     };
 
-    use super::{ProviderUsageState, derive_usage_pace, provider_usage_rows};
+    use super::{ProviderUsageState, derive_usage_pace, provider_usage_rows, usage_provider_icon};
 
     #[test]
     fn weekly_pace_reports_deficit_and_projected_exhaustion() {
@@ -252,8 +263,9 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_claude_then_codex_and_use_active_accounts() {
+    fn rows_are_claude_then_codex_then_kimi_and_use_active_accounts() {
         let reset = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
+        let rolling_reset = Utc.with_ymd_and_hms(2026, 8, 20, 15, 0, 0).unwrap();
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
                 account(
@@ -286,6 +298,23 @@ mod tests {
                         resets_at: Some(reset),
                     }],
                 ),
+                account(
+                    "kimi-managed",
+                    HarnessId::Kimi,
+                    true,
+                    vec![
+                        AgentUsageWindow {
+                            label: "Weekly".into(),
+                            used_fraction: 0.40,
+                            resets_at: Some(reset),
+                        },
+                        AgentUsageWindow {
+                            label: "5h".into(),
+                            used_fraction: 0.25,
+                            resets_at: Some(rolling_reset),
+                        },
+                    ],
+                ),
             ],
             warnings: Vec::new(),
         };
@@ -296,6 +325,13 @@ mod tests {
         assert_eq!(rows[0].weekly_summary.as_deref(), Some("Weekly 52%"));
         assert_eq!(rows[1].label, "Codex");
         assert_eq!(rows[1].weekly_summary.as_deref(), Some("Weekly 54%"));
+        assert_eq!(rows[2].label, "Kimi");
+        assert_eq!(rows[2].weekly_summary.as_deref(), Some("Weekly 60%"));
+        assert!(rows[2].windows[1].pace.is_some());
+        assert_eq!(
+            usage_provider_icon(HarnessId::Kimi),
+            (crate::icons::WORKER_KIMI, false)
+        );
     }
 
     #[test]
@@ -324,8 +360,9 @@ mod tests {
     #[test]
     fn missing_provider_account_is_explicitly_unavailable() {
         let rows = provider_usage_rows(&AgentAccountsSnapshot::default(), Utc::now());
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].state, ProviderUsageState::NotSignedIn);
         assert_eq!(rows[1].state, ProviderUsageState::NotSignedIn);
+        assert_eq!(rows[2].state, ProviderUsageState::NotSignedIn);
     }
 }

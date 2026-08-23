@@ -4,6 +4,8 @@ Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). Controlador mul
 
 Detalhe canônico de arquitetura: `ARCHITECTURE.md`. Paridade contra o app original: `docs/PARITY.md`. Inventário funcional: `FUNCTIONAL-BASELINE.html`.
 
+Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes de mexer na linguagem de provider/conta: **Managed Provider Usage** é quota de assinatura device-local, nunca billing de API nem usage sincronizado.
+
 ## Stack
 
 - **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,mcp,update,ui}` + `apps/comet`.

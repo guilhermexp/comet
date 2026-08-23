@@ -16,6 +16,7 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - Mudar shape de tipo serializado é **breaking cross-device**: dois devices em versões diferentes falam o mesmo fio. Campo novo entra opcional/`#[serde(default)]`; remoção exige change no OpenSpec.
 - `view` é puro: sem I/O, sem tokio, sem gpui. É o que permite testar a regra sem subir engine nem janela.
 - Tipos de usage são compatíveis por serde e cruzam apenas engine↔UI; não são persistidos em Loro nem sincronizados pelo edge.
+- `HarnessId` também chaveia providers device-local de conta/Usage. Uma variante não torna um runtime executável — só o registry de harness da engine publica descritores runnable. Snapshots do Kimi carregam apenas campos normalizados de conta/quota, nunca material de credencial.
 
 ## Work Guidance
 

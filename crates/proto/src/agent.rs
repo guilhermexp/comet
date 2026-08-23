@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessId {
     ClaudeCode,
     Codex,
+    /// Kimi Code managed account/Usage identity; not a runnable harness.
+    Kimi,
     Cursor,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
@@ -724,9 +726,14 @@ mod tests {
             "\"claude-code\""
         );
         assert_eq!(serde_json::to_string(&HarnessId::Omp).unwrap(), "\"omp\"");
+        assert_eq!(serde_json::to_string(&HarnessId::Kimi).unwrap(), "\"kimi\"");
         assert_eq!(
             serde_json::from_str::<HarnessId>("\"omp\"").unwrap(),
             HarnessId::Omp
+        );
+        assert_eq!(
+            serde_json::from_str::<HarnessId>("\"kimi\"").unwrap(),
+            HarnessId::Kimi
         );
     }
 }

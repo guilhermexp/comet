@@ -55,6 +55,7 @@ use zeron_proto::{
     AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 
+use crate::kimi_usage::KimiUsage;
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
 
@@ -138,6 +139,17 @@ impl AgentAccountsConfig {
 
     fn root_dir(&self) -> PathBuf {
         self.data_dir.join("agent-accounts")
+    }
+
+    /// Only the canonical production constructor may resolve the default
+    /// `~/.kimi` store. Explicit configs are test/integration seams and must
+    /// never accidentally fall through to a real user credential.
+    fn uses_detected_paths(&self) -> bool {
+        let detected = Self::detect(&self.data_dir);
+        self.claude_config_dir == detected.claude_config_dir
+            && self.claude_config_file == detected.claude_config_file
+            && self.codex_home == detected.codex_home
+            && self.cursor_sdk_auth_file == detected.cursor_sdk_auth_file
     }
 }
 
@@ -245,6 +257,8 @@ struct Inner {
     /// Slots with a token refresh in flight — a second refresh of the same
     /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
+    kimi_usage: Option<KimiUsage>,
+    kimi_setup_warning: Option<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -258,6 +272,27 @@ pub struct AgentAccounts {
 
 impl AgentAccounts {
     pub fn new(config: AgentAccountsConfig) -> Self {
+        let (kimi_usage, kimi_setup_warning) = if config.uses_detected_paths() {
+            match KimiUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+        Self::new_inner(config, kimi_usage, kimi_setup_warning)
+    }
+
+    #[cfg(test)]
+    fn new_with_kimi_usage(config: AgentAccountsConfig, kimi_usage: KimiUsage) -> Self {
+        Self::new_inner(config, Some(kimi_usage), None)
+    }
+
+    fn new_inner(
+        config: AgentAccountsConfig,
+        kimi_usage: Option<KimiUsage>,
+        kimi_setup_warning: Option<String>,
+    ) -> Self {
         // Startup sweep: a previous process that crashed mid-login leaves
         // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
         // tokens — with no owner to clean them. Reclaim them at boot.
@@ -281,6 +316,8 @@ impl AgentAccounts {
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
+                kimi_usage,
+                kimi_setup_warning,
             }),
         }
     }
@@ -292,27 +329,45 @@ impl AgentAccounts {
         if force_usage {
             lock(&self.inner.usage_cache).clear();
         }
-        let mut warnings: Vec<AgentAccountWarning> = Vec::new();
+        let mut warnings: Vec<AgentAccountWarning> = self
+            .inner
+            .kimi_setup_warning
+            .iter()
+            .cloned()
+            .map(|message| AgentAccountWarning {
+                harness: HarnessId::Kimi,
+                message,
+            })
+            .collect();
         let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
         let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
-        let mut local_usage = HashMap::new();
-        if force_usage {
-            let codex_root = self.inner.config.codex_home.join("sessions");
-            let claude_root = self.inner.config.claude_config_dir.join("projects");
-            let now = Utc::now();
-            let (codex, claude) = tokio::join!(
-                tokio::task::spawn_blocking(move || {
-                    crate::provider_usage_archive::codex_usage_lines(&codex_root, now)
-                }),
-                tokio::task::spawn_blocking(move || {
-                    crate::provider_usage_archive::claude_usage_lines(&claude_root, now)
-                }),
-            );
-            local_usage.insert(HarnessId::Codex, codex.unwrap_or_default());
-            local_usage.insert(HarnessId::ClaudeCode, claude.unwrap_or_default());
-        }
-
-        let (claude, claude_warning) = self.detect_claude().await;
+        let local_usage = async {
+            let mut usage = HashMap::new();
+            if force_usage {
+                let codex_root = self.inner.config.codex_home.join("sessions");
+                let claude_root = self.inner.config.claude_config_dir.join("projects");
+                let now = Utc::now();
+                let (codex, claude) = tokio::join!(
+                    tokio::task::spawn_blocking(move || {
+                        crate::provider_usage_archive::codex_usage_lines(&codex_root, now)
+                    }),
+                    tokio::task::spawn_blocking(move || {
+                        crate::provider_usage_archive::claude_usage_lines(&claude_root, now)
+                    }),
+                );
+                usage.insert(HarnessId::Codex, codex.unwrap_or_default());
+                usage.insert(HarnessId::ClaudeCode, claude.unwrap_or_default());
+            }
+            usage
+        };
+        let kimi = async {
+            match &self.inner.kimi_usage {
+                Some(usage) => Some(usage.snapshot(force_usage, Utc::now().timestamp()).await),
+                None => None,
+            }
+        };
+        let (local_usage, (claude, claude_warning), kimi) =
+            tokio::join!(local_usage, self.detect_claude(), kimi);
         if let Some(message) = claude_warning {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::ClaudeCode,
@@ -394,6 +449,32 @@ impl AgentAccounts {
                     switchable: false,
                     saved_at: None,
                 });
+            }
+            if harness == HarnessId::Codex
+                && let Some(kimi) = &kimi
+            {
+                if let Some(message) = &kimi.warning {
+                    warnings.push(AgentAccountWarning {
+                        harness: HarnessId::Kimi,
+                        message: message.clone(),
+                    });
+                }
+                if kimi.present {
+                    accounts.push(AgentAccount {
+                        id: "kimi-code-managed".into(),
+                        harness: HarnessId::Kimi,
+                        email: None,
+                        plan_label: Some("Managed".into()),
+                        active: true,
+                        usage_windows: kimi.usage_windows.clone(),
+                        usage_lines: Vec::new(),
+                        display_name: Some("Kimi Code".into()),
+                        organization: None,
+                        auth_kind: Some(AgentAuthKind::Oauth),
+                        switchable: false,
+                        saved_at: None,
+                    });
+                }
             }
         }
         Ok(AgentAccountsSnapshot { accounts, warnings })
@@ -1458,6 +1539,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
+        HarnessId::Kimi => "kimi",
         HarnessId::Cursor => "cursor",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
@@ -1900,6 +1982,122 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn kimi_managed_credential_is_a_non_switchable_device_local_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+        };
+        let credential = root
+            .path()
+            .join("kimi")
+            .join("credentials")
+            .join("kimi-code.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credential,
+            r#"{"access_token":"test-access-private","refresh_token":"test-refresh-private","expires_at":4102444800,"expires_in":3600}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let kimi = crate::kimi_usage::KimiUsage::from_paths(
+            credential,
+            "http://127.0.0.1:1/coding/v1".into(),
+            "http://127.0.0.1:1/api/oauth/token".into(),
+            Duration::from_millis(10),
+            [Duration::ZERO, Duration::ZERO],
+            [Duration::ZERO; 5],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_kimi_usage(config, kimi);
+
+        let snapshot = accounts.list(false).await.unwrap();
+
+        let kimi = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Kimi)
+            .unwrap();
+        assert!(kimi.active);
+        assert!(!kimi.switchable);
+        assert_eq!(kimi.auth_kind, Some(AgentAuthKind::Oauth));
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("test-access-private"));
+        assert!(!wire.contains("test-refresh-private"));
+    }
+
+    #[tokio::test]
+    async fn kimi_windows_survive_forced_then_non_forced_account_lists() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+        };
+        let credential = root
+            .path()
+            .join("kimi")
+            .join("credentials")
+            .join("kimi-code.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credential,
+            r#"{"access_token":"test-access","refresh_token":"test-refresh","expires_at":4102444800.5,"expires_in":3600.5}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"usage":{"used":"40","limit":"1000"},"limits":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let kimi = crate::kimi_usage::KimiUsage::from_paths(
+            credential,
+            format!("http://{address}/coding/v1"),
+            format!("http://{address}/api/oauth/token"),
+            Duration::from_secs(1),
+            [Duration::ZERO, Duration::ZERO],
+            [Duration::ZERO; 5],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_kimi_usage(config, kimi);
+
+        let forced = accounts.list(true).await.unwrap();
+        server.await.unwrap();
+        let cached = accounts.list(false).await.unwrap();
+        let windows = |snapshot: &AgentAccountsSnapshot| {
+            snapshot
+                .accounts
+                .iter()
+                .find(|account| account.harness == HarnessId::Kimi)
+                .map(|account| account.usage_windows.len())
+        };
+
+        assert_eq!(windows(&forced), Some(1));
+        assert_eq!(windows(&cached), Some(1));
+    }
 
     #[test]
     fn plan_labels() {

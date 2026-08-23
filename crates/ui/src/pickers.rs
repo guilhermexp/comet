@@ -3751,6 +3751,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
             Some(crate::icons::claude_brand()),
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
+        HarnessId::Kimi => (crate::icons::WORKER_KIMI, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
         // Monochrome mark, tinted by the surface like OpenAI's.
         HarnessId::Grok => (crate::icons::GROK_MARK, None),

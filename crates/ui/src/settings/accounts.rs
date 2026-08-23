@@ -116,11 +116,16 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
+    (HarnessId::Kimi, "Kimi Code", "kimi"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
 ];
+
+pub fn provider_can_add(harness: HarnessId) -> bool {
+    harness != HarnessId::Kimi
+}
 
 /// Accounts of one provider, in the engine's order (slot creation). No
 /// active-first re-sort: switching accounts must not move the switched-to
@@ -893,11 +898,14 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        "Usage unavailable"
-                                    } else {
-                                        "Credentials unavailable"
-                                    })),
+                                    .child(SharedString::from(
+                                        if account.switchable || account.harness == HarnessId::Kimi
+                                        {
+                                            "Usage unavailable"
+                                        } else {
+                                            "Credentials unavailable"
+                                        },
+                                    )),
                             )
                         } else {
                             el.child(
@@ -1213,6 +1221,7 @@ impl Render for AccountsPage {
 
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
+            HarnessId::Kimi => (crate::icons::WORKER_KIMI, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
             HarnessId::Grok => (crate::icons::GROK_MARK, None),
             HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
@@ -1248,6 +1257,7 @@ impl Render for AccountsPage {
                 .map(|(harness, name, _cli)| {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
+                        HarnessId::Kimi => "accounts-skeleton-kimi",
                         HarnessId::Cursor => "accounts-skeleton-cursor",
                         _ => "accounts-skeleton-claude",
                     };
@@ -1336,6 +1346,9 @@ impl Render for AccountsPage {
                         let add_id: SharedString = format!("add-account-{name}").into();
                         let card = widgets::section_card(&theme).mt(px(8.0));
                         let empty_copy = match harness {
+                            HarnessId::Kimi => {
+                                format!("No {name} managed subscription detected on this device.")
+                            }
                             // Cursor's app login is SEPARATE from `cursor-agent
                             // login` — pointing at the CLI would send users to a
                             // sign-in that does not light this up.
@@ -1380,20 +1393,22 @@ impl Render for AccountsPage {
                                             .child(SharedString::from(name)),
                                     )
                                     .child(div().flex_1())
-                                    .child(
-                                        widgets::ghost_action(&theme)
-                                            .id(add_id)
-                                            .hover(|s| widgets::ghost_hover(&theme, s))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.start_login(harness, cx);
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from("Add account")),
-                                    ),
+                                    .when(provider_can_add(harness), |header| {
+                                        header.child(
+                                            widgets::ghost_action(&theme)
+                                                .id(add_id)
+                                                .hover(|s| widgets::ghost_hover(&theme, s))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.start_login(harness, cx);
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(crate::icons::ADD_CIRCLE)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child(SharedString::from("Add account")),
+                                        )
+                                    }),
                             )
                             .children(
                                 warnings
@@ -1445,9 +1460,9 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code, Codex, and Cursor logins on this device. Zeron \
-                         detects the live session, keeps each account backed up, and can \
-                         swap between them.",
+                        "The Claude Code, Codex, and Cursor logins plus managed Kimi Code \
+                         Usage on this device. Zeron keeps switchable accounts backed up; \
+                         Kimi authentication remains owned by its CLI.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1499,6 +1514,21 @@ mod tests {
         assert!(force_usage_for(LoadTrigger::PostLogin));
         // Switch/Forget re-lists ride the still-warm 60s cache.
         assert!(!force_usage_for(LoadTrigger::PostAction));
+    }
+
+    #[test]
+    fn managed_kimi_provider_is_visible_but_has_no_login_action() {
+        assert_eq!(
+            PROVIDERS.map(|(harness, _, _)| harness),
+            [
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Kimi,
+                HarnessId::Cursor,
+            ]
+        );
+        assert!(!provider_can_add(HarnessId::Kimi));
+        assert!(provider_can_add(HarnessId::ClaudeCode));
     }
 
     #[test]

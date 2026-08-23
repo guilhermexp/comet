@@ -23,6 +23,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Nada de bloqueio em contexto async (`rpc.rs`, `repos.rs` já cobraram esse preço). Trabalho síncrono vai pra `spawn_blocking` com timeout.
 - Auth passa pelo edge (WorkOS): a engine não guarda segredo de OAuth próprio.
 - Usage de providers combina janelas remotas com totais locais limitados de arquivos Claude/Codex. Esses snapshots são device-local e trafegam só no RPC engine→UI; nunca entram no session doc nem no sync.
+- **Kimi managed Usage:** Kimi é identidade de conta/Usage ativa e não trocável, nunca um harness executável nem login próprio do app. Produção lê só `${KIMI_SHARE_DIR:-~/.kimi}/credentials/kimi-code.json`, faz refresh sob o `kimi-code.lock` irmão com seis tentativas não bloqueantes (cinco backoffs de 1.5s), re-leitura pós-lock e substituição atômica `0600`. Requests Bearer vão só para `https://api.kimi.com/coding/v1/usages`; redirects são desabilitados. Janelas bem-sucedidas ficam 60s em cache, invalidado por force refresh, mudança/remoção de credencial ou TTL. Credencial e janelas ficam fora do Loro e do sync do edge; erros expõem só warnings seguros ao provider.
 - Context usage é last-known por chat: iniciar um novo processo preserva a última
   medição até o runtime emitir outra; update ausente nunca apaga o indicador.
 
