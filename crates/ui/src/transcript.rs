@@ -628,6 +628,7 @@ pub enum RowKind {
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
+        detail_auto_open: bool,
     },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
@@ -686,8 +687,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
-    let mut acc = Vec::with_capacity(tools.len() * 8 + 1);
+fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool) -> u64 {
+    let mut acc = Vec::with_capacity(tools.len() * 8 + 2);
     for t in tools {
         let (label, detail) = tool_chip_content(&t.call);
         acc.extend_from_slice(label.as_bytes());
@@ -745,7 +746,7 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
             acc.extend_from_slice(tail.as_bytes());
         }
     }
-    acc.push(auto_open as u8);
+    acc.push(auto_open as u8 | (detail_auto_open as u8) << 1);
     fnv1a(&acc)
 }
 
@@ -868,15 +869,17 @@ pub fn rows_for_entry(
             }
             let tools = std::mem::take(group);
             let image_paths = tool_image_paths(&tools);
-            let auto_open = streaming && last_ix == last_part_ix;
+            let auto_open = streaming;
+            let detail_auto_open = streaming && last_ix == last_part_ix;
             let current_group = *group_ix;
             rows.push(Row {
                 id: format!("{}#g{}", entry.id, current_group).into(),
-                version: tool_fingerprint(&tools, auto_open),
+                version: tool_fingerprint(&tools, auto_open, detail_auto_open),
                 turn_start: false,
                 kind: RowKind::ToolGroup {
                     tools: Arc::new(tools),
                     auto_open,
+                    detail_auto_open,
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
@@ -4066,9 +4069,11 @@ impl Transcript {
             RowKind::InlineImages { paths } => {
                 self.render_inline_image_gallery(&row.id, paths, &theme, cx)
             }
-            RowKind::ToolGroup { tools, auto_open } => {
-                self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
-            }
+            RowKind::ToolGroup {
+                tools,
+                auto_open,
+                detail_auto_open,
+            } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
@@ -4692,6 +4697,7 @@ impl Transcript {
         row_id: &SharedString,
         tools: &Arc<Vec<ToolItem>>,
         auto_open: bool,
+        detail_auto_open: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4814,7 +4820,7 @@ impl Transcript {
                 tool_detail_default_open(
                     &tool.call,
                     tool.resolved,
-                    auto_open,
+                    detail_auto_open,
                     ix + 1 == tools.len(),
                 )
             })
@@ -6806,7 +6812,10 @@ mod tests {
             ]
         );
 
-        let RowKind::ToolGroup { tools, auto_open } = &rows[1].kind else {
+        let RowKind::ToolGroup {
+            tools, auto_open, ..
+        } = &rows[1].kind
+        else {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 2);
@@ -6843,7 +6852,10 @@ mod tests {
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert_eq!(rows.len(), 1);
-        let RowKind::ToolGroup { tools, auto_open } = &rows[0].kind else {
+        let RowKind::ToolGroup {
+            tools, auto_open, ..
+        } = &rows[0].kind
+        else {
             panic!("agent group expected")
         };
         assert_eq!(tools.len(), 1);
@@ -6888,33 +6900,57 @@ mod tests {
     }
 
     #[test]
-    fn trailing_group_auto_opens_only_while_streaming() {
+    fn all_tool_groups_auto_open_only_while_streaming() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[1].kind else {
+        let RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } = rows[1].kind
+        else {
             panic!()
         };
-        assert!(auto_open, "trailing group opens while streaming");
+        assert!(auto_open, "tool group opens while streaming");
+        assert!(
+            detail_auto_open,
+            "current tool detail keeps its old default"
+        );
 
         let complete = assistant("m3", MessageStatus::Complete, parts);
         let rows = rows_for_entry(&complete, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[1].kind else {
+        let RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } = rows[1].kind
+        else {
             panic!()
         };
         assert!(!auto_open);
+        assert!(!detail_auto_open);
 
-        // A non-trailing group never auto-opens.
+        // Earlier groups in the active streaming turn stay open too.
         let mid = assistant(
             "m4",
             MessageStatus::Streaming,
             vec![tool_part("a", "ls"), text_part("t0", "hi")],
         );
         let rows = rows_for_entry(&mid, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[0].kind else {
+        let RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } = rows[0].kind
+        else {
             panic!()
         };
-        assert!(!auto_open);
+        assert!(auto_open);
+        assert!(
+            !detail_auto_open,
+            "earlier command output remains collapsed by default"
+        );
     }
 
     #[test]
