@@ -43,6 +43,7 @@ pub mod terminal;
 pub mod theme;
 pub mod tool_icons;
 pub mod transcript;
+mod turn_steps;
 pub mod workers;
 
 use std::borrow::Cow;
