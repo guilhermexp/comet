@@ -954,6 +954,36 @@ fn turn_steps_version(
     fnv1a(&bytes)
 }
 
+fn turn_steps_is_open(state: &HashMap<SharedString, bool>, id: &str) -> bool {
+    state.get(id).copied().unwrap_or(false)
+}
+
+fn toggle_turn_steps_state(state: &mut HashMap<SharedString, bool>, id: SharedString) {
+    let open = turn_steps_is_open(state, id.as_ref());
+    state.insert(id, !open);
+}
+
+fn format_turn_duration(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else if duration_ms < 60_000 {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
+    } else {
+        let seconds = duration_ms / 1_000;
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn turn_steps_duration_label(duration_ms: Option<u64>) -> Option<String> {
+    duration_ms
+        .filter(|duration_ms| *duration_ms > 0)
+        .map(format_turn_duration)
+}
+
+fn visible_turn_step_children(open: bool, rows: &[Row]) -> &[Row] {
+    if open { rows } else { &[] }
+}
+
 fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -2099,6 +2129,9 @@ pub struct Transcript {
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
+    /// Outer per-assistant disclosure state, keyed by the stable
+    /// `{entry_id}#steps` row id. Render-local and reset on chat attachment.
+    turn_steps_open: HashMap<SharedString, bool>,
     /// Detail folds (output/diff) per chip, keyed `"{row_id}#d{ix}"` — full
     /// [`FoldState`]s so detail bodies tween open/closed exactly like the
     /// group fold. Render-local like `folds` — never part of the row
@@ -2364,6 +2397,7 @@ impl Transcript {
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
+            turn_steps_open: HashMap::new(),
             tool_details: HashMap::new(),
             reasoning_started: HashMap::new(),
             reasoning_tick: None,
@@ -3158,6 +3192,7 @@ impl Transcript {
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.turn_steps_open.clear();
             self.reasoning_started.clear();
             self.reasoning_tick = None;
             self.inline_images.clear();
@@ -4192,7 +4227,106 @@ impl Transcript {
             .then(|| self.render_working_trailer(cx))
             .flatten();
 
-        let inner: AnyElement = match &row.kind {
+        let inner = self.render_row_body(&row, window, &theme, cx);
+
+        // Hover-revealed timestamp strip (zeron chat-view.tsx `Timestamp`):
+        // a RESERVED 16px lane under the entry's last row — the label only
+        // flips opacity, so revealing it never shifts the virtualizer's
+        // layout. User entries align end (under the bubble), assistant start.
+        let is_user_row = matches!(row.kind, RowKind::User { .. });
+        let hovered = self
+            .hovered_entry
+            .as_ref()
+            .is_some_and(|(_, entry)| entry == &row.entry_id);
+        // Vertical breathing room from the source: assistant text blocks sit
+        // in a `VStack padding={4}` (chat-view.tsx:183), so the strip starts
+        // 4px below the message text — the native markdown column has no such
+        // bottom padding, so the strip carries it as top inset (grown into the
+        // reserved height: reveal still never shifts layout). User rows are
+        // flush: the Timestamp follows the bubble HStack directly (VStack gap
+        // defaults to 0 in mugen), the label's centering inside the 16px lane
+        // is all the gap the original has.
+        let strip = row.timestamp.map(|ms| {
+            div()
+                .h(px(if is_user_row { 16.0 } else { 20.0 }))
+                .when(!is_user_row, |el| el.pt(px(4.0)))
+                .w_full()
+                .flex()
+                .items_center()
+                // No horizontal inset: the original's `px-1` netted out flush
+                // because its message text was inset by the same amount (group
+                // padding 4 + inner VStack 4 = 8 = group 4 + px-1 4). Here the
+                // markdown text / user bubble sit AT the content column edges,
+                // so the label must too — assistant label's left edge on the
+                // text's first-character x, user label's right edge on the
+                // bubble's right edge (user-reported 4px drift).
+                .when(is_user_row, |el| el.justify_end())
+                .when(hovered, |el| {
+                    el.child(motion::fade_quick(
+                        SharedString::from(format!("ts-{}", row.id)),
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.55))
+                            .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
+                    ))
+                })
+        });
+        let entry_id = row.entry_id.clone();
+        let row_id = row.id.clone();
+        div()
+            .id(row.id.clone())
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    let next = Some((row_id.clone(), entry_id.clone()));
+                    if this.hovered_entry != next {
+                        let entry_changed = this
+                            .hovered_entry
+                            .as_ref()
+                            .is_none_or(|(_, entry)| entry != &entry_id);
+                        this.hovered_entry = next;
+                        if entry_changed {
+                            cx.notify();
+                        }
+                    }
+                } else if this
+                    .hovered_entry
+                    .as_ref()
+                    .is_some_and(|(row, _)| row == &row_id)
+                {
+                    // Only the row that OWNS the current reveal may clear it —
+                    // a stale leave from an earlier row must not blank the
+                    // strip the newly entered row just lit.
+                    this.hovered_entry = None;
+                    cx.notify();
+                }
+            }))
+            .w_full()
+            .flex()
+            .justify_center()
+            .pt(px(top_gap))
+            .pb(px(bottom_pad))
+            // Wide gutters (zeron `px-4 @3xl:px-12`) around the 46rem column.
+            .px(px(48.0))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(MAX_CONTENT_WIDTH))
+                    .min_w_0()
+                    .child(inner)
+                    .children(strip)
+                    .children(trailer),
+            )
+            .into_any_element()
+    }
+
+    fn render_row_body(
+        &mut self,
+        row: &Row,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match &row.kind {
             RowKind::User {
                 text,
                 mentions,
@@ -4430,11 +4564,11 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
-            RowKind::TurnSteps { summary, .. } => div()
-                .text_sm()
-                .text_color(theme.text_muted)
-                .child(summary.clone())
-                .into_any_element(),
+            RowKind::TurnSteps {
+                rows,
+                summary,
+                duration_ms,
+            } => self.render_turn_steps(&row.id, rows, summary, *duration_ms, window, theme, cx),
             RowKind::TaskSnapshot {
                 items,
                 created,
@@ -4445,96 +4579,89 @@ impl Transcript {
                 input_chip(header.clone(), *resolved, &theme)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
-        };
+        }
+    }
 
-        // Hover-revealed timestamp strip (zeron chat-view.tsx `Timestamp`):
-        // a RESERVED 16px lane under the entry's last row — the label only
-        // flips opacity, so revealing it never shifts the virtualizer's
-        // layout. User entries align end (under the bubble), assistant start.
-        let is_user_row = matches!(row.kind, RowKind::User { .. });
-        let hovered = self
-            .hovered_entry
-            .as_ref()
-            .is_some_and(|(_, entry)| entry == &row.entry_id);
-        // Vertical breathing room from the source: assistant text blocks sit
-        // in a `VStack padding={4}` (chat-view.tsx:183), so the strip starts
-        // 4px below the message text — the native markdown column has no such
-        // bottom padding, so the strip carries it as top inset (grown into the
-        // reserved height: reveal still never shifts layout). User rows are
-        // flush: the Timestamp follows the bubble HStack directly (VStack gap
-        // defaults to 0 in mugen), the label's centering inside the 16px lane
-        // is all the gap the original has.
-        let strip = row.timestamp.map(|ms| {
-            div()
-                .h(px(if is_user_row { 16.0 } else { 20.0 }))
-                .when(!is_user_row, |el| el.pt(px(4.0)))
-                .w_full()
-                .flex()
-                .items_center()
-                // No horizontal inset: the original's `px-1` netted out flush
-                // because its message text was inset by the same amount (group
-                // padding 4 + inner VStack 4 = 8 = group 4 + px-1 4). Here the
-                // markdown text / user bubble sit AT the content column edges,
-                // so the label must too — assistant label's left edge on the
-                // text's first-character x, user label's right edge on the
-                // bubble's right edge (user-reported 4px drift).
-                .when(is_user_row, |el| el.justify_end())
-                .when(hovered, |el| {
-                    el.child(motion::fade_quick(
-                        SharedString::from(format!("ts-{}", row.id)),
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.55))
-                            .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
-                    ))
-                })
-        });
-        let entry_id = row.entry_id.clone();
-        let row_id = row.id.clone();
-        div()
-            .id(row.id.clone())
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered {
-                    let next = Some((row_id.clone(), entry_id.clone()));
-                    if this.hovered_entry != next {
-                        let entry_changed = this
-                            .hovered_entry
-                            .as_ref()
-                            .is_none_or(|(_, entry)| entry != &entry_id);
-                        this.hovered_entry = next;
-                        if entry_changed {
-                            cx.notify();
-                        }
-                    }
-                } else if this
-                    .hovered_entry
-                    .as_ref()
-                    .is_some_and(|(row, _)| row == &row_id)
-                {
-                    // Only the row that OWNS the current reveal may clear it —
-                    // a stale leave from an earlier row must not blank the
-                    // strip the newly entered row just lit.
-                    this.hovered_entry = None;
-                    cx.notify();
-                }
-            }))
+    fn render_turn_steps(
+        &mut self,
+        row_id: &SharedString,
+        rows: &Arc<Vec<Row>>,
+        summary: &SharedString,
+        duration_ms: Option<u64>,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = turn_steps_is_open(&self.turn_steps_open, row_id.as_ref());
+        let toggle_id = row_id.clone();
+        let mut header = div()
+            .id(SharedString::from(format!("{row_id}-hdr")))
+            .h(px(26.0))
             .w_full()
             .flex()
-            .justify_center()
-            .pt(px(top_gap))
-            .pb(px(bottom_pad))
-            // Wide gutters (zeron `px-4 @3xl:px-12`) around the 46rem column.
-            .px(px(48.0))
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(4.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .line_height(px(18.0))
+            .text_color(theme.text_muted)
+            .hover(|style| style.text_color(theme.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle_turn_steps_state(&mut this.turn_steps_open, toggle_id.clone());
+                cx.notify();
+            }))
             .child(
+                crate::icons::icon(crate::icons::CHECKLIST)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.72)),
+            )
+            .child(div().min_w_0().flex_1().truncate().child(summary.clone()));
+        if let Some(duration) = turn_steps_duration_label(duration_ms) {
+            header = header.child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(SharedString::from(duration)),
+            );
+        }
+        header = header.child(
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.06))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from(if open { "▾" } else { "▸" })),
+        );
+
+        let mut disclosure = div().w_full().flex().flex_col().child(header);
+        if open {
+            let children = visible_turn_step_children(open, rows)
+                .iter()
+                .map(|child| {
+                    let body = self.render_row_body(child, window, theme, cx);
+                    div().id(child.id.clone()).w_full().min_w_0().child(body)
+                })
+                .collect::<Vec<_>>();
+            disclosure = disclosure.child(
                 div()
                     .w_full()
-                    .max_w(px(MAX_CONTENT_WIDTH))
-                    .min_w_0()
-                    .child(inner)
-                    .children(strip)
-                    .children(trailer),
-            )
-            .into_any_element()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .children(children),
+            );
+        }
+        disclosure.into_any_element()
     }
 
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
@@ -7171,6 +7298,63 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
         assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
+    }
+
+    #[test]
+    fn turn_step_disclosures_are_closed_by_default_and_independent() {
+        let mut state = HashMap::new();
+        assert!(!turn_steps_is_open(&state, "a#steps"));
+        toggle_turn_steps_state(&mut state, "a#steps".into());
+        assert!(turn_steps_is_open(&state, "a#steps"));
+        assert!(!turn_steps_is_open(&state, "b#steps"));
+        toggle_turn_steps_state(&mut state, "a#steps".into());
+        assert!(!turn_steps_is_open(&state, "a#steps"));
+    }
+
+    #[test]
+    fn turn_duration_matches_the_reference_thresholds() {
+        assert_eq!(format_turn_duration(850), "850ms");
+        assert_eq!(format_turn_duration(12_500), "12.5s");
+        assert_eq!(format_turn_duration(125_000), "2m 5s");
+        assert_eq!(turn_steps_duration_label(None), None);
+        assert_eq!(turn_steps_duration_label(Some(0)), None);
+        assert_eq!(
+            turn_steps_duration_label(Some(12_500)).as_deref(),
+            Some("12.5s")
+        );
+    }
+
+    #[test]
+    fn turn_steps_children_mount_only_when_open_and_keep_nested_fold_state() {
+        let entry = assistant(
+            "turn-steps-render",
+            MessageStatus::Complete,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Done."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("expected disclosure row");
+        };
+        assert!(visible_turn_step_children(false, children).is_empty());
+        assert_eq!(visible_turn_step_children(true, children).len(), 1);
+
+        let child_id = children[0].id.clone();
+        let mut nested_folds = HashMap::new();
+        nested_folds.insert(
+            child_id.clone(),
+            FoldState {
+                open: Some(true),
+                ..FoldState::default()
+            },
+        );
+        let mut outer = HashMap::new();
+        toggle_turn_steps_state(&mut outer, rows[0].id.clone());
+        toggle_turn_steps_state(&mut outer, rows[0].id.clone());
+        assert_eq!(nested_folds[&child_id].open, Some(true));
+        assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
     }
 
     #[test]
