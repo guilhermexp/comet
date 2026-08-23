@@ -49,6 +49,7 @@ use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
+use crate::turn_steps::{TurnStepsMode, plan_turn_steps};
 use comet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
@@ -630,6 +631,11 @@ pub enum RowKind {
         auto_open: bool,
         detail_auto_open: bool,
     },
+    TurnSteps {
+        rows: Arc<Vec<Row>>,
+        summary: SharedString,
+        duration_ms: Option<u64>,
+    },
     TaskSnapshot {
         items: Arc<Vec<TaskSnapshotItem>>,
         created: bool,
@@ -682,6 +688,12 @@ pub struct Row {
     /// LAST row of a completed entry (user rows always; assistant rows only
     /// once streaming ends — "the turn isn't at a time yet", chat-view.tsx).
     pub timestamp: Option<i64>,
+}
+
+struct ProjectedRow {
+    source_start: usize,
+    source_end: usize,
+    row: Row,
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -891,6 +903,57 @@ fn inline_image_version(paths: &[String]) -> u64 {
     fnv1a(&bytes)
 }
 
+fn settle_turn_steps_child(row: &mut Row) {
+    let replacement = match &row.kind {
+        RowKind::LiveMarkdown { tree, block_ix } => Some(RowKind::Markdown {
+            tree: tree.clone(),
+            block_ix: *block_ix,
+        }),
+        _ => None,
+    };
+    if let Some(kind) = replacement {
+        row.kind = kind;
+    }
+    if let RowKind::ToolGroup {
+        auto_open,
+        detail_auto_open,
+        ..
+    } = &mut row.kind
+    {
+        *auto_open = false;
+        *detail_auto_open = false;
+    }
+}
+
+fn turn_steps_version(
+    mode: TurnStepsMode,
+    summary: &str,
+    duration_ms: Option<u64>,
+    rows: &[Row],
+) -> u64 {
+    let mut bytes = Vec::new();
+    bytes.push(match mode {
+        TurnStepsMode::StreamingPrefix => 0,
+        TurnStepsMode::FinalAnswer => 1,
+    });
+    bytes.extend_from_slice(&(summary.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(summary.as_bytes());
+    match duration_ms {
+        Some(duration_ms) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&duration_ms.to_le_bytes());
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for row in rows {
+        bytes.extend_from_slice(&(row.id.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(row.id.as_bytes());
+        bytes.extend_from_slice(&row.version.to_le_bytes());
+    }
+    fnv1a(&bytes)
+}
+
 fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -946,7 +1009,6 @@ fn rows_for_entry_with_todo_history(
     previous_todos: &[TodoItem],
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
 ) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
     let mut todo_history = previous_todos.to_vec();
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
@@ -995,6 +1057,10 @@ fn rows_for_entry_with_todo_history(
     // Assistant/system: split parts into block rows, folding consecutive
     // ordinary tools. Agent/spawn chips flush into their own group so they
     // never share a collapse with Reads/Runs.
+    let turn_steps_plan = (entry.role == MessageRole::Assistant)
+        .then(|| plan_turn_steps(&entry.parts, entry.status))
+        .flatten();
+    let mut rows: Vec<ProjectedRow> = Vec::new();
     let last_part_ix = entry
         .parts
         .iter()
@@ -1002,19 +1068,26 @@ fn rows_for_entry_with_todo_history(
         .unwrap_or_default();
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
+    let mut group_first_part_ix = 0usize;
     let mut group_last_part_ix = 0usize;
 
-    let flush_group =
-        |rows: &mut Vec<Row>, group: &mut Vec<ToolItem>, group_ix: &mut usize, last_ix: usize| {
-            if group.is_empty() {
-                return;
-            }
-            let tools = std::mem::take(group);
-            let image_paths = tool_image_paths(&tools);
-            let auto_open = streaming;
-            let detail_auto_open = streaming && last_ix == last_part_ix;
-            let current_group = *group_ix;
-            rows.push(Row {
+    let flush_group = |rows: &mut Vec<ProjectedRow>,
+                       group: &mut Vec<ToolItem>,
+                       group_ix: &mut usize,
+                       first_ix: usize,
+                       last_ix: usize| {
+        if group.is_empty() {
+            return;
+        }
+        let tools = std::mem::take(group);
+        let image_paths = tool_image_paths(&tools);
+        let auto_open = streaming;
+        let detail_auto_open = streaming && last_ix == last_part_ix;
+        let current_group = *group_ix;
+        rows.push(ProjectedRow {
+            source_start: first_ix,
+            source_end: last_ix,
+            row: Row {
                 id: format!("{}#g{}", entry.id, current_group).into(),
                 version: tool_fingerprint(&tools, auto_open, detail_auto_open),
                 turn_start: false,
@@ -1025,9 +1098,13 @@ fn rows_for_entry_with_todo_history(
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
-            });
-            if !image_paths.is_empty() {
-                rows.push(Row {
+            },
+        });
+        if !image_paths.is_empty() {
+            rows.push(ProjectedRow {
+                source_start: first_ix,
+                source_end: last_ix,
+                row: Row {
                     id: format!("{}#g{}.images", entry.id, current_group).into(),
                     version: inline_image_version(&image_paths),
                     turn_start: false,
@@ -1036,10 +1113,11 @@ fn rows_for_entry_with_todo_history(
                     },
                     entry_id: entry.id.clone().into(),
                     timestamp: None,
-                });
-            }
-            *group_ix += 1;
-        };
+                },
+            });
+        }
+        *group_ix += 1;
+    };
 
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
@@ -1060,6 +1138,18 @@ fn rows_for_entry_with_todo_history(
                 subagent_tail,
                 ..
             } => {
+                if turn_steps_plan
+                    .as_ref()
+                    .is_some_and(|plan| part_ix == plan.split_before_part)
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                }
                 if let ToolCall::Todo { items } = call
                     && !items.is_empty()
                 {
@@ -1067,24 +1157,29 @@ fn rows_for_entry_with_todo_history(
                         &mut rows,
                         &mut pending_group,
                         &mut group_ix,
+                        group_first_part_ix,
                         group_last_part_ix,
                     );
                     let created = todo_history.is_empty();
                     let version =
                         todo_snapshot_version(&todo_history, items, *resolved, *is_error, created);
                     let display_items = task_snapshot_items(&todo_history, items, created);
-                    rows.push(Row {
-                        id: format!("{}#{}", entry.id, tool_id).into(),
-                        version,
-                        turn_start: false,
-                        kind: RowKind::TaskSnapshot {
-                            items: Arc::new(display_items),
-                            created,
-                            resolved: *resolved,
-                            is_error: *is_error,
+                    rows.push(ProjectedRow {
+                        source_start: part_ix,
+                        source_end: part_ix,
+                        row: Row {
+                            id: format!("{}#{}", entry.id, tool_id).into(),
+                            version,
+                            turn_start: false,
+                            kind: RowKind::TaskSnapshot {
+                                items: Arc::new(display_items),
+                                created,
+                                resolved: *resolved,
+                                is_error: *is_error,
+                            },
+                            entry_id: entry.id.clone().into(),
+                            timestamp: None,
                         },
-                        entry_id: entry.id.clone().into(),
-                        timestamp: None,
                     });
                     todo_history.clone_from(items);
                     continue;
@@ -1116,8 +1211,12 @@ fn rows_for_entry_with_todo_history(
                         &mut rows,
                         &mut pending_group,
                         &mut group_ix,
+                        group_first_part_ix,
                         group_last_part_ix,
                     );
+                }
+                if pending_group.is_empty() {
+                    group_first_part_ix = part_ix;
                 }
                 pending_group.push(item);
                 group_last_part_ix = part_ix;
@@ -1131,6 +1230,7 @@ fn rows_for_entry_with_todo_history(
                     &mut rows,
                     &mut pending_group,
                     &mut group_ix,
+                    group_first_part_ix,
                     group_last_part_ix,
                 );
                 match other {
@@ -1155,36 +1255,44 @@ fn rows_for_entry_with_todo_history(
                                 .get(range.start.min(end)..end)
                                 .unwrap_or_default();
                             let version = (fnv1a(bytes) << 1) | streaming as u64;
-                            rows.push(Row {
-                                id: format!("{key}.{block_ix}").into(),
-                                version,
-                                turn_start: false,
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
-                                kind: if streaming {
-                                    RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                } else {
-                                    RowKind::Markdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
+                            rows.push(ProjectedRow {
+                                source_start: part_ix,
+                                source_end: part_ix,
+                                row: Row {
+                                    id: format!("{key}.{block_ix}").into(),
+                                    version,
+                                    turn_start: false,
+                                    entry_id: entry_id.clone(),
+                                    timestamp: None,
+                                    kind: if streaming {
+                                        RowKind::LiveMarkdown {
+                                            tree: tree.clone(),
+                                            block_ix,
+                                        }
+                                    } else {
+                                        RowKind::Markdown {
+                                            tree: tree.clone(),
+                                            block_ix,
+                                        }
+                                    },
                                 },
                             });
                         }
                         let image_paths = crate::inline_media::extract_image_paths(text);
                         if !image_paths.is_empty() {
-                            rows.push(Row {
-                                id: format!("{key}.images").into(),
-                                version: inline_image_version(&image_paths),
-                                turn_start: false,
-                                kind: RowKind::InlineImages {
-                                    paths: Arc::new(image_paths),
+                            rows.push(ProjectedRow {
+                                source_start: part_ix,
+                                source_end: part_ix,
+                                row: Row {
+                                    id: format!("{key}.images").into(),
+                                    version: inline_image_version(&image_paths),
+                                    turn_start: false,
+                                    kind: RowKind::InlineImages {
+                                        paths: Arc::new(image_paths),
+                                    },
+                                    entry_id: entry_id.clone(),
+                                    timestamp: None,
                                 },
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
                             });
                         }
                     }
@@ -1202,32 +1310,40 @@ fn rows_for_entry_with_todo_history(
                                 .unwrap_or_else(|| "Question".to_string()),
                         )
                         .into();
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
-                            turn_start: false,
-                            kind: RowKind::InputChip {
-                                header,
-                                resolved: *resolved,
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                                turn_start: false,
+                                kind: RowKind::InputChip {
+                                    header,
+                                    resolved: *resolved,
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
                             },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
                         });
                     }
                     MessagePart::Error {
                         id: part_id,
                         message,
                     } => {
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: message.len() as u64,
-                            turn_start: false,
-                            kind: RowKind::ErrorChip {
-                                // Harness-generated; the chip is one line.
-                                message: single_line(message).into(),
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: message.len() as u64,
+                                turn_start: false,
+                                kind: RowKind::ErrorChip {
+                                    // Harness-generated; the chip is one line.
+                                    message: single_line(message).into(),
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
                             },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
                         });
                     }
                     MessagePart::Reasoning {
@@ -1244,17 +1360,21 @@ fn rows_for_entry_with_todo_history(
                         let tree = parse(&key, text);
                         let mut version = fnv1a(text.as_bytes()) << 1 | active as u64;
                         version ^= duration_ms.unwrap_or_default().rotate_left(17);
-                        rows.push(Row {
-                            id: key.into(),
-                            version,
-                            turn_start: false,
-                            kind: RowKind::Reasoning {
-                                tree,
-                                active,
-                                duration_ms: *duration_ms,
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: key.into(),
+                                version,
+                                turn_start: false,
+                                kind: RowKind::Reasoning {
+                                    tree,
+                                    active,
+                                    duration_ms: *duration_ms,
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
                             },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
                         });
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
@@ -1267,11 +1387,12 @@ fn rows_for_entry_with_todo_history(
         &mut rows,
         &mut pending_group,
         &mut group_ix,
+        group_first_part_ix,
         group_last_part_ix,
     );
 
     if let Some(first) = rows.first_mut() {
-        first.turn_start = true;
+        first.row.turn_start = true;
     }
     // Timestamp strip under the entry's LAST row once the turn has settled
     // (chat-view.tsx: "No timestamp hover mid-stream"). The version bit keeps
@@ -1281,12 +1402,53 @@ fn rows_for_entry_with_todo_history(
         && let Some(last) = rows
             .iter_mut()
             .rev()
-            .find(|row| !matches!(row.kind, RowKind::InlineImages { .. }))
+            .find(|row| !matches!(row.row.kind, RowKind::InlineImages { .. }))
     {
-        last.timestamp = Some(entry.created_at);
-        last.version ^= 1 << 62;
+        last.row.timestamp = Some(entry.created_at);
+        last.row.version ^= 1 << 62;
     }
-    rows
+
+    let Some(plan) = turn_steps_plan else {
+        return rows.into_iter().map(|projected| projected.row).collect();
+    };
+
+    let prefix_len = rows
+        .iter()
+        .take_while(|projected| {
+            projected.source_start < plan.split_before_part
+                && projected.source_end < plan.split_before_part
+        })
+        .count();
+    if prefix_len == 0 {
+        return rows.into_iter().map(|projected| projected.row).collect();
+    }
+
+    let mut remaining = rows.split_off(prefix_len);
+    let mut children = rows
+        .into_iter()
+        .map(|projected| projected.row)
+        .collect::<Vec<_>>();
+    for child in &mut children {
+        settle_turn_steps_child(child);
+    }
+    let turn_start = children.first().is_some_and(|row| row.turn_start);
+    let version = turn_steps_version(plan.mode, &plan.summary, entry.duration_ms, &children);
+    let steps = Row {
+        id: format!("{}#steps", entry.id).into(),
+        version,
+        turn_start,
+        kind: RowKind::TurnSteps {
+            rows: Arc::new(children),
+            summary: plan.summary.into(),
+            duration_ms: entry.duration_ms,
+        },
+        entry_id: entry_id.clone(),
+        timestamp: None,
+    };
+
+    std::iter::once(steps)
+        .chain(remaining.drain(..).map(|projected| projected.row))
+        .collect()
 }
 
 /// `ZERON_FRAME_STATS=1` logs live-row render-cost percentiles (p50/p95 µs
@@ -4268,6 +4430,11 @@ impl Transcript {
                 auto_open,
                 detail_auto_open,
             } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
+            RowKind::TurnSteps { summary, .. } => div()
+                .text_sm()
+                .text_color(theme.text_muted)
+                .child(summary.clone())
+                .into_any_element(),
             RowKind::TaskSnapshot {
                 items,
                 created,
@@ -6781,6 +6948,232 @@ mod tests {
     }
 
     #[test]
+    fn assistant_turn_projects_completed_work_before_the_final_answer() {
+        let read = MessagePart::Tool {
+            id: "read-1".into(),
+            call: ToolCall::ReadFile {
+                path: "src/lib.rs".into(),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let entry = assistant(
+            "assistant-turn-projects",
+            MessageStatus::Complete,
+            vec![
+                text_part("narration-1", "Inspecting the implementation."),
+                read,
+                text_part("narration-2", "Now checking the gate."),
+                tool_part("exec-1", "cargo test"),
+                text_part("answer", "The issue is fixed."),
+            ],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id.as_ref(), "assistant-turn-projects#steps");
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("completed operational prefix should be one TurnSteps row");
+        };
+        assert_eq!(children.len(), 4);
+        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
+        assert!(matches!(children[1].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(children[2].kind, RowKind::Markdown { .. }));
+        assert!(matches!(children[3].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+    }
+
+    #[test]
+    fn assistant_turn_streaming_keeps_unresolved_tools_and_latest_text_top_level() {
+        let mut unresolved_a = tool_part("exec-a", "cargo test");
+        let mut unresolved_b = tool_part("exec-b", "cargo check");
+        for part in [&mut unresolved_a, &mut unresolved_b] {
+            let MessagePart::Tool { resolved, .. } = part else {
+                unreachable!();
+            };
+            *resolved = false;
+        }
+        let entry = assistant(
+            "assistant-live-tools",
+            MessageStatus::Streaming,
+            vec![
+                text_part("narration", "Inspecting."),
+                tool_part("read", "cat src/lib.rs"),
+                unresolved_a,
+                unresolved_b,
+            ],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows[0].id.as_ref(), "assistant-live-tools#steps");
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("completed prefix should be folded while streaming");
+        };
+        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
+        assert!(matches!(children[1].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::ToolGroup {
+                tools,
+                auto_open: true,
+                ..
+            } if tools.len() == 2 && tools.iter().all(|tool| !tool.resolved)
+        ));
+
+        let latest_text = assistant(
+            "assistant-live-text",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                text_part("latest", "Writing the answer now."),
+            ],
+        );
+        let rows = rows_for_entry(&latest_text, false, &mut parse);
+        assert_eq!(rows[0].id.as_ref(), "assistant-live-text#steps");
+        assert!(matches!(rows[1].kind, RowKind::LiveMarkdown { .. }));
+    }
+
+    #[test]
+    fn assistant_turn_keeps_active_reasoning_input_and_subagent_outside() {
+        let active_reasoning = assistant(
+            "assistant-live-reasoning",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                MessagePart::Reasoning {
+                    id: "reasoning".into(),
+                    text: "Still checking".into(),
+                    completed: false,
+                    duration_ms: None,
+                },
+            ],
+        );
+        let rows = rows_for_entry(&active_reasoning, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(
+            rows[1].kind,
+            RowKind::Reasoning { active: true, .. }
+        ));
+
+        let unresolved_input = assistant(
+            "assistant-live-input",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                MessagePart::Input {
+                    id: "input".into(),
+                    request_id: "request".into(),
+                    questions: Vec::new(),
+                    resolved: false,
+                },
+            ],
+        );
+        let rows = rows_for_entry(&unresolved_input, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(
+            rows[1].kind,
+            RowKind::InputChip {
+                resolved: false,
+                ..
+            }
+        ));
+
+        let running_subagent = assistant(
+            "assistant-live-agent",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                agent_part("agent", "Audit"),
+            ],
+        );
+        let rows = rows_for_entry(&running_subagent, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
+    }
+
+    #[test]
+    fn assistant_turn_preserves_specialized_children_and_stable_identity() {
+        let todo = MessagePart::Tool {
+            id: "todo".into(),
+            call: ToolCall::Todo {
+                items: vec![TodoItem {
+                    text: "Inspect".into(),
+                    done: true,
+                }],
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let parts = vec![
+            text_part("artifact", "Preview ![chart](artifacts/chart.png)"),
+            todo,
+            text_part("answer", "Done."),
+        ];
+        let live = assistant(
+            "assistant-specialized",
+            MessageStatus::Streaming,
+            parts.clone(),
+        );
+        let done = assistant("assistant-specialized", MessageStatus::Complete, parts);
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+
+        assert_eq!(live_rows[0].id, done_rows[0].id);
+        assert_eq!(live_rows[0].id.as_ref(), "assistant-specialized#steps");
+        let RowKind::TurnSteps { rows: children, .. } = &done_rows[0].kind else {
+            panic!("specialized prefix should be preserved inside TurnSteps");
+        };
+        assert!(
+            children
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::InlineImages { .. }))
+        );
+        assert!(
+            children
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::TaskSnapshot { .. }))
+        );
+        assert!(children.iter().all(|row| row.timestamp.is_none()));
+        assert_eq!(done_rows.last().unwrap().timestamp, Some(done.created_at));
+    }
+
+    #[test]
+    fn assistant_turn_without_final_text_keeps_independent_rows() {
+        let entry = assistant(
+            "assistant-no-answer",
+            MessageStatus::Complete,
+            vec![
+                text_part("narration", "Inspecting."),
+                tool_part("read", "ls"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
+    }
+
+    #[test]
     fn workflow_activity_does_not_create_a_transcript_row() {
         let entry = assistant(
             "workflow-entry",
@@ -7286,14 +7679,26 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&done, false, &mut parse);
-        // Rows: t0.0, t0.1, t0.2 (three MD blocks), g0, t1.0.
-        assert_eq!(rows.len(), 5);
+        // The completed operational prefix is projected into TurnSteps while
+        // the final answer remains top-level.
+        assert_eq!(rows.len(), 2);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("expected completed prefix disclosure");
+        };
+        assert_eq!(children.len(), 4);
         // Sibling markdown blocks from the same part: md block gap.
-        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
-        assert_eq!(top_gap_for(Some(&rows[1]), &rows[2]), render::MD_BLOCK_GAP);
-        // Markdown → tool group and tool group → next part: block gap.
-        assert_eq!(top_gap_for(Some(&rows[2]), &rows[3]), GAP_BLOCK);
-        assert_eq!(top_gap_for(Some(&rows[3]), &rows[4]), GAP_BLOCK);
+        assert_eq!(
+            top_gap_for(Some(&children[0]), &children[1]),
+            render::MD_BLOCK_GAP
+        );
+        assert_eq!(
+            top_gap_for(Some(&children[1]), &children[2]),
+            render::MD_BLOCK_GAP
+        );
+        // Markdown → tool group inside the disclosure and disclosure → final
+        // answer retain the ordinary block gap.
+        assert_eq!(top_gap_for(Some(&children[2]), &children[3]), GAP_BLOCK);
+        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), GAP_BLOCK);
         // Turn starts get the turn gap regardless.
         assert_eq!(top_gap_for(None, &rows[0]), GAP_TURN);
     }
@@ -7464,7 +7869,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tool_groups_auto_open_only_while_streaming() {
+    fn active_tail_tool_groups_open_while_folded_prefix_groups_settle() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
@@ -7502,18 +7907,21 @@ mod tests {
             vec![tool_part("a", "ls"), text_part("t0", "hi")],
         );
         let rows = rows_for_entry(&mid, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("completed prefix should be folded");
+        };
         let RowKind::ToolGroup {
             auto_open,
             detail_auto_open,
             ..
-        } = rows[0].kind
+        } = children[0].kind
         else {
             panic!()
         };
-        assert!(auto_open);
+        assert!(!auto_open);
         assert!(
             !detail_auto_open,
-            "earlier command output remains collapsed by default"
+            "completed prefix command output remains collapsed by default"
         );
     }
 
