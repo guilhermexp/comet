@@ -28,6 +28,8 @@ replace or restyle it.
   after the turn's last tool.
 - Summarize the whole folded prefix across narration boundaries, for example
   `9 reads, 10 edits, 4 commands, 2 tools`.
+- Show the persisted duration of the assistant message at the right edge of
+  the disclosure header once the segment reaches a terminal state.
 - Preserve the existing specialized rows, tool detail folds, inline images,
   Mermaid rendering, todo cards, reasoning, and subagent links inside the
   expanded disclosure.
@@ -37,11 +39,12 @@ replace or restyle it.
 ## Non-goals
 
 - Replacing or visually redesigning the composer.
-- Changing runtime protocols, durable document schemas, or harness adapters.
+- Changing runtime protocols or harness adapters.
 - Collapsing the user's message bubble with the assistant work.
 - Introducing a second final-answer field into persisted messages.
 - Hiding active subagents or unresolved input requests.
-- Adding a new response label, duration field, or animation system.
+- Adding a new response label or animation system.
+- Adding a live elapsed timer to a disclosure whose segment is still running.
 
 ## Considered approaches
 
@@ -58,7 +61,7 @@ Advantages:
 - closed disclosures do not mount their child subtree;
 - child tool folds and media renderers remain reusable;
 - list splices operate on one stable `entry#steps` row;
-- no durable schema or runtime change.
+- no runtime or harness change; one additive durable entry field carries time.
 
 Cost: `Transcript::render_row` must be split into outer list-row chrome and an
 inner row-body renderer so the composite can reuse child renderers without
@@ -81,6 +84,32 @@ Allow one tool group to span intervening text/reasoning.
 Rejected because `ToolGroup` is not a turn model. It cannot identify the final
 answer, would either discard or duplicate narration, and would force todo,
 reasoning, input, and media components into a tool-only abstraction.
+
+## Duration source
+
+Comet's engine already owns the authoritative start time for each assistant
+segment in `drive_run.segment_started`. That boundary restarts for a routed
+steer and for a parked persistent-session turn, exactly where a new assistant
+message entry begins. The elapsed time therefore belongs on
+`SessionMessageEntry`, not on a tool, runtime session row, or renderer timer.
+
+### Considered duration approaches
+
+1. **Persist engine-measured segment duration (recommended).** On every normal,
+   interrupted, errored, quiesced, steered, and subagent segment finish, store
+   `max(0, finished_at - started_at)` as `duration_ms` on the assistant entry.
+   This works for every runtime and survives restart/sync.
+2. **Derive from session `started_at`/`updated_at`.** Rejected because the
+   session row is mutable, chat-scoped, cleared on idle, and not historical per
+   assistant message.
+3. **Use provider-reported duration.** Rejected as the authority because the
+   field is not universal and different providers measure different intervals.
+   Provider tool durations remain tool metadata; they do not define turn time.
+
+`SessionMessageEntry.duration_ms: Option<u64>` is an additive Loro/JSON field.
+Old entries read as `None`. Recovery paths that merely stamp a stale streaming
+entry terminal and cannot reconstruct its real start/end leave it `None` rather
+than inventing a duration.
 
 ## Architecture
 
@@ -137,20 +166,36 @@ already resolved.
 The same pure module summarizes tool calls in the prefix in this fixed order:
 
 1. agents;
-2. reads;
-3. searches;
-4. edits;
-5. commands;
-6. tools.
+2. skills;
+3. reads;
+4. searches;
+5. edits;
+6. commands;
+7. waits;
+8. messages;
+9. terminals;
+10. captures;
+11. tools.
 
 Mappings:
 
 - agent-shaped MCP/unknown calls -> agents;
+- `Skill`/`skill` calls -> skills;
 - `ReadFile`, `Search`, and `Glob` -> reads;
 - `WebSearch` and `WebFetch` -> searches;
 - `WriteFile`, `EditFile`, and `ApplyPatch` -> edits;
-- `Exec` -> commands;
+- `Exec`, `Eval`, and terminal-creation calls -> commands;
+- peer/background-job waits -> waits;
+- agent prompts and terminal-key sends -> messages;
+- terminal listing -> terminals;
+- terminal capture -> captures;
 - `Todo`, other MCP calls, and other unknown calls -> tools.
+
+OMP `hub` calls are classified by their `input.op`: `wait` -> waits, `send` ->
+messages, `start|restart|stop` -> commands, and every other operation -> tools.
+Built-in and MCP calls feed the same `ActivityBucket` counts, so the Comet
+header does not reproduce Orchestrator's duplicate labels such as
+`1 agent, ..., 1 agent`.
 
 Reasoning, text, workflow-only updates, inline-image projections, and input/error
 parts do not increment a bucket. If no tool is categorizable, the header falls
@@ -179,11 +224,12 @@ Rows wholly before the split become children of:
 RowKind::TurnSteps {
     rows: Arc<Vec<Row>>,
     summary: SharedString,
+    duration_ms: Option<u64>,
 }
 ```
 
 The composite row id is `{entry.id}#steps`. Its version hashes the mode,
-summary, and every child id/version. Prefix `LiveMarkdown` children become
+summary, `duration_ms`, and every child id/version. Prefix `LiveMarkdown` children become
 settled `Markdown` children, and prefix `ToolGroup` defaults are forced closed;
 the prefix is already complete even while its owning entry continues streaming.
 Explicit child fold choices still win through the existing stable child ids.
@@ -210,11 +256,19 @@ vertical gap. The outer disclosure follows Orchestrator and toggles without a
 variable-height tween; nested tool/detail folds retain their existing analytic
 animations.
 
+The header renders `duration_ms` only when it is `Some` and greater than zero,
+using Orchestrator's compact formatter: `<1000ms` -> `Nms`, `<60s` -> one
+decimal second, and `>=60s` -> `Nm Ns`. Duration is quiet, monospaced, and
+right-aligned immediately before the disclosure chevron.
+
 ### Cache and lifecycle safety
 
 - `invalidate_row_tree` invalidates both the composite id and every child id
   when a `TurnSteps` row is replaced.
 - `turn_steps_open` is pruned against current composite row ids after sync.
+- `duration_ms` participates in entry fingerprints, transcript delta equality,
+  and composite row versions, so the terminal metadata update remeasures only
+  its owning disclosure row.
 - Child ids remain unchanged when moving into or out of the disclosure.
 - Streaming-to-settled transitions preserve `{entry.id}#steps` whenever the
   message remains eligible.
@@ -234,6 +288,8 @@ animations.
 - Empty/whitespace text and `WorkflowTask` parts do not create boundaries.
 - A split with no visible prefix produces no disclosure.
 - Expanding an old disclosure cannot restart a live Markdown veil.
+- Old entries and recovery-finalized entries without a trustworthy elapsed time
+  omit the duration label.
 
 ## Validation
 
@@ -243,4 +299,5 @@ answer separation, running subagents, todo cards, and child default folds.
 Render-state tests cover independent disclosures and state survival through row
 replacement. Final validation runs the full UI suite, native build, formatting,
 diff hygiene, and a real Claude/Codex/OMP smoke in the rebuilt app.
-
+Schema/engine tests additionally cover completed, interrupted, errored,
+quiesced, steered, subagent, legacy, continuation, and recovery duration paths.
