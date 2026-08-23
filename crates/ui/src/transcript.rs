@@ -4944,7 +4944,9 @@ impl Transcript {
     ) -> AnyElement {
         use crate::file_change::{
             FILE_CARD_HEADER_HEIGHT, effective_file_path, file_card_action, file_card_body_height,
-            file_card_can_expand, file_card_should_virtualize,
+            file_card_can_expand, file_card_should_contain_wheel,
+            file_card_should_occlude_outer_scroll, file_card_should_virtualize,
+            file_card_virtualized_footer_index, file_card_virtualized_item_count,
         };
 
         let Some(call_path) = file_change_path(&tool.call) else {
@@ -5110,7 +5112,25 @@ impl Transcript {
                 0.0
             };
             let content_height = marker_height + preview.lines.len() as f32 * line_height;
-            let body_height = file_card_body_height(open, content_height);
+            let status = if open {
+                match loaded {
+                    Some(FileInputLoad::Loading(_)) => Some(("Loading full content…", false)),
+                    Some(FileInputLoad::Failed) => Some(("Full content unavailable · Retry", true)),
+                    Some(FileInputLoad::Ready(ready)) if ready.snapshot.truncated => {
+                        Some(("Preview limited to 1 MiB", false))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let status_height = if status.is_some() { 24.0 } else { 0.0 };
+            let scroll_content_height = content_height + status_height;
+            let body_height = file_card_body_height(open, scroll_content_height);
+            let contain_wheel =
+                file_card_should_contain_wheel(open, scroll_content_height, body_height);
+            let occlude_outer_scroll =
+                file_card_should_occlude_outer_scroll(open, scroll_content_height, body_height);
             let bounded_source = (ready.is_none() && tool.resolved).then(|| {
                 preview
                     .lines
@@ -5161,6 +5181,10 @@ impl Transcript {
                             )
                         }))
                 })
+                .when(contain_wheel, |body| {
+                    body.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                })
+                .when(occlude_outer_scroll, |body| body.occlude())
                 .overflow_hidden();
             let virtualized =
                 open && ready.is_some() && file_card_should_virtualize(preview.lines.len());
@@ -5168,18 +5192,73 @@ impl Transcript {
                 let lines = ready.as_ref().unwrap().preview.clone();
                 let highlights = highlights.clone();
                 let theme = theme.clone();
-                let list_height = if ready.as_ref().is_some_and(|ready| ready.snapshot.truncated) {
-                    (body_height - 24.0).max(line_height)
-                } else {
-                    body_height
-                };
+                let footer_index =
+                    file_card_virtualized_footer_index(lines.lines.len(), status.is_some());
+                let item_count =
+                    file_card_virtualized_item_count(lines.lines.len(), status.is_some());
+                let weak = cx.weak_entity();
+                let retry_target = self.file_fetch_target(cx);
+                let retry_row = row_id.clone();
+                let retry_tool = tool.id.to_string();
+                let retry_preview = tool.file_preview.clone();
                 body = body.child(
                     uniform_list(
                         SharedString::from(format!("{row_id}#file-lines")),
-                        lines.lines.len(),
-                        move |range, _, _| {
+                        item_count,
+                        move |range, _, _cx| {
                             range
                                 .map(|index| {
+                                    if footer_index == Some(index) {
+                                        let (label, retry) = status.unwrap();
+                                        let mut footer = div()
+                                            .id(SharedString::from(format!(
+                                                "{retry_row}#file-status"
+                                            )))
+                                            .h(px(line_height))
+                                            .flex_none()
+                                            .px(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.5))
+                                            .text_color(if retry {
+                                                theme.danger_muted
+                                            } else {
+                                                theme.text_faint
+                                            });
+                                        if retry {
+                                            let weak = weak.clone();
+                                            let retry_target = retry_target.clone();
+                                            let retry_row = retry_row.clone();
+                                            let retry_tool = retry_tool.clone();
+                                            let retry_preview = retry_preview.clone();
+                                            footer = footer.cursor_pointer().on_click(
+                                                move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some((
+                                                        chat_id,
+                                                        target_device_id,
+                                                        parent_tool_use_id,
+                                                    )) = retry_target.clone()
+                                                    {
+                                                        weak.update(cx, |this, cx| {
+                                                            this.spawn_file_input_fetch(
+                                                                retry_row.clone(),
+                                                                chat_id,
+                                                                retry_tool.clone(),
+                                                                target_device_id,
+                                                                parent_tool_use_id,
+                                                                kind,
+                                                                retry_preview.clone(),
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                    }
+                                                },
+                                            );
+                                        }
+                                        return footer.child(label).into_any_element();
+                                    }
                                     let spans = highlights
                                         .as_ref()
                                         .and_then(|document| document.lines.get(index))
@@ -5190,7 +5269,7 @@ impl Transcript {
                                 .collect()
                         },
                     )
-                    .h(px(list_height))
+                    .h(px(body_height))
                     .w_full()
                     .track_scroll(&virtualized_scroll),
                 );
@@ -5221,15 +5300,7 @@ impl Transcript {
                 }));
             }
 
-            if open {
-                let status = match loaded {
-                    Some(FileInputLoad::Loading(_)) => Some(("Loading full content…", false)),
-                    Some(FileInputLoad::Failed) => Some(("Full content unavailable · Retry", true)),
-                    Some(FileInputLoad::Ready(ready)) if ready.snapshot.truncated => {
-                        Some(("Preview limited to 1 MiB", false))
-                    }
-                    _ => None,
-                };
+            if open && !virtualized {
                 if let Some((label, retry)) = status {
                     let retry_row = row_id.clone();
                     let retry_tool = tool.id.to_string();

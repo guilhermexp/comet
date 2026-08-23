@@ -37,6 +37,22 @@ pub fn file_card_body_height(expanded: bool, content_height: f32) -> f32 {
     }
 }
 
+pub fn file_card_should_contain_wheel(
+    open: bool,
+    content_height: f32,
+    viewport_height: f32,
+) -> bool {
+    open && content_height > viewport_height
+}
+
+pub fn file_card_should_occlude_outer_scroll(
+    open: bool,
+    content_height: f32,
+    viewport_height: f32,
+) -> bool {
+    file_card_should_contain_wheel(open, content_height, viewport_height)
+}
+
 pub fn snapshot_preview(
     kind: FileChangeKind,
     snapshot: &FileToolInputSnapshot,
@@ -152,6 +168,14 @@ pub fn file_card_should_virtualize(line_count: usize) -> bool {
     line_count > FILE_CARD_VIRTUALIZE_AFTER_LINES
 }
 
+pub fn file_card_virtualized_item_count(line_count: usize, has_footer: bool) -> usize {
+    line_count + usize::from(has_footer)
+}
+
+pub fn file_card_virtualized_footer_index(line_count: usize, has_footer: bool) -> Option<usize> {
+    has_footer.then_some(line_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +217,27 @@ mod tests {
         assert_eq!(file_card_body_height(false, 500.0), 72.0);
         assert_eq!(file_card_body_height(true, 120.0), 120.0);
         assert_eq!(file_card_body_height(true, 500.0), 200.0);
+    }
+
+    #[test]
+    fn expanded_scrollable_body_contains_wheel_even_at_its_boundaries() {
+        assert!(!file_card_should_contain_wheel(false, 1_000.0, 200.0));
+        assert!(!file_card_should_contain_wheel(true, 200.0, 200.0));
+        assert!(file_card_should_contain_wheel(true, 200.1, 200.0));
+        assert!(file_card_should_contain_wheel(true, 1_000.0, 200.0));
+        assert!(!file_card_should_occlude_outer_scroll(
+            false, 1_000.0, 200.0
+        ));
+        assert!(!file_card_should_occlude_outer_scroll(true, 200.0, 200.0));
+        assert!(file_card_should_occlude_outer_scroll(true, 200.1, 200.0));
+    }
+
+    #[test]
+    fn virtualized_footer_is_an_item_inside_the_inner_scroll_surface() {
+        assert_eq!(file_card_virtualized_item_count(80, true), 81);
+        assert_eq!(file_card_virtualized_footer_index(80, true), Some(80));
+        assert_eq!(file_card_virtualized_item_count(80, false), 80);
+        assert_eq!(file_card_virtualized_footer_index(80, false), None);
     }
 
     #[test]
