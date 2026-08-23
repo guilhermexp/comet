@@ -82,6 +82,7 @@ mod tests {
             created_at: 1,
             device_id: "device".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         }
     }

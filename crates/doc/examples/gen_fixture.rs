@@ -25,6 +25,7 @@ fn main() {
         created_at: 1_700_000_000_000,
         device_id: "device-rust".into(),
         status: Some(MessageStatus::Complete),
+        duration_ms: None,
         continuation_of: None,
     })
     .expect("push user message");
@@ -64,7 +65,7 @@ fn main() {
         },
     );
     writer
-        .finish(&folded, MessageStatus::Complete)
+        .finish(&folded, MessageStatus::Complete, Some(1_000))
         .expect("finish");
 
     // A queued command with a host outcome.

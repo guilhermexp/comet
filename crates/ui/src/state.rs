@@ -2557,6 +2557,7 @@ mod tests {
             created_at: 0,
             device_id: "dev".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         }
     }
@@ -2998,6 +2999,7 @@ mod tests {
             created_at: 0,
             device_id: "local".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         };
         state.push_echo("c1", echo.clone());

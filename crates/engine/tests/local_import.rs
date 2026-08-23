@@ -56,6 +56,7 @@ async fn seed_local(data_dir: &std::path::Path) -> (String, String, String) {
         created_at: 1_700_000_000_000,
         device_id: device.clone(),
         status: None,
+        duration_ms: None,
         continuation_of: None,
     })
     .expect("push message");

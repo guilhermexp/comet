@@ -433,6 +433,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         .find(|e| e.role == MessageRole::Assistant)
         .unwrap();
     assert_eq!(assistant.status, Some(MessageStatus::Aborted));
+    assert!(assistant.duration_ms.is_some_and(|duration| duration > 0));
     match &assistant.parts[0] {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
@@ -816,6 +817,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             created_at: 1,
             device_id: device_id.into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -2245,4 +2247,14 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     )
     .await;
     assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
+    let assistant_entries = entries(&core)
+        .into_iter()
+        .filter(|entry| entry.role == MessageRole::Assistant)
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_entries.len(), 2);
+    assert!(
+        assistant_entries[1]
+            .duration_ms
+            .is_some_and(|duration| duration > 0)
+    );
 }

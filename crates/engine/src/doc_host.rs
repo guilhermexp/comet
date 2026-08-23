@@ -477,6 +477,7 @@ impl ChatDocHandle {
             created_at,
             device_id: self.device_id.clone(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
     }

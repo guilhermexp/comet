@@ -303,6 +303,14 @@ async fn parked_self_continuation_folds_and_requiesces() {
         }),
         "self-continued output must fold into a complete transcript entry, got {texts:#?}"
     );
+    assert!(entries(&rig.core).iter().any(|entry| {
+        entry.role == MessageRole::Assistant
+            && entry
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Text { text, .. } if text.contains("Build finished successfully")))
+            && entry.duration_ms.is_some_and(|duration| duration > 0)
+    }));
 
     rig.core.sessions.shutdown().await;
 }
@@ -365,6 +373,14 @@ async fn missing_turn_end_settles_instead_of_working_forever() {
         }),
         "the lost-Done turn's answer must still finalize in the doc, got {texts:#?}"
     );
+    assert!(entries(&rig.core).iter().any(|entry| {
+        entry.role == MessageRole::Assistant
+            && entry
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Text { text, .. } if text.contains("here are the results")))
+            && entry.duration_ms.is_some_and(|duration| duration > 0)
+    }));
 
     rig.core.sessions.shutdown().await;
 }

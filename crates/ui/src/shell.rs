@@ -1765,6 +1765,7 @@ impl Shell {
                     created_at: chrono::Utc::now().timestamp_millis(),
                     device_id: "local".into(),
                     status: None,
+                    duration_ms: None,
                     continuation_of: None,
                 };
                 state.update(cx, |s, cx| {

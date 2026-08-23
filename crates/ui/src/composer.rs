@@ -4825,6 +4825,7 @@ impl Composer {
             created_at,
             device_id: "local".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         };
         self.state.update(cx, |s, cx| {
@@ -4987,6 +4988,7 @@ impl Composer {
                         created_at,
                         device_id: "local".into(),
                         status: None,
+                        duration_ms: None,
                         continuation_of: None,
                     };
                     let echo_chat_id = chat_id.clone();
@@ -7015,6 +7017,7 @@ mod tests {
             created_at: 0,
             device_id: "d".into(),
             status,
+            duration_ms: None,
             continuation_of: None,
         };
         // Streaming entry with unresolved input → panel.
@@ -7051,6 +7054,7 @@ mod tests {
                 created_at: 2,
                 device_id: "d".into(),
                 status: Some(MessageStatus::Complete),
+                duration_ms: None,
                 continuation_of: None,
             },
         ];
@@ -7083,6 +7087,7 @@ mod tests {
             created_at: 1,
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         };
         let t = vec![

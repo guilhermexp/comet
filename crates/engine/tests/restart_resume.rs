@@ -345,6 +345,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             created_at: 1,
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -358,6 +359,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             created_at: 2,
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Streaming),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -404,6 +406,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     let entries = entries_now(&core);
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
+    assert_eq!(entries[1].duration_ms, None);
     // … and closed the stale journal with a synthetic Done.
     let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
     assert!(matches!(
@@ -591,6 +594,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             created_at: now - 60_000,
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -604,6 +608,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             created_at: now - 30_000,
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Streaming),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -659,6 +664,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         .iter()
         .find(|e| e.status == Some(MessageStatus::Aborted))
         .expect("crashed entry stays, stamped aborted");
+    assert_eq!(aborted.duration_ms, None);
     assert!(
         aborted.parts.iter().any(|p| matches!(
             p,

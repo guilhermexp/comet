@@ -1143,12 +1143,13 @@ impl SubagentSink {
     /// reads like any steered chat.
     fn push_user(&mut self, device_id: &str, text: &str) {
         let rendered = render_parts(&self.folded);
+        let duration_ms = Some(segment_duration_ms(self.started_at, now_ms()));
         let closed = match self.entry_index.take() {
             Some(ix) => SegmentWriter::resume(&self.doc, ix, std::mem::take(&mut self.written))
-                .finish(&rendered, MessageStatus::Complete),
+                .finish(&rendered, MessageStatus::Complete, duration_ms),
             None if !self.folded.is_empty() => {
                 match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
-                    Ok(w) => w.finish(&rendered, MessageStatus::Complete),
+                    Ok(w) => w.finish(&rendered, MessageStatus::Complete, duration_ms),
                     Err(e) => Err(e),
                 }
             }
@@ -1167,6 +1168,7 @@ impl SubagentSink {
             created_at: now_ms(),
             device_id: device_id.to_owned(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         };
         if let Err(err) = self.doc.push_message(&entry) {
@@ -1183,12 +1185,13 @@ impl SubagentSink {
     /// frozen blob (entries as the client renders them).
     fn finish(mut self, device_id: &str, status: MessageStatus) -> Option<String> {
         let rendered = render_parts(&self.folded);
+        let duration_ms = Some(segment_duration_ms(self.started_at, now_ms()));
         let finished = match self.entry_index {
             Some(ix) => SegmentWriter::resume(&self.doc, ix, std::mem::take(&mut self.written))
-                .finish(&rendered, status),
+                .finish(&rendered, status, duration_ms),
             None if !self.folded.is_empty() => {
                 match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
-                    Ok(w) => w.finish(&rendered, status),
+                    Ok(w) => w.finish(&rendered, status, duration_ms),
                     Err(e) => Err(e),
                 }
             }
@@ -1347,13 +1350,17 @@ fn finish_segment<'a>(
     status: MessageStatus,
 ) -> Result<(), DocError> {
     let rendered = render_parts(folded);
+    let duration_ms = Some(segment_duration_ms(started_at, now_ms()));
     match writer {
-        Some(w) => w.finish(&rendered, status),
-        None if !folded.is_empty() => {
-            SegmentWriter::begin(doc, entry_id, device_id, started_at)?.finish(&rendered, status)
-        }
+        Some(w) => w.finish(&rendered, status, duration_ms),
+        None if !folded.is_empty() => SegmentWriter::begin(doc, entry_id, device_id, started_at)?
+            .finish(&rendered, status, duration_ms),
         None => Ok(()),
     }
+}
+
+fn segment_duration_ms(started_at: i64, finished_at: i64) -> u64 {
+    finished_at.saturating_sub(started_at).max(0) as u64
 }
 
 /// `~` / `~/…` → this host's home directory. Anything else passes through.
@@ -2283,8 +2290,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        PendingInput, RuntimeConfig, apply_context_usage_to_session, resolve_pending_question,
-        subagent_doc_id, workflow_tasks_from_entries,
+        PendingInput, RuntimeConfig, SubagentSink, apply_context_usage_to_session, finish_segment,
+        resolve_pending_question, segment_duration_ms, subagent_doc_id,
+        workflow_tasks_from_entries,
     };
     use chrono::Utc;
     use tokio::sync::oneshot;
@@ -2315,8 +2323,71 @@ mod tests {
             created_at: index as i64,
             device_id: "dev".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn segment_duration_clamps_clock_regressions() {
+        assert_eq!(segment_duration_ms(1_000, 13_500), 12_500);
+        assert_eq!(segment_duration_ms(13_500, 1_000), 0);
+    }
+
+    #[test]
+    fn finished_segment_persists_engine_measured_duration() {
+        let doc = zeron_doc::SessionDoc::init("chat-duration").unwrap();
+        let parts = vec![MessagePart::Text {
+            id: "text".into(),
+            text: "done".into(),
+        }];
+        let started_at = chrono::Utc::now().timestamp_millis() - 50;
+
+        finish_segment(
+            &doc,
+            None,
+            "assistant",
+            "device",
+            started_at,
+            &parts,
+            MessageStatus::Complete,
+        )
+        .unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert!(
+            entries[0]
+                .duration_ms
+                .is_some_and(|duration| duration >= 50)
+        );
+    }
+
+    #[test]
+    fn finished_subagent_persists_engine_measured_duration() {
+        let doc = Arc::new(zeron_doc::SessionDoc::init("subagent-duration").unwrap());
+        let sink = SubagentSink {
+            doc_id: "subagent-duration".into(),
+            doc,
+            entry_id: "assistant".into(),
+            started_at: chrono::Utc::now().timestamp_millis() - 50,
+            entry_index: None,
+            written: Vec::new(),
+            folded: vec![MessagePart::Text {
+                id: "text".into(),
+                text: "done".into(),
+            }],
+            dirty: true,
+        };
+
+        let json = sink
+            .finish("device", MessageStatus::Complete)
+            .expect("subagent transcript");
+        let entries: Vec<SessionMessageEntry> = serde_json::from_str(&json).unwrap();
+        assert!(
+            entries[0]
+                .duration_ms
+                .is_some_and(|duration| duration >= 50)
+        );
     }
 
     #[test]

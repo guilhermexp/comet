@@ -186,6 +186,7 @@ mod tests {
             created_at: 5,
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         }
     }

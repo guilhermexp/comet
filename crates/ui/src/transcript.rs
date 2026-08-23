@@ -6768,6 +6768,7 @@ mod tests {
             created_at: 0,
             device_id: "dev".into(),
             status: Some(status),
+            duration_ms: None,
             continuation_of: None,
         }
     }
@@ -8208,6 +8209,7 @@ mod tests {
             created_at: ms,
             device_id: "dev".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         };
         let rows = rows_for_entry(&user, true, &mut parse);

@@ -587,6 +587,7 @@ mod tests {
             created_at: 0,
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         }
     }

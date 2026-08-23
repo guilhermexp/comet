@@ -462,6 +462,7 @@ mod tests {
             created_at: 1,
             device_id: "device-1".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         };
 
@@ -486,6 +487,7 @@ mod tests {
             created_at: 1,
             device_id: "device-1".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         };
         let entries = vec![
@@ -536,6 +538,7 @@ mod tests {
             created_at: 1,
             device_id: "device-1".into(),
             status: Some(MessageStatus::Streaming),
+            duration_ms: None,
             continuation_of: None,
         };
 
@@ -577,6 +580,7 @@ mod tests {
             created_at: 1,
             device_id: "device-1".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         };
 
@@ -606,6 +610,7 @@ mod tests {
             created_at: 0,
             device_id: "device-1".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         }];
         entries.extend((0..100).map(|index| SessionMessageEntry {
@@ -618,6 +623,7 @@ mod tests {
             created_at: index + 1,
             device_id: "device-1".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         }));
 

@@ -81,6 +81,7 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
         || prev.created_at != next.created_at
         || prev.device_id != next.device_id
         || prev.status != next.status
+        || prev.duration_ms != next.duration_ms
         || prev.continuation_of != next.continuation_of
         || prev.parts.len() != next.parts.len()
     {
@@ -265,6 +266,7 @@ mod tests {
             created_at: 0,
             device_id: "dev".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         }
     }
@@ -321,6 +323,29 @@ mod tests {
             other => panic!("expected delta, got {other:?}"),
         }
         apply(&[a.clone(), b0], &[a, b1]);
+    }
+
+    #[test]
+    fn duration_metadata_prevents_text_append_optimization() {
+        let before = entry("assistant", "don");
+        let mut after = before.clone();
+        let MessagePart::Text { text, .. } = &mut after.parts[0] else {
+            panic!("text fixture");
+        };
+        text.push('e');
+        after.duration_ms = Some(12_500);
+
+        let frame = diff_transcript(std::slice::from_ref(&before), std::slice::from_ref(&after));
+        match &frame {
+            TranscriptFrame::Delta { upsert, append, .. } => {
+                assert_eq!(upsert.len(), 1);
+                assert_eq!(upsert[0].after, None);
+                assert_eq!(upsert[0].entry, after.clone());
+                assert!(append.is_empty());
+            }
+            other => panic!("expected duration upsert, got {other:?}"),
+        }
+        apply(&[before], &[after]);
     }
 
     #[test]

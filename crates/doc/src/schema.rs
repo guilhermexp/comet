@@ -49,6 +49,9 @@ pub struct SessionMessageEntry {
     pub device_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<MessageStatus>,
+    /// Engine-measured elapsed time for this assistant segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_of: Option<String>,
 }
@@ -639,6 +642,9 @@ fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Resu
     if let Some(status) = entry.status {
         map.insert("status", status_str(status))?;
     }
+    if let Some(duration_ms) = entry.duration_ms {
+        map.insert("durationMs", duration_ms as i64)?;
+    }
     if let Some(continuation_of) = &entry.continuation_of {
         map.insert("continuationOf", continuation_of.as_str())?;
     }
@@ -736,6 +742,8 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         #[serde(default)]
         status: Option<MessageStatus>,
         #[serde(default)]
+        duration_ms: Option<u64>,
+        #[serde(default)]
         continuation_of: Option<String>,
     }
     match serde_json::from_value::<RawEntry>(v.clone()) {
@@ -746,6 +754,7 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
             created_at: raw.created_at,
             device_id: raw.device_id,
             status: raw.status,
+            duration_ms: raw.duration_ms,
             continuation_of: raw.continuation_of,
         }),
         // 2026-08-10 incident rule: a missing field must cost AT MOST what
@@ -810,6 +819,7 @@ fn salvage_entry(
         status: obj
             .get("status")
             .and_then(|s| serde_json::from_value(s.clone()).ok()),
+        duration_ms: obj.get("durationMs").and_then(|x| x.as_u64()),
         continuation_of: str_field("continuationOf"),
     })
 }
@@ -907,6 +917,9 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
         match &entry.continuation_of {
             Some(root_id) => {
                 if let Some(&at) = root_index.get(root_id) {
+                    if out[at].duration_ms.is_none() {
+                        out[at].duration_ms = entry.duration_ms;
+                    }
                     out[at].parts.extend(entry.parts);
                 } else {
                     // Orphan continuation — surface as its own entry rather than dropping.
@@ -961,6 +974,7 @@ impl<'a> SegmentWriter<'a> {
                 created_at,
                 device_id: device_id.into(),
                 status: Some(MessageStatus::Streaming),
+                duration_ms: None,
                 continuation_of: None,
             },
         )?;
@@ -1091,9 +1105,17 @@ impl<'a> SegmentWriter<'a> {
     }
 
     /// Finish the stream: sync final parts and stamp a terminal status.
-    pub fn finish(mut self, folded: &[MessagePart], status: MessageStatus) -> Result<(), DocError> {
+    pub fn finish(
+        mut self,
+        folded: &[MessagePart],
+        status: MessageStatus,
+        duration_ms: Option<u64>,
+    ) -> Result<(), DocError> {
         self.sync(folded)?;
         let map = self.entry_map()?;
+        if let Some(duration_ms) = duration_ms {
+            map.insert("durationMs", duration_ms as i64)?;
+        }
         map.insert("status", status_str(status))?;
         self.doc.doc.commit();
         Ok(())
@@ -1231,8 +1253,57 @@ mod tests {
             created_at: 1,
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn assistant_entry_duration_round_trips_and_legacy_entries_default_to_none() {
+        let mut entry = user_entry("assistant-1", "done");
+        entry.role = MessageRole::Assistant;
+        entry.duration_ms = Some(12_500);
+        let doc = SessionDoc::init("chat-duration").unwrap();
+        doc.push_message(&entry).unwrap();
+
+        let read = doc.read_entries().unwrap();
+        assert_eq!(read[0].duration_ms, Some(12_500));
+
+        let legacy = entry_from_json(serde_json::json!({
+            "id": "legacy",
+            "role": "assistant",
+            "parts": [],
+            "createdAt": 1,
+            "deviceId": "device",
+            "status": "complete"
+        }))
+        .unwrap();
+        assert_eq!(legacy.duration_ms, None);
+    }
+
+    #[test]
+    fn continuation_duration_fills_only_a_missing_root_duration() {
+        let mut missing_root = user_entry("root-missing", "first");
+        missing_root.role = MessageRole::Assistant;
+        let mut continuation = user_entry("continuation", "second");
+        continuation.role = MessageRole::Assistant;
+        continuation.continuation_of = Some(missing_root.id.clone());
+        continuation.duration_ms = Some(7_500);
+
+        let joined = join_continuation_entries(vec![missing_root, continuation]);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].duration_ms, Some(7_500));
+
+        let mut authoritative_root = user_entry("root-authoritative", "first");
+        authoritative_root.role = MessageRole::Assistant;
+        authoritative_root.duration_ms = Some(2_000);
+        let mut continuation = user_entry("continuation-2", "second");
+        continuation.role = MessageRole::Assistant;
+        continuation.continuation_of = Some(authoritative_root.id.clone());
+        continuation.duration_ms = Some(9_000);
+
+        let joined = join_continuation_entries(vec![authoritative_root, continuation]);
+        assert_eq!(joined[0].duration_ms, Some(2_000));
     }
 
     #[test]
@@ -1278,7 +1349,11 @@ mod tests {
         };
         task.status = WorkflowTaskStatus::Completed;
         writer
-            .finish(std::slice::from_ref(&completed), MessageStatus::Complete)
+            .finish(
+                std::slice::from_ref(&completed),
+                MessageStatus::Complete,
+                None,
+            )
             .unwrap();
 
         let entries = doc.read_entries().unwrap();
@@ -1356,6 +1431,7 @@ mod tests {
             device_id: "dev-a".into(),
             // The orphan case: the run died and recovery stamped the entry.
             status: Some(MessageStatus::Aborted),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -1443,7 +1519,9 @@ mod tests {
             },
         );
         writer.sync(&folded).unwrap();
-        writer.finish(&folded, MessageStatus::Complete).unwrap();
+        writer
+            .finish(&folded, MessageStatus::Complete, None)
+            .unwrap();
 
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
@@ -1500,7 +1578,9 @@ mod tests {
         );
         crate::parts::apply_sidecar_refs("chat-2", &mut folded);
         writer.sync(&folded).unwrap();
-        writer.finish(&folded, MessageStatus::Complete).unwrap();
+        writer
+            .finish(&folded, MessageStatus::Complete, None)
+            .unwrap();
 
         let entries = doc.read_entries().unwrap();
         match &entries[0].parts[0] {
@@ -1563,6 +1643,7 @@ mod tests {
             created_at: 1,
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -1607,6 +1688,7 @@ mod tests {
             created_at: 1,
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -1643,7 +1725,9 @@ mod tests {
             *completed = true;
             *duration_ms = Some(4_100);
         }
-        writer.finish(&parts, MessageStatus::Complete).unwrap();
+        writer
+            .finish(&parts, MessageStatus::Complete, None)
+            .unwrap();
 
         let entries = doc.read_entries().unwrap();
         assert!(matches!(
@@ -1675,6 +1759,7 @@ mod tests {
         );
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries[0].status, Some(MessageStatus::Aborted));
+        assert_eq!(entries[0].duration_ms, None);
     }
 
     #[test]
@@ -1728,6 +1813,7 @@ mod tests {
         let v = serde_json::json!({
             "role": "assistant",
             "createdAt": 123,
+            "durationMs": 4_200,
             "parts": [
                 { "id": "p1", "text": "still readable" },
                 { "opaque": true },
@@ -1743,6 +1829,7 @@ mod tests {
         assert_eq!(entry.id, again.id, "recovered id is stable across reads");
         assert_eq!(entry.role, MessageRole::Assistant);
         assert_eq!(entry.created_at, 123);
+        assert_eq!(entry.duration_ms, Some(4_200));
         assert_eq!(
             entry.parts.len(),
             2,
