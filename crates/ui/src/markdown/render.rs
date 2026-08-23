@@ -228,7 +228,7 @@ pub fn render_block(
         ),
         Block::BlockQuote { children } => div()
             // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
+            // behind it.
             .border_l_2()
             .border_color(theme.accent.opacity(0.6))
             .bg(theme.accent.opacity(0.05))
@@ -488,31 +488,18 @@ fn render_table(
         .into_any_element()
 }
 
-/// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
-/// + inline-code ranges (their rounded washes are painted by a canvas UNDER
-/// the text — `TextRun::background_color` can only paint square boxes).
+/// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges.
 /// `text` is a `SharedString` so cached reuse across frames is an Arc clone.
 pub struct FlatText {
     pub text: SharedString,
     pub runs: Vec<TextRun>,
     pub links: Vec<(Range<usize>, String)>,
-    pub code_ranges: Vec<Range<usize>>,
 }
 
-/// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
-/// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
-/// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
+/// Inline-code tint: violet text without a separate background surface.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
     theme.code_text // violet-300
 }
-pub fn inline_code_wash(theme: &Theme) -> Hsla {
-    theme.code_wash // violet-400/12
-}
-/// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
-/// x extends 2px past the glyphs, y insets 2px from the 22px line box).
-pub const INLINE_CODE_RADIUS: f32 = 4.5;
-pub const INLINE_CODE_PAD_X: f32 = 2.0;
-pub const INLINE_CODE_INSET_Y: f32 = 2.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
@@ -533,7 +520,6 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
-    let mut code_ranges: Vec<Range<usize>> = Vec::new();
     for run in runs {
         if run.text.is_empty() {
             continue;
@@ -566,13 +552,6 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             theme.text
         };
-        if run.style.code {
-            // Merge adjacent code runs into one wash box (like links below).
-            match code_ranges.last_mut() {
-                Some(range) if range.end == start => range.end = text.len(),
-                _ => code_ranges.push(start..text.len()),
-            }
-        }
         if let Some(url) = &run.style.link {
             // A still-streaming link (mend.rs sentinel) keeps link styling —
             // so the URL's completion changes nothing visually — but is not
@@ -591,9 +570,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             len: run.text.len(),
             font: f,
             color,
-            // Inline code's wash is painted as ROUNDED quads by the canvas
-            // underlay (`code_wash_underlay`) — a run background here could
-            // only be a square box.
+            // Inline code is distinguished by font and text color only.
             background_color: None,
             underline: is_link.then_some(UnderlineStyle {
                 color: Some(theme.text_muted),
@@ -610,7 +587,6 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         text: text.into(),
         runs: out,
         links,
-        code_ranges,
     }
 }
 
@@ -671,31 +647,16 @@ fn flat_text_element(
             })
             .into_any_element()
     };
-    // Underlay canvas: inline-code washes + the selection wash, painted
-    // BEFORE the text (earlier sibling ⇒ underneath), reading glyph geometry
-    // from the text's own layout handle. Pure paint — never in layout. The
-    // same paint pass re-registers the frame-scoped window mouse listeners
+    // Underlay canvas: selection wash painted BEFORE the text (earlier sibling
+    // ⇒ underneath), reading glyph geometry from the text's own layout handle.
+    // The same paint pass re-registers the frame-scoped window mouse listeners
     // that drive text selection (round 18; see markdown/selection.rs).
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
-    let code_ranges = flat.code_ranges.clone();
     let flat_text = flat.text.clone();
-    let wash = inline_code_wash(theme);
     let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
-            for range in &code_ranges {
-                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
-                    window.paint_quad(quad(
-                        rect,
-                        px(INLINE_CODE_RADIUS),
-                        wash,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
-                    ));
-                }
-            }
             if let Some(range) = super::selection::wash_range(&sel_key) {
                 for rect in range_rects(&layout, &range, 0.0, 0.0) {
                     window.paint_quad(quad(
@@ -1335,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn flatten_collects_and_merges_inline_code_ranges() {
+    fn flatten_styles_inline_code_as_violet_text_without_background() {
         let theme = Theme::dark();
         let code = |text: &str| InlineRun {
             text: text.into(),
@@ -1359,10 +1320,7 @@ mod tests {
             &theme,
             false,
         );
-        // Adjacent code runs merge into ONE wash box; separated ones don't.
-        assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
-        // Code text is the violet tint; the square run background is gone
-        // (the rounded wash is painted by the canvas underlay instead).
+        // Code text keeps the violet tint without any run background.
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.text);
