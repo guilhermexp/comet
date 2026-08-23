@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, SlashCommand, ToolCall, ToolDiff, ToolExecutionMeta,
-    WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
+    AgentEvent, DoneStatus, HarnessId, SlashCommand, TodoItem, ToolCall, ToolDiff,
+    ToolExecutionMeta, WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
 };
 
 use super::protocol::sanitize_diagnostic;
@@ -30,6 +30,8 @@ pub struct OmpNormalizer {
     cwd: String,
     model: String,
     subagents: HashMap<String, SubagentContext>,
+    todos: Vec<TodoItem>,
+    todo_previous: HashMap<String, Vec<TodoItem>>,
 }
 
 impl OmpNormalizer {
@@ -38,14 +40,16 @@ impl OmpNormalizer {
             cwd: cwd.into(),
             model: model.into(),
             subagents: HashMap::new(),
+            todos: Vec::new(),
+            todo_previous: HashMap::new(),
         }
     }
 
     pub fn push(&mut self, frame: Value) -> Vec<AgentEvent> {
         match frame.get("type").and_then(Value::as_str) {
             Some("message_update") => self.message_update(&frame),
-            Some("tool_execution_start") => tool_start(&frame).into_iter().collect(),
-            Some("tool_execution_end") => tool_end(&frame).into_iter().collect(),
+            Some("tool_execution_start") => self.tool_start(&frame).into_iter().collect(),
+            Some("tool_execution_end") => self.tool_end(&frame),
             Some("available_commands_update") => available_commands(&frame)
                 .map(|commands| AgentEvent::AvailableCommands { commands })
                 .into_iter()
@@ -68,6 +72,61 @@ impl OmpNormalizer {
 
     pub fn active_subagents(&self) -> usize {
         self.subagents.len()
+    }
+
+    fn tool_start(&mut self, frame: &Value) -> Option<AgentEvent> {
+        let id = frame.get("toolCallId")?.as_str()?;
+        let name = frame.get("toolName")?.as_str()?;
+        if name != "todo" {
+            return tool_start(frame);
+        }
+
+        let input = frame.get("args").unwrap_or(&Value::Null);
+        self.todo_previous.insert(id.to_owned(), self.todos.clone());
+        if let Some(items) = todo_items_from_input(input) {
+            self.todos = items;
+        }
+        Some(AgentEvent::ToolCall {
+            id: id.to_owned(),
+            call: ToolCall::Todo {
+                items: self.todos.clone(),
+            },
+        })
+    }
+
+    fn tool_end(&mut self, frame: &Value) -> Vec<AgentEvent> {
+        let Some(result) = tool_end(frame) else {
+            return Vec::new();
+        };
+        if frame.get("toolName").and_then(Value::as_str) != Some("todo") {
+            return vec![result];
+        }
+
+        let Some(id) = frame.get("toolCallId").and_then(Value::as_str) else {
+            return vec![result];
+        };
+        let previous = self.todo_previous.remove(id);
+        if let Some(items) = frame
+            .get("result")
+            .and_then(|value| value.get("details"))
+            .and_then(|value| value.get("phases"))
+            .and_then(todo_items_from_phases)
+        {
+            self.todos = items;
+        } else if frame.get("isError").and_then(Value::as_bool) == Some(true)
+            && let Some(previous) = previous
+        {
+            self.todos = previous;
+        }
+        vec![
+            AgentEvent::ToolCall {
+                id: id.to_owned(),
+                call: ToolCall::Todo {
+                    items: self.todos.clone(),
+                },
+            },
+            result,
+        ]
     }
 
     pub fn classify_agent_end(&mut self, frame: &Value) -> AgentEndDisposition {
@@ -604,6 +663,58 @@ fn normalize_tool(name: &str, input: &Value) -> ToolCall {
     }
 }
 
+fn todo_items_from_input(input: &Value) -> Option<Vec<TodoItem>> {
+    if input.get("op").and_then(Value::as_str) != Some("init") {
+        return None;
+    }
+    let items = if let Some(phases) = input.get("list").and_then(Value::as_array) {
+        phases
+            .iter()
+            .filter_map(|phase| phase.get("items").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+    } else {
+        input
+            .get("items")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+    };
+    Some(
+        items
+            .into_iter()
+            .map(|text| TodoItem {
+                text: text.to_owned(),
+                done: false,
+            })
+            .collect(),
+    )
+}
+
+fn todo_items_from_phases(phases: &Value) -> Option<Vec<TodoItem>> {
+    Some(
+        phases
+            .as_array()?
+            .iter()
+            .filter_map(|phase| phase.get("tasks").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|task| {
+                let text = task.get("content").and_then(Value::as_str)?;
+                let done = matches!(
+                    task.get("status").and_then(Value::as_str),
+                    Some("completed" | "abandoned")
+                );
+                Some(TodoItem {
+                    text: text.to_owned(),
+                    done,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn available_commands(frame: &Value) -> Option<Vec<SlashCommand>> {
     let rows = frame.get("commands")?.as_array()?;
     Some(
@@ -877,5 +988,282 @@ mod tests {
             }
         }));
         assert!(matches!(&nested[..], [AgentEvent::Subagent { .. }]));
+    }
+
+    #[test]
+    fn omp_todo_init_normalizes_phased_items() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        let events = normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-1",
+            "toolName": "todo",
+            "args": {
+                "op": "init",
+                "list": [{
+                    "phase": "Work",
+                    "items": ["Inspect state", "Run gates"]
+                }]
+            }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::ToolCall {
+                id,
+                call: ToolCall::Todo { items },
+            }] if id == "todo-1"
+                && items.len() == 2
+                && items[0].text == "Inspect state"
+                && !items[0].done
+                && items[1].text == "Run gates"
+                && !items[1].done
+        ));
+    }
+
+    #[test]
+    fn omp_todo_init_normalizes_flat_items() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        let events = normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-2",
+            "toolName": "todo",
+            "args": {
+                "op": "init",
+                "items": ["Inspect state", "Run gates"]
+            }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::ToolCall {
+                call: ToolCall::Todo { items },
+                ..
+            }] if items.iter().map(|item| item.text.as_str()).collect::<Vec<_>>()
+                == ["Inspect state", "Run gates"]
+        ));
+    }
+
+    #[test]
+    fn omp_todo_invalid_init_still_uses_shared_todo_call() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        let events = normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-3",
+            "toolName": "todo",
+            "args": { "op": "init", "task": "" }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::ToolCall {
+                call: ToolCall::Todo { items },
+                ..
+            }] if items.is_empty()
+        ));
+    }
+
+    #[test]
+    fn omp_todo_append_start_preserves_previous_snapshot() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-init",
+            "toolName": "todo",
+            "args": { "op": "init", "items": ["Inspect state", "Run gates"] }
+        }));
+
+        let events = normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-append",
+            "toolName": "todo",
+            "args": {
+                "op": "append",
+                "phase": "Work",
+                "items": ["Write report"]
+            }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::ToolCall {
+                call: ToolCall::Todo { items },
+                ..
+            }] if items.iter().map(|item| item.text.as_str()).collect::<Vec<_>>()
+                == ["Inspect state", "Run gates"]
+        ));
+    }
+
+    #[test]
+    fn omp_todo_result_reconciles_authoritative_snapshot() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-4",
+            "toolName": "todo",
+            "args": { "op": "init", "items": ["Inspect state", "Run gates"] }
+        }));
+
+        let events = normalizer.push(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-4",
+            "toolName": "todo",
+            "isError": false,
+            "result": {
+                "content": [{ "type": "text", "text": "1/2 done" }],
+                "details": {
+                    "phases": [{
+                        "name": "Work",
+                        "tasks": [
+                            { "content": "Inspect state", "status": "completed" },
+                            { "content": "Run gates", "status": "in_progress" }
+                        ]
+                    }]
+                }
+            }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [
+                AgentEvent::ToolCall {
+                    id,
+                    call: ToolCall::Todo { items },
+                },
+                AgentEvent::ToolResult {
+                    id: result_id,
+                    is_error: false,
+                    ..
+                }
+            ] if id == "todo-4"
+                && result_id == "todo-4"
+                && items.len() == 2
+                && items[0].text == "Inspect state"
+                && items[0].done
+                && items[1].text == "Run gates"
+                && !items[1].done
+        ));
+    }
+
+    #[test]
+    fn omp_todo_result_preserves_snapshot_and_error_output() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-5",
+            "toolName": "todo",
+            "args": { "op": "init", "items": ["Inspect state", "Run gates"] }
+        }));
+        normalizer.push(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-5",
+            "toolName": "todo",
+            "isError": false,
+            "result": {
+                "details": {
+                    "phases": [{
+                        "name": "Work",
+                        "tasks": [
+                            { "content": "Inspect state", "status": "in_progress" },
+                            { "content": "Run gates", "status": "pending" }
+                        ]
+                    }]
+                }
+            }
+        }));
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-failed",
+            "toolName": "todo",
+            "args": { "op": "init", "task": "" }
+        }));
+
+        let events = normalizer.push(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-failed",
+            "toolName": "todo",
+            "isError": true,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Errors: Missing list for init operation"
+                }]
+            }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [
+                AgentEvent::ToolCall {
+                    call: ToolCall::Todo { items },
+                    ..
+                },
+                AgentEvent::ToolResult {
+                    is_error: true,
+                    output: Some(output),
+                    ..
+                }
+            ] if items.iter().map(|item| item.text.as_str()).collect::<Vec<_>>()
+                    == ["Inspect state", "Run gates"]
+                && output.contains("Missing list for init operation")
+        ));
+    }
+
+    #[test]
+    fn omp_todo_rejected_init_restores_previous_snapshot() {
+        let mut normalizer = OmpNormalizer::new("/repo", "kimi-code/k3");
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-initial",
+            "toolName": "todo",
+            "args": { "op": "init", "items": ["Inspect state", "Run gates"] }
+        }));
+        normalizer.push(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-initial",
+            "toolName": "todo",
+            "isError": false,
+            "result": {
+                "details": {
+                    "phases": [{
+                        "name": "Work",
+                        "tasks": [
+                            { "content": "Inspect state", "status": "in_progress" },
+                            { "content": "Run gates", "status": "pending" }
+                        ]
+                    }]
+                }
+            }
+        }));
+
+        normalizer.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-rejected",
+            "toolName": "todo",
+            "args": {
+                "op": "init",
+                "items": ["Duplicate task", "Duplicate task"]
+            }
+        }));
+        let events = normalizer.push(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-rejected",
+            "toolName": "todo",
+            "isError": true,
+            "result": {
+                "content": [{ "type": "text", "text": "Duplicate task" }]
+            }
+        }));
+
+        assert!(matches!(
+            &events[..],
+            [
+                AgentEvent::ToolCall {
+                    call: ToolCall::Todo { items },
+                    ..
+                },
+                AgentEvent::ToolResult { is_error: true, .. }
+            ] if items.iter().map(|item| item.text.as_str()).collect::<Vec<_>>()
+                == ["Inspect state", "Run gates"]
+        ));
     }
 }
