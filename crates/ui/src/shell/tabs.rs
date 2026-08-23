@@ -424,6 +424,28 @@ mod cycle_tests {
         ids.iter().map(|id| id.to_string()).collect()
     }
 
+    fn chat(id: &str, space_id: Option<&str>) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: space_id.map(Into::into),
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
     #[test]
     fn steps_forward_and_back_through_the_list() {
         let list = order(&["a", "b", "c"]);
