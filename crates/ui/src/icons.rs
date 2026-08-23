@@ -24,8 +24,11 @@ mod material_file_icon_assets {
     include!(concat!(env!("OUT_DIR"), "/material_file_icon_assets.rs"));
 }
 
-mod codex_subagent_avatar_assets {
-    include!(concat!(env!("OUT_DIR"), "/codex_subagent_avatar_assets.rs"));
+mod blobatar_subagent_avatar_assets {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/blobatar_subagent_avatar_assets.rs"
+    ));
 }
 
 macro_rules! icon_assets {
@@ -40,7 +43,7 @@ macro_rules! icon_assets {
                 if let Some(bytes) = material_file_icon_assets::load(path) {
                     return Ok(Some(Cow::Borrowed(bytes)));
                 }
-                if let Some(bytes) = codex_subagent_avatar_assets::load(path) {
+                if let Some(bytes) = blobatar_subagent_avatar_assets::load(path) {
                     return Ok(Some(Cow::Borrowed(bytes)));
                 }
                 Ok(match path {
@@ -55,7 +58,7 @@ macro_rules! icon_assets {
                 let all = [$(concat!("icons/", $path, ".svg")),+];
                 Ok(all
                     .into_iter()
-                    .chain(codex_subagent_avatar_assets::PATHS.iter().copied())
+                    .chain(blobatar_subagent_avatar_assets::PATHS.iter().copied())
                     .filter(|p| p.starts_with(path))
                     .map(SharedString::from)
                     .collect())
@@ -272,10 +275,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_subagent_avatar_assets_include_every_appearance_pair() {
+    fn blobatar_subagent_avatar_assets_include_every_variant() {
         let assets = Assets;
-        let paths = assets.list("icons/subagents/codex/").unwrap();
-        assert_eq!(paths.len(), 56);
+        let paths = assets.list("icons/subagents/blobatar/").unwrap();
+        assert_eq!(paths.len(), 28);
         for path in paths {
             let bytes = assets.load(&path).unwrap().expect("embedded avatar");
             let svg = std::str::from_utf8(&bytes).expect("avatar svg is utf-8");

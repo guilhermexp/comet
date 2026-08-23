@@ -32,6 +32,7 @@ mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
+install -m 644 "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/THIRD_PARTY_NOTICES.md"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
@@ -41,6 +42,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/zeron" "$HOME/.local/bin/zeron"
 install -Dm644 "$HERE/zeron.desktop" "$HOME/.local/share/applications/zeron.desktop"
 install -Dm644 "$HERE/zeron.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/zeron.png"
+install -Dm644 "$HERE/THIRD_PARTY_NOTICES.md" "$HOME/.local/share/doc/zeron/THIRD_PARTY_NOTICES.md"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
 echo "Installed. Make sure ~/.local/bin is on your PATH."

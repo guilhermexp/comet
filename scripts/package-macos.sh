@@ -27,6 +27,7 @@ cargo build --release -p zeron
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
+install -m 644 "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow

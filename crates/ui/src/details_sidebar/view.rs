@@ -146,7 +146,7 @@ use crate::{
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, scan_checkout},
         files_view::{file_glyph, material_icon_path},
-        subagent_avatars::codex_subagent_avatar_path,
+        subagent_avatars::blobatar_subagent_avatar_path,
         todos::latest_todos,
         usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows},
         widgets::{
@@ -224,8 +224,8 @@ fn open_subagent_event(chat_id: &str, row: &ChatActivityRow) -> DetailsSidebarEv
     }
 }
 
-fn subagent_row_avatar_path(row_id: &str, theme: &Theme) -> &'static str {
-    codex_subagent_avatar_path(row_id, theme.appearance)
+fn subagent_row_avatar_path(row_id: &str) -> &'static str {
+    blobatar_subagent_avatar_path(row_id)
 }
 
 fn open_worker_event(chat_id: &str, worker: &ChatWorkerRow) -> DetailsSidebarEvent {
@@ -988,7 +988,7 @@ impl DetailsSidebar {
         let row_id = row.id.clone();
         let event = open_subagent_event(&chat_id, &row);
         let doc_id = row.id.clone();
-        let avatar_path = subagent_row_avatar_path(&row.id, theme);
+        let avatar_path = subagent_row_avatar_path(&row.id);
         let transcript = div()
             .id(SharedString::from(format!("subagent-open-{}", row.id)))
             .min_w_0()
@@ -1013,7 +1013,7 @@ impl DetailsSidebar {
             }))
             .child(
                 img(avatar_path)
-                    .size(px(14.0))
+                    .size(px(16.0))
                     .object_fit(ObjectFit::Contain),
             )
             .child(
@@ -1790,13 +1790,11 @@ mod tests {
     }
 
     #[test]
-    fn subagent_row_uses_seeded_codex_avatar() {
-        let dark = subagent_row_avatar_path("subagent-1", &Theme::dark());
-        let light = subagent_row_avatar_path("subagent-1", &Theme::light());
+    fn subagent_row_uses_seeded_blobatar_avatar() {
+        let avatar = subagent_row_avatar_path("subagent-1");
 
-        assert_eq!(dark, "icons/subagents/codex/23-dark.svg");
-        assert_eq!(light, "icons/subagents/codex/23-light.svg");
-        assert_ne!(dark, crate::icons::BOT);
+        assert_eq!(avatar, "icons/subagents/blobatar/23.svg");
+        assert_ne!(avatar, crate::icons::BOT);
     }
 
     #[test]
