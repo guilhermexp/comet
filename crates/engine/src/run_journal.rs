@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -32,6 +32,13 @@ pub enum JournalError {
 struct JournalLine {
     seq: u64,
     event: AgentEvent,
+}
+
+#[derive(Debug, Default)]
+struct ReverseScanStats {
+    lines_scanned: usize,
+    max_buffer_bytes: usize,
+    oversized_line: bool,
 }
 
 struct ChatJournal {
@@ -189,16 +196,37 @@ impl RunJournal {
         parent_tool_use_id: Option<&str>,
         max_bytes: usize,
     ) -> Result<Option<FileToolInputSnapshot>, JournalError> {
-        let events = self.replay(chat_id, 0)?;
+        Ok(self
+            .file_tool_input_scoped_impl(chat_id, tool_call_id, parent_tool_use_id, max_bytes)?
+            .0)
+    }
+
+    fn file_tool_input_scoped_impl(
+        &self,
+        chat_id: &str,
+        tool_call_id: &str,
+        parent_tool_use_id: Option<&str>,
+        max_bytes: usize,
+    ) -> Result<(Option<FileToolInputSnapshot>, ReverseScanStats), JournalError> {
+        let path = self.path_for(chat_id);
         let mut authoritative_diff: Option<ToolDiff> = None;
         let mut path_only_fallback: Option<FileToolInputSnapshot> = None;
-        for (_, event) in events.into_iter().rev() {
+        let mut resolved: Option<Option<FileToolInputSnapshot>> = None;
+        let stats = scan_lines_reverse_until(&path, |line| {
+            let parsed = match serde_json::from_slice::<JournalLine>(line) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "journal: skipping malformed line");
+                    return Ok(false);
+                }
+            };
+            let event = parsed.event;
             let event = match (parent_tool_use_id, event) {
-                (None, AgentEvent::Subagent { .. }) => continue,
+                (None, AgentEvent::Subagent { .. }) => return Ok(false),
                 (None, event) => event,
                 (Some(scope), event) => match event_in_subagent_scope(event, scope) {
                     Some(event) => event,
-                    None => continue,
+                    None => return Ok(false),
                 },
             };
             match event {
@@ -241,7 +269,10 @@ impl RunJournal {
                                 has_complete_body,
                             )
                         }
-                        _ => return Ok(None),
+                        _ => {
+                            resolved = Some(None);
+                            return Ok(true);
+                        }
                     };
                     if let Some(diff) = authoritative_diff.take() {
                         snapshot.path = diff.path;
@@ -249,23 +280,42 @@ impl RunJournal {
                         snapshot.old_string = diff.old_text;
                         snapshot.new_string = Some(diff.new_text);
                         cap_file_snapshot_serialized(&mut snapshot, max_bytes);
-                        return Ok(Some(snapshot));
+                        resolved = Some(Some(snapshot));
+                        return Ok(true);
                     }
                     if has_complete_body {
                         cap_file_snapshot_serialized(&mut snapshot, max_bytes);
-                        return Ok(Some(snapshot));
+                        resolved = Some(Some(snapshot));
+                        return Ok(true);
                     }
                     path_only_fallback.get_or_insert(snapshot);
                 }
                 _ => {}
             }
-        }
-        if let Some(mut snapshot) = path_only_fallback {
+            Ok(false)
+        })?;
+        let snapshot = if stats.oversized_line {
+            None
+        } else if let Some(resolved) = resolved {
+            resolved
+        } else if let Some(mut snapshot) = path_only_fallback {
             cap_file_snapshot_serialized(&mut snapshot, max_bytes);
-            Ok(Some(snapshot))
+            Some(snapshot)
         } else {
-            Ok(None)
-        }
+            None
+        };
+        Ok((snapshot, stats))
+    }
+
+    #[cfg(test)]
+    fn file_tool_input_scoped_with_stats(
+        &self,
+        chat_id: &str,
+        tool_call_id: &str,
+        parent_tool_use_id: Option<&str>,
+        max_bytes: usize,
+    ) -> Result<(Option<FileToolInputSnapshot>, ReverseScanStats), JournalError> {
+        self.file_tool_input_scoped_impl(chat_id, tool_call_id, parent_tool_use_id, max_bytes)
     }
 
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
@@ -300,6 +350,70 @@ impl RunJournal {
         }
         Ok(())
     }
+}
+
+const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
+/// Supports the 1 MiB historical response even under worst-case `\u00XX`
+/// JSON escaping, while placing an absolute ceiling on reverse-scan carry.
+const MAX_REVERSE_SCAN_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+fn scan_lines_reverse_until(
+    path: &Path,
+    mut visit: impl FnMut(&[u8]) -> Result<bool, JournalError>,
+) -> Result<ReverseScanStats, JournalError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReverseScanStats::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut position = file.metadata()?.len() as usize;
+    let mut carry = Vec::new();
+    let mut first_chunk = true;
+    let mut stats = ReverseScanStats::default();
+
+    while position > 0 {
+        let chunk_len = position.min(REVERSE_SCAN_CHUNK_BYTES);
+        position -= chunk_len;
+        file.seek(SeekFrom::Start(position as u64))?;
+        let mut data = vec![0; chunk_len];
+        file.read_exact(&mut data)?;
+        data.extend_from_slice(&carry);
+        stats.max_buffer_bytes = stats.max_buffer_bytes.max(data.len());
+
+        let mut end = data.len();
+        if first_chunk && data.last() == Some(&b'\n') {
+            end = end.saturating_sub(1);
+        }
+        first_chunk = false;
+        while let Some(newline) = data[..end].iter().rposition(|byte| *byte == b'\n') {
+            let line = &data[newline + 1..end];
+            if line.len() > MAX_REVERSE_SCAN_LINE_BYTES {
+                stats.oversized_line = true;
+                return Ok(stats);
+            }
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                stats.lines_scanned += 1;
+                if visit(line)? {
+                    return Ok(stats);
+                }
+            }
+            end = newline;
+        }
+        if end > MAX_REVERSE_SCAN_LINE_BYTES {
+            stats.oversized_line = true;
+            return Ok(stats);
+        }
+        carry.clear();
+        carry.extend_from_slice(&data[..end]);
+    }
+
+    if !carry.iter().all(u8::is_ascii_whitespace) {
+        stats.lines_scanned += 1;
+        let _ = visit(&carry)?;
+    }
+    Ok(stats)
 }
 
 fn event_in_subagent_scope(event: AgentEvent, scope: &str) -> Option<AgentEvent> {
@@ -811,5 +925,108 @@ mod tests {
             .unwrap();
         assert!(snapshot.truncated);
         assert!(serde_json::to_vec(&snapshot).unwrap().len() <= 1_024);
+    }
+
+    #[test]
+    fn file_tool_input_reverse_scan_is_bounded_by_tail_not_journal_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for index in 0..2_048 {
+            journal
+                .append(
+                    "chat",
+                    &AgentEvent::TextDelta {
+                        text: format!("old history {index}: {}", "x".repeat(80)),
+                    },
+                )
+                .unwrap();
+        }
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "write-tail".into(),
+                    call: zeron_proto::ToolCall::WriteFile {
+                        path: "tail.txt".into(),
+                        content: Some("newest body".into()),
+                    },
+                },
+            )
+            .unwrap();
+        journal.append("chat", &done()).unwrap();
+
+        let (snapshot, stats) = journal
+            .file_tool_input_scoped_with_stats("chat", "write-tail", None, 1_048_576)
+            .unwrap();
+        assert_eq!(snapshot.unwrap().content.as_deref(), Some("newest body"));
+        assert!(
+            stats.lines_scanned <= 2,
+            "scanned {} lines",
+            stats.lines_scanned
+        );
+        assert!(
+            stats.max_buffer_bytes <= 128 * 1024,
+            "buffered {} bytes for a much larger journal",
+            stats.max_buffer_bytes
+        );
+        assert!(std::fs::metadata(journal.path_for("chat")).unwrap().len() > 200_000);
+    }
+
+    #[test]
+    fn oversized_write_line_is_unavailable_without_unbounded_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "write-huge".into(),
+                    call: zeron_proto::ToolCall::WriteFile {
+                        path: "huge.txt".into(),
+                        content: Some("x".repeat(MAX_REVERSE_SCAN_LINE_BYTES + 1)),
+                    },
+                },
+            )
+            .unwrap();
+
+        let (snapshot, stats) = journal
+            .file_tool_input_scoped_with_stats("chat", "write-huge", None, 1_048_576)
+            .unwrap();
+        assert_eq!(snapshot, None);
+        assert!(stats.oversized_line);
+        assert!(stats.max_buffer_bytes <= MAX_REVERSE_SCAN_LINE_BYTES + REVERSE_SCAN_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn oversized_malformed_tail_blocks_older_fallback_without_unbounded_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat",
+                &AgentEvent::ToolCall {
+                    id: "write-1".into(),
+                    call: zeron_proto::ToolCall::WriteFile {
+                        path: "old.txt".into(),
+                        content: Some("older body".into()),
+                    },
+                },
+            )
+            .unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.path_for("chat"))
+            .unwrap();
+        file.write_all(b"{\"seq\":999,\"event\":\"").unwrap();
+        file.write_all(&vec![b'x'; MAX_REVERSE_SCAN_LINE_BYTES + 1])
+            .unwrap();
+        file.flush().unwrap();
+
+        let (snapshot, stats) = journal
+            .file_tool_input_scoped_with_stats("chat", "write-1", None, 1_048_576)
+            .unwrap();
+        assert_eq!(snapshot, None, "must not fabricate the older body");
+        assert!(stats.oversized_line);
+        assert!(stats.max_buffer_bytes <= MAX_REVERSE_SCAN_LINE_BYTES + REVERSE_SCAN_CHUNK_BYTES);
     }
 }

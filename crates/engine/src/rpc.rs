@@ -1961,15 +1961,21 @@ impl RpcService for EngineRpc {
                     chat.as_ref().map(|chat| chat.device_id.as_str()),
                     self.doc_host.device_id(),
                 )?;
-                let snapshot = self
-                    .sessions
-                    .file_tool_input(
-                        &p.chat_id,
-                        &p.tool_call_id,
-                        p.parent_tool_use_id.as_deref(),
+                let sessions = self.sessions.clone();
+                let chat_id = p.chat_id.clone();
+                let tool_call_id = p.tool_call_id.clone();
+                let parent_tool_use_id = p.parent_tool_use_id.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    sessions.file_tool_input(
+                        &chat_id,
+                        &tool_call_id,
+                        parent_tool_use_id.as_deref(),
                         FILE_TOOL_INPUT_RESPONSE_MAX_BYTES - FILE_TOOL_INPUT_ENVELOPE_RESERVE,
                     )
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                })
+                .await
+                .map_err(|error| RpcError::Failed(format!("journal lookup task failed: {error}")))?
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "snapshot": snapshot }))
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
