@@ -148,7 +148,9 @@ unsafe fn isolated_view(allow_file: bool) -> Option<NativeDocumentView> {
         return None;
     }
     let navigation_delegate = navigation_delegate();
-    (&mut *navigation_delegate).set_ivar("_allowFile", if allow_file { YES } else { NO });
+    unsafe {
+        (&mut *navigation_delegate).set_ivar("_allowFile", if allow_file { YES } else { NO });
+    }
     let _: () = msg_send![view, setNavigationDelegate: navigation_delegate];
     Some(NativeDocumentView {
         view,

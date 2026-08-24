@@ -48,31 +48,33 @@ mod imp {
     const NW_PATH_STATUS_UNSATISFIED: i32 = 2;
 
     pub(super) fn start() {
+        // The handler fires later, on the dispatch queue: it carries its own
+        // unsafe scope rather than inheriting the setup block's.
+        let handler = RcBlock::new(|path: *mut c_void| {
+            let status = unsafe { nw_path_get_status(path) };
+            let online = status != NW_PATH_STATUS_UNSATISFIED;
+            crate::wake::set_path_online(online);
+            if online {
+                // Interface handovers (wifi→hotspot, VPN up/down) arrive
+                // as satisfied→satisfied updates. Old sockets are dead on
+                // the new path either way, so kick parked dials on every
+                // viable-path report — waiters drain stale events before
+                // arming, so a redundant kick costs nothing.
+                crate::wake::notify_online();
+            }
+        });
         unsafe {
             let monitor = nw_path_monitor_create();
             if monitor.is_null() {
                 tracing::warn!("net_path: NWPathMonitor unavailable");
                 return;
             }
-            let handler = RcBlock::new(|path: *mut c_void| {
-                let status = unsafe { nw_path_get_status(path) };
-                let online = status != NW_PATH_STATUS_UNSATISFIED;
-                crate::wake::set_path_online(online);
-                if online {
-                    // Interface handovers (wifi→hotspot, VPN up/down) arrive
-                    // as satisfied→satisfied updates. Old sockets are dead on
-                    // the new path either way, so kick parked dials on every
-                    // viable-path report — waiters drain stale events before
-                    // arming, so a redundant kick costs nothing.
-                    crate::wake::notify_online();
-                }
-            });
             let queue = dispatch_queue_create(c"zeron.net-path".as_ptr(), std::ptr::null_mut());
             nw_path_monitor_set_queue(monitor, queue);
             nw_path_monitor_set_update_handler(monitor, &handler);
             nw_path_monitor_start(monitor);
-            // The monitor (and its handler copy) lives for the process.
-            std::mem::forget(handler);
         }
+        // The monitor (and its handler copy) lives for the process.
+        std::mem::forget(handler);
     }
 }

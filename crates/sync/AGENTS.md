@@ -22,12 +22,13 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 
 ## Verification
 
-- Comandos: `cargo test -p comet-sync`
+- Comandos: `cargo test -p zeron-sync --features mock-server` — a feature **não** é implícita: `tests/registry_client.rs` importa `zeron_sync::registry::mock_server`, então a invocação sem ela nem compila.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/**` (backoff, VV, DocsStore) | unit | `cargo test -p comet-sync` |
-| `tests/edge_convergence.rs` | integration — convergência real contra o edge | `cargo test -p comet-sync` |
+| `src/**` (backoff, VV, DocsStore) | unit | `cargo test -p zeron-sync --features mock-server --lib` |
+| `tests/registry_client.rs` | integration — cliente contra o DO mock in-process | `cargo test -p zeron-sync --features mock-server --test registry_client` |
+| `tests/registry_edge.rs` | e2e, `--ignored` por padrão; precisa de `wrangler dev` + `AUTH_MODE=dev` | `ZERON_EDGE_WS=ws://127.0.0.1:27640 cargo test -p zeron-sync --test registry_edge -- --ignored` |
 
 ## Child DOX Index
 
