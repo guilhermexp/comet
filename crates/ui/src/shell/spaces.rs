@@ -582,6 +582,8 @@ impl Shell {
                 ));
 
         popover::popover_card(theme)
+            .id("spaces-menu")
+            .role(gpui::Role::Menu)
             .w(px(248.0))
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -2239,6 +2241,8 @@ impl Shell {
         let card =
             div()
                 .id("add-space-palette")
+                .role(gpui::Role::Dialog)
+                .aria_label("Add project")
                 .w(px(680.0))
                 .rounded(px(card_radius))
                 .border_1()

@@ -780,6 +780,8 @@ pub fn lightbox(
             .child(
                 div()
                     .id("attachment-lightbox")
+                    .role(gpui::Role::Dialog)
+                    .aria_label("Attachment preview")
                     .occlude()
                     .track_focus(focus)
                     .w(viewport.width)

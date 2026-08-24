@@ -2605,6 +2605,8 @@ impl Pickers {
     fn popover_frame(&self, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         popover::popover_card(&theme)
+            .id(("picker-popover", cx.entity_id()))
+            .role(gpui::Role::Dialog)
             .w(px(width))
             // zeron caps its tallest picker at min(640px, 75vh).
             .max_h(px(640.0))
@@ -2630,6 +2632,8 @@ impl Pickers {
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         popover::popover_card_flush(&theme)
+            .id(("picker-popover-flush", cx.entity_id()))
+            .role(gpui::Role::Dialog)
             .w(px(width))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
