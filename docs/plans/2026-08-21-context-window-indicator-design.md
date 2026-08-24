@@ -31,13 +31,13 @@ Give the user a persistent, trustworthy view of the active chat's context pressu
 
 - Do not alter provider account quotas, billing usage, model selection, compact behavior, or composer geometry beyond the control's reserved width.
 - Do not fabricate a model limit when the runtime has not supplied or deterministically selected one.
-- Reset the visible snapshot when a new runtime configuration starts with no usage; retain it across ordinary idle/resume for the same chat.
+- Keep the snapshot last-known per chat: only a newer runtime measurement replaces it. Superseded by `openspec/specs/context-usage-continuity/spec.md`, which owns this contract.
 
 ## Validation
 
 - Protocol and serde compatibility tests for old and new usage/session payloads.
 - Runtime normalization tests for Codex, Claude, and OMP.
-- Engine session-watch tests for snapshot update/reset behavior.
+- Engine session-watch tests for snapshot update and retention behavior.
 - Pure formatting, threshold, and neutral-state UI tests.
 - Real GPUI app inspection at the standard and narrow layouts, including tooltip and high-usage fixtures.
 

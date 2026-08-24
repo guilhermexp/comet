@@ -2401,3 +2401,157 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
             .is_some_and(|duration| duration > 0)
     );
 }
+
+/// Regression: turn 2 spawns a fresh runtime process that has not reported a
+/// context snapshot yet. The session row feeding the composer gauge must keep
+/// the last known measurement across the boundary — dropping it flipped the
+/// indicator back to its neutral "no measurement yet" state mid-conversation.
+#[tokio::test]
+async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
+    /// Only the first turn reports usage; later turns are silent, like a
+    /// restarted runtime that has not billed a snapshot yet.
+    struct MeasuresOnlyOnFirstTurn;
+
+    #[async_trait]
+    impl Harness for MeasuresOnlyOnFirstTurn {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Measures once"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let measures = request.prompt == "first";
+            let mut script = vec![AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-1".into(),
+                assistant_message_id: format!("a-{}", request.prompt),
+            }];
+            if measures {
+                script.push(AgentEvent::Usage {
+                    input_tokens: 120_000,
+                    output_tokens: 512,
+                    context_usage: Some(zeron_proto::ContextUsage {
+                        tokens: 120_000,
+                        context_window: 200_000,
+                    }),
+                });
+            }
+            script.push(AgentEvent::TextDelta {
+                text: format!("answering {}", request.prompt),
+            });
+            script.push(done(DoneStatus::Completed));
+            Ok(futures::stream::iter(script.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    let measured = zeron_proto::ContextUsage {
+        tokens: 120_000,
+        context_window: 200_000,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MeasuresOnlyOnFirstTurn));
+    let watch = core.sessions.watch_sessions();
+    let usage_now = || watch.borrow().first().and_then(|s| s.context_usage);
+
+    // Record every snapshot the UI could observe, so a momentary clear during
+    // the second dispatch fails just as loudly as a permanent one.
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sampler = {
+        let observed = observed.clone();
+        let mut watch = core.sessions.watch_sessions();
+        tokio::spawn(async move {
+            while watch.changed().await.is_ok() {
+                let snapshot = watch.borrow().first().and_then(|s| s.context_usage);
+                observed.lock().unwrap().push(snapshot);
+            }
+        })
+    };
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-usage-turn-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-usage-1".into(),
+        },
+    );
+    wait_for(
+        || usage_now() == Some(measured),
+        "the first turn to report a context measurement",
+    )
+    .await;
+    wait_for(
+        || watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle),
+        "the first turn to settle",
+    )
+    .await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-usage-turn-2",
+        SessionCommandPayload::Run {
+            request: run_request("second"),
+            message_id: "m-usage-2".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-usage-2" && e.role == MessageRole::User)
+        },
+        "the second turn to dispatch",
+    )
+    .await;
+    wait_for(
+        || {
+            watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle)
+                && entries_now(&core)
+                    .iter()
+                    .filter(|e| e.role == MessageRole::Assistant)
+                    .count()
+                    == 2
+        },
+        "the second turn to settle",
+    )
+    .await;
+
+    assert_eq!(
+        usage_now(),
+        Some(measured),
+        "a silent second turn must not erase the last known measurement"
+    );
+    sampler.abort();
+    let observed = observed.lock().unwrap().clone();
+    let first_measurement = observed
+        .iter()
+        .position(|snapshot| snapshot == &Some(measured))
+        .expect("the first turn's measurement reaches the session row");
+    assert!(
+        observed[first_measurement..]
+            .iter()
+            .all(|snapshot| snapshot == &Some(measured)),
+        "the gauge fell back to an unmeasured state between turns: {observed:?}"
+    );
+}

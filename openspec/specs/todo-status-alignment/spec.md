@@ -1,7 +1,10 @@
 # todo-status-alignment Specification
 
 ## Purpose
-TBD - created by archiving change align-todo-status-icons. Update Purpose after archive.
+
+Give every To-dos row one shared status geometry so completed checks and the
+current-item arrow sit centered in the same circular slot, aligned with the row
+text on every row including the rounded last one.
 
 ## Requirements
 

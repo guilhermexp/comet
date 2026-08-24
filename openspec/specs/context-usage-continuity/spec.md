@@ -1,7 +1,10 @@
 # context-usage-continuity Specification
 
 ## Purpose
-TBD - created by archiving change retain-context-usage-between-turns. Update Purpose after archive.
+
+Keep the composer's context-window indicator on the last measurement reported
+for a chat while the next turn waits for a newer runtime snapshot, so the gauge
+never falls back to its neutral first-turn state mid-conversation.
 
 ## Requirements
 

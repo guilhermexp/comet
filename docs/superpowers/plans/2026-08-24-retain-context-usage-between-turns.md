@@ -26,7 +26,7 @@
 
 **Interfaces:**
 - Consumes: `Session.context_usage` and `Inner::set_context_usage`.
-- Produces: last-known usage retained until the next `Some(ContextUsage)` update.
+- Produces: last-known usage retained until the next `ContextUsage` measurement.
 
 - [x] **Step 1: Write a failing last-known retention test**
 - [x] **Step 2: Run the focused test and verify RED**
