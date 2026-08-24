@@ -236,10 +236,6 @@ fn runway_owns_user_position(held: bool, positioned: bool, has_landed: bool) -> 
     held && (!has_landed || positioned)
 }
 
-fn own_turn_step_active(held: bool) -> bool {
-    held
-}
-
 /// Pure stick-to-bottom spring stepper — the mugen `tick()` integration:
 /// velocity relaxes toward `(damping·v + stiffness·diff)/mass` per 60fps
 /// sub-frame, position advances by `v + target_vel` where `target_vel` is a
@@ -3250,9 +3246,6 @@ impl Transcript {
             self.engage_pin(cx);
             return;
         }
-        if !own_turn_step_active(self.own_turn.as_ref().is_some_and(|anchor| anchor.held)) {
-            return;
-        }
         // Layout moves the bottom too (pad refinement, streaming growth):
         // refresh the wheel handler's escape baseline every frame so only a
         // WHEEL's own delta registers as user intent. Without this, the pad
@@ -3315,10 +3308,10 @@ impl Transcript {
             cx.notify();
             return;
         }
-        let positioned = self
+        let (held, positioned) = self
             .own_turn
             .as_ref()
-            .is_some_and(|anchor| anchor.positioned);
+            .map_or((false, false), |anchor| (anchor.held, anchor.positioned));
         if let (Some(anchor_bounds), Some(last_bounds)) = (
             self.list.bounds_for_item(anchor_ix),
             self.list.bounds_for_item(last_ix),
@@ -3349,7 +3342,9 @@ impl Transcript {
                 // yanked back down.
                 self.own_turn = None;
                 self.remeasure_last_row();
-                if positioned {
+                if !held {
+                    cx.notify();
+                } else if positioned {
                     self.own_turn_release_pending = true;
                     self.own_turn_kick = true;
                     cx.notify();
@@ -3371,6 +3366,11 @@ impl Transcript {
         }
 
         // ---- glide to the hold, then hold exactly --------------------------
+        // A released view keeps its reservation SIZED above, but owns its own
+        // offset: only the hold moves the viewport.
+        if !held {
+            return;
+        }
         let Some(anchor_bounds) = self.list.bounds_for_item(anchor_ix) else {
             // The anchor is outside the measured window (a send fired while
             // scrolled deep into history): teleport onto it; the glide covers
@@ -8522,7 +8522,6 @@ mod tests {
             !runway_owns_user_position(true, false, true),
             "after the first landing, the sticky copy stays visible during a restick glide"
         );
-        assert!(!own_turn_step_active(false));
     }
 
     #[test]

@@ -127,11 +127,8 @@ impl RuntimeConfig {
 
 fn apply_context_usage_to_session(
     session: &mut Session,
-    context_usage: Option<zeron_proto::ContextUsage>,
+    context_usage: zeron_proto::ContextUsage,
 ) -> bool {
-    let Some(context_usage) = context_usage else {
-        return false;
-    };
     if session.context_usage == Some(context_usage) {
         return false;
     }
@@ -944,7 +941,7 @@ impl Inner {
         }
     }
 
-    fn set_context_usage(&self, chat_id: &str, context_usage: Option<zeron_proto::ContextUsage>) {
+    fn set_context_usage(&self, chat_id: &str, context_usage: zeron_proto::ContextUsage) {
         let now = Utc::now();
         let session = {
             let mut statuses = lock(&self.statuses);
@@ -2142,7 +2139,7 @@ async fn drive_run(
                 context_usage: Some(context_usage),
                 ..
             } => {
-                inner.set_context_usage(&chat_id, Some(*context_usage));
+                inner.set_context_usage(&chat_id, *context_usage);
             }
             _ => {}
         }
@@ -2535,7 +2532,7 @@ mod tests {
     }
 
     #[test]
-    fn context_snapshot_updates_deduplicates_and_retains_last_known_value() {
+    fn context_snapshot_updates_deduplicate_and_only_a_measurement_replaces() {
         let mut session = Session {
             chat_id: "chat-1".into(),
             device_id: "device-1".into(),
@@ -2548,12 +2545,16 @@ mod tests {
             tokens: 392_000,
             context_window: 828_000,
         };
-        assert!(apply_context_usage_to_session(&mut session, Some(usage)));
+        assert!(apply_context_usage_to_session(&mut session, usage));
         assert_eq!(session.context_usage, Some(usage));
-        assert!(!apply_context_usage_to_session(&mut session, Some(usage)));
-        assert!(!apply_context_usage_to_session(&mut session, None));
+        assert!(!apply_context_usage_to_session(&mut session, usage));
         assert_eq!(session.context_usage, Some(usage));
-        assert!(!apply_context_usage_to_session(&mut session, None));
+        let next = ContextUsage {
+            tokens: 410_000,
+            context_window: 828_000,
+        };
+        assert!(apply_context_usage_to_session(&mut session, next));
+        assert_eq!(session.context_usage, Some(next));
     }
 
     fn request() -> RunRequest {

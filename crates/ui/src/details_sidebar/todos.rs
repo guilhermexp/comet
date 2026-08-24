@@ -7,12 +7,6 @@ pub struct TodoStatusLayout {
     pub glyph_px: f32,
 }
 
-impl TodoStatusLayout {
-    pub fn glyph_inset_px(self) -> f32 {
-        (self.slot_px - self.glyph_px) / 2.0
-    }
-}
-
 pub fn todo_status_layout() -> TodoStatusLayout {
     TodoStatusLayout {
         slot_px: 15.0,
@@ -138,6 +132,5 @@ mod tests {
         let layout = todo_status_layout();
         assert_eq!(layout.slot_px, 15.0);
         assert_eq!(layout.glyph_px, 9.0);
-        assert_eq!(layout.glyph_inset_px(), 3.0);
     }
 }
