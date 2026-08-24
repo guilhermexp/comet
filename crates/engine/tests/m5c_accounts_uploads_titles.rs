@@ -747,6 +747,190 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     core.shutdown().await;
 }
 
+/// The anthropic slice of a REAL OMP runtime inventory, captured verbatim from
+/// `~/.omp/agent/models.db` on 2026-08-24 — the raw provider list the OMP
+/// harness forwards, alphabetical and full of retired rows, unlike the curated
+/// one-per-tier claude/codex catalogs. The retired `claude-3-haiku-20240307`
+/// sits four rows ahead of the live `claude-haiku-4-5`.
+const OMP_ANTHROPIC_INVENTORY: &[(&str, &str)] = &[
+    ("anthropic/claude-3-5-sonnet-20240620", "Claude Sonnet 3.5"),
+    ("anthropic/claude-3-5-sonnet-20241022", "Claude Sonnet 3.5 v2"),
+    ("anthropic/claude-3-7-sonnet-20250219", "Claude Sonnet 3.7"),
+    ("anthropic/claude-3-haiku-20240307", "Claude Haiku 3"),
+    ("anthropic/claude-3-opus-20240229", "Claude Opus 3"),
+    ("anthropic/claude-3-sonnet-20240229", "Claude Sonnet 3"),
+    ("anthropic/claude-fable-5", "Claude Fable 5"),
+    ("anthropic/claude-haiku-4-5", "Claude Haiku 4.5"),
+    ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+    ("anthropic/claude-mythos-5", "Claude Mythos 5"),
+    ("anthropic/claude-opus-4-0", "Claude Opus 4"),
+    ("anthropic/claude-opus-4-1", "Claude Opus 4.1"),
+    ("anthropic/claude-opus-4-1-20250805", "Claude 4.1 Opus"),
+    ("anthropic/claude-opus-4-20250514", "Claude 4 Opus"),
+    ("anthropic/claude-opus-4-5", "Claude Opus 4.5"),
+    ("anthropic/claude-opus-4-5-20251101", "Claude Opus 4.5"),
+    ("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
+    ("anthropic/claude-opus-4-7", "Claude Opus 4.7"),
+    ("anthropic/claude-opus-4-8", "Claude Opus 4.8"),
+    ("anthropic/claude-opus-5", "Claude Opus 5"),
+    ("anthropic/claude-sonnet-4-0", "Claude Sonnet 4"),
+    ("anthropic/claude-sonnet-4-20250514", "Claude 4 Sonnet"),
+    ("anthropic/claude-sonnet-4-5", "Claude Sonnet 4.5"),
+    ("anthropic/claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
+    ("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
+];
+
+/// Anthropic retired this one: every titling attempt came back 404.
+const RETIRED_HAIKU: &str = "anthropic/claude-3-haiku-20240307";
+
+/// Serves the raw OMP inventory and answers a titling run the way Anthropic
+/// does — 404 for the retired model, a real title for a live one — while
+/// recording which model each titling run asked for.
+struct InventoryHarness {
+    titling_models: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl zeron_harness::Harness for InventoryHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Inventory"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> zeron_proto::SteeringMode {
+        zeron_proto::SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+        &[zeron_proto::ReasoningLevel::Minimal]
+    }
+    async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+        Ok(OMP_ANTHROPIC_INVENTORY
+            .iter()
+            .map(|(id, name)| zeron_proto::Model {
+                id: (*id).into(),
+                label: format!("anthropic/{name}"),
+                description: None,
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            })
+            .collect())
+    }
+    async fn run(
+        &self,
+        request: zeron_proto::RunRequest,
+        _controls: zeron_harness::RunControls,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+        zeron_harness::HarnessError,
+    > {
+        let titling = request.prompt.starts_with("Reply with ONLY");
+        if titling {
+            self.titling_models
+                .lock()
+                .unwrap()
+                .push(request.model.clone());
+        }
+        let events = if titling && request.model.as_deref() == Some(RETIRED_HAIKU) {
+            vec![AgentEvent::Error {
+                message: "404 not_found_error: model: claude-3-haiku-20240307".into(),
+            }]
+        } else {
+            vec![
+                AgentEvent::TextDelta {
+                    text: if titling {
+                        "Fix Login Flow".to_string()
+                    } else {
+                        "on it".to_string()
+                    },
+                },
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            ]
+        };
+        Ok(futures::StreamExt::boxed(futures::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
+/// Regression: over a raw OMP inventory the old first-substring-match picked
+/// the retired Haiku 3, every titling attempt 404'd, and the chat ended up
+/// named after the prompt's first words. Titling must ask for the newest row
+/// of the small-tier family, and the chat must carry the model's answer.
+#[tokio::test]
+async fn titling_picks_the_live_haiku_out_of_a_raw_omp_inventory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let titling_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(InventoryHarness {
+        titling_models: titling_models.clone(),
+    }));
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).expect("data dir");
+    let core = zeron_engine::EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine assembles");
+
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let chat_id = "chat-omp-title";
+    core.workspace
+        .create_space("space-omp", &core.device_id, &cwd, None, true)
+        .expect("create space");
+    core.workspace
+        .create_chat(chat_id, Some("space-omp"), None, None, Some(cwd.clone()))
+        .expect("create chat");
+
+    core.sessions
+        .dispatch(
+            chat_id,
+            HarnessId::Mock,
+            zeron_proto::RunRequest {
+                prompt: "please fix the login flow".into(),
+                harness: None,
+                model: None,
+                reasoning: None,
+                model_options: serde_json::Map::new(),
+                cwd,
+                sandbox: SandboxLevel::ReadOnly,
+                auto_approve: true,
+                enable_workers_mcp: false,
+                workers_parent_chat_id: None,
+                attachments: Vec::new(),
+                worktree: None,
+                resume: None,
+            },
+            None,
+        )
+        .await
+        .expect("dispatch");
+
+    let chat = wait_for("chat title", || {
+        core.workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .filter(|c| c.title.as_deref().is_some_and(|t| !t.is_empty()))
+    })
+    .await;
+
+    // The user-visible outcome: the model's title, not the prompt's first words.
+    assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
+    assert_eq!(
+        titling_models.lock().unwrap().as_slice(),
+        [Some("anthropic/claude-haiku-4-5".to_string())],
+        "titling must ask for the live Haiku once — no 404 retry ladder"
+    );
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn rename_worktree_branch_guards_and_collisions() {
     let tmp = tempfile::tempdir().expect("tempdir");
