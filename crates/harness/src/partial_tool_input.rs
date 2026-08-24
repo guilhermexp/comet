@@ -4,6 +4,57 @@ pub(crate) const PARTIAL_PREVIEW_BODY_MAX_BYTES: usize = 8 * 1024;
 pub(crate) const PARTIAL_REFRESH_BYTES: usize = 16 * 1024;
 const PARTIAL_PATH_MAX_BYTES: usize = 4 * 1024;
 
+pub(crate) fn bounded_file_tool_preview(call: &ToolCall) -> Option<(ToolCall, usize)> {
+    match call {
+        ToolCall::WriteFile { path, content } => {
+            let body_bytes = content.as_ref().map_or(0, String::len);
+            let content = content
+                .as_deref()
+                .map(|content| bounded_tail(content, PARTIAL_PREVIEW_BODY_MAX_BYTES));
+            Some((
+                ToolCall::WriteFile {
+                    path: bounded_prefix(path, PARTIAL_PATH_MAX_BYTES),
+                    content,
+                },
+                body_bytes,
+            ))
+        }
+        ToolCall::EditFile {
+            path,
+            old_string,
+            new_string,
+        } => {
+            let body_bytes = old_string
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(new_string.as_ref().map_or(0, String::len));
+            let old_string = old_string
+                .as_deref()
+                .map(|value| bounded_tail(value, PARTIAL_PREVIEW_BODY_MAX_BYTES));
+            let new_string = new_string
+                .as_deref()
+                .map(|value| bounded_tail(value, PARTIAL_PREVIEW_BODY_MAX_BYTES));
+            Some((
+                ToolCall::EditFile {
+                    path: bounded_prefix(path, PARTIAL_PATH_MAX_BYTES),
+                    old_string,
+                    new_string,
+                },
+                body_bytes,
+            ))
+        }
+        ToolCall::ApplyPatch { path } => Some((
+            ToolCall::ApplyPatch {
+                path: path
+                    .as_deref()
+                    .map(|path| bounded_prefix(path, PARTIAL_PATH_MAX_BYTES)),
+            },
+            0,
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileToolKind {
     Write,
@@ -397,14 +448,34 @@ fn field_alias(key: &str) -> Option<FileField> {
 }
 
 fn truncate_to_tail(value: &mut String, max_bytes: usize) {
+    let start = bounded_tail_start(value, max_bytes);
+    value.drain(..start);
+}
+
+fn bounded_tail(value: &str, max_bytes: usize) -> String {
+    value[bounded_tail_start(value, max_bytes)..].to_owned()
+}
+
+fn bounded_tail_start(value: &str, max_bytes: usize) -> usize {
     if value.len() <= max_bytes {
-        return;
+        return 0;
     }
     let mut start = value.len() - max_bytes;
     while !value.is_char_boundary(start) {
         start += 1;
     }
-    value.drain(..start);
+    start
+}
+
+fn bounded_prefix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn has_line_boundary(delta: &str) -> bool {

@@ -16,7 +16,7 @@
 //!   holds it).
 //! - `session/prompt` owns the turn: its response's `stopReason` ends the
 //!   turn (`cancelled` → Interrupted, `refusal` → Errored, else Completed).
-//! - `session/update` notifications normalize per [`normalize::map_update`].
+//! - `session/update` notifications normalize per [`normalize::UpdateNormalizer`].
 //! - Permission requests auto-accept with the agent's preferred allow option
 //!   (zeron sessions run unattended); question-shaped requests block on the
 //!   engine's input bridge.
@@ -93,7 +93,7 @@ fn workers_mcp_servers(enabled: bool, parent_chat_id: Option<&str>) -> Vec<Value
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{UpdateNormalizer, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
 
@@ -1657,7 +1657,7 @@ fn config_option_sets(
 /// The per-agent subagent correlator: grok's spawn-tool + disk-tail tracker
 /// (inert for agents that never emit `subagent_*` updates), or opencode's
 /// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
-/// [`map_update`]; their tagged events flow from their own tasks.
+/// [`UpdateNormalizer`]; their tagged events flow from their own tasks.
 enum SubagentObserver {
     Grok(SubagentTracker),
     Opencode(OpencodeTracker),
@@ -1673,7 +1673,7 @@ impl SubagentObserver {
 }
 
 /// The events of one notification, session-filtered. `session/update` maps
-/// per [`map_update`]; `_x.ai/session_notification` is grok's extension
+/// per [`UpdateNormalizer`]; `_x.ai/session_notification` is grok's extension
 /// channel — same `{sessionId, update}` envelope, but its updates (the
 /// `subagent_*` lifecycle) render nothing directly. The subagent tracker sees
 /// both first (spawn/finished correlation + transcript tails); its tagged
@@ -1683,6 +1683,7 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    updates: &mut UpdateNormalizer,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -1691,7 +1692,7 @@ fn session_update_events(
     match method {
         "session/update" => {
             subagents.observe(update);
-            map_update(update)
+            updates.map_update(update)
         }
         "_x.ai/session_notification" => {
             subagents.observe(update);
@@ -1958,7 +1959,7 @@ fn track_turn_signals(
 ) {
     match ev {
         AgentEvent::TextDelta { text } if !text.is_empty() => *content_seen = true,
-        AgentEvent::ToolCall { id, .. } => {
+        AgentEvent::ToolCall { id, .. } | AgentEvent::ToolCallPreview { id, .. } => {
             *content_seen = true;
             open_tools.insert(id.clone());
         }
@@ -2247,6 +2248,7 @@ async fn run_session(session: Session) {
             sessions_root,
         ))
     };
+    let mut updates = UpdateNormalizer::default();
 
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
@@ -2423,8 +2425,13 @@ async fn run_session(session: Session) {
                 while let Ok(inc) = incoming.try_recv() {
                     match inc {
                         Incoming::Notification { method, params } => {
-                            let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                            let events = session_update_events(
+                                &method,
+                                &params,
+                                &session_id,
+                                &mut subagents,
+                                &mut updates,
+                            );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2456,6 +2463,7 @@ async fn run_session(session: Session) {
                 if consumer_gone {
                     break 'main;
                 }
+                updates.finish_turn();
                 let (prev, _next) = rotate(&mut assistant_message_id);
                 if !send(
                     &event_tx,
@@ -2597,8 +2605,13 @@ async fn run_session(session: Session) {
                     }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
-                    let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                    let events = session_update_events(
+                        &method,
+                        &params,
+                        &session_id,
+                        &mut subagents,
+                        &mut updates,
+                    );
                     for ev in events {
                         track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -2709,8 +2722,13 @@ async fn run_session(session: Session) {
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
                                 Incoming::Notification { method, params } => {
-                                    let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                    let events = session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        &mut updates,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2798,6 +2816,7 @@ async fn run_session(session: Session) {
                     done_current = false;
                     turn_content_seen = false;
                     steered_this_turn = false;
+                    updates.finish_turn();
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2849,6 +2868,7 @@ async fn run_session(session: Session) {
                     done_current = false;
                     turn_content_seen = false;
                     steered_this_turn = false;
+                    updates.finish_turn();
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2953,6 +2973,7 @@ async fn run_session(session: Session) {
                     done_current = false;
                     turn_content_seen = false;
                     steered_this_turn = false;
+                    updates.finish_turn();
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -3026,6 +3047,7 @@ async fn run_session(session: Session) {
                         done_current = false;
                         turn_content_seen = false;
                         steered_this_turn = false;
+                        updates.finish_turn();
                         open_tools.clear();
                         last_update_at = tokio::time::Instant::now();
                         prompt_seq += 1;
@@ -3165,6 +3187,38 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progressive_tool_preview_holds_quiet_settle_open_until_result() {
+        let mut content_seen = false;
+        let mut open_tools = std::collections::HashSet::new();
+        track_turn_signals(
+            &AgentEvent::ToolCallPreview {
+                id: "write-live".into(),
+                call: zeron_proto::ToolCall::WriteFile {
+                    path: "live.txt".into(),
+                    content: Some("bounded".into()),
+                },
+            },
+            &mut content_seen,
+            &mut open_tools,
+        );
+        assert!(content_seen);
+        assert!(open_tools.contains("write-live"));
+
+        track_turn_signals(
+            &AgentEvent::ToolResult {
+                id: "write-live".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: None,
+            },
+            &mut content_seen,
+            &mut open_tools,
+        );
+        assert!(open_tools.is_empty());
+    }
 
     #[test]
     fn opencode_model_probe_and_chat_share_one_startup_budget() {

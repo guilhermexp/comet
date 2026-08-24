@@ -4938,6 +4938,7 @@ impl Transcript {
             .w_full()
             .min_w_0()
             .rounded(px(surface.occlusion_radius))
+            .block_mouse_except_scroll()
             .when_some(surface.occlusion_background, |wrapper, background| {
                 wrapper.bg(background)
             })

@@ -1,5 +1,5 @@
-//! ACP `session/update` → [`AgentEvent`] mapping (protocol v1, the line the
-//! claude/codex adapters and Grok Build speak today).
+//! ACP `session/update` → [`AgentEvent`] normalization (protocol v1, the line
+//! the claude/codex adapters and Grok Build speak today).
 //!
 //! Tolerant by construction, like the codex normalizer: decoded from raw
 //! [`Value`]s, unknown `sessionUpdate` kinds and content types map to nothing,
@@ -12,6 +12,8 @@ use serde_json::Value;
 use zeron_proto::{
     AgentEvent, ContextUsage, SlashCommand, TodoItem, ToolCall, ToolDiff, ToolExecutionMeta,
 };
+
+use crate::partial_tool_input::{PARTIAL_REFRESH_BYTES, bounded_file_tool_preview};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only
@@ -394,10 +396,135 @@ fn typed_call(update: &Value) -> ToolCall {
     }
 }
 
+#[derive(Debug, Default)]
+struct ProgressiveFileCall {
+    latest: Option<ToolCall>,
+    last_observed_body_bytes: usize,
+    bytes_since_emit: usize,
+    last_preview: Option<ToolCall>,
+}
+
+impl ProgressiveFileCall {
+    fn observe(
+        &mut self,
+        call: ToolCall,
+        preview: ToolCall,
+        body_bytes: usize,
+    ) -> Option<ToolCall> {
+        let first = self.latest.is_none();
+        let body_started = !first && self.last_observed_body_bytes == 0 && body_bytes > 0;
+        let rewritten = body_bytes <= self.last_observed_body_bytes
+            && self
+                .last_preview
+                .as_ref()
+                .is_some_and(|latest| latest != &preview);
+        self.bytes_since_emit = self
+            .bytes_since_emit
+            .saturating_add(body_bytes.saturating_sub(self.last_observed_body_bytes));
+        self.last_observed_body_bytes = body_bytes;
+        self.latest = Some(call);
+        if !first && !body_started && !rewritten && self.bytes_since_emit < PARTIAL_REFRESH_BYTES {
+            return None;
+        }
+        if self.last_preview.as_ref() == Some(&preview) {
+            return None;
+        }
+        self.last_preview = Some(preview.clone());
+        self.bytes_since_emit = 0;
+        Some(preview)
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct UpdateNormalizer {
+    progressive_file_calls: std::collections::HashMap<String, ProgressiveFileCall>,
+}
+
+impl UpdateNormalizer {
+    pub(crate) fn map_update(&mut self, update: &Value) -> Vec<AgentEvent> {
+        let events = map_update_frame(update);
+        if !matches!(
+            update.get("sessionUpdate").and_then(Value::as_str),
+            Some("tool_call" | "tool_call_update")
+        ) {
+            return events;
+        }
+
+        let id = str_field(update, "toolCallId");
+        let mut current_call = None;
+        let mut remaining = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                AgentEvent::ToolCall { id, call } => current_call = Some((id, call)),
+                event => remaining.push(event),
+            }
+        }
+
+        let resolved = remaining
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolResult { .. }));
+        if resolved {
+            let progressive = self.progressive_file_calls.remove(&id);
+            let current_has_input = update
+                .get("rawInput")
+                .and_then(Value::as_object)
+                .is_some_and(|input| !input.is_empty());
+            let authoritative = match (progressive, current_call) {
+                (Some(_progressive), Some((_, current)))
+                    if current_has_input && bounded_file_tool_preview(&current).is_some() =>
+                {
+                    Some(current)
+                }
+                (Some(progressive), _) => progressive.latest,
+                (None, Some((_, current))) => Some(current),
+                (None, None) => None,
+            };
+            let mut normalized = Vec::with_capacity(remaining.len() + 1);
+            if let Some(call) = authoritative {
+                normalized.push(AgentEvent::ToolCall {
+                    id: id.clone(),
+                    call,
+                });
+            }
+            normalized.extend(remaining);
+            return normalized;
+        }
+
+        let Some((call_id, call)) = current_call else {
+            return remaining;
+        };
+        let progressive_input = self.progressive_file_calls.contains_key(&id)
+            || update.get("rawInput").is_some()
+            || (update.get("kind").and_then(Value::as_str) == Some("edit")
+                && tool_diff(update).is_none());
+        if progressive_input && let Some((preview, body_bytes)) = bounded_file_tool_preview(&call) {
+            let preview = self
+                .progressive_file_calls
+                .entry(id)
+                .or_default()
+                .observe(call, preview, body_bytes);
+            if let Some(call) = preview {
+                remaining.insert(0, AgentEvent::ToolCallPreview { id: call_id, call });
+            }
+            return remaining;
+        }
+        if self.progressive_file_calls.contains_key(&id) && update.get("rawInput").is_none() {
+            return remaining;
+        }
+        self.progressive_file_calls.remove(&id);
+        remaining.insert(0, AgentEvent::ToolCall { id: call_id, call });
+        remaining
+    }
+
+    pub(crate) fn finish_turn(&mut self) {
+        self.progressive_file_calls.clear();
+    }
+}
+
 /// Map one `session/update` payload's `update` object to events.
 /// Message/thought chunks are handled here too (unlike codex, ACP has no
 /// separate delta channel).
-pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
+fn map_update_frame(update: &Value) -> Vec<AgentEvent> {
     let kind = update
         .get("sessionUpdate")
         .and_then(Value::as_str)
@@ -567,6 +694,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn map_update(update: &Value) -> Vec<AgentEvent> {
+        UpdateNormalizer::default().map_update(update)
+    }
+
     #[test]
     fn execution_metadata_reads_only_reported_numeric_fields() {
         assert_eq!(
@@ -706,8 +837,9 @@ mod tests {
     }
 
     #[test]
-    fn growing_raw_input_refreshes_same_write_call_id() {
-        let first = map_update(&json!({
+    fn progressive_write_snapshots_are_bounded_and_coalesced_until_resolution() {
+        let mut normalizer = UpdateNormalizer::default();
+        let first = normalizer.map_update(&json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "write-growing",
             "kind": "edit",
@@ -717,20 +849,9 @@ mod tests {
                 "content": ""
             }
         }));
-        let second = map_update(&json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "write-growing",
-            "kind": "edit",
-            "title": "Write notes/new.txt",
-            "rawInput": {
-                "path": "notes/new.txt",
-                "content": "first\nsecond"
-            }
-        }));
-
         assert_eq!(
             first,
-            vec![AgentEvent::ToolCall {
+            vec![AgentEvent::ToolCallPreview {
                 id: "write-growing".into(),
                 call: ToolCall::WriteFile {
                     path: "notes/new.txt".into(),
@@ -738,14 +859,160 @@ mod tests {
                 },
             }]
         );
-        assert_eq!(
-            second,
-            vec![AgentEvent::ToolCall {
-                id: "write-growing".into(),
-                call: ToolCall::WriteFile {
-                    path: "notes/new.txt".into(),
-                    content: Some("first\nsecond".into()),
+
+        let complete = "x".repeat(64 * 1024);
+        let mut preview_count = 1;
+        for bytes in (1024..=complete.len()).step_by(1024) {
+            let events = normalizer.map_update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "write-growing",
+                "kind": "edit",
+                "title": "Write notes/new.txt",
+                "rawInput": {
+                    "path": "notes/new.txt",
+                    "content": &complete[..bytes]
+                }
+            }));
+            if events.is_empty() {
+                continue;
+            }
+            let [
+                AgentEvent::ToolCallPreview {
+                    id,
+                    call:
+                        ToolCall::WriteFile {
+                            path,
+                            content: Some(content),
+                        },
                 },
+            ] = events.as_slice()
+            else {
+                panic!("progressive snapshot escaped as a durable event: {events:#?}");
+            };
+            assert_eq!(id, "write-growing");
+            assert_eq!(path, "notes/new.txt");
+            assert!(content.len() <= 8 * 1024);
+            preview_count += 1;
+        }
+        assert!((2..=6).contains(&preview_count), "{preview_count}");
+
+        let resolved = normalizer.map_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "write-growing",
+            "status": "completed"
+        }));
+        assert_eq!(
+            resolved,
+            vec![
+                AgentEvent::ToolCall {
+                    id: "write-growing".into(),
+                    call: ToolCall::WriteFile {
+                        path: "notes/new.txt".into(),
+                        content: Some(complete),
+                    },
+                },
+                AgentEvent::ToolResult {
+                    id: "write-growing".into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                    execution: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn progressive_edit_snapshot_keeps_full_authoritative_input_only_at_resolution() {
+        let mut normalizer = UpdateNormalizer::default();
+        let old_string = "before\n".repeat(2 * 1024);
+        let new_string = "after\n".repeat(2 * 1024);
+        let preview = normalizer.map_update(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "edit-growing",
+            "kind": "edit",
+            "rawInput": {
+                "path": "notes/existing.txt",
+                "old_string": old_string,
+                "new_string": new_string
+            }
+        }));
+        let [
+            AgentEvent::ToolCallPreview {
+                call:
+                    ToolCall::EditFile {
+                        old_string: Some(preview_old),
+                        new_string: Some(preview_new),
+                        ..
+                    },
+                ..
+            },
+        ] = preview.as_slice()
+        else {
+            panic!("expected bounded edit preview: {preview:#?}");
+        };
+        assert!(preview_old.len() <= 8 * 1024);
+        assert!(preview_new.len() <= 8 * 1024);
+
+        let resolved = normalizer.map_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "edit-growing",
+            "status": "failed"
+        }));
+        assert_eq!(
+            resolved,
+            vec![
+                AgentEvent::ToolCall {
+                    id: "edit-growing".into(),
+                    call: ToolCall::EditFile {
+                        path: "notes/existing.txt".into(),
+                        old_string: Some(old_string),
+                        new_string: Some(new_string),
+                    },
+                },
+                AgentEvent::ToolResult {
+                    id: "edit-growing".into(),
+                    is_error: true,
+                    output: None,
+                    diff: None,
+                    execution: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn progressive_file_state_does_not_cross_a_turn_boundary() {
+        let mut normalizer = UpdateNormalizer::default();
+        assert!(matches!(
+            normalizer
+                .map_update(&json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "turn-local-write",
+                    "kind": "edit",
+                    "rawInput": {
+                        "path": "turn-one.txt",
+                        "content": "turn one"
+                    }
+                }))
+                .as_slice(),
+            [AgentEvent::ToolCallPreview { .. }]
+        ));
+
+        normalizer.finish_turn();
+
+        assert_eq!(
+            normalizer.map_update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "turn-local-write",
+                "status": "completed"
+            })),
+            vec![AgentEvent::ToolResult {
+                id: "turn-local-write".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: None,
             }]
         );
     }
