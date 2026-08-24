@@ -33,9 +33,7 @@ use super::presentation::{
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
 use super::resource_monitor::{PressureAction, WorkersResourceGlobal};
-#[cfg(target_os = "macos")]
-use super::session_gallery::native as native_session_gallery;
-use super::session_gallery::{self, CaptureMode};
+use super::session_gallery;
 #[cfg(target_os = "macos")]
 use super::session_menu::native::{self as native_session_menu, Selection as NativeMenuSelection};
 use super::session_menu::{WorkersSessionMenuItem as SessionMenuItem, session_menu_items};
@@ -1442,33 +1440,10 @@ impl WorkersContent {
         cx.notify();
     }
 
+    /// The gallery's capture entry: pick a mode, shoot, attach to this
+    /// session's uploads. One method - the mode menu and the shot live in
+    /// `session_gallery::pick_and_capture`, shared with the orchestrator.
     pub fn open_capture_menu(&mut self, session_id: String, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        {
-            let selection = native_session_gallery::show_async();
-            cx.spawn(async move |this, cx| {
-                let Ok(Some(mode)) = selection.await else {
-                    return;
-                };
-                this.update(cx, |this, cx| {
-                    this.capture_session_screenshot(session_id, mode, cx)
-                })
-                .ok();
-            })
-            .detach();
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (session_id, cx);
-        }
-    }
-
-    fn capture_session_screenshot(
-        &mut self,
-        session_id: String,
-        mode: CaptureMode,
-        cx: &mut Context<Self>,
-    ) {
         let directory = match self
             .model
             .read(cx)
@@ -1483,14 +1458,14 @@ impl WorkersContent {
                 return;
             }
         };
+        let executor = cx.background_executor().clone();
         self.gallery_capture_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { session_gallery::capture_screenshot(&directory, mode) })
-                .await;
+            let result = session_gallery::pick_and_capture(directory, executor).await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(path) => {
+                    Ok(Some(path)) => {
+                        // The user may have moved on while the capture UI was
+                        // up: a shot belongs to the session it was taken for.
                         if !gallery_session_matches(
                             this.model.read(cx).selected_session_id.as_deref(),
                             &session_id,
@@ -1507,7 +1482,7 @@ impl WorkersContent {
                             .find(|entry| entry.artifact.path == path)
                             .map(|entry| gallery_artifact_key(&entry.artifact));
                     }
-                    Err(error) if error == "Screenshot capture was cancelled" => return,
+                    Ok(None) => return,
                     Err(error) => this.gallery_error = Some(error),
                 }
                 cx.notify();

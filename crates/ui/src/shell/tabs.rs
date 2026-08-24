@@ -240,7 +240,10 @@ impl Shell {
                     // gutter, so the scope label sits flush over the stats
                     // strip below.
                     .pl(px(8.0))
-                    .child(self.render_orchestrator_capture_button(&theme, cx))
+                    // No capture button here: `capture_action` below already
+                    // renders it whenever the pane is open, and a second copy
+                    // meant two elements with the same ids (`orchestrator-
+                    // capture`, `-menu`) fighting over hover/click state.
                     .when(!details_open && self.details_context(cx).is_some(), |el| {
                         el.child(self.render_details_sidebar_button(
                             "orchestrator-toggle-details-sidebar-with-panel",

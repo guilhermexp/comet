@@ -42,6 +42,40 @@ impl CaptureMode {
     }
 }
 
+/// What `capture_screenshot` reports when the user dismisses macOS's own
+/// capture UI. Dismissing is not a failure, so callers stay silent.
+pub const CAPTURE_CANCELLED: &str = "Screenshot capture was cancelled";
+
+/// The whole capture gesture: the native mode menu, then the screenshot on a
+/// background thread. `Ok(None)` means the user cancelled - the menu or the
+/// capture itself. Both the orchestrator titlebar and the Workers gallery
+/// drive this; the gesture used to be written once per caller, cancel-string
+/// comparison included.
+pub async fn pick_and_capture(
+    directory: PathBuf,
+    executor: gpui::BackgroundExecutor,
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(Some(mode)) = native::show_async().await else {
+            return Ok(None);
+        };
+        match executor
+            .spawn(async move { capture_screenshot(&directory, mode) })
+            .await
+        {
+            Ok(path) => Ok(Some(path)),
+            Err(error) if error == CAPTURE_CANCELLED => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (directory, executor);
+        Ok(None)
+    }
+}
+
 pub fn capture_screenshot(directory: &Path, mode: CaptureMode) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     if !screen_recording_access() {
@@ -68,7 +102,7 @@ pub fn capture_screenshot(directory: &Path, mode: CaptureMode) -> Result<PathBuf
         .map_err(|error| format!("failed to launch screencapture: {error}"))?;
     if !status.success() {
         return Err(if status.code() == Some(1) {
-            "Screenshot capture was cancelled".into()
+            CAPTURE_CANCELLED.into()
         } else {
             format!("screencapture exited with status {status}")
         });

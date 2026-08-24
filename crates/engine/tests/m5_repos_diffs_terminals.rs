@@ -372,14 +372,15 @@ async fn folder_lister_flags_and_ordering() {
         .expect("listing");
     assert!(!listing.truncated);
     let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-    // Dirs first (name-sorted), including hidden directories; files follow.
-    assert_eq!(names, vec![".hidden", "alpha", "beta", "aaa.txt"]);
-    let hidden = listing
-        .entries
-        .iter()
-        .find(|e| e.name == ".hidden")
-        .expect("hidden directory entry");
-    assert!(hidden.is_dir && !hidden.is_repo);
+    // Dirs first (name-sorted), then files. The `.hidden` directory is in the
+    // fixture on purpose: without `includeHidden` a dotfile stays out of the
+    // listing (`folder_lister_includes_dotfiles_only_when_asked` covers the
+    // asked-for case), so this also pins the flag's default.
+    assert_eq!(names, vec!["alpha", "beta", "aaa.txt"]);
+    assert!(
+        !listing.entries.iter().any(|e| e.name == ".hidden"),
+        "a dotfile directory must stay out of a listing that did not ask for it"
+    );
     let beta = listing
         .entries
         .iter()

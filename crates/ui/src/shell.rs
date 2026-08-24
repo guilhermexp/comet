@@ -64,8 +64,6 @@ use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workers::model::{WorkersModel, WorkersRoute};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
 use crate::workers::session_gallery;
-#[cfg(target_os = "macos")]
-use crate::workers::session_gallery::native as native_session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
 use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
@@ -4252,37 +4250,25 @@ impl Shell {
     }
 
     fn open_orchestrator_capture_menu(&mut self, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        {
-            let selection = native_session_gallery::show_async();
-            let composer = self.composer.clone();
-            cx.spawn(async move |_, cx| {
-                let Ok(Some(mode)) = selection.await else {
-                    return;
-                };
-                let directory = std::env::temp_dir().join("comet-orchestrator-captures");
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { session_gallery::capture_screenshot(&directory, mode) })
-                    .await;
-                match result {
-                    Ok(path) => {
-                        let cleanup = path.clone();
-                        composer.update(cx, |composer, cx| composer.add_paths(vec![path], cx));
-                        let _ = std::fs::remove_file(cleanup);
-                    }
-                    Err(error) if error == "Screenshot capture was cancelled" => {}
-                    Err(error) => {
-                        composer.update(cx, |composer, cx| composer.set_failure(error, cx));
-                    }
+        let composer = self.composer.clone();
+        let directory = std::env::temp_dir().join("comet-orchestrator-captures");
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |_, cx| {
+            match session_gallery::pick_and_capture(directory, executor).await {
+                // The composer owns the attachment now; the capture file was
+                // only a hand-off in temp.
+                Ok(Some(path)) => {
+                    let cleanup = path.clone();
+                    composer.update(cx, |composer, cx| composer.add_paths(vec![path], cx));
+                    let _ = std::fs::remove_file(cleanup);
                 }
-            })
-            .detach();
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = cx;
-        }
+                Ok(None) => {}
+                Err(error) => {
+                    composer.update(cx, |composer, cx| composer.set_failure(error, cx));
+                }
+            }
+        })
+        .detach();
     }
 
     fn render_orchestrator_capture_button(
