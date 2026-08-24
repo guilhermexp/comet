@@ -349,8 +349,14 @@ impl FilePreview {
             PreviewLoadState::Ready(LoadedPreview::Unsupported) => {
                 centered_message("Cannot view this file", theme)
             }
+            // Scroll offset is element state keyed by id: a shared id handed
+            // the next file the previous file's offset, so a short document
+            // opened parked past its own end (user report: "opens in the
+            // middle, shows nothing"). One id per path, one offset per file.
             PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => div()
-                .id("file-preview-markdown-scroll")
+                .id(SharedString::from(format!(
+                    "file-preview-markdown-scroll:{path}"
+                )))
                 .size_full()
                 .overflow_y_scroll()
                 .px(px(28.0))
@@ -364,7 +370,7 @@ impl FilePreview {
                 ))
                 .into_any_element(),
             PreviewLoadState::Ready(LoadedPreview::Code { lines, highlights }) => {
-                render_code(lines, highlights, theme)
+                render_code(&path, lines, highlights, theme)
             }
             PreviewLoadState::Ready(LoadedPreview::Html(document)) => {
                 self.render_native_document(window, theme, Some(document.as_ref()))
@@ -373,7 +379,7 @@ impl FilePreview {
             PreviewLoadState::Ready(LoadedPreview::Pdf) => {
                 self.render_native_document(window, theme, None)
             }
-            PreviewLoadState::Ready(LoadedPreview::Table(rows)) => render_data(rows, theme),
+            PreviewLoadState::Ready(LoadedPreview::Table(rows)) => render_data(&path, rows, theme),
         }
     }
 
@@ -495,6 +501,7 @@ fn centered_message(message: impl Into<SharedString>, theme: &Theme) -> AnyEleme
 }
 
 fn render_code(
+    path: &str,
     lines: Arc<[SharedString]>,
     highlights: Option<Arc<HighlightedDocument>>,
     theme: &Theme,
@@ -546,7 +553,9 @@ fn render_code(
     let code_lines = lines.clone();
     let code_highlights = highlights;
     let code = div()
-        .id("file-preview-code-scroll")
+        .id(SharedString::from(format!(
+            "file-preview-code-scroll:{path}"
+        )))
         .flex_1()
         .min_w_0()
         .h_full()
@@ -607,9 +616,11 @@ fn minimap_sample_indices(line_count: usize, limit: usize) -> Vec<usize> {
         .collect()
 }
 
-fn render_data(rows: Arc<[Vec<SharedString>]>, theme: &Theme) -> AnyElement {
+fn render_data(path: &str, rows: Arc<[Vec<SharedString>]>, theme: &Theme) -> AnyElement {
     div()
-        .id("file-preview-data-scroll")
+        .id(SharedString::from(format!(
+            "file-preview-data-scroll:{path}"
+        )))
         .size_full()
         .overflow_scroll()
         .p(px(16.0))

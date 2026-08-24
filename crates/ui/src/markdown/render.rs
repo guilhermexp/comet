@@ -242,7 +242,15 @@ pub fn render_block(
             .gap(px(8.0))
             .text_color(theme.text_muted)
             .children(children.iter().enumerate().map(|(ci, child)| {
-                render_block(child, top_ix, ix * 100 + ci, opts, theme, window, None)
+                render_block(
+                    child,
+                    top_ix,
+                    nested_ix(ix, 0, ci),
+                    opts,
+                    theme,
+                    window,
+                    None,
+                )
             }))
             .into_any_element(),
         Block::List {
@@ -293,7 +301,7 @@ pub fn render_block(
                             render_block(
                                 child,
                                 top_ix,
-                                ix * 100 + item_ix * 10 + ci,
+                                nested_ix(ix, item_ix + 1, ci),
                                 opts,
                                 theme,
                                 window,
@@ -356,9 +364,32 @@ pub fn table_columns(content_widths: &[f32]) -> TableColumns {
     }
 }
 
+/// Discriminator for a block nested under `parent` at `slot`/`child`.
+///
+/// Fixed-radix packing (`parent * 100 + slot * 10 + child`) was NOT injective:
+/// a list with ten or more items, or a document with a hundred or more
+/// top-level blocks, carried a child straight onto another block's id. Two
+/// blocks then shared one `InteractiveText` id — which is a duplicate a11y
+/// node id (gpui panics in debug, drops the node in release) — plus one
+/// `flatten_cached` entry and one selection key, so a long document rendered
+/// another block's text. Mixing (FNV-1a) keeps the id a pure function of the
+/// path with collisions at 2^-64 instead of at ten list items.
+fn nested_ix(parent: usize, slot: usize, child: usize) -> usize {
+    // Each component gets its own round: folding `parent` straight into the
+    // offset basis would make (parent 1, slot 0) and (parent 0, slot 1) the
+    // same id — the test catches exactly that.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [parent as u64, slot as u64, child as u64] {
+        hash = (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Keep it inside `usize` on 32-bit targets too; the top bit carries no
+    // information the low 63 do not.
+    (hash >> 1) as usize
+}
+
 /// Element/cache discriminator for a table cell (row-major under the block ix).
 fn table_cell_ix(ix: usize, r: usize, c: usize) -> usize {
-    ix * 100_000 + r * 100 + c
+    nested_ix(ix, r, c)
 }
 
 /// A GFM table — a port of mugen-markdown's `TableBlock` under zeron's md
@@ -1435,5 +1466,33 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+    }
+
+    /// Block ids key the `InteractiveText` element (hence an a11y node), the
+    /// flatten cache and the selection wash. Two blocks sharing one id made
+    /// gpui abort on `Duplicate a11y node id` in debug and made a long
+    /// document paint another block's cached text. The old
+    /// `parent * 100 + slot * 10 + child` packing collided at ten list items.
+    #[test]
+    fn nested_block_ids_never_collide() {
+        use std::collections::HashSet;
+        let mut seen: HashSet<usize> = HashSet::new();
+        // Top-level blocks are keyed by their raw index.
+        for ix in 0..512 {
+            assert!(seen.insert(ix), "top-level {ix} is not unique");
+        }
+        // Every nesting slot a real document can reach: 512 parents, 64
+        // items/rows per parent, 8 children/columns per item.
+        for parent in 0..512 {
+            for slot in 0..64 {
+                for child in 0..8 {
+                    let id = nested_ix(parent, slot, child);
+                    assert!(
+                        seen.insert(id),
+                        "id {id} collides at parent={parent} slot={slot} child={child}"
+                    );
+                }
+            }
+        }
     }
 }
