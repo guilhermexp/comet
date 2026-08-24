@@ -12,7 +12,10 @@
 //!   keeps its id, so row identity is continuous and nothing flickers;
 //! - rows are cached per entry keyed by a content fingerprint — only changed
 //!   messages rebuild (the anti-"streaming stutter" trick);
-//! - row-set changes diff by (id, version) into one minimal `splice`.
+//! - row-set changes diff by (id, version) into one minimal `splice`;
+//! - the user row for the turn crossing the reading line is repainted as an
+//!   absolute sticky header, bounded by the next user row, so virtualization
+//!   stays flat while historical turns retain their prompt context.
 //!
 //! Stick-to-bottom is a velocity spring (mugen §1e, the same shape as
 //! stackblitz's use-stick-to-bottom): while pinned, a per-frame stepper glides
@@ -207,6 +210,10 @@ const OWN_SEND_GLIDE_SNAP_PX: f32 = 1.0;
 /// filled the reserved space — the notes-app `minHeight` analogue.
 fn own_turn_reservation(usable: f32, turn_height: f32) -> f32 {
     (usable - turn_height).max(0.0)
+}
+
+fn runway_owns_user_position(held: bool, positioned: bool, has_landed: bool) -> bool {
+    held && (!has_landed || positioned)
 }
 
 /// Pure stick-to-bottom spring stepper — the mugen `tick()` integration:
@@ -2218,6 +2225,10 @@ struct OwnTurnAnchor {
     runway: f32,
     /// The send glide has landed; the anchor now holds position exactly.
     positioned: bool,
+    /// Distinguishes the initial send glide from a later return-to-bottom
+    /// glide. The initial glide owns the prompt visual; on a restick, the
+    /// sticky copy remains until the original has re-landed.
+    has_landed: bool,
 }
 
 #[derive(Clone)]
@@ -2225,6 +2236,173 @@ struct UserMessagePreview {
     row_id: SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StickyTurnGroup {
+    user_ix: usize,
+    next_user_ix: Option<usize>,
+}
+
+fn sticky_turn_rows(rows: &[Row]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(ix, row)| matches!(row.kind, RowKind::User { .. }).then_some(ix))
+        .collect()
+}
+
+fn sticky_turn_group(user_rows: &[usize], reading_row_ix: usize) -> Option<StickyTurnGroup> {
+    let next = user_rows.partition_point(|user_ix| *user_ix <= reading_row_ix);
+    let user_ix = *user_rows.get(next.checked_sub(1)?)?;
+    Some(StickyTurnGroup {
+        user_ix,
+        next_user_ix: user_rows.get(next).copied(),
+    })
+}
+
+fn sticky_turn_group_for_viewport(
+    user_rows: &[usize],
+    sticky_top: f32,
+    fallback_reading_row: Option<usize>,
+    mut user_top: impl FnMut(usize) -> Option<f32>,
+) -> Option<StickyTurnGroup> {
+    let group_at = |position: usize| {
+        Some(StickyTurnGroup {
+            user_ix: *user_rows.get(position)?,
+            next_user_ix: user_rows.get(position + 1).copied(),
+        })
+    };
+    let fallback = sticky_turn_group(user_rows, fallback_reading_row?)?;
+    let mut position = user_rows.binary_search(&fallback.user_ix).ok()?;
+    while user_top(position).is_some_and(|top| top > sticky_top + 0.5) {
+        position = position.checked_sub(1)?;
+    }
+    while position + 1 < user_rows.len()
+        && user_top(position + 1).is_some_and(|top| top <= sticky_top + 0.5)
+    {
+        position += 1;
+    }
+    group_at(position)
+}
+
+fn sticky_turn_overlay_top(
+    sticky_top: f32,
+    source_top: Option<f32>,
+    source_is_above_when_unmeasured: bool,
+    next_turn_top: Option<f32>,
+    header_height: f32,
+) -> Option<f32> {
+    let source_crossed = source_top.map_or(source_is_above_when_unmeasured, |source_top| {
+        source_top < sticky_top - 0.5
+    });
+    if !source_crossed {
+        return None;
+    }
+    Some(
+        next_turn_top
+            .map(|next_top| next_top - header_height)
+            .unwrap_or(sticky_top)
+            .min(sticky_top),
+    )
+}
+
+#[derive(Default)]
+struct StickyTurnState {
+    chat_id: Option<String>,
+    heights: HashMap<SharedString, f32>,
+    geometries: HashMap<SharedString, StickyUserGeometry>,
+    suppress_once: std::collections::HashSet<SharedString>,
+    viewport: Option<(f32, f32)>,
+}
+
+#[derive(Clone, Copy)]
+struct StickyUserGeometry {
+    top: f32,
+    scroll_y: f32,
+}
+
+impl StickyTurnState {
+    fn attach_chat(&mut self, chat_id: Option<&str>) -> bool {
+        if self.chat_id.as_deref() == chat_id {
+            return false;
+        }
+        self.chat_id = chat_id.map(str::to_owned);
+        self.heights.clear();
+        self.geometries.clear();
+        self.suppress_once.clear();
+        self.viewport = None;
+        true
+    }
+
+    fn record_height(&mut self, id: SharedString, height: f32) -> bool {
+        if self
+            .heights
+            .get(&id)
+            .is_some_and(|current| (*current - height).abs() <= 0.5)
+        {
+            return false;
+        }
+        self.heights.insert(id, height);
+        true
+    }
+
+    fn record_geometry(&mut self, id: SharedString, top: f32, height: f32, scroll_y: f32) -> bool {
+        let changed = self.geometries.get(&id).is_none_or(|current| {
+            (current.top - top).abs() > 0.5 || (current.scroll_y - scroll_y).abs() > 0.5
+        });
+        let height_changed = self.record_height(id.clone(), height);
+        self.suppress_once.remove(&id);
+        self.geometries
+            .insert(id, StickyUserGeometry { top, scroll_y });
+        changed || height_changed
+    }
+
+    fn height(&self, id: &str) -> Option<f32> {
+        self.heights.get(id).copied()
+    }
+
+    fn projected_top(&self, id: &str, current_scroll_y: f32) -> Option<f32> {
+        self.geometries
+            .get(id)
+            .map(|geometry| geometry.top + current_scroll_y - geometry.scroll_y)
+    }
+
+    fn invalidate_layout(&mut self) {
+        self.suppress_once.extend(self.geometries.keys().cloned());
+        self.geometries.clear();
+    }
+
+    fn invalidate_user_ids(&mut self, ids: impl IntoIterator<Item = SharedString>) {
+        for id in ids {
+            if self.geometries.remove(&id).is_some() {
+                self.suppress_once.insert(id);
+            }
+        }
+    }
+
+    fn consume_layout_suppression(&mut self, id: &str) -> bool {
+        self.suppress_once.remove(id)
+    }
+
+    fn update_viewport(&mut self, width: f32, height: f32) -> bool {
+        if self
+            .viewport
+            .is_some_and(|(current_width, current_height)| {
+                (current_width - width).abs() <= 0.5 && (current_height - height).abs() <= 0.5
+            })
+        {
+            return false;
+        }
+        self.viewport = Some((width, height));
+        self.invalidate_layout();
+        true
+    }
+
+    fn retain_user_ids(&mut self, live: &std::collections::HashSet<SharedString>) {
+        self.heights.retain(|id, _| live.contains(id));
+        self.geometries.retain(|id, _| live.contains(id));
+        self.suppress_once.retain(|id| live.contains(id));
+    }
 }
 
 fn user_message_preview(
@@ -2319,6 +2497,17 @@ pub struct Transcript {
     /// A locally-sent prompt currently held near the viewport top while its
     /// reply grows into the empty space below it.
     own_turn: Option<OwnTurnAnchor>,
+    /// Per-chat measurements for the virtual sticky copy of user rows. The
+    /// copy is paint-only; none of this state participates in list height.
+    sticky_turn: StickyTurnState,
+    /// Top-level indices of user rows, rebuilt only when the row projection
+    /// changes. Scroll frames binary-search this list instead of walking a
+    /// long transcript.
+    sticky_turn_rows: Vec<usize>,
+    /// Scrollbar offset sampled by the outer `Render` before GPUI mutably
+    /// borrows `ListState` to run the row processor. `render_row` must never
+    /// read the list back from inside that processor.
+    sticky_scroll_y: f32,
     /// A layout-affecting change needs one post-layout own-turn measurement.
     own_turn_kick: bool,
     /// One own-turn `on_next_frame` callback in flight at most.
@@ -2603,6 +2792,9 @@ impl Transcript {
             last_scroll_distance: 0.0,
             pinned,
             own_turn: None,
+            sticky_turn: StickyTurnState::default(),
+            sticky_turn_rows: Vec::new(),
+            sticky_scroll_y: 0.0,
             own_turn_kick: false,
             own_turn_scheduled: false,
             own_turn_last_tick: None,
@@ -2697,7 +2889,16 @@ impl Transcript {
         self.scroll_anim = Some(task);
     }
 
-    fn remeasure_last_row(&self) {
+    /// Give the viewport to the user/navigation without dropping the
+    /// reservation: the pad stays, the hold stands down until a restick.
+    fn release_own_turn_hold(&mut self) {
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = false;
+        }
+        self.own_turn_last_tick = None;
+    }
+
+    fn remeasure_last_row(&mut self) {
         if let Some(last) = self.rows.len().checked_sub(1) {
             self.list.remeasure_items(last..last + 1);
         }
@@ -2933,6 +3134,7 @@ impl Transcript {
             message_id: SharedString::from(message_id),
             runway: 0.0,
             positioned: false,
+            has_landed: false,
         });
         self.own_turn_release_pending = false;
         self.own_turn_last_tick = None;
@@ -3204,6 +3406,7 @@ impl Transcript {
             land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
+                anchor.has_landed = true;
             }
             self.own_turn_last_tick = None;
         } else if anchored
@@ -3218,6 +3421,7 @@ impl Transcript {
             }
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
+                anchor.has_landed = true;
             }
             self.own_turn_last_tick = None;
         } else if !anchored && err <= OWN_SEND_GLIDE_SNAP_PX {
@@ -3226,6 +3430,7 @@ impl Transcript {
             land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
+                anchor.has_landed = true;
             }
             self.own_turn_last_tick = None;
         } else {
@@ -3370,6 +3575,7 @@ impl Transcript {
 
         let attached = selected != self.chat_id;
         if attached {
+            self.sticky_turn.attach_chat(selected.as_deref());
             let keep_own_turn = self
                 .own_turn
                 .as_ref()
@@ -3381,6 +3587,7 @@ impl Transcript {
             }
             self.chat_id = selected;
             self.rows.clear();
+            self.sticky_turn_rows.clear();
             self.row_cache.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
@@ -3418,6 +3625,12 @@ impl Transcript {
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true, &mut todo_history));
         }
+        let new_sticky_turn_rows = sticky_turn_rows(&new_rows);
+        let live_sticky_user_ids = new_sticky_turn_rows
+            .iter()
+            .filter_map(|ix| new_rows.get(*ix).map(|row| row.id.clone()))
+            .collect();
+        self.sticky_turn.retain_user_ids(&live_sticky_user_ids);
         self.reasoning_started.retain(|id, _| {
             new_rows.iter().any(|row| {
                 row.id == *id && matches!(&row.kind, RowKind::Reasoning { active: true, .. })
@@ -3470,10 +3683,12 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                self.sticky_turn_rows = new_sticky_turn_rows;
                 self.refresh_protected_attachments(cx);
                 return;
             }
             Some((old_range, count)) => {
+                self.invalidate_sticky_users_from(old_range.start);
                 // Any replaced row's cached flatten results are stale — and
                 // because live replies splice only the rows whose content hash
                 // changed (the tail), this is O(changed rows) per commit, never
@@ -3501,6 +3716,7 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        self.sticky_turn_rows = new_sticky_turn_rows;
         self.refresh_protected_attachments(cx);
         if self.land_end_pending && !self.rows.is_empty() {
             // First content for an unpinned override tab: land at the end.
@@ -3602,6 +3818,7 @@ impl Transcript {
             .insert(blob_ref.clone(), self.blob_fetch_counter);
         match self.blob_details.get(&blob_ref) {
             Some(BlobFetch::Ready(_)) => {
+                self.sticky_turn.invalidate_layout();
                 cx.notify();
                 return;
             }
@@ -3636,6 +3853,7 @@ impl Transcript {
             };
             this.update(cx, |this, cx| {
                 this.blob_details.insert(ref_key, fetched);
+                this.sticky_turn.invalidate_layout();
                 cx.notify();
             })
             .ok();
@@ -3779,17 +3997,40 @@ impl Transcript {
         ))
     }
 
+    fn invalidate_sticky_users_from(&mut self, row_ix: usize) {
+        let first_user = self
+            .sticky_turn_rows
+            .partition_point(|user_ix| *user_ix < row_ix);
+        let ids = self.sticky_turn_rows[first_user..]
+            .iter()
+            .filter_map(|user_ix| self.rows.get(*user_ix).map(|row| row.id.clone()))
+            .collect::<Vec<_>>();
+        self.sticky_turn.invalidate_user_ids(ids);
+    }
+
+    fn invalidate_sticky_users_after_row(&mut self, row_id: &SharedString) {
+        if let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| row_contains_id(row, row_id))
+        {
+            self.invalidate_sticky_users_from(index + 1);
+        }
+    }
+
     fn remeasure_row_containing(&mut self, row_id: &SharedString) {
         if let Some(index) = self
             .rows
             .iter()
             .position(|row| row_contains_id(row, row_id))
         {
+            self.invalidate_sticky_users_from(index + 1);
             self.list.remeasure_items(index..index + 1);
         }
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
+        self.invalidate_sticky_users_after_row(&row_id);
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
         entry.from = if currently_open { open_height } else { 0.0 };
@@ -4118,6 +4359,7 @@ impl Transcript {
                     },
                 );
                 transcript.trim_inline_image_cache();
+                transcript.sticky_turn.invalidate_layout();
                 cx.notify();
             })
             .ok();
@@ -4536,6 +4778,182 @@ impl Transcript {
         )
     }
 
+    fn row_top_gap(&self, ix: usize, row: &Row) -> f32 {
+        if ix == 0 {
+            if self.doc_override.is_some() {
+                GAP_TURN
+            } else {
+                Theme::TITLEBAR_HEIGHT + GAP_TURN + 10.0
+            }
+        } else {
+            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), row)
+        }
+    }
+
+    fn sticky_reading_row(&self) -> Option<usize> {
+        let last_ix = self.rows.len().checked_sub(1)?;
+        let viewport = self.list.viewport_bounds();
+        if f32::from(viewport.size.height) <= 0.0
+            || f32::from(self.list.max_offset_for_scrollbar().y) <= 0.5
+        {
+            return None;
+        }
+        let read_top = f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX + 0.5;
+        let mut row_ix = self.list.logical_scroll_top().item_ix.min(last_ix);
+        while row_ix < last_ix {
+            let Some(bounds) = self.list.bounds_for_item(row_ix + 1) else {
+                break;
+            };
+            if f32::from(bounds.top()) > read_top {
+                break;
+            }
+            row_ix += 1;
+        }
+        Some(row_ix)
+    }
+
+    fn sticky_user_top(&self, user_ix: usize, current_scroll_y: f32) -> Option<f32> {
+        let row = self.rows.get(user_ix)?;
+        self.list
+            .bounds_for_item(user_ix)
+            .map(|bounds| f32::from(bounds.top()) + self.row_top_gap(user_ix, row))
+            .or_else(|| {
+                self.sticky_turn
+                    .projected_top(row.id.as_ref(), current_scroll_y)
+            })
+    }
+
+    fn render_sticky_turn(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.doc_override.is_some() {
+            return None;
+        }
+        let viewport = self.list.viewport_bounds();
+        let viewport_top = f32::from(viewport.top());
+        let sticky_top = viewport_top + OWN_SEND_TOP_INSET_PX;
+        if self.sticky_turn.update_viewport(
+            f32::from(viewport.size.width),
+            f32::from(viewport.size.height),
+        ) {
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |_this: &mut Transcript, cx| cx.notify())
+                    .ok();
+            });
+            return None;
+        }
+        let current_scroll_y = self.sticky_scroll_y;
+        let fallback_reading_ix = self.sticky_reading_row();
+        let group = sticky_turn_group_for_viewport(
+            &self.sticky_turn_rows,
+            sticky_top,
+            fallback_reading_ix,
+            |position| {
+                let user_ix = *self.sticky_turn_rows.get(position)?;
+                self.sticky_user_top(user_ix, current_scroll_y)
+            },
+        )?;
+        let source = self.rows.get(group.user_ix)?.clone();
+        if self.own_turn.as_ref().is_some_and(|anchor| {
+            source.entry_id == anchor.message_id
+                && runway_owns_user_position(anchor.held, anchor.positioned, anchor.has_landed)
+        }) {
+            // The runway already owns this exact visual position. Painting a
+            // second copy would double text/attachments during the landing.
+            return None;
+        }
+
+        let source_top = self.sticky_user_top(group.user_ix, current_scroll_y);
+        let source_was_invalidated = self
+            .sticky_turn
+            .consume_layout_suppression(source.id.as_ref());
+        if source_top.is_none() && source_was_invalidated {
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |_this: &mut Transcript, cx| cx.notify())
+                    .ok();
+            });
+            return None;
+        }
+        let next_turn_top = group.next_user_ix.and_then(|ix| {
+            self.list
+                .bounds_for_item(ix)
+                .map(|bounds| f32::from(bounds.top()))
+                .or_else(|| {
+                    let body_top = self.sticky_user_top(ix, current_scroll_y)?;
+                    let row = self.rows.get(ix)?;
+                    Some(body_top - self.row_top_gap(ix, row))
+                })
+        });
+        let measured_height = self
+            .sticky_turn
+            .height(source.id.as_ref())
+            .unwrap_or(USER_MESSAGE_CARD_MAX_HEIGHT);
+        let overlay_top = sticky_turn_overlay_top(
+            sticky_top,
+            source_top,
+            fallback_reading_ix.is_some_and(|reading_ix| reading_ix > group.user_ix),
+            next_turn_top,
+            measured_height + GAP_TURN,
+        )?;
+
+        // Namespace the duplicate element ids while preserving every field
+        // and the same renderer/interaction path as the list row.
+        let mut sticky_row = source.clone();
+        sticky_row.id = SharedString::from(format!("{}#sticky", source.id));
+        let theme = Theme::of(cx).clone();
+        let body = self.render_row_body(&sticky_row, None, window, &theme, cx);
+        let source_id = source.id.clone();
+        let weak = cx.weak_entity();
+        let measured =
+            div()
+                .w_full()
+                .min_w_0()
+                .child(body)
+                .on_children_prepainted(move |bounds, _, cx| {
+                    let Some(height) = bounds
+                        .first()
+                        .map(|bounds| f32::from(bounds.size.height))
+                        .filter(|height| *height > 0.0)
+                    else {
+                        return;
+                    };
+                    weak.update(cx, |this, cx| {
+                        if this.sticky_turn.record_height(source_id.clone(), height) {
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+
+        Some(
+            div()
+                .id(SharedString::from(format!("{}#sticky-turn", source.id)))
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(overlay_top - viewport_top))
+                .px(px(48.0))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(MAX_CONTENT_WIDTH))
+                        .min_w_0()
+                        .pb(px(GAP_TURN))
+                        .bg(theme.bg)
+                        .child(measured),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
@@ -4546,15 +4964,7 @@ impl Transcript {
         // rests below the chrome it fades under. The right pane already pads
         // for the titlebar — an override instance's first row keeps only the
         // ordinary turn gap, or the content sits double-chrome low.
-        let top_gap = if ix == 0 {
-            if self.doc_override.is_some() {
-                GAP_TURN
-            } else {
-                Theme::TITLEBAR_HEIGHT + GAP_TURN + 10.0
-            }
-        } else {
-            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
-        };
+        let top_gap = self.row_top_gap(ix, &row);
         // The last row must clear the composer/status stack the transcript
         // scrolls under PLUS the fade band above it, or the timestamp strip
         // (the row's lowest content) renders half-faded (or hidden) when the
@@ -4579,7 +4989,9 @@ impl Transcript {
             .then(|| self.render_working_trailer(cx))
             .flatten();
 
-        let inner = self.render_row_body(&row, window, &theme, cx);
+        let user_geometry = matches!(row.kind, RowKind::User { .. })
+            .then(|| (row.id.clone(), self.sticky_scroll_y));
+        let inner = self.render_row_body(&row, user_geometry, window, &theme, cx);
 
         // Hover-revealed timestamp strip (zeron chat-view.tsx `Timestamp`):
         // a RESERVED 16px lane under the entry's last row — the label only
@@ -4674,6 +5086,7 @@ impl Transcript {
     fn render_row_body(
         &mut self,
         row: &Row,
+        user_geometry: Option<(SharedString, f32)>,
         window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -4813,7 +5226,39 @@ impl Transcript {
                             .child(summary),
                     );
                 }
-                column.into_any_element()
+                if let Some((geometry_id, scroll_y)) = user_geometry {
+                    let weak = cx.weak_entity();
+                    column
+                        .on_children_prepainted(move |bounds, _, cx| {
+                            let Some(first) = bounds.first() else {
+                                return;
+                            };
+                            let mut top = f32::from(first.top());
+                            let mut bottom = f32::from(first.bottom());
+                            for bounds in &bounds[1..] {
+                                top = top.min(f32::from(bounds.top()));
+                                bottom = bottom.max(f32::from(bounds.bottom()));
+                            }
+                            let height = bottom - top;
+                            if height <= 0.0 {
+                                return;
+                            }
+                            weak.update(cx, |this, cx| {
+                                if this.sticky_turn.record_geometry(
+                                    geometry_id.clone(),
+                                    top,
+                                    height,
+                                    scroll_y,
+                                ) {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .into_any_element()
+                } else {
+                    column.into_any_element()
+                }
             }
             RowKind::Markdown { tree, block_ix } => {
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -5375,6 +5820,7 @@ impl Transcript {
             .text_color(theme.text_muted)
             .hover(|style| style.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.invalidate_sticky_users_after_row(&toggle_id);
                 toggle_turn_steps_state(&mut this.turn_steps_open, toggle_id.clone());
                 cx.notify();
             }))
@@ -5414,7 +5860,7 @@ impl Transcript {
             let children = visible_turn_step_children(open, rows)
                 .iter()
                 .map(|child| {
-                    let body = self.render_row_body(child, window, theme, cx);
+                    let body = self.render_row_body(child, None, window, theme, cx);
                     div().id(child.id.clone()).w_full().min_w_0().child(body)
                 })
                 .collect::<Vec<_>>();
@@ -5570,6 +6016,7 @@ impl Transcript {
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::ink(0.035)))
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.invalidate_sticky_users_after_row(&toggle_id);
                 this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
                 cx.notify();
             }))
@@ -5737,6 +6184,7 @@ impl Transcript {
                     },
                 );
                 transcript.trim_mermaid_cache();
+                transcript.sticky_turn.invalidate_layout();
                 cx.notify();
             })
             .ok();
@@ -6271,6 +6719,7 @@ impl Transcript {
                             .items_center()
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.invalidate_sticky_users_after_row(&group_key);
                                 let entry =
                                     this.tool_details.entry(toggle_key.clone()).or_default();
                                 let currently_open = entry.open.unwrap_or(default_open);
@@ -7519,6 +7968,9 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
+        // The row processor runs later under ListState's mutable prepaint
+        // borrow, so capture every list-derived scalar it needs now.
+        self.sticky_scroll_y = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
         // Own-turn driver: measurements are only authoritative after layout,
         // so reservation sizing, the send glide, and the outgrown-handoff
         // each advance at most once per requested frame. Scheduled on every
@@ -7586,6 +8038,7 @@ impl Render for Transcript {
         } else {
             list_el.into_any_element()
         };
+        let sticky_turn = self.render_sticky_turn(window, cx);
         let root = div()
             .relative()
             .size_full()
@@ -7598,6 +8051,7 @@ impl Render for Transcript {
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
             .child(content)
+            .children(sticky_turn)
             .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
@@ -7872,6 +8326,240 @@ mod tests {
         // over with no height jump).
         assert_eq!(own_turn_reservation(usable, 700.0), 0.0);
         assert_eq!(own_turn_reservation(usable, 1_200.0), 0.0);
+    }
+
+    fn user_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![text_part(&format!("{id}-text"), id)],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn sticky_turn_header_tracks_the_group_crossing_the_reading_line() {
+        let mut rows = Vec::new();
+        rows.extend(rows_for_entry(&user_entry("user-a"), false, &mut parse));
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-a",
+                MessageStatus::Complete,
+                vec![text_part("answer-a", "First answer")],
+            ),
+            false,
+            &mut parse,
+        ));
+        rows.extend(rows_for_entry(&user_entry("user-b"), false, &mut parse));
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-b",
+                MessageStatus::Complete,
+                vec![text_part("answer-b", "Second answer")],
+            ),
+            false,
+            &mut parse,
+        ));
+
+        let user_rows = sticky_turn_rows(&rows);
+        assert_eq!(user_rows, vec![0, 2]);
+        assert_eq!(
+            sticky_turn_group(&user_rows, 1),
+            Some(StickyTurnGroup {
+                user_ix: 0,
+                next_user_ix: Some(2),
+            })
+        );
+        assert_eq!(
+            sticky_turn_group(&user_rows, 3),
+            Some(StickyTurnGroup {
+                user_ix: 2,
+                next_user_ix: None,
+            })
+        );
+    }
+
+    #[test]
+    fn sticky_turn_header_never_duplicates_the_original_and_yields_to_the_next_turn() {
+        let sticky_top = 48.0;
+        let header_height = 64.0;
+
+        assert_eq!(
+            sticky_turn_overlay_top(sticky_top, Some(sticky_top), false, None, header_height),
+            None,
+            "the original row already occupies the sticky position"
+        );
+        assert_eq!(
+            sticky_turn_overlay_top(
+                sticky_top,
+                Some(sticky_top - 1.0),
+                false,
+                None,
+                header_height,
+            ),
+            Some(sticky_top),
+        );
+        assert_eq!(
+            sticky_turn_overlay_top(sticky_top, None, true, Some(100.0), header_height,),
+            Some(36.0),
+            "the next turn boundary pushes the previous 64px header upward"
+        );
+    }
+
+    #[test]
+    fn runway_and_sticky_copy_hand_off_without_skipping_the_restick_glide() {
+        assert!(runway_owns_user_position(true, false, false));
+        assert!(runway_owns_user_position(true, true, true));
+        assert!(!runway_owns_user_position(false, true, true));
+        assert!(
+            !runway_owns_user_position(true, false, true),
+            "after the first landing, the sticky copy stays visible during a restick glide"
+        );
+    }
+
+    #[test]
+    fn sticky_turn_state_resets_on_chat_switch_and_accepts_streaming_remeasurement() {
+        let mut state = StickyTurnState::default();
+        assert!(state.attach_chat(Some("chat-a")));
+        assert!(state.record_height("user-a".into(), 42.0));
+        assert!(!state.record_height("user-a".into(), 42.2));
+        assert!(state.record_height("user-a".into(), 68.0));
+        assert_eq!(state.height("user-a"), Some(68.0));
+        assert!(state.record_height("user-b".into(), 32.0));
+        state.retain_user_ids(&std::collections::HashSet::from([SharedString::from(
+            "user-b",
+        )]));
+        assert_eq!(state.height("user-a"), None);
+        assert_eq!(state.height("user-b"), Some(32.0));
+
+        assert!(state.attach_chat(Some("chat-b")));
+        assert_eq!(state.height("user-a"), None);
+        assert!(!state.attach_chat(Some("chat-b")));
+    }
+
+    #[test]
+    fn measured_user_geometry_prevents_a_glued_list_from_painting_a_duplicate() {
+        let mut state = StickyTurnState::default();
+        state.attach_chat(Some("chat"));
+        assert!(state.update_viewport(800.0, 600.0));
+        assert!(state.record_geometry("user".into(), 320.0, 64.0, -100.0));
+        assert_eq!(state.projected_top("user", -100.0), Some(320.0));
+        assert_eq!(state.projected_top("user", -360.0), Some(60.0));
+
+        assert_eq!(
+            sticky_turn_overlay_top(
+                48.0,
+                state.projected_top("user", -100.0),
+                true,
+                None,
+                state.height("user").unwrap(),
+            ),
+            None,
+            "logical top may be past the user while the original card is still visibly below it"
+        );
+        assert_eq!(
+            sticky_turn_overlay_top(
+                48.0,
+                state.projected_top("user", -380.0),
+                true,
+                None,
+                state.height("user").unwrap(),
+            ),
+            Some(48.0),
+        );
+
+        state.invalidate_layout();
+        assert_eq!(state.projected_top("user", -380.0), None);
+        assert!(state.consume_layout_suppression("user"));
+        assert!(!state.consume_layout_suppression("user"));
+        assert_eq!(
+            state.height("user"),
+            Some(64.0),
+            "a transcript reflow invalidates positions, not the user card's measured height"
+        );
+
+        assert!(state.record_geometry("user".into(), 80.0, 64.0, -380.0));
+        assert!(!state.update_viewport(800.2, 600.0));
+        assert!(state.update_viewport(720.0, 600.0));
+        assert_eq!(state.projected_top("user", -380.0), None);
+        assert!(state.consume_layout_suppression("user"));
+    }
+
+    #[test]
+    fn measured_turn_boundaries_override_the_bottom_glued_logical_sentinel() {
+        let user_rows = vec![0, 2];
+        let first_tops = [Some(-120.0), Some(320.0)];
+        assert_eq!(
+            sticky_turn_group_for_viewport(&user_rows, 48.0, Some(3), |position| {
+                first_tops[position]
+            }),
+            Some(StickyTurnGroup {
+                user_ix: 0,
+                next_user_ix: Some(2),
+            }),
+            "the second original bubble is visible mid-viewport, so the first turn still owns the top"
+        );
+        let second_tops = [Some(-500.0), Some(48.0)];
+        assert_eq!(
+            sticky_turn_group_for_viewport(&user_rows, 48.0, Some(3), |position| {
+                second_tops[position]
+            }),
+            Some(StickyTurnGroup {
+                user_ix: 2,
+                next_user_ix: None,
+            }),
+        );
+
+        let sparse_rows = vec![0, 10, 20, 30];
+        let sparse_tops = [None, None, None, Some(400.0)];
+        assert_eq!(
+            sticky_turn_group_for_viewport(&sparse_rows, 48.0, Some(15), |position| {
+                sparse_tops[position]
+            }),
+            Some(StickyTurnGroup {
+                user_ix: 10,
+                next_user_ix: Some(20),
+            }),
+            "a non-adjacent measurement must not replace the logical group"
+        );
+    }
+
+    #[test]
+    fn sticky_turn_index_rebuild_keeps_the_same_group_during_stream_growth() {
+        let mut rows = rows_for_entry(&user_entry("user-live"), false, &mut parse);
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-live",
+                MessageStatus::Streaming,
+                vec![text_part("stream-1", "Working")],
+            ),
+            false,
+            &mut parse,
+        ));
+        let before = sticky_turn_rows(&rows);
+        assert_eq!(
+            sticky_turn_group(&before, rows.len() - 1).unwrap().user_ix,
+            0
+        );
+
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-live-tail",
+                MessageStatus::Streaming,
+                vec![text_part("stream-2", "Still working")],
+            ),
+            false,
+            &mut parse,
+        ));
+        let after = sticky_turn_rows(&rows);
+        assert_eq!(
+            sticky_turn_group(&after, rows.len() - 1).unwrap().user_ix,
+            0
+        );
     }
 
     fn parse(_: &str, text: &str) -> Arc<BlockTree> {
