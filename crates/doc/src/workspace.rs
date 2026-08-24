@@ -1,4 +1,4 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces comet's
+//! Workspace doc schema over `loro` — the per-org entity index that replaces zeron's
 //! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
 //! SessionRoom class, doc id `ws/{orgId}`).
 //!
@@ -12,23 +12,23 @@
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
-//!   updatedAt}
+//!   updatedAt, contextTokens?, contextWindow?}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
 //!
 //! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
 //! own session rows, and rows for chats it hosts; title/archived renames are LWW map
-//! sets from any device — matching comet's Mutate surface. Presence rides the room's
+//! sets from any device — matching zeron's Mutate surface. Presence rides the room's
 //! `EphemeralStore` under keys `presence/{deviceId}` (an online timestamp), replacing
-//! comet's 15s heartbeat writes so liveness never grows the oplog.
+//! zeron's 15s heartbeat writes so liveness never grows the oplog.
 //!
 //! Timestamps are stored as epoch millis (the session-doc convention) and surface as
-//! `chrono::DateTime<Utc>` through the `comet_proto` entity types.
+//! `chrono::DateTime<Utc>` through the `zeron_proto` entity types.
 
 use chrono::{DateTime, Utc};
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
+use zeron_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
 
 use crate::schema::DocError;
 
@@ -380,7 +380,7 @@ impl WorkspaceDoc {
     }
 
     /// Host-side resume continuity: the harness-native session id of the chat's
-    /// latest run and the cwd it was created under (comet stored the same pair
+    /// latest run and the cwd it was created under (zeron stored the same pair
     /// on the chats table). An empty
     /// `session_id` is the explicit "do not resume" tombstone written after a
     /// harness rejects a resume. `false` when no such row.
@@ -438,6 +438,22 @@ impl WorkspaceDoc {
         row.insert("status", status_str(session.status))?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
+        match session.context_usage {
+            Some(usage) => {
+                row.insert(
+                    "contextTokens",
+                    i64::try_from(usage.tokens).unwrap_or(i64::MAX),
+                )?;
+                row.insert(
+                    "contextWindow",
+                    i64::try_from(usage.context_window).unwrap_or(i64::MAX),
+                )?;
+            }
+            None => {
+                row.delete("contextTokens")?;
+                row.delete("contextWindow")?;
+            }
+        }
         self.doc.commit();
         Ok(())
     }
@@ -558,7 +574,7 @@ fn dt(ms: i64) -> DateTime<Utc> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawDevice {
+pub(crate) struct RawDevice {
     id: String,
     name: String,
     platform: String,
@@ -585,7 +601,7 @@ impl From<RawDevice> for Device {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawSpace {
+pub(crate) struct RawSpace {
     id: String,
     device_id: String,
     path: String,
@@ -618,7 +634,7 @@ impl From<RawSpace> for Space {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawChat {
+pub(crate) struct RawChat {
     id: String,
     device_id: String,
     #[serde(default)]
@@ -647,6 +663,8 @@ struct RawChat {
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
+    #[serde(default)]
+    room_gen: Option<u32>,
 }
 
 impl From<RawChat> for Chat {
@@ -667,13 +685,14 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
+            room_gen: raw.room_gen,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawSession {
+pub(crate) struct RawSession {
     chat_id: String,
     device_id: String,
     status: SessionStatus,
@@ -681,6 +700,10 @@ struct RawSession {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
+    #[serde(default)]
+    context_tokens: Option<i64>,
+    #[serde(default)]
+    context_window: Option<i64>,
 }
 
 impl From<RawSession> for Session {
@@ -691,6 +714,16 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            context_usage: raw
+                .context_tokens
+                .zip(raw.context_window)
+                .and_then(|(tokens, context_window)| {
+                    Some(zeron_proto::ContextUsage {
+                        tokens: u64::try_from(tokens).ok()?,
+                        context_window: u64::try_from(context_window).ok()?,
+                    })
+                })
+                .filter(|usage| usage.context_window > 0),
         }
     }
 }
@@ -698,7 +731,7 @@ impl From<RawSession> for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{HarnessId, SandboxLevel};
+    use zeron_proto::{HarnessId, SandboxLevel};
 
     fn ts(ms: i64) -> DateTime<Utc> {
         dt(ms)
@@ -738,6 +771,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            room_gen: None,
         }
     }
 
@@ -761,7 +795,20 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            context_usage: None,
         }
+    }
+
+    #[test]
+    fn session_context_usage_round_trips_through_workspace_rows() {
+        let ws = WorkspaceDoc::new();
+        let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+        row.context_usage = Some(zeron_proto::ContextUsage {
+            tokens: 392_000,
+            context_window: 828_000,
+        });
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row]);
     }
 
     fn cross_sync(a: &WorkspaceDoc, b: &WorkspaceDoc) {
@@ -789,7 +836,7 @@ mod tests {
         let config = ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
-            reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: options,
             sandbox: SandboxLevel::WorkspaceWrite,
         };

@@ -8,19 +8,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use loro::LoroDoc;
 
-use comet_doc::{
+use zeron_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
-use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
-use comet_harness::mock::MockHarness;
-use comet_harness::{Harness, HarnessError, RunControls};
-use comet_proto::{
+use zeron_engine::{EngineCore, HarnessRegistry, RunJournal};
+use zeron_harness::mock::MockHarness;
+use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SessionStatus, SteeringMode, ToolCall,
 };
-use comet_sync::DocsStore;
+use zeron_sync::DocsStore;
 
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
@@ -28,13 +29,17 @@ const VIEWER: &str = "viewer-device";
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }
@@ -70,6 +75,9 @@ fn mock_script() -> Vec<AgentEvent> {
         AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
+            output: None,
+            diff: None,
+            execution: None,
         },
         done(DoneStatus::Completed),
     ]
@@ -151,7 +159,7 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         doc.read_entries()
             .expect("read entries")
             .last()
-            .map(|m| comet_doc::CommandBasedOn {
+            .map(|m| zeron_doc::CommandBasedOn {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
@@ -425,6 +433,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         .find(|e| e.role == MessageRole::Assistant)
         .unwrap();
     assert_eq!(assistant.status, Some(MessageStatus::Aborted));
+    assert!(assistant.duration_ms.is_some_and(|duration| duration > 0));
     match &assistant.parts[0] {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
@@ -439,6 +448,57 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     assert_eq!(
         core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)
+    );
+}
+
+#[tokio::test]
+async fn errored_done_persists_assistant_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::TextDelta {
+                    text: "partial before error".into(),
+                },
+                done(DoneStatus::Errored),
+            ],
+            step_delay: Duration::from_millis(10),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-error-duration",
+        SessionCommandPayload::Run {
+            request: run_request("fail after output"),
+            message_id: "m-error-duration".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            })
+        },
+        "errored assistant entry",
+    )
+    .await;
+
+    let assistant = entries(&core)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("assistant entry");
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    assert!(assistant.duration_ms.is_some_and(|duration| duration > 0));
+    assert_eq!(
+        core.sessions
+            .session_status(CHAT)
+            .map(|session| session.status),
+        Some(SessionStatus::Errored)
     );
 }
 
@@ -478,7 +538,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     .await;
 
     // No live run anymore (mock finishes instantly): a steer command must fall back to
-    // dispatch-as-next-turn, per comet's executor.
+    // dispatch-as-next-turn, per zeron's executor.
     queue_as_viewer(
         handle.doc(),
         "cmd-steer-1",
@@ -549,17 +609,26 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
 
-    // Give the drain a moment: the command must be SKIPPED — no user entry, no run.
+    // Give the drain a moment: the command must not EXECUTE — no user entry,
+    // no run. But it must not stay a forever-Pending ghost either (v0.2.12
+    // swallowed-send: "Sending…" forever, retry a no-op): the dead-command
+    // sweep terminalizes it as Rejected so the doc tells the truth and a
+    // retry can mint a fresh attempt.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         entries(&core).is_empty(),
         "skipped command must not execute"
     );
-    assert_eq!(
-        command_status(&core, "cmd-crashed"),
-        Some((SessionCommandStatus::Pending, None)),
-        "skip leaves the entry pending without an outcome"
-    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-crashed"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "crash-window command terminalized as Rejected",
+    )
+    .await;
     assert!(core.sessions.session_status(CHAT).is_none());
 
     // Direct ledger-evaluation check: re-evaluating a processed command = Skip.
@@ -568,9 +637,9 @@ async fn processed_commands_are_skipped_on_redelivery() {
     let entry = commands.iter().find(|c| c.id == "cmd-crashed").unwrap();
     let is_processed = |id: &str| store.is_processed(id).unwrap_or(false);
     let never_past = |_: &str| false;
-    let verdict = comet_doc::evaluate_command(
+    let verdict = zeron_doc::evaluate_command(
         entry,
-        &comet_doc::EvaluationContext {
+        &zeron_doc::EvaluationContext {
             is_processed: &is_processed,
             now_ms: chrono::Utc::now().timestamp_millis(),
             entries: &commands,
@@ -578,7 +647,275 @@ async fn processed_commands_are_skipped_on_redelivery() {
             turn_is_past: &never_past,
         },
     );
-    assert_eq!(verdict, comet_doc::CommandDisposition::Skip);
+    assert_eq!(verdict, zeron_doc::CommandDisposition::Skip);
+}
+
+/// The v0.2.12 field report: a send whose command was consumed by the ledger
+/// but never executed (crash between mark and resolve) was invisible to
+/// every retry — the drain filters processed ids, so the session was dead
+/// forever while new sessions worked. Retry must mint a FRESH attempt.
+#[tokio::test]
+async fn retry_reissues_a_swallowed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        assert!(store.mark_processed("cmd-dead").unwrap());
+    }
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-dead",
+        SessionCommandPayload::Run {
+            request: run_request("try again"),
+            message_id: "m-retry".into(),
+        },
+    );
+    // The sweep terminalizes the dead attempt without executing it…
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-dead"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "dead attempt rejected",
+    )
+    .await;
+    assert!(entries(&core).is_empty(), "dead attempt must not execute");
+
+    // …and the user's retry mints a fresh attempt that actually runs.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-retry" && e.role == MessageRole::User)
+        },
+        "re-issued send writes the user entry",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "re-issued send runs to completion",
+    )
+    .await;
+    let run_attempts = |cmds: &[SessionCommandEntry]| {
+        cmds.iter()
+            .filter(|c| {
+                matches!(&c.payload,
+                    SessionCommandPayload::Run { message_id, .. } if message_id == "m-retry")
+            })
+            .count()
+    };
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "original + exactly one re-issue"
+    );
+    // A delivered message must never re-issue: retry while healthy is a no-op.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "retry after delivery must not duplicate the send"
+    );
+}
+
+#[tokio::test]
+async fn deterministic_queue_command_id_is_returned_and_executes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let command = serde_json::to_value(SessionCommandPayload::Steer {
+        prompt: "worker finished".into(),
+        message_id: Some("worker-notify-message:worker-1:7:completed".into()),
+    })
+    .unwrap();
+    let params = serde_json::json!({
+        "chatId": CHAT,
+        "commandId": "worker-notify:worker-1:7:completed",
+        "command": command
+    });
+
+    let first = client
+        .call(
+            zeron_rpc::methods::QUEUE_WORKER_NOTIFICATION,
+            params.clone(),
+        )
+        .await
+        .unwrap();
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    let bytes = store
+        .load_snapshot(CHAT)
+        .unwrap()
+        .expect("notification command is durable before RPC success");
+    let restored = LoroDoc::new();
+    restored.import(&bytes).unwrap();
+    assert!(
+        SessionDoc::from_doc(restored)
+            .read_commands()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == "worker-notify:worker-1:7:completed")
+    );
+    let second = client
+        .call(zeron_rpc::methods::QUEUE_WORKER_NOTIFICATION, params)
+        .await
+        .unwrap();
+    assert_eq!(first["commandId"], "worker-notify:worker-1:7:completed");
+    assert_eq!(second["commandId"], "worker-notify:worker-1:7:completed");
+
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .filter(|entry| entry.role == MessageRole::Assistant)
+                .count()
+                == 1
+        },
+        "one deterministic command execution",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| entry.role == MessageRole::Assistant)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn fetch_tool_input_returns_journal_body_only_for_the_local_chat_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
+        .unwrap();
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request("write the file"),
+            Some("fetch-input-user".into()),
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(MessageStatus::Complete)
+            })
+        },
+        "write tool to settle",
+    )
+    .await;
+
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .call(
+            zeron_rpc::methods::FETCH_TOOL_INPUT,
+            serde_json::json!({
+                "chatId": CHAT,
+                "toolCallId": "tool-1",
+                "targetDeviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply["snapshot"]["path"], "/tmp/x");
+    assert_eq!(reply["snapshot"]["content"], "SECRET");
+    let missing = client
+        .call(
+            zeron_rpc::methods::FETCH_TOOL_INPUT,
+            serde_json::json!({
+                "chatId": CHAT,
+                "toolCallId": "missing",
+                "targetDeviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(missing["snapshot"].is_null());
+
+    core.workspace
+        .create_chat(
+            "remote-chat",
+            None,
+            Some("other-device"),
+            None,
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let error = client
+        .call(
+            zeron_rpc::methods::FETCH_TOOL_INPUT,
+            serde_json::json!({
+                "chatId": "remote-chat",
+                "toolCallId": "tool-1",
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("another device"));
+}
+
+#[tokio::test]
+async fn worker_notification_rejects_a_deleted_parent_without_creating_an_orphan_doc() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let command = serde_json::to_value(SessionCommandPayload::Steer {
+        prompt: "worker finished".into(),
+        message_id: Some("worker-notify-message:missing".into()),
+    })
+    .unwrap();
+
+    let error = client
+        .call(
+            zeron_rpc::methods::QUEUE_WORKER_NOTIFICATION,
+            serde_json::json!({
+                "chatId": "deleted-parent",
+                "commandId": "worker-notify:missing",
+                "command": command
+            }),
+        )
+        .await
+        .expect_err("missing parent must be rejected");
+    assert!(error.to_string().contains("parent chat does not exist"));
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    assert!(store.load_snapshot("deleted-parent").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -612,6 +949,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             created_at: 1,
             device_id: device_id.into(),
             status: Some(MessageStatus::Complete),
+            duration_ms: None,
             continuation_of: None,
         })
         .unwrap();
@@ -672,17 +1010,17 @@ async fn rpc_surface_over_in_memory_transport() {
             script: mock_script(),
         }),
     );
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
 
     // ListHarnesses + ListModels.
     let harnesses = client
-        .call(comet_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
+        .call(zeron_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
         .await
         .unwrap();
     assert_eq!(harnesses[0]["id"], "mock");
     let models = client
         .call(
-            comet_rpc::methods::LIST_MODELS,
+            zeron_rpc::methods::LIST_MODELS,
             serde_json::json!({"harness": "mock"}),
         )
         .await
@@ -691,7 +1029,7 @@ async fn rpc_surface_over_in_memory_transport() {
 
     // WatchSessions + WatchDocMessages streams.
     let mut sessions_stream = client
-        .subscribe(comet_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
+        .subscribe(zeron_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
         .await
         .unwrap();
     let first_sessions = tokio::time::timeout(Duration::from_secs(5), sessions_stream.recv())
@@ -702,7 +1040,7 @@ async fn rpc_surface_over_in_memory_transport() {
 
     let mut messages_stream = client
         .subscribe(
-            comet_rpc::methods::WATCH_DOC_MESSAGES,
+            zeron_rpc::methods::WATCH_DOC_MESSAGES,
             serde_json::json!({"chatId": CHAT}),
         )
         .await
@@ -722,7 +1060,7 @@ async fn rpc_surface_over_in_memory_transport() {
     .unwrap();
     let queued = client
         .call(
-            comet_rpc::methods::QUEUE_COMMAND,
+            zeron_rpc::methods::QUEUE_COMMAND,
             serde_json::json!({"chatId": CHAT, "command": command}),
         )
         .await
@@ -739,8 +1077,8 @@ async fn rpc_surface_over_in_memory_transport() {
             .await
             .expect("doc messages before timeout")
             .expect("stream alive");
-        let frame: comet_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
-        comet_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
+        let frame: zeron_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
+        zeron_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
         if materialized.len() == 2 && materialized[1].status == Some(MessageStatus::Complete) {
             break materialized;
         }
@@ -797,7 +1135,7 @@ async fn respond_input_resolves_pending_question() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
@@ -878,7 +1216,7 @@ async fn respond_input_resolves_pending_question() {
         "cmd-answer-1",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
             }],
@@ -950,7 +1288,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
@@ -1020,7 +1358,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         "cmd-answer-bogus",
         SessionCommandPayload::RespondInput {
             request_id: "bogus-id".into(),
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
             }],
@@ -1067,7 +1405,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         "cmd-answer-right",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
             }],
@@ -1141,7 +1479,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                     // Blocks on the question; an interrupt fails the resolver
                     // (empty answers) and cancels the token — like a real CLI
                     // being torn down, the stream then ends WITHOUT a Done.
-                    let _ = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                    let _ = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
                         id: "q1".into(),
                         header: "Pick".into(),
                         question: "Which one?".into(),
@@ -1288,7 +1626,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let question = comet_proto::UserInputQuestion {
+                let question = zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
@@ -1395,7 +1733,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         "cmd-answer-twin",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
             }],
@@ -1493,7 +1831,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
             seen: seen.clone(),
         }),
     );
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
 
     // Chunked upload exactly as the composer sends it: base64 split across
     // positional UploadChunk slots, then UploadCommit → the durable path.
@@ -1503,7 +1841,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     for (seq, data) in [(0, first), (1, second)] {
         client
             .call(
-                comet_rpc::methods::UPLOAD_CHUNK,
+                zeron_rpc::methods::UPLOAD_CHUNK,
                 serde_json::json!({ "uploadId": "e2e-att", "seq": seq, "data": data }),
             )
             .await
@@ -1511,7 +1849,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     }
     let committed = client
         .call(
-            comet_rpc::methods::UPLOAD_COMMIT,
+            zeron_rpc::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "e2e-att", "fileName": "red.png" }),
         )
         .await
@@ -1523,7 +1861,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         "committed file holds the exact reassembled bytes"
     );
 
-    // Run with the comet `withAttachments` transport: refs embedded in the
+    // Run with the zeron `withAttachments` transport: refs embedded in the
     // prompt text (this is what persists), paths on the additive field.
     let prompt = format!(
         "what color is this?\n\nAttached images (local files — open them to view):\n- {path}"
@@ -1576,7 +1914,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     // Read-back over the same RPC surface the transcript uses.
     let chunk = client
         .call(
-            comet_rpc::methods::READ_ATTACHMENT_CHUNK,
+            zeron_rpc::methods::READ_ATTACHMENT_CHUNK,
             serde_json::json!({ "path": path, "offset": 0 }),
         )
         .await
@@ -1591,7 +1929,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
 /// color — it can only know it by SEEING the inline image block (the sandbox
 /// prompt forbids opening the file). Ignored by default: needs an installed,
 /// authenticated `claude` CLI and spends real tokens.
-/// Run with: `cargo test -p comet-engine --test e2e -- --ignored`
+/// Run with: `cargo test -p zeron-engine --test e2e -- --ignored`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires installed+authenticated claude CLI; spends tokens"]
 async fn real_claude_sees_uploaded_image_inline() {
@@ -1604,14 +1942,14 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     let core = EngineCore::assemble(
         &dir,
-        Arc::new(comet_engine::default_registry()),
+        Arc::new(zeron_engine::default_registry()),
         HarnessId::ClaudeCode,
         None,
     )
     .expect("engine core assembles");
     // Pre-title the chat so the auto-titler doesn't spend a second model call.
     core.workspace
-        .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
         .expect("create chat row");
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
@@ -1619,17 +1957,17 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     // 8×8 solid-red PNG, uploaded exactly as the composer does.
     const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAB+GTG2wAAJP0GeGuMDBnAAAAAElFTkSuQmCC";
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
     client
         .call(
-            comet_rpc::methods::UPLOAD_CHUNK,
+            zeron_rpc::methods::UPLOAD_CHUNK,
             serde_json::json!({ "uploadId": "real-img", "seq": 0, "data": RED_PNG_B64 }),
         )
         .await
         .expect("UploadChunk");
     let committed = client
         .call(
-            comet_rpc::methods::UPLOAD_COMMIT,
+            zeron_rpc::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "real-img", "fileName": "swatch.png" }),
         )
         .await
@@ -1647,14 +1985,18 @@ async fn real_claude_sees_uploaded_image_inline() {
     );
     let request = RunRequest {
         prompt,
+        harness: None,
         model: Some("haiku".into()),
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.to_string_lossy().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: vec![path],
         resume: None,
+        worktree: None,
     };
     core.doc_host
         .queue_command(
@@ -1779,5 +2121,437 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
             .iter()
             .any(|j| matches!(&j.event, AgentEvent::TextDelta { text } if text == "done")),
         "text deltas unaffected"
+    );
+}
+
+#[tokio::test]
+async fn parked_session_ignores_trailing_frames_and_stays_idle() {
+    // ACP children keep forwarding session/update frames after a turn's Done
+    // (late tool_call_updates, flushed text). A parked session must treat
+    // them as inert: no Working re-arm (the eternally-running-session bug),
+    // no phantom assistant entry.
+    let mut script = mock_script();
+    script.push(AgentEvent::ToolCall {
+        id: "tool-1".into(),
+        call: ToolCall::Exec {
+            command: "echo late-echo".into(),
+        },
+    });
+    script.push(AgentEvent::TextDelta {
+        text: "trailing flush".into(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-parked".into(),
+        },
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session to complete",
+    )
+    .await;
+    // The trailing frames land right after the park; hold the assertion open
+    // past the 120ms flush window to catch a phantom segment or a Working
+    // re-arm (both are what the old code did).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            core.sessions.session_status(CHAT).map(|s| s.status),
+            Some(SessionStatus::Idle),
+            "trailing frames must not re-arm Working"
+        );
+        let all = entries_now(&core);
+        assert!(
+            all.len() <= 2,
+            "trailing frames must not open a phantom entry: {all:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let all = entries(&core);
+    assert_eq!(all.len(), 2, "user + one assistant entry");
+    assert_eq!(all[1].status, Some(MessageStatus::Complete));
+}
+
+#[tokio::test]
+async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
+    // Adapters re-emit shape-bearing tool_call_updates as full ToolCall
+    // events. Once a steer boundary reset the fold, such an echo for a
+    // PRIOR segment's tool must not mint a chip mid-text in the new segment
+    // (the mid-word transcript splits).
+    let script = vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-steer".into(),
+            assistant_message_id: "a-1".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "part one".into(),
+        },
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-2".into()),
+        },
+        AgentEvent::TextDelta {
+            text: "part ".into(),
+        },
+        // The long-running exec from segment one completes mid-stream of the
+        // next segment: a shape-bearing echo plus its result.
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::ToolResult {
+            id: "tool-long".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+            execution: None,
+        },
+        AgentEvent::TextDelta { text: "two".into() },
+        done(DoneStatus::Completed),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script,
+            step_delay: Duration::from_millis(10),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-echo",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-echo".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).len() == 3
+                && core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle)
+        },
+        "both segments to land",
+    )
+    .await;
+    let all = entries(&core);
+    // Segment one: text + the (unresolved-at-boundary) tool chip.
+    assert_eq!(all[1].parts.len(), 2, "{:#?}", all[1].parts);
+    assert!(
+        all[1].duration_ms.is_some_and(|duration| duration > 0),
+        "the segment finalized by Steered must persist its elapsed duration"
+    );
+    // Segment two: ONE contiguous text part, no spliced chip.
+    assert_eq!(
+        all[2].parts,
+        vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "part two".into()
+        }],
+        "stale echo must not split the streaming text"
+    );
+}
+
+/// The elapsed timer's base (`started_at`) is per user message: a settled
+/// session drops it (no reader can resurrect the previous turn's elapsed —
+/// the "timer opens at 30:00 on send" bug), and a steer into a PARKED
+/// persistent session restamps it fresh for the new turn.
+#[tokio::test]
+async fn parked_steer_restamps_started_at_and_idle_clears_it() {
+    // Steerable harness whose stream stays open after the turn's Done — the
+    // engine parks the session — and whose steering mailbox drives turn two.
+    struct ParkingHarness;
+    #[async_trait]
+    impl Harness for ParkingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Parking"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            mut controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "turn one".into(),
+                    }))
+                    .await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                // Parked. The next steer is turn two.
+                if let Some(_msg) = controls.steering.recv().await {
+                    let _ = tx
+                        .send(Ok(AgentEvent::Steered {
+                            assistant_message_id: None,
+                            next_assistant_message_id: None,
+                        }))
+                        .await;
+                    let _ = tx
+                        .send(Ok(AgentEvent::TextDelta {
+                            text: "turn two".into(),
+                        }))
+                        .await;
+                    // Hold the turn open so the test's poll observes Working
+                    // (the transition is otherwise sub-millisecond).
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                }
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ParkingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-park-timer",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "turn one to park",
+    )
+    .await;
+    let parked = core.sessions.session_status(CHAT).unwrap();
+    assert_eq!(
+        parked.started_at, None,
+        "a settled session must drop its timer base"
+    );
+
+    let before_steer = chrono::Utc::now();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-park-timer",
+        SessionCommandPayload::Steer {
+            prompt: "next".into(),
+            message_id: Some("m-2".into()),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "turn two working",
+    )
+    .await;
+    let working = core.sessions.session_status(CHAT).unwrap();
+    let started = working.started_at.expect("Working carries a timer base");
+    assert!(
+        started >= before_steer,
+        "steer into a parked session must restamp started_at (got {started}, steered at {before_steer})"
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "turn two to settle",
+    )
+    .await;
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
+    let assistant_entries = entries(&core)
+        .into_iter()
+        .filter(|entry| entry.role == MessageRole::Assistant)
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_entries.len(), 2);
+    assert!(
+        assistant_entries[1]
+            .duration_ms
+            .is_some_and(|duration| duration > 0)
+    );
+}
+
+/// Regression: turn 2 spawns a fresh runtime process that has not reported a
+/// context snapshot yet. The session row feeding the composer gauge must keep
+/// the last known measurement across the boundary — dropping it flipped the
+/// indicator back to its neutral "no measurement yet" state mid-conversation.
+#[tokio::test]
+async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
+    /// Only the first turn reports usage; later turns are silent, like a
+    /// restarted runtime that has not billed a snapshot yet.
+    struct MeasuresOnlyOnFirstTurn;
+
+    #[async_trait]
+    impl Harness for MeasuresOnlyOnFirstTurn {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Measures once"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let measures = request.prompt == "first";
+            let mut script = vec![AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-1".into(),
+                assistant_message_id: format!("a-{}", request.prompt),
+            }];
+            if measures {
+                script.push(AgentEvent::Usage {
+                    input_tokens: 120_000,
+                    output_tokens: 512,
+                    context_usage: Some(zeron_proto::ContextUsage {
+                        tokens: 120_000,
+                        context_window: 200_000,
+                    }),
+                });
+            }
+            script.push(AgentEvent::TextDelta {
+                text: format!("answering {}", request.prompt),
+            });
+            script.push(done(DoneStatus::Completed));
+            Ok(futures::stream::iter(script.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    let measured = zeron_proto::ContextUsage {
+        tokens: 120_000,
+        context_window: 200_000,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MeasuresOnlyOnFirstTurn));
+    let watch = core.sessions.watch_sessions();
+    let usage_now = || watch.borrow().first().and_then(|s| s.context_usage);
+
+    // Record every snapshot the UI could observe, so a momentary clear during
+    // the second dispatch fails just as loudly as a permanent one.
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sampler = {
+        let observed = observed.clone();
+        let mut watch = core.sessions.watch_sessions();
+        tokio::spawn(async move {
+            while watch.changed().await.is_ok() {
+                let snapshot = watch.borrow().first().and_then(|s| s.context_usage);
+                observed.lock().unwrap().push(snapshot);
+            }
+        })
+    };
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-usage-turn-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-usage-1".into(),
+        },
+    );
+    wait_for(
+        || usage_now() == Some(measured),
+        "the first turn to report a context measurement",
+    )
+    .await;
+    wait_for(
+        || watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle),
+        "the first turn to settle",
+    )
+    .await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-usage-turn-2",
+        SessionCommandPayload::Run {
+            request: run_request("second"),
+            message_id: "m-usage-2".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-usage-2" && e.role == MessageRole::User)
+        },
+        "the second turn to dispatch",
+    )
+    .await;
+    wait_for(
+        || {
+            watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle)
+                && entries_now(&core)
+                    .iter()
+                    .filter(|e| e.role == MessageRole::Assistant)
+                    .count()
+                    == 2
+        },
+        "the second turn to settle",
+    )
+    .await;
+
+    assert_eq!(
+        usage_now(),
+        Some(measured),
+        "a silent second turn must not erase the last known measurement"
+    );
+    sampler.abort();
+    let observed = observed.lock().unwrap().clone();
+    let first_measurement = observed
+        .iter()
+        .position(|snapshot| snapshot == &Some(measured))
+        .expect("the first turn's measurement reaches the session row");
+    assert!(
+        observed[first_measurement..]
+            .iter()
+            .all(|snapshot| snapshot == &Some(measured)),
+        "the gauge fell back to an unmeasured state between turns: {observed:?}"
     );
 }

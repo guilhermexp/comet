@@ -1,4 +1,4 @@
-//! comet-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
+//! zeron-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
 //! diff pane.
 //!
 //! Design: ARCHITECTURE.md §4; animation catalog docs/research/feature-inventory.md
@@ -6,23 +6,32 @@
 //!
 //! M3a foundation:
 //! - [`theme`] — always-dark monochrome theme (oklch-derived neutrals), a gpui Global;
-//! - [`motion`] — the comet animation catalog over gpui `Animation` + cubic-bezier;
+//! - [`motion`] — the zeron animation catalog over gpui `Animation` + cubic-bezier;
 //! - [`state`] — `AppState` entity + `EngineHandle` (connect-or-embed engine);
 //! - [`settings`] — persisted pane widths/collapse flags;
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
-//! - [`loaders`] — comet pulse loader, gradient spinner, boot splash.
+//! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
 
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
+pub mod badges;
+pub mod change_requests;
 pub mod changes;
+pub mod comments;
 pub mod composer;
+pub mod details_sidebar;
 pub mod edge_fade;
+pub mod file_change;
+pub mod file_preview;
 pub mod frost;
+pub mod history;
 pub mod icons;
+pub mod inline_media;
 pub mod loaders;
 pub mod markdown;
 pub mod motion;
+pub mod notify;
 pub mod pickers;
 pub mod popover;
 pub mod rail;
@@ -30,9 +39,13 @@ pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
+pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
+pub mod tool_icons;
 pub mod transcript;
+mod turn_steps;
+pub mod workers;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -69,11 +82,11 @@ fn register_fonts(cx: &App) {
     }
 }
 
-pub use comet_proto::HarnessId;
 pub use state::EngineBootConfig;
+pub use zeron_proto::HarnessId;
 
 /// Everything the headed binary passes in (config/env resolution lives in
-/// `apps/comet`, not here).
+/// `apps/zeron`, not here).
 #[derive(Debug, Clone)]
 pub struct UiConfig {
     /// Data directory — engine stores + `ui-settings.json`.
@@ -112,6 +125,7 @@ impl UiConfig {
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
+    workers_model: gpui::Entity<workers::model::WorkersModel>,
 }
 
 impl gpui::Global for ReopenState {}
@@ -128,8 +142,12 @@ pub fn run_app(config: UiConfig) {
         if cx.windows().is_empty()
             && let Some(reopen) = cx.try_global::<ReopenState>()
         {
-            let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
-            open_main_window(state, boot, cx);
+            let (state, boot, workers_model) = (
+                reopen.state.clone(),
+                reopen.boot.clone(),
+                reopen.workers_model.clone(),
+            );
+            open_main_window(state, boot, workers_model, cx);
         }
     });
     app.run(move |cx: &mut App| {
@@ -150,6 +168,24 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
+        let workers_model = cx.new({
+            let state = state.clone();
+            move |cx| workers::model::WorkersModel::new(state, cx)
+        });
+        let workers_resource_monitor = cx.new({
+            let workers_model = workers_model.clone();
+            move |cx| workers::resource_monitor::WorkersResourceMonitor::new(workers_model, cx)
+        });
+        cx.set_global(workers::resource_monitor::WorkersResourceGlobal {
+            monitor: workers_resource_monitor,
+        });
+        let workers_menu_bar = cx.new({
+            let workers_model = workers_model.clone();
+            move |cx| workers::menu_bar::WorkersMenuBarController::new(workers_model, cx)
+        });
+        cx.set_global(workers::menu_bar::WorkersMenuBarGlobal {
+            controller: workers_menu_bar,
+        });
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -171,8 +207,9 @@ pub fn run_app(config: UiConfig) {
         cx.set_global(ReopenState {
             state: state.clone(),
             boot: config.boot(),
+            workers_model: workers_model.clone(),
         });
-        open_main_window(state, config.boot(), cx);
+        open_main_window(state, config.boot(), workers_model, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -188,8 +225,13 @@ pub fn run_app(config: UiConfig) {
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
-fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
-    // comet window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
+fn open_main_window(
+    state: gpui::Entity<state::AppState>,
+    boot: EngineBootConfig,
+    workers_model: gpui::Entity<workers::model::WorkersModel>,
+    cx: &mut App,
+) {
+    // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     cx.open_window(
         WindowOptions {
@@ -220,6 +262,18 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // Drag + start_window_move) — mark the content view app-owned
             // so AppKit neither dead-zones the strip nor delays clicks.
             app_owns_titlebar_drag: true,
+            // Linux: request client-side decorations — zeron draws its own
+            // unified titlebar and (under CSD) its own caption buttons
+            // (shell.rs `render_linux_caption_controls`). Leaving this unset
+            // requests SERVER decorations, which stacked a compositor
+            // titlebar on top of the app's chrome under sway/KDE, while
+            // compositors without SSD support (GNOME) went client-side
+            // anyway — frameless, and before the shell drew caption buttons,
+            // with no window controls at all. The compositor can still
+            // override via xdg-decoration negotiation; the shell re-resolves
+            // what to draw every frame.
+            window_decorations: cfg!(target_os = "linux")
+                .then_some(gpui::WindowDecorations::Client),
             // Frosted shell (macOS): blur the desktop behind the window; the
             // shell paints its frost surface translucent so the sidebar reads
             // as glass (shell.rs root). Elsewhere blur support is compositor
@@ -228,7 +282,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // — if these two ever disagree, vibrancy dies on the first theme
             // change and never comes back.
             window_background: theme::Theme::of(cx).window_background_appearance(),
-            app_id: Some("comet".into()),
+            app_id: Some("zeron".into()),
             ..Default::default()
         },
         move |window, cx| {
@@ -236,7 +290,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // the subscription lives as long as the window does, and the window
             // owns nothing that would drop it early.
             appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, cx))
+            cx.new(|cx| shell::Shell::new(state, boot, workers_model, cx))
         },
     )
     .expect("failed to open window");

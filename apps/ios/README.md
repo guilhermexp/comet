@@ -1,6 +1,6 @@
-# Comet for iOS
+# Zeron for iOS
 
-A native SwiftUI viewport onto the comet-native mesh. The phone is a **peer
+A native SwiftUI viewport onto the zeron mesh. The phone is a **peer
 device**: it joins the same Loro CRDT rooms as every other device (workspace
 doc + per-chat session docs over the edge's Durable Objects), renders the
 mirrors, and drives remote engines through the durable command queue. No
@@ -12,11 +12,11 @@ Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs).
 
 ```sh
 cd apps/ios
-xcodebuild -project Comet.xcodeproj -scheme Comet \
+xcodebuild -project Zeron.xcodeproj -scheme Zeron \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
-Or open `Comet.xcodeproj` in Xcode and run. Dependencies (SPM, resolved
+Or open `Zeron.xcodeproj` in Xcode and run. Dependencies (SPM, resolved
 automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (matches the engine's loro 1.13), [swift-markdown](https://github.com/swiftlang/swift-markdown)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
@@ -77,6 +77,8 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Sidebar: Spaces + attention-sorted Sessions | Home screen sections (same sort ranks: awaiting > errored > working > completed > idle) |
 | Horizontal session tabs per space | Space detail: vertical session list (creation order) |
 | Tab close = archive | Swipe-to-archive |
+| Archived shelf under the sidebar list (open by default, Show-more paging, hover-swap Unarchive) | Same shelf under Home/space lists; unarchive is swipe-to-unarchive |
+| Status word in the row corner (muted dots; Done keeps its pop; spinner rides bottom-right) | Same, same colors |
 | Composer `white_alpha(0.03)` pill + hairline | Liquid Glass pill (`glassEffect`) + hairline |
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |

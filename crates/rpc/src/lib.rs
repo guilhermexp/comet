@@ -1,8 +1,8 @@
-//! comet-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
+//! zeron-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
 //! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
 //!
 //! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
-//! byte transports), matching the shape of comet's Effect RPC without the Effect runtime:
+//! byte transports), matching the shape of zeron's Effect RPC without the Effect runtime:
 //!
 //! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
 //! - server → client: `{id, ok}` / `{id, err}` for unary calls,
@@ -22,11 +22,11 @@ mod client;
 pub mod device_room;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
-    encode_device_frame,
+    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenSource, decode_device_frame,
+    device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
 
@@ -34,9 +34,45 @@ pub use server::{serve_connection, serve_ws_listener};
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
+    /// Flip a harness's enablement on the target device (Settings → Agents);
+    /// replies with the device's fresh `ListHarnesses` catalog.
+    pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
+    pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// App-owned durable delivery of a Worker lifecycle event to its existing
+    /// parent chat. Uses a deterministic command id and fsync-equivalent store
+    /// persistence before acknowledging the RPC.
+    pub const QUEUE_WORKER_NOTIFICATION: &str = "QueueWorkerNotification";
+    /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
+    /// command entry (client-minted id and all) straight over the device-room
+    /// link when its chat2 rows can't reach the edge but the host's peer link
+    /// is alive. The host claims the id in its processed ledger before
+    /// executing, so the doc row arriving later dedupes to a no-op —
+    /// exactly-once by construction. Params `{chatId, entry}`.
+    pub const RELAY_COMMAND: &str = "RelayCommand";
+    /// User-driven delivery retry for a chat with unadopted queued sends:
+    /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
+    /// per pending command. Params `{chatId}`; IPC-only.
+    pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Nudge every open room client to verify liveness NOW (window focus,
+    /// app foregrounded). No params; IPC-only. Each room ignores the hint
+    /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
+    pub const PROBE_SYNC: &str = "ProbeSync";
+    /// Live sync introspection (`zeron sync` / debug surfaces): per-room
+    /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
+    /// counters for the workspace room and every open chat doc. No params;
+    /// IPC-only.
+    pub const SYNC_STATUS: &str = "SyncStatus";
+    /// Pushed edge-connectivity posture (`zeron_proto::Connectivity`):
+    /// current value first, then every change — the connection pill /
+    /// composer-honesty / queued-badge feed. No params; IPC-only.
+    pub const WATCH_CONNECTIVITY: &str = "WatchConnectivity";
+    /// In-flight queued-attachment transfers (`zeron_proto::TransferProgress`
+    /// list): current set first, then a fresh snapshot per landed chunk —
+    /// the sending thumbnail's percent-ring feed. No params; IPC-only.
+    pub const WATCH_TRANSFERS: &str = "WatchTransfers";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
@@ -49,6 +85,15 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
+    /// This engine runtime's fixed device and workspace identity.
+    pub const ENGINE_INFO: &str = "EngineInfo";
+    /// Readiness barrier for the engine runtime. The call completes once stores
+    /// and journals are assembled, or fails with the assembly error.
+    pub const ENGINE_READY: &str = "EngineReady";
+    /// Ask a headless IPC owner to drain its runtime and exit successfully.
+    /// Headed IPC owners do not implement this method: closing another app's
+    /// engine behind its windows would leave that process unusable.
+    pub const STOP_ENGINE: &str = "StopEngine";
     pub const AUTH_STATUS: &str = "AuthStatus";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";
@@ -58,6 +103,10 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";
+    /// One-time local→synced profile import: what's importable (unary).
+    pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
+    /// One-time local→synced profile import: run it (stream of progress items).
+    pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -65,8 +114,13 @@ pub mod methods {
     pub const CREATE_REPO: &str = "CreateRepo";
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
+    pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
+    /// Update remote-tracking refs without changing HEAD, the index, or files.
+    pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
+    /// The device's browse roots: home plus mounted drives/volumes.
+    pub const LIST_DRIVES: &str = "ListDrives";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
@@ -80,6 +134,10 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    /// Current pull request for one checkout, resolved on the checkout's host device.
+    pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
+    pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
+    pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
@@ -92,6 +150,12 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+    /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
+    /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
+    pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
+    /// Fetch sanitized historical Write/Edit input from the chat host's local
+    /// run journal. Relay-forwardable via `targetDeviceId`.
+    pub const FETCH_TOOL_INPUT: &str = "FetchToolInput";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
@@ -184,8 +248,43 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Mutex;
 
     struct TestService;
+
+    struct CancelAwareService {
+        dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RpcService for CancelAwareService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+                return Err(RpcError::UnknownMethod(method.into()));
+            }
+            let guard = DropSignal(self.dropped.lock().unwrap().take());
+            let stream = futures::stream::unfold(guard, |guard| async move {
+                let item = std::future::pending::<Option<(serde_json::Value, DropSignal)>>().await;
+                drop(guard);
+                item
+            });
+            Ok(RpcReply::Stream(stream.boxed()))
+        }
+    }
 
     #[async_trait]
     impl RpcService for TestService {
@@ -244,6 +343,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_stream_acknowledges_support_and_preserves_unknown_method() {
+        let client = memory_client(Arc::new(TestService));
+
+        let mut items = client
+            .subscribe_checked("Count", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        assert_eq!(items.recv().await, Some(serde_json::json!(0)));
+        assert_eq!(items.recv().await, None);
+
+        let error = match client
+            .subscribe_checked("FutureStream", serde_json::Value::Null)
+            .await
+        {
+            Ok(_) => panic!("old service must reject unknown stream"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RpcError::UnknownMethod(method) if method == "FutureStream"));
+    }
+
+    #[tokio::test]
+    async fn dropping_checked_subscription_cancels_pending_server_stream() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let client = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        }));
+        let stream = client
+            .subscribe_checked(
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("server stream cancelled")
+            .expect("drop signal");
+    }
+
+    #[tokio::test]
     async fn websocket_round_trip() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -263,6 +405,34 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn handshake_with_origin_header_is_rejected() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+
+        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
+        // the server must refuse the handshake before serving any RPC.
+        let mut req = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("origin", "https://evil.example".parse().unwrap());
+        let result = tokio_tungstenite::connect_async(req).await;
+        assert!(
+            result.is_err(),
+            "handshake carrying an Origin header must be rejected"
+        );
+
+        // A native viewport (no Origin) still connects and can call RPC — the
+        // reject must not be a blanket denial.
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
+        assert_eq!(echoed, serde_json::json!("ok"));
     }
 
     #[tokio::test]

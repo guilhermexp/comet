@@ -1,7 +1,7 @@
 //! The app theme — two concrete appearances, one token set.
 //!
 //! Colors are precomputed from an oklch-derived neutral scale (perceptually even
-//! lightness steps; the same scale comet's Tailwind theme used) into gpui [`Hsla`].
+//! lightness steps; the same scale zeron's Tailwind theme used) into gpui [`Hsla`].
 //! **Numbers drive layout, colors are paint**: layout constants live here as plain
 //! numbers and never depend on which color is painted.
 //!
@@ -34,6 +34,7 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
+use comet_syntax::HighlightKind;
 use gpui::{App, Global, Hsla, SharedString, hsla};
 
 /// Which appearance the app is painting.
@@ -141,6 +142,145 @@ pub const INK_FILL_SCALE: f32 = 1.0;
 /// and the dark palette's white hairlines are deliberately faint. Scaling up
 /// keeps separators legible instead of dissolving into the panel.
 pub const INK_HAIRLINE_SCALE: f32 = 1.35;
+
+/// Paint-only syntax colors. The hues follow the Git history graph's lane
+/// palette (indigo, pink, emerald, amber, red, neutral), while light-mode
+/// variants are darkened enough to remain readable as text on white.
+#[derive(Debug, Clone)]
+pub struct SyntaxPalette {
+    pub comment: Hsla,
+    pub keyword: Hsla,
+    pub string: Hsla,
+    pub string_special: Hsla,
+    pub escape: Hsla,
+    pub number: Hsla,
+    pub boolean: Hsla,
+    pub type_name: Hsla,
+    pub type_builtin: Hsla,
+    pub constructor: Hsla,
+    pub function: Hsla,
+    pub function_builtin: Hsla,
+    pub macro_name: Hsla,
+    pub property: Hsla,
+    pub constant: Hsla,
+    pub variable: Hsla,
+    pub variable_special: Hsla,
+    pub parameter: Hsla,
+    pub operator: Hsla,
+    pub punctuation: Hsla,
+    pub tag: Hsla,
+    pub attribute: Hsla,
+    pub label: Hsla,
+    pub invalid: Hsla,
+}
+
+impl SyntaxPalette {
+    pub fn color(&self, kind: HighlightKind) -> Hsla {
+        match kind {
+            HighlightKind::Comment => self.comment,
+            HighlightKind::Keyword => self.keyword,
+            HighlightKind::String => self.string,
+            HighlightKind::StringSpecial => self.string_special,
+            HighlightKind::Escape => self.escape,
+            HighlightKind::Number => self.number,
+            HighlightKind::Boolean => self.boolean,
+            HighlightKind::Type => self.type_name,
+            HighlightKind::TypeBuiltin => self.type_builtin,
+            HighlightKind::Constructor => self.constructor,
+            HighlightKind::Function => self.function,
+            HighlightKind::FunctionBuiltin => self.function_builtin,
+            HighlightKind::Macro => self.macro_name,
+            HighlightKind::Property => self.property,
+            HighlightKind::Constant => self.constant,
+            HighlightKind::Variable => self.variable,
+            HighlightKind::VariableSpecial => self.variable_special,
+            HighlightKind::Parameter => self.parameter,
+            HighlightKind::Operator => self.operator,
+            HighlightKind::Punctuation | HighlightKind::Embedded => self.punctuation,
+            HighlightKind::Tag => self.tag,
+            HighlightKind::Attribute => self.attribute,
+            HighlightKind::Label => self.label,
+            HighlightKind::Invalid => self.invalid,
+        }
+    }
+
+    fn dark(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
+        // Same sources and 72% saturation treatment as history::graph_color.
+        let indigo = git_graph_tone(oklch(0.673, 0.182, 276.935));
+        let pink = git_graph_tone(oklch(0.718, 0.202, 349.761));
+        let emerald = git_graph_tone(oklch(0.765, 0.177, 163.223));
+        let amber = git_graph_tone(oklch(0.828, 0.189, 84.429));
+        let red = git_graph_tone(danger);
+        Self {
+            comment,
+            keyword: indigo,
+            string: emerald,
+            string_special: pink,
+            escape: pink,
+            number: amber,
+            boolean: amber,
+            type_name: amber,
+            type_builtin: emerald,
+            constructor: amber,
+            function: indigo,
+            function_builtin: pink,
+            macro_name: pink,
+            property: amber,
+            constant: emerald,
+            variable: text,
+            variable_special: pink,
+            parameter: text,
+            operator: text,
+            punctuation: text,
+            tag: pink,
+            attribute: amber,
+            label: amber,
+            invalid: red,
+        }
+    }
+
+    fn light(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
+        // Match the light graph's hue families at text-safe lightness.
+        let indigo = git_graph_tone(oklch(0.47, 0.20, 276.966));
+        let pink = git_graph_tone(oklch(0.47, 0.17, 0.584));
+        let emerald = git_graph_tone(oklch(0.46, 0.11, 163.225));
+        let amber = git_graph_tone(oklch(0.47, 0.12, 48.998));
+        let red = git_graph_tone(danger);
+        Self {
+            comment,
+            keyword: indigo,
+            string: emerald,
+            string_special: pink,
+            escape: pink,
+            number: amber,
+            boolean: amber,
+            type_name: amber,
+            type_builtin: emerald,
+            constructor: amber,
+            function: indigo,
+            function_builtin: pink,
+            macro_name: pink,
+            property: amber,
+            constant: emerald,
+            variable: text,
+            variable_special: pink,
+            parameter: text,
+            operator: text,
+            punctuation: text,
+            tag: pink,
+            attribute: amber,
+            label: amber,
+            invalid: red,
+        }
+    }
+}
+
+/// Git history intentionally softens lane saturation so the graph remains
+/// colorful without competing with content. Syntax uses the same treatment.
+fn git_graph_tone(mut color: Hsla) -> Hsla {
+    color.s *= 0.72;
+    color
+}
 
 /// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
 #[derive(Debug, Clone)]
@@ -262,12 +402,8 @@ pub struct Theme {
     pub code_text: Hsla,
     /// Inline-code wash behind [`Self::code_text`].
     pub code_wash: Hsla,
-    /// Syntax: keywords (soft rose).
-    pub syntax_keyword: Hsla,
-    /// Syntax: string literals (soft green).
-    pub syntax_string: Hsla,
-    /// Syntax: numeric literals (soft amber).
-    pub syntax_number: Hsla,
+    /// Shared paint-only syntax palette.
+    pub syntax: SyntaxPalette,
     /// Diff: added lines.
     pub diff_add: Hsla,
     /// Diff: deleted lines.
@@ -296,7 +432,7 @@ impl Theme {
     /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
     /// backdrop blur has no material layer, so the scrim runs heavier to land
     /// on the same perceived tone (see [`Theme::glass`]).
-    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
+    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
     /// Light-mode frost alpha — glass-forward, like dark mode.
     ///
     /// A light tint controls the blur less than a dark one: the desktop's
@@ -306,8 +442,8 @@ impl Theme {
     /// vibrancy material is mostly white). Floating cards compensate further:
     /// see [`Self::glass_overlay`], where light coverage steps up to keep menu
     /// text legible over an unknown backdrop.
-    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
-    /// Main-panel header height (comet `h-11`) — in-card headers (changes pane).
+    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
+    /// Main-panel header height (zeron `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
     /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
@@ -315,9 +451,15 @@ impl Theme {
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
     /// Downward shift of titlebar content within the bar.
     pub const TITLEBAR_TOP_PAD: f32 = 2.0;
-    /// Reserved status strip under the content outlet (comet `h-6`) — the
+    /// Reserved status strip under the content outlet (zeron `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
+    /// Height of the gradient that fades the transcript into the panel
+    /// background at its bottom edge. The transcript's last row must pad
+    /// itself past this band so settled content (message text, the
+    /// hover-revealed timestamp) never sits inside the fade when scrolled
+    /// to the bottom.
+    pub const TRANSCRIPT_FADE_BAND: f32 = 24.0;
     /// Message bubble corner radius.
     pub const BUBBLE_RADIUS: f32 = 16.0;
     /// Panel / card corner radius.
@@ -366,36 +508,75 @@ impl Theme {
         self.glass().a < 1.0
     }
 
+    /// Whether FLOATING surfaces (popovers, the composer pill) paint their
+    /// backdrop blur and translucent tints. Unlike [`Self::is_glass`] this is
+    /// scene-level: the blur runs on in-app content inside the window, not on
+    /// the desktop behind it, so it needs no compositor vibrancy — macOS
+    /// rasterizes it in Metal and Linux in the vendored wgpu renderer (other
+    /// wgpu platforms keep opaque floats until tested). The window chrome
+    /// itself stays opaque off macOS either way.
+    pub fn is_frost(&self) -> bool {
+        cfg!(any(target_os = "macos", target_os = "linux"))
+    }
+
     /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
-    /// buttons). Dark: the standard luminous hover. Light: a white wash below
-    /// [`glass_selected_bg`] — the appearance-neutral `element_hover` is a
-    /// *black* wash in light mode, which put a dark hover next to a white
-    /// selection on the same surface (user report). Hover and selection must
-    /// lift the same way.
+    /// buttons). One recipe, both appearances: the 11% [`wash`], tone-flipped
+    /// by the palette convention (soft-white on dark, soft-black on light).
     ///
-    /// Dark gives hover and selection the SAME fill (selection adds only the
-    /// ring) because the wash is a 14% translucent glow. Light cannot mirror
-    /// that literally — its selected fill is near-opaque white, and fill
-    /// parity would flash a solid card under every pointer pass — so hover
-    /// runs the same direction at roughly half the lift instead. 0.30 was
-    /// invisible against the bright frost: rest→hover has to be as legible a
-    /// step as dark's, or the sidebar feels dead under the pointer.
+    /// Hover and selection share the SAME fill (selection adds only the ring).
+    /// Light previously ran heavy white washes here (hover 0.55, selection
+    /// 0.92) after a black-hover-next-to-white-selection mismatch report; now
+    /// hover and selection are *both* the tone-flipped wash, so they lift the
+    /// same way again. Light's alpha sits under dark's: dark's 11% at the
+    /// light tone read too dark over the bright frost (user report).
     pub fn glass_hover(&self) -> Hsla {
         match self.appearance {
-            Appearance::Dark => self.element_hover,
-            Appearance::Light => hsla(0.0, 0.0, 1.0, 0.55),
+            Appearance::Dark => wash_for(Appearance::Dark, 0.11),
+            Appearance::Light => wash_for(Appearance::Light, 0.06),
         }
     }
 
     /// The translucent tint floating cards paint over their backdrop blur
-    /// (see [`crate::frost::frosted`]). Dark: 65% — a dark tint dominates the
-    /// blur at low coverage. Light: heavier — a white tint at 65% left menu
-    /// text ghosting over whatever sat behind the popover, so light coverage
+    /// (see [`crate::frost::frosted`]). Dark: the reference zeron
+    /// `.glass-surface` menu tint verbatim — `oklch(0.33 0 0 / 34%)`. The
+    /// previous `surface_overlay` at 65% was tuned back when the tint had to
+    /// *approximate* the composited recipe without a real blur; kept over the
+    /// blur it buried the backdrop's colour and menus read as flat grey slabs
+    /// next to the hue-inheriting chrome (user report). At 34% the blurred
+    /// backdrop carries the card and the mid-grey only lifts it off the
+    /// plane. Light: heavier — a translucent white tint left menu text
+    /// ghosting over whatever sat behind the popover, so light coverage
     /// steps up to keep rows on a known background.
     pub fn glass_overlay(&self) -> Hsla {
         match self.appearance {
-            Appearance::Dark => self.surface_overlay.opacity(0.65),
+            Appearance::Dark => oklch(0.33, 0.0, 0.0).opacity(0.34),
             Appearance::Light => self.surface_overlay.opacity(0.85),
+        }
+    }
+
+    /// The composer pill / question panel fill. Light's `input_bg` is opaque
+    /// white (the elevation ladder on an opaque page) — over glass it read as
+    /// a solid slab in front of the frosted blur, so it thins to a
+    /// translucent tint there (0.6 and then 0.45 both still read too bright
+    /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
+    /// is already glass-native.
+    pub fn input_glass_bg(&self) -> Hsla {
+        if self.is_frost() && matches!(self.appearance, Appearance::Light) {
+            self.input_bg.opacity(0.30)
+        } else {
+            self.input_bg
+        }
+    }
+
+    /// Section-card fill (settings cards and similar in-panel cards). The
+    /// opaque `surface` tone read as a harsh solid slab floating on the
+    /// frosted blur (user report), so glass thins it to a translucent tint;
+    /// opaque platforms keep the true card tone.
+    pub fn card_glass_bg(&self) -> Hsla {
+        if self.is_glass() {
+            self.surface.opacity(0.40)
+        } else {
+            self.surface
         }
     }
 
@@ -435,7 +616,7 @@ impl Theme {
             surface_card: grey(0x0e),
             surface_dialog: grey(0x10),
             surface_overlay: grey(0x16),
-            element_hover: hsla(0.0, 0.0, 0.92, 0.14),
+            element_hover: hsla(0.0, 0.0, 0.92, 0.11),
             element_active: hsla(0.0, 0.0, 0.92, 0.16),
             border: hsla(0.0, 0.0, 1.0, 0.08),
             border_strong: hsla(0.0, 0.0, 1.0, 0.14),
@@ -464,11 +645,9 @@ impl Theme {
             danger_strong: oklch(0.58, 0.16, 25.0),
             code_text: oklch(0.811, 0.111, 293.571), // violet-300
             code_wash: oklch(0.702, 0.183, 293.541).opacity(0.12), // violet-400/12
-            syntax_keyword: oklch(0.709, 0.129, 20.0), // soft rose
-            syntax_string: oklch(0.77, 0.11, 168.0), // soft green
-            syntax_number: oklch(0.78, 0.12, 80.0),  // soft amber
-            diff_add: oklch(0.765, 0.177, 163.223),  // emerald-400
-            diff_del: oklch(0.704, 0.191, 22.216),   // red-400
+            syntax: SyntaxPalette::dark(neutral(0.922), neutral(0.60), oklch(0.704, 0.191, 22.216)),
+            diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
+            diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
@@ -542,9 +721,7 @@ impl Theme {
             danger_strong: oklch(0.51, 0.20, 25.0),
             code_text: oklch(0.491, 0.27, 292.581), // violet-700
             code_wash: oklch(0.541, 0.281, 293.009).opacity(0.10), // violet-600/10
-            syntax_keyword: oklch(0.52, 0.19, 20.0),
-            syntax_string: oklch(0.46, 0.11, 168.0),
-            syntax_number: oklch(0.52, 0.13, 70.0),
+            syntax: SyntaxPalette::light(neutral(0.25), neutral(0.48), oklch(0.505, 0.213, 27.518)),
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
@@ -721,35 +898,39 @@ fn band_for(appearance: Appearance) -> Hsla {
 
 /// Selected-state glass treatment (tabs, session rows, space rows): a
 /// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
-/// the glass (user request).
-///
-/// The wash lifts toward the appearance's *luminous* end. Dark: soft white.
-/// Light: white too, NOT the literal translation to a black wash — 14% black
-/// over light frost reads as a pressed dent and muddies with whatever the
-/// wallpaper puts behind the glass. Thickening the frost toward white pops
-/// the chip forward the way dark's wash glows (the light-Safari active-tab
-/// recipe). Selection *inside floating cards* is different — see
-/// [`card_selected_bg`].
+/// the glass (user request). Dark: the 11% [`wash`]. Light: the tone-flipped
+/// wash at 6% — 11% black read too dark over the bright frost (user report;
+/// light also previously ran a near-opaque white chip, rejected the same
+/// way). Same fill as [`Theme::glass_hover`] — the ring in
+/// [`glass_selected_shadows`] is what distinguishes selection. Selection
+/// *inside floating cards* is different — see [`card_selected_bg`].
 pub fn glass_selected_bg() -> Hsla {
     match current_appearance() {
-        Appearance::Dark => wash(0.14),
-        // Near-opaque: at 0.55 the chip sank into the (bright) frost and the
-        // active tab lost its contrast — the ring and seat shadow in
-        // [`glass_selected_shadows`] carry the edge, the fill carries the pop.
-        Appearance::Light => hsla(0.0, 0.0, 1.0, 0.92),
+        Appearance::Dark => wash(0.11),
+        Appearance::Light => wash(0.06),
+    }
+}
+
+/// The user message bubble's plate: the same translucent wash family as
+/// [`glass_selected_bg`], one step softer — at the selection weight the
+/// bubble read too strong for settled content (user report), and an opaque
+/// plate before that read as a solid slab over glass.
+pub fn user_bubble_bg() -> Hsla {
+    match current_appearance() {
+        Appearance::Dark => wash(0.08),
+        Appearance::Light => wash(0.04),
     }
 }
 
 /// Selected/keyboard-active treatment for rows and chips INSIDE a floating
 /// card (menu rows, the picker rail, segmented chips). The card is already the
 /// bright plane in light mode, so a white lift can't read there — selection is
-/// a grey wash instead, at Primer/Radix "selected" weight (~8% black). The
-/// dark-mode card is translucent dark glass, where the standard luminous wash
-/// still applies.
+/// the tone-flipped grey wash, at 6% (dark's 11% read too dark on the bright
+/// plane, user report).
 pub fn card_selected_bg() -> Hsla {
     match current_appearance() {
-        Appearance::Dark => wash(0.14),
-        Appearance::Light => wash(0.08),
+        Appearance::Dark => wash(0.11),
+        Appearance::Light => wash(0.06),
     }
 }
 
@@ -956,7 +1137,7 @@ mod tests {
 
     #[test]
     fn neutral_950_is_0a0a0a() {
-        // oklch(0.145 0 0) is Tailwind neutral-950, comet's app background.
+        // oklch(0.145 0 0) is Tailwind neutral-950, zeron's app background.
         let rgb = srgb_u8(oklch_to_srgb(0.145, 0.0, 0.0));
         assert_eq!(rgb, [10, 10, 10]);
     }
@@ -1100,9 +1281,9 @@ mod tests {
         for t in [Theme::dark(), Theme::light()] {
             for (name, fg) in [
                 ("code_text", t.code_text),
-                ("syntax_keyword", t.syntax_keyword),
-                ("syntax_string", t.syntax_string),
-                ("syntax_number", t.syntax_number),
+                ("syntax_keyword", t.syntax.keyword),
+                ("syntax_string", t.syntax.string),
+                ("syntax_number", t.syntax.number),
             ] {
                 let r = contrast_ratio(fg, t.bg);
                 assert!(r >= 4.5, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
@@ -1111,6 +1292,63 @@ mod tests {
             for (name, fg) in [("diff_add", t.diff_add), ("diff_del", t.diff_del)] {
                 let r = contrast_ratio(fg, t.bg);
                 assert!(r >= 3.0, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_palette_resolves_every_kind_on_code_and_diff_backgrounds() {
+        let kinds = [
+            HighlightKind::Comment,
+            HighlightKind::Keyword,
+            HighlightKind::String,
+            HighlightKind::StringSpecial,
+            HighlightKind::Escape,
+            HighlightKind::Number,
+            HighlightKind::Boolean,
+            HighlightKind::Type,
+            HighlightKind::TypeBuiltin,
+            HighlightKind::Constructor,
+            HighlightKind::Function,
+            HighlightKind::FunctionBuiltin,
+            HighlightKind::Macro,
+            HighlightKind::Property,
+            HighlightKind::Constant,
+            HighlightKind::Variable,
+            HighlightKind::VariableSpecial,
+            HighlightKind::Parameter,
+            HighlightKind::Operator,
+            HighlightKind::Punctuation,
+            HighlightKind::Tag,
+            HighlightKind::Attribute,
+            HighlightKind::Label,
+            HighlightKind::Embedded,
+            HighlightKind::Invalid,
+        ];
+        for theme in [Theme::dark(), Theme::light()] {
+            let add_bg = flatten(theme.diff_add.opacity(0.055), theme.bg);
+            let del_bg = flatten(theme.diff_del.opacity(0.055), theme.bg);
+            for kind in kinds {
+                let color = theme.syntax.color(kind);
+                let floor = if matches!(
+                    kind,
+                    HighlightKind::Comment
+                        | HighlightKind::Operator
+                        | HighlightKind::Punctuation
+                        | HighlightKind::Embedded
+                ) {
+                    3.0
+                } else {
+                    4.5
+                };
+                for (name, background) in [("code", theme.bg), ("add", add_bg), ("del", del_bg)] {
+                    let ratio = contrast_ratio(color, background);
+                    assert!(
+                        ratio >= floor,
+                        "{:?} {kind:?} is {ratio:.2}:1 on {name}",
+                        theme.appearance
+                    );
+                }
             }
         }
     }
@@ -1450,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_numbers_match_comet() {
+    fn layout_numbers_match_zeron() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
         assert_eq!(Theme::BUBBLE_RADIUS, 16.0);

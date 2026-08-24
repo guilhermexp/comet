@@ -1,18 +1,37 @@
 //! Claude Code harness: spawns the installed `claude` CLI and speaks its
-//! stream-json protocol directly (spec: docs/research/harness.md; behavior
-//! ported from comet's `packages/harness/src/claude.ts`).
+//! stream-json protocol directly — no adapter process in between. Resurrected
+//! from the pre-ACP driver (see docs/research/harness.md) and modernized
+//! against CLI 2.1.228.
 //!
 //! - stdout JSONL frames are normalized into [`AgentEvent`]s (init dedupe,
-//!   subagent filtering, typed tool decoding, error-code mapping).
-//! - The bidirectional control channel is served: `can_use_tool` requests are
-//!   auto-allowed, except `AskUserQuestion` which round-trips through
-//!   [`RunControls::request_input`] (InputRequested → answers → InputResolved).
+//!   subagent tagging, typed tool decoding, error-code mapping).
+//! - PERMISSIONS ride the stdio control channel: `--permission-prompt-tool
+//!   stdio` (undocumented — absent from `claude --help`, but it is the same
+//!   transport the Claude Agent SDK's `query()` drives, and was re-validated
+//!   live against 2.1.228: `can_use_tool` control requests arrive and
+//!   allow/deny responses are honored). The alternative channel — an MCP
+//!   permission tool — needs a server process and was rejected. Tool calls
+//!   auto-allow (zeron sessions run unattended, parity with the ACP
+//!   harness's preferred-allow behavior); `AskUserQuestion` round-trips
+//!   through [`RunControls::request_input`].
+//! - DONE is the CLI's own `result` frame, eagerly: background work (a
+//!   spawned subagent) never holds the turn. The CLI natively runs a second
+//!   wake turn when a background task finishes — a fresh `init` (same
+//!   session id, deduped) plus another `result` — and both are forwarded;
+//!   the engine's parked-session resume path turns them into the
+//!   done→Working→done wake.
+//! - SUBAGENT frames arrive on the same stdout tagged with a top-level
+//!   `parent_tool_use_id`; they are wrapped in [`AgentEvent::Subagent`] and
+//!   NEVER folded into the parent feed (a background subagent interleaves
+//!   with the parent's own stream — folding them in split contiguous text
+//!   around phantom tool calls).
 //! - Steering: queued [`SteerMessage`]s are written to stdin as user lines at
-//!   any time; the CLI applies them at its own step boundary.
+//!   any time; the CLI folds them into the running turn at its own step
+//!   boundary.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
-mod catalog;
+pub mod catalog;
 mod normalize;
 mod wire;
 
@@ -29,12 +48,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
-use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
@@ -92,6 +111,74 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     }
 }
 
+fn claude_context_window(request: &RunRequest) -> u64 {
+    if request
+        .model_options
+        .get("contextWindow")
+        .and_then(Value::as_str)
+        == Some("1m")
+    {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+fn claude_workers_mcp_config_for(
+    executable: &std::path::Path,
+    request: &RunRequest,
+    disabled_by_environment: bool,
+) -> Option<String> {
+    let server = crate::acp::workers_mcp_servers_for(
+        executable,
+        request.enable_workers_mcp,
+        disabled_by_environment,
+        request.workers_parent_chat_id.as_deref(),
+    )
+    .into_iter()
+    .next()?;
+    let name = server.get("name")?.as_str()?;
+    let command = server.get("command")?.clone();
+    let args = server
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let env = server
+        .get("env")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some((
+                row.get("name")?.as_str()?.to_owned(),
+                row.get("value")?.clone(),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Some(
+        serde_json::json!({
+            "mcpServers": {
+                name: {
+                    "command": command,
+                    "args": args,
+                    "env": env,
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn claude_workers_mcp_config(request: &RunRequest) -> Option<String> {
+    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
+        .ok()
+        .is_some_and(|value| value == "1");
+    let executable = std::env::var_os("ZERON_WORKERS_MCP_BIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())?;
+    claude_workers_mcp_config_for(&executable, request, disabled)
+}
+
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
@@ -100,6 +187,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Command discovery cache: only a successful probe is cached, so a
+    /// broken CLI retries on the next picker open (ACP-harness parity).
+    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for ClaudeHarness {
@@ -108,6 +198,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            commands: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -145,16 +236,7 @@ impl ClaudeHarness {
         })
     }
 
-    /// `worker_tools` is the comet MCP server to hand the agent, or `None` when
-    /// there is no comet binary to point at — a missing binary degrades to "no
-    /// worker tools", never to a failed run.
-    fn build_command(
-        &self,
-        exe: &PathBuf,
-        request: &RunRequest,
-        chat_id: &str,
-        worker_tools: Option<&crate::worker_tools::ServerTarget>,
-    ) -> Command {
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
@@ -163,10 +245,16 @@ impl ClaudeHarness {
             "stream-json",
             "--output-format",
             "stream-json",
+            // Required by the CLI alongside `-p --output-format stream-json`.
             "--verbose",
             "--include-partial-messages",
+            // Newer Claude models emit no readable thinking text unless a
+            // summary is asked for (raw reasoning stays provider-private).
+            "--thinking-display",
+            "summarized",
             // Route permission prompts to the stdio control channel so
             // `can_use_tool` (and AskUserQuestion in particular) reaches us.
+            // Undocumented flag; validated live against 2.1.228.
             "--permission-prompt-tool",
             "stdio",
         ]);
@@ -201,6 +289,9 @@ impl ClaudeHarness {
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
+        if let Some(config) = claude_workers_mcp_config(request) {
+            cmd.args(["--mcp-config", &config]);
+        }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
             settings.insert("fastMode".into(), Value::Bool(true));
@@ -215,17 +306,6 @@ impl ClaudeHarness {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
         }
-        // The comet MCP server, so the agent can delegate to CLI workers that
-        // outlive its turn. Inline JSON, one argument. `--strict-mcp-config` is
-        // deliberately absent: it would drop the user's own MCP servers.
-        if let Some(config) = crate::worker_tools::claude_mcp_config(
-            worker_tools,
-            chat_id,
-            crate::worker_tools::SESSION_DEPTH,
-        ) {
-            cmd.arg("--mcp-config");
-            cmd.arg(config);
-        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -235,6 +315,118 @@ impl ClaudeHarness {
             .kill_on_drop(true);
         cmd
     }
+
+    /// Short-lived discovery probe: spawn the CLI in stream-json mode, send
+    /// the `initialize` control request, and read the commands out of its
+    /// control_response. No user message is ever written, so no turn (and no
+    /// API call) happens; the child is torn down as soon as the response
+    /// lands.
+    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            // Mandatory with --print + stream-json output; without it the
+            // CLI exits immediately with a usage error.
+            "--verbose",
+        ]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            shutdown_child(&mut child, self.kill_grace).await;
+            return Err(HarnessError::Protocol("claude child has no stdio".into()));
+        };
+        const PROBE_ID: &str = "zeron-command-probe";
+        let discovery = async {
+            let request = serde_json::json!({
+                "type": "control_request",
+                "request_id": PROBE_ID,
+                "request": { "subtype": "initialize" },
+            });
+            stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .map_err(HarnessError::Io)?;
+            stdin.flush().await.map_err(HarnessError::Io)?;
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+                    continue;
+                }
+                let response = frame.get("response").cloned().unwrap_or(Value::Null);
+                if response.get("request_id").and_then(Value::as_str) != Some(PROBE_ID) {
+                    continue;
+                }
+                if response.get("subtype").and_then(Value::as_str) == Some("error") {
+                    let msg = response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("initialize control request failed");
+                    return Err(HarnessError::Protocol(msg.into()));
+                }
+                return Ok(parse_initialize_commands(&response));
+            }
+            Err(HarnessError::Protocol(
+                "claude exited before answering the initialize control request".into(),
+            ))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+        }
+    }
+}
+
+/// `commands` out of an `initialize` control_response payload
+/// (`response.response.commands`: name / description / argumentHint).
+fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
+    response
+        .get("response")
+        .and_then(|r| r.get("commands"))
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SlashCommand {
+                name: name.to_owned(),
+                description: c
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                input_hint: c
+                    .get("argumentHint")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -260,13 +452,32 @@ impl Harness for ClaudeHarness {
             ReasoningLevel::Max,
         ]
     }
+    fn installed(&self) -> bool {
+        self.executable.is_some() || resolve_claude_executable().is_some()
+    }
+    /// Done is the CLI's own terminal frame, for wake turns too.
+    fn deterministic_turn_end(&self) -> bool {
+        true
+    }
 
     /// The curated static catalog (see [`catalog`]); requires an installed CLI
     /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here,
-    /// like the TS harness's discovery call.
+    /// like the discovery call would.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         Ok(static_models())
+    }
+
+    /// Slash commands from the CLI's `initialize` control-request handshake —
+    /// the same channel the Claude Agent SDK's `query()` opens. The response
+    /// carries every command with description + argument hint and involves no
+    /// model turn (verified live, 2.1.228: the control_response is the first
+    /// stdout line, well before any API traffic). Cached on success.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.commands
+            .get_or_try_init(|| self.discover_commands())
+            .await
+            .cloned()
     }
 
     async fn run(
@@ -275,8 +486,7 @@ impl Harness for ClaudeHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let worker_tools = crate::worker_tools::server_target();
-        let mut cmd = self.build_command(&exe, &request, &controls.chat_id, worker_tools.as_ref());
+        let mut cmd = self.build_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -299,7 +509,7 @@ impl Harness for ClaudeHarness {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "comet_harness::claude", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::claude", "stderr: {line}");
                     tail.push(&line);
                 }
             });
@@ -329,6 +539,7 @@ impl Harness for ClaudeHarness {
             event_tx,
             controls,
             reasoning: request.reasoning,
+            context_window: claude_context_window(&request),
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -401,16 +612,16 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!(target: "comet_harness::claude", %path, error = %err, "attachment unreadable; path ref only");
+                tracing::warn!(target: "zeron_harness::claude", %path, error = %err, "attachment unreadable; path ref only");
                 continue;
             }
         };
         if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
-            tracing::debug!(target: "comet_harness::claude", %path, "attachment over inline cap; path ref only");
+            tracing::debug!(target: "zeron_harness::claude", %path, "attachment over inline cap; path ref only");
             continue;
         }
         let Some(media_type) = image_media_type(std::path::Path::new(path), &bytes) else {
-            tracing::debug!(target: "comet_harness::claude", %path, "attachment not an inline-supported image; path ref only");
+            tracing::debug!(target: "zeron_harness::claude", %path, "attachment not an inline-supported image; path ref only");
             continue;
         };
         blocks.push(wire::ImageBlock {
@@ -422,7 +633,7 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
 }
 
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
-/// tolerated and logged, matching the TS harness's swallowed-EPIPE behavior.
+/// tolerated and logged.
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -433,7 +644,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
                     stdin.flush().await
                 };
                 if let Err(e) = write.await {
-                    tracing::debug!(target: "comet_harness::claude", "stdin write failed (tolerated): {e}");
+                    tracing::debug!(target: "zeron_harness::claude", "stdin write failed (tolerated): {e}");
                     return;
                 }
             }
@@ -452,6 +663,7 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
+    context_window: u64,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
@@ -468,6 +680,7 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         reasoning,
+        context_window,
         interrupt_grace,
         kill_grace,
         stderr_tail,
@@ -480,7 +693,7 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = Arc::new(request_input);
 
-    let mut norm = Normalizer::new();
+    let mut norm = Normalizer::with_context_window(context_window);
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -499,7 +712,7 @@ async fn run_session(session: Session) {
                     let frame = match wire::parse_frame(line) {
                         Ok(frame) => frame,
                         Err(e) => {
-                            tracing::debug!(target: "comet_harness::claude", "unparseable frame (skipped): {e}");
+                            tracing::debug!(target: "zeron_harness::claude", "unparseable frame (skipped): {e}");
                             continue;
                         }
                     };
@@ -546,7 +759,7 @@ async fn run_session(session: Session) {
                 }
                 None => {
                     // Mailbox closed: end the input so the run can finish
-                    // after the current turn (mirrors claude.ts steeredInput).
+                    // after the current turn.
                     steering_open = false;
                     let _ = stdin_tx.send(StdinMsg::Close);
                 }
@@ -604,57 +817,19 @@ async fn run_session(session: Session) {
     }
 }
 
-/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
-async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    if let Some(pid) = child.id() {
-        send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-#[derive(Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
-#[cfg(unix)]
-fn send_signal(pid: u32, signal: Signal) {
-    let sig = match signal {
-        Signal::Term => libc::SIGTERM,
-        Signal::Kill => libc::SIGKILL,
-    };
-    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
-    }
-}
-
-#[cfg(not(unix))]
-fn send_signal(_pid: u32, _signal: Signal) {
-    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
-}
-
 type RequestInputFn = Box<
     dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
         + Send
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved;
-/// `AskUserQuestion` is intercepted — surface the questions through the
-/// engine's input bridge (which owns the `InputRequested`/`InputResolved`
-/// lifecycle), wait for the user's answers (in a subtask so the frame loop
-/// keeps flowing), and hand them back keyed by question text, as the tool
-/// expects.
+/// Serve one `can_use_tool` control request. Every tool is auto-approved
+/// (unattended parity — the CLI still blocks until SOME response arrives, so
+/// every request must be answered); `AskUserQuestion` is intercepted —
+/// surface the questions through the engine's input bridge (which owns the
+/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
+/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
+/// by question text, as the tool expects.
 fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
@@ -662,7 +837,7 @@ fn handle_control_request(
 ) {
     if req.request.subtype != "can_use_tool" {
         tracing::debug!(
-            target: "comet_harness::claude",
+            target: "zeron_harness::claude",
             "unhandled control_request subtype: {}", req.request.subtype
         );
         return;
@@ -767,69 +942,78 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
 
-    fn probe_request() -> RunRequest {
+    fn workers_request(enabled: bool) -> RunRequest {
         RunRequest {
-            prompt: "hi".into(),
+            prompt: "test".into(),
+            harness: None,
             model: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
-            cwd: String::new(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            attachments: Vec::new(),
+            cwd: "/tmp/project".into(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            enable_workers_mcp: enabled,
+            workers_parent_chat_id: Some("parent-chat".into()),
             resume: None,
+            attachments: Vec::new(),
+            worktree: None,
         }
     }
 
-    fn args_of(cmd: &Command) -> Vec<String> {
-        cmd.as_std()
+    #[test]
+    fn native_workers_mcp_config_mounts_the_controller_without_persistence() {
+        let config = claude_workers_mcp_config_for(
+            Path::new("/absolute/zeron"),
+            &workers_request(true),
+            false,
+        )
+        .expect("Workers config");
+        let config: Value = serde_json::from_str(&config).expect("valid JSON");
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["command"],
+            "/absolute/zeron"
+        );
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["args"],
+            json!(["__workers_mcp__"])
+        );
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["env"]["COMET_WORKERS_CONTROLLER"],
+            "1"
+        );
+        assert_eq!(
+            config["mcpServers"]["comet-workers"]["env"]["COMET_WORKERS_PARENT_CHAT_ID"],
+            "parent-chat"
+        );
+        assert!(
+            claude_workers_mcp_config_for(
+                Path::new("/absolute/zeron"),
+                &workers_request(false),
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_workers_mcp_is_added_to_the_claude_process() {
+        let harness = ClaudeHarness::new();
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/claude"), &workers_request(true));
+        let args = command
+            .as_std()
             .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--mcp-config"));
+
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/claude"), &workers_request(false));
+        assert!(command.as_std().get_args().all(|arg| arg != "--mcp-config"));
     }
 
-    #[test]
-    fn build_command_hands_the_agent_the_comet_mcp_server() {
-        let target = crate::worker_tools::ServerTarget {
-            bin: std::path::PathBuf::from("/opt/comet bin/comet"),
-            port: 30007,
-        };
-        let cmd = ClaudeHarness::default().build_command(
-            &PathBuf::from("/usr/bin/claude"),
-            &probe_request(),
-            "chat-42",
-            Some(&target),
-        );
-        let args = args_of(&cmd);
-        let flag = args
-            .iter()
-            .position(|a| a == "--mcp-config")
-            .expect("--mcp-config is emitted");
-        // One inline argument, and it must parse: a malformed template shows up
-        // as "no tools", never as an error.
-        let parsed: Value =
-            serde_json::from_str(&args[flag + 1]).expect("the config argument is valid JSON");
-        let server = &parsed["mcpServers"]["comet"];
-        assert_eq!(server["command"], json!("/opt/comet bin/comet"));
-        let server_args: Vec<String> =
-            serde_json::from_value(server["args"].clone()).expect("args array");
-        assert!(server_args.contains(&"chat-42".to_string()));
-        assert!(server_args.contains(&"30007".to_string()));
-        // Strict mode would drop the user's own MCP servers.
-        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
-    }
-
-    #[test]
-    fn build_command_omits_the_server_when_there_is_no_comet_binary() {
-        let cmd = ClaudeHarness::default().build_command(
-            &PathBuf::from("/usr/bin/claude"),
-            &probe_request(),
-            "chat-42",
-            None,
-        );
-        assert!(!args_of(&cmd).iter().any(|a| a == "--mcp-config"));
-    }
     #[test]
     fn parses_questions_tolerantly() {
         let input = json!({

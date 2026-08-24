@@ -1,4 +1,4 @@
-//! Loaders: the comet pulse loader, the gradient matrix spinner, and the boot
+//! Loaders: the zeron pulse loader, the gradient matrix spinner, and the boot
 //! splash content. All motion routes through `crate::motion` pure helpers, so
 //! the math is unit-tested and these elements are testable-by-compile.
 //!
@@ -9,23 +9,26 @@
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
-use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
-
-use crate::motion::{self, COMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
-use crate::theme::Theme;
-
-// Shared with the terminal viewport (`comet_proto::motion`) so both animate the
-// same loaders from the same numbers.
-pub use comet_proto::motion::{
-    COMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
+use gpui::{
+    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
+    canvas, div, point, px,
 };
 
-/// The animated comet mark (comet-loader.tsx `CometLoader`): the full logo
+use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
+use crate::theme::Theme;
+
+// Shared with the terminal viewport (`zeron_proto::motion`) so both animate the
+// same loaders from the same numbers.
+pub use zeron_proto::motion::{
+    MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, ZERON_CELLS, mark_cell_stagger,
+};
+
+/// The animated zeron mark (zeron-loader.tsx `ZeronLoader`): the full logo
 /// pixel grid with a light wave sweeping tail→head. Each cell rests dim
 /// (opacity 0.08, scale 0.9) and flares to full as the crest passes; per-cell
 /// stagger follows the flight axis. `height_px` sets the mark's height (width
 /// follows the 820:940 canvas).
-pub fn comet_mark_loader(
+pub fn zeron_mark_loader(
     _id: &'static str,
     theme: &Theme,
     height_px: f32,
@@ -35,7 +38,7 @@ pub fn comet_mark_loader(
     let color = theme.text;
     let scale = height_px / 940.0;
     let cell = 100.0 * scale;
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&ZERON_PULSE, view, cx);
     div()
         .relative()
         .w(px(820.0 * scale))
@@ -53,7 +56,7 @@ pub fn comet_mark_loader(
                 .justify_center()
                 .child({
                     // Negative CSS delay ⇒ the cell starts mid-cycle:
-                    // the stagger ADDS phase (comet-loader.tsx delayFor).
+                    // the stagger ADDS phase (zeron-loader.tsx delayFor).
                     let phase = (delta + stagger).rem_euclid(1.0);
                     div()
                         .rounded(px(16.0 * scale))
@@ -64,12 +67,12 @@ pub fn comet_mark_loader(
         }))
 }
 
-/// The comet wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
+/// The zeron wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
 /// over 2.4s with a 0.15s stagger per cell.
 ///
 /// `id` scopes the per-cell animation state — give each loader instance a
 /// distinct id.
-pub fn comet_loader(
+pub fn zeron_loader(
     _id: &'static str,
     theme: &Theme,
     cell_px: f32,
@@ -78,13 +81,13 @@ pub fn comet_loader(
 ) -> impl IntoElement {
     let color = theme.text;
     let slot = cell_px;
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&ZERON_PULSE, view, cx);
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(slot / 2.0))
-        .children((0..COMET_CELLS).map(move |i| {
+        .children((0..ZERON_CELLS).map(move |i| {
             // Fixed slot; the animated cell breathes inside it.
             div()
                 .size(px(slot))
@@ -102,9 +105,9 @@ pub fn comet_loader(
         }))
 }
 
-pub use comet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
+pub use zeron_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
-/// The gradient matrix spinner (WorkingIndicator), ported from comet's
+/// The gradient matrix spinner (WorkingIndicator), ported from zeron's
 /// gradient-spin.tsx: a 3×3 grid of round cells tinted per row from the
 /// sunrise gradient. Each cell pulses opacity once per 750ms period; the
 /// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
@@ -155,6 +158,30 @@ pub fn mini_gradient_spinner(
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
+    let tints = GSPIN_ROW_TINTS.map(|t| gpui::rgb(t).into());
+    mini_spinner_tinted(key, cell_px, tints, view, cx)
+}
+
+/// [`mini_gradient_spinner`] in a single flat tint — the grayscale take for
+/// surfaces where the brand gradient would pull focus (the sidebar
+/// connection line): same grid, snake, and timing, color left to the caller.
+pub fn mini_mono_spinner(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    tint: gpui::Hsla,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
+    mini_spinner_tinted(key, cell_px, [tint; 3], view, cx)
+}
+
+fn mini_spinner_tinted(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    row_tints: [gpui::Hsla; 3],
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
     const COLS: usize = 2;
     const ROWS: usize = 3;
     /// Clockwise ring position of each `(row, col)` cell, top-left first:
@@ -168,7 +195,7 @@ pub fn mini_gradient_spinner(
         .flex_col()
         .gap(px(cell_px / 2.0))
         .children((0..ROWS).map(move |row| {
-            let tint: gpui::Hsla = gpui::rgb(GSPIN_ROW_TINTS[row]).into();
+            let tint = row_tints[row];
             div()
                 .flex()
                 .flex_row()
@@ -184,21 +211,135 @@ pub fn mini_gradient_spinner(
         }))
 }
 
-/// Full-window boot splash (comet App.tsx `Splash`): the animated comet mark
+/// Stroke width of [`upload_progress_ring`].
+const RING_STROKE: f32 = 2.5;
+/// Polyline segments for a full circle — plenty for a ≤40px ring.
+const RING_SEGMENTS: f32 = 64.0;
+
+/// Small informational progress ring used by the composer context gauge.
+/// Unlike the upload ring it carries no centered text and accepts semantic
+/// theme colors, so it remains quiet until the tooltip is requested.
+pub fn context_progress_ring(
+    fraction: f32,
+    diameter: f32,
+    track: gpui::Hsla,
+    fill: gpui::Hsla,
+) -> AnyElement {
+    let fraction = fraction.clamp(0.0, 1.0);
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius = diameter / 2.0 - 2.0;
+            let mut paint_arc = |sweep: f32, color: gpui::Hsla| {
+                if sweep <= 0.0 {
+                    return;
+                }
+                let steps = ((RING_SEGMENTS * sweep).ceil() as usize).max(2);
+                let at = |i: usize| {
+                    let theta = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * sweep * (i as f32 / steps as f32);
+                    point(
+                        center.x + px(radius * theta.cos()),
+                        center.y + px(radius * theta.sin()),
+                    )
+                };
+                let mut builder = PathBuilder::stroke(px(2.0));
+                builder.move_to(at(0));
+                for i in 1..=steps {
+                    builder.line_to(at(i));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            paint_arc(1.0, track);
+            paint_arc(fraction, fill);
+        },
+    )
+    .size(px(diameter))
+    .into_any_element()
+}
+
+/// Radial upload-progress ring with the percent centered — overlaid on a
+/// sending echo's attachment thumbnail while its bytes cross the relay
+/// (2026-08-18 "Sending… forever" report; the thumbnail is where the wait
+/// visibly belongs). A faint full track plus a bright arc growing clockwise
+/// from 12 o'clock; gpui paths have no arc primitive, so both are stroked
+/// polylines. Fixed white-on-wash palette: the caller dims the image behind
+/// it, which reads in both themes.
+pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
+    let frac = f32::from(percent.min(100)) / 100.0;
+    let ring = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius = diameter / 2.0 - RING_STROKE;
+            let mut paint_arc = |sweep: f32, color: gpui::Hsla| {
+                if sweep <= 0.0 {
+                    return;
+                }
+                let steps = ((RING_SEGMENTS * sweep).ceil() as usize).max(2);
+                let at = |i: usize| {
+                    // Clockwise from 12 o'clock.
+                    let theta = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * sweep * (i as f32 / steps as f32);
+                    point(
+                        center.x + px(radius * theta.cos()),
+                        center.y + px(radius * theta.sin()),
+                    )
+                };
+                let mut builder = PathBuilder::stroke(px(RING_STROKE));
+                builder.move_to(at(0));
+                for i in 1..=steps {
+                    builder.line_to(at(i));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            paint_arc(1.0, gpui::hsla(0.0, 0.0, 1.0, 0.22));
+            paint_arc(frac, gpui::hsla(0.0, 0.0, 1.0, 0.95));
+        },
+    )
+    .absolute()
+    .inset_0();
+    div()
+        .relative()
+        .size(px(diameter))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(ring)
+        .child(
+            div()
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.95))
+                .child(SharedString::from(format!("{percent}%"))),
+        )
+        .into_any_element()
+}
+
+/// Full-window boot splash (zeron App.tsx `Splash`): the animated zeron mark
 /// (`h-16`) over the app background with an uppercase tracked "Loading" line.
 /// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
 /// lift); the shell removes it once [`SPLASH_OUT`] has run its course.
-pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App) -> AnyElement {
+pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
     let content = div()
         .absolute()
         .inset_0()
-        .bg(theme.bg)
+        // Frosted glass, not the opaque page tone (user request): the boot
+        // overlay reads like the rest of the chrome — the frost tint over
+        // the blurred window background (opaque platforms get the surface
+        // tone, since `glass()` collapses to it there).
+        .bg(theme.glass())
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
         .gap(px(28.0))
-        .child(comet_mark_loader("boot-splash", theme, 64.0, view, cx))
+        .child(hero_ascii(theme))
         .child(loading_word(theme));
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
@@ -206,6 +347,52 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
         content.into_any_element()
     }
 }
+
+/// The landing page's hero comet, monochrome (user request: white instead of
+/// the site's purple gradient). One div per row — gpui has no `white-space:
+/// pre`, and the art's leading/interior spaces carry the shading.
+///
+/// The site masks the rectangle behind a radial gradient; here the same
+/// softening comes from an [`crate::edge_fade`] scope on all four edges, so
+/// the block dissolves into the frost instead of ending on a hard edge.
+fn hero_ascii(theme: &Theme) -> AnyElement {
+    /// Glyph cell: the site runs 7.6px/1.25; a hair smaller keeps the 110-col
+    /// art inside a narrow window.
+    const FONT: f32 = 7.0;
+    const LINE: f32 = 8.75;
+    const FADE_BAND: f32 = 72.0;
+    let art = div()
+        .flex()
+        .flex_col()
+        .font_family(theme.font_mono.clone())
+        // Ligatures OFF, like the terminal grid and the landing page's own
+        // `.hero-ascii` rule: the art is a character grid full of `--`/`::`
+        // runs, and a contextual substitution would collapse cells and bend
+        // the picture (the `codex --yolo` bug, in still life).
+        .font_features(gpui::FontFeatures(std::sync::Arc::new(vec![
+            ("liga".into(), 0),
+            ("calt".into(), 0),
+            ("dlig".into(), 0),
+        ])))
+        .text_size(px(FONT))
+        .line_height(px(LINE))
+        // `theme.text` IS near-white on dark; on light it flips to the ink
+        // tone rather than painting an invisible white block.
+        .text_color(theme.text.opacity(0.55))
+        .children(
+            HERO_ASCII
+                .lines()
+                .map(|line| div().child(SharedString::from(line.to_string()))),
+        );
+    crate::edge_fade::edge_faded(FADE_BAND, true, true, art)
+        .fade_left(true)
+        .fade_right(true)
+        .into_any_element()
+}
+
+/// The landing page's hero comet (apps/landing/public/index.html
+/// `.hero-ascii`), kept as an asset so both surfaces render the same art.
+const HERO_ASCII: &str = include_str!("../assets/hero.txt");
 
 /// "L O A D I N G" — `text-[11px] uppercase tracking-[0.32em]
 /// text-muted-foreground/70`; tracking approximated with thin spaces (gpui has
@@ -222,7 +409,7 @@ pub fn loading_word(theme: &Theme) -> impl IntoElement {
 // Compile-time proof the specs referenced here stay wired to the catalog.
 const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
-    assert!(COMET_PULSE.duration_ms == 2400);
+    assert!(ZERON_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
 };
 

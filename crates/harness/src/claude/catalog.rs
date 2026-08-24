@@ -1,4 +1,4 @@
-//! Model catalog + effort mapping for Claude Code, ported from comet's
+//! Model catalog + effort mapping for Claude Code, ported from zeron's
 //! `packages/harness/src/claude.ts` (which itself mirrors Claude Code's own
 //! picker via t3code's catalog).
 //!
@@ -9,7 +9,7 @@
 //! curated list directly; `ClaudeHarness::models` is the single seam where
 //! dynamic discovery can later be spliced in.
 
-use comet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
+use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
 /// The ultrathink directive rides every user message as a prompt prefix — that
 /// is how the mode actually works in Claude Code (a prompt convention, not an
@@ -86,7 +86,7 @@ fn toggle(id: &str, label: &str) -> ModelOption {
 /// The 200K/1M context-window select carried by the long-context models. The
 /// 1M window is selected via a model-id suffix (`<model>[1m]`), exactly how the
 /// CLI itself does it.
-fn context_window() -> ModelOption {
+pub(crate) fn context_window() -> ModelOption {
     ModelOption {
         id: "contextWindow".into(),
         label: "Context Window".into(),
@@ -146,7 +146,11 @@ fn model(
 /// Fable 5, `max`-topped ladders on Opus/Sonnet, no efforts but a thinking
 /// toggle on Haiku; context-window select on the long-context families and
 /// fast mode on Opus 4.5+.
-pub(crate) fn static_models() -> Vec<Model> {
+///
+/// `pub`: besides the discovery-side enrichment here, the UI's display-side
+/// normalization borrows these labels so alias rows served by older engines
+/// still read with their version numbers ("Opus 5", not "Opus").
+pub fn static_models() -> Vec<Model> {
     vec![
         model(
             "claude-fable-5",

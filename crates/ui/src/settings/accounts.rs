@@ -1,8 +1,8 @@
 //! Settings → Agents / accounts (feature-inventory §1.9): provider cards
-//! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
+//! (Claude Code, Codex, Cursor) with account rows — email, plan badge, Active, usage
 //! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
 //! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons. Comet retargets devices from the settings
+//! account-shaped loading skeletons. Zeron retargets devices from the settings
 //! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
@@ -16,11 +16,11 @@ use gpui::{
 };
 use std::time::Duration;
 
-use comet_proto::{
+use zeron_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
     AgentLoginStatus, HarnessId,
 };
-use comet_rpc::methods;
+use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
@@ -96,39 +96,45 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
     }
 }
 
-/// Compact absolute reset moment (comet settings.agents.tsx `formatReset`):
-/// a local clock time ("3:45 PM") when it lands within ~22h, else a short
-/// weekday ("Mon"); the caller prefixes "resets ". Pure given `now`.
+/// Compact absolute reset moment (zeron settings.agents.tsx `formatReset`):
+/// a local clock time ("3:45 PM") when it lands within ~22h, a short weekday
+/// ("Mon") within a week, else month + day ("Sep 14") — a weekday is noise
+/// when the window is a Codex free-tier MONTHLY reset weeks out. The caller
+/// prefixes "resets ". Pure given `now`.
 pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     use chrono::Local;
     let at = resets_at?;
     let local = at.with_timezone(&Local);
     Some(if at.signed_duration_since(now).num_hours() < 22 {
         format!("resets {}", local.format("%-I:%M %p"))
-    } else {
+    } else if at.signed_duration_since(now).num_hours() < 24 * 7 {
         format!("resets {}", local.format("%a"))
+    } else {
+        format!("resets {}", local.format("%b %-d"))
     })
 }
 
 /// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, comet settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
+/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
+pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
+    (HarnessId::Cursor, "Cursor", "cursor-agent"),
 ];
 
-/// Accounts of one provider, active first (stable otherwise). Pure.
+/// Accounts of one provider, in the engine's order (slot creation). No
+/// active-first re-sort: switching accounts must not move the switched-to
+/// card — the Active badge already says which one is live, and a list that
+/// reshuffles under the click reads as broken. Pure.
 pub fn provider_accounts(
     snapshot: &AgentAccountsSnapshot,
     harness: HarnessId,
 ) -> Vec<&AgentAccount> {
-    let mut accounts: Vec<&AgentAccount> = snapshot
+    snapshot
         .accounts
         .iter()
         .filter(|a| a.harness == harness)
-        .collect();
-    accounts.sort_by_key(|a| !a.active);
-    accounts
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +161,7 @@ enum LoginFlow {
 }
 
 impl LoginFlow {
-    /// Dialog title (comet: "Add Claude account" / "Add Codex account").
+    /// Dialog title (zeron: "Add Claude account" / "Add Codex account").
     fn title(&self) -> &'static str {
         let harness = match self {
             LoginFlow::Starting { harness }
@@ -164,6 +170,7 @@ impl LoginFlow {
         };
         match harness {
             HarnessId::Codex => "Add Codex account",
+            HarnessId::Cursor => "Connect Cursor",
             _ => "Add Claude account",
         }
     }
@@ -172,13 +179,10 @@ impl LoginFlow {
 pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
-    /// Retargeted by the page-header device switcher (comet parity: the
+    /// Retargeted by the page-header device switcher (zeron parity: the
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
-    device_menu_open: bool,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    device_menu_dismissed_at: Option<std::time::Instant>,
+    device_menu: popover::Popup<()>,
     snapshot: Loadable<AgentAccountsSnapshot>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
@@ -204,8 +208,7 @@ impl AccountsPage {
         let mut page = Self {
             state,
             target_device: None,
-            device_menu_open: false,
-            device_menu_dismissed_at: None,
+            device_menu: popover::Popup::default(),
             snapshot: Loadable::Idle,
             busy_account: None,
             login: None,
@@ -229,8 +232,15 @@ impl AccountsPage {
     /// Retarget the page at another device's logins: every accounts RPC is
     /// relay-forwardable, so the whole page — list, usage probes, switch,
     /// forget, login flows — follows the passthrough.
+    fn close_device_menu(&mut self, cx: &mut Context<Self>) {
+        if self.device_menu.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.device_menu);
+            cx.notify();
+        }
+    }
+
     fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
-        self.device_menu_open = false;
+        self.close_device_menu(cx);
         if self.target_device == target {
             cx.notify();
             return;
@@ -254,7 +264,7 @@ impl AccountsPage {
         value
     }
 
-    /// The page-header device switcher (comet device-switcher.tsx): a quiet
+    /// The page-header device switcher (zeron device-switcher.tsx): a quiet
     /// trigger — platform glyph · name · presence dot · sort glyph — opening a
     /// dropdown of every registered device. Selecting one retargets the page.
     fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -263,7 +273,7 @@ impl AccountsPage {
             let s = self.state.read(cx);
             (s.devices.clone(), s.local_device_id.clone())
         };
-        // Stable row order (registration time, then id) — comet's switcher
+        // Stable row order (registration time, then id) — zeron's switcher
         // sorts the same way so rows never reshuffle on heartbeats.
         devices.sort_by(|a, b| {
             a.created_at
@@ -291,7 +301,7 @@ impl AccountsPage {
             .map(|d| d.name.clone().into())
             .unwrap_or_else(|| SharedString::from("This device"));
         let emerald = theme.success;
-        let open = self.device_menu_open;
+        let open = self.device_menu.is_open();
 
         let mut trigger =
             div()
@@ -311,12 +321,18 @@ impl AccountsPage {
                     gpui::transparent_black()
                 })
                 .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.device_menu.note_trigger_press()),
+                )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let just_dismissed = this
-                        .device_menu_dismissed_at
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
-                    this.device_menu_dismissed_at = None;
+                    // A press that found the menu open closes it (the card's
+                    // mouse-down-out already began the close) — never reopen.
+                    if this.device_menu.take_press_was_open() {
+                        this.close_device_menu(cx);
+                    } else {
+                        this.device_menu.open(());
+                    }
                     cx.notify();
                 }))
                 .child(
@@ -348,13 +364,12 @@ impl AccountsPage {
                         .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
                 );
 
-        if open {
+        if self.device_menu.get().is_some() {
+            let closing = self.device_menu.closing_since();
             let menu = popover::popover_card(theme)
                 .w(px(220.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.device_menu_open = false;
-                    this.device_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
+                    this.close_device_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -390,7 +405,6 @@ impl AccountsPage {
                                     .child(SharedString::from("You")),
                             )
                         })
-                        .when(is_active, |el| el.child(popover::menu_check(theme)))
                         .child(
                             div()
                                 .size(px(6.0))
@@ -404,7 +418,11 @@ impl AccountsPage {
                         )
                 }))
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("accounts-device-menu", menu));
+            trigger = trigger.child(popover::anchored_menu(
+                "accounts-device-menu",
+                menu,
+                closing,
+            ));
         }
         trigger.into_any_element()
     }
@@ -486,7 +504,7 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 match result.and_then(|value| {
                     serde_json::from_value::<AgentLoginStart>(value)
-                        .map_err(|e| comet_rpc::RpcError::Failed(e.to_string()))
+                        .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(start) => {
                         cx.open_url(&start.url);
@@ -667,12 +685,12 @@ impl AccountsPage {
 
     // ---- render pieces ----
 
-    /// One usage window (comet settings.agents.tsx `UsageMeter`): label ·
+    /// One usage window (zeron settings.agents.tsx `UsageMeter`): label ·
     /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used" ·
     /// quiet reset time.
     fn render_usage_meter(
         &self,
-        window: &comet_proto::AgentUsageWindow,
+        window: &zeron_proto::AgentUsageWindow,
         theme: &Theme,
         now: DateTime<Utc>,
     ) -> AnyElement {
@@ -711,7 +729,7 @@ impl AccountsPage {
                             div()
                                 .h_full()
                                 // A 1.5% floor keeps tiny non-zero usage
-                                // visible (comet `max(used, 1.5)%`).
+                                // visible (zeron `max(used, 1.5)%`).
                                 .w(gpui::relative(fraction.max(0.015)))
                                 .rounded_full()
                                 .bg(fill),
@@ -740,7 +758,7 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// One account row (comet settings.agents.tsx `AccountRow`): initial
+    /// One account row (zeron settings.agents.tsx `AccountRow`): initial
     /// avatar, email + usage meters left; badges over the Switch/Forget
     /// actions right-anchored.
     fn render_account_row(
@@ -781,7 +799,7 @@ impl AccountsPage {
                 el.child(widgets::badge(theme, plan))
             });
 
-        // Actions only on INACTIVE accounts (comet `{!account.active && …}`):
+        // Actions only on INACTIVE accounts (zeron `{!account.active && …}`):
         // an icon-only Forget (trash, hover → foreground) then Switch, which
         // reads "Switching…" while the activate round-trips.
         let actions: Option<gpui::Div> = (!account.active).then(|| {
@@ -867,7 +885,7 @@ impl AccountsPage {
                     .child(widgets::row_title(theme, email))
                     .map(|el| {
                         // Meters XOR the quiet fallback line — never both
-                        // (comet: `usage ? meters : "Usage unavailable"…`).
+                        // (zeron: `usage ? meters : "Usage unavailable"…`).
                         if account.usage_windows.is_empty() {
                             el.child(
                                 div()
@@ -919,7 +937,7 @@ impl AccountsPage {
         let url_link =
             |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
                 let open_url = url.to_string();
-                // "Reopen the …" text link (comet: `text-[12px]
+                // "Reopen the …" text link (zeron: `text-[12px]
                 // text-muted-foreground/60 hover:underline`).
                 div()
                     .id(id)
@@ -1012,21 +1030,28 @@ impl AccountsPage {
                     .into_any_element()
             }
             LoginFlow::Browser {
+                harness,
                 start,
                 message,
                 error,
-                ..
             } => {
                 let has_error = error.is_some();
+                let body = match harness {
+                    HarnessId::Cursor => {
+                        "Finish signing in to Cursor in your browser. This mints a \
+                         zeron-named API key you can revoke any time from Cursor's \
+                         dashboard — it is separate from `cursor-agent login`."
+                    }
+                    _ => {
+                        "Finish signing in to OpenAI in your browser. The new login is \
+                         captured in an isolated profile — your current session is untouched \
+                         until you switch."
+                    }
+                };
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().mt(px(8.0)).child(popover::dialog_body(
-                        &theme,
-                        "Finish signing in to OpenAI in your browser. The new login is \
-                         captured in an isolated profile — your current session is untouched \
-                         until you switch.",
-                    )))
+                    .child(div().mt(px(8.0)).child(popover::dialog_body(&theme, body)))
                     .child(url_link(
                         "login-open-url-browser",
                         "Reopen the sign-in page",
@@ -1088,7 +1113,7 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
-    /// A ghost account row (comet settings.agents.tsx `SkeletonRow`): avatar,
+    /// A ghost account row (zeron settings.agents.tsx `SkeletonRow`): avatar,
     /// email line, two usage-meter ghosts, a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
@@ -1100,7 +1125,7 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::motion;
-        let delta = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
+        let delta = motion::pulse_delta(&motion::ZERON_PULSE, cx.entity_id(), cx);
         let ghost = |w: gpui::Length, h: f32, round_full: bool| {
             div()
                 .w(w)
@@ -1189,12 +1214,16 @@ impl Render for AccountsPage {
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
+            HarnessId::Grok => (crate::icons::GROK_MARK, None),
+            HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
+            HarnessId::Pi => (crate::icons::PI_MARK, None),
+            HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
             ),
         };
-        // Brand mark inside a 24px centered box (comet: `grid size-6
+        // Brand mark inside a 24px centered box (zeron: `grid size-6
         // place-items-center [&_svg]:size-4`).
         let provider_mark = |harness: HarnessId, theme: &Theme| {
             let (mark, tint) = provider_icon(harness);
@@ -1211,7 +1240,7 @@ impl Render for AccountsPage {
                 )
         };
 
-        // One section per provider (comet settings.agents.tsx `ProviderSection`):
+        // One section per provider (zeron settings.agents.tsx `ProviderSection`):
         // brand header + Add account, then the account rows card.
         let sections: Vec<AnyElement> = match &self.snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
@@ -1219,6 +1248,7 @@ impl Render for AccountsPage {
                 .map(|(harness, name, _cli)| {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
+                        HarnessId::Cursor => "accounts-skeleton-cursor",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -1289,7 +1319,7 @@ impl Render for AccountsPage {
                     .into_iter()
                     .map(|(harness, name, cli)| {
                         let accounts = provider_accounts(&snapshot, harness);
-                        // EVERY warning renders its own strip (comet maps them).
+                        // EVERY warning renders its own strip (zeron maps them).
                         let warnings: Vec<String> = snapshot
                             .warnings
                             .iter()
@@ -1305,6 +1335,19 @@ impl Render for AccountsPage {
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
                         let card = widgets::section_card(&theme).mt(px(8.0));
+                        let empty_copy = match harness {
+                            // Cursor's app login is SEPARATE from `cursor-agent
+                            // login` — pointing at the CLI would send users to a
+                            // sign-in that does not light this up.
+                            HarnessId::Cursor => format!(
+                                "{name} isn't connected on this device — connect it to run \
+                                 Cursor sessions."
+                            ),
+                            _ => format!(
+                                "No {name} login detected on this device — sign in \
+                                 with \u{201C}{cli}\u{201D} or add an account."
+                            ),
+                        };
                         let card = if rows.is_empty() {
                             card.child(
                                 div()
@@ -1313,10 +1356,7 @@ impl Render for AccountsPage {
                                     .text_center()
                                     .text_size(px(14.0))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(format!(
-                                        "No {name} login detected on this device — sign in \
-                                         with \u{201C}{cli}\u{201D} or add an account."
-                                    ))),
+                                    .child(SharedString::from(empty_copy)),
                             )
                         } else {
                             card.children(rows)
@@ -1383,7 +1423,7 @@ impl Render for AccountsPage {
                             .child(div().flex_1())
                             .child(
                                 // `text-[12.5px]` + leading 16px Refresh icon,
-                                // dimmed while a refresh is in flight (comet
+                                // dimmed while a refresh is in flight (zeron
                                 // `disabled:opacity-50`).
                                 widgets::ghost_action(&theme)
                                     .id("accounts-refresh")
@@ -1405,9 +1445,9 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code and Codex logins on this device. Comet detects the \
-                         live session, keeps each account backed up, and can swap between \
-                         them.",
+                        "The Claude Code, Codex, and Cursor logins on this device. Zeron \
+                         detects the live session, keeps each account backed up, and can \
+                         swap between them.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1421,7 +1461,7 @@ impl Render for AccountsPage {
                         )
                     })
                     .children(sections)
-                    // Footer note (comet: `mt-6 text-[12px] leading-relaxed
+                    // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
                     .child(
                         div()
@@ -1462,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_thresholds_match_comet() {
+    fn usage_thresholds_match_zeron() {
         assert_eq!(usage_level(0.0), UsageLevel::Normal);
         assert_eq!(usage_level(0.79), UsageLevel::Normal);
         assert_eq!(usage_level(0.80), UsageLevel::Warn);
@@ -1493,7 +1533,7 @@ mod tests {
                 soon.with_timezone(&Local).format("%-I:%M %p")
             ))
         );
-        // Beyond: a short weekday ("resets Mon").
+        // Within a week: a short weekday ("resets Mon").
         let later = now + TimeDelta::days(3);
         assert_eq!(
             format_reset(Some(later), now),
@@ -1502,10 +1542,20 @@ mod tests {
                 later.with_timezone(&Local).format("%a")
             ))
         );
+        // Beyond a week (Codex free tier resets ~monthly): month + day
+        // ("resets Sep 14") — a weekday 4 weeks out carries no information.
+        let monthly = now + TimeDelta::days(26);
+        assert_eq!(
+            format_reset(Some(monthly), now),
+            Some(format!(
+                "resets {}",
+                monthly.with_timezone(&Local).format("%b %-d")
+            ))
+        );
     }
 
     #[test]
-    fn provider_grouping_puts_active_first() {
+    fn provider_grouping_keeps_engine_order_even_when_active_is_later() {
         let account = |id: &str, harness: HarnessId, active: bool| AgentAccount {
             id: id.into(),
             harness,
@@ -1513,6 +1563,7 @@ mod tests {
             plan_label: None,
             active,
             usage_windows: vec![],
+            usage_lines: vec![],
             display_name: None,
             organization: None,
             auth_kind: None,
@@ -1529,7 +1580,11 @@ mod tests {
         };
         let claude = provider_accounts(&snapshot, HarnessId::ClaudeCode);
         let ids: Vec<&str> = claude.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["c2", "c1"], "active account leads");
+        assert_eq!(
+            ids,
+            ["c1", "c2"],
+            "engine (creation) order holds — switching must not move a card"
+        );
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
     }

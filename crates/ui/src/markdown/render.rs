@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
+use comet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 use gpui::{
     AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
     StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
@@ -22,13 +23,12 @@ use gpui::{
 
 use crate::theme::Theme;
 
-use super::highlight::{Token, TokenClass};
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
-/// Gap between markdown blocks inside one message (comet mdBlockGap).
+/// Gap between markdown blocks inside one message (zeron mdBlockGap).
 pub const MD_BLOCK_GAP: f32 = 12.0;
-/// Body text size / line height (comet: 14px / 22px).
+/// Body text size / line height (zeron: 14px / 22px).
 pub const MD_TEXT_SIZE: f32 = 14.0;
 pub const MD_LINE_HEIGHT: f32 = 22.0;
 /// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
@@ -37,26 +37,26 @@ pub const CODE_LINE_HEIGHT: f32 = 18.0;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
 
-// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under comet's
+// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under zeron's
 // resolved md theme. The design is frameless ("flat hairline"): 1px horizontal
 // rules under the header and between rows are the only chrome — no outer box,
 // no header fill, no corner radius (theme: headerBackground transparent,
 // radius 0). Cells use the body scale (14/22) with a uniform 12px padding;
 // the header row is weight-700 per `table.headerWeight`.
-/// Uniform cell padding in px (comet `table.cellPadding`).
+/// Uniform cell padding in px (zeron `table.cellPadding`).
 pub const TABLE_CELL_PADDING: f32 = 12.0;
-/// Hairline between rows in px (comet `table.gap`).
+/// Hairline between rows in px (zeron `table.gap`).
 pub const TABLE_DIVIDER: f32 = 1.0;
-/// Header row font weight (comet `table.headerWeight` = 700).
+/// Header row font weight (zeron `table.headerWeight` = 700).
 pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::BOLD;
 /// Floor for a column's max-content share, so a short column ("1k") beside a
 /// prose column keeps a readable width (mugen `MIN_COLUMN_CONTENT`).
 pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
-/// Minimum rendered column width in px, padding included (comet
+/// Minimum rendered column width in px, padding included (zeron
 /// `table.minColumnWidth`). Naturally narrower columns keep their content
 /// width; wider ones wrap down to this floor, then the table scrolls.
 pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
-/// Hairline tone (comet md theme `table.borderColor`: rgba(255,255,255,0.1)).
+/// Hairline tone (zeron md theme `table.borderColor`: rgba(255,255,255,0.1)).
 pub fn table_hairline() -> Hsla {
     crate::theme::hairline(0.10)
 }
@@ -158,7 +158,7 @@ impl RenderCache {
 }
 
 /// Per-line highlight tokens for a code block, or `None` while pending.
-pub type CodeHighlight<'a> = Option<&'a [Vec<Token>]>;
+pub type CodeHighlight<'a> = Option<&'a [Vec<HighlightSpan>]>;
 
 /// Render a whole tree stacked with the md block gap. `highlight` resolves
 /// tokens for a top-level block index (code blocks only).
@@ -167,14 +167,14 @@ pub fn render_tree(
     opts: &RenderOptions,
     theme: &Theme,
     window: &Window,
-    highlight: &dyn Fn(usize) -> Option<std::sync::Arc<Vec<Vec<Token>>>>,
+    highlight: &dyn Fn(usize) -> Option<std::sync::Arc<HighlightedDocument>>,
 ) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
-            let lines = highlight(ix);
+            let document = highlight(ix);
             render_block(
                 &top.block,
                 ix,
@@ -182,7 +182,9 @@ pub fn render_tree(
                 opts,
                 theme,
                 window,
-                lines.as_deref().map(|l| &l[..]),
+                document
+                    .as_deref()
+                    .map(|document| document.lines.as_slice()),
             )
         }))
         .into_any_element()
@@ -226,7 +228,7 @@ pub fn render_block(
         ),
         Block::BlockQuote { children } => div()
             // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
+            // behind it.
             .border_l_2()
             .border_color(theme.accent.opacity(0.6))
             .bg(theme.accent.opacity(0.05))
@@ -314,7 +316,7 @@ pub fn render_block(
     }
 }
 
-/// Tight monochrome heading scale (comet: h2 ≈ 16px semibold; headings step
+/// Tight monochrome heading scale (zeron: h2 ≈ 16px semibold; headings step
 /// down quickly toward body size).
 fn heading_metrics(level: u8) -> (f32, f32) {
     match level {
@@ -359,7 +361,7 @@ fn table_cell_ix(ix: usize, r: usize, c: usize) -> usize {
     ix * 100_000 + r * 100 + c
 }
 
-/// A GFM table — a port of mugen-markdown's `TableBlock` under comet's md
+/// A GFM table — a port of mugen-markdown's `TableBlock` under zeron's md
 /// theme (see the `TABLE_*` constants).
 ///
 /// Column widths resolve exactly the way the source's CSS does: each cell is
@@ -486,31 +488,18 @@ fn render_table(
         .into_any_element()
 }
 
-/// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
-/// + inline-code ranges (their rounded washes are painted by a canvas UNDER
-/// the text — `TextRun::background_color` can only paint square boxes).
+/// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges.
 /// `text` is a `SharedString` so cached reuse across frames is an Arc clone.
 pub struct FlatText {
     pub text: SharedString,
     pub runs: Vec<TextRun>,
     pub links: Vec<(Range<usize>, String)>,
-    pub code_ranges: Vec<Range<usize>>,
 }
 
-/// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
-/// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
-/// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
+/// Inline-code tint: violet text without a separate background surface.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
     theme.code_text // violet-300
 }
-pub fn inline_code_wash(theme: &Theme) -> Hsla {
-    theme.code_wash // violet-400/12
-}
-/// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
-/// x extends 2px past the glyphs, y insets 2px from the 22px line box).
-pub const INLINE_CODE_RADIUS: f32 = 4.5;
-pub const INLINE_CODE_PAD_X: f32 = 2.0;
-pub const INLINE_CODE_INSET_Y: f32 = 2.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
@@ -526,12 +515,11 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
 }
 
 /// [`flatten_runs`] with an explicit base weight (table headers are 700 per
-/// comet's `table.headerWeight`; strong runs never drop below semibold).
+/// zeron's `table.headerWeight`; strong runs never drop below semibold).
 fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) -> FlatText {
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
-    let mut code_ranges: Vec<Range<usize>> = Vec::new();
     for run in runs {
         if run.text.is_empty() {
             continue;
@@ -553,7 +541,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (comet's md
+        // Links stay monochrome — foreground with an underline (zeron's md
         // theme underlines in the text color; indigo is reserved for primary
         // actions).
         let is_link = run.style.link.is_some();
@@ -564,13 +552,6 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             theme.text
         };
-        if run.style.code {
-            // Merge adjacent code runs into one wash box (like links below).
-            match code_ranges.last_mut() {
-                Some(range) if range.end == start => range.end = text.len(),
-                _ => code_ranges.push(start..text.len()),
-            }
-        }
         if let Some(url) = &run.style.link {
             // A still-streaming link (mend.rs sentinel) keeps link styling —
             // so the URL's completion changes nothing visually — but is not
@@ -589,9 +570,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             len: run.text.len(),
             font: f,
             color,
-            // Inline code's wash is painted as ROUNDED quads by the canvas
-            // underlay (`code_wash_underlay`) — a run background here could
-            // only be a square box.
+            // Inline code is distinguished by font and text color only.
             background_color: None,
             underline: is_link.then_some(UnderlineStyle {
                 color: Some(theme.text_muted),
@@ -608,7 +587,6 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         text: text.into(),
         runs: out,
         links,
-        code_ranges,
     }
 }
 
@@ -669,31 +647,16 @@ fn flat_text_element(
             })
             .into_any_element()
     };
-    // Underlay canvas: inline-code washes + the selection wash, painted
-    // BEFORE the text (earlier sibling ⇒ underneath), reading glyph geometry
-    // from the text's own layout handle. Pure paint — never in layout. The
-    // same paint pass re-registers the frame-scoped window mouse listeners
+    // Underlay canvas: selection wash painted BEFORE the text (earlier sibling
+    // ⇒ underneath), reading glyph geometry from the text's own layout handle.
+    // The same paint pass re-registers the frame-scoped window mouse listeners
     // that drive text selection (round 18; see markdown/selection.rs).
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
-    let code_ranges = flat.code_ranges.clone();
     let flat_text = flat.text.clone();
-    let wash = inline_code_wash(theme);
     let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
-            for range in &code_ranges {
-                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
-                    window.paint_quad(quad(
-                        rect,
-                        px(INLINE_CODE_RADIUS),
-                        wash,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
-                    ));
-                }
-            }
             if let Some(range) = super::selection::wash_range(&sel_key) {
                 for rect in range_rects(&layout, &range, 0.0, 0.0) {
                     window.paint_quad(quad(
@@ -731,6 +694,40 @@ fn flat_text_element(
 /// Selection tint: the accent hue under the glyphs, dark-panel strength.
 fn selection_wash(theme: &Theme) -> Hsla {
     theme.accent.opacity(0.35) // indigo-400
+}
+
+/// Selection support for a plain (non-markdown) text element — the user
+/// bubble. Paints the selection wash under the glyphs, registers the element
+/// into the frame's document-ordered registry (so drags span into adjacent
+/// markdown rows and Cmd+C joins in order), and re-registers the mouse
+/// listeners. Call from a paint-phase canvas that sits UNDER the text.
+pub(crate) fn paint_text_selection(
+    window: &mut Window,
+    key: &std::sync::Arc<str>,
+    text: &SharedString,
+    layout: &gpui::TextLayout,
+    theme: &Theme,
+) {
+    if let Some(range) = super::selection::wash_range(key) {
+        for rect in range_rects(layout, &range, 0.0, 0.0) {
+            window.paint_quad(quad(
+                rect,
+                px(0.0),
+                selection_wash(theme),
+                px(0.0),
+                gpui::transparent_black(),
+                BorderStyle::default(),
+            ));
+        }
+    }
+    REGISTRY.with(|r| {
+        r.borrow_mut().push(RegEntry {
+            key: key.clone(),
+            text: text.clone(),
+            layout: layout.clone(),
+        })
+    });
+    register_selection_listeners(window, key, text, layout);
 }
 
 /// One painted text element, registered per frame in document order — the
@@ -790,21 +787,28 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
     })
 }
 
-/// Resolve the anchor + head into document-ordered spans over the frame's
-/// registry and store them; true if the selection changed.
-fn resolve_drag(anchor_key: &str, anchor_ix: usize, head: (usize, usize)) -> bool {
+/// Resolve the drag head into document-ordered spans over the frame's registry
+/// and store them; true if the selection changed. The selection model retains
+/// spans across overlapping virtualized frames once its anchor scrolls away.
+fn resolve_drag(head: (usize, usize)) -> bool {
     REGISTRY.with(|r| {
         let reg = r.borrow();
-        let Some(anchor_ei) = reg.iter().position(|e| e.key.as_ref() == anchor_key) else {
-            return false; // anchor scrolled out of the frame — keep spans
-        };
         let elements: Vec<(&str, &str)> = reg
             .iter()
             .map(|e| (e.key.as_ref(), e.text.as_ref()))
             .collect();
-        let spans = super::selection::resolve_spans(&elements, (anchor_ei, anchor_ix), head);
-        super::selection::update_spans(spans)
+        super::selection::update_drag(&elements, head)
     })
+}
+
+/// Continue the active drag at a window position. The transcript's edge-scroll
+/// driver calls this between scroll steps, so a stationary pointer keeps
+/// extending through newly painted rows.
+pub(crate) fn update_drag_at(position: gpui::Point<gpui::Pixels>) -> bool {
+    let Some(head) = registry_point(position) else {
+        return false;
+    };
+    resolve_drag(head)
 }
 
 /// Register this frame's window-level mouse listeners for one text element's
@@ -850,13 +854,10 @@ fn register_selection_listeners(
                 return;
             }
             // Only the anchor element's listener drives the drag.
-            let Some(anchor_ix) = super::selection::drag_anchor(&key) else {
+            if super::selection::drag_anchor(&key).is_none() {
                 return;
-            };
-            let Some(head) = registry_point(e.position) else {
-                return;
-            };
-            if resolve_drag(&key, anchor_ix, head) {
+            }
+            if update_drag_at(e.position) {
                 window.refresh();
             }
         });
@@ -887,21 +888,48 @@ pub(crate) fn range_rects(
     pad_x: f32,
     inset_y: f32,
 ) -> Vec<Bounds<gpui::Pixels>> {
+    range_rects_with_positions(
+        layout.bounds(),
+        layout.line_height(),
+        range,
+        pad_x,
+        inset_y,
+        |ix| layout.position_for_index(ix),
+    )
+}
+
+fn range_rects_with_positions(
+    bounds: Bounds<gpui::Pixels>,
+    line_height: gpui::Pixels,
+    range: &Range<usize>,
+    pad_x: f32,
+    inset_y: f32,
+    position_for_index: impl Fn(usize) -> Option<gpui::Point<gpui::Pixels>>,
+) -> Vec<Bounds<gpui::Pixels>> {
     let mut rects = Vec::new();
-    let line_height = layout.line_height();
     let mut cur = range.start;
     // Walk the range one visual row at a time: find the furthest index that
     // still sits on the current row (binary search over glyph positions).
     let mut guard = 0;
     while cur < range.end && guard < 256 {
         guard += 1;
-        let Some(p1) = layout.position_for_index(cur) else {
+        let Some(mut p1) = position_for_index(cur) else {
             break;
         };
+        // GPUI gives a soft-wrap boundary upstream affinity: the boundary
+        // index is reported at the end of the preceding visual row. When the
+        // following byte advances to a lower row, `cur` is also the start of
+        // that row; use its downstream position for the range start.
+        if let Some(after) = position_for_index(cur.saturating_add(1))
+            && after.y > p1.y
+        {
+            p1 = point(bounds.left(), after.y);
+        }
         // `seg_end` closes the wash on this row; `next` is the first index on
-        // the following row (strict progress even though a row-end index's
-        // position still reports the earlier row).
-        let (seg_end, next) = match layout.position_for_index(range.end) {
+        // the following row. A soft-wrap boundary belongs to both rows, so it
+        // closes this rectangle with upstream affinity and starts the next
+        // rectangle with the downstream correction above.
+        let (seg_end, next) = match position_for_index(range.end) {
             Some(pe) if pe.y == p1.y => (range.end, range.end),
             _ => {
                 // Largest ix on this row (probes stay on char boundaries only
@@ -909,15 +937,15 @@ pub(crate) fn range_rects(
                 let (mut lo, mut hi) = (cur, range.end);
                 while hi - lo > 1 {
                     let mid = lo + (hi - lo) / 2;
-                    match layout.position_for_index(mid) {
+                    match position_for_index(mid) {
                         Some(pm) if pm.y == p1.y => lo = mid,
                         _ => hi = mid,
                     }
                 }
-                (lo, hi)
+                (lo, lo)
             }
         };
-        if let Some(p2) = layout.position_for_index(seg_end)
+        if let Some(p2) = position_for_index(seg_end)
             && p2.x > p1.x
         {
             rects.push(Bounds::new(
@@ -980,13 +1008,13 @@ fn render_code_block(
             .split('\n')
             .enumerate()
             .map(|(li, line)| {
-                let tokens = highlight
+                let spans = highlight
                     .and_then(|h| h.get(li))
                     .map(|t| &t[..])
                     .unwrap_or(&[]);
                 (
                     SharedString::from(line.to_string()),
-                    runs_for_code_line(line, tokens, &mono, theme),
+                    runs_for_syntax_line(line, spans, &mono, theme),
                 )
             })
             .collect();
@@ -1065,7 +1093,7 @@ fn render_code_block(
     });
     div()
         .rounded(px(10.0))
-        // Faint white wash over the near-black panel ≈ #101010 (comet's code
+        // Faint white wash over the near-black panel ≈ #101010 (zeron's code
         // surface), with the hairline border.
         .bg(crate::theme::ink(0.035))
         .border_1()
@@ -1120,36 +1148,28 @@ fn render_code_block(
 /// Paint color for a token class — the soft syntax palette (round 9: the
 /// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
 /// asked for color; these are the diff pane's hues, now shared by both).
-pub fn token_color(class: TokenClass, theme: &Theme) -> Hsla {
-    match class {
-        TokenClass::Keyword => theme.syntax_keyword, // soft rose
-        TokenClass::StringLit => theme.syntax_string, // soft green
-        TokenClass::Number => theme.syntax_number,   // soft amber
-        TokenClass::Comment => theme.text_faint,
-    }
+pub fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
+    theme.syntax.color(kind)
 }
 
 /// Build the exact-cover `TextRun` list for one code line from its tokens.
 /// Same font everywhere — recoloring can never change layout.
-pub fn runs_for_code_line(
+/// Build paint-only runs from the neutral Tree-sitter contract.
+pub fn runs_for_syntax_line(
     line: &str,
-    tokens: &[Token],
+    spans: &[HighlightSpan],
     mono: &gpui::Font,
     theme: &Theme,
 ) -> Vec<TextRun> {
-    runs_with_palette(line, tokens, mono, theme.text, |class| {
-        token_color(class, theme)
-    })
+    runs_for_syntax_line_with_plain(line, spans, mono, theme.text, theme)
 }
 
-/// [`runs_for_code_line`] with a caller-supplied palette (the diff pane keys
-/// its plain color differently; the hues are shared via [`token_color`]).
-pub fn runs_with_palette(
+pub fn runs_for_syntax_line_with_plain(
     line: &str,
-    tokens: &[Token],
+    spans: &[HighlightSpan],
     mono: &gpui::Font,
     plain_color: Hsla,
-    color_for: impl Fn(TokenClass) -> Hsla,
+    theme: &Theme,
 ) -> Vec<TextRun> {
     let plain = |len: usize| TextRun {
         len,
@@ -1161,35 +1181,81 @@ pub fn runs_with_palette(
     };
     let mut runs = Vec::new();
     let mut at = 0usize;
-    for token in tokens {
-        if token.range.start > at {
-            runs.push(plain(token.range.start - at));
+    for span in spans {
+        if span.range.start > at {
+            runs.push(plain(span.range.start - at));
         }
-        let mut run = plain(token.range.len());
-        run.color = color_for(token.class);
+        let mut run = plain(span.range.len());
+        run.color = token_color(span.kind, theme);
         runs.push(run);
-        at = token.range.end;
+        at = span.range.end;
     }
     if at < line.len() {
         runs.push(plain(line.len() - at));
     }
-    runs.retain(|r| r.len > 0);
+    runs.retain(|run| run.len > 0);
     runs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::highlight::{Lang, tokenize_line};
     use crate::markdown::parser::InlineStyle;
+
+    /// Model GPUI's upstream affinity at a soft-wrap boundary: byte 5 is
+    /// reported at the end of row 0, while byte 6 is after the first glyph on
+    /// row 1.
+    fn wrapped_position(ix: usize) -> Option<gpui::Point<gpui::Pixels>> {
+        (ix <= 9).then(|| {
+            if ix <= 5 {
+                point(px(ix as f32 * 10.0), px(0.0))
+            } else {
+                point(px((ix - 5) as f32 * 10.0), px(22.0))
+            }
+        })
+    }
+
+    fn wrapped_range_rects(range: Range<usize>) -> Vec<Bounds<gpui::Pixels>> {
+        range_rects_with_positions(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(50.0), px(44.0))),
+            px(22.0),
+            &range,
+            0.0,
+            0.0,
+            wrapped_position,
+        )
+    }
+
+    #[test]
+    fn range_starting_at_soft_wrap_includes_first_glyph() {
+        let rects = wrapped_range_rects(5..9);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].origin, point(px(0.0), px(22.0)));
+        assert_eq!(rects[0].size, size(px(40.0), px(22.0)));
+    }
+
+    #[test]
+    fn range_crossing_soft_wrap_includes_first_continuation_glyph() {
+        let rects = wrapped_range_rects(2..9);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].origin, point(px(20.0), px(0.0)));
+        assert_eq!(rects[0].size, size(px(30.0), px(22.0)));
+        assert_eq!(rects[1].origin, point(px(0.0), px(22.0)));
+        assert_eq!(rects[1].size, size(px(40.0), px(22.0)));
+    }
 
     #[test]
     fn code_line_runs_cover_exactly() {
         let theme = Theme::dark();
         let mono = font(theme.font_mono.clone());
         let line = r#"let x = "hi"; // done"#;
-        let (tokens, _) = tokenize_line(Lang::Rust, line, Default::default());
-        let runs = runs_for_code_line(line, &tokens, &mono, &theme);
+        let document = comet_syntax::highlight(comet_syntax::HighlightRequest {
+            source: line,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let runs = runs_for_syntax_line(line, &document.lines[0], &mono, &theme);
         let total: usize = runs.iter().map(|r| r.len).sum();
         assert_eq!(total, line.len());
         assert!(
@@ -1201,16 +1267,36 @@ mod tests {
     }
 
     #[test]
+    fn tree_sitter_runs_are_rich_and_paint_only() {
+        let theme = Theme::dark();
+        let mono = font(theme.font_mono.clone());
+        let line = "let widget = build!(42);";
+        let document = comet_syntax::highlight(comet_syntax::HighlightRequest {
+            source: line,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let runs = runs_for_syntax_line(line, &document.lines[0], &mono, &theme);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), line.len());
+        assert!(runs.iter().all(|run| run.font == mono));
+        let colors = runs.iter().map(|run| run.color).collect::<Vec<_>>();
+        assert!(colors.contains(&theme.syntax.keyword));
+        assert!(colors.contains(&theme.syntax.macro_name));
+        assert!(colors.contains(&theme.syntax.number));
+    }
+
+    #[test]
     fn code_line_runs_with_no_tokens_are_one_plain_run() {
         let theme = Theme::dark();
         let mono = font(theme.font_mono.clone());
-        let runs = runs_for_code_line("plain text", &[], &mono, &theme);
+        let runs = runs_for_syntax_line("plain text", &[], &mono, &theme);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, 10);
     }
 
     #[test]
-    fn flatten_collects_and_merges_inline_code_ranges() {
+    fn flatten_styles_inline_code_as_violet_text_without_background() {
         let theme = Theme::dark();
         let code = |text: &str| InlineRun {
             text: text.into(),
@@ -1234,10 +1320,7 @@ mod tests {
             &theme,
             false,
         );
-        // Adjacent code runs merge into ONE wash box; separated ones don't.
-        assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
-        // Code text is the violet tint; the square run background is gone
-        // (the rounded wash is painted by the canvas underlay instead).
+        // Code text keeps the violet tint without any run background.
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.text);
@@ -1248,12 +1331,12 @@ mod tests {
         // Round 9: transcript code blocks paint the soft hues (rose keyword,
         // green string, amber number); comments stay faint neutral.
         let theme = Theme::dark();
-        assert_ne!(token_color(TokenClass::Keyword, &theme), theme.text);
+        assert_ne!(token_color(HighlightKind::Keyword, &theme), theme.text);
         assert_ne!(
-            token_color(TokenClass::StringLit, &theme),
-            token_color(TokenClass::Keyword, &theme)
+            token_color(HighlightKind::String, &theme),
+            token_color(HighlightKind::Keyword, &theme)
         );
-        assert_eq!(token_color(TokenClass::Comment, &theme), theme.text_faint);
+        assert_ne!(token_color(HighlightKind::Comment, &theme), theme.text);
     }
 
     #[test]

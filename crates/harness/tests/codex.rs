@@ -8,10 +8,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use comet_harness::{
+use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
-use comet_proto::{
+use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
     ToolCall, UserInputAnswer, UserInputQuestion,
 };
@@ -36,13 +36,17 @@ fn harness() -> CodexHarness {
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: Some("gpt-5.6-sol".into()),
         reasoning: Some(ReasoningLevel::Ultra),
         model_options: serde_json::Map::new(),
         cwd: String::new(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }
@@ -68,7 +72,7 @@ fn controls(
         }),
         steering: steer_rx,
         interrupt: token.clone(),
-        chat_id: "chat-test".into(),
+        chat_id: String::new(),
     };
     (controls, steer_tx, token)
 }
@@ -146,7 +150,13 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "c1".into(),
-        is_error: true
+        is_error: true,
+        output: None,
+        diff: None,
+        execution: Some(zeron_proto::ToolExecutionMeta {
+            exit_code: Some(1),
+            duration_ms: None,
+        }),
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -166,7 +176,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "f1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
+        diff: None,
+        execution: None,
     }));
 
     // mcpToolCall with failed status.
@@ -180,7 +193,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "mcp1".into(),
-        is_error: true
+        is_error: true,
+        output: None,
+        diff: None,
+        execution: None,
     }));
 
     // webSearch lifecycle.
@@ -192,7 +208,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "w1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
+        diff: None,
+        execution: None,
     }));
 
     // Completion-only todoList still opens and closes the lifecycle.
@@ -213,7 +232,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "td1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
+        diff: None,
+        execution: None,
     }));
 
     // Streamed agentMessage must not re-emit its completed text…
@@ -243,7 +265,11 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
                 e,
                 AgentEvent::Usage {
                     input_tokens: 42,
-                    output_tokens: 7
+                    output_tokens: 7,
+                    context_usage: Some(zeron_proto::ContextUsage {
+                        tokens: 49,
+                        context_window: 258_400,
+                    }),
                 }
             )
         })
@@ -378,7 +404,7 @@ async fn approvals_round_trip_as_input_requests() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
-        chat_id: "chat-test".into(),
+        chat_id: String::new(),
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;
@@ -589,4 +615,216 @@ async fn models_returns_curated_catalog() {
     // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
+}
+
+#[tokio::test]
+async fn child_thread_routing_tags_and_never_settles_parent() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:subagent"), controls).await;
+
+    // Exactly one Done — the child's turn/completed must NOT settle the
+    // parent turn (the swallowed-catch-all bug class this table exists for).
+    let dones: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e, AgentEvent::Done { .. }).then_some(i))
+        .collect();
+    assert_eq!(dones.len(), 1, "one parent Done only: {events:?}");
+
+    // Parent output that follows the child's turn/completed still streams.
+    let late_parent = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "parent still going"))
+        .expect("parent delta after child turn end");
+    assert!(late_parent < dones[0]);
+
+    // The spawn chip lives on the parent feed, named from the agent path,
+    // and resolves when the activity completes.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+            if id == "call_alpha" && name == "Agent: alpha"
+    )));
+    assert!(events.iter().any(
+        |e| matches!(e, AgentEvent::ToolResult { id, is_error: false, .. } if id == "call_alpha")
+    ));
+    // The root's own subAgentActivity produces no chip.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "call_root")),
+        "root self-activity must not register or render: {events:?}"
+    );
+
+    // Child deltas and items arrive tagged with the spawn call id — never
+    // bare (child threads stream deltas on this wire; live-verified 0.146.1).
+    assert!(events.contains(&AgentEvent::Subagent {
+        parent_tool_use_id: "call_alpha".into(),
+        event: Box::new(AgentEvent::TextDelta {
+            text: "child says hi".into()
+        }),
+    }));
+    assert!(events.contains(&AgentEvent::Subagent {
+        parent_tool_use_id: "call_alpha".into(),
+        event: Box::new(AgentEvent::ToolCall {
+            id: "cs1".into(),
+            call: ToolCall::Exec {
+                command: "echo hi".into()
+            },
+        }),
+    }));
+    assert!(events.contains(&AgentEvent::Subagent {
+        parent_tool_use_id: "call_alpha".into(),
+        event: Box::new(AgentEvent::ToolResult {
+            id: "cs1".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+            execution: Some(zeron_proto::ToolExecutionMeta {
+                exit_code: Some(0),
+                duration_ms: None,
+            }),
+        }),
+    }));
+    // The parent's steer (a userMessage item on the CHILD thread) arrives as
+    // exactly one tagged UserMessage — completed only, never doubled by the
+    // started lifecycle event, never leaked untagged.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "call_alpha"
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "also check the rebuild")
+            ))
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage { .. })),
+        "steer leaked into the parent feed: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "cs1")),
+        "child tool call leaked into the parent feed: {events:?}"
+    );
+
+    // The child's turn/completed (and later thread/closed) become tagged
+    // terminal events — real fan-outs never call close_agent, so the turn
+    // end is what flips the chip off "running".
+    assert!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "call_alpha"
+                        && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+            ))
+            .count()
+            >= 1,
+        "{events:?}"
+    );
+    // The tagged terminal must arrive from turn/completed — BEFORE the
+    // parent delta that follows it in the script (not only at thread/closed).
+    let child_done = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "call_alpha"
+                        && matches!(event.as_ref(), AgentEvent::Done { .. })
+            )
+        })
+        .expect("tagged done");
+    let late_parent_delta = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "parent still going"))
+        .expect("parent delta");
+    assert!(child_done < late_parent_delta, "{events:?}");
+}
+
+/// Live smoke against the REAL codex app-server (0.146.x, installed + authed):
+/// one trivial turn, ending on turn/completed.
+/// `cargo test -p zeron-harness --test codex -- --ignored`.
+#[tokio::test]
+#[ignore = "spawns the real codex app-server; needs install + auth + network"]
+async fn live_real_app_server_single_turn() {
+    let harness = CodexHarness::new();
+    let mut req = request("Reply with exactly the word: pong");
+    req.cwd = std::env::temp_dir().display().to_string();
+    let (controls, _steer, _token) = controls("Yes");
+    let mut stream = harness.run(req, controls).await.expect("run starts");
+    // The session parks after the turn (steering mailbox open) — collect up
+    // to the first Done, not stream end.
+    let events = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let done = matches!(ev, AgentEvent::Done { .. });
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .expect("live turn finished in time");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Slash-command discovery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn commands_come_from_skills_list() {
+    let h = harness();
+    let commands = h.commands().await.expect("discovery succeeds");
+    assert_eq!(
+        commands.len(),
+        2,
+        "same-name skills across cwd groups dedupe: {commands:?}"
+    );
+    assert_eq!(commands[0].name, "imagegen");
+    assert_eq!(
+        commands[0].description, "Generate or edit images",
+        "interface.shortDescription wins over the model-facing paragraph"
+    );
+    assert_eq!(commands[1].name, "bare");
+    assert_eq!(
+        commands[1].description, "No interface block",
+        "top-level description is the fallback"
+    );
+    assert_eq!(h.commands().await.expect("cache hit"), commands);
+}
+
+/// Live smoke against the real CLI: `cargo test -p zeron-harness --test
+/// codex -- --ignored live_commands`.
+#[tokio::test]
+#[ignore]
+async fn live_commands_discovery() {
+    let h = CodexHarness::new();
+    let commands = h.commands().await.expect("live discovery");
+    eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }

@@ -1,7 +1,7 @@
 //! Shared scaffolding for the settings pages — the original's page rhythm
 //! (`mx-auto max-w-3xl px-6 pb-16 pt-8`), section cards, row layout, badges
 //! and small buttons, so every page reads as the same product surface
-//! (comet settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
+//! (zeron settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
@@ -21,7 +21,7 @@ pub fn page_column() -> gpui::Div {
 }
 
 /// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (comet settings.devices.tsx).
+/// title + `text-[13px]` count sharing a baseline (zeron settings.devices.tsx).
 pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
@@ -153,14 +153,15 @@ pub fn option_card(
 }
 
 /// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
-/// — the opaque raised-card tone (comet `--card`), not a translucent wash.
+/// — the card tone, thinned to a translucent tint over glass so the card
+/// reads as frost instead of a solid slab ([`Theme::card_glass_bg`]).
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(24.0))
         .rounded(px(12.0))
         .border_1()
         .border_color(theme.border)
-        .bg(theme.surface)
+        .bg(theme.card_glass_bg())
         .overflow_hidden()
         .flex()
         .flex_col()
@@ -267,6 +268,28 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
         .text_size(px(10.5))
         .text_color(emerald_text.opacity(0.9))
         .child(label.into())
+}
+
+/// Display-only toggle switch (zeron branch-picker.tsx `Toggle`): an 18×32
+/// pill whose knob slides right and track flips white when on. State is owned
+/// by the parent row — the caller adds `.id(..)` and `.on_click(..)`.
+pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(32.0))
+        .h(px(18.0))
+        .rounded_full()
+        .bg(if on { theme.text } else { ink(0.15) })
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .left(px(if on { 16.0 } else { 2.0 }))
+                .size(px(14.0))
+                .rounded_full()
+                .bg(if on { theme.on_solid } else { ink(0.7) }),
+        )
 }
 
 /// A small quiet ghost action (`rounded-lg px-2.5 py-1.5 text-[12px]

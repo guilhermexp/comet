@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
+use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -139,7 +139,7 @@ pub fn sort_chats(chats: &mut [Chat]) {
 // Boot gate
 // ---------------------------------------------------------------------------
 
-/// The app gate (comet's App.tsx phases). Pure.
+/// The app gate (zeron's App.tsx phases). Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
     /// Booting / probing — splash covers this.
@@ -154,17 +154,94 @@ pub enum GatePhase {
     Ready,
 }
 
-/// `auth = None` means "engine doesn't report auth yet" (dev mode) and gates
-/// nothing.
-pub fn gate_phase(connection: &ConnectionStatus, auth: Option<&AuthState>) -> GatePhase {
+/// Missing scope is treated as synced. Current engines always publish
+/// [`WorkspaceScope`] before becoming ready, while old daemons are deliberately
+/// kept behind the account gate instead of being mistaken for local runtimes.
+pub fn gate_phase(
+    connection: &ConnectionStatus,
+    workspace_scope: Option<WorkspaceScope>,
+    auth: Option<&AuthState>,
+) -> GatePhase {
     match connection {
         ConnectionStatus::Connecting => GatePhase::Loading,
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
-        ConnectionStatus::Ready => match auth {
-            Some(AuthState::SignedOut) => GatePhase::SignIn,
-            Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
-            _ => GatePhase::Ready,
+        ConnectionStatus::Ready => match workspace_scope.unwrap_or(WorkspaceScope::Synced) {
+            WorkspaceScope::Local | WorkspaceScope::Development => GatePhase::Ready,
+            WorkspaceScope::Synced => match auth {
+                Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
+                Some(AuthState::SignedIn { .. }) => GatePhase::Ready,
+                Some(AuthState::SignedOut) | None => GatePhase::SignIn,
+            },
         },
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::UserProfile;
+
+    fn user() -> UserProfile {
+        UserProfile {
+            id: "user-1".into(),
+            email: "user@example.com".into(),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn workspace_scope_controls_the_auth_gate() {
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::Ready
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::SignIn
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::NeedsOrganization { user: user() }),
+            ),
+            GatePhase::OrgGate
+        );
+    }
+
+    #[test]
+    fn development_and_local_never_use_the_workos_gate() {
+        for scope in [WorkspaceScope::Local, WorkspaceScope::Development] {
+            for auth in [
+                AuthState::SignedOut,
+                AuthState::NeedsOrganization { user: user() },
+                AuthState::SignedIn {
+                    user: user(),
+                    org_id: Some("org-1".into()),
+                },
+            ] {
+                assert_eq!(
+                    gate_phase(&ConnectionStatus::Ready, Some(scope), Some(&auth)),
+                    GatePhase::Ready
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_scope_falls_back_to_a_synced_gate() {
+        assert_eq!(
+            gate_phase(&ConnectionStatus::Ready, None, None),
+            GatePhase::SignIn
+        );
     }
 }
 
@@ -240,7 +317,7 @@ pub fn group_chats<'a>(chats: impl IntoIterator<Item = &'a Chat>) -> Vec<ChatGro
 }
 
 /// Compact relative time ("now", "5m", "3h", "2d", "1w", …) — no "ago" suffix;
-/// port of comet's `formatTimeAgo`.
+/// port of zeron's `formatTimeAgo`.
 pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let s = now.signed_duration_since(then).num_seconds().max(0);
     // Under a minute reads as "now" — otherwise 45–59s floors to a bare "0m".
@@ -270,7 +347,7 @@ pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{}y", d / 365)
 }
 
-/// Session-row sub-line, "project · branch" (comet `chatLocation`): the repo
+/// Session-row sub-line, "project · branch" (zeron `chatLocation`): the repo
 /// checkout identity. Either part may be missing; empty when both are.
 pub fn chat_location(chat: &Chat) -> Option<String> {
     let project = chat
@@ -315,7 +392,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Per-kind chip label + one-line detail. Labels match comet's `describeTool`
+/// Per-kind chip label + one-line detail. Labels match zeron's `describeTool`
 /// (tool-chip.tsx) exactly, so the two viewports name a tool identically.
 pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     let (label, detail) = tool_chip_content_raw(call);
@@ -347,7 +424,94 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             ("Todo", format!("{done}/{} done", items.len()))
         }
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
-        ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
+        // Subagent spawns decode as Unknown named "Agent[: <description>]"
+        // (every native driver's convention): label them "Agent" with the
+        // description as the detail — "Tool · Agent: scan repo" read as two
+        // labels fighting.
+        ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
+            Some(description) => ("Agent", description.to_owned()),
+            None if name == "Agent" => ("Agent", String::new()),
+            None => ("Tool", name.clone()),
+        },
+    }
+}
+
+/// Runtime-neutral lifecycle state for one transcript tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Pending,
+    Success,
+    Failed,
+}
+
+/// Presentation copy and detail for one tool at a specific lifecycle point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPresentation {
+    pub label: &'static str,
+    pub detail: String,
+    pub outcome: ToolOutcome,
+    /// Commands get an explicit Success/Failed trail; quieter tool rows rely on
+    /// their completed verb and error tint instead.
+    pub show_outcome_label: bool,
+}
+
+/// Derive live/completed copy from the shared tool lifecycle. Harnesses report
+/// only shape + resolution; every viewport should narrate that state the same
+/// way instead of adding provider-specific labels.
+pub fn tool_presentation(
+    call: &crate::ToolCall,
+    resolved: bool,
+    is_error: bool,
+) -> ToolPresentation {
+    use crate::ToolCall;
+    let label = match (call, resolved) {
+        (ToolCall::Exec { .. }, false) => "Running command",
+        (ToolCall::Exec { .. }, true) => "Ran command",
+        (ToolCall::ReadFile { .. }, false) => "Reading",
+        (ToolCall::ReadFile { .. }, true) => "Read",
+        (ToolCall::WriteFile { .. }, false) => "Creating",
+        (ToolCall::WriteFile { .. }, true) => "Created",
+        (ToolCall::EditFile { .. }, false) => "Editing",
+        (ToolCall::EditFile { .. }, true) => "Edited",
+        (ToolCall::ApplyPatch { .. }, false) => "Applying patch",
+        (ToolCall::ApplyPatch { .. }, true) => "Applied patch",
+        (ToolCall::Search { .. }, false) => "Searching",
+        (ToolCall::Search { .. }, true) => "Searched",
+        (ToolCall::Glob { .. }, false) => "Exploring files",
+        (ToolCall::Glob { .. }, true) => "Explored files",
+        (ToolCall::WebFetch { .. }, false) => "Fetching",
+        (ToolCall::WebFetch { .. }, true) => "Fetched",
+        (ToolCall::WebSearch { .. }, false) => "Searching web",
+        (ToolCall::WebSearch { .. }, true) => "Searched web",
+        (ToolCall::Todo { .. }, false) => "Updating todos",
+        (ToolCall::Todo { .. }, true) => "Updated todos",
+        (ToolCall::Mcp { .. }, false) => "Calling tool",
+        (ToolCall::Mcp { .. }, true) => "Called tool",
+        (ToolCall::Unknown { name, .. }, false)
+            if name == "Agent" || name.starts_with("Agent: ") =>
+        {
+            "Running agent"
+        }
+        (ToolCall::Unknown { name, .. }, true)
+            if name == "Agent" || name.starts_with("Agent: ") =>
+        {
+            "Agent completed"
+        }
+        (ToolCall::Unknown { .. }, false) => "Running tool",
+        (ToolCall::Unknown { .. }, true) => "Ran tool",
+    };
+    let (_, detail) = tool_chip_content_raw(call);
+    ToolPresentation {
+        label,
+        detail: single_line(&detail),
+        outcome: if !resolved {
+            ToolOutcome::Pending
+        } else if is_error {
+            ToolOutcome::Failed
+        } else {
+            ToolOutcome::Success
+        },
+        show_outcome_label: resolved && matches!(call, ToolCall::Exec { .. }),
     }
 }
 
@@ -420,7 +584,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         segments.push(format!("{failed} failed"));
     }
     let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (comet's style).
+    // Capitalize the first segment only (zeron's style).
     if let Some(first) = summary.get(0..1) {
         let upper = first.to_uppercase();
         summary.replace_range(0..1, &upper);
@@ -428,11 +592,76 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     summary
 }
 
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+    use crate::ToolCall;
+
+    #[test]
+    fn exec_presentation_tracks_running_success_and_failure() {
+        let call = ToolCall::Exec {
+            command: "cargo test".into(),
+        };
+        let running = tool_presentation(&call, false, false);
+        assert_eq!(running.label, "Running command");
+        assert_eq!(running.detail, "cargo test");
+        assert_eq!(running.outcome, ToolOutcome::Pending);
+        assert!(!running.show_outcome_label);
+
+        let success = tool_presentation(&call, true, false);
+        assert_eq!(success.label, "Ran command");
+        assert_eq!(success.outcome, ToolOutcome::Success);
+        assert!(success.show_outcome_label);
+
+        let failed = tool_presentation(&call, true, true);
+        assert_eq!(failed.label, "Ran command");
+        assert_eq!(failed.outcome, ToolOutcome::Failed);
+        assert!(failed.show_outcome_label);
+    }
+
+    #[test]
+    fn non_exec_tools_use_active_and_completed_verbs_without_outcome_badges() {
+        let cases = [
+            (
+                ToolCall::ReadFile {
+                    path: "src/lib.rs".into(),
+                },
+                "Reading",
+                "Read",
+            ),
+            (
+                ToolCall::EditFile {
+                    path: "src/lib.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+                "Editing",
+                "Edited",
+            ),
+            (
+                ToolCall::Search {
+                    pattern: "needle".into(),
+                    path: None,
+                },
+                "Searching",
+                "Searched",
+            ),
+        ];
+        for (call, active, completed) in cases {
+            assert_eq!(tool_presentation(&call, false, false).label, active);
+            let settled = tool_presentation(&call, true, false);
+            assert_eq!(settled.label, completed);
+            assert_eq!(settled.outcome, ToolOutcome::Success);
+            assert!(!settled.show_outcome_label);
+        }
+    }
+}
+
 /// The status-dot palette, as oklch triples (L, C, H°).
 ///
 /// Colors live here rather than in the viewport because the *meaning* of a
 /// dot is part of the protocol, not the presentation — a given status must
-/// read the same on every surface. `comet-ui` has the oklch→sRGB math.
+/// read the same on every surface. `zeron-ui` has the oklch→sRGB math.
 pub mod dot {
     /// Running. Pink, not amber: the harsh yellow read as a warning, and running
     /// is routine (user request).
@@ -473,7 +702,7 @@ pub enum CheckoutPlan {
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (the engine mints a `comet/<name>`
+    /// `CreateWorktree` off `base` on send (the engine mints a `zeron/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the space
     /// folder rather than failing.
     NewWorktree { base: Option<String> },

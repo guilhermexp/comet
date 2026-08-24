@@ -33,6 +33,36 @@ pub(crate) struct SystemFrame {
     pub cwd: String,
     #[serde(default)]
     pub session_id: String,
+    /// `task_notification` (a background subagent settling): the spawning
+    /// Agent tool's id — the only TAGGED terminal signal the 2.1.x wire has
+    /// for a background subagent (its frames otherwise just stop).
+    #[serde(default, alias = "toolUseId")]
+    pub tool_use_id: Option<String>,
+    /// `task_notification` terminal status (`completed`/`failed`/`killed`…).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// `task_started`: the agent/task id (`SendMessage`'s `to:` address) —
+    /// with `tool_use_id`, the agentId→spawn mapping steers need.
+    #[serde(default, alias = "taskId")]
+    pub task_id: Option<String>,
+    /// `task_started`: present only for AGENT tasks (a subagent spawning),
+    /// absent on subagent-owned background shell tasks.
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub workflow_name: Option<String>,
+    #[serde(default)]
+    pub usage: Option<Value>,
+    #[serde(default)]
+    pub workflow_progress: Option<Value>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub patch: Option<Value>,
+    #[serde(default)]
+    pub summary: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -48,6 +78,10 @@ pub(crate) struct StreamEventBody {
     #[serde(rename = "type", default)]
     pub kind: String,
     #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub content_block: Option<ContentBlock>,
+    #[serde(default)]
     pub delta: Delta,
 }
 
@@ -59,6 +93,8 @@ pub(crate) struct Delta {
     pub text: String,
     #[serde(default)]
     pub thinking: String,
+    #[serde(default)]
+    pub partial_json: String,
 }
 
 /// An `assistant` or `user` frame (an Anthropic API message envelope).
@@ -91,10 +127,12 @@ impl MessageBody {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ContentBlock {
     #[serde(rename = "type", default)]
     pub kind: String,
+    #[serde(default)]
+    pub text: String,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -105,6 +143,8 @@ pub(crate) struct ContentBlock {
     pub tool_use_id: String,
     #[serde(default)]
     pub is_error: Option<bool>,
+    #[serde(default)]
+    pub content: Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -139,6 +179,10 @@ pub(crate) struct ResultFrame {
 pub(crate) struct UsageBody {
     #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
 }

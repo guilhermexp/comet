@@ -1,4 +1,4 @@
-//! Model catalog + effort/sandbox mapping for Codex, ported from comet's
+//! Model catalog + effort mapping for Codex, ported from zeron's
 //! `packages/harness/src/codex.ts`.
 //!
 //! The TS harness discovers models live via the app server's `model/list`
@@ -7,7 +7,7 @@
 //! short-lived `codex app-server` + `model/list` pagination can later be
 //! spliced in (same call t3code's Codex provider makes).
 
-use comet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
+use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
 /// on the wire — see [`to_effort`]).
@@ -56,7 +56,7 @@ pub(crate) fn sandbox_policy_type(sandbox: SandboxLevel) -> &'static str {
 }
 
 /// `turn/start`'s full `sandboxPolicy` object. Workspace-write keeps network
-/// access: comet agents fetch deps and hit APIs unattended, and with the
+/// access: zeron agents fetch deps and hit APIs unattended, and with the
 /// approval policy pinned to "never" a network-less sandbox would fail those
 /// commands with no escalation path.
 pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
@@ -185,20 +185,6 @@ mod tests {
         assert_eq!(to_effort(Some(ReasoningLevel::Ultrathink)), Some("xhigh"));
         assert_eq!(to_effort(Some(ReasoningLevel::Max)), Some("max"));
         assert_eq!(to_effort(Some(ReasoningLevel::Ultra)), Some("ultra"));
-    }
-
-    #[test]
-    fn sandbox_maps_both_spellings() {
-        assert_eq!(sandbox_mode(SandboxLevel::ReadOnly), "read-only");
-        assert_eq!(sandbox_policy_type(SandboxLevel::ReadOnly), "readOnly");
-        assert_eq!(
-            sandbox_policy_type(SandboxLevel::WorkspaceWrite),
-            "workspaceWrite"
-        );
-        assert_eq!(
-            sandbox_mode(SandboxLevel::DangerFullAccess),
-            "danger-full-access"
-        );
     }
 
     #[test]

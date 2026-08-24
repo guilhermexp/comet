@@ -1,7 +1,10 @@
 //! Codex harness: spawns the installed `codex` CLI as `codex app-server` and
 //! speaks JSON-RPC 2.0 over stdio — the same interface the Codex IDE extension
-//! uses (spec: docs/research/harness.md; behavior ported from comet's
-//! `packages/harness/src/codex.ts`).
+//! uses. Resurrected from the pre-ACP driver and modernized.
+//!
+//! VERSION PIN: the app-server API is EXPERIMENTAL (`capabilities.
+//! experimentalApi`); this driver is validated against codex-cli 0.146.1 —
+//! revalidate the method/notification surface when bumping past it.
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
 //!   the `initialized` notification; unknown notification methods tolerated.
@@ -11,11 +14,19 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals: the wire policy is always `"never"` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs; the sandbox is the
-//!   guardrail). Stray `item/commandExecution/requestApproval` +
+//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
+//!   the sandbox is forced to `danger-full-access` — parity with the Claude
+//!   adapter's auto-approve-everything (unattended runs). Stray
+//!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Subagents are full child app-server threads (`thread/started` with
+//!   `source.subAgent.thread_spawn`, `subAgentActivity` items on the parent).
+//!   A registered child's notifications route through an EXPLICIT table
+//!   ([`normalize::route_child_notification`]) — item lifecycles/errors become
+//!   tagged [`AgentEvent::Subagent`] events, child turn bookkeeping is
+//!   consumed so it can never settle the parent turn, and unknown methods
+//!   fall through to the parent path (fail open, never silent loss).
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
 //!   steer (the turn-completed race) is queued and delivered as the next
 //!   `turn/start` on the same thread. The session is persistent across turns
@@ -24,11 +35,10 @@
 //!   escalating to SIGTERM → SIGKILL if the child is unresponsive; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
-mod catalog;
+pub(crate) mod catalog;
 mod normalize;
-mod rpc;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -42,17 +52,18 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    Phase, delta_text, item_id, item_type, map_item, turn_error_message, turn_id, usage_event,
+    ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
+    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
 };
-use rpc::{Incoming, RpcClient};
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
 /// PATH, then the login-shell PATH snapshot (the user's shell init shapes
@@ -96,32 +107,55 @@ fn resolve_codex_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// True when `cwd` is a LINKED git worktree whose checked-out branch name
-/// contains '/' — the exact shape that trips codex's sandbox worktree-mount
-/// derivation (see the escalation in [`CodexHarness::run`]). Pure filesystem
-/// reads: the worktree's `.git` pointer FILE names the admin dir, whose HEAD
-/// symref carries the branch.
-fn worktree_on_slashed_branch(cwd: &str) -> bool {
-    if cwd.is_empty() {
-        return false;
+fn codex_workers_mcp_overrides_for(
+    executable: &std::path::Path,
+    request: &RunRequest,
+    disabled_by_environment: bool,
+) -> Vec<String> {
+    let Some(server) = crate::acp::workers_mcp_servers_for(
+        executable,
+        request.enable_workers_mcp,
+        disabled_by_environment,
+        request.workers_parent_chat_id.as_deref(),
+    )
+    .into_iter()
+    .next() else {
+        return Vec::new();
+    };
+    let Some(command) = server.get("command").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let mut overrides = vec![format!(
+        "mcp_servers.comet-workers.command={}",
+        serde_json::to_string(command).expect("string serialization cannot fail")
+    )];
+    if let Some(args) = server.get("args") {
+        overrides.push(format!("mcp_servers.comet-workers.args={args}"));
     }
-    let dot_git = std::path::Path::new(cwd).join(".git");
-    let is_pointer_file = std::fs::metadata(&dot_git).is_ok_and(|m| m.is_file());
-    if !is_pointer_file {
-        return false; // main checkout (`.git` dir) — codex handles it fine
+    if let Some(environment) = server.get("env").and_then(Value::as_array) {
+        overrides.extend(environment.iter().filter_map(|row| {
+            let name = row.get("name")?.as_str()?;
+            let value = row.get("value")?.as_str()?;
+            Some(format!(
+                "mcp_servers.comet-workers.env.{name}={}",
+                serde_json::to_string(value).expect("string serialization cannot fail")
+            ))
+        }));
     }
-    let Ok(pointer) = std::fs::read_to_string(&dot_git) else {
-        return false;
+    overrides
+}
+
+fn codex_workers_mcp_overrides(request: &RunRequest) -> Vec<String> {
+    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
+        .ok()
+        .is_some_and(|value| value == "1");
+    let Some(executable) = std::env::var_os("ZERON_WORKERS_MCP_BIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
+        return Vec::new();
     };
-    let Some(gitdir) = pointer.strip_prefix("gitdir:").map(str::trim) else {
-        return false;
-    };
-    let Ok(head) = std::fs::read_to_string(std::path::Path::new(gitdir).join("HEAD")) else {
-        return false;
-    };
-    head.trim()
-        .strip_prefix("ref: refs/heads/")
-        .is_some_and(|branch| branch.contains('/'))
+    codex_workers_mcp_overrides_for(&executable, request, disabled)
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -132,6 +166,9 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Command discovery cache: only a successful probe is cached, so a
+    /// broken CLI retries on the next picker open (ACP-harness parity).
+    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for CodexHarness {
@@ -140,6 +177,7 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            commands: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -162,6 +200,23 @@ impl CodexHarness {
         self
     }
 
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+        let mut cmd = Command::new(exe);
+        cmd.arg("app-server");
+        for value in codex_workers_mcp_overrides(request) {
+            cmd.args(["-c", &value]);
+        }
+        crate::compose_child_path(&mut cmd, exe);
+        if !request.cwd.is_empty() {
+            cmd.current_dir(&request.cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    }
+
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
             return Ok(p.clone());
@@ -177,36 +232,106 @@ impl CodexHarness {
         })
     }
 
-    /// `worker_tools` is the comet MCP server to hand the agent, or `None` when
-    /// there is no comet binary to point at — a missing binary degrades to "no
-    /// worker tools", never to a failed run.
-    fn build_command(
-        &self,
-        exe: &PathBuf,
-        request: &RunRequest,
-        chat_id: &str,
-        worker_tools: Option<&crate::worker_tools::ServerTarget>,
-    ) -> Command {
-        let mut cmd = Command::new(exe);
+    /// Short-lived discovery probe: a `codex app-server` handshake followed by
+    /// `skills/list` — the only invocable-listing method the 0.146.x wire has
+    /// (custom `~/.codex/prompts` are NOT exposed; the TUI-only built-ins
+    /// aren't either). Skills are what the codex TUI itself surfaces as
+    /// slash-invocables, listed per-cwd and deduped by name here.
+    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, exe);
-        // The comet MCP server, so the agent can delegate to CLI workers that
-        // outlive its turn. Same server as the Claude path, through Codex's
-        // config overrides; the user's own `mcp_servers` entries are untouched.
-        cmd.args(crate::worker_tools::codex_mcp_flags(
-            worker_tools,
-            chat_id,
-            crate::worker_tools::SESSION_DEPTH,
-        ));
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
+        crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
-        cmd
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            shutdown_child(&mut child, self.kill_grace).await;
+            return Err(HarnessError::Protocol("codex child has no stdio".into()));
+        };
+        // The receiver must stay alive for the client's reader loop; agent →
+        // client traffic during the probe is ignored.
+        let (client, _incoming) = RpcClient::new(stdin, stdout);
+        let discovery = async {
+            client
+                .request(
+                    "initialize",
+                    json!({
+                        "clientInfo": {
+                            "name": "zeron-native",
+                            "title": "Zeron",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                        "capabilities": { "experimentalApi": true },
+                    }),
+                )
+                .await?;
+            client.notify("initialized", None);
+            let skills = client.request("skills/list", json!({})).await?;
+            Ok::<Vec<SlashCommand>, HarnessError>(parse_skill_commands(&skills))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+        }
     }
+}
+
+/// `skills/list` result → picker commands. `data` groups skills by cwd; the
+/// same skill appears under every root, so dedupe by name keeping first
+/// appearance order. The interface's shortDescription is picker-sized; the
+/// top-level description is a model-facing paragraph, kept only as fallback.
+fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
+    let mut seen = std::collections::HashSet::new();
+    let mut commands = Vec::new();
+    for group in result
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+    {
+        for skill in group
+            .get("skills")
+            .and_then(Value::as_array)
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+        {
+            let Some(name) = skill
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            if !seen.insert(name.to_owned()) {
+                continue;
+            }
+            let interface = skill.get("interface");
+            let description = interface
+                .and_then(|i| i.get("shortDescription"))
+                .and_then(Value::as_str)
+                .filter(|d| !d.is_empty())
+                .or_else(|| skill.get("description").and_then(Value::as_str))
+                .unwrap_or_default();
+            commands.push(SlashCommand {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                input_hint: None,
+            });
+        }
+    }
+    commands
 }
 
 #[async_trait]
@@ -231,6 +356,13 @@ impl Harness for CodexHarness {
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         REASONING_LEVELS
     }
+    fn installed(&self) -> bool {
+        self.executable.is_some() || resolve_codex_executable().is_some()
+    }
+    /// Done is the CLI's own terminal frame, for wake turns too.
+    fn deterministic_turn_end(&self) -> bool {
+        true
+    }
 
     /// The curated static catalog (see [`catalog`]); requires an installed CLI
     /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here.
@@ -241,32 +373,30 @@ impl Harness for CodexHarness {
         Ok(static_models())
     }
 
+    /// Skills from a short-lived `skills/list` probe (see
+    /// [`Self::discover_commands`]); cached on success.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.commands
+            .get_or_try_init(|| self.discover_commands())
+            .await
+            .cloned()
+    }
+
     async fn run(
         &self,
         mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
-        // worktree mount when the checked-out branch name contains '/'
-        // (verified against the real CLI: `wing/x` in a linked worktree kills
-        // every command before it starts; `wing-x` is fine; explicit
-        // writableRoots don't suppress the broken derivation; full access
-        // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run — parity note: the Claude adapter effectively
-        // grants full access anyway (auto-approved can_use_tool).
-        if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
-            && worktree_on_slashed_branch(&request.cwd)
-        {
-            tracing::warn!(
-                cwd = %request.cwd,
-                "codex sandbox escalated to danger-full-access: linked worktree on a \
-                 slash-named branch trips codex's worktree-mount derivation"
-            );
-            request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
-        }
-        let worker_tools = crate::worker_tools::server_target();
-        let mut cmd = self.build_command(&exe, &request, &controls.chat_id, worker_tools.as_ref());
+        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
+        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
+        // Parity with the Claude adapter, which auto-approves every
+        // can_use_tool and so effectively grants full access. This also
+        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
+        // worktree on a slash-named branch derives a malformed mount that
+        // kills every command.
+        request.sandbox = zeron_proto::SandboxLevel::DangerFullAccess;
+        let mut cmd = self.build_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -289,7 +419,7 @@ impl Harness for CodexHarness {
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "comet_harness::codex", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::codex", "stderr: {line}");
                     tail.push(&line);
                 }
             });
@@ -431,8 +561,9 @@ async fn run_session(session: Session) {
 
     // ---- wire params ------------------------------------------------------
     // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (comet sessions run unattended; the sandbox
-    // is the guardrail): never surface wire approvals. "on-request" turned
+    // regardless of `auto_approve` (zeron sessions run unattended; combined
+    // with the danger-full-access override above this is codex's yolo mode):
+    // never surface wire approvals. "on-request" turned
     // every command into a yes/no question (user report: "asking me for
     // approval at every step"). The approval-as-input plumbing below stays for
     // stray requests and a future explicit permission-mode setting.
@@ -468,8 +599,8 @@ async fn run_session(session: Session) {
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "comet-native",
-                        "title": "Comet",
+                        "name": "zeron-native",
+                        "title": "Zeron",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "capabilities": { "experimentalApi": true },
@@ -486,7 +617,7 @@ async fn run_session(session: Session) {
                 // A missing/foreign rollout falls back to a fresh thread.
                 Err(e) => {
                     tracing::debug!(
-                        target: "comet_harness::codex",
+                        target: "zeron_harness::codex",
                         "thread/resume failed (starting fresh): {e}"
                     );
                     client
@@ -577,6 +708,11 @@ async fn run_session(session: Session) {
     }
 
     let mut router = TurnRouter::default();
+    // Child app-server threads (multi-agent v2): child thread id → the
+    // parent-feed spawn call id its traffic is attributed to. Registered
+    // from `subAgentActivity` items on the parent thread and from a child
+    // `thread/started` carrying a spawn source.
+    let mut children: HashMap<String, String> = HashMap::new();
     match start_turn(&client, turn_params(&request.prompt)).await {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
@@ -613,7 +749,157 @@ async fn run_session(session: Session) {
     'main: loop {
         tokio::select! {
             inc = incoming.recv() => match inc {
-                Some(Incoming::Notification { method, params }) => match method.as_str() {
+                Some(Incoming::Notification { method, params }) => {
+                // Foreign-thread traffic FIRST: a child thread's turn/thread
+                // bookkeeping must never reach the parent turn router below
+                // (a child's turn/completed would settle the PARENT turn).
+                if let Some(nthread) = notification_thread_id(&method, &params)
+                    && !nthread.is_empty()
+                    && nthread != thread_id
+                {
+                    // Registration path: a child thread/started with an
+                    // explicit spawn source. The spawn-call mapping from a
+                    // subAgentActivity item wins (that id IS the parent
+                    // chip); this only seeds a fallback.
+                    if method == "thread/started"
+                        && params
+                            .pointer("/thread/source/subAgent/thread_spawn")
+                            .is_some()
+                    {
+                        children
+                            .entry(nthread.clone())
+                            .or_insert_with(|| nthread.clone());
+                    }
+                    match route_child_notification(&method) {
+                        ChildRoute::Parent => {
+                            // Unknown/parent-owned: fall through so a codex
+                            // update degrades to "the parent sees it",
+                            // never silent loss.
+                        }
+                        ChildRoute::Consumed => continue,
+                        ChildRoute::Subagent => {
+                            // Attributed child traffic — but only for a
+                            // REGISTERED child; pre-registration lifecycle
+                            // (captured ordering: a child's status change
+                            // can precede its registration) is dropped, not
+                            // passed to the parent path.
+                            if let Some(parent_call) = children.get(&nthread).cloned() {
+                                let events: Vec<AgentEvent> = match method.as_str() {
+                                    // The child settling its turn IS the
+                                    // subagent finishing its assignment —
+                                    // the chip's terminal state.
+                                    "turn/completed" => vec![AgentEvent::Done {
+                                        status: if turn_error_message(&params).is_some()
+                                            || params
+                                                .pointer("/turn/status")
+                                                .and_then(Value::as_str)
+                                                == Some("failed")
+                                        {
+                                            DoneStatus::Errored
+                                        } else {
+                                            DoneStatus::Completed
+                                        },
+                                        result: None,
+                                        error: None,
+                                        session_id: Some(nthread.clone()),
+                                    }],
+                                    "turn/failed" => vec![AgentEvent::Done {
+                                        status: DoneStatus::Errored,
+                                        result: None,
+                                        error: turn_error_message(&params),
+                                        session_id: Some(nthread.clone()),
+                                    }],
+                                    "turn/aborted" => vec![AgentEvent::Done {
+                                        status: DoneStatus::Interrupted,
+                                        result: None,
+                                        error: None,
+                                        session_id: Some(nthread.clone()),
+                                    }],
+                                    "item/agentMessage/delta" => delta_text(&params)
+                                        .map(|text| AgentEvent::TextDelta { text })
+                                        .into_iter()
+                                        .collect(),
+                                    "item/reasoning/textDelta"
+                                    | "item/reasoning/summaryTextDelta" => delta_text(&params)
+                                        .map(|text| AgentEvent::ReasoningDelta { text })
+                                        .into_iter()
+                                        .collect(),
+                                    "item/started" | "item/completed" => {
+                                        let phase = if method == "item/started" {
+                                            Phase::Started
+                                        } else {
+                                            Phase::Completed
+                                        };
+                                        let item =
+                                            params.get("item").cloned().unwrap_or(Value::Null);
+                                        // Same paragraphing as the parent:
+                                        // a child's completed message ends
+                                        // a paragraph in its transcript.
+                                        if phase == Phase::Completed
+                                            && matches!(
+                                                item_type(&item),
+                                                "agentMessage" | "agent_message"
+                                            )
+                                        {
+                                            vec![AgentEvent::TextDelta {
+                                                text: "\n\n".into(),
+                                            }]
+                                        } else if matches!(
+                                            item_type(&item),
+                                            "userMessage" | "user_message"
+                                        ) {
+                                            // A CHILD thread's user message
+                                            // is the parent steering it (the
+                                            // collab send_message path) —
+                                            // its own entry in the subagent
+                                            // doc. Completed only: both
+                                            // lifecycle events carry the
+                                            // full item.
+                                            if phase == Phase::Completed {
+                                                user_message_text(&item)
+                                                    .map(|text| AgentEvent::UserMessage { text })
+                                                    .into_iter()
+                                                    .collect()
+                                            } else {
+                                                Vec::new()
+                                            }
+                                        } else {
+                                            map_item(phase, &item)
+                                        }
+                                    }
+                                    "error" => vec![AgentEvent::Error {
+                                        message: params
+                                            .pointer("/error/message")
+                                            .and_then(Value::as_str)
+                                            .or_else(|| {
+                                                params.get("message").and_then(Value::as_str)
+                                            })
+                                            .unwrap_or("Codex subagent error")
+                                            .to_owned(),
+                                    }],
+                                    "thread/closed" => vec![AgentEvent::Done {
+                                        status: DoneStatus::Completed,
+                                        result: None,
+                                        error: None,
+                                        session_id: Some(nthread.clone()),
+                                    }],
+                                    _ => Vec::new(),
+                                };
+                                for ev in events {
+                                    let wrapped = AgentEvent::Subagent {
+                                        parent_tool_use_id: parent_call.clone(),
+                                        event: Box::new(ev),
+                                    };
+                                    if !send(&event_tx, wrapped).await {
+                                        break 'main;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+                match method.as_str() {
                     "turn/started" => router.note_started(turn_id(&params)),
 
                     "item/agentMessage/delta" => {
@@ -640,6 +926,40 @@ async fn run_session(session: Session) {
                             Phase::Completed
                         };
                         let item = params.get("item").cloned().unwrap_or(Value::Null);
+                        // A subAgentActivity item on the parent thread names a
+                        // child: register it (its call id = the parent chip
+                        // its traffic is attributed to). NEVER the root
+                        // thread itself — the wire emits subAgentActivity
+                        // about the root during collab runs, and registering
+                        // it would intercept every subsequent root
+                        // notification including turn/completed (the thread
+                        // would hang Working after the fleet finished).
+                        if matches!(
+                            item_type(&item),
+                            "subAgentActivity" | "sub_agent_activity"
+                        ) {
+                            let child = item
+                                .get("agentThreadId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let path = item
+                                .get("agentPath")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let call = item.get("id").and_then(Value::as_str).unwrap_or("");
+                            if !child.is_empty()
+                                && child != thread_id
+                                && path != "/root"
+                                && path != "/"
+                                && !call.is_empty()
+                            {
+                                children.insert(child.to_owned(), call.to_owned());
+                            } else if child == thread_id || path == "/root" || path == "/" {
+                                // The root's own activity marker: no chip, no
+                                // registration — it is not a subagent.
+                                continue;
+                            }
+                        }
                         if matches!(item_type(&item), "agentMessage" | "agent_message") {
                             if phase == Phase::Completed {
                                 // Fallback for non-streamed messages only.
@@ -648,6 +968,23 @@ async fn run_session(session: Session) {
                                 if !streamed_text.contains(id)
                                     && !text.is_empty()
                                     && !send(&event_tx, AgentEvent::TextDelta { text: text.into() }).await
+                                {
+                                    break 'main;
+                                }
+                                // Codex emits several assistant messages per
+                                // turn (commentary, final answer); their
+                                // deltas carry no separator, so consecutive
+                                // messages rendered concatenated
+                                // ("…waiting.Beta's 90-second…" — live
+                                // finding). Close each message as a
+                                // paragraph.
+                                if !send(
+                                    &event_tx,
+                                    AgentEvent::TextDelta {
+                                        text: "\n\n".into(),
+                                    },
+                                )
+                                .await
                                 {
                                     break 'main;
                                 }
@@ -692,7 +1029,13 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        let error = turn_error_message(&params);
+                        let error = turn_error_message(&params).or_else(|| {
+                            (params
+                                .pointer("/turn/status")
+                                .and_then(Value::as_str)
+                                == Some("failed"))
+                            .then(|| "Codex turn failed".to_owned())
+                        });
                         let status = if interrupted {
                             DoneStatus::Interrupted
                         } else if error.is_some() {
@@ -790,9 +1133,12 @@ async fn run_session(session: Session) {
                     }
 
                     "error" => {
+                        // 0.146.x nests it (`params.error.message`); older
+                        // builds were flat (`params.message`) — accept both.
                         let message = params
-                            .get("message")
+                            .pointer("/error/message")
                             .and_then(Value::as_str)
+                            .or_else(|| params.get("message").and_then(Value::as_str))
                             .unwrap_or("Codex error")
                             .to_owned();
                         if !send(&event_tx, AgentEvent::Error { message }).await {
@@ -803,7 +1149,8 @@ async fn run_session(session: Session) {
                     // thread/status, mcpServer startup, account noise, … —
                     // unknown notification methods are tolerated by design.
                     _ => {}
-                },
+                }
+                }
 
                 Some(Incoming::Request { id, method, params }) => {
                     handle_server_request(
@@ -852,7 +1199,7 @@ async fn run_session(session: Session) {
                             // fallback for older Codex without steering).
                             Err(e) => {
                                 tracing::debug!(
-                                    target: "comet_harness::codex",
+                                    target: "zeron_harness::codex",
                                     "turn/steer rejected (queued as next turn): {e}"
                                 );
                                 if router.active.as_deref() == Some(expected.as_str())
@@ -909,7 +1256,7 @@ async fn run_session(session: Session) {
                             .await
                         {
                             tracing::debug!(
-                                target: "comet_harness::codex",
+                                target: "zeron_harness::codex",
                                 "turn/interrupt failed (escalation will reap): {e}"
                             );
                         }
@@ -1012,7 +1359,7 @@ async fn steer_as_new_turn(
 }
 
 // ---------------------------------------------------------------------------
-// Approvals (approval-as-input parity with comet's UX)
+// Approvals (approval-as-input parity with zeron's UX)
 // ---------------------------------------------------------------------------
 
 type RequestInputFn = Box<
@@ -1034,13 +1381,40 @@ fn handle_server_request(
     auto_approve: bool,
     request_input: &Arc<RequestInputFn>,
 ) {
+    // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
+    // question, never auto-approvable — route it to the input bridge and
+    // answer keyed by question id, `{ answers: { <id>: { answers: [..] } } }`.
+    if method == "item/tool/requestUserInput" {
+        let questions = user_input_questions(params);
+        if questions.is_empty() {
+            client.respond(&id, json!({ "answers": {} }));
+            return;
+        }
+        let client = client.clone();
+        let request_input = Arc::clone(request_input);
+        tokio::spawn(async move {
+            let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
+            let answers = (request_input)(asked).await.unwrap_or_default();
+            let mut by_id = serde_json::Map::new();
+            for (wire_id, q) in &questions {
+                let labels: Vec<Value> = answers
+                    .iter()
+                    .find(|a| a.question_id == q.id)
+                    .map(|a| a.labels.iter().cloned().map(Value::String).collect())
+                    .unwrap_or_default();
+                by_id.insert(wire_id.clone(), json!({ "answers": labels }));
+            }
+            client.respond(&id, json!({ "answers": by_id }));
+        });
+        return;
+    }
     let is_approval = matches!(
         method,
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
     );
     if !is_approval {
         tracing::debug!(
-            target: "comet_harness::codex",
+            target: "zeron_harness::codex",
             "unhandled server request: {method}"
         );
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
@@ -1073,6 +1447,64 @@ fn handle_server_request(
             json!({ "decision": if accept { "accept" } else { "decline" } }),
         );
     });
+}
+
+/// Parse `item/tool/requestUserInput` questions into (wire id, question)
+/// pairs, tolerant of field spellings; answers key by the WIRE id.
+fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
+    params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(ix, q)| {
+            let field = |keys: [&str; 3]| {
+                keys.iter()
+                    .find_map(|k| q.get(*k).and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let wire_id = {
+                let id = field(["id", "questionId", "question_id"]);
+                if id.is_empty() { format!("q{ix}") } else { id }
+            };
+            let question = UserInputQuestion {
+                id: new_message_id(),
+                header: {
+                    let h = field(["header", "title", "label"]);
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
+                },
+                question: field(["question", "prompt", "text"]),
+                options: q
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|a| a.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|op| match op {
+                        Value::String(s) => s.clone(),
+                        other => other
+                            .get("label")
+                            .or_else(|| other.get("value"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .into(),
+                    })
+                    .collect(),
+                multi_select: ["multiSelect", "multi_select"]
+                    .iter()
+                    .find_map(|k| q.get(*k).and_then(Value::as_bool))
+                    .unwrap_or(false),
+            };
+            (wire_id, question)
+        })
+        .collect()
 }
 
 /// Synthesize the yes/no question an approval request surfaces to the user.
@@ -1122,163 +1554,87 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Child lifecycle
-// ---------------------------------------------------------------------------
-
-/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
-async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    if let Some(pid) = child.id() {
-        send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-#[derive(Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
-#[cfg(unix)]
-fn send_signal(pid: u32, signal: Signal) {
-    let sig = match signal {
-        Signal::Term => libc::SIGTERM,
-        Signal::Kill => libc::SIGKILL,
-    };
-    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
-    }
-}
-
-#[cfg(not(unix))]
-fn send_signal(_pid: u32, _signal: Signal) {
-    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
-}
+use crate::{Signal, send_signal, shutdown_child};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
 
-    #[test]
-    fn build_command_hands_the_agent_the_comet_mcp_server() {
-        let target = crate::worker_tools::ServerTarget {
-            bin: std::path::PathBuf::from("/opt/comet bin/comet"),
-            port: 30007,
-        };
-        let request = RunRequest {
-            prompt: "hi".into(),
-            model: None,
+    fn workers_request(enabled: bool) -> RunRequest {
+        RunRequest {
+            prompt: "test".into(),
+            harness: None,
+            model: Some("gpt-5.6-sol".into()),
             reasoning: None,
             model_options: serde_json::Map::new(),
-            cwd: String::new(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            attachments: Vec::new(),
+            cwd: "/tmp/project".into(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            enable_workers_mcp: enabled,
+            workers_parent_chat_id: Some("parent-chat".into()),
             resume: None,
-        };
-        let cmd = CodexHarness::default().build_command(
-            &PathBuf::from("/usr/bin/codex"),
-            &request,
-            "chat-42",
-            Some(&target),
-        );
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let command_flag = args
-            .iter()
-            .find(|a| a.starts_with("mcp_servers.comet.command="))
-            .expect("the command override is emitted");
-        assert_eq!(
-            serde_json::from_str::<String>(
-                command_flag
-                    .strip_prefix("mcp_servers.comet.command=")
-                    .unwrap()
-            )
-            .expect("valid JSON string"),
-            "/opt/comet bin/comet"
-        );
-        let args_flag = args
-            .iter()
-            .find(|a| a.starts_with("mcp_servers.comet.args="))
-            .expect("the args override is emitted");
-        let server_args: Vec<String> =
-            serde_json::from_str(args_flag.strip_prefix("mcp_servers.comet.args=").unwrap())
-                .expect("valid JSON array");
-        assert!(server_args.contains(&"chat-42".to_string()));
-        assert!(server_args.contains(&"30007".to_string()));
-        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+            attachments: Vec::new(),
+            worktree: None,
+        }
     }
 
     #[test]
-    fn build_command_omits_the_server_when_there_is_no_comet_binary() {
-        let request = RunRequest {
-            prompt: "hi".into(),
-            model: None,
-            reasoning: None,
-            model_options: serde_json::Map::new(),
-            cwd: String::new(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            attachments: Vec::new(),
-            resume: None,
-        };
-        let cmd = CodexHarness::default().build_command(
-            &PathBuf::from("/usr/bin/codex"),
-            &request,
-            "chat-42",
-            None,
+    fn native_workers_mcp_overrides_mount_the_controller_without_persistence() {
+        let overrides = codex_workers_mcp_overrides_for(
+            Path::new("/absolute/zeron"),
+            &workers_request(true),
+            false,
         );
         assert!(
-            !cmd.as_std()
-                .get_args()
-                .any(|a| a.to_string_lossy().starts_with("mcp_servers.comet."))
+            overrides
+                .iter()
+                .any(|value| value == "mcp_servers.comet-workers.command=\"/absolute/zeron\"")
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|value| value == "mcp_servers.comet-workers.args=[\"__workers_mcp__\"]")
+        );
+        assert!(overrides.iter().any(|value| {
+            value == "mcp_servers.comet-workers.env.COMET_WORKERS_CONTROLLER=\"1\""
+        }));
+        assert!(overrides.iter().any(|value| {
+            value == "mcp_servers.comet-workers.env.COMET_WORKERS_PARENT_CHAT_ID=\"parent-chat\""
+        }));
+        assert!(
+            codex_workers_mcp_overrides_for(
+                Path::new("/absolute/zeron"),
+                &workers_request(false),
+                false,
+            )
+            .is_empty()
         );
     }
+
     #[test]
-    fn slashed_branch_worktrees_are_detected_for_sandbox_escalation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let make = |name: &str, branch: &str| {
-            let wt = tmp.path().join(name);
-            let admin = tmp.path().join(format!("{name}-admin"));
-            std::fs::create_dir_all(&wt).unwrap();
-            std::fs::create_dir_all(&admin).unwrap();
-            std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
-            std::fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
-            wt.display().to_string()
-        };
-        assert!(worktree_on_slashed_branch(&make(
-            "slashed",
-            "wing/prd-5645"
-        )));
-        assert!(!worktree_on_slashed_branch(&make("plain", "brave-ember")));
-        // A main checkout (`.git` DIRECTORY) never escalates.
-        let main = tmp.path().join("main");
-        std::fs::create_dir_all(main.join(".git")).unwrap();
-        assert!(!worktree_on_slashed_branch(&main.display().to_string()));
-        // Detached HEAD (raw sha) never escalates.
-        let detached = make("detached", "x");
-        std::fs::write(
-            tmp.path().join("detached-admin").join("HEAD"),
-            "0ba950848abc\n",
-        )
-        .unwrap();
-        assert!(!worktree_on_slashed_branch(&detached));
-        assert!(!worktree_on_slashed_branch(""));
-        assert!(!worktree_on_slashed_branch("/nonexistent/path"));
+    fn native_workers_mcp_is_added_to_the_codex_app_server_process() {
+        let harness = CodexHarness::new();
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/codex"), &workers_request(true));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "-c" && pair[1].starts_with("mcp_servers.comet-workers.command=")
+        }));
+
+        let command =
+            harness.build_command(&PathBuf::from("/absolute/codex"), &workers_request(false));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg.contains("comet-workers")));
     }
 
     #[test]

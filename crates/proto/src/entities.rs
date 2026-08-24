@@ -1,12 +1,12 @@
 //! Synced entity rows (workspace doc) and local projections.
 //!
-//! In comet these were synced Postgres rows; in comet-native they live in the per-org
+//! In zeron these were synced Postgres rows; in zeron they live in the per-org
 //! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{ContextUsage, HarnessId, ReasoningLevel, SandboxLevel};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,7 +15,7 @@ pub struct Device {
     pub name: String,
     pub platform: String,
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// First registration time (comet devices.created_at — the Devices page
+    /// First registration time (zeron devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
@@ -100,7 +100,7 @@ pub struct Chat {
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Harness-native session id of the chat's latest run — engine-owned resume
-    /// continuity across engine restarts (comet's `chats.harness_session_id`).
+    /// continuity across engine restarts (zeron's `chats.harness_session_id`).
     /// Empty string = explicit
     /// "do not resume" tombstone after a rejected resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +120,19 @@ pub struct Chat {
     /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// Which sync room generation serves this chat (docs/chat2-sync.md M2):
+    /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay. The HOST flips
+    /// this in the same breath as seeding the chat2 checkpoint; every device
+    /// dials the room the registry names. Per-chat and instantly revertible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_gen: Option<u32>,
+}
+
+impl Chat {
+    /// True when this chat syncs over the chat2 dumb relay.
+    pub fn on_chat2(&self) -> bool {
+        self.room_gen.unwrap_or(1) >= 2
+    }
 }
 
 impl Chat {
@@ -178,6 +191,8 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,13 +219,55 @@ pub struct RepoRef {
     pub worktree_path: Option<String>,
 }
 
+/// Public Git reference attached to a commit in the history graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistoryRefKind {
+    Branch,
+    Remote,
+    Tag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryRef {
+    pub kind: GitHistoryRefKind,
+    pub label: String,
+}
+
+/// One topologically ordered row in the repository history graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryCommit {
+    pub sha: String,
+    pub parent_shas: Vec<String>,
+    pub subject: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: String,
+    #[serde(default)]
+    pub refs: Vec<GitHistoryRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryPage {
+    pub commits: Vec<GitHistoryCommit>,
+    pub head_sha: Option<String>,
+    pub next_cursor: Option<usize>,
+    pub total_count: Option<usize>,
+    /// Number of commits reachable from the active checkout's HEAD.
+    #[serde(default)]
+    pub head_commit_count: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Worktree {
     pub repo_path: String,
     pub path: String,
     pub branch: String,
-    /// Generated worktree folder name (`comet/<name>` is its branch).
+    /// Generated worktree folder name (`zeron/<name>` is its branch).
     #[serde(default)]
     pub name: String,
     /// Canonical checkout identity (device-scoped hash of the git dir).
@@ -234,6 +291,22 @@ pub struct FolderListing {
     /// True when the listing hit the entry cap.
     #[serde(default)]
     pub truncated: bool,
+}
+
+/// A browse root beyond home: a mounted drive/volume (or the system root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveEntry {
+    /// Display name (volume label / mount folder name; "System" for `/`).
+    pub name: String,
+    /// Absolute mount point.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveListing {
+    pub drives: Vec<DriveEntry>,
 }
 
 /// A workspace-relative file or directory returned by `SearchFiles`.
@@ -277,6 +350,81 @@ pub struct CheckoutDiff {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Provider-neutral lifecycle state for a code change request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+/// Compact provider-neutral change request metadata for checkout surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRequestSummary {
+    pub provider: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: ChangeRequestState,
+    pub base_ref: String,
+    pub head_ref: String,
+}
+
+/// Latest successful change request resolution for one checkout and branch.
+///
+/// `change_request: None` is an authoritative successful lookup with no match;
+/// resolution failures must retain the previous successful snapshot instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutChangeRequestStatus {
+    pub checkout_id: String,
+    pub device_id: String,
+    pub cwd: String,
+    pub branch: String,
+    pub change_request: Option<ChangeRequestSummary>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetCheckoutFileDiffTextRequest {
+    pub checkout_id: String,
+    pub cwd: String,
+    pub path: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    /// Pinned commit for History's per-commit diff scope. When present, the
+    /// source pair is read from the commit parent and this commit, never from
+    /// the live working tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    pub diff_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutFileDiffText {
+    pub diff_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_content_hash: Option<String>,
+    pub binary: bool,
+    pub truncated: bool,
+    #[serde(default)]
+    pub stale: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserProfile {
@@ -309,6 +457,9 @@ pub struct AgentAccount {
     pub active: bool,
     #[serde(default)]
     pub usage_windows: Vec<AgentUsageWindow>,
+    /// Local provider transcript/session archive totals (24h, 7d, 30d).
+    #[serde(default)]
+    pub usage_lines: Vec<AgentUsageLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -393,6 +544,15 @@ pub struct AgentUsageWindow {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsageLine {
+    pub label: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+}
+
 /// An open PTY session on the owning device (`OpenTerminal` reply).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -417,4 +577,158 @@ pub enum TerminalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+}
+
+/// One in-flight queued-attachment transfer (the `WatchTransfers` stream):
+/// raw-byte progress of the engine-side relay leg pushing staged bytes to a
+/// remote host. An entry appears when a file's chunks start moving, updates
+/// per landed chunk, and disappears when the host commits it (or the attempt
+/// fails — the retry re-adds it). Keyed by the send-minted uploadId, so the
+/// sender's thumbnails can resolve their `pending://{uploadId}/…` refs to a
+/// real percent instead of an indeterminate spinner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub upload_id: String,
+    pub file_name: String,
+    /// Raw bytes the host has acknowledged so far.
+    pub done: u64,
+    /// Total raw bytes of the staged file.
+    pub total: u64,
+}
+
+/// Live edge-connectivity posture (the `WatchConnectivity` stream): the truth
+/// the connection pill, composer honesty, and queued-send badges render.
+/// Derived engine-side from the registry room's reconnect state, the OS
+/// network-path monitor, and each open chat room's stats.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Connectivity {
+    pub state: ConnectivityState,
+    /// Epoch ms of the next scheduled registry dial while reconnecting
+    /// (0 = none pending / dialing right now). The countdown renders
+    /// client-side from this.
+    #[serde(default)]
+    pub retry_at_ms: i64,
+    /// The failure that started the current outage — sticky through the next
+    /// attempt (no flicker back to a bare "connecting…"), cleared on rejoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    /// Per-OPEN-chat room state; a chat absent here is unknown (consumers
+    /// fall back to the global state).
+    #[serde(default)]
+    pub chats: Vec<ChatConnectivity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectivityState {
+    /// No edge transports on this profile (local scope) — hide the pill.
+    #[default]
+    Disabled,
+    /// The OS reports no network path.
+    Offline,
+    /// Edge expected but the registry room is down (dialing/backing off).
+    Reconnecting,
+    Connected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatConnectivity {
+    pub chat_id: String,
+    pub connected: bool,
+    /// Local update batches not yet acked by the chat's edge room.
+    #[serde(default)]
+    pub pending_pushes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn session_context_is_additive_and_round_trips() {
+        let old: Session = serde_json::from_value(serde_json::json!({
+            "chatId": "chat-1",
+            "deviceId": "device-1",
+            "status": "idle",
+            "startedAt": null,
+            "updatedAt": "2026-08-21T12:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(old.context_usage, None);
+
+        let session = Session {
+            context_usage: Some(crate::ContextUsage {
+                tokens: 392_000,
+                context_window: 828_000,
+            }),
+            ..old
+        };
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["contextUsage"]["tokens"], 392_000);
+        assert_eq!(value["contextUsage"]["contextWindow"], 828_000);
+        assert_eq!(serde_json::from_value::<Session>(value).unwrap(), session);
+    }
+
+    #[test]
+    fn checkout_change_request_status_round_trips_all_states_as_camel_case() {
+        for (state, encoded_state) in [
+            (ChangeRequestState::Open, "open"),
+            (ChangeRequestState::Closed, "closed"),
+            (ChangeRequestState::Merged, "merged"),
+        ] {
+            let status = CheckoutChangeRequestStatus {
+                checkout_id: "checkout-1".into(),
+                device_id: "device-1".into(),
+                cwd: "/repo".into(),
+                branch: "feature/change".into(),
+                change_request: Some(ChangeRequestSummary {
+                    provider: "github".into(),
+                    number: 90,
+                    title: "Model checkout change request status".into(),
+                    url: "https://github.com/acme/zeron/pull/90".into(),
+                    state,
+                    base_ref: "main".into(),
+                    head_ref: "feature/change".into(),
+                }),
+                updated_at: Utc.with_ymd_and_hms(2026, 8, 15, 12, 30, 0).unwrap(),
+            };
+
+            let value = serde_json::to_value(&status).unwrap();
+            assert_eq!(value["checkoutId"], "checkout-1");
+            assert_eq!(value["deviceId"], "device-1");
+            assert_eq!(value["changeRequest"]["state"], encoded_state);
+            assert_eq!(value["changeRequest"]["baseRef"], "main");
+            assert_eq!(value["changeRequest"]["headRef"], "feature/change");
+            assert_eq!(
+                serde_json::from_value::<CheckoutChangeRequestStatus>(value).unwrap(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_file_diff_text_contract_is_camel_case() {
+        let request = GetCheckoutFileDiffTextRequest {
+            checkout_id: "checkout".into(),
+            cwd: "/repo".into(),
+            path: "src/lib.rs".into(),
+            mode: "branch".into(),
+            base_ref: Some("main".into()),
+            chat_id: None,
+            commit_sha: Some("deadbeef".into()),
+            diff_checksum: "abc".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["checkoutId"], "checkout");
+        assert_eq!(value["diffChecksum"], "abc");
+        assert_eq!(value["commitSha"], "deadbeef");
+        assert_eq!(
+            serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
+            request
+        );
+    }
 }

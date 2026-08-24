@@ -11,12 +11,12 @@ not built yet).
 | --- | --- | --- |
 | 1.1 Window shell | partial | gpui window, always-dark theme, external links via OS browser. Deferred: frameless-inset/traffic-light chrome (macOS packaging not executed), single-instance lock, dev-vs-packaged port split (env vars instead). |
 | 1.2 App phases | done | Gate / OrgGate ("Create your workspace" + memberships) / app with crossfade; boot splash with fade-out cap (`ui/src/shell.rs`). |
-| 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), full-height shared right utility column for Terminal/Changes (360–760, 52% cap), one shared top tab strip, widths persisted to `ui-settings.json`; the external split-panel control hides/restores the complete column and opens the utility chooser when no tabs exist. |
+| 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), tabbed Terminal/Git/file-preview host (360–760), independent Details/Files sidebar (300–700), responsive minimum-width arbitration, header variants, and persisted widths/state in `ui-settings.json`. |
 | 1.4 Keyboard shortcuts | done | Customizable keymap, click-to-record with conflict detection, per-row reset (`ui/src/settings/shortcuts.rs`); persisted with UI settings. |
 | 1.5 Routes | partial | Native navigation instead of URL routes; devices / agents / shortcuts / archived settings pages exist. Profile page (heatmap) is an §8 exclusion. |
 | 1.6 Sidebar | done | Device switcher, new session, grouped-by-project or flat, status dots (staleness-checked), row context menu (rename/archive/delete), resort glide. |
 | 1.7 Composer | done | Send/Steer/Stop morph, compact↔expanded flip, per-chat drafts, optimistic echo with failure return-to-draft, QuestionPanel (paged, auto-advance, number keys), all four pickers (harness/model, traits, repo with folder browser + clone/create, branch with worktree toggle), image attachments (paste/drop/picker → strip → chunked upload to host device → `withAttachments` refs in prompt text + inline image blocks for the Claude harness; per-chat stash, failure hand-back, lightbox — `ui/src/attachments.rs`). |
-| 1.8 Transcript | done | Doc-projection source, virtualized, markdown + syntax highlight, tool folding (ToolGroup/ToolChip), input/error chips, stick-to-bottom band, MessageRail minimap (hover preview, hidden < 48rem), user-bubble attachment thumbnails (112×80, read-back from owning device, 2s→15s retry ladder, seeded cache, click-to-expand lightbox). |
+| 1.8 Transcript | done | Doc-projection source, virtualized, markdown + syntax highlight, tool folding (ToolGroup/ToolChip), input/error chips, stick-to-bottom band, MessageRail minimap (hover preview, hidden < 48rem), user-bubble attachment thumbnails (112×80, read-back from owning device, 2s→15s retry ladder, seeded cache, click-to-expand lightbox). Assistant-turn operational prefix disclosure with categorized summary, persisted duration, streaming current-activity preservation, default-visible nested tool cards with compact details, and final-answer separation; live Write/Edit cards with bounded semantic preview and journal-backed full-content expansion. User cards are sticky per turn: the turn crossing the reading line keeps its existing rich user renderer at the top, and the next user-row boundary pushes/replaces it without changing virtualized row heights. **Live-verified with OMP as the baseline runtime**: a 25-line Write streamed as a green preview, the completed turn collapsed to `1 read, 2 edits, 1 command` with duration, the final answer remained visible, and the full file expanded into a 200px internally scrollable body. Wheel input over that body stayed inside the code block by hover alone—even at its boundaries and without prior focus—and the inner scroll/expansion state survived closing and reopening the outer turn. A second OMP run with Read + command + 35 output lines kept its prompt sticky while the output scrolled; scrolling into history kept the previous turn sticky while the next original user card remained mid-viewport, with no duplicate. Claude/Codex visual parity was not exercised in this smoke. |
 | 1.9 Accounts settings | done | Provider cards, usage meters with 80/95% thresholds + reset time, Switch/Forget, paste-code and browser-poll add flows, device switcher (`targetDeviceId`). |
 | 1.10 Terminal panel | done | Discoverable direct Terminal toggle + Cmd+J, Terminal sessions and Changes in one closeable top tab strip with a shared `+` menu, session-scoped state, width drag, replay-then-tail streams, input coalescing, ANSI emulator (`ui/src/terminal/`). |
 | 1.11 Changes viewer | done | Distinct diff glyph; Patch → file/hunk/line rows, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
@@ -30,20 +30,20 @@ not built yet).
 | ListHarnesses / ListModels | done | Relay-forwardable. |
 | Run/Subscribe/Interrupt/Steer/RespondInput RPCs | done (changed shape) | Deliberate redesign: these ride the durable doc command queue (`QueueCommand {run|steer|interrupt|respondInput}`) instead of device-addressed RPCs — same capability, offline-tolerant. |
 | Repos/folders/worktrees RPCs | done | All eight methods, relay-forwardable. |
-| Uploads / ReadAttachmentChunk | done | Chunked staging → durable file; path-jailed reads; R2 mirror. |
+| Uploads / ReadAttachmentChunk | done | Chunked staging → durable file; path-jailed reads; attachments live only on the host device. |
 | Terminals RPCs | done | Open/Subscribe/Write/Resize/Close, forwardable. |
 | Agent-account RPCs | done | Full login/activate/forget/poll surface, forwardable. |
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
 | DataRpc watches + QueueCommand | done | — |
 | Mutate ops | partial | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exists on the doc layer but is not yet exposed as a Mutate op. |
 | AuthRpc | done | AuthStatus emits the canonical proto shape (`{"state": "signedIn", …}`); SignIn/SignInHeadless/CompleteSignIn/SignOut/ListOrgs/CreateOrg/SelectOrg. |
-| Wire types | done | `comet-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
+| Wire types | done | `zeron-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
 
 ## §3 Backend engine
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `comet login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `comet login` first"; `comet daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
+| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `zeron login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `zeron login` first"; `zeron daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
 | 3.2 Sessions engine | partial | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS. Gaps: idle reaper + 10-min stall watchdog for persistent harness sessions. |
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
@@ -56,7 +56,10 @@ not built yet).
 | --- | --- | --- |
 | Claude Code adapter | done | stream-json, model discovery/effort ladders, AskUserQuestion → requestInput, steering via persistent input, init dedup, subagent filtering. **Live-verified against the real `claude` CLI 2.1.215**: doc-queued run → host executor → subprocess → streamed reply landed complete in the doc. |
 | Codex adapter | done | `codex app-server` JSON-RPC (thread/start/resume, sandbox policy). |
-| Cursor adapter | deferred | Parity item scheduled after Codex; no CLI surface settled. |
+| Cursor (ACP) | done | Shared `AcpHarness` spec; `cursor-agent acp` (Cursor's native ACP server), turn-boundary steering, no effort ladder (effort rides the model id's bracket suffix). Cursor's blocking extension methods are answered: `cursor/ask_question` → requestInput, `cursor/create_plan` auto-accepts, `cursor/update_todos` → todo chip. **Live-verified against the real `cursor-agent` CLI**: model discovery, streamed reply, todo chip and exec tool calls. |
+| Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
+| Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
+| Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema
@@ -73,7 +76,7 @@ not built yet).
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| Worker routes | done | health, session ws/tail/stats/diff/snapshot/append, workspace rooms, device ws/sidecar/status/nudge, attachments (content-addressed R2, hash-verified). |
+| Worker routes | done | health, session ws/tail/stats/diff/snapshot/append, workspace rooms, device ws/sidecar/status/nudge. |
 | Auth at edge | done | WorkOS JWKS verify; dev mode `user@org` bearers; DOs see Worker-stamped identity; claim-on-first-join ownership. |
 | SessionRoom DO | done | Hibernatable WS, update log + snapshot, lazy tail, two-level compaction, daily alarm checkpoint/trim/R2 backup, VV backfill, fragment reassembly. |
 | DeviceRoom DO | done | Byte-pipe frames, single host socket + supersede, relay control frames, durable nudges (replay on join, cap), sidecar slots. |
@@ -96,13 +99,12 @@ not built yet).
 - **Mobile app** — out of scope for the native rewrite so far.
 - **E2EE** — transport is TLS + WorkOS bearers; end-to-end encryption of doc
   contents not designed.
-- **Cursor harness** (§4).
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
 - **Engine hardening**: single-instance lock, parent-PID watchdog, crash
   shield, idle reaper / stall watchdog, boot warm-open of recent chats.
 
 ## Summary
 
-Table rows above: **39 done · 6 partial · 1 deferred** (Cursor harness), plus
-the cross-cutting deferrals (mobile, E2EE, macOS packaging execution,
-engine hardening) — the last overlaps the named gaps in the partial rows.
+Table rows above: **40 done · 6 partial**, plus the cross-cutting deferrals
+(mobile, E2EE, macOS packaging execution, engine hardening) — the last
+overlaps the named gaps in the partial rows.

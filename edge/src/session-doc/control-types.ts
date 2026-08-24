@@ -1,5 +1,5 @@
 /**
- * Vendored from comet's `@comet/control` (packages/control/src/wire.ts +
+ * Vendored from zeron's `@zeron/control` (packages/control/src/wire.ts +
  * parts.ts): the plain-type equivalents of the effect/Schema wire types that
  * the session-doc modules reference. Type-only — no runtime behavior — so the
  * edge package stays dependency-light (no effect).
@@ -34,6 +34,14 @@ export type ToolCall =
   | { readonly _tag: "Mcp"; readonly server?: string; readonly tool: string; readonly input: unknown }
   | { readonly _tag: "Unknown"; readonly name: string; readonly input: unknown };
 
+/** An inline file diff carried on a resolved tool part (mirrors the Rust
+ * `ToolDiff`; `oldText` absent means a new file). */
+export interface ToolPartDiff {
+  readonly path: string;
+  readonly oldText?: string;
+  readonly newText: string;
+}
+
 /** A question the agent poses to the user mid-run (mirrors the harness type). */
 export interface UserInputQuestion {
   readonly id: string;
@@ -57,6 +65,10 @@ export type MessagePart =
       readonly call: ToolCall;
       /** Undefined while running; false on success; true on failure. */
       readonly isError?: boolean;
+      /** Capped tool output text (ACP harnesses; absent on claude/codex). */
+      readonly output?: string;
+      /** Capped inline file diff for edit-shaped tools (ACP harnesses). */
+      readonly diff?: ToolPartDiff;
     }
   | {
       /** An interactive question the agent asked. Unresolved ⇒ awaiting the user. */

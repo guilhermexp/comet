@@ -1,5 +1,5 @@
 /**
- * Comet-native edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
+ * Zeron-native edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
  * edge, then forwarding into per-session, per-workspace, and per-device
  * Durable Objects. Also serves content-addressed R2 attachments (§1.2) and
  * the absorbed WorkOS auth routes (formerly apps/server).
@@ -17,28 +17,50 @@
  *   POST /diff/:chatId                — host publishes the diff sidecar
  *   GET  /snapshot/:chatId            — repair: read current doc snapshot
  *   POST /append/:chatId              — repair: merge-import a Loro update
- *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss)
+ *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
+ *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
+ *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
+ *   GET  /registry/:orgId/rows        — registry full-table repair read
+ *   POST /registry/:orgId/reset       — registry operator wipe (self-healing)
  *   GET  /device/:deviceId/ws?role=   — device-room byte pipe (§8)
  *   GET  /device/:deviceId/sidecar/:name
  *   POST /device/:deviceId/sidecar/:name
  *   GET  /device/:deviceId/status
- *   PUT  /attachments/:sha256         — content-addressed upload
- *   GET  /attachments/:sha256
- *   HEAD /attachments/:sha256
+ *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
+ *   GET  /blob/:chatId/:partId
+ *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
+ *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
+ *   GET|PUT  /chat2/:chatId/diff
+ *   GET  /chat2/:chatId/stats
+ *   POST /chat2/:chatId/reset
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
+import { RegistryRoom } from "./registry-room";
+import { ChatRoom } from "./chat-room";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom };
+export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const SHA256_RE = /^[a-f0-9]{64}$/;
-const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024; // mirrors today's upload cap
+
+/** `decodeURIComponent` that answers `undefined` for malformed %-escapes. */
+const safeDecode = (segment: string): string | undefined => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+};
+/** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
+ * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
+const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
+const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -61,6 +83,12 @@ const forward = (
   url.pathname = path;
   if (search !== undefined) url.search = search;
   const headers = new Headers(request.headers);
+  // room-kind is a Worker-controlled signal (the DO relaxes owner gating for
+  // workspace rooms): clear any inbound value so only the explicit set below —
+  // reached solely on workspace forwards, after the org-membership check —
+  // can assert it. Do not drop this line; passthrough would let a caller
+  // choose their own room kind.
+  headers.delete(ROOM_KIND_HEADER);
   headers.set(AUTH_USER_HEADER, userId);
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
@@ -71,6 +99,15 @@ const requestInit = (request: Request): RequestInit => ({
   body: request.body
 });
 
+/** Carry the dialing engine's `&device=` through to the DO (socket
+ * attribution in logs — the 2026-08-04 deaf socket was only identifiable by
+ * reverse-engineering rotating IPv6 privacy addresses). Validated so a
+ * hand-crafted value can't inject into log lines or the DO's query. */
+const deviceParam = (url: URL): string => {
+  const device = url.searchParams.get("device") ?? "";
+  return ID_RE.test(device) ? `&device=${device}` : "";
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -80,7 +117,7 @@ export default {
       return json({ ok: true, auth: env.AUTH_MODE === "dev" ? "dev" : "workos" });
     }
 
-    // ── public install surface (also routed from comet.zeron.sh): the
+    // ── public install surface (also routed from zeron.sh): the
     //    `curl | sh` installer and the release artifacts it downloads ───────
     if (url.pathname === "/install.sh" && (request.method === "GET" || request.method === "HEAD")) {
       return new Response(request.method === "HEAD" ? null : installSh, {
@@ -138,7 +175,7 @@ export default {
         request,
         auth.userId,
         "/ws",
-        `?chatId=${parts[1]}`
+        `?chatId=${parts[1]}${deviceParam(url)}`
       );
     }
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
@@ -157,6 +194,45 @@ export default {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
     }
 
+    // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
+    //    Claim-on-first-join ownership enforced in the DO (chat ids are
+    //    client-minted). The DO handles /ws, /checkpoint (GET Range-resumable
+    //    + POST floor-guarded), host-published /tail + /diff sidecars,
+    //    /stats, /reset. ──────────────────────────────────────────────────────
+    if (parts[0] === "chat2" && parts[1] && ID_RE.test(parts[1]) && parts[2]) {
+      const room = `chat2/${parts[1]}`;
+      if (parts[2] === "ws" && parts.length === 3) {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        return forward(
+          env.CHAT_ROOMS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?chatId=${parts[1]}${deviceParam(url)}`
+        );
+      }
+      const routes: Record<string, string[]> = {
+        checkpoint: ["GET", "POST"],
+        // Pull/push over plain HTTPS (the airplane-wifi transport): GET
+        // /rows?after= collapses connect→hello→state→rowsReq→backfill into
+        // one round trip; POST /rows is the batchId-deduped push twin.
+        rows: ["GET", "POST"],
+        tail: ["GET", "PUT"],
+        diff: ["GET", "PUT"],
+        stats: ["GET"],
+        reset: ["POST"]
+      };
+      if (parts.length === 3 && routes[parts[2]]?.includes(request.method)) {
+        // Query carries through (`seqCovered` on POST /checkpoint), as do
+        // headers (`x-chat2-frontier`, `range`).
+        return forward(env.CHAT_ROOMS, room, request, auth.userId, `/${parts[2]}`, url.search);
+      }
+      return json({ error: "not found" }, 404);
+    }
+
     // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
     //    the caller's WorkOS org claim (`org_id`) must equal the URL's orgId,
     //    and the room itself is derived from the caller's OWN user id — the
@@ -165,11 +241,14 @@ export default {
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
       if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      // `ws3` = the per-user privacy destructive break (`ws2` was the spaces
-      // overhaul): a fresh DO instance with an empty doc; legacy org-wide
-      // rooms are orphaned (hibernated, ~zero cost). URL path stays
-      // `/workspace/:orgId/*`.
-      const room = `ws3/${orgId}/${auth.userId}`;
+      // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
+      // left with causally-broken update rows by the abort-thrash loop (acks
+      // outran the debounced flush) and could not be trusted again even after
+      // /reset-log; a name bump allocates a virgin DO. (`ws3` was the per-user
+      // privacy break, `ws2` the spaces overhaul.) Legacy rooms are orphaned
+      // (hibernated, ~zero cost). URL path stays `/workspace/:orgId/*`; the
+      // name is worker-internal — clients echo their own roomId strings.
+      const room = `ws4/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);
@@ -180,7 +259,7 @@ export default {
           request,
           auth.userId,
           "/ws",
-          `?chatId=${encodeURIComponent(room)}`,
+          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
           "workspace"
         );
       }
@@ -194,11 +273,69 @@ export default {
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
       }
+      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
+      // behind the shallow-locked rebuild converges by replacing its local
+      // workspace doc with this — see the incident repair recipe).
+      if (parts[2] === "snapshot" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/snapshot", "", "workspace");
+      }
       // Operator wedge-break: clear a workspace room whose update log grew big
       // enough to CPU-reset the DO on every cold start (org-membership already
       // checked; state re-uploads from each device's local doc on rejoin).
       if (parts[2] === "reset-log" && request.method === "POST") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
+      }
+      // Merge-safe repair write (the chat rooms' /append, for the workspace
+      // doc): lets an operator seed a reset room with ONE compact
+      // locally-exported history blob instead of waiting for every device to
+      // re-upload its whole doc — the N-way redundant re-seed is what kept
+      // ballooning the update log after the 2026-08-05 wedge breaks.
+      if (parts[2] === "append" && request.method === "POST") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/append", "", "workspace");
+      }
+    }
+
+    // ── registry rooms (docs/registry-sync.md): the row-table replacement for
+    //    the Loro workspace doc. Same trust shape as /workspace: org claim
+    //    must match the URL, room derived from the caller's OWN user id, DO
+    //    trusts the stamped header. `reg1` = first registry generation. ─────
+    if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
+      const orgId = parts[1];
+      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      const room = `reg1/${orgId}/${auth.userId}`;
+      if (parts[2] === "ws") {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        return forward(
+          env.REGISTRY_ROOMS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?${deviceParam(url).replace(/^&/, "")}`
+        );
+      }
+      if (parts[2] === "stats" && request.method === "GET") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
+      }
+      // Pull over plain HTTPS: `?since=` returns the same delta the WS
+      // hello would (full table without it — the original repair read).
+      // One round trip on any network that passes HTTPS at all, where the
+      // WS upgrade needs 4 and a cooperative middlebox.
+      if (parts[2] === "rows" && request.method === "GET") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/rows", url.search);
+      }
+      // Push over plain HTTPS — the WS push's fallback twin (LWW clocks
+      // make replays no-ops, so at-least-once delivery is safe).
+      if (parts[2] === "push" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/push", url.search);
+      }
+      // Operator wipe. Unlike the CRDT rooms this needs no recipe: clients
+      // detect the seq regression on their next hello and re-seed the table
+      // from local rows with original clocks, automatically.
+      if (parts[2] === "reset" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/reset", "");
       }
     }
 
@@ -235,21 +372,32 @@ export default {
       }
     }
 
-    // ── R2 attachments (§1.2): content-addressed, per-user prefix ──────────
-    if (parts[0] === "attachments" && parts[1] && SHA256_RE.test(parts[1])) {
-      const key = `att/${auth.userId}/${parts[1]}`;
+    // ── R2 tool-output sidecar (docs/chat2-sync.md A2): full tool outputs
+    //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps
+    //    only a one-line summary + this key. Straight R2, no DO involvement —
+    //    the doc stays thin whether or not these uploads land. Per-user
+    //    prefix = owner auth. ─────────────────────────────────────────────
+    if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1])) {
+      // Percent-decode the part segment before validating: PART_RE allows
+      // `#` (`m1#c1`-style harness ids), which HTTP clients cannot send raw
+      // (fragment delimiter) — the host percent-encodes it. Decode-then-
+      // validate keeps traversal shut: `%2F` decodes to `/`, fails PART_RE.
+      const partId = safeDecode(parts[2]);
+      if (partId === undefined || !PART_RE.test(partId)) {
+        return json({ error: "bad part id" }, 400);
+      }
+      const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
-        if (body.byteLength > MAX_ATTACHMENT_BYTES) return json({ error: "too_large" }, 413);
-        const digest = await crypto.subtle.digest("SHA-256", body);
-        const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-        if (hex !== parts[1]) return json({ error: "hash_mismatch" }, 400);
+        // Outputs are 4KiB-capped at the harness boundary; diffs can run
+        // larger but a sidecar entry is one tool result, never a dump.
+        if (body.byteLength > MAX_TOOL_BLOB_BYTES) return json({ error: "too_large" }, 413);
         await env.BLOBS.put(key, body, {
           httpMetadata: {
-            contentType: request.headers.get("content-type") ?? "application/octet-stream"
+            contentType: request.headers.get("content-type") ?? "text/plain; charset=utf-8"
           }
         });
-        return json({ ok: true, hash: hex, bytes: body.byteLength });
+        return json({ ok: true, bytes: body.byteLength });
       }
       if (request.method === "GET" || request.method === "HEAD") {
         const object =
@@ -258,11 +406,18 @@ export default {
         const headers = new Headers();
         object.writeHttpMetadata(headers);
         headers.set("etag", object.httpEtag);
-        headers.set("cache-control", "private, max-age=31536000, immutable");
+        // Re-resolved tool parts overwrite their key, so short-lived caching only.
+        headers.set("cache-control", "private, max-age=300");
         const body =
           request.method === "GET" && "body" in object ? (object as R2ObjectBody).body : null;
         return new Response(body, { headers });
       }
+    }
+
+    // ── retired attachment mirror (clients ≤0.1.62): acknowledge and discard
+    //    so old outboxes drain once instead of retrying the PUT forever ──────
+    if (parts[0] === "attachments" && parts[1] && request.method === "PUT") {
+      return json({ ok: true });
     }
 
     return json({ error: "not_found" }, 404);

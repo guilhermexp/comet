@@ -4,7 +4,7 @@
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
 //! daemon (ARCHITECTURE §1). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port, mirroring comet: if an engine is listening it connects over WebSocket
+//! port, mirroring zeron: if an engine is listening it connects over WebSocket
 //! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
 //! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
@@ -27,10 +27,18 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
-use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use crate::comments::DiffComment;
+use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
+use zeron_proto::{
+    AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
+    EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+};
+use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+
+use crate::change_requests::{
+    ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
+};
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -39,7 +47,7 @@ use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.comet-native`).
+    /// Data directory for the embedded engine (`~/.zeron`).
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
@@ -111,21 +119,33 @@ impl EngineBackend for InProcessEngine {
 #[derive(Clone)]
 enum DeferredEngineState {
     Waiting,
-    Ready(Arc<dyn RpcService>),
+    Ready,
     Failed(String),
 }
 
-/// Serves AuthRpc immediately, then holds all data RPC calls until the signed-in
-/// user's identity-scoped engine is assembled. Existing UI subscriptions remain
-/// pending and attach to the real service without reconnecting.
+/// Serves engine identity and AuthRpc immediately, then holds data calls only
+/// while a captured synced profile still needs organization onboarding.
+/// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
     auth: AuthRpc,
+    engine_info: EngineInfo,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
+    service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
 }
 
 #[async_trait]
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if method == methods::ENGINE_INFO {
+            return RpcReply::value(&self.engine_info);
+        }
+        if method == methods::ENGINE_READY {
+            let mut state = self.state.clone();
+            return match wait_for_deferred_engine(&mut state).await {
+                Ok(()) => RpcReply::value(&serde_json::json!({ "ready": true })),
+                Err(message) => Err(RpcError::Failed(message)),
+            };
+        }
         if AuthRpc::handles(method) {
             return self.auth.handle(method, params).await;
         }
@@ -135,7 +155,12 @@ impl RpcService for DeferredEngineRpc {
             let current = { state.borrow().clone() };
             match current {
                 DeferredEngineState::Waiting => {}
-                DeferredEngineState::Ready(service) => {
+                DeferredEngineState::Ready => {
+                    let service = self.service.get().ok_or_else(|| {
+                        RpcError::Failed(
+                            "embedded engine became ready without an RPC service".into(),
+                        )
+                    })?;
                     return service.handle(method, params).await;
                 }
                 DeferredEngineState::Failed(message) => return Err(RpcError::Failed(message)),
@@ -145,10 +170,28 @@ impl RpcService for DeferredEngineRpc {
     }
 }
 
+async fn wait_for_deferred_engine(
+    state: &mut tokio::sync::watch::Receiver<DeferredEngineState>,
+) -> Result<(), String> {
+    loop {
+        let current = { state.borrow().clone() };
+        match current {
+            DeferredEngineState::Waiting => {}
+            DeferredEngineState::Ready => return Ok(()),
+            DeferredEngineState::Failed(message) => return Err(message),
+        }
+        state
+            .changed()
+            .await
+            .map_err(|_| "embedded engine assembly ended without a result".to_string())?;
+    }
+}
+
 /// External daemon over `ws://127.0.0.1:{port}`.
 struct RemoteEngine {
-    client: RpcClient,
+    client: Arc<RpcClient>,
     url: String,
+    lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[async_trait]
@@ -162,7 +205,10 @@ impl EngineBackend for RemoteEngine {
         }
     }
     async fn shutdown(&self) {
-        // The daemon outlives this viewport; nothing to tear down.
+        // The daemon outlives this viewport; only stop our readiness probe.
+        if let Some(task) = self.lifecycle_task.lock().await.take() {
+            task.abort();
+        }
     }
 }
 
@@ -170,6 +216,8 @@ impl EngineBackend for RemoteEngine {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
+    engine_info: EngineInfo,
+    deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
 }
 
 impl EngineHandle {
@@ -177,25 +225,15 @@ impl EngineHandle {
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
-        let url = format!("ws://127.0.0.1:{}", config.ipc_port);
-        let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            tokio::net::TcpStream::connect(("127.0.0.1", config.ipc_port)),
-        )
-        .await;
-        if matches!(probe, Ok(Ok(_))) {
-            tracing::info!(%url, "engine daemon detected; connecting");
-            match connect_ws(&url).await {
-                Ok(client) => {
-                    return Ok(EngineHandle {
-                        inner: Arc::new(RemoteEngine { client, url }),
-                    });
-                }
-                // Something is on the port but it is not an engine (or it is
-                // wedged). Fall through and embed: a stranger holding 27654
-                // should cost other viewports, not this window.
-                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
-            }
+        // Invariant: at most one bootstrap in this process runs probe+embed at
+        // a time. The winner binds the deferred IPC listener before releasing
+        // the gate, so a concurrent viewport's probe finds it and attaches as
+        // Remote instead of racing it for the data dir.
+        static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _gate = BOOTSTRAP_GATE.lock().await;
+
+        if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
+            return Ok(handle);
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -208,24 +246,54 @@ impl EngineHandle {
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
         };
+
+        // Own the data dir before opening anything under it or binding IPC —
+        // the lock, not the port bind, is the ownership decision. A failed
+        // acquire means an out-of-process engine holds the dir but was not
+        // serving IPC at probe time (a daemon mid-start): wait for its
+        // listener, re-trying the lock in case it dies instead.
+        std::fs::create_dir_all(&engine_config.data_dir)?;
+        let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lock = loop {
+            match InstanceLock::acquire(&engine_config.data_dir) {
+                Ok(lock) => break lock,
+                Err(err) => {
+                    if std::time::Instant::now() >= lock_deadline {
+                        return Err(err.into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(handle) = Self::attach_to_daemon(engine_config.ipc_port).await {
+                        return Ok(handle);
+                    }
+                }
+            }
+        };
+
         let auth = Engine::build_auth(&engine_config).await;
+        let workspace_scope = Engine::initial_workspace_scope(&auth);
+        let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
+        let profile_is_resolved = initial_profile.is_some();
+        let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
         let refresh_task = auth.spawn_refresh_loop();
-        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let assembled_service = Arc::new(tokio::sync::OnceCell::new());
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
-            state: state_rx,
+            engine_info: engine_info.clone(),
+            state: state_rx.clone(),
+            service: assembled_service.clone(),
         });
         let client = memory_client(service.clone());
 
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
         // *deferred* service, not the assembled one: a viewport that connects
-        // before sign-in gets AuthRpc (so it can show its own gate) and its
-        // data subscriptions wait exactly as this window's do.
+        // during cloud onboarding gets EngineInfo and AuthRpc immediately, and
+        // its data subscriptions wait exactly as this window's do.
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match comet_engine::serve_ipc(engine_config.ipc_port, service).await {
+        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service).await {
             Ok(task) => Some(task),
             Err(err) => {
                 tracing::warn!(
@@ -238,22 +306,50 @@ impl EngineHandle {
         };
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
+        let service_for_boot = assembled_service.clone();
+        // The instance lock rides into the boot task and is consumed by
+        // assembly — held through sign-in onboarding too, because this process
+        // owns the data dir from the moment it decided to embed.
         let boot_task = tokio::spawn(async move {
-            let mut auth_state = auth.watch_state();
-            while !auth_state.borrow().is_signed_in() {
-                if auth_state.changed().await.is_err() {
-                    state_tx.send_replace(DeferredEngineState::Failed(
-                        "authentication state closed before sign-in".into(),
-                    ));
-                    return;
+            let profile = match initial_profile {
+                Some(profile) => profile,
+                None => {
+                    let mut auth_state = auth.watch_state();
+                    while !auth_state.borrow().is_signed_in() {
+                        if auth_state.changed().await.is_err() {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "authentication state closed before workspace onboarding".into(),
+                            ));
+                            return;
+                        }
+                    }
+                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
+                        Ok(Some(profile)) => profile,
+                        Ok(None) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "workspace onboarding completed without an organization".into(),
+                            ));
+                            return;
+                        }
+                        Err(err) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(err.to_string()));
+                            return;
+                        }
+                    }
                 }
-            }
+            };
 
-            match Engine::assemble_runtime(&engine_config, auth).await {
+            match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
-                    state_tx.send_replace(DeferredEngineState::Ready(service));
+                    if service_for_boot.set(service).is_err() {
+                        state_tx.send_replace(DeferredEngineState::Failed(
+                            "embedded engine RPC service was assembled more than once".into(),
+                        ));
+                        return;
+                    }
+                    state_tx.send_replace(DeferredEngineState::Ready);
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "embedded engine assembly failed");
@@ -261,7 +357,7 @@ impl EngineHandle {
                 }
             }
         });
-        Ok(EngineHandle {
+        let handle = EngineHandle {
             inner: Arc::new(InProcessEngine {
                 runtime,
                 boot_task,
@@ -269,7 +365,85 @@ impl EngineHandle {
                 ipc_task,
                 client,
             }),
-        })
+            engine_info,
+            deferred_state: Some(state_rx.clone()),
+        };
+        // Local, development, and already-resolved synced profiles need no
+        // authentication UI while assembling. Keep the viewport Connecting
+        // until their stores and journals are actually open, and surface a
+        // boot failure through the existing bootstrap error path.
+        if profile_is_resolved && let Err(message) = wait_for_deferred_engine(&mut state_rx).await {
+            handle.shutdown().await;
+            return Err(anyhow::anyhow!(message));
+        }
+        Ok(handle)
+    }
+
+    /// Probe the IPC port and, if a live engine answers, attach as a remote
+    /// viewport. `None` means embed: nothing listening, a non-engine listener,
+    /// or a listener without an identity.
+    async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
+        let url = format!("ws://127.0.0.1:{ipc_port}");
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await;
+        if !matches!(probe, Ok(Ok(_))) {
+            return None;
+        }
+        tracing::info!(%url, "engine daemon detected; connecting");
+        match connect_ws(&url).await {
+            Ok(client) => match query_engine_info(&client).await {
+                Ok(engine_info) => {
+                    let client = Arc::new(client);
+                    let (state_tx, state_rx) =
+                        tokio::sync::watch::channel(DeferredEngineState::Waiting);
+                    let lifecycle_client = client.clone();
+                    let lifecycle_task = tokio::spawn(async move {
+                        let state = match lifecycle_client
+                            .call(methods::ENGINE_READY, serde_json::json!({}))
+                            .await
+                        {
+                            Ok(_) => DeferredEngineState::Ready,
+                            // EngineReady was added after EngineInfo. An older daemon
+                            // that does not expose the barrier is already assembled.
+                            Err(RpcError::UnknownMethod(method))
+                                if method == methods::ENGINE_READY =>
+                            {
+                                DeferredEngineState::Ready
+                            }
+                            Err(err) => DeferredEngineState::Failed(err.to_string()),
+                        };
+                        state_tx.send_replace(state);
+                    });
+                    Some(EngineHandle {
+                        inner: Arc::new(RemoteEngine {
+                            client,
+                            url,
+                            lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
+                        }),
+                        engine_info,
+                        deferred_state: Some(state_rx),
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %url,
+                        error = %err,
+                        "listener did not provide engine identity; embedding instead"
+                    );
+                    None
+                }
+            },
+            // Something is on the port but it is not an engine (or it is
+            // wedged). Fall through and embed: a stranger holding 27654
+            // should cost other viewports, not this window.
+            Err(err) => {
+                tracing::warn!(%url, error = %err, "not an engine; embedding instead");
+                None
+            }
+        }
     }
 
     pub fn client(&self) -> &RpcClient {
@@ -280,8 +454,42 @@ impl EngineHandle {
         self.inner.mode()
     }
 
+    pub fn engine_info(&self) -> &EngineInfo {
+        &self.engine_info
+    }
+
+    fn deferred_state(&self) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {
+        self.deferred_state.clone()
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
+    }
+}
+
+/// Query the current protocol first, with a conservative fallback for daemons
+/// from before `EngineInfo` existed. Old daemons are always treated as synced.
+async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
+    match client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+    {
+        Ok(info) => Ok(info),
+        Err(RpcError::UnknownMethod(method)) if method == methods::ENGINE_INFO => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LocalDevice {
+                device_id: String,
+            }
+            let legacy: LocalDevice = client
+                .call_as(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await?;
+            Ok(EngineInfo {
+                device_id: legacy.device_id,
+                workspace_scope: WorkspaceScope::Synced,
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -290,10 +498,10 @@ impl EngineHandle {
 // ---------------------------------------------------------------------------
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
-// grouping, the boot gate, relative times) live in `comet_proto::view`, pure
+// grouping, the boot gate, relative times) live in `zeron_proto::view`, pure
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
-pub use comet_proto::view::{
+pub use zeron_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
     parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
@@ -340,41 +548,111 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 // AppState entity
 // ---------------------------------------------------------------------------
 
+/// A composer send whose doc command is queued but not yet executed by the
+/// chat's host device — cleared when the host writes the user message back
+/// into the transcript (same client-minted id as the [`AppState::echoes`]
+/// dedup), or after [`UNDELIVERED_GRACE_MS`].
+#[derive(Debug, Clone)]
+struct PendingSend {
+    message_id: String,
+    started: DateTime<Utc>,
+}
+
+/// How long an unadopted send reads as Working/Sending (or Queued when the
+/// path is degraded) before flipping to the EXPLICIT failed state with a
+/// retry affordance. The old 30s overlay silently expired back to Idle with
+/// no visible trace of the send at all — the exact hole the 2026-08-19
+/// incident fell into.
+pub const UNDELIVERED_GRACE_MS: i64 = 120_000;
+
+/// A send's attachment-upload leg in flight. `done` is bumped by the upload
+/// task per completed chunk (binary bytes); the working label reads it every
+/// paint (the spinner already animates each frame), so no notify plumbing is
+/// needed. A slow upload renders as "Uploading… N%" instead of a
+/// hang-indistinguishable "Sending…" (2026-08-18 user report).
+pub struct UploadProgress {
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: u64,
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
 pub struct AppState {
     pub connection: ConnectionStatus,
+    /// Fixed data boundary of the attached engine. Authentication may change
+    /// in place, but changing this scope requires assembling a new runtime.
+    pub workspace_scope: Option<WorkspaceScope>,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
+    /// Live edge posture (WatchConnectivity): drives the connection pill,
+    /// composer honesty ("will queue"), and the Queued send badges.
+    pub connectivity: zeron_proto::Connectivity,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
-    /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
-    /// when the row vanishes; selecting a chat implies its space.
+    /// The project the new-session canvas mints into. Healed by
+    /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
+    /// its project.
     pub selected_space: Option<String>,
+    /// Deliberate "Don't work in a project" pick: while set, the canvas mints
+    /// project-less sessions (cwd `~` on the picked device) and
+    /// [`Self::selected_space_row`] reads as `None` — healing must NOT
+    /// re-select a project underneath it.
+    pub no_project: bool,
+    /// The composer's device pick — where project-less sessions run, and the
+    /// device whose projects the project picker lists. `None` falls back to
+    /// the local device.
+    pub selected_device: Option<String>,
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
+    /// First chats / spaces watch frame has landed — device-local state that
+    /// prunes against the doc (open tabs, the sidebar space filter) must not
+    /// judge by the empty pre-sync lists.
+    pub chats_synced: bool,
+    pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    /// Send-in-flight overlay per chat id: a queued doc command the host
+    /// hasn't executed yet (see [`Self::begin_pending_send`]).
+    pending_sends: HashMap<String, PendingSend>,
+    /// The in-flight send's attachment upload, when it has one.
+    upload_progress: Option<UploadProgress>,
+    /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
+    /// snapshots): real relay-leg progress for the sending thumbnail's
+    /// percent ring, present exactly while bytes are moving.
+    transfers: HashMap<String, (u64, u64)>,
+    /// Written by the changes pane, read by the composer.
+    diff_comments: HashMap<String, Vec<DiffComment>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<comet_update::UpdateStatus>,
+    pub update: Option<zeron_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
+    /// subagent tabs read these). Independent of `selected_chat`: a tab's
+    /// feed must survive chat switches — the tab itself is what scopes it.
+    sub_transcripts: HashMap<String, Vec<SessionMessageEntry>>,
+    /// One watch task per live subagent doc (single-flight per key).
+    /// Dropping a task cancels the engine-side watch and unpins the doc from
+    /// the engine LRU — closing a tab MUST go through
+    /// [`Self::unwatch_subagent_doc`].
+    sub_watch_tasks: HashMap<String, Task<()>>,
+    change_requests: ChangeRequestClientState,
+    change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
 }
 
 impl Default for AppState {
@@ -387,23 +665,75 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connection: ConnectionStatus::Connecting,
+            workspace_scope: None,
             auth: None,
             devices: Vec::new(),
+            connectivity: zeron_proto::Connectivity::default(),
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
             selected_space: None,
+            no_project: false,
+            selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
+            pending_sends: HashMap::new(),
+            upload_progress: None,
+            transfers: HashMap::new(),
+            diff_comments: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
+            sub_transcripts: HashMap::new(),
+            sub_watch_tasks: HashMap::new(),
+            change_requests: ChangeRequestClientState::default(),
+            change_request_tasks: HashMap::new(),
             auto_selected: false,
+            chats_synced: false,
+            spaces_synced: false,
         }
+    }
+
+    /// The selected chat, or `""` on the new-chat canvas. Identical to the
+    /// composer's own attachment/draft key, so a comment written before the
+    /// first send survives the chat being minted.
+    pub fn composer_key(&self) -> String {
+        self.selected_chat.clone().unwrap_or_default()
+    }
+
+    pub fn diff_comments(&self, key: &str) -> &[DiffComment] {
+        self.diff_comments
+            .get(key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn add_diff_comment(&mut self, key: &str, comment: DiffComment) {
+        self.diff_comments
+            .entry(key.to_string())
+            .or_default()
+            .push(comment);
+    }
+
+    pub fn remove_diff_comment(&mut self, key: &str, id: &str) {
+        if let Some(list) = self.diff_comments.get_mut(key) {
+            list.retain(|c| c.id != id);
+            if list.is_empty() {
+                self.diff_comments.remove(key);
+            }
+        }
+    }
+
+    pub fn take_diff_comments(&mut self, key: &str) -> Vec<DiffComment> {
+        self.diff_comments.remove(key).unwrap_or_default()
+    }
+
+    pub fn purge_diff_comments(&mut self, key: &str) {
+        self.diff_comments.remove(key);
     }
 
     // ---- reducers (pure) ----
@@ -411,6 +741,7 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
+        self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
@@ -428,35 +759,125 @@ impl AppState {
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
-        // Heal a vanished selection (space deleted elsewhere): fall back to the
-        // first space; its chats died with it, so a matching chat selection is
-        // healed by the accompanying chats frame (`apply_chats`).
+        self.spaces_synced = true;
+        // Heal a vanished selection (project deleted elsewhere): fall back to
+        // the first project; its chats died with it, so a matching chat
+        // selection is healed by the accompanying chats frame (`apply_chats`).
+        // The picker lists projects per-device, so healing prefers one on the
+        // picked device — a global fallback would silently re-aim the canvas
+        // at another machine.
         if let Some(selected) = &self.selected_space
             && !self.spaces.iter().any(|s| &s.id == selected)
         {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+            self.selected_space = self.first_space_on_picked_device();
         }
-        // First frame with no selection yet: pick the first space so the shell
-        // never renders an empty main area while spaces exist.
-        if self.selected_space.is_none() {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+        // First frame with no selection yet: pick the first project so the
+        // canvas never boots project-less by accident — unless the user
+        // deliberately opted out.
+        if self.selected_space.is_none() && !self.no_project {
+            self.selected_space = self.first_space_on_picked_device();
         }
     }
 
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
-    pub fn apply_chat_config(&mut self, chat_id: &str, config: comet_proto::ChatConfig) {
+    pub fn apply_chat_config(&mut self, chat_id: &str, config: zeron_proto::ChatConfig) {
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
     }
 
-    pub fn apply_devices(&mut self, devices: Vec<Device>) {
+    pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
+        self.connectivity = connectivity;
+    }
+
+    /// Is this chat's delivery path degraded — will a send QUEUE rather than
+    /// reach its executor promptly? Locally-hosted chats are never degraded
+    /// (a queued command executes on this device even fully offline). Remote
+    /// chats degrade when the OS says offline, when the chat's own edge room
+    /// is down, or when the host device has gone presence-dark.
+    pub fn chat_delivery_degraded(&self, chat_id: &str) -> bool {
+        use zeron_proto::ConnectivityState as S;
+        if self.connectivity.state == S::Disabled {
+            return false;
+        }
+        let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
+            // Unknown chat (a just-minted canvas send): only the global
+            // state can speak.
+            return self.connectivity.state == S::Offline;
+        };
+        if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
+            return false;
+        }
+        if self.connectivity.state == S::Offline {
+            return true;
+        }
+        let room_down = match self
+            .connectivity
+            .chats
+            .iter()
+            .find(|c| c.chat_id == chat_id)
+        {
+            Some(net) => !net.connected,
+            None => self.connectivity.state != S::Connected,
+        };
+        room_down || !self.device_online(&chat.device_id, Utc::now())
+    }
+
+    /// A send is queued: in flight AND its delivery path is degraded — the
+    /// honest badge is "Queued", not a Working spinner.
+    pub fn send_queued(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
+    }
+
+    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
+        // A local-only workspace has no remote device identity to distinguish.
+        // Keep the engine's legacy sentinel out of the UI while preserving real
+        // hostnames and user-assigned device names.
+        if self.workspace_scope == Some(WorkspaceScope::Local)
+            && let Some(local_id) = self.local_device_id.as_deref()
+            && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
+            && device.name == "unknown-device"
+        {
+            device.name = "Local".to_string();
+        }
+        for device in &devices {
+            self.change_requests
+                .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
+        }
         self.devices = devices;
     }
 
-    pub fn apply_update(&mut self, status: comet_update::UpdateStatus) {
+    /// True when `device_id`'s engine (per its registry device row) is at
+    /// least `min`. Unknown devices and unstamped versions are conservatively
+    /// false — feature gates fall back to the legacy path rather than speak a
+    /// protocol the peer may not understand.
+    pub fn device_version_at_least(&self, device_id: &str, min: (u64, u64, u64)) -> bool {
+        self.devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.version.as_deref())
+            .and_then(version_triple)
+            .is_some_and(|v| v >= min)
+    }
+
+    /// First project on the composer's picked device (falling back through
+    /// the local device, then any project at all — better a cross-device
+    /// project than a surprise project-less canvas). Display order.
+    fn first_space_on_picked_device(&self) -> Option<String> {
+        let device = self
+            .selected_device
+            .as_deref()
+            .or(self.local_device_id.as_deref());
+        let sorted = self.spaces_sorted();
+        device
+            .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
+            .or_else(|| sorted.first().copied())
+            .map(|s| s.id.clone())
+    }
+
+    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
         self.update = Some(status);
     }
 
@@ -473,7 +894,7 @@ impl AppState {
     }
 
     /// The signed-in user, if the engine reports one.
-    pub fn auth_user(&self) -> Option<&comet_proto::UserProfile> {
+    pub fn auth_user(&self) -> Option<&zeron_proto::UserProfile> {
         match self.auth.as_ref()? {
             AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
@@ -488,6 +909,7 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.ack_pending_send_from_transcript();
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -496,14 +918,53 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
+        self.ack_pending_send_from_transcript();
         Ok(())
+    }
+
+    /// A subagent doc's current transcript copy (empty until its watch's
+    /// replay frame lands, or its frozen snapshot is set).
+    pub fn sub_transcript(&self, doc_id: &str) -> &[SessionMessageEntry] {
+        self.sub_transcripts
+            .get(doc_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Watch a SUBAGENT doc (`WatchDocMessages` works for any doc id).
+    /// Single-flight per key; a frozen snapshot already in place wins — the
+    /// watch would race the (complete) blob with a possibly-purged live doc.
+    pub fn watch_subagent_doc(&mut self, doc_id: String, cx: &mut Context<Self>) {
+        if self.sub_watch_tasks.contains_key(&doc_id) {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.sub_transcripts.entry(doc_id.clone()).or_default();
+        let task = spawn_subagent_watch(cx, handle, doc_id.clone());
+        self.sub_watch_tasks.insert(doc_id, task);
+    }
+
+    /// Tab closed: drop the watch task (cancels the engine-side watch and
+    /// unpins the doc from the engine LRU) and the rows.
+    pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
+        self.sub_watch_tasks.remove(doc_id);
+        self.sub_transcripts.remove(doc_id);
+    }
+
+    /// Frozen-blob path: the finished subagent's uploaded transcript, no
+    /// watch needed (and any in-flight watch is superseded).
+    pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        self.sub_watch_tasks.remove(&doc_id);
+        self.sub_transcripts.insert(doc_id, entries);
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -518,6 +979,153 @@ impl AppState {
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
             echoes.retain(|e| e.id != message_id);
+        }
+    }
+
+    /// Composer send fired: overlay the chat as Working until the host writes
+    /// the user message back into the transcript (or the TTL lapses). A remote
+    /// send has no live session row until the host drains the queued command —
+    /// that gap read as "no live run" and flashed the Completed dot, and any
+    /// phantom Working→Idle edge in it rang the done-chime on send (user
+    /// report 2026-08-05).
+    pub fn begin_pending_send(&mut self, chat_id: &str, message_id: &str, now: DateTime<Utc>) {
+        self.pending_sends.insert(
+            chat_id.to_string(),
+            PendingSend {
+                message_id: message_id.to_string(),
+                started: now,
+            },
+        );
+    }
+
+    /// Send failed — drop the overlay so the dot tells the truth again. Only
+    /// removes the overlay this message started: a quick resend must not lose
+    /// its own overlay to the first send's failure cleanup.
+    pub fn end_pending_send(&mut self, chat_id: &str, message_id: &str) {
+        if self
+            .pending_sends
+            .get(chat_id)
+            .is_some_and(|p| p.message_id == message_id)
+        {
+            self.pending_sends.remove(chat_id);
+        }
+    }
+
+    /// Attachment upload starting: expose its progress to the working label.
+    pub fn begin_upload_progress(
+        &mut self,
+        total: u64,
+        done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.upload_progress = Some(UploadProgress { done, total });
+    }
+
+    /// Upload leg over (success or failure) — the label goes back to plain
+    /// send/working wording.
+    pub fn end_upload_progress(&mut self) {
+        self.upload_progress = None;
+    }
+
+    /// Percent of the in-flight attachment upload, clamped to 99 — the last
+    /// point belongs to the commit + queue, so "100% but still spinning"
+    /// never shows. `None` when no upload is in flight (or it's empty).
+    pub fn upload_progress_percent(&self) -> Option<u8> {
+        let progress = self.upload_progress.as_ref()?;
+        if progress.total == 0 {
+            return None;
+        }
+        let done = progress
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(progress.total);
+        Some(((done * 100) / progress.total).min(99) as u8)
+    }
+
+    /// A send whose queued command is past the delivery grace and still
+    /// unacked. The explicit failed/retry trailer takes precedence; this
+    /// compatibility seam remains for the static queued fallback.
+    pub fn send_queued_unacked(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+        })
+    }
+
+    /// A `WatchTransfers` snapshot: the engine-side relay leg's in-flight
+    /// queued-attachment transfers, replacing the whole set each frame.
+    pub fn apply_transfers(&mut self, transfers: Vec<zeron_proto::TransferProgress>) {
+        self.transfers = transfers
+            .into_iter()
+            .map(|t| (t.upload_id, (t.done, t.total)))
+            .collect();
+    }
+
+    /// Percent of one queued attachment's relay transfer, by the uploadId
+    /// its `pending://{uploadId}/…` ref names. Same 99-clamp as
+    /// [`Self::upload_progress_percent`]: the last point belongs to the
+    /// commit, so "100% but still spinning" never shows. `None` when no
+    /// bytes are moving for that upload (staged-but-waiting, retry backoff,
+    /// or done) — the thumbnail falls back to its indeterminate spinner.
+    pub fn transfer_percent(&self, upload_id: &str) -> Option<u8> {
+        let (done, total) = self.transfers.get(upload_id)?;
+        if *total == 0 {
+            return None;
+        }
+        Some(((done.min(total) * 100) / total).min(99) as u8)
+    }
+
+    /// Is a send still in flight for this chat (unacked)? Inside the grace
+    /// window normally; while the chat's delivery path is degraded the
+    /// overlay holds indefinitely — the truth IS "Queued", and silently
+    /// expiring back to Idle left a queued send with no visible trace at
+    /// all (the 30s→silence hole, 2026-08-19).
+    pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                || self.chat_delivery_degraded(chat_id)
+        })
+    }
+
+    /// The send has sat unadopted past the grace window: surface the
+    /// EXPLICIT failed state ("Not delivered — retry") instead of either
+    /// faking progress or silently forgetting the send ever happened.
+    pub fn send_undelivered(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+        })
+    }
+
+    /// Retry pressed: restart the grace clock so the overlay returns to its
+    /// Sending/Queued phase while the re-kicked delivery runs.
+    pub fn retry_pending_send(&mut self, chat_id: &str, now: DateTime<Utc>) {
+        if let Some(p) = self.pending_sends.get_mut(chat_id) {
+            p.started = now;
+        }
+    }
+
+    /// When the in-flight send (if any, inside the TTL) was fired — the
+    /// elapsed-timer base while the overlay reads as Working. The session
+    /// row's `started_at` still belongs to the PREVIOUS turn during this
+    /// window, and showing it made a fresh send open at the old turn's
+    /// half-hour mark.
+    pub fn pending_send_started(&self, chat_id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.pending_sends
+            .get(chat_id)
+            .filter(|p| {
+                now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                    || self.chat_delivery_degraded(chat_id)
+            })
+            .map(|p| p.started)
+    }
+
+    /// The host executed the queued command iff the sent message's id showed
+    /// up in the transcript (it writes the message before — causally with —
+    /// the Working status; sessions.rs dispatch paths).
+    fn ack_pending_send_from_transcript(&mut self) {
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(pending) = self.pending_sends.get(chat_id)
+            && self.transcript.iter().any(|e| e.id == pending.message_id)
+        {
+            self.pending_sends.remove(chat_id);
         }
     }
 
@@ -538,12 +1146,57 @@ impl AppState {
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
+        if self.no_project {
+            return None;
+        }
         let id = self.selected_space.as_deref()?;
         self.spaces.iter().find(|s| s.id == id)
     }
 
+    /// The device the new-session canvas targets: the picked project's host
+    /// when one is selected, else the explicit device pick, else this device.
+    pub fn effective_device_id(&self) -> Option<String> {
+        if let Some(space) = self.selected_space_row() {
+            return Some(space.device_id.clone());
+        }
+        self.selected_device
+            .clone()
+            .or_else(|| self.local_device_id.clone())
+    }
+
+    /// Pick the composer's target device. Keeps the project pick consistent:
+    /// a project on another device can't survive the switch — fall back to
+    /// the first project on the new device, else "no project".
+    pub fn select_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let project_moves = self
+            .selected_space_row()
+            .is_some_and(|s| s.device_id != device_id);
+        if project_moves {
+            let first = self
+                .spaces_sorted()
+                .iter()
+                .find(|s| s.device_id == device_id)
+                .map(|s| s.id.clone());
+            self.no_project = first.is_none();
+            if first.is_some() {
+                self.selected_space = first;
+            }
+        }
+        self.selected_device = Some(device_id);
+        cx.notify();
+    }
+
     pub fn space_row(&self, space_id: &str) -> Option<&Space> {
         self.spaces.iter().find(|s| s.id == space_id)
+    }
+
+    /// Spaces in display order — case-insensitive alphabetical, the order
+    /// both space selectors (sidebar filter, composer picker) list rows in.
+    /// Ties break on id so the order is stable across renders.
+    pub fn spaces_sorted(&self) -> Vec<&Space> {
+        let mut spaces: Vec<&Space> = self.spaces.iter().collect();
+        spaces.sort_by_key(|s| (s.display_name().to_lowercase(), s.id.clone()));
+        spaces
     }
 
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
@@ -582,14 +1235,31 @@ impl AppState {
         }
     }
 
+    /// The "@ device" tag for a space — shared by the space pickers' rows,
+    /// the sidebar filter trigger, and the composer's space chip. Returns
+    /// `(tag, offline)`; staleness renders as a disconnected GLYPH at the
+    /// call sites (user request), never words in the tag.
+    pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
+        let offline = !self.device_online(&space.device_id, now);
+        let device = self
+            .device_name(&space.device_id)
+            .unwrap_or("Unknown device");
+        (format!("@ {device}"), offline)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {
         self.selected_space_row().is_some_and(|s| s.git_detected)
     }
 
-    /// Full display status for a chat (tab dots, Active list).
+    /// Full display status for a chat (tab dots, Active list). A send in
+    /// flight ([`Self::begin_pending_send`]) reads as Working — the queued
+    /// command is as good as running.
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
+        if self.send_pending(&chat.id, now) {
+            return ChatIndicator::Working;
+        }
         display_status(chat, self.session_for(&chat.id), now)
     }
 
@@ -599,12 +1269,12 @@ impl AppState {
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
-            .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
+            .filter(|c| match c.space_id.as_deref() {
+                // Project-less sessions are first-class rows.
+                None => true,
+                Some(id) => self.space_row(id).is_some(),
             })
-            .map(|c| (display_status(c, self.session_for(&c.id), now), c))
+            .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
@@ -614,8 +1284,12 @@ impl AppState {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
-    /// Staleness-checked status dot for a chat row.
+    /// Staleness-checked status dot for a chat row. A send in flight reads as
+    /// Working (see [`Self::display_status_for`]).
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
+        if self.send_pending(chat_id, now) {
+            return Indicator::Working;
+        }
         effective_indicator(self.session_for(chat_id), now)
     }
 
@@ -624,12 +1298,51 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// Latest valid PR for a chat, rechecked against device, checkout, cwd and branch.
+    pub fn change_request_for_chat(&self, chat: &Chat) -> Option<&ChangeRequestSummary> {
+        self.change_requests
+            .change_request_for_chat(chat, &self.spaces)
+    }
+
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.auth.as_ref())
+        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    /// Drop every account-scoped view and subscription after its runtime has
+    /// stopped. The next bootstrap must never render rows from the previous
+    /// account while the local profile is opening.
+    pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
+        self.engine = None;
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        self.change_request_tasks.clear();
+        self.change_requests = ChangeRequestClientState::default();
+        self.connection = ConnectionStatus::Connecting;
+        self.workspace_scope = None;
+        self.auth = None;
+        self.devices.clear();
+        self.spaces.clear();
+        self.chats.clear();
+        self.sessions.clear();
+        self.selected_space = None;
+        self.no_project = false;
+        self.selected_device = None;
+        self.selected_chat = None;
+        self.auto_selected = false;
+        self.chats_synced = false;
+        self.spaces_synced = false;
+        self.transcript.clear();
+        self.echoes.clear();
+        self.pending_sends.clear();
+        self.upload_progress = None;
+        self.transfers.clear();
+        self.local_device_id = None;
+        self.update = None;
+        cx.notify();
     }
 
     // ---- gpui glue ----
@@ -640,6 +1353,8 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
+            s.workspace_scope = None;
+            s.auth = None;
             s.data_dir = Some(data_dir);
             cx.notify();
         });
@@ -669,9 +1384,15 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
-        self.connection = ConnectionStatus::Ready;
+        let engine_info = handle.engine_info();
+        self.workspace_scope = Some(engine_info.workspace_scope);
+        self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
-        self.watch_tasks = vec![
+        let mut watch_tasks = Vec::with_capacity(8);
+        if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
+            watch_tasks.push(task);
+        }
+        watch_tasks.extend([
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -684,6 +1405,18 @@ impl AppState {
                 handle.clone(),
                 methods::WATCH_DEVICES,
                 AppState::apply_devices,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_CONNECTIVITY,
+                AppState::apply_connectivity,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_TRANSFERS,
+                AppState::apply_transfers,
             ),
             spawn_watch(
                 cx,
@@ -705,12 +1438,45 @@ impl AppState {
                 AppState::apply_update,
             ),
             spawn_local_device_probe(cx, handle.clone()),
-        ];
+        ]);
+        self.watch_tasks = watch_tasks;
+        self.reconcile_change_request_watches(cx);
+        // EngineInfo is part of the attachment boundary: views must know which
+        // data profile they reached before they are allowed to render Ready.
+        self.connection = ConnectionStatus::Ready;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
         }
         cx.notify();
+    }
+
+    fn reconcile_change_request_watches(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            self.change_request_tasks.clear();
+            return;
+        };
+        let targets = desired_watch_targets(&self.chats, &self.spaces, |device| {
+            !self.change_requests.is_supported(device)
+        });
+
+        self.change_request_tasks
+            .retain(|target, _| targets.contains(target));
+        self.change_requests.retain_targets(&targets);
+
+        let local_device_id = self.local_device_id.clone();
+        for target in targets {
+            if self.change_request_tasks.contains_key(&target) {
+                continue;
+            }
+            let task = spawn_change_request_watch(
+                cx,
+                handle.clone(),
+                target.clone(),
+                local_device_id.clone(),
+            );
+            self.change_request_tasks.insert(target, task);
+        }
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -730,15 +1496,19 @@ impl AppState {
         self.transcript.clear();
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
-            // A chat implies its space; `select_chat(None)` (the new-session
-            // canvas) stays within the current space.
-            if let Some(space_id) = self
-                .chats
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.space_id.clone())
-            {
-                self.selected_space = Some(space_id);
+            // A chat implies its project (or the lack of one); `select_chat(None)`
+            // (the new-session canvas) keeps the current project pick.
+            if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+                match chat.space_id.clone() {
+                    Some(space_id) => {
+                        self.selected_space = Some(space_id);
+                        self.no_project = false;
+                    }
+                    None => {
+                        self.no_project = true;
+                        self.selected_device = Some(chat.device_id.clone());
+                    }
+                }
             }
             self.mark_chat_seen(id, cx);
         }
@@ -748,18 +1518,48 @@ impl AppState {
         cx.notify();
     }
 
-    /// Select a space; the caller (shell) decides which chat to land on.
+    /// Select a project; the caller (shell) decides which chat to land on.
+    /// `Some` clears a "Don't work in a project" opt-out and re-aims the
+    /// device pick at the project's host; `None` IS that opt-out.
     pub fn select_space(&mut self, space_id: Option<String>, cx: &mut Context<Self>) {
-        if self.selected_space == space_id {
+        match &space_id {
+            Some(id) => {
+                self.no_project = false;
+                if let Some(device) = self.space_row(id).map(|s| s.device_id.clone()) {
+                    self.selected_device = Some(device);
+                }
+            }
+            None => self.no_project = true,
+        }
+        if self.selected_space == space_id && space_id.is_some() {
+            cx.notify();
             return;
         }
-        self.selected_space = space_id;
+        if space_id.is_some() {
+            self.selected_space = space_id;
+        }
         cx.notify();
     }
 
     /// Synced seen marker: only fires when the chat is currently unseen
     /// (idempotence — no mutate spam), stamps the local row optimistically so
     /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
+    /// Window-focus liveness sweep: ask the engine to probe every open room
+    /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
+    /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
+    pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            let params = serde_json::json!({});
+            if let Err(err) = handle.client().call(methods::PROBE_SYNC, params).await {
+                tracing::debug!(error = %err, "probe sync failed");
+            }
+        })
+        .detach();
+    }
+
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
             return;
@@ -783,50 +1583,169 @@ impl AppState {
     }
 }
 
-/// Subscribe to a watch method and pump each frame through `apply`. Runs on the
-/// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: comet's `/` route redirected to the
-/// last-used chat; we approximate by selecting the most recent unarchived chat
-/// on the first frame when nothing is selected yet (manual selection wins).
+/// Observe assembly after an early attach (cloud onboarding or another viewport
+/// reaching the embedded engine over IPC). Data subscriptions wait on the same
+/// result, but their individual errors are not authoritative: older engines may
+/// legitimately omit a watch method. Only the assembly result may fail the
+/// whole connection.
+fn spawn_deferred_engine_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+) -> Option<Task<()>> {
+    let mut deferred = handle.deferred_state()?;
+    Some(cx.spawn(async move |this, cx| {
+        let Err(failure) = wait_for_deferred_engine(&mut deferred).await else {
+            return;
+        };
+        tracing::error!(error = %failure, "engine assembly failed after attachment");
+        // Embedded handles release their IPC listener before exposing Retry;
+        // remote handles stop their completed readiness probe.
+        handle.shutdown().await;
+        this.update(cx, |state, cx| {
+            state.connection = ConnectionStatus::Failed(failure);
+            cx.notify();
+        })
+        .ok();
+    }))
+}
+
+/// Chats watch. Boot selection is the shell's job; this task only pumps frames.
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(error = %err, "chats watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop (same contract as the transcript watch): a daemon
+        // restart or RPC drop ends the stream, and a bare return here froze
+        // the sidebar until app restart — new chats, renames and archives
+        // from every device silently stopped arriving.
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed chats frame");
+                    tracing::debug!(error = %err, "chats watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
+            while let Some(value) = rx.recv().await {
+                let parsed: Vec<Chat> = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed chats frame");
+                        continue;
                     }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    state.apply_chats(parsed);
+                    state.reconcile_change_request_watches(cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
                 }
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
             }
+            tracing::debug!("chats stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+pub use zeron_proto::version_triple;
+
+fn spawn_change_request_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    target: ChangeRequestWatchKey,
+    local_device_id: Option<String>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let params = watch_params(&target, local_device_id.as_deref());
+
+            let mut subscription = match handle
+                .client()
+                .subscribe_checked(methods::WATCH_CHECKOUT_CHANGE_REQUEST, params)
+                .await
+            {
+                Ok(subscription) => subscription,
+                Err(RpcError::UnknownMethod(_)) => {
+                    tracing::debug!(
+                        device = %target.device_id,
+                        "checkout change requests unsupported on device"
+                    );
+                    this.update(cx, |state, cx| {
+                        let engine_version = state
+                            .devices
+                            .iter()
+                            .find(|device| device.id == target.device_id)
+                            .and_then(|device| device.version.clone());
+                        state
+                            .change_requests
+                            .mark_unsupported(target.device_id.clone(), engine_version);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        device = %target.device_id,
+                        cwd = %target.cwd,
+                        error = %err,
+                        "checkout change request watch unavailable; retrying"
+                    );
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            while let Some(value) = subscription.recv().await {
+                let snapshot: CheckoutChangeRequestStatus = match serde_json::from_value(value) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        tracing::warn!(
+                            device = %target.device_id,
+                            cwd = %target.cwd,
+                            error = %err,
+                            "dropping malformed checkout change request frame"
+                        );
+                        continue;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        state.change_requests.store(target.clone(), snapshot);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            // Preserve the latest successful snapshot during a transport gap.
+            tracing::debug!(
+                device = %target.device_id,
+                cwd = %target.cwd,
+                "checkout change request stream ended; resubscribing"
+            );
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -838,32 +1757,52 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     apply: fn(&mut AppState, T),
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(method, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(method, error = %err, "watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: T = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop: these are the standing Sessions/Devices/Spaces
+        // watches — a daemon restart ended the stream and a bare return froze
+        // them for the rest of the app's life (remote Working dots staled out
+        // to nothing after 45s, and Idle/Completed transitions from other
+        // devices never arrived again — "the session never completes").
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(method, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                    tracing::debug!(method, error = %err, "watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                apply(state, parsed);
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
+            while let Some(value) = rx.recv().await {
+                let parsed: T = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    apply(state, parsed);
+                    if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
+                        state.reconcile_change_request_watches(cx);
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
             }
+            tracing::debug!(method, "watch stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -969,19 +1908,181 @@ fn spawn_transcript_watch(
     })
 }
 
+/// [`spawn_transcript_watch`]'s shape, writing into `sub_transcripts[doc_id]`
+/// instead of the selected chat's transcript. The apply guard is PER KEY:
+/// the map still holding the key (unwatch/snapshot both remove it), never
+/// `selected_chat` — a subagent tab outlives chat switches.
+fn spawn_subagent_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    doc_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": doc_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(%doc_id, error = %err, "subagent watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "malformed subagent frame; resubscribing");
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue 'resubscribe;
+                    }
+                };
+                let mut desync = false;
+                let alive = this.update(cx, |state, cx| {
+                    // A stale pump racing a snapshot/unwatch finds no key.
+                    if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
+                            tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
+                            desync = true;
+                        }
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+                if desync {
+                    continue 'resubscribe;
+                }
+            }
+            tracing::debug!(%doc_id, "subagent stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeDelta;
-    use comet_engine::{EngineCore, default_registry};
+    use zeron_engine::{EngineCore, default_registry};
     // `SessionStatus` is only needed to build the fixtures below — the module
-    // itself derives everything through `comet_proto::view`.
-    use comet_proto::{SessionStatus, UserProfile};
+    // itself derives everything through `zeron_proto::view`.
+    use zeron_proto::{SessionStatus, UserProfile};
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    struct LegacyIdentityRpc;
+
+    #[async_trait]
+    impl RpcService for LegacyIdentityRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::LOCAL_DEVICE => {
+                    RpcReply::value(&serde_json::json!({ "deviceId": "legacy-device" }))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    struct DeferredIdentityRpc {
+        engine_info: EngineInfo,
+        state: tokio::sync::watch::Receiver<DeferredEngineState>,
+    }
+
+    #[async_trait]
+    impl RpcService for DeferredIdentityRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+                methods::ENGINE_READY => {
+                    let mut state = self.state.clone();
+                    wait_for_deferred_engine(&mut state)
+                        .await
+                        .map_err(RpcError::Failed)?;
+                    RpcReply::value(&serde_json::json!({ "ready": true }))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_identity_falls_back_to_synced_scope() {
+        let client = memory_client(Arc::new(LegacyIdentityRpc));
+
+        let info = query_engine_info(&client).await.unwrap();
+
+        assert_eq!(info.device_id, "legacy-device");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(info.workspace_scope),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::SignIn
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_treats_legacy_daemon_as_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            Arc::new(LegacyIdentityRpc),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("legacy daemon remains attachable");
+
+        let mut deferred = handle
+            .deferred_state()
+            .expect("remote viewport tracks readiness");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_deferred_engine(&mut deferred),
+        )
+        .await
+        .expect("legacy readiness fallback completes")
+        .expect("unknown EngineReady means the old daemon is assembled");
+
+        handle.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -999,6 +2100,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
+        assert!(matches!(
+            handle
+                .deferred_state()
+                .expect("embedded lifecycle")
+                .borrow()
+                .clone(),
+            DeferredEngineState::Ready
+        ));
         // Same protocol over the in-memory transport: a real engine answers.
         let harnesses = handle
             .client()
@@ -1007,6 +2116,100 @@ mod tests {
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        zeron_engine::EngineProfile::local(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("profiles")).unwrap();
+        std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
+        let port = free_port().await;
+
+        let error = match EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        {
+            Ok(handle) => {
+                handle.shutdown().await;
+                panic!("a corrupt local store must fail bootstrap")
+            }
+            Err(error) => error,
+        };
+
+        assert!(!format!("{error:#}").is_empty());
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "failed bootstrap must release the IPC listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_engine_failure_remains_observable_after_early_attach() {
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        state_tx.send_replace(DeferredEngineState::Failed("store failed".into()));
+
+        assert_eq!(
+            wait_for_deferred_engine(&mut state_rx).await,
+            Err("store failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_observes_deferred_engine_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            Arc::new(DeferredIdentityRpc {
+                engine_info: EngineInfo {
+                    device_id: "owner-device".into(),
+                    workspace_scope: WorkspaceScope::Local,
+                },
+                state: state_rx,
+            }),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("second viewport attaches over IPC");
+        assert!(matches!(handle.mode(), EngineMode::Remote { .. }));
+
+        let mut deferred = handle
+            .deferred_state()
+            .expect("remote viewport tracks engine readiness");
+        state_tx.send_replace(DeferredEngineState::Failed("store failed".into()));
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("remote readiness probe completes"),
+            Err("store failed".into())
+        );
+
+        handle.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -1051,6 +2254,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_bootstraps_elect_one_embedded_engine() {
+        // Two viewports of one app booting at once (the Local-switch restart
+        // path): both used to probe a closed port, both embedded, and one lost
+        // the data-dir lock. The bootstrap gate must elect exactly one owner
+        // and turn the other into a plain remote attach.
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().await;
+        let config = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        };
+        let (a, b) = tokio::join!(
+            EngineHandle::bootstrap(config.clone()),
+            EngineHandle::bootstrap(config.clone()),
+        );
+        let a = a.expect("first viewport boots");
+        let b = b.expect("second viewport boots");
+
+        let modes = [a.mode(), b.mode()];
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| **mode == EngineMode::InProcess)
+                .count(),
+            1,
+            "exactly one viewport embeds: {modes:?}"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| matches!(mode, EngineMode::Remote { .. }))
+                .count(),
+            1,
+            "the other attaches over IPC: {modes:?}"
+        );
+
+        for handle in [&a, &b] {
+            let mut deferred = handle.deferred_state().expect("lifecycle tracked");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("readiness resolves")
+            .expect("both viewports reach Ready");
+        }
+
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
         // The port probe only proves *something* is listening. A process that
         // accepts TCP and never speaks WebSocket used to hang the dial forever;
@@ -1086,7 +2346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_bootstrap_requires_sign_in_before_opening_engine_data() {
+    async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
@@ -1100,6 +2360,14 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(info, *handle.engine_info());
+
         let mut auth = handle
             .client()
             .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
@@ -1109,6 +2377,55 @@ mod tests {
             parse_auth_state(&auth.recv().await.unwrap()),
             Some(AuthState::SignedOut)
         );
+        let harnesses = handle
+            .client()
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .expect("local data RPC is immediately available");
+        assert!(harnesses.as_array().is_some_and(|items| !items.is_empty()));
+        assert!(
+            !dir.path().join("orgs/dev-org/dev-user").exists(),
+            "production boot must not create dev-user data"
+        );
+        assert!(dir.path().join("profiles/local").is_dir());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn engine_info_is_available_while_cloud_onboarding_is_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
+        )
+        .unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            handle
+                .deferred_state()
+                .expect("embedded lifecycle")
+                .borrow()
+                .clone(),
+            DeferredEngineState::Waiting
+        ));
+
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .expect("EngineInfo bypasses deferred cloud stores");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
@@ -1118,18 +2435,15 @@ mod tests {
             )
             .await
             .is_err(),
-            "data RPC must wait behind the production sign-in gate"
+            "cloud data waits for organization onboarding"
         );
-        assert!(
-            !dir.path().join("orgs/dev-org/dev-user").exists(),
-            "production boot must not create dev-user data"
-        );
+        assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
     }
 
     #[tokio::test]
     async fn bootstrap_connects_when_daemon_is_listening() {
-        // Stand in for `comet headless`: an engine served over the WS IPC port.
+        // Stand in for `zeron headless`: an engine served over the WS IPC port.
         let daemon_dir = tempfile::tempdir().unwrap();
         let core = EngineCore::assemble(
             daemon_dir.path(),
@@ -1140,7 +2454,7 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(comet_rpc::serve_ws_listener(listener, core.rpc_service()));
+        tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
 
         let ui_dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
@@ -1160,12 +2474,23 @@ mod tests {
                 url: format!("ws://127.0.0.1:{port}")
             }
         );
+        assert_eq!(
+            handle.engine_info().workspace_scope,
+            WorkspaceScope::Development
+        );
         let harnesses = handle
             .client()
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
             .await
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(matches!(
+            handle
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({}))
+                .await,
+            Err(RpcError::UnknownMethod(method)) if method == methods::STOP_ENGINE
+        ));
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
@@ -1188,6 +2513,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            room_gen: None,
         }
     }
 
@@ -1219,7 +2545,189 @@ mod tests {
             status,
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
+            context_usage: None,
         }
+    }
+
+    fn user_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        }
+    }
+
+    fn device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn local_workspace_hides_the_unknown_device_sentinel() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.local_device_id = Some("local".into());
+
+        state.apply_devices(vec![
+            device("local", "unknown-device"),
+            device("remote", "unknown-device"),
+        ]);
+
+        assert_eq!(state.device_name("local"), Some("Local"));
+        assert_eq!(state.device_name("remote"), Some("unknown-device"));
+
+        state.apply_devices(vec![device("local", "José's MacBook Pro")]);
+        assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
+    }
+
+    #[test]
+    fn queued_unacked_takes_over_after_the_ttl() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        assert!(!s.send_queued_unacked("c", now), "no send, no queued line");
+        s.begin_pending_send("c", "m1", now);
+        // Inside the TTL the Working overlay owns the surface.
+        assert!(s.send_pending("c", now));
+        assert!(!s.send_queued_unacked("c", now));
+        // Past it, the overlay lapses and the queued line takes over.
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        assert!(!s.send_pending("c", later));
+        assert!(s.send_queued_unacked("c", later));
+        // The host ack (or failure cleanup) clears it.
+        s.end_pending_send("c", "m1");
+        assert!(!s.send_queued_unacked("c", later));
+    }
+
+    #[test]
+    fn transfer_percent_tracks_snapshots_by_upload_id() {
+        let mut s = AppState::new();
+        assert_eq!(s.transfer_percent("u1"), None);
+
+        let frame = |id: &str, done, total| zeron_proto::TransferProgress {
+            upload_id: id.into(),
+            file_name: "a.png".into(),
+            done,
+            total,
+        };
+        s.apply_transfers(vec![frame("u1", 430, 1_000), frame("u2", 0, 400)]);
+        assert_eq!(s.transfer_percent("u1"), Some(43));
+        assert_eq!(s.transfer_percent("u2"), Some(0));
+        assert_eq!(s.transfer_percent("other"), None);
+
+        // The last point belongs to the commit — never a stuck 100%; b64
+        // padding overshoot stays clamped too.
+        s.apply_transfers(vec![frame("u1", 1_000, 1_000), frame("u3", 12, 0)]);
+        assert_eq!(s.transfer_percent("u1"), Some(99));
+        // Zero-total renders indeterminate, not a division blowup.
+        assert_eq!(s.transfer_percent("u3"), None);
+        // Snapshots REPLACE: u2's transfer retired with its entry.
+        assert_eq!(s.transfer_percent("u2"), None);
+
+        s.apply_transfers(Vec::new());
+        assert_eq!(s.transfer_percent("u1"), None);
+    }
+
+    #[test]
+    fn upload_progress_percent_clamps_and_clears() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut s = AppState::new();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        let done = Arc::new(AtomicU64::new(0));
+        s.begin_upload_progress(1_000, done.clone());
+        assert_eq!(s.upload_progress_percent(), Some(0));
+        done.store(430, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(43));
+        // The last point belongs to commit+queue — never show a stuck 100%.
+        done.store(1_000, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+        // Overshoot (b64 padding rounding) stays clamped.
+        done.store(1_002, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+
+        s.end_upload_progress();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        // A zero-byte total renders as plain "Sending…", not a percent.
+        s.begin_upload_progress(0, Arc::new(AtomicU64::new(0)));
+        assert_eq!(s.upload_progress_percent(), None);
+    }
+
+    #[test]
+    fn device_version_change_reenables_change_request_capability() {
+        let mut state = AppState::new();
+        state
+            .change_requests
+            .mark_unsupported("remote".into(), Some("0.2.2".into()));
+        let mut old = device("remote", "Remote");
+        old.version = Some("0.2.2".into());
+        state.apply_devices(vec![old]);
+        assert!(!state.change_requests.is_supported("remote"));
+
+        let mut upgraded = device("remote", "Remote");
+        upgraded.version = Some("0.2.3".into());
+        state.apply_devices(vec![upgraded]);
+        assert!(state.change_requests.is_supported("remote"));
+    }
+
+    #[test]
+    fn send_pending_overlays_working_until_the_grace_window() {
+        let now = Utc::now();
+        let s_chat = chat("c", 0, Some(10)); // unseen, no session row
+        let mut s = AppState::new();
+        assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Completed);
+        assert_eq!(s.indicator_for("c", now), Indicator::None);
+        s.begin_pending_send("c", "m1", now);
+        assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Working);
+        assert_eq!(s.indicator_for("c", now), Indicator::Working);
+        // Time-bounded: an offline host must not leave an eternal spinner —
+        // past the grace the overlay yields (and `send_undelivered` takes
+        // over with the explicit failed state).
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        assert_eq!(
+            s.display_status_for(&s_chat, later),
+            ChatIndicator::Completed
+        );
+        assert_eq!(s.indicator_for("c", later), Indicator::None);
+        assert!(s.send_undelivered("c", later));
+    }
+
+    #[test]
+    fn send_pending_acked_when_the_host_writes_the_message_back() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        s.selected_chat = Some("c".into());
+        s.begin_pending_send("c", "m1", now);
+        // A frame without the message keeps the overlay.
+        s.apply_transcript(vec![user_entry("other")]);
+        assert!(s.send_pending("c", now));
+        // The host executed the command: our id comes back in the doc.
+        s.apply_transcript(vec![user_entry("other"), user_entry("m1")]);
+        assert!(!s.send_pending("c", now));
+    }
+
+    #[test]
+    fn send_failure_cleanup_only_ends_its_own_overlay() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        s.begin_pending_send("c", "m1", now);
+        s.begin_pending_send("c", "m2", now); // quick resend superseded m1
+        s.end_pending_send("c", "m1"); // m1's failure cleanup arrives late
+        assert!(s.send_pending("c", now), "m2's overlay must survive");
+        s.end_pending_send("c", "m2");
+        assert!(!s.send_pending("c", now));
     }
 
     #[test]
@@ -1405,15 +2913,17 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        // The overview shows every live-space chat (idle included) — chats of
-        // unknown spaces stay hidden. Completed ("old") outranks idle ("new").
+        // The overview shows every live-space chat (idle included) PLUS
+        // project-less chats (first-class since the project selectors);
+        // chats of unknown spaces stay hidden. Completed ("old") outranks
+        // idle ("new"/"dangling").
         let now = Utc::now();
         let overview: Vec<&str> = state
             .overview_chats(now)
             .iter()
             .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(overview, ["old", "new"]);
+        assert_eq!(overview, ["old", "new", "dangling"]);
     }
 
     #[test]
@@ -1434,12 +2944,12 @@ mod tests {
     fn apply_chat_config_stamps_the_row() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
-        let config = comet_proto::ChatConfig {
+        let config = zeron_proto::ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
-            reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -1458,12 +2968,12 @@ mod tests {
         // Unknown chat: no-op, no panic.
         state.apply_chat_config(
             "missing",
-            comet_proto::ChatConfig {
+            zeron_proto::ChatConfig {
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,
                 model_options: serde_json::Map::new(),
-                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             },
         );
     }
@@ -1484,11 +2994,12 @@ mod tests {
         state.selected_chat = Some("c1".into());
         let echo = SessionMessageEntry {
             id: "m1".into(),
-            role: comet_doc::MessageRole::User,
+            role: zeron_doc::MessageRole::User,
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         };
         state.push_echo("c1", echo.clone());
@@ -1533,22 +3044,33 @@ mod tests {
             name: None,
         };
         assert_eq!(
-            gate_phase(&ConnectionStatus::Connecting, None),
+            gate_phase(&ConnectionStatus::Connecting, None, None),
             GatePhase::Loading
         );
         assert_eq!(
-            gate_phase(&ConnectionStatus::Failed("boom".into()), None),
+            gate_phase(&ConnectionStatus::Failed("boom".into()), None, None),
             GatePhase::Failed("boom".into())
         );
-        // Unknown auth (pre-M4) gates nothing.
-        assert_eq!(gate_phase(&ConnectionStatus::Ready, None), GatePhase::Ready);
         assert_eq!(
-            gate_phase(&ConnectionStatus::Ready, Some(&AuthState::SignedOut)),
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::Ready
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
             GatePhase::SignIn
         );
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::SignedIn {
                     user: user.clone(),
                     org_id: None
@@ -1560,10 +3082,39 @@ mod tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::NeedsOrganization { user })
             ),
             GatePhase::OrgGate
         );
+    }
+
+    #[test]
+    fn auth_changes_do_not_change_a_local_runtime_scope_or_watches() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.watch_tasks.push(Task::ready(()));
+
+        state.apply_auth(AuthState::NeedsOrganization {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
+
+        state.apply_auth(AuthState::SignedIn {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
     }
 
     #[test]
@@ -1606,8 +3157,8 @@ mod tests {
 
     #[test]
     fn project_labels_from_cwd() {
-        assert_eq!(project_label(Some("/home/w/dev/comet")), "comet");
-        assert_eq!(project_label(Some("/home/w/dev/comet/")), "comet");
+        assert_eq!(project_label(Some("/home/w/dev/zeron")), "zeron");
+        assert_eq!(project_label(Some("/home/w/dev/zeron/")), "zeron");
         assert_eq!(project_label(None), "No project");
         assert_eq!(project_label(Some("   ")), "No project");
         assert_eq!(project_label(Some("/")), "/");
@@ -1617,22 +3168,22 @@ mod tests {
     fn grouped_sidebar_preserves_recency_order() {
         // Input is sidebar-sorted (most recent first).
         let chats = [
-            chat_with_cwd("a", 9, Some("/dev/comet")),
+            chat_with_cwd("a", 9, Some("/dev/zeron")),
             chat_with_cwd("b", 8, Some("/dev/zed")),
-            chat_with_cwd("c", 7, Some("/dev/comet")),
+            chat_with_cwd("c", 7, Some("/dev/zeron")),
             chat_with_cwd("d", 6, None),
         ];
         let groups = group_chats(chats.iter());
         let labels: Vec<&str> = groups.iter().map(|g| g.label.as_str()).collect();
         // Groups ordered by their most recent chat; rows keep order.
-        assert_eq!(labels, ["comet", "zed", "No project"]);
-        let comet_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(comet_ids, ["a", "c"]);
+        assert_eq!(labels, ["zeron", "zed", "No project"]);
+        let zeron_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(zeron_ids, ["a", "c"]);
         assert!(group_chats(std::iter::empty()).is_empty());
     }
 
     #[test]
-    fn relative_times_match_comet_format() {
+    fn relative_times_match_zeron_format() {
         let now = Utc::now();
         let ago = |secs: i64| now - chrono::Duration::seconds(secs);
         assert_eq!(format_time_ago(ago(0), now), "now");
@@ -1657,10 +3208,10 @@ mod tests {
     #[test]
     fn chat_location_joins_project_and_branch() {
         let mut c = chat_with_cwd("x", 1, Some("/home/w/dev/soccertcg"));
-        c.branch = Some("comet/rebalance".into());
+        c.branch = Some("zeron/rebalance".into());
         assert_eq!(
             chat_location(&c).as_deref(),
-            Some("soccertcg · comet/rebalance")
+            Some("soccertcg · zeron/rebalance")
         );
         c.branch = None;
         assert_eq!(chat_location(&c).as_deref(), Some("soccertcg"));
@@ -1701,5 +3252,108 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn version_triple_parses_and_gates_device_features() {
+        assert_eq!(version_triple("0.2.12"), Some((0, 2, 12)));
+        assert_eq!(version_triple("0.2.12-beta.1"), Some((0, 2, 12)));
+        assert_eq!(version_triple("1.0.0+build7"), Some((1, 0, 0)));
+        assert_eq!(version_triple("0.2"), None);
+        assert_eq!(version_triple("garbage"), None);
+
+        let mut s = AppState::default();
+        assert!(
+            !s.device_version_at_least("d1", (0, 2, 12)),
+            "unknown device conservatively fails the gate"
+        );
+        s.devices = vec![Device {
+            id: "d1".into(),
+            name: "laptop".into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: Some("0.2.12".into()),
+        }];
+        assert!(s.device_version_at_least("d1", (0, 2, 12)));
+        assert!(!s.device_version_at_least("d1", (0, 2, 13)));
+        s.devices[0].version = None;
+        assert!(
+            !s.device_version_at_least("d1", (0, 2, 12)),
+            "unstamped version conservatively fails the gate"
+        );
+    }
+
+    #[test]
+    fn delivery_degradation_and_queued_sends_tell_the_truth() {
+        use zeron_proto::{ChatConnectivity, ConnectivityState};
+        let now = Utc::now();
+        let mut s = AppState::default();
+        s.local_device_id = Some("local".into());
+        let mut remote = chat("c-remote", 0, None);
+        remote.device_id = "remote".into();
+        let mut local = chat("c-local", 0, None);
+        local.device_id = "local".into();
+        s.chats = vec![remote, local];
+        s.devices = vec![Device {
+            id: "remote".into(),
+            name: "vps".into(),
+            platform: "linux".into(),
+            last_seen_at: Some(now),
+            created_at: None,
+            version: None,
+        }];
+        s.connectivity.state = ConnectivityState::Connected;
+        s.connectivity.chats = vec![ChatConnectivity {
+            chat_id: "c-remote".into(),
+            connected: true,
+            pending_pushes: 0,
+        }];
+
+        // Healthy: nothing degraded.
+        assert!(!s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-local"));
+
+        // The chat's own room down → degraded even while globally Connected.
+        s.connectivity.chats[0].connected = false;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].connected = true;
+
+        // Host gone presence-dark → degraded (a send would queue at best).
+        s.devices[0].last_seen_at = Some(now - TimeDelta::minutes(10));
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.devices[0].last_seen_at = Some(now);
+
+        // OS offline: remote degrades; a locally-hosted chat NEVER does (the
+        // queued command executes on this device even fully offline).
+        s.connectivity.state = ConnectivityState::Offline;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-local"));
+
+        // Local profile (Disabled): nothing degrades.
+        s.connectivity.state = ConnectivityState::Disabled;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+
+        // Queued = pending send + degraded path — and degradation HOLDS the
+        // overlay past the grace window instead of silently expiring (the
+        // no-trace hole).
+        s.connectivity.state = ConnectivityState::Offline;
+        s.begin_pending_send("c-remote", "m1", now - TimeDelta::seconds(200));
+        assert!(s.send_pending("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        // Past the grace: the explicit failed state surfaces alongside.
+        assert!(s.send_undelivered("c-remote", now));
+        // Retry restarts the clock: back to Queued, no longer failed.
+        s.retry_pending_send("c-remote", now);
+        assert!(!s.send_undelivered("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        // Path healed with a stale unacked send: the overlay expires after
+        // the grace rather than holding forever.
+        s.retry_pending_send("c-remote", now - TimeDelta::seconds(200));
+        s.connectivity.state = ConnectivityState::Connected;
+        assert!(!s.send_pending("c-remote", now));
+        assert!(!s.send_queued("c-remote", now));
+        // …but the explicit undelivered flag still tells the truth.
+        assert!(s.send_undelivered("c-remote", now));
     }
 }

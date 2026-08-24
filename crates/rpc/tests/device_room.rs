@@ -25,13 +25,13 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
 
-use comet_rpc::device_room::{
+use zeron_rpc::device_room::{
     CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, NUDGE_KIND, RELAY_KIND,
 };
-use comet_rpc::{
+use zeron_rpc::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    RpcError, RpcReply, RpcService, StaticToken, decode_device_frame, device_room_ws_url,
-    encode_device_frame, methods,
+    RpcError, RpcReply, RpcService, StaticToken, TokenSource, decode_device_frame,
+    device_room_ws_url, encode_device_frame, methods,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,9 @@ enum Out {
 struct RelayState {
     host: Option<mpsc::UnboundedSender<Out>>,
     clients: HashMap<String, mpsc::UnboundedSender<Out>>,
+    /// Zombie-path simulation: the host stays "connected" (no bounce) but
+    /// client→host frames vanish — the 2026-08-19 dead edge↔host leg.
+    blackhole_host_bound: bool,
 }
 
 struct FakeRelay {
@@ -88,6 +91,12 @@ impl FakeRelay {
 
     async fn wait_host_connected(&self) {
         wait_until(|| self.host_connected()).await;
+    }
+
+    /// Swallow client→host frames while keeping the host registered — the
+    /// zombie relay path (client↔edge healthy, edge↔host dead).
+    fn set_blackhole_host_bound(&self, on: bool) {
+        self.state.lock().expect("lock").blackhole_host_bound = on;
     }
 
     /// Deliver a nudge frame to the connected host (the DO's /nudge live path).
@@ -179,6 +188,9 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
         };
         let st = state.lock().expect("lock");
         if !is_host {
+            if st.blackhole_host_bound {
+                continue; // zombie path: frame vanishes, no bounce
+            }
             match &st.host {
                 Some(host) => {
                     let mut routed = DeviceFrameHeader::new(header.s, header.k);
@@ -322,13 +334,145 @@ fn cache(edge_url: &str) -> Arc<LinkCache> {
     LinkCache::new(config)
 }
 
-fn noop_nudge() -> comet_rpc::NudgeHandler {
+fn noop_nudge() -> zeron_rpc::NudgeHandler {
     Arc::new(|_| {})
+}
+
+struct RecoveringToken {
+    value: Mutex<Option<String>>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl RecoveringToken {
+    fn new(value: Option<&str>) -> Self {
+        let (changes, _) = tokio::sync::watch::channel(0);
+        Self {
+            value: Mutex::new(value.map(str::to_string)),
+            changes,
+        }
+    }
+
+    fn replace(&self, value: &str) {
+        *self.value.lock().expect("lock") = Some(value.into());
+        self.changes
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    fn clear(&self) {
+        *self.value.lock().expect("lock") = None;
+        self.changes
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+}
+
+#[async_trait]
+impl TokenSource for RecoveringToken {
+    async fn token(&self) -> Option<String> {
+        self.value.lock().expect("lock").clone()
+    }
+
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn token_recovery_wakes_a_signed_out_host_relay_immediately() {
+    let relay = FakeRelay::start().await;
+    let token = Arc::new(RecoveringToken::new(None));
+    let mut config = HostRelayConfig::new(relay.edge_url(), "dev-a", token.clone());
+    // Without the token signal this test would remain asleep for two minutes.
+    config.retry = Duration::from_secs(120);
+    let _host = HostRelay::spawn(config, TestService::new("host-a"), noop_nudge());
+    tokio::task::yield_now().await;
+    assert!(!relay.host_connected());
+
+    token.replace("test-user");
+
+    relay.wait_host_connected().await;
+}
+
+#[tokio::test]
+async fn sign_out_closes_a_live_host_relay_immediately() {
+    let relay = FakeRelay::start().await;
+    let token = Arc::new(RecoveringToken::new(Some("test-user")));
+    let mut config = HostRelayConfig::new(relay.edge_url(), "dev-a", token.clone());
+    // A sign-out signal must close the authenticated socket, not wait for retry.
+    config.retry = Duration::from_secs(120);
+    let _host = HostRelay::spawn(config, TestService::new("host-a"), noop_nudge());
+    relay.wait_host_connected().await;
+
+    token.clear();
+
+    wait_until(|| !relay.host_connected()).await;
+}
+
+#[tokio::test]
+async fn token_rotation_does_not_interrupt_a_live_peer_link() {
+    let relay = FakeRelay::start().await;
+    let _host = HostRelay::spawn(
+        relay_config(&relay.edge_url(), 100),
+        TestService::new("host-a"),
+        noop_nudge(),
+    );
+    relay.wait_host_connected().await;
+
+    let token = Arc::new(RecoveringToken::new(Some("old-token")));
+    let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+    let client = links.client("dev-a").await.expect("client dials");
+    token.replace("new-token");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let echoed = client
+        .call("Echo", serde_json::json!({ "after": "refresh" }))
+        .await
+        .expect("live link survives token rotation");
+    assert_eq!(echoed["params"]["after"], "refresh");
+}
+
+#[tokio::test]
+async fn sign_out_closes_cached_peer_links() {
+    let relay = FakeRelay::start().await;
+    let _host = HostRelay::spawn(
+        relay_config(&relay.edge_url(), 100),
+        TestService::new("host-a"),
+        noop_nudge(),
+    );
+    relay.wait_host_connected().await;
+
+    let token = Arc::new(RecoveringToken::new(Some("test-user")));
+    let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+    let client = links.client("dev-a").await.expect("client dials");
+    client
+        .call("Echo", serde_json::json!({ "before": "sign-out" }))
+        .await
+        .expect("link is live before sign-out");
+
+    token.clear();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client
+                .call("Echo", serde_json::json!({ "after": "sign-out" }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cached peer link survived sign-out");
+    assert!(
+        links.client("dev-a").await.is_err(),
+        "signed-out cache must not redial"
+    );
+}
 
 #[tokio::test]
 async fn relay_serves_multiple_clients_end_to_end() {
@@ -531,7 +675,7 @@ async fn nudges_reach_the_host_callback() {
     let relay = FakeRelay::start().await;
     let service = TestService::new("host-a");
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id| {
+    let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id| {
         let _ = tx.send(chat_id);
     });
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, on_nudge);
@@ -546,15 +690,15 @@ async fn nudges_reach_the_host_callback() {
 }
 
 /// Live-edge variant: run the same host+client path through a real DeviceRoom DO.
-/// `COMET_EDGE_WS=http://127.0.0.1:26640 cargo test -p comet-rpc -- --ignored live_edge`
-/// (dev-mode edge; COMET_EDGE_TOKEN defaults to a fixed dev user id).
+/// `ZERON_EDGE_WS=http://127.0.0.1:26640 cargo test -p zeron-rpc -- --ignored live_edge`
+/// (dev-mode edge; ZERON_EDGE_TOKEN defaults to a fixed dev user id).
 #[tokio::test]
-#[ignore = "needs a running edge (set COMET_EDGE_WS)"]
+#[ignore = "needs a running edge (set ZERON_EDGE_WS)"]
 async fn live_edge_relay_round_trip() {
-    let Ok(edge_url) = std::env::var("COMET_EDGE_WS") else {
-        panic!("set COMET_EDGE_WS to the edge base URL (e.g. http://127.0.0.1:26640)");
+    let Ok(edge_url) = std::env::var("ZERON_EDGE_WS") else {
+        panic!("set ZERON_EDGE_WS to the edge base URL (e.g. http://127.0.0.1:26640)");
     };
-    let token = std::env::var("COMET_EDGE_TOKEN").unwrap_or_else(|_| "relay-live-test".into());
+    let token = std::env::var("ZERON_EDGE_TOKEN").unwrap_or_else(|_| "relay-live-test".into());
     let device_id = format!("relay-live-{}", uuid::Uuid::new_v4());
 
     let service = TestService::new("live-host");
@@ -586,4 +730,37 @@ async fn live_edge_relay_round_trip() {
         .expect("echo");
     assert_eq!(echoed["host"], "live-host");
     assert_eq!(echoed["params"]["live"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zombie_relay_path_trips_the_echo_deadline() {
+    // 2026-08-19 incident shape: the client↔edge leg stays healthy (pongs
+    // flow), the edge↔host leg is dead — the link used to sit "open" for
+    // minutes, retrying frames into the void, until an unrelated host-session
+    // cycle exposed it. The app-level echo must rule the link dead within its
+    // deadline instead.
+    zeron_rpc::device_room::set_client_liveness_for_tests(
+        Duration::from_millis(100),
+        Duration::from_millis(600),
+    );
+    let relay = FakeRelay::start().await;
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
+    relay.wait_host_connected().await;
+
+    let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("c-echo"), "tok");
+    let link = DeviceLink::connect(&url).await.expect("client link dials");
+    // Healthy phase: echoes flow, the deadline never trips.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!link.is_closed(), "echoing link must stay open");
+
+    relay.set_blackhole_host_bound(true);
+    wait_until(|| link.is_closed()).await;
+    assert_eq!(
+        link.closed().borrow().as_deref(),
+        Some("host echo silent"),
+        "the zombie path must be ruled dead by the echo deadline"
+    );
+    // Restore the production clocks for the rest of the process's tests.
+    zeron_rpc::device_room::set_client_liveness_for_tests(Duration::ZERO, Duration::ZERO);
 }

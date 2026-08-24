@@ -3,8 +3,8 @@
 //!
 //! Row model (docs/research/mugen-pretext.md §3):
 //! - one row per BLOCK: user message = one bubble row; assistant messages split
-//!   into one row per markdown top-level block, plus consecutive-tool groups and
-//!   input/error chips;
+//!   into one row per markdown top-level block, plus consecutive-tool groups
+//!   (agent/spawn chips split out so they never collapse) and input/error chips;
 //! - stable row ids `{msgId}#{partId}.{blockIx}` / `{msgId}#g{groupIx}` — LIVE
 //!   (streaming) entries split per block exactly like completed ones (the list
 //!   virtualizes them, so a fading live reply re-renders only its visible tail
@@ -12,7 +12,10 @@
 //!   keeps its id, so row identity is continuous and nothing flickers;
 //! - rows are cached per entry keyed by a content fingerprint — only changed
 //!   messages rebuild (the anti-"streaming stutter" trick);
-//! - row-set changes diff by (id, version) into one minimal `splice`.
+//! - row-set changes diff by (id, version) into one minimal `splice`;
+//! - the user row for the turn crossing the reading line is repainted as an
+//!   absolute sticky header, bounded by the next user row, so virtualization
+//!   stays flat while historical turns retain their prompt context.
 //!
 //! Stick-to-bottom is a velocity spring (mugen §1e, the same shape as
 //! stackblitz's use-stick-to-bottom): while pinned, a per-frame stepper glides
@@ -20,31 +23,39 @@
 //! smoothed target growth, so 120ms doc commits read as a continuous glide
 //! instead of per-commit snaps. The pin breaks only on user input (the list's
 //! scroll handler fires exclusively from its wheel/touch path) and re-engages
-//! inside the 70px band; own-send re-engages with the same glide.
+//! inside the 70px band; the first send in an empty chat anchors the prompt at
+//! the viewport top and hands off to the same glide when the reply overflows.
+//! While that anchor holds, wheel/touch is clamped rather than obeyed — the
+//! whole turn is already visible, so there is nothing to scroll to.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
-    ListState, ObjectFit, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
+    Point, ScrollHandle, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
+    UniformListScrollHandle, Window, canvas, div, img, list, prelude::*, px, quad, uniform_list,
 };
 
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::ToolCall;
+use zeron_doc::{
+    FileChangePreview, MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus,
+};
+use zeron_proto::{TodoItem, ToolCall, view::tool_presentation};
 
-use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
+use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
+use crate::turn_steps::{TurnStepsMode, plan_turn_steps};
+use comet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
@@ -56,19 +67,67 @@ pub const STICK_THRESHOLD_PX: f32 = 70.0;
 pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
+/// Text-selection edge scrolling runs only during a drag. A 24 ms cadence is
+/// smooth enough to track text while avoiding a permanent animation-frame loop
+/// on low-end devices.
+const SELECTION_SCROLL_TICK_MS: u64 = 24;
+const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
+const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
+const INLINE_IMAGE_CACHE_MAX_ENTRIES: usize = 24;
+const INLINE_IMAGE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const INLINE_IMAGE_CACHE_MAX_TOTAL: usize = 32;
+const INLINE_IMAGE_MAX_INFLIGHT: usize = 4;
+const MERMAID_CACHE_MAX_ENTRIES: usize = 16;
+const MERMAID_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MERMAID_CACHE_MAX_TOTAL: usize = 20;
+const MERMAID_MAX_INFLIGHT: usize = 2;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
 pub const GAP_BLOCK: f32 = 8.0;
-/// Transcript column max width (comet 46rem).
+/// Transcript column max width (zeron 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// Tool chip row height / gap — analytic, so fold heights need no measurement.
-/// A row is the guide rail + a 30px chip card centered in it (comet
+/// A row is the guide rail + a 30px chip card centered in it (zeron
 /// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
 /// gap so the rail reads continuous.
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
+/// Inner height of the chip header: [`CHIP_CARD_HEIGHT`] is the card's
+/// border-box (explicit `h` in gpui includes the 1px border), so a 30px
+/// header inside a 30px bordered card clips 2px off the bottom and every
+/// glyph/icon reads high (user report).
+const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
+
+/// Signed list scroll step for a pointer near a viewport edge.
+///
+/// GPUI list offsets increase toward the document bottom. The quadratic ramp
+/// keeps entry into the edge zone gentle and reaches full speed at the edge.
+fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
+    let height = f32::from(bounds.size.height);
+    if height <= 0.0 {
+        return 0.0;
+    }
+    let edge = SELECTION_SCROLL_EDGE_PX.min(height / 3.0);
+    if edge <= 0.0 {
+        return 0.0;
+    }
+    let y = f32::from(position.y);
+    let top = f32::from(bounds.top());
+    let bottom = f32::from(bounds.bottom());
+    let scaled = |penetration: f32| {
+        let t = (penetration / edge).clamp(0.0, 1.0);
+        SELECTION_SCROLL_MAX_STEP_PX * t * t
+    };
+    if y < top + edge {
+        -scaled(top + edge - y)
+    } else if y > bottom - edge {
+        scaled(y - (bottom - edge))
+    } else {
+        0.0
+    }
+}
 const CHIPS_TOP_PAD: f32 = 2.0;
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
@@ -79,6 +138,46 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+pub const USER_MESSAGE_CARD_MAX_HEIGHT: f32 = 100.0;
+pub const USER_MESSAGE_CARD_PAD_Y: f32 = 8.0;
+pub const USER_MESSAGE_CARD_RADIUS: f32 = 12.0;
+pub const USER_MESSAGE_FADE_HEIGHT: f32 = 40.0;
+
+fn user_message_overflows(content_height: f32) -> bool {
+    content_height > USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0
+}
+
+fn user_message_attachment_summary(count: usize) -> Option<SharedString> {
+    match count {
+        0 => None,
+        1 => Some("Using image".into()),
+        count => Some(format!("Using {count} images").into()),
+    }
+}
+
+fn user_message_card_background(theme: &Theme) -> gpui::Hsla {
+    theme.input_glass_bg()
+}
+
+#[derive(Clone, Copy)]
+struct StickyTurnSurface {
+    outer_background: Option<gpui::Hsla>,
+    occlusion_background: Option<gpui::Hsla>,
+    occlusion_radius: f32,
+    occlusion_blur_radius: f32,
+}
+
+/// The positioning wrapper is layout-only. The card-shaped inner layer blurs
+/// scrolling content before the reused translucent user card paints, avoiding
+/// both text ghosting and the old full-width rectangular plate.
+fn sticky_turn_surface(theme: &Theme) -> StickyTurnSurface {
+    StickyTurnSurface {
+        outer_background: None,
+        occlusion_background: (!theme.is_frost()).then_some(theme.bg),
+        occlusion_radius: USER_MESSAGE_CARD_RADIUS,
+        occlusion_blur_radius: 16.0,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -107,6 +206,35 @@ pub const AT_BOTTOM_PX: f32 = 2.0;
 pub const SPRING_SETTLE_GRACE_MS: u64 = 500;
 /// Teleport when farther than this many viewports from the end; glide the rest.
 pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
+/// A freshly-sent prompt rests this far below the transcript viewport's top.
+/// The titlebar overlays the full-height list, so its height is part of the
+/// inset; the extra 10px matches the first row's breathing room.
+pub(crate) const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
+/// Epsilon of extra height under the reservation. The runway ends AT the
+/// app's bottom — this is not scroll room (24px of it read as a janky
+/// overshoot-and-fight zone, user report) — it exists only to keep the held
+/// layout out of gpui's shorter-than-viewport regime, where a bottom-aligned
+/// list reports no item bounds (sizing goes blind) and position becomes a
+/// function of content height instead of the hold. Two pixels of travel is
+/// below perception.
+const OWN_SEND_SCROLL_SLACK_PX: f32 = 2.0;
+/// Per-60fps-frame fraction of the remaining entry glide retained (~90%
+/// covered in ~230ms, ease-out).
+const OWN_SEND_GLIDE_RETAIN: f32 = 0.85;
+/// The anchor glide snaps to its hold position within this error.
+const OWN_SEND_GLIDE_SNAP_PX: f32 = 1.0;
+
+/// The reservation a held turn still needs: the room under the prompt's
+/// top-inset position (`usable` = viewport minus inset and bottom chrome)
+/// not yet consumed by the turn's own content. Zero once the reply has
+/// filled the reserved space — the notes-app `minHeight` analogue.
+fn own_turn_reservation(usable: f32, turn_height: f32) -> f32 {
+    (usable - turn_height).max(0.0)
+}
+
+fn runway_owns_user_position(held: bool, positioned: bool, has_landed: bool) -> bool {
+    held && (!has_landed || positioned)
+}
 
 /// Pure stick-to-bottom spring stepper — the mugen `tick()` integration:
 /// velocity relaxes toward `(damping·v + stiffness·diff)/mass` per 60fps
@@ -190,9 +318,307 @@ impl StickSpring {
 /// One tool invocation inside a group row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolItem {
+    pub id: SharedString,
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    pub execution: Option<zeron_proto::ToolExecutionMeta>,
+    /// Expandable detail: a code-block of output lines, or a real diff
+    /// section rendered by the changes pane's component (ACP harnesses).
+    /// Precomputed here because rows are cached by fingerprint — diffing and
+    /// tokenizing per paint would run on every scroll frame.
+    pub detail: Option<Arc<ToolDetail>>,
+    /// Full invocation rendered above the result when a card opens.
+    pub invocation: Option<Arc<ToolDetail>>,
+    /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
+    /// a one-line summary; expanding offers a lazy "Show full output" fetch.
+    pub output_ref: Option<SharedString>,
+    /// Full-output size, for the affordance label ("Show full output (12 KB)").
+    pub output_bytes: Option<u64>,
+    /// Sidecar key of the full diff (doc carries only per-file stats).
+    pub diff_ref: Option<SharedString>,
+    /// Bounded semantic preview carried by the synchronized doc. Full bodies
+    /// are fetched from the owning device only when the completed card opens.
+    pub file_preview: Option<Arc<FileChangePreview>>,
+    /// The spawned SUBAGENT's doc id — the chip IS the index (there is no
+    /// listing endpoint); with it the chip offers "Open subagent".
+    pub subagent_ref: Option<SharedString>,
+    /// Subagent lifecycle, distinct from `resolved` (eager-done: the spawn
+    /// tool's own result lands while the subagent still runs).
+    pub subagent_status: Option<SubagentStatus>,
+    /// One-line live tail — LEGACY docs only (new runs stopped folding it;
+    /// per-delta header rewrites read as noise). Never rendered; still
+    /// fingerprinted so an old doc's chips re-splice correctly.
+    pub subagent_tail: Option<SharedString>,
+}
+
+/// Subagent spawn chips — the "Agent[: <description>]" Unknown convention
+/// every native driver uses, or any tool the engine has already bound to a
+/// subagent doc. These stay out of the collapsible "Called N tools" wrap so
+/// a running subagent is visible without opening the fold.
+fn is_agent_name(name: &str) -> bool {
+    name == "Agent" || name.starts_with("Agent: ")
+}
+
+fn is_agent_call(call: &ToolCall) -> bool {
+    match call {
+        ToolCall::Unknown { name, .. } => is_agent_name(name),
+        ToolCall::Mcp { tool, .. } => is_agent_name(tool),
+        _ => false,
+    }
+}
+
+fn is_agent_tool(item: &ToolItem) -> bool {
+    item.subagent_ref.is_some() || is_agent_call(&item.call)
+}
+
+/// Ordinary tool groups fold behind a summary header; agent/spawn chips
+/// render as their own always-open row.
+fn tool_group_collapses(tools: &[ToolItem]) -> bool {
+    tools.iter().any(|t| !is_agent_tool(t))
+}
+
+/// A chip's expandable detail payload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolDetail {
+    /// Command/tool output as a code block: verbatim lines (indentation
+    /// intact), capped at [`OUTPUT_DETAIL_MAX_LINES`] with a counted tail.
+    Output {
+        lines: Vec<SharedString>,
+        truncated_by: usize,
+    },
+    /// A file diff, in the changes pane's model: hunks with 3 lines of
+    /// context, dual line numbers, and (for recognized languages) syntax
+    /// tokens — rendered by `changes::render_file_body`.
+    Diff {
+        file: Arc<crate::changes::FileDiff>,
+        old_text: Option<Arc<str>>,
+        new_text: Option<Arc<str>>,
+    },
+    /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
+    /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
+    /// via the sidecar fetch.
+    Stats {
+        stats: Arc<Vec<zeron_doc::ToolDiffStat>>,
+    },
+}
+
+/// Max verbatim output lines per chip before the counted tail row.
+pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
+
+/// Max diff lines an inline tool-diff detail renders — the detail is one
+/// stacked element inside its transcript row, so it must stay bounded
+/// (~600 lines ≈ 12.6k px, several screens of context before the cut).
+pub const DIFF_DETAIL_MAX_LINES: usize = 600;
+
+/// Per-line height of an output detail block (diff blocks use the changes
+/// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
+pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
+
+/// Vertical padding of an output detail body (py(6) × 2).
+const OUTPUT_BODY_PAD: f32 = 12.0;
+
+/// The hairline between an expanded chip's header row and its detail body.
+const DETAIL_SEPARATOR: f32 = 1.0;
+
+/// Build a tool part's expandable detail. A diff wins over raw output (it is
+/// the more structured record of the same action); post-strip docs carry diff
+/// STATS instead of inline diff text, which win the same way.
+pub fn tool_detail(
+    output: Option<&str>,
+    diff: Option<&zeron_proto::ToolDiff>,
+    diff_stats: Option<&[zeron_doc::ToolDiffStat]>,
+) -> Option<ToolDetail> {
+    if let Some(diff) = diff {
+        let mut file = diff_to_file(diff);
+        if file.hunks.is_empty() {
+            return None;
+        }
+        // A transcript diff renders as one stacked element inside its row —
+        // cap it so a whole-file rewrite (or fetched full-diff blob) can't
+        // build tens of thousands of elements per frame. The changes pane
+        // has no such cap; it virtualizes per line.
+        crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
+        return Some(ToolDetail::Diff {
+            file: Arc::new(file),
+            old_text: diff.old_text.as_deref().map(Arc::from),
+            new_text: Some(Arc::from(diff.new_text.as_str())),
+        });
+    }
+    if let Some(stats) = diff_stats.filter(|s| !s.is_empty()) {
+        return Some(ToolDetail::Stats {
+            stats: Arc::new(stats.to_vec()),
+        });
+    }
+    let output = output?;
+    let mut lines: Vec<SharedString> = output
+        .lines()
+        .map(|l| SharedString::from(l.to_owned()))
+        .collect();
+    // Trim trailing blank output lines so the block hugs its content.
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Columns at which an invocation line soft-wraps into continuation lines.
+/// The wrap is char-counted, not measured — block heights must be analytic —
+/// so the budget is sized to fit the narrowest useful transcript pane.
+pub const CALL_WRAP_COLS: usize = 80;
+
+/// Soft-wrap one raw line into [`CALL_WRAP_COLS`]-char chunks so a long
+/// single-line command stays fully readable instead of ellipsizing.
+fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
+    if line.chars().count() <= cols {
+        return vec![SharedString::from(line.to_owned())];
+    }
+    line.chars()
+        .collect::<Vec<_>>()
+        .chunks(cols)
+        .map(|chunk| SharedString::from(chunk.iter().collect::<String>()))
+        .collect()
+}
+
+/// Build a chip's full-invocation block — the complete tool call the header
+/// truncates to one line: the whole command, pattern, or URL, todo items one
+/// per line, MCP/unknown input as pretty-printed JSON. Reuses the output
+/// code-block payload so rendering and height stay one implementation.
+pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
+    let text: String = match call {
+        ToolCall::Exec { command } => command.clone(),
+        ToolCall::ReadFile { path } => path.clone(),
+        ToolCall::WriteFile { path, content } => match content {
+            Some(content) => format!("{path}\n{content}"),
+            None => path.clone(),
+        },
+        ToolCall::EditFile { path, .. } => path.clone(),
+        ToolCall::ApplyPatch { path } => path.clone().unwrap_or_else(|| "workspace".into()),
+        ToolCall::Search { pattern, path } => match path {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.clone(),
+        },
+        ToolCall::Glob { pattern } => pattern.clone(),
+        ToolCall::WebFetch { url, prompt } => match prompt {
+            Some(prompt) => format!("{url}\n{prompt}"),
+            None => url.clone(),
+        },
+        ToolCall::WebSearch { query } => query.clone(),
+        ToolCall::Todo { items } => items
+            .iter()
+            .map(|i| format!("{} {}", if i.done { "[x]" } else { "[ ]" }, i.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => match input {
+            Some(input) => format!(
+                "{server} · {tool}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => return None,
+        },
+        ToolCall::Unknown { name, input } => match input {
+            Some(input) => format!(
+                "{name}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => name.clone(),
+        },
+    };
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .flat_map(|l| wrap_cols(l, CALL_WRAP_COLS))
+        .collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Reduce an inline [`zeron_proto::ToolDiff`] to the changes pane's
+/// [`crate::changes::FileDiff`]: hunks grouped with 3 context lines, dual
+/// 1-based line numbers, unified-diff hunk headers, and add/del counts.
+pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
+    use crate::changes::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+    let old = diff.old_text.as_deref().unwrap_or("");
+    let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
+    let mut hunks = Vec::new();
+    let (mut additions, mut deletions) = (0u32, 0u32);
+    let mut max_line = 0u32;
+    for group in text_diff.grouped_ops(3) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else {
+            continue;
+        };
+        let old_range = first.old_range().start..last.old_range().end;
+        let new_range = first.new_range().start..last.new_range().end;
+        let header = format!(
+            "@@ -{},{} +{},{} @@",
+            old_range.start + 1,
+            old_range.len(),
+            new_range.start + 1,
+            new_range.len(),
+        );
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in text_diff.iter_changes(op) {
+                let kind = match change.tag() {
+                    similar::ChangeTag::Delete => {
+                        deletions += 1;
+                        LineKind::Del
+                    }
+                    similar::ChangeTag::Insert => {
+                        additions += 1;
+                        LineKind::Add
+                    }
+                    similar::ChangeTag::Equal => LineKind::Context,
+                };
+                let old_no = change.old_index().map(|n| n as u32 + 1);
+                let new_no = change.new_index().map(|n| n as u32 + 1);
+                max_line = max_line.max(old_no.unwrap_or(0)).max(new_no.unwrap_or(0));
+                lines.push(DiffLine {
+                    kind,
+                    old_no,
+                    new_no,
+                    text: change.value().trim_end_matches('\n').to_owned(),
+                });
+            }
+        }
+        hunks.push(Hunk { header, lines });
+    }
+    FileDiff {
+        path: diff.path.clone(),
+        old_path: None,
+        status: if diff.old_text.is_none() {
+            FileStatus::Added
+        } else {
+            FileStatus::Modified
+        },
+        binary: false,
+        notices: Vec::new(),
+        hunks,
+        additions,
+        deletions,
+        max_line,
+    }
 }
 
 #[derive(Clone)]
@@ -209,6 +635,8 @@ pub enum RowKind {
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
+        /// Context the prompt folded in as text, lifted back out by `badges`.
+        badges: Arc<Vec<crate::badges::MessageBadge>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
     },
@@ -225,9 +653,32 @@ pub enum RowKind {
         tree: Arc<BlockTree>,
         block_ix: usize,
     },
+    Reasoning {
+        tree: Arc<BlockTree>,
+        active: bool,
+        duration_ms: Option<u64>,
+    },
+    InlineImages {
+        paths: Arc<Vec<String>>,
+    },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
+        detail_auto_open: bool,
+    },
+    FileChange {
+        tool: ToolItem,
+    },
+    TurnSteps {
+        rows: Arc<Vec<Row>>,
+        summary: SharedString,
+        duration_ms: Option<u64>,
+    },
+    TaskSnapshot {
+        items: Arc<Vec<TaskSnapshotItem>>,
+        created: bool,
+        resolved: bool,
+        is_error: bool,
     },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
@@ -243,6 +694,23 @@ pub enum RowKind {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskChange {
+    Created,
+    Started,
+    Completed,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshotItem {
+    ordinal: usize,
+    text: String,
+    done: bool,
+    current: bool,
+    change: Option<TaskChange>,
+}
+
 /// A transcript row: stable id + content version (diff key) + block payload.
 #[derive(Clone)]
 pub struct Row {
@@ -252,12 +720,101 @@ pub struct Row {
     pub turn_start: bool,
     pub kind: RowKind,
     /// The owning message entry — hover anywhere on the entry's rows reveals
-    /// its timestamp strip (comet chat-view.tsx `group`/`group-hover`).
+    /// its timestamp strip (zeron chat-view.tsx `group`/`group-hover`).
     pub entry_id: SharedString,
     /// Epoch-ms for the 16px hover-timestamp strip UNDER this row: set on the
     /// LAST row of a completed entry (user rows always; assistant rows only
     /// once streaming ends — "the turn isn't at a time yet", chat-view.tsx).
     pub timestamp: Option<i64>,
+}
+
+struct ProjectedRow {
+    source_start: usize,
+    source_end: usize,
+    row: Row,
+}
+
+fn visit_row_ids(row: &Row, visit: &mut impl FnMut(&SharedString)) {
+    visit(&row.id);
+    if let RowKind::TurnSteps { rows, .. } = &row.kind {
+        for child in rows.iter() {
+            visit_row_ids(child, visit);
+        }
+    }
+}
+
+fn row_contains_id(row: &Row, id: &SharedString) -> bool {
+    if &row.id == id {
+        return true;
+    }
+    matches!(&row.kind, RowKind::TurnSteps { rows, .. } if rows.iter().any(|row| row_contains_id(row, id)))
+}
+
+#[cfg(test)]
+fn row_render_ids(row: &Row) -> Vec<SharedString> {
+    let mut ids = Vec::new();
+    visit_row_ids(row, &mut |id| ids.push(id.clone()));
+    ids
+}
+
+fn live_turn_step_ids(rows: &[Row]) -> std::collections::HashSet<SharedString> {
+    rows.iter()
+        .filter(|row| matches!(row.kind, RowKind::TurnSteps { .. }))
+        .map(|row| row.id.clone())
+        .collect()
+}
+
+fn prune_turn_steps_state(state: &mut HashMap<SharedString, bool>, rows: &[Row]) {
+    let live = live_turn_step_ids(rows);
+    state.retain(|id, _| live.contains(id));
+}
+
+fn collect_file_change_ids(row: &Row, live: &mut std::collections::HashSet<SharedString>) {
+    match &row.kind {
+        RowKind::FileChange { .. } => {
+            live.insert(row.id.clone());
+        }
+        RowKind::TurnSteps { rows, .. } => {
+            for child in rows.iter() {
+                collect_file_change_ids(child, live);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn live_file_change_ids(rows: &[Row]) -> std::collections::HashSet<SharedString> {
+    let mut live = std::collections::HashSet::new();
+    for row in rows {
+        collect_file_change_ids(row, &mut live);
+    }
+    live
+}
+
+fn file_change_path(call: &ToolCall) -> Option<&str> {
+    match call {
+        ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+fn file_open_target(
+    context_key: &str,
+    cwd: &str,
+    path: &str,
+) -> Option<(String, std::path::PathBuf, String)> {
+    let root = std::path::PathBuf::from(cwd);
+    let candidate = std::path::Path::new(path);
+    let relative = if candidate.is_absolute() {
+        candidate
+            .strip_prefix(&root)
+            .ok()?
+            .to_string_lossy()
+            .to_string()
+    } else {
+        path.to_string()
+    };
+    Some((context_key.to_string(), root, relative))
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -286,16 +843,352 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
-    let mut acc = Vec::with_capacity(tools.len() * 8 + 1);
+fn append_todo_snapshot_bytes(bytes: &mut Vec<u8>, items: &[TodoItem]) {
+    bytes.extend_from_slice(&(items.len() as u64).to_le_bytes());
+    for item in items {
+        bytes.extend_from_slice(&(item.text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(item.text.as_bytes());
+        bytes.push(item.done as u8);
+    }
+}
+
+fn todo_snapshot_version(
+    previous: &[TodoItem],
+    items: &[TodoItem],
+    resolved: bool,
+    is_error: bool,
+    created: bool,
+) -> u64 {
+    let mut bytes = Vec::new();
+    append_todo_snapshot_bytes(&mut bytes, previous);
+    append_todo_snapshot_bytes(&mut bytes, items);
+    bytes.push(resolved as u8 | (is_error as u8) << 1 | (created as u8) << 2);
+    fnv1a(&bytes)
+}
+
+fn task_snapshot_items(
+    previous: &[TodoItem],
+    current: &[TodoItem],
+    created: bool,
+) -> Vec<TaskSnapshotItem> {
+    let current_index = current.iter().position(|item| !item.done);
+    if created {
+        return current
+            .iter()
+            .enumerate()
+            .map(|(index, item)| TaskSnapshotItem {
+                ordinal: index + 1,
+                text: item.text.clone(),
+                done: item.done,
+                current: current_index == Some(index),
+                change: None,
+            })
+            .collect();
+    }
+
+    let previous_by_text: HashMap<&str, &TodoItem> = previous
+        .iter()
+        .map(|item| (item.text.as_str(), item))
+        .collect();
+    let current_by_text: HashMap<&str, &TodoItem> = current
+        .iter()
+        .map(|item| (item.text.as_str(), item))
+        .collect();
+    let previous_current = previous
+        .iter()
+        .find(|item| !item.done)
+        .map(|item| item.text.as_str());
+    let current_current = current_index.map(|index| current[index].text.as_str());
+
+    let mut changes = Vec::new();
+    for (index, item) in current.iter().enumerate() {
+        let change = match previous_by_text.get(item.text.as_str()) {
+            None => Some(TaskChange::Created),
+            Some(previous) if previous.done != item.done => Some(if item.done {
+                TaskChange::Completed
+            } else {
+                TaskChange::Started
+            }),
+            Some(_)
+                if current_current == Some(item.text.as_str())
+                    && previous_current != current_current =>
+            {
+                Some(TaskChange::Started)
+            }
+            Some(_) => None,
+        };
+        if let Some(change) = change {
+            changes.push(TaskSnapshotItem {
+                ordinal: index + 1,
+                text: item.text.clone(),
+                done: item.done,
+                current: current_current == Some(item.text.as_str()),
+                change: Some(change),
+            });
+        }
+    }
+    for (index, item) in previous.iter().enumerate() {
+        if !current_by_text.contains_key(item.text.as_str()) {
+            changes.push(TaskSnapshotItem {
+                ordinal: index + 1,
+                text: item.text.clone(),
+                done: item.done,
+                current: false,
+                change: Some(TaskChange::Deleted),
+            });
+        }
+    }
+    changes.sort_by_key(|item| item.ordinal);
+    changes
+}
+
+fn last_todo_snapshot(entry: &SessionMessageEntry) -> Option<&[TodoItem]> {
+    entry.parts.iter().rev().find_map(|part| match part {
+        MessagePart::Tool {
+            call: ToolCall::Todo { items },
+            ..
+        } => Some(items.as_slice()),
+        _ => None,
+    })
+}
+
+fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool) -> u64 {
+    let mut acc = Vec::with_capacity(tools.len() * 8 + 2);
     for t in tools {
+        acc.extend_from_slice(t.id.as_bytes());
         let (label, detail) = tool_chip_content(&t.call);
         acc.extend_from_slice(label.as_bytes());
         acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
+        if let Some(execution) = t.execution {
+            acc.extend_from_slice(&execution.exit_code.unwrap_or_default().to_le_bytes());
+            acc.extend_from_slice(&execution.duration_ms.unwrap_or_default().to_le_bytes());
+        }
+        // Detail payload arriving (or growing) must re-splice the row even
+        // when the resolved bit didn't change.
+        match t.detail.as_deref() {
+            None => acc.push(0),
+            Some(ToolDetail::Output {
+                lines,
+                truncated_by,
+            }) => {
+                acc.push(1);
+                acc.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+                acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+                let bytes: usize = lines.iter().map(|l| l.len()).sum();
+                acc.extend_from_slice(&(bytes as u32).to_le_bytes());
+            }
+            Some(ToolDetail::Diff { file, .. }) => {
+                acc.push(2);
+                acc.extend_from_slice(file.path.as_bytes());
+                acc.extend_from_slice(&file.additions.to_le_bytes());
+                acc.extend_from_slice(&file.deletions.to_le_bytes());
+                acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+            }
+            Some(ToolDetail::Stats { stats }) => {
+                acc.push(3);
+                for stat in stats.iter() {
+                    acc.extend_from_slice(stat.path.as_bytes());
+                    acc.extend_from_slice(&stat.additions.to_le_bytes());
+                    acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                }
+            }
+        }
+        // Invocation changes can preserve the same header summary and byte
+        // length, so hash the actual payload rather than only its presence.
+        match t.invocation.as_deref() {
+            None => acc.push(0),
+            Some(ToolDetail::Output {
+                lines,
+                truncated_by,
+            }) => {
+                acc.push(1);
+                acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+                for line in lines {
+                    acc.extend_from_slice(&(line.len() as u32).to_le_bytes());
+                    acc.extend_from_slice(line.as_bytes());
+                }
+            }
+            Some(ToolDetail::Diff { file, .. }) => {
+                acc.push(2);
+                acc.extend_from_slice(file.path.as_bytes());
+                acc.extend_from_slice(&file.additions.to_le_bytes());
+                acc.extend_from_slice(&file.deletions.to_le_bytes());
+                acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+            }
+            Some(ToolDetail::Stats { stats }) => {
+                acc.push(3);
+                for stat in stats.iter() {
+                    acc.extend_from_slice(stat.path.as_bytes());
+                    acc.extend_from_slice(&stat.additions.to_le_bytes());
+                    acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                }
+            }
+        }
+        // Sidecar refs arriving after the resolve tick must re-splice too —
+        // they add the fetch affordance without changing the detail payload.
+        acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
+        if let Some(preview) = &t.file_preview {
+            acc.extend_from_slice(&(preview.total_lines as u64).to_le_bytes());
+            acc.extend_from_slice(&(preview.additions as u64).to_le_bytes());
+            acc.extend_from_slice(&(preview.deletions as u64).to_le_bytes());
+            acc.extend_from_slice(&(preview.truncated_before as u64).to_le_bytes());
+            for line in &preview.lines {
+                acc.push(match line.kind {
+                    zeron_doc::FileChangeLineKind::Added => 1,
+                    zeron_doc::FileChangeLineKind::Removed => 2,
+                    zeron_doc::FileChangeLineKind::Context => 3,
+                });
+                acc.extend_from_slice(line.text.as_bytes());
+                acc.push(0);
+            }
+        }
+        // Subagent lifecycle mutates the chip in place (status flips, the
+        // live tail grows) — hash it so the row re-splices on every change.
+        acc.push(
+            t.subagent_ref.is_some() as u8
+                | match t.subagent_status {
+                    None => 0,
+                    Some(SubagentStatus::Running) => 1 << 1,
+                    Some(SubagentStatus::Done) => 2 << 1,
+                    Some(SubagentStatus::Failed) => 3 << 1,
+                },
+        );
+        if let Some(tail) = &t.subagent_tail {
+            acc.extend_from_slice(tail.as_bytes());
+        }
     }
-    acc.push(auto_open as u8);
+    acc.push(auto_open as u8 | (detail_auto_open as u8) << 1);
     fnv1a(&acc)
+}
+
+fn inline_image_version(paths: &[String]) -> u64 {
+    let mut bytes = Vec::new();
+    for path in paths {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+    }
+    fnv1a(&bytes)
+}
+
+fn settle_turn_steps_child(row: &mut Row) {
+    let replacement = match &row.kind {
+        RowKind::LiveMarkdown { tree, block_ix } => Some(RowKind::Markdown {
+            tree: tree.clone(),
+            block_ix: *block_ix,
+        }),
+        _ => None,
+    };
+    if let Some(kind) = replacement {
+        row.kind = kind;
+    }
+    if let RowKind::ToolGroup {
+        auto_open,
+        detail_auto_open,
+        ..
+    } = &mut row.kind
+    {
+        // TurnSteps is already the disclosure for the completed prefix. Keep
+        // its tool cards visible by default without opening command output,
+        // diffs, or other per-card detail bodies.
+        *auto_open = true;
+        *detail_auto_open = false;
+    }
+}
+
+fn turn_steps_version(
+    mode: TurnStepsMode,
+    summary: &str,
+    duration_ms: Option<u64>,
+    rows: &[Row],
+) -> u64 {
+    let mut bytes = Vec::new();
+    bytes.push(match mode {
+        TurnStepsMode::StreamingPrefix => 0,
+        TurnStepsMode::FinalAnswer => 1,
+    });
+    bytes.extend_from_slice(&(summary.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(summary.as_bytes());
+    match duration_ms {
+        Some(duration_ms) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&duration_ms.to_le_bytes());
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for row in rows {
+        bytes.extend_from_slice(&(row.id.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(row.id.as_bytes());
+        bytes.extend_from_slice(&row.version.to_le_bytes());
+    }
+    fnv1a(&bytes)
+}
+
+fn turn_steps_is_open(state: &HashMap<SharedString, bool>, id: &str) -> bool {
+    state.get(id).copied().unwrap_or(false)
+}
+
+fn toggle_turn_steps_state(state: &mut HashMap<SharedString, bool>, id: SharedString) {
+    let open = turn_steps_is_open(state, id.as_ref());
+    state.insert(id, !open);
+}
+
+fn format_turn_duration(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else if duration_ms < 60_000 {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
+    } else {
+        let seconds = duration_ms / 1_000;
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn turn_steps_duration_label(duration_ms: Option<u64>) -> Option<String> {
+    duration_ms
+        .filter(|duration_ms| *duration_ms > 0)
+        .map(format_turn_duration)
+}
+
+fn visible_turn_step_children(open: bool, rows: &[Row]) -> &[Row] {
+    if open { rows } else { &[] }
+}
+
+fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tool in tools {
+        let mut sources = Vec::new();
+        if let Ok(call) = serde_json::to_string(&tool.call) {
+            sources.push(call);
+        }
+        for detail in [tool.invocation.as_deref(), tool.detail.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let ToolDetail::Output { lines, .. } = detail {
+                sources.push(
+                    lines
+                        .iter()
+                        .map(SharedString::as_ref)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        for source in sources {
+            for path in crate::inline_media::extract_image_paths(&source) {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                    if out.len() == 6 {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Build the block rows of one (already continuation-joined) entry.
@@ -308,7 +1201,16 @@ pub fn rows_for_entry(
     pending: bool,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
 ) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
+    rows_for_entry_with_todo_history(entry, pending, &[], parse)
+}
+
+fn rows_for_entry_with_todo_history(
+    entry: &SessionMessageEntry,
+    pending: bool,
+    previous_todos: &[TodoItem],
+    parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
+) -> Vec<Row> {
+    let mut todo_history = previous_todos.to_vec();
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
 
@@ -328,9 +1230,12 @@ pub fn rows_for_entry(
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
-        let (text, mentions) = match crate::composer::sent_mention_display(&parsed.text) {
+        // Lifted before the mention projection, so a comment body's own
+        // Markdown never lands in the bubble.
+        let (body, badges) = crate::badges::split(&parsed.text);
+        let (text, mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
-            None => (parsed.text, Vec::new()),
+            None => (body, Vec::new()),
         };
         return vec![Row {
             id: entry.id.clone().into(),
@@ -340,6 +1245,7 @@ pub fn rows_for_entry(
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
+                badges: Arc::new(badges),
                 pending,
             },
             entry_id,
@@ -349,53 +1255,212 @@ pub fn rows_for_entry(
         }];
     }
 
-    // Assistant/system: split parts into block rows, folding consecutive tools.
-    let last_part_ix = entry.parts.len().saturating_sub(1);
+    // Assistant/system: split parts into block rows, folding consecutive
+    // ordinary tools. Agent/spawn chips flush into their own group so they
+    // never share a collapse with Reads/Runs.
+    let turn_steps_plan = (entry.role == MessageRole::Assistant)
+        .then(|| plan_turn_steps(&entry.parts, entry.status))
+        .flatten();
+    let mut rows: Vec<ProjectedRow> = Vec::new();
+    let last_part_ix = entry
+        .parts
+        .iter()
+        .rposition(|part| !matches!(part, MessagePart::WorkflowTask { .. }))
+        .unwrap_or_default();
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
+    let mut group_first_part_ix = 0usize;
     let mut group_last_part_ix = 0usize;
 
-    let flush_group =
-        |rows: &mut Vec<Row>, group: &mut Vec<ToolItem>, group_ix: &mut usize, last_ix: usize| {
-            if group.is_empty() {
-                return;
-            }
-            let tools = std::mem::take(group);
-            let auto_open = streaming && last_ix == last_part_ix;
-            rows.push(Row {
-                id: format!("{}#g{}", entry.id, group_ix).into(),
-                version: tool_fingerprint(&tools, auto_open),
+    let flush_group = |rows: &mut Vec<ProjectedRow>,
+                       group: &mut Vec<ToolItem>,
+                       group_ix: &mut usize,
+                       first_ix: usize,
+                       last_ix: usize| {
+        if group.is_empty() {
+            return;
+        }
+        let tools = std::mem::take(group);
+        let image_paths = tool_image_paths(&tools);
+        let auto_open = streaming;
+        let detail_auto_open = streaming && last_ix == last_part_ix;
+        let current_group = *group_ix;
+        rows.push(ProjectedRow {
+            source_start: first_ix,
+            source_end: last_ix,
+            row: Row {
+                id: format!("{}#g{}", entry.id, current_group).into(),
+                version: tool_fingerprint(&tools, auto_open, detail_auto_open),
                 turn_start: false,
                 kind: RowKind::ToolGroup {
                     tools: Arc::new(tools),
                     auto_open,
+                    detail_auto_open,
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
+            },
+        });
+        if !image_paths.is_empty() {
+            rows.push(ProjectedRow {
+                source_start: first_ix,
+                source_end: last_ix,
+                row: Row {
+                    id: format!("{}#g{}.images", entry.id, current_group).into(),
+                    version: inline_image_version(&image_paths),
+                    turn_start: false,
+                    kind: RowKind::InlineImages {
+                        paths: Arc::new(image_paths),
+                    },
+                    entry_id: entry.id.clone().into(),
+                    timestamp: None,
+                },
             });
-            *group_ix += 1;
-        };
+        }
+        *group_ix += 1;
+    };
 
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
             MessagePart::Tool {
+                id: tool_id,
                 call,
                 is_error,
                 resolved,
+                execution,
+                output,
+                diff,
+                output_ref,
+                output_bytes,
+                diff_ref,
+                diff_stats,
+                file_preview,
+                subagent_ref,
+                subagent_status,
+                subagent_tail,
                 ..
             } => {
-                pending_group.push(ToolItem {
+                if turn_steps_plan
+                    .as_ref()
+                    .is_some_and(|plan| part_ix == plan.split_before_part)
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                }
+                if let ToolCall::Todo { items } = call
+                    && !items.is_empty()
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                    let created = todo_history.is_empty();
+                    let version =
+                        todo_snapshot_version(&todo_history, items, *resolved, *is_error, created);
+                    let display_items = task_snapshot_items(&todo_history, items, created);
+                    rows.push(ProjectedRow {
+                        source_start: part_ix,
+                        source_end: part_ix,
+                        row: Row {
+                            id: format!("{}#{}", entry.id, tool_id).into(),
+                            version,
+                            turn_start: false,
+                            kind: RowKind::TaskSnapshot {
+                                items: Arc::new(display_items),
+                                created,
+                                resolved: *resolved,
+                                is_error: *is_error,
+                            },
+                            entry_id: entry.id.clone().into(),
+                            timestamp: None,
+                        },
+                    });
+                    todo_history.clone_from(items);
+                    continue;
+                }
+                if matches!(call, ToolCall::Todo { .. }) {
+                    todo_history.clear();
+                }
+                let item = ToolItem {
+                    id: tool_id.clone().into(),
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
-                });
+                    execution: *execution,
+                    detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
+                        .map(Arc::new),
+                    invocation: call_block(call).map(Arc::new),
+                    output_ref: output_ref.clone().map(SharedString::from),
+                    output_bytes: *output_bytes,
+                    diff_ref: diff_ref.clone().map(SharedString::from),
+                    file_preview: file_preview.clone().map(Arc::new),
+                    subagent_ref: subagent_ref.clone().map(SharedString::from),
+                    subagent_status: *subagent_status,
+                    subagent_tail: subagent_tail.clone().map(SharedString::from),
+                };
+                let is_file_change =
+                    matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
+                if is_file_change {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                    let version = tool_fingerprint(std::slice::from_ref(&item), false, false);
+                    rows.push(ProjectedRow {
+                        source_start: part_ix,
+                        source_end: part_ix,
+                        row: Row {
+                            id: format!("{}#{}", entry.id, tool_id).into(),
+                            version,
+                            turn_start: false,
+                            kind: RowKind::FileChange { tool: item },
+                            entry_id: entry.id.clone().into(),
+                            timestamp: None,
+                        },
+                    });
+                    continue;
+                }
+                // Agent chips don't share a fold with ordinary tools: flush
+                // whenever the genus flips so each group is uniform.
+                if pending_group
+                    .first()
+                    .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                }
+                if pending_group.is_empty() {
+                    group_first_part_ix = part_ix;
+                }
+                pending_group.push(item);
                 group_last_part_ix = part_ix;
             }
+            // Durable activity feeds the Details Workers widget only. Ignore
+            // it before the visible-part branch so it cannot split rows or
+            // tool groups in the transcript.
+            MessagePart::WorkflowTask { .. } => {}
             other => {
                 flush_group(
                     &mut rows,
                     &mut pending_group,
                     &mut group_ix,
+                    group_first_part_ix,
                     group_last_part_ix,
                 );
                 match other {
@@ -420,22 +1485,43 @@ pub fn rows_for_entry(
                                 .get(range.start.min(end)..end)
                                 .unwrap_or_default();
                             let version = (fnv1a(bytes) << 1) | streaming as u64;
-                            rows.push(Row {
-                                id: format!("{key}.{block_ix}").into(),
-                                version,
-                                turn_start: false,
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
-                                kind: if streaming {
-                                    RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                } else {
-                                    RowKind::Markdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
+                            rows.push(ProjectedRow {
+                                source_start: part_ix,
+                                source_end: part_ix,
+                                row: Row {
+                                    id: format!("{key}.{block_ix}").into(),
+                                    version,
+                                    turn_start: false,
+                                    entry_id: entry_id.clone(),
+                                    timestamp: None,
+                                    kind: if streaming {
+                                        RowKind::LiveMarkdown {
+                                            tree: tree.clone(),
+                                            block_ix,
+                                        }
+                                    } else {
+                                        RowKind::Markdown {
+                                            tree: tree.clone(),
+                                            block_ix,
+                                        }
+                                    },
+                                },
+                            });
+                        }
+                        let image_paths = crate::inline_media::extract_image_paths(text);
+                        if !image_paths.is_empty() {
+                            rows.push(ProjectedRow {
+                                source_start: part_ix,
+                                source_end: part_ix,
+                                row: Row {
+                                    id: format!("{key}.images").into(),
+                                    version: inline_image_version(&image_paths),
+                                    turn_start: false,
+                                    kind: RowKind::InlineImages {
+                                        paths: Arc::new(image_paths),
+                                    },
+                                    entry_id: entry_id.clone(),
+                                    timestamp: None,
                                 },
                             });
                         }
@@ -454,36 +1540,75 @@ pub fn rows_for_entry(
                                 .unwrap_or_else(|| "Question".to_string()),
                         )
                         .into();
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
-                            turn_start: false,
-                            kind: RowKind::InputChip {
-                                header,
-                                resolved: *resolved,
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                                turn_start: false,
+                                kind: RowKind::InputChip {
+                                    header,
+                                    resolved: *resolved,
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
                             },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
                         });
                     }
                     MessagePart::Error {
                         id: part_id,
                         message,
                     } => {
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: message.len() as u64,
-                            turn_start: false,
-                            kind: RowKind::ErrorChip {
-                                // Harness-generated; the chip is one line.
-                                message: single_line(message).into(),
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: message.len() as u64,
+                                turn_start: false,
+                                kind: RowKind::ErrorChip {
+                                    // Harness-generated; the chip is one line.
+                                    message: single_line(message).into(),
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
                             },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
+                        });
+                    }
+                    MessagePart::Reasoning {
+                        id: part_id,
+                        text,
+                        completed,
+                        duration_ms,
+                    } => {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        let key = format!("{}#{}", entry.id, part_id);
+                        let active = streaming && !*completed;
+                        let tree = parse(&key, text);
+                        let mut version = fnv1a(text.as_bytes()) << 1 | active as u64;
+                        version ^= duration_ms.unwrap_or_default().rotate_left(17);
+                        rows.push(ProjectedRow {
+                            source_start: part_ix,
+                            source_end: part_ix,
+                            row: Row {
+                                id: key.into(),
+                                version,
+                                turn_start: false,
+                                kind: RowKind::Reasoning {
+                                    tree,
+                                    active,
+                                    duration_ms: *duration_ms,
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                            },
                         });
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
-                    MessagePart::Tool { .. } => {}
+                    MessagePart::Tool { .. } | MessagePart::WorkflowTask { .. } => {}
                 }
             }
         }
@@ -492,40 +1617,87 @@ pub fn rows_for_entry(
         &mut rows,
         &mut pending_group,
         &mut group_ix,
+        group_first_part_ix,
         group_last_part_ix,
     );
 
     if let Some(first) = rows.first_mut() {
-        first.turn_start = true;
+        first.row.turn_start = true;
     }
     // Timestamp strip under the entry's LAST row once the turn has settled
     // (chat-view.tsx: "No timestamp hover mid-stream"). The version bit keeps
     // the diff key honest for last-row kinds whose own version wouldn't
     // change when streaming flips off (chips).
-    if !streaming && let Some(last) = rows.last_mut() {
-        last.timestamp = Some(entry.created_at);
-        last.version ^= 1 << 62;
+    if !streaming
+        && let Some(last) = rows
+            .iter_mut()
+            .rev()
+            .find(|row| !matches!(row.row.kind, RowKind::InlineImages { .. }))
+    {
+        last.row.timestamp = Some(entry.created_at);
+        last.row.version ^= 1 << 62;
     }
-    rows
+
+    let Some(plan) = turn_steps_plan else {
+        return rows.into_iter().map(|projected| projected.row).collect();
+    };
+
+    let prefix_len = rows
+        .iter()
+        .take_while(|projected| {
+            projected.source_start < plan.split_before_part
+                && projected.source_end < plan.split_before_part
+        })
+        .count();
+    if prefix_len == 0 {
+        return rows.into_iter().map(|projected| projected.row).collect();
+    }
+
+    let mut remaining = rows.split_off(prefix_len);
+    let mut children = rows
+        .into_iter()
+        .map(|projected| projected.row)
+        .collect::<Vec<_>>();
+    for child in &mut children {
+        settle_turn_steps_child(child);
+    }
+    let turn_start = children.first().is_some_and(|row| row.turn_start);
+    let version = turn_steps_version(plan.mode, &plan.summary, entry.duration_ms, &children);
+    let steps = Row {
+        id: format!("{}#steps", entry.id).into(),
+        version,
+        turn_start,
+        kind: RowKind::TurnSteps {
+            rows: Arc::new(children),
+            summary: plan.summary.into(),
+            duration_ms: entry.duration_ms,
+        },
+        entry_id: entry_id.clone(),
+        timestamp: None,
+    };
+
+    std::iter::once(steps)
+        .chain(remaining.drain(..).map(|projected| projected.row))
+        .collect()
 }
 
-/// `COMET_FRAME_STATS=1` logs live-row render-cost percentiles (p50/p95 µs
+/// `ZERON_FRAME_STATS=1` logs live-row render-cost percentiles (p50/p95 µs
 /// over rolling windows of [`FRAME_STATS_WINDOW`] samples) at `warn` level —
 /// the smoothness measurement knob. Off by default; zero cost when off.
 fn frame_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
-        .get_or_init(|| std::env::var("COMET_FRAME_STATS").is_ok_and(|v| !v.is_empty() && v != "0"))
+        .get_or_init(|| std::env::var("ZERON_FRAME_STATS").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 const FRAME_STATS_WINDOW: usize = 240;
 
-/// `COMET_NO_RENDER_CACHE=1` bypasses the cross-frame flatten cache — the
+/// `ZERON_NO_RENDER_CACHE=1` bypasses the cross-frame flatten cache — the
 /// A/B knob for the frame-cost measurement above.
 fn render_cache_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
-        std::env::var("COMET_NO_RENDER_CACHE").is_ok_and(|v| !v.is_empty() && v != "0")
+        std::env::var("ZERON_NO_RENDER_CACHE").is_ok_and(|v| !v.is_empty() && v != "0")
     })
 }
 
@@ -630,6 +1802,9 @@ fn part_prefix(id: &str) -> &str {
 /// part — matching the live row's internal spacing exactly, so the
 /// live→split handoff cannot shift a pixel; the block gap otherwise.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
+    if matches!(row.kind, RowKind::InlineImages { .. }) {
+        return 0.0;
+    }
     if row.turn_start {
         return GAP_TURN;
     }
@@ -670,19 +1845,126 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
-/// The rule lives in `comet_proto::view` so the terminal viewport reports the
+/// The rule lives in `zeron_proto::view` so the terminal viewport reports the
 /// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
-    comet_proto::view::tool_group_summary(&pairs)
+    zeron_proto::view::tool_group_summary(&pairs)
+}
+
+fn tool_detail_default_open(
+    call: &ToolCall,
+    resolved: bool,
+    active_group: bool,
+    is_last: bool,
+) -> bool {
+    active_group
+        && matches!(
+            call,
+            ToolCall::Exec { .. }
+                | ToolCall::WriteFile { .. }
+                | ToolCall::EditFile { .. }
+                | ToolCall::ApplyPatch { .. }
+        )
+        && (!resolved || is_last)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolHeaderState {
+    Pending,
+    Success,
+    Failed,
+    Quiet,
+}
+
+fn tool_header_state(resolved: bool, is_error: bool, show_outcome_label: bool) -> ToolHeaderState {
+    if !resolved {
+        ToolHeaderState::Pending
+    } else if show_outcome_label {
+        if is_error {
+            ToolHeaderState::Failed
+        } else {
+            ToolHeaderState::Success
+        }
+    } else {
+        ToolHeaderState::Quiet
+    }
+}
+
+fn format_execution_duration(duration_ms: u64) -> String {
+    if duration_ms < 60_000 {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
+    } else {
+        let seconds = duration_ms / 1_000;
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_reasoning_elapsed(duration_ms: u64) -> String {
+    format_execution_duration(duration_ms)
+}
+
+fn reasoning_is_open(pinned: Option<bool>, _active: bool) -> bool {
+    pinned.unwrap_or(true)
+}
+
+fn should_render_mermaid(block: &Block, streaming: bool) -> bool {
+    !streaming && crate::inline_media::mermaid_source(block).is_some()
+}
+
+fn media_task_admitted(
+    inflight: usize,
+    total: usize,
+    max_inflight: usize,
+    max_total: usize,
+) -> bool {
+    inflight < max_inflight && total < max_total
+}
+
+fn remember_validated(cache: &mut HashMap<u64, u64>, key: u64, used_at: u64, limit: usize) {
+    cache.insert(key, used_at);
+    while cache.len() > limit {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, stamp)| **stamp)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
+fn format_thought_duration(duration_ms: Option<u64>) -> Option<String> {
+    let duration_ms = duration_ms.filter(|duration| *duration >= 1_000)?;
+    let seconds = (duration_ms / 1_000).max(1);
+    let minutes = seconds / 60;
+    let remainder = seconds % 60;
+    if minutes == 0 {
+        return Some(format!(
+            "Thought for {seconds} {}",
+            if seconds == 1 { "second" } else { "seconds" }
+        ));
+    }
+    let mut label = format!(
+        "Thought for {minutes} {}",
+        if minutes == 1 { "minute" } else { "minutes" }
+    );
+    if remainder > 0 {
+        label.push_str(&format!(
+            " {remainder} {}",
+            if remainder == 1 { "second" } else { "seconds" }
+        ));
+    }
+    Some(label)
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
-// viewport (`comet_proto::view`): a tool must be named identically on every
+// viewport (`zeron_proto::view`): a tool must be named identically on every
 // surface, and the one-line collapse is needed for the same reason in both (a
 // literal newline breaks gpui's ellipsis logic and would be a cursor move in a
 // cell grid).
-pub use comet_proto::view::{single_line, tool_chip_content};
+pub use zeron_proto::view::{single_line, tool_chip_content};
 
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
 pub fn chips_height(count: usize) -> f32 {
@@ -690,6 +1972,77 @@ pub fn chips_height(count: usize) -> f32 {
         return 0.0;
     }
     CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
+}
+
+/// Analytic height an open detail adds to its chip's card (separator + body)
+/// — output blocks by line count, diff blocks via the changes pane's own
+/// [`crate::changes::body_height`]. The chip's own [`CHIP_HEIGHT`] is already
+/// counted by [`chips_height`].
+pub fn detail_height(detail: &ToolDetail) -> f32 {
+    let body = match detail {
+        ToolDetail::Output {
+            lines,
+            truncated_by,
+        } => {
+            let rows = lines.len() + usize::from(*truncated_by > 0);
+            rows as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
+        }
+        ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
+        ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
+    };
+    DETAIL_SEPARATOR + body
+}
+
+/// Height of the "Show full output/diff" affordance row appended below an
+/// open detail whose full payload lives in the sidecar (chat2-sync A3).
+pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
+
+/// What an open chip's [`BLOB_AFFORDANCE_HEIGHT`] row offers: a lazy sidecar
+/// fetch ("Show full output/diff"). One slot, so the analytic height sums
+/// stay a single `is_some` check.
+#[derive(Clone)]
+struct ChipAffordance {
+    blob_ref: SharedString,
+    label: SharedString,
+}
+
+/// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
+/// the harness bounds outputs at 4KiB, so this is rarely reached).
+const FULL_OUTPUT_MAX_LINES: usize = 400;
+
+/// Build the upgraded detail from a fetched sidecar blob. Diff blobs parse
+/// the `ToolDiff` JSON through the same pipeline as inline diffs; output
+/// blobs render (near-)uncapped — fetching past the summary was the point.
+fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
+    if is_diff {
+        let diff: zeron_proto::ToolDiff = serde_json::from_str(text).ok()?;
+        return tool_detail(None, Some(&diff), None);
+    }
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .map(|l| SharedString::from(l.to_owned()))
+        .collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(FULL_OUTPUT_MAX_LINES);
+    lines.truncate(FULL_OUTPUT_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Compact byte size for the fetch affordance label ("812 B", "12 KB").
+fn format_kb(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +2085,21 @@ pub fn flavour_seed(chat_id: &str) -> u64 {
     fnv1a(chat_id.as_bytes())
 }
 
+/// The working trailer's "Sending…" bridge: true while an in-flight send is
+/// fresher than the session row's turn start — the row still carries the
+/// PREVIOUS turn (or none), so a timer would count the send round-trip and
+/// restart when the turn actually begins.
+pub fn sending_bridge(
+    send_started: Option<chrono::DateTime<chrono::Utc>>,
+    turn_started: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match (send_started, turn_started) {
+        (Some(send), Some(turn)) => turn <= send,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// "1m 32s"-style elapsed formatting.
 pub fn format_elapsed(secs: i64) -> String {
     let secs = secs.max(0);
@@ -746,23 +2114,9 @@ pub fn format_elapsed(secs: i64) -> String {
 // Highlight store (background, time-sliced, paint-only)
 // ---------------------------------------------------------------------------
 
-async fn yield_now() {
-    let mut yielded = false;
-    futures::future::poll_fn(move |cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
-}
-
 struct HighlightEntry {
-    code_len: usize,
-    lines: Option<Arc<Vec<Vec<Token>>>>,
+    key: DocumentHighlightKey,
+    document: Option<Weak<comet_syntax::HighlightedDocument>>,
     _task: Option<Task<()>>,
 }
 
@@ -772,6 +2126,7 @@ struct HighlightEntry {
 #[derive(Default)]
 struct HighlightStore {
     entries: HashMap<(SharedString, usize), HighlightEntry>,
+    cache: SyntaxHighlightCache,
 }
 
 impl HighlightStore {
@@ -783,41 +2138,92 @@ impl HighlightStore {
         lang: Lang,
         code: &str,
         cx: &mut Context<Transcript>,
-    ) -> Option<Arc<Vec<Vec<Token>>>> {
-        let key = (row_id.clone(), block_ix);
-        if let Some(entry) = self.entries.get(&key)
-            && entry.code_len == code.len()
+    ) -> Option<Arc<comet_syntax::HighlightedDocument>> {
+        let slot_key = (row_id.clone(), block_ix);
+        let document_key = DocumentHighlightKey::new(lang, code);
+        if let Some(entry) = self.entries.get(&slot_key)
+            && entry.key == document_key
         {
-            return entry.lines.clone();
+            let document = entry.document.as_ref()?;
+            if let Some(document) = document.upgrade() {
+                return Some(document);
+            }
         }
-        // Keep stale lines visible while the fresh parse runs (paint-only, so a
-        // briefly stale color is harmless; lengths shift at most on the tail).
-        let stale = self.entries.get(&key).and_then(|e| e.lines.clone());
+        if let Some(document) = self.cache.get(&document_key) {
+            self.entries.insert(
+                slot_key,
+                HighlightEntry {
+                    key: document_key,
+                    document: Some(Arc::downgrade(&document)),
+                    _task: None,
+                },
+            );
+            return Some(document);
+        }
         let code = code.to_string();
-        let code_len = code.len();
+        let source_bytes = code.len();
         let task = cx.spawn(async move |this, cx| {
-            let lines = cx
+            let started = Instant::now();
+            let document = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut carry = LineCarry::None;
-                    let mut out = Vec::new();
-                    for (ix, line) in code.split('\n').enumerate() {
-                        let (tokens, next) = tokenize_line(lang, line, carry);
-                        carry = next;
-                        out.push(tokens);
-                        if ix % 128 == 127 {
-                            yield_now().await;
-                        }
-                    }
-                    out
+                    comet_syntax::highlight(comet_syntax::HighlightRequest {
+                        source: &code,
+                        path: None,
+                        fence_tag: Some(match lang {
+                            Lang::Rust => "rust",
+                            Lang::JavaScript => "javascript",
+                            Lang::Jsx => "jsx",
+                            Lang::TypeScript => "typescript",
+                            Lang::Tsx => "tsx",
+                            Lang::Python => "python",
+                            Lang::Go => "go",
+                            Lang::Json => "json",
+                            Lang::Jsonc => "jsonc",
+                            Lang::Bash => "bash",
+                            Lang::Toml => "toml",
+                            Lang::Markdown => "markdown",
+                            Lang::Html => "html",
+                            Lang::Css => "css",
+                            Lang::Yaml => "yaml",
+                            Lang::C => "c",
+                            Lang::Cpp => "cpp",
+                            Lang::CSharp => "csharp",
+                            Lang::Java => "java",
+                            Lang::Kotlin => "kotlin",
+                            Lang::Swift => "swift",
+                            Lang::Ruby => "ruby",
+                            Lang::Php => "php",
+                            Lang::Sql => "sql",
+                            Lang::Lua => "lua",
+                            Lang::Dockerfile => "dockerfile",
+                            Lang::Nix => "nix",
+                            Lang::Make => "make",
+                        }),
+                    })
+                    .ok()
                 })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
-                    && entry.code_len == code_len
-                {
-                    entry.lines = Some(Arc::new(lines));
-                    cx.notify();
+                if let Some(document) = document {
+                    let document = Arc::new(document);
+                    let retained = transcript
+                        .highlights
+                        .cache
+                        .insert(document_key, document.clone());
+                    if let Some(entry) = transcript.highlights.entries.get_mut(&slot_key)
+                        && entry.key == document_key
+                    {
+                        tracing::debug!(
+                            language = ?lang,
+                            source_bytes,
+                            spans = document.lines.iter().map(Vec::len).sum::<usize>(),
+                            elapsed_us = started.elapsed().as_micros() as u64,
+                            "syntax highlight ready"
+                        );
+                        entry.document = retained.then(|| Arc::downgrade(&document));
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -825,12 +2231,12 @@ impl HighlightStore {
         self.entries.insert(
             (row_id, block_ix),
             HighlightEntry {
-                code_len,
-                lines: stale.clone(),
+                key: document_key,
+                document: None,
                 _task: Some(task),
             },
         );
-        stale
+        None
     }
 }
 
@@ -861,15 +2267,263 @@ struct FoldState {
     toggled_at: Option<Instant>,
 }
 
+/// Layout state for the most recent locally-sent turn (notes-app parity):
+/// EVERY send glides the prompt to the viewport top and reserves the space
+/// below it for the reply — a trailing runway pad sized `usable − turn
+/// height`, i.e. a min-height for the turn. The pad shrinks 1:1 as the reply
+/// grows (zero net motion), so the hold is stable across steers and finished
+/// turns until the reply overflows the reservation — at which point the pad
+/// is ~0 and the bottom spring takes over with no height jump. Cleared by
+/// explicit navigation and chat switches (revisits start at the bottom).
+struct OwnTurnAnchor {
+    chat_id: String,
+    message_id: SharedString,
+    /// Current reservation pad on the last row (`usable − turn_height`).
+    runway: f32,
+    /// Whether the own-turn step still owns the viewport position.
+    held: bool,
+    /// The send glide has landed; the anchor now holds position exactly.
+    positioned: bool,
+    /// Distinguishes the initial send glide from a later return-to-bottom
+    /// glide. The initial glide owns the prompt visual; on a restick, the
+    /// sticky copy remains until the original has re-landed.
+    has_landed: bool,
+}
+
+#[derive(Clone)]
+struct UserMessagePreview {
+    row_id: SharedString,
+    text: SharedString,
+    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StickyTurnGroup {
+    user_ix: usize,
+    next_user_ix: Option<usize>,
+}
+
+fn sticky_turn_rows(rows: &[Row]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(ix, row)| matches!(row.kind, RowKind::User { .. }).then_some(ix))
+        .collect()
+}
+
+fn sticky_turn_group(user_rows: &[usize], reading_row_ix: usize) -> Option<StickyTurnGroup> {
+    let next = user_rows.partition_point(|user_ix| *user_ix <= reading_row_ix);
+    let user_ix = *user_rows.get(next.checked_sub(1)?)?;
+    Some(StickyTurnGroup {
+        user_ix,
+        next_user_ix: user_rows.get(next).copied(),
+    })
+}
+
+fn sticky_turn_group_for_viewport(
+    user_rows: &[usize],
+    sticky_top: f32,
+    fallback_reading_row: Option<usize>,
+    mut user_top: impl FnMut(usize) -> Option<f32>,
+) -> Option<StickyTurnGroup> {
+    let group_at = |position: usize| {
+        Some(StickyTurnGroup {
+            user_ix: *user_rows.get(position)?,
+            next_user_ix: user_rows.get(position + 1).copied(),
+        })
+    };
+    let fallback = sticky_turn_group(user_rows, fallback_reading_row?)?;
+    let mut position = user_rows.binary_search(&fallback.user_ix).ok()?;
+    while user_top(position).is_some_and(|top| top > sticky_top + 0.5) {
+        position = position.checked_sub(1)?;
+    }
+    while position + 1 < user_rows.len()
+        && user_top(position + 1).is_some_and(|top| top <= sticky_top + 0.5)
+    {
+        position += 1;
+    }
+    group_at(position)
+}
+
+fn sticky_turn_overlay_top(
+    sticky_top: f32,
+    source_top: Option<f32>,
+    source_is_above_when_unmeasured: bool,
+    next_turn_top: Option<f32>,
+    header_height: f32,
+) -> Option<f32> {
+    let source_crossed = source_top.map_or(source_is_above_when_unmeasured, |source_top| {
+        source_top < sticky_top - 0.5
+    });
+    if !source_crossed {
+        return None;
+    }
+    Some(
+        next_turn_top
+            .map(|next_top| next_top - header_height)
+            .unwrap_or(sticky_top)
+            .min(sticky_top),
+    )
+}
+
+#[derive(Default)]
+struct StickyTurnState {
+    chat_id: Option<String>,
+    heights: HashMap<SharedString, f32>,
+    geometries: HashMap<SharedString, StickyUserGeometry>,
+    suppress_once: std::collections::HashSet<SharedString>,
+    viewport: Option<(f32, f32)>,
+}
+
+#[derive(Clone, Copy)]
+struct StickyUserGeometry {
+    top: f32,
+    scroll_y: f32,
+}
+
+impl StickyTurnState {
+    fn attach_chat(&mut self, chat_id: Option<&str>) -> bool {
+        if self.chat_id.as_deref() == chat_id {
+            return false;
+        }
+        self.chat_id = chat_id.map(str::to_owned);
+        self.heights.clear();
+        self.geometries.clear();
+        self.suppress_once.clear();
+        self.viewport = None;
+        true
+    }
+
+    fn record_height(&mut self, id: SharedString, height: f32) -> bool {
+        if self
+            .heights
+            .get(&id)
+            .is_some_and(|current| (*current - height).abs() <= 0.5)
+        {
+            return false;
+        }
+        self.heights.insert(id, height);
+        true
+    }
+
+    fn record_geometry(&mut self, id: SharedString, top: f32, height: f32, scroll_y: f32) -> bool {
+        let changed = self.geometries.get(&id).is_none_or(|current| {
+            (current.top - top).abs() > 0.5 || (current.scroll_y - scroll_y).abs() > 0.5
+        });
+        let height_changed = self.record_height(id.clone(), height);
+        self.suppress_once.remove(&id);
+        self.geometries
+            .insert(id, StickyUserGeometry { top, scroll_y });
+        changed || height_changed
+    }
+
+    fn height(&self, id: &str) -> Option<f32> {
+        self.heights.get(id).copied()
+    }
+
+    fn projected_top(&self, id: &str, current_scroll_y: f32) -> Option<f32> {
+        self.geometries
+            .get(id)
+            .map(|geometry| geometry.top + current_scroll_y - geometry.scroll_y)
+    }
+
+    fn invalidate_layout(&mut self) {
+        self.suppress_once.extend(self.geometries.keys().cloned());
+        self.geometries.clear();
+    }
+
+    fn invalidate_user_ids(&mut self, ids: impl IntoIterator<Item = SharedString>) {
+        for id in ids {
+            if self.geometries.remove(&id).is_some() {
+                self.suppress_once.insert(id);
+            }
+        }
+    }
+
+    fn consume_layout_suppression(&mut self, id: &str) -> bool {
+        self.suppress_once.remove(id)
+    }
+
+    fn update_viewport(&mut self, width: f32, height: f32) -> bool {
+        if self
+            .viewport
+            .is_some_and(|(current_width, current_height)| {
+                (current_width - width).abs() <= 0.5 && (current_height - height).abs() <= 0.5
+            })
+        {
+            return false;
+        }
+        self.viewport = Some((width, height));
+        self.invalidate_layout();
+        true
+    }
+
+    fn retain_user_ids(&mut self, live: &std::collections::HashSet<SharedString>) {
+        self.heights.retain(|id, _| live.contains(id));
+        self.geometries.retain(|id, _| live.contains(id));
+        self.suppress_once.retain(|id| live.contains(id));
+    }
+}
+
+fn user_message_preview(
+    row_id: SharedString,
+    text: SharedString,
+    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+) -> UserMessagePreview {
+    UserMessagePreview {
+        row_id,
+        text,
+        mentions,
+    }
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
     chat_id: Option<String>,
+    /// `Some(doc_id)` pins this instance to a SUBAGENT doc: rows come from
+    /// `AppState::sub_transcript(doc_id)` instead of the selected chat, and
+    /// the instance is READ-ONLY — no echoes, no own-turn hold, and no global
+    /// attachment protection (that set is shared with the primary transcript
+    /// and overwritten wholesale).
+    doc_override: Option<String>,
+    /// Whether an override instance watches a LIVE doc (`for_doc(follow)`):
+    /// only then may the working trailer render — a frozen snapshot must
+    /// never spin, whatever its entries claim.
+    doc_live: bool,
+    /// One-shot "open at the latest content" for UNPINNED (frozen) override
+    /// instances: rows land ASYNC after the tab opens (watch replay / blob
+    /// fetch), so the end-scroll fires on the first non-empty sync, then
+    /// never again — landing at the end and FOLLOWING it are different
+    /// states, and the user owns the viewport from there. Pinned instances
+    /// don't need it (the pin branch already opens at the end).
+    land_end_pending: bool,
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
+    /// Outer per-assistant disclosure state, keyed by the stable
+    /// `{entry_id}#steps` row id. Render-local and reset on chat attachment.
+    turn_steps_open: HashMap<SharedString, bool>,
+    /// Detail folds (output/diff) per chip, keyed `"{row_id}#d{ix}"` — full
+    /// [`FoldState`]s so detail bodies tween open/closed exactly like the
+    /// group fold. Render-local like `folds` — never part of the row
+    /// fingerprint.
+    tool_details: HashMap<SharedString, FoldState>,
+    /// Render-local epochs for live reasoning rows.
+    reasoning_started: HashMap<SharedString, Instant>,
+    /// Independent of motion settings: Reduced Motion stops the spinner,
+    /// not the honest elapsed-time label beside it.
+    reasoning_tick: Option<Task<()>>,
+    /// Agent-referenced checkout images load once per root/path and survive
+    /// virtualized row remounts for the attached chat.
+    inline_images: HashMap<String, InlineImageLoad>,
+    validated_inline_images: HashMap<u64, u64>,
+    /// Settled Mermaid fences render once off-thread and survive row
+    /// virtualization for the attached chat.
+    mermaid: HashMap<String, MermaidLoad>,
+    validated_mermaid: HashMap<u64, u64>,
+    media_clock: u64,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -896,8 +2550,32 @@ pub struct Transcript {
     /// (see [`Transcript::should_restick`]).
     last_scroll_distance: f32,
     /// The stick-to-bottom pin. Broken only by user input (wheel/touch up);
-    /// re-engaged inside the 70px band, on own-send, and on the jump button.
+    /// re-engaged inside the 70px band, after an own-send first overflows, and
+    /// on the jump button.
     pinned: bool,
+    /// A locally-sent prompt currently held near the viewport top while its
+    /// reply grows into the empty space below it.
+    own_turn: Option<OwnTurnAnchor>,
+    /// Per-chat measurements for the virtual sticky copy of user rows. The
+    /// copy is paint-only; none of this state participates in list height.
+    sticky_turn: StickyTurnState,
+    /// Top-level indices of user rows, rebuilt only when the row projection
+    /// changes. Scroll frames binary-search this list instead of walking a
+    /// long transcript.
+    sticky_turn_rows: Vec<usize>,
+    /// Scrollbar offset sampled by the outer `Render` before GPUI mutably
+    /// borrows `ListState` to run the row processor. `render_row` must never
+    /// read the list back from inside that processor.
+    sticky_scroll_y: f32,
+    /// A layout-affecting change needs one post-layout own-turn measurement.
+    own_turn_kick: bool,
+    /// One own-turn `on_next_frame` callback in flight at most.
+    own_turn_scheduled: bool,
+    /// Wall-clock of the previous own-turn glide tick (`None` = not gliding).
+    own_turn_last_tick: Option<Instant>,
+    /// The runway was removed on the previous frame; engage the bottom spring
+    /// only after layout has incorporated that removal.
+    own_turn_release_pending: bool,
     spring: StickSpring,
     /// Wall-clock of the previous spring tick (`None` = parked).
     spring_last_tick: Option<Instant>,
@@ -909,12 +2587,21 @@ pub struct Transcript {
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
     scroll_anim: Option<Task<()>>,
+    /// Last pointer sample while markdown selection owns a left-button drag.
+    selection_drag_position: Option<Point<Pixels>>,
+    /// One-shot timer rescheduled only while the pointer remains in an edge
+    /// zone. Dropping it on mouse-up stops all selection scroll work.
+    selection_scroll_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
+    /// Height of the shell's composer/status/terminal stack overlaying the
+    /// transcript's bottom (measured last frame): the last row pads past it
+    /// so pinned content rests above the glass chrome it scrolls under.
+    bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
-    /// strip (comet chat-view.tsx `group-hover`; the rows report hover
+    /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
     /// clear the reveal when the old row's leave event arrives after the new
     /// row's enter (enter/leave order across rows is not guaranteed).
@@ -925,19 +2612,195 @@ pub struct Transcript {
     copied_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
+    /// Focused while the lightbox is open so Escape reaches it.
+    attachment_preview_focus: gpui::FocusHandle,
+    /// Shaped-content overflow for each user card, reported after prepaint.
+    user_message_overflow: HashMap<SharedString, bool>,
+    /// Full text opened from a clipped user-message card.
+    user_message_preview: Option<UserMessagePreview>,
+    /// Focused while the full-message overlay is open so Escape reaches it.
+    user_message_preview_focus: gpui::FocusHandle,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
     /// source; results land in the global attachment cache.
     attachment_loads: HashMap<(String, String), Task<()>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
+    /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
+    /// chat2-sync A3). `Ready` holds the UPGRADED detail, built once on
+    /// arrival — render swaps it in per chip; rows never rebuild for it.
+    /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
+    /// fetched blob stays valid.
+    blob_details: HashMap<SharedString, BlobFetch>,
+    /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
+    /// an output blob fetched, the chip shows the one requested most
+    /// recently (click "Show full output" after a diff → see the output).
+    blob_fetch_order: HashMap<SharedString, u64>,
+    blob_fetch_counter: u64,
+    file_change_open: HashMap<SharedString, bool>,
+    file_change_inputs: HashMap<SharedString, FileInputLoad>,
+    file_change_scrolls: HashMap<SharedString, FileChangeScroll>,
+    journal_chat_id: Option<String>,
+    journal_parent_tool_use_id: Option<String>,
     _observe: Subscription,
 }
 
+/// One sidecar blob fetch's lifecycle.
+enum BlobFetch {
+    Loading(#[allow(dead_code)] Task<()>),
+    /// Failed with the affordance re-armed as a retry.
+    Failed,
+    Ready(Arc<ToolDetail>),
+}
+
+enum FileInputLoad {
+    Loading(#[allow(dead_code)] Task<()>),
+    Failed,
+    Ready(Arc<FileInputReady>),
+}
+
+struct FileInputReady {
+    snapshot: Arc<zeron_proto::FileToolInputSnapshot>,
+    preview: Arc<FileChangePreview>,
+    highlight: Option<Arc<comet_syntax::HighlightedDocument>>,
+}
+
+struct FileChangeScroll {
+    plain: ScrollHandle,
+    virtualized: UniformListScrollHandle,
+}
+
+impl Default for FileChangeScroll {
+    fn default() -> Self {
+        Self {
+            plain: ScrollHandle::new(),
+            virtualized: UniformListScrollHandle::new(),
+        }
+    }
+}
+
+fn file_input_should_fetch(load: Option<&FileInputLoad>) -> bool {
+    matches!(load, None | Some(FileInputLoad::Failed))
+}
+
+enum InlineImageLoad {
+    Loading(#[allow(dead_code)] Task<()>),
+    Failed {
+        used_at: u64,
+    },
+    Ready {
+        image: crate::inline_media::LoadedInlineImage,
+        used_at: u64,
+    },
+}
+
+enum InlineImageSnapshot {
+    Loading,
+    Reloading,
+    Failed,
+    Ready {
+        name: SharedString,
+        image: Arc<gpui::Image>,
+    },
+}
+
+enum MermaidLoad {
+    Loading(#[allow(dead_code)] Task<()>),
+    Failed {
+        used_at: u64,
+    },
+    Ready {
+        image: Arc<gpui::Image>,
+        bytes: usize,
+        used_at: u64,
+    },
+}
+
+enum MermaidSnapshot {
+    Loading,
+    Reloading,
+    Failed,
+    Ready(Arc<gpui::Image>),
+}
+
+/// Shell-facing events (the transcript itself hosts no surfaces).
+#[derive(Debug, Clone)]
+pub enum TranscriptEvent {
+    OpenFile {
+        context_key: String,
+        root: std::path::PathBuf,
+        relative_path: String,
+    },
+    /// A spawn chip's "Open subagent" affordance: open the subagent's
+    /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
+    /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
+    /// the subagent finished — try the blob before watching the doc.
+    OpenSubagent {
+        chat_id: String,
+        doc_id: String,
+        parent_tool_use_id: String,
+        title: String,
+        frozen: bool,
+    },
+}
+
+impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
+
 impl Transcript {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self::build(state, None, None, None, true, cx)
+    }
+
+    /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
+    /// caller starts the feed (`watch_subagent_doc` or the frozen snapshot);
+    /// this instance only renders whatever lands under `doc_id`. `follow` =
+    /// the doc is live: engage the end-follow pin from the start. Either
+    /// way the tab OPENS at the latest content — a frozen transcript lands
+    /// at the end once, unpinned, and free-scrolls from there.
+    pub fn for_doc(
+        state: Entity<AppState>,
+        journal_chat_id: String,
+        parent_tool_use_id: String,
+        doc_id: String,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            state,
+            Some(doc_id),
+            Some(journal_chat_id),
+            Some(parent_tool_use_id),
+            follow,
+            cx,
+        )
+    }
+
+    fn build(
+        state: Entity<AppState>,
+        doc_override: Option<String>,
+        journal_chat_id: Option<String>,
+        journal_parent_tool_use_id: Option<String>,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
-        let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW_PX));
+        //
+        // Override instances align TOP: a subagent transcript reads like a
+        // fresh notes page — entries anchored at the top, streaming growing
+        // into the empty space below, never rising from the pane's bottom.
+        // Top alignment gets that structurally (a short list rests at the
+        // top with no reservation pad), and the PIN machinery still runs on
+        // top of it for end-follow: the spring is purely distance-based, and
+        // the glue trap it was built around is Bottom-only — layout
+        // materializes a Top list's past-end offset to a CONCRETE position
+        // every frame (gpui list.rs: only `Bottom` re-glues to the `None`
+        // sentinel), so a parked spring can't re-glue and hard-track growth.
+        let alignment = if doc_override.is_some() {
+            ListAlignment::Top
+        } else {
+            ListAlignment::Bottom
+        };
+        let list = ListState::new(0, alignment, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
             weak.update(cx, |this: &mut Transcript, cx| {
@@ -946,15 +2809,39 @@ impl Transcript {
             .ok();
         });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        // The rail is sized for the conversation column; a narrow right-pane
+        // tab has no width gate driving it, so override instances skip it.
+        let rail_enabled = doc_override.is_none();
+        // `follow` is the initial pin: the primary transcript always opens
+        // pinned; an override instance pins only while its doc is LIVE (a
+        // frozen transcript reads top-down, free-scrolling). Short content
+        // is at-end by definition (distance 0), so the pin is invisible
+        // until streaming overflows the pane — then it follows, releases on
+        // wheel-up, and resticks/jumps exactly like the main transcript.
+        let pinned = follow;
         let mut this = Self {
             state,
             list,
             rows: Vec::new(),
-            chat_id: None,
+            // Pre-set so `sync` never sees an attach edge — an override
+            // instance must not reset (or re-pin) on selection changes.
+            chat_id: doc_override.clone(),
+            land_end_pending: doc_override.is_some() && !follow,
+            doc_live: doc_override.is_some() && follow,
+            doc_override,
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
+            turn_steps_open: HashMap::new(),
+            tool_details: HashMap::new(),
+            reasoning_started: HashMap::new(),
+            reasoning_tick: None,
+            inline_images: HashMap::new(),
+            validated_inline_images: HashMap::new(),
+            mermaid: HashMap::new(),
+            validated_mermaid: HashMap::new(),
+            media_clock: 0,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -962,21 +2849,44 @@ impl Transcript {
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
-            pinned: true,
+            pinned,
+            own_turn: None,
+            sticky_turn: StickyTurnState::default(),
+            sticky_turn_rows: Vec::new(),
+            sticky_scroll_y: 0.0,
+            own_turn_kick: false,
+            own_turn_scheduled: false,
+            own_turn_last_tick: None,
+            own_turn_release_pending: false,
             spring: StickSpring::new(),
             spring_last_tick: None,
             spring_settled_at: None,
             spring_kick: false,
             spring_scheduled: false,
             scroll_anim: None,
-            rail_enabled: true,
+            selection_drag_position: None,
+            selection_scroll_task: None,
+            rail_enabled,
+            bottom_clearance: 0.0,
             rail_hover: None,
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
             attachment_preview: None,
+            attachment_preview_focus: cx.focus_handle(),
+            user_message_overflow: HashMap::new(),
+            user_message_preview: None,
+            user_message_preview_focus: cx.focus_handle(),
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
+            blob_details: HashMap::new(),
+            blob_fetch_order: HashMap::new(),
+            blob_fetch_counter: 0,
+            file_change_open: HashMap::new(),
+            file_change_inputs: HashMap::new(),
+            file_change_scrolls: HashMap::new(),
+            journal_chat_id,
+            journal_parent_tool_use_id,
             _observe: observe,
         };
         this.sync(cx);
@@ -995,6 +2905,20 @@ impl Transcript {
 
     pub(crate) fn rail_enabled(&self) -> bool {
         self.rail_enabled
+    }
+
+    /// Shell-driven: the measured height of the bottom chrome stack the
+    /// transcript scrolls under. Sub-pixel jitter is ignored so steady-state
+    /// frames don't re-notify.
+    pub fn set_bottom_clearance(&mut self, height: f32, cx: &mut Context<Self>) {
+        if (self.bottom_clearance - height).abs() > 0.5 {
+            self.bottom_clearance = height;
+            if self.own_turn.is_some() {
+                self.remeasure_last_row();
+                self.own_turn_kick = true;
+            }
+            cx.notify();
+        }
     }
 
     pub(crate) fn rail_hover(&self) -> Option<usize> {
@@ -1019,8 +2943,35 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
+        self.remove_own_turn_runway();
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    /// Give the viewport to the user/navigation without dropping the
+    /// reservation: the pad stays, the hold stands down until a restick.
+    fn release_own_turn_hold(&mut self) {
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = false;
+        }
+        self.own_turn_last_tick = None;
+    }
+
+    fn remeasure_last_row(&mut self) {
+        if let Some(last) = self.rows.len().checked_sub(1) {
+            self.list.remeasure_items(last..last + 1);
+        }
+    }
+
+    /// Drop the temporary send runway without enabling follow-tail. Used when
+    /// explicit user navigation supersedes the automatic own-turn behavior.
+    fn remove_own_turn_runway(&mut self) {
+        if self.own_turn.take().is_some() {
+            self.remeasure_last_row();
+        }
+        self.own_turn_kick = false;
+        self.own_turn_last_tick = None;
+        self.own_turn_release_pending = false;
     }
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
@@ -1046,6 +2997,64 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
+                // While a landed own-turn anchor holds, everything already
+                // fits on screen — the prompt at the top, the whole reply
+                // below, and under that only reserved runway. Wheel/touch has
+                // nothing to reveal in either direction, so clamp back to the
+                // anchor instead of handing over the viewport (cancelling
+                // here collapses the runway and teleports the layout by up to
+                // a viewport). The runway retires when the reply outgrows it;
+                // explicit navigation (jump pill, rail clicks, chat switches)
+                // still cancels it. During the send glide the step fn owns
+                // the offset — input just waits the ~200ms out.
+                if this.own_turn.is_some() {
+                    let distance = this.distance_from_bottom();
+                    let previous = this.last_scroll_distance;
+                    this.last_scroll_distance = distance;
+                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                        // Input moving away from the bottom breaks the hold.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.pinned = false;
+                        this.spring.reset();
+                        this.spring_last_tick = None;
+                    } else if !held
+                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
+                    {
+                        // Returning to the bottom returns to the RUNWAY: the
+                        // glide re-lands the prompt at its inset.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = true;
+                            anchor.positioned = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.own_turn_kick = true;
+                    } else if held {
+                        // Wheel-down while held: the bottom is a HARD STOP.
+                        // The pad runs one frame behind a streaming commit,
+                        // so the list's own end-clamp can briefly admit
+                        // travel into the transient surplus — re-assert the
+                        // hold in the same effect cycle, before anything
+                        // paints, and the sink never reaches the screen.
+                        // (scroll_to is bounds-free, so this also covers the
+                        // wheel gluing the offset at the end.)
+                        if let Some(ix) = this.own_turn_anchor_ix() {
+                            this.list.scroll_to(ListOffset {
+                                item_ix: ix,
+                                offset_in_item: px(0.0),
+                            });
+                            this.list.scroll_by(px(-Self::own_send_inset(ix)));
+                        }
+                        this.last_scroll_distance = this.distance_from_bottom();
+                    }
+                    this.last_scroll_distance = this.distance_from_bottom();
+                    return;
+                }
+                // User input supersedes a pending post-handoff re-pin.
+                this.own_turn_release_pending = false;
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
@@ -1075,9 +3084,455 @@ impl Transcript {
         });
     }
 
-    /// Own-send re-engage: glide to the end, then stay pinned.
-    pub fn on_own_send(&mut self, cx: &mut Context<Self>) {
-        self.engage_pin(cx);
+    fn on_selection_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() || !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        self.selection_drag_position = Some(event.position);
+        if render::update_drag_at(event.position) {
+            cx.notify();
+        }
+        self.schedule_selection_scroll(cx);
+    }
+
+    fn on_selection_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_selection_scroll();
+        if let Some(_text) = crate::markdown::selection::end_active_drag() {
+            // X11 middle-click paste parity, including the case where the
+            // anchor row has virtualized away and cannot receive mouse-up.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(ClipboardItem::new_string(_text));
+        }
+    }
+
+    fn stop_selection_scroll(&mut self) {
+        self.selection_drag_position = None;
+        self.selection_scroll_task = None;
+    }
+
+    fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_task.is_some() || !crate::markdown::selection::is_dragging() {
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        if selection_scroll_step(self.list.viewport_bounds(), position) == 0.0 {
+            return;
+        }
+        self.selection_scroll_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECTION_SCROLL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |transcript, cx| {
+                transcript.selection_scroll_task = None;
+                transcript.step_selection_scroll(cx);
+            });
+        }));
+    }
+
+    fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        let step = selection_scroll_step(self.list.viewport_bounds(), position);
+        if step == 0.0 {
+            return;
+        }
+
+        // Resolve against the registry painted after the previous step before
+        // moving it again. This is what lets a stationary edge pointer consume
+        // successive virtualized rows.
+        render::update_drag_at(position);
+        self.scroll_anim = None;
+        self.release_own_turn_hold();
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.list.scroll_by(px(step));
+        self.last_scroll_distance = self.distance_from_bottom();
+        self.show_jump_button = self.last_scroll_distance > SCROLL_BUTTON_THRESHOLD_PX;
+        cx.notify();
+        self.schedule_selection_scroll(cx);
+    }
+
+    /// Glide a locally-sent prompt to the viewport top and reserve the space
+    /// below it for the reply — EVERY send, not just the first (a steer or a
+    /// post-turn send used to collapse the previous reservation and drop the
+    /// messages back down — user report). [`Self::step_own_turn`] sizes the
+    /// reservation, drives the glide, and hands off to the bottom spring
+    /// once the reply outgrows the reserved space.
+    pub fn on_own_send(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
+        self.pinned = false;
+        self.show_jump_button = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.spring_settled_at = None;
+        self.spring_kick = false;
+        self.scroll_anim = None;
+        self.materialize_scroll_anchor();
+        // Replacing a still-held previous anchor: its pad collapses on the
+        // next remeasure while the glide re-targets the new prompt — one
+        // continuous motion, no release frame needed.
+        self.own_turn = Some(OwnTurnAnchor {
+            chat_id,
+            message_id: SharedString::from(message_id),
+            runway: 0.0,
+            held: true,
+            positioned: false,
+            has_landed: false,
+        });
+        self.own_turn_release_pending = false;
+        self.own_turn_last_tick = None;
+        self.own_turn_kick = true;
+        self.remeasure_last_row();
+        cx.notify();
+    }
+
+    fn materialize_scroll_anchor(&mut self) {
+        if !self.is_glued() {
+            return;
+        }
+        let vp_top = f32::from(self.list.viewport_bounds().top());
+        for ix in 0..self.rows.len() {
+            if let Some(bounds) = self.list.bounds_for_item(ix)
+                && f32::from(bounds.bottom()) > vp_top + 0.5
+            {
+                self.list.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(vp_top - f32::from(bounds.top())),
+                });
+                return;
+            }
+        }
+    }
+
+    fn own_send_inset(anchor_ix: usize) -> f32 {
+        if anchor_ix == 0 {
+            0.0
+        } else {
+            OWN_SEND_TOP_INSET_PX
+        }
+    }
+
+    fn own_turn_anchor_ix(&self) -> Option<usize> {
+        let anchor = self.own_turn.as_ref()?;
+        self.rows
+            .iter()
+            .position(|row| row.turn_start && row.entry_id == anchor.message_id)
+    }
+
+    /// One post-layout own-turn step: install the runway, position the prompt,
+    /// then watch the real content bottom until it consumes the visible room.
+    fn step_own_turn(&mut self, cx: &mut Context<Self>) {
+        self.own_turn_kick = false;
+        if self.own_turn_release_pending {
+            self.own_turn_release_pending = false;
+            self.engage_pin(cx);
+            return;
+        }
+        // Layout moves the bottom too (pad refinement, streaming growth):
+        // refresh the wheel handler's escape baseline every frame so only a
+        // WHEEL's own delta registers as user intent. Without this, the pad
+        // growing at turn-completion between two wheel events read as
+        // "scrolled away" and silently released the hold — the next wheels
+        // then sank unopposed deep into the runway blank (rig-traced).
+        self.last_scroll_distance = self.distance_from_bottom();
+        let Some(anchor_ix) = self.own_turn_anchor_ix() else {
+            // The optimistic echo may arrive on the next state notification.
+            return;
+        };
+        let viewport = self.list.viewport_bounds();
+        let viewport_height = f32::from(viewport.size.height);
+        if viewport_height <= 0.0 {
+            self.own_turn_kick = true;
+            cx.notify();
+            return;
+        }
+        let Some(last_ix) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        let base_pad = self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0;
+        let inset = Self::own_send_inset(anchor_ix);
+        // A glued offset hard-tracks a GROWING end — streamed text visually
+        // pushes everything above it up while the runway blank persists
+        // below (user report; the glued representation also hides every
+        // item's bounds, so the sizing that would consume the runway goes
+        // blind). Dissolve it for HELD and RELEASED views alike. The glued
+        // sentinel resolves NUMERICALLY to the total content height (a
+        // viewport top past the last item), so a small nudge lands in an
+        // absurd overscroll that layout's under-fill normalizer re-glues on
+        // the very next frame — an invisible wedge loop (rig-traced).
+        // Stepping back a FULL viewport from the sentinel is exactly "end
+        // at the screen bottom": the same visual position, concrete.
+        if self.is_glued() {
+            self.list.scroll_by(px(-viewport_height));
+        }
+        // The slack keeps the held layout scrollable (see the constant) —
+        // the reservation deliberately over-fills by this much.
+        let usable = viewport_height - inset - base_pad + OWN_SEND_SCROLL_SLACK_PX;
+        let current = self.own_turn.as_ref().map_or(0.0, |a| a.runway);
+
+        // ---- reservation: a min-height for the turn, on the last row -------
+        // A fresh anchor installs a full-viewport pad BEFORE anything needs
+        // bounds: the just-sent rows sit below the fold, unmeasured, and
+        // without the pad there is no scroll room to bring them into the
+        // measured window (gating the pad on their bounds deadlocked — the
+        // clamped scroll kept them unmeasured forever). It refines to the
+        // true reservation as soon as the turn measures.
+        let fresh = self
+            .own_turn
+            .as_ref()
+            .is_some_and(|anchor| anchor.runway <= 0.0 && !anchor.positioned);
+        if fresh {
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.runway = viewport_height;
+            }
+            self.remeasure_last_row();
+            self.own_turn_kick = true;
+            cx.notify();
+            return;
+        }
+        let (held, positioned) = self
+            .own_turn
+            .as_ref()
+            .map_or((false, false), |anchor| (anchor.held, anchor.positioned));
+        if let (Some(anchor_bounds), Some(last_bounds)) = (
+            self.list.bounds_for_item(anchor_ix),
+            self.list.bounds_for_item(last_ix),
+        ) {
+            // Content height of the turn, excluding the pads on the last row.
+            let turn_height = f32::from(last_bounds.bottom())
+                - f32::from(anchor_bounds.top())
+                - current
+                - base_pad;
+            let target = own_turn_reservation(usable, turn_height);
+            // FLOOR: never shrink the pad faster than the viewport allows.
+            // The step runs a frame behind content growth, so a wheel that
+            // lands inside that window can sink the view toward the stale
+            // end; snapping the pad straight to `target` then pulls the end
+            // UP THROUGH the viewport (the list clamps instantly — a visible
+            // yank, user report "stutter push back"). Shrinking is capped so
+            // the end never rises above the current view; deferred surplus
+            // burns off as the view moves away from the stop.
+            let dist = self.distance_from_bottom();
+            let floor = current - (dist - OWN_SEND_SCROLL_SLACK_PX).max(0.0);
+            let target = target.max(floor.min(current));
+            if target <= 0.5 {
+                // The reply has outgrown the reserved space (or the prompt
+                // alone overfills it): the pad is ~0, so releasing to the
+                // bottom spring is height-neutral — continuous, not a
+                // one-viewport jump. Before the glide has landed, skip the
+                // anchor entirely rather than gliding to the top only to be
+                // yanked back down.
+                self.own_turn = None;
+                self.remeasure_last_row();
+                if !held {
+                    cx.notify();
+                } else if positioned {
+                    self.own_turn_release_pending = true;
+                    self.own_turn_kick = true;
+                    cx.notify();
+                } else {
+                    self.engage_pin(cx);
+                }
+                return;
+            }
+            if (target - current).abs() > 0.5 {
+                if let Some(anchor) = self.own_turn.as_mut() {
+                    anchor.runway = target;
+                }
+                // Growth into the reservation shrinks the pad 1:1 — the
+                // turn's total height (and the held viewport) never moves.
+                self.remeasure_last_row();
+                self.own_turn_kick = true;
+                cx.notify();
+            }
+        }
+
+        // ---- glide to the hold, then hold exactly --------------------------
+        // A released view keeps its reservation SIZED above, but owns its own
+        // offset: only the hold moves the viewport.
+        if !held {
+            return;
+        }
+        let Some(anchor_bounds) = self.list.bounds_for_item(anchor_ix) else {
+            // The anchor is outside the measured window (a send fired while
+            // scrolled deep into history): teleport onto it; the glide covers
+            // the remaining error once it measures.
+            self.list.scroll_to(ListOffset {
+                item_ix: anchor_ix,
+                offset_in_item: px(0.0),
+            });
+            self.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+            self.own_turn_kick = true;
+            cx.notify();
+            return;
+        };
+        let err =
+            f32::from(anchor_bounds.top()) - (f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX);
+        if positioned {
+            // Landed: re-assert the prompt's position after every layout.
+            // scroll_to is absolute and bounds-independent, so neither glue
+            // re-snaps, pad-sizing lag, nor a splice's unmeasured flicker can
+            // carry the view off the prompt (each broke the spring-held
+            // variants of this — rig-traced). ONE-SIDED: only upward drift
+            // (view above the hold) is corrected. The scroll slack under the
+            // reservation is legal resting space — wheel-down sinks into it
+            // and stops hard at the list's own clamp; snapping back up from
+            // there made the bottom bounce/stutter on every scroll event
+            // (user report). Way-below-slack (impossible short of a bug)
+            // still re-asserts.
+            let moved = match self.list.bounds_for_item(anchor_ix) {
+                Some(b) => {
+                    let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                    // The legal rest zone below the hold is the epsilon plus
+                    // rounding; anything deeper is a transient-collision sink
+                    // and rubber-bands back.
+                    err > 0.5 || err < -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+                }
+                // Bounds vanish in the glued representation (dissolved
+                // above, so at most for this one frame) and through splice
+                // flicker. Near the stop that is dead-band space — no
+                // assert (asserting on None here was the bottom bounce);
+                // far from it the position is unknowable flicker: re-assert.
+                None => self.distance_from_bottom() > OWN_SEND_SCROLL_SLACK_PX + 8.0,
+            };
+            if moved {
+                // Correct with the entry glide's ease, not a snap: the only
+                // in-band escapes are one-frame commit transients and splice
+                // flicker, and an eased ~200ms return reads as native
+                // rubber-banding where an instant re-assert read as stutter
+                // (user report). Bounds-less flicker still snaps — there is
+                // nothing to ease against.
+                match self.list.bounds_for_item(anchor_ix) {
+                    Some(b) => {
+                        let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                        let now = Instant::now();
+                        let frames = match self.own_turn_last_tick {
+                            Some(last) => (now.duration_since(last).as_secs_f32() * 1000.0
+                                / SPRING_FRAME_MS)
+                                .min(SPRING_MAX_CATCHUP_FRAMES),
+                            None => 1.0,
+                        };
+                        self.own_turn_last_tick = Some(now);
+                        let ease = 1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames);
+                        if err.abs() <= OWN_SEND_GLIDE_SNAP_PX {
+                            self.list.scroll_by(px(err));
+                            self.own_turn_last_tick = None;
+                        } else {
+                            self.list.scroll_by(px(err * ease));
+                        }
+                        self.own_turn_kick = true;
+                    }
+                    None => {
+                        self.list.scroll_to(ListOffset {
+                            item_ix: anchor_ix,
+                            offset_in_item: px(0.0),
+                        });
+                        self.list.scroll_by(px(-inset));
+                        self.own_turn_last_tick = None;
+                    }
+                }
+                cx.notify();
+            } else {
+                self.own_turn_last_tick = None;
+            }
+            return;
+        }
+        let now = Instant::now();
+        let frames = match self.own_turn_last_tick {
+            Some(last) => (now.duration_since(last).as_secs_f32() * 1000.0 / SPRING_FRAME_MS)
+                .min(SPRING_MAX_CATCHUP_FRAMES),
+            None => 1.0,
+        };
+        self.own_turn_last_tick = Some(now);
+        let ease = 1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames);
+        // Remaining travel: the anchor's own error once it measures; the
+        // bottom distance while it is still below the measured window (the
+        // undershot provisional pad guarantees the bottom stops short of the
+        // prompt, so this leg can never overshoot it).
+        // The two error legs mean DIFFERENT things at zero: on the bounds
+        // leg, err 0 is AT the hold (no correction needed); on the bounds-
+        // less leg, err is the distance to the pad's bottom — arrival there
+        // still needs the absolute snap onto the anchor (the short-chat/
+        // glued landing, where bounds never appear). Conflating them once
+        // marked entries "positioned" at the pad bottom without ever
+        // landing (rig-caught: sends parked deep in blank runway).
+        let (err, anchored) = match self.list.bounds_for_item(anchor_ix) {
+            Some(bounds) => (
+                f32::from(bounds.top()) - (f32::from(viewport.top()) + inset),
+                true,
+            ),
+            None => (self.distance_from_bottom(), false),
+        };
+        let glide_max = GLIDE_MAX_VIEWPORTS * viewport_height;
+        let err = if err.abs() > glide_max {
+            let teleport = err - err.signum() * glide_max;
+            self.list.scroll_by(px(teleport));
+            err - teleport
+        } else {
+            err
+        };
+        let land = |list: &ListState| {
+            list.scroll_to(ListOffset {
+                item_ix: anchor_ix,
+                offset_in_item: px(0.0),
+            });
+            list.scroll_by(px(-inset));
+        };
+        if motion::reduced_motion(cx) {
+            land(&self.list);
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+                anchor.has_landed = true;
+            }
+            self.own_turn_last_tick = None;
+        } else if anchored
+            && err <= OWN_SEND_GLIDE_SNAP_PX
+            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+        {
+            // At the hold — or resting inside the slack under it (a restick
+            // that fired at the true bottom): land WITHOUT pulling the view
+            // up. Only a still-above position gets the snap.
+            if err > 0.5 {
+                land(&self.list);
+            }
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+                anchor.has_landed = true;
+            }
+            self.own_turn_last_tick = None;
+        } else if !anchored && err <= OWN_SEND_GLIDE_SNAP_PX {
+            // Arrived at the bottom with the anchor still unmeasured: the
+            // absolute, bounds-free snap IS the landing.
+            land(&self.list);
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+                anchor.has_landed = true;
+            }
+            self.own_turn_last_tick = None;
+        } else {
+            self.list
+                .scroll_by(px(err * (1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames))));
+        }
+        self.own_turn_kick = true;
+        cx.notify();
     }
 
     /// Whether the transcript is currently pinned to the bottom.
@@ -1093,6 +3548,7 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.remove_own_turn_runway();
         self.engage_pin(cx);
     }
 
@@ -1194,26 +3650,60 @@ impl Transcript {
     fn sync(&mut self, cx: &mut Context<Self>) {
         let (selected, entries, echoes) = {
             let s = self.state.read(cx);
-            (
-                s.selected_chat.clone(),
-                s.transcript.clone(),
-                s.pending_echoes().to_vec(),
-            )
+            match &self.doc_override {
+                // Pinned to a subagent doc: `selected` equals `chat_id` by
+                // construction, so the attach/reset branch below never fires,
+                // and echoes stay empty (nothing is ever sent from here).
+                Some(doc_id) => (
+                    Some(doc_id.clone()),
+                    s.sub_transcript(doc_id).to_vec(),
+                    Vec::new(),
+                ),
+                None => (
+                    s.selected_chat.clone(),
+                    s.transcript.clone(),
+                    s.pending_echoes().to_vec(),
+                ),
+            }
         };
 
         let attached = selected != self.chat_id;
         if attached {
+            self.sticky_turn.attach_chat(selected.as_deref());
+            let keep_own_turn = self
+                .own_turn
+                .as_ref()
+                .is_some_and(|anchor| selected.as_deref() == Some(anchor.chat_id.as_str()));
+            if !keep_own_turn {
+                self.own_turn = None;
+                self.own_turn_kick = false;
+                self.own_turn_release_pending = false;
+            }
             self.chat_id = selected;
             self.rows.clear();
+            self.sticky_turn_rows.clear();
             self.row_cache.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.turn_steps_open.clear();
+            self.file_change_open.clear();
+            self.file_change_inputs.clear();
+            self.file_change_scrolls.clear();
+            self.reasoning_started.clear();
+            self.reasoning_tick = None;
+            self.inline_images.clear();
+            self.validated_inline_images.clear();
+            self.mermaid.clear();
+            self.validated_mermaid.clear();
+            self.media_clock = 0;
+            self.user_message_overflow.clear();
+            self.user_message_preview = None;
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
             self.list.reset(0);
-            self.pinned = true;
+            self.pinned = self.own_turn.is_none();
             self.spring.reset();
             self.spring_last_tick = None;
             self.spring_settled_at = None;
@@ -1222,12 +3712,24 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
+        let mut todo_history = Vec::new();
         for entry in &entries {
-            new_rows.extend(self.rows_for(entry, false));
+            new_rows.extend(self.rows_for(entry, false, &mut todo_history));
         }
         for echo in &echoes {
-            new_rows.extend(self.rows_for(echo, true));
+            new_rows.extend(self.rows_for(echo, true, &mut todo_history));
         }
+        let new_sticky_turn_rows = sticky_turn_rows(&new_rows);
+        let live_sticky_user_ids = new_sticky_turn_rows
+            .iter()
+            .filter_map(|ix| new_rows.get(*ix).map(|row| row.id.clone()))
+            .collect();
+        self.sticky_turn.retain_user_ids(&live_sticky_user_ids);
+        self.reasoning_started.retain(|id, _| {
+            new_rows.iter().any(|row| {
+                row.id == *id && matches!(&row.kind, RowKind::Reasoning { active: true, .. })
+            })
+        });
 
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
@@ -1261,25 +3763,75 @@ impl Transcript {
                 .iter()
                 .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
         });
+        prune_turn_steps_state(&mut self.turn_steps_open, &new_rows);
+        let live_file_changes = live_file_change_ids(&new_rows);
+        self.file_change_open
+            .retain(|id, _| live_file_changes.contains(id));
+        self.file_change_inputs
+            .retain(|id, _| live_file_changes.contains(id));
+        self.file_change_scrolls
+            .retain(|id, _| live_file_changes.contains(id));
 
         let was_empty = self.rows.is_empty();
+        let old_last = self.rows.len().checked_sub(1);
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                self.sticky_turn_rows = new_sticky_turn_rows;
+                self.refresh_protected_attachments(cx);
                 return;
             }
             Some((old_range, count)) => {
+                self.invalidate_sticky_users_from(old_range.start);
                 // Any replaced row's cached flatten results are stale — and
                 // because live replies splice only the rows whose content hash
                 // changed (the tail), this is O(changed rows) per commit, never
                 // O(reply).
                 for row in &self.rows[old_range.clone()] {
-                    self.render_cache.borrow_mut().invalidate_row(&row.id);
+                    visit_row_ids(row, &mut |id| {
+                        self.render_cache.borrow_mut().invalidate_row(id);
+                    });
                 }
-                self.list.splice(old_range, count);
+                if old_range.len() == count {
+                    // In-place content change, same row count — notably the
+                    // live→complete flip, where EVERY row of the streamed
+                    // message changes version (streaming bit, tool auto_open,
+                    // timestamp bit) with identical ids. `splice` would reset
+                    // those items to hint-less Unmeasured (heights read 0
+                    // until the next paint) and, when the viewport-top item is
+                    // inside the range, clobber the scroll anchor to the range
+                    // start — the end-of-turn up/down jump the spring then has
+                    // to walk back. `remeasure_items` keeps old sizes as hints
+                    // and holds the anchor across the remeasure.
+                    self.list.remeasure_items(old_range);
+                } else {
+                    self.list.splice(old_range, count);
+                }
             }
         }
         self.rows = new_rows;
+        self.sticky_turn_rows = new_sticky_turn_rows;
+        self.refresh_protected_attachments(cx);
+        if self.land_end_pending && !self.rows.is_empty() {
+            // First content for an unpinned override tab: land at the end.
+            // `scroll_to_end` is ITEM-anchored (past-the-end offset that the
+            // next layout materializes) — a pixel scroll off `max_offset`
+            // would land short here, since the freshly-spliced rows are
+            // still unmeasured. Short content clamps back to the top under
+            // Top alignment, so "end" and "top" coincide there.
+            self.land_end_pending = false;
+            self.list.scroll_to_end();
+        }
+        if self.own_turn.is_some() {
+            // Appending a reply moves the runway from the previous last row to
+            // the new one. Both measurements must be invalidated because the
+            // row diff itself only knows that rows were appended at the tail.
+            if let Some(old_last) = old_last.filter(|&ix| ix < self.rows.len()) {
+                self.list.remeasure_items(old_last..old_last + 1);
+            }
+            self.remeasure_last_row();
+            self.own_turn_kick = true;
+        }
         if self.pinned {
             if motion::reduced_motion(cx) || was_empty {
                 // First fill (chat open) lands at the bottom instantly
@@ -1298,13 +3850,27 @@ impl Transcript {
     }
 
     /// Cached row build for one entry (streaming entries bypass the cache).
-    fn rows_for(&mut self, entry: &SessionMessageEntry, pending: bool) -> Vec<Row> {
+    fn rows_for(
+        &mut self,
+        entry: &SessionMessageEntry,
+        pending: bool,
+        todo_history: &mut Vec<TodoItem>,
+    ) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
-        let fingerprint = entry_fingerprint(entry, pending);
+        let next_todos = last_todo_snapshot(entry).map(<[TodoItem]>::to_vec);
+        let mut fingerprint = entry_fingerprint(entry, pending);
+        if next_todos.is_some() {
+            let mut context = Vec::new();
+            append_todo_snapshot_bytes(&mut context, todo_history);
+            fingerprint ^= fnv1a(&context).rotate_left(17);
+        }
         if !streaming
             && let Some(cached) = self.row_cache.get(&entry.id)
             && cached.fingerprint == fingerprint
         {
+            if let Some(next_todos) = next_todos {
+                *todo_history = next_todos;
+            }
             return cached.rows.clone();
         }
 
@@ -1315,7 +3881,11 @@ impl Transcript {
             // rows whose content hash changed are spliced — the reparsed tail).
             parse_for_row(streaming, key, text, live_parsers, tree_cache).0
         };
-        let rows = rows_for_entry(entry, pending, &mut parse);
+        let rows = rows_for_entry_with_todo_history(entry, pending, todo_history, &mut parse);
+
+        if let Some(next_todos) = next_todos {
+            *todo_history = next_todos;
+        }
 
         if !streaming {
             self.row_cache.insert(
@@ -1329,14 +3899,235 @@ impl Transcript {
         rows
     }
 
-    fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, auto_open: bool) {
+    /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
+    /// [`ToolDetail`] once, off the render path. Re-entry while Loading/Ready
+    /// is a no-op; Failed re-arms as a retry (the affordance label says so).
+    fn spawn_blob_fetch(&mut self, blob_ref: SharedString, cx: &mut Context<Self>) {
+        // Rank BEFORE the already-fetched guard: clicking a Ready ref is the
+        // "show me this one again" toggle (recency bump + repaint, no
+        // re-fetch) — with both a diff and an output fetched, the two
+        // affordances must be able to trade places forever.
+        self.blob_fetch_counter += 1;
+        self.blob_fetch_order
+            .insert(blob_ref.clone(), self.blob_fetch_counter);
+        match self.blob_details.get(&blob_ref) {
+            Some(BlobFetch::Ready(_)) => {
+                self.sticky_turn.invalidate_layout();
+                cx.notify();
+                return;
+            }
+            Some(BlobFetch::Loading(_)) => return,
+            Some(BlobFetch::Failed) | None => {}
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let is_diff = blob_ref.ends_with(".diff");
+        let ref_key = blob_ref.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                zeron_rpc::methods::FETCH_TOOL_BLOB,
+                serde_json::json!({ "blobRef": ref_key.as_ref() }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let fetched = match reply {
+                Ok(value) => {
+                    let text = value
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
+                    blob_detail(text, is_diff)
+                        .map(|d| BlobFetch::Ready(Arc::new(d)))
+                        .unwrap_or(BlobFetch::Failed)
+                }
+                Err(_) => BlobFetch::Failed,
+            };
+            this.update(cx, |this, cx| {
+                this.blob_details.insert(ref_key, fetched);
+                this.sticky_turn.invalidate_layout();
+                cx.notify();
+            })
+            .ok();
+        });
+        self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
+    }
+
+    fn spawn_file_input_fetch(
+        &mut self,
+        row_id: SharedString,
+        chat_id: String,
+        tool_call_id: String,
+        target_device_id: String,
+        parent_tool_use_id: Option<String>,
+        kind: zeron_doc::FileChangeKind,
+        durable_preview: Option<Arc<FileChangePreview>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !file_input_should_fetch(self.file_change_inputs.get(&row_id)) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.file_change_inputs
+                .insert(row_id, FileInputLoad::Failed);
+            return;
+        };
+        let fetch_key = row_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                zeron_rpc::methods::FETCH_TOOL_INPUT,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "toolCallId": tool_call_id,
+                    "targetDeviceId": target_device_id,
+                    "parentToolUseId": parent_tool_use_id,
+                }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let snapshot: Option<zeron_proto::FileToolInputSnapshot> = match reply {
+                Ok(value) => value
+                    .get("snapshot")
+                    .cloned()
+                    .filter(|value| !value.is_null())
+                    .and_then(|value| serde_json::from_value(value).ok()),
+                Err(_) => None,
+            };
+            let loaded = if let Some(snapshot) = snapshot {
+                cx.background_executor()
+                    .spawn(async move {
+                        let derived = crate::file_change::derive_file_input(
+                            kind,
+                            &snapshot,
+                            durable_preview.as_deref(),
+                        )?;
+                        let highlight = derived.source.as_deref().and_then(|source| {
+                            comet_syntax::language_for_path(&snapshot.path).and_then(|_language| {
+                                comet_syntax::highlight(comet_syntax::HighlightRequest {
+                                    source,
+                                    path: Some(&snapshot.path),
+                                    fence_tag: None,
+                                })
+                                .ok()
+                                .map(Arc::new)
+                            })
+                        });
+                        Some(FileInputReady {
+                            snapshot: Arc::new(snapshot),
+                            preview: Arc::new(derived.preview),
+                            highlight,
+                        })
+                    })
+                    .await
+                    .map(Arc::new)
+                    .map(FileInputLoad::Ready)
+                    .unwrap_or(FileInputLoad::Failed)
+            } else {
+                FileInputLoad::Failed
+            };
+            this.update(cx, |this, cx| {
+                this.file_change_inputs.insert(fetch_key.clone(), loaded);
+                this.remeasure_row_containing(&fetch_key);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.file_change_inputs
+            .insert(row_id, FileInputLoad::Loading(task));
+    }
+
+    fn toggle_file_change(
+        &mut self,
+        row_id: SharedString,
+        tool_call_id: String,
+        can_expand: bool,
+        kind: zeron_doc::FileChangeKind,
+        durable_preview: Option<Arc<FileChangePreview>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !can_expand {
+            return;
+        }
+        let open = self.file_change_open.get(&row_id).copied().unwrap_or(false);
+        self.file_change_open.insert(row_id.clone(), !open);
+        self.file_change_scrolls.entry(row_id.clone()).or_default();
+        if !open {
+            let target = self.file_fetch_target(cx);
+            if let Some((chat_id, target_device_id, parent_tool_use_id)) = target {
+                self.spawn_file_input_fetch(
+                    row_id.clone(),
+                    chat_id,
+                    tool_call_id,
+                    target_device_id,
+                    parent_tool_use_id,
+                    kind,
+                    durable_preview,
+                    cx,
+                );
+            } else {
+                self.file_change_inputs
+                    .insert(row_id.clone(), FileInputLoad::Failed);
+            }
+        }
+        self.remeasure_row_containing(&row_id);
+        cx.notify();
+    }
+
+    fn file_fetch_target(&self, cx: &Context<Self>) -> Option<(String, String, Option<String>)> {
+        let state = self.state.read(cx);
+        let chat_id = self
+            .journal_chat_id
+            .as_deref()
+            .or(self.chat_id.as_deref())?;
+        let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
+        Some((
+            chat_id.to_string(),
+            chat.device_id.clone(),
+            self.journal_parent_tool_use_id.clone(),
+        ))
+    }
+
+    fn invalidate_sticky_users_from(&mut self, row_ix: usize) {
+        let first_user = self
+            .sticky_turn_rows
+            .partition_point(|user_ix| *user_ix < row_ix);
+        let ids = self.sticky_turn_rows[first_user..]
+            .iter()
+            .filter_map(|user_ix| self.rows.get(*user_ix).map(|row| row.id.clone()))
+            .collect::<Vec<_>>();
+        self.sticky_turn.invalidate_user_ids(ids);
+    }
+
+    fn invalidate_sticky_users_after_row(&mut self, row_id: &SharedString) {
+        if let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| row_contains_id(row, row_id))
+        {
+            self.invalidate_sticky_users_from(index + 1);
+        }
+    }
+
+    fn remeasure_row_containing(&mut self, row_id: &SharedString) {
+        if let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| row_contains_id(row, row_id))
+        {
+            self.invalidate_sticky_users_from(index + 1);
+            self.list.remeasure_items(index..index + 1);
+        }
+    }
+
+    fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
+        self.invalidate_sticky_users_after_row(&row_id);
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
-        entry.from = if currently_open {
-            chips_height(tool_count)
-        } else {
-            0.0
-        };
+        entry.from = if currently_open { open_height } else { 0.0 };
         entry.open = Some(!currently_open);
         entry.epoch += 1;
         entry.toggled_at = Some(Instant::now());
@@ -1344,10 +4135,40 @@ impl Transcript {
 
     // ---- attachment read-back (user-attachments.tsx + transcript cache) ----
 
+    /// Shield the open transcript's attachments from image-cache eviction —
+    /// rebuilt on every row sync so a chat switch swaps the set. Without it,
+    /// budget pressure evicted thumbnails still on screen (the list caches
+    /// rendered rows, so a visible image's LRU tick goes stale).
+    fn refresh_protected_attachments(&self, cx: &Context<Self>) {
+        // The protected set is GLOBAL and replaced wholesale — an override
+        // instance writing it would clobber the primary transcript's keys.
+        if self.doc_override.is_some() {
+            return;
+        }
+        let devices = self.attachment_device_ids(cx);
+        let mut keys = std::collections::HashSet::new();
+        for row in &self.rows {
+            if let RowKind::User { attachments, .. } = &row.kind {
+                for att in attachments.iter() {
+                    for dev in &devices {
+                        keys.insert((dev.clone(), att.path.clone()));
+                    }
+                }
+            }
+        }
+        crate::attachments::protect_attachments(keys);
+    }
+
     /// Devices that may own a user message's attachment files: the chat's host
-    /// device (uploads targeted it) plus this device (comet's
+    /// device (uploads targeted it) plus this device (zeron's
     /// `uniqueIds([attachmentDeviceId, m.device_id])`).
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
+        // `selected_chat_row` belongs to the PRIMARY transcript's chat — an
+        // override instance has no chat row, so it claims no devices (its
+        // thumbnails degrade to placeholders instead of guessing).
+        if self.doc_override.is_some() {
+            return Vec::new();
+        }
         let state = self.state.read(cx);
         let mut ids = Vec::new();
         if let Some(chat) = state.selected_chat_row() {
@@ -1461,6 +4282,285 @@ impl Transcript {
         self.attachment_retries.insert(key, task);
     }
 
+    fn inline_image_root(&self, cx: &gpui::App) -> Option<std::path::PathBuf> {
+        let state = self.state.read(cx);
+        let chat = state.selected_chat_row()?;
+        if let Some(local_device) = state.local_device_id.as_deref()
+            && chat.device_id != local_device
+        {
+            return None;
+        }
+        chat.cwd.as_deref().map(std::path::PathBuf::from)
+    }
+
+    fn next_media_use(&mut self) -> u64 {
+        self.media_clock = self.media_clock.wrapping_add(1).max(1);
+        self.media_clock
+    }
+
+    fn trim_inline_image_cache(&mut self) {
+        loop {
+            let settled = self
+                .inline_images
+                .values()
+                .filter(|entry| !matches!(entry, InlineImageLoad::Loading(_)))
+                .count();
+            let bytes: u64 = self
+                .inline_images
+                .values()
+                .filter_map(|entry| match entry {
+                    InlineImageLoad::Ready { image, .. } => Some(image.bytes),
+                    _ => None,
+                })
+                .sum();
+            if self.inline_images.len() <= INLINE_IMAGE_CACHE_MAX_TOTAL
+                && settled <= INLINE_IMAGE_CACHE_MAX_ENTRIES
+                && bytes <= INLINE_IMAGE_CACHE_MAX_BYTES
+            {
+                break;
+            }
+            let oldest = self
+                .inline_images
+                .iter()
+                .filter_map(|(key, entry)| match entry {
+                    InlineImageLoad::Failed { used_at }
+                    | InlineImageLoad::Ready { used_at, .. } => Some((key.clone(), *used_at)),
+                    InlineImageLoad::Loading(_) => None,
+                })
+                .min_by_key(|(_, used_at)| *used_at)
+                .map(|(key, _)| key);
+            let Some(oldest) = oldest else { break };
+            self.inline_images.remove(&oldest);
+        }
+    }
+
+    fn trim_mermaid_cache(&mut self) {
+        loop {
+            let settled = self
+                .mermaid
+                .values()
+                .filter(|entry| !matches!(entry, MermaidLoad::Loading(_)))
+                .count();
+            let bytes: usize = self
+                .mermaid
+                .values()
+                .filter_map(|entry| match entry {
+                    MermaidLoad::Ready { bytes, .. } => Some(*bytes),
+                    _ => None,
+                })
+                .sum();
+            if self.mermaid.len() <= MERMAID_CACHE_MAX_TOTAL
+                && settled <= MERMAID_CACHE_MAX_ENTRIES
+                && bytes <= MERMAID_CACHE_MAX_BYTES
+            {
+                break;
+            }
+            let oldest = self
+                .mermaid
+                .iter()
+                .filter_map(|(key, entry)| match entry {
+                    MermaidLoad::Failed { used_at } | MermaidLoad::Ready { used_at, .. } => {
+                        Some((key.clone(), *used_at))
+                    }
+                    MermaidLoad::Loading(_) => None,
+                })
+                .min_by_key(|(_, used_at)| *used_at)
+                .map(|(key, _)| key);
+            let Some(oldest) = oldest else { break };
+            self.mermaid.remove(&oldest);
+        }
+    }
+
+    fn inline_image_snapshot(
+        &mut self,
+        root: &std::path::Path,
+        candidate: &str,
+        cx: &mut Context<Self>,
+    ) -> InlineImageSnapshot {
+        let key = format!("{}\0{candidate}", root.display());
+        let used_at = self.next_media_use();
+        match self.inline_images.get_mut(&key) {
+            Some(InlineImageLoad::Loading(_)) => return InlineImageSnapshot::Loading,
+            Some(InlineImageLoad::Failed { used_at: stamp }) => {
+                *stamp = used_at;
+                return InlineImageSnapshot::Failed;
+            }
+            Some(InlineImageLoad::Ready {
+                image,
+                used_at: stamp,
+            }) => {
+                *stamp = used_at;
+                return InlineImageSnapshot::Ready {
+                    name: image.name.clone(),
+                    image: image.image.clone(),
+                };
+            }
+            None => {}
+        }
+
+        self.trim_inline_image_cache();
+        let validation_key = fnv1a(key.as_bytes());
+        let previously_ready =
+            if let Some(stamp) = self.validated_inline_images.get_mut(&validation_key) {
+                *stamp = used_at;
+                true
+            } else {
+                false
+            };
+        let inflight = self
+            .inline_images
+            .values()
+            .filter(|entry| matches!(entry, InlineImageLoad::Loading(_)))
+            .count();
+        if !media_task_admitted(
+            inflight,
+            self.inline_images.len(),
+            INLINE_IMAGE_MAX_INFLIGHT,
+            INLINE_IMAGE_CACHE_MAX_TOTAL,
+        ) {
+            return if previously_ready {
+                InlineImageSnapshot::Reloading
+            } else {
+                InlineImageSnapshot::Failed
+            };
+        }
+
+        let task_key = key.clone();
+        let root = root.to_path_buf();
+        let candidate = candidate.to_owned();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::inline_media::load_checkout_image(&root, &candidate) })
+                .await;
+            this.update(cx, |transcript, cx| {
+                let used_at = transcript.next_media_use();
+                if result.is_ok() {
+                    remember_validated(
+                        &mut transcript.validated_inline_images,
+                        validation_key,
+                        used_at,
+                        INLINE_IMAGE_CACHE_MAX_TOTAL,
+                    );
+                } else {
+                    transcript.validated_inline_images.remove(&validation_key);
+                }
+                transcript.inline_images.insert(
+                    task_key,
+                    match result {
+                        Ok(image) => InlineImageLoad::Ready { image, used_at },
+                        Err(_) => InlineImageLoad::Failed { used_at },
+                    },
+                );
+                transcript.trim_inline_image_cache();
+                transcript.sticky_turn.invalidate_layout();
+                cx.notify();
+            })
+            .ok();
+        });
+        self.inline_images
+            .insert(key, InlineImageLoad::Loading(task));
+        if previously_ready {
+            InlineImageSnapshot::Reloading
+        } else {
+            InlineImageSnapshot::Loading
+        }
+    }
+
+    fn render_inline_image_gallery(
+        &mut self,
+        row_id: &SharedString,
+        paths: &[String],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(root) = self.inline_image_root(cx) else {
+            return gpui::Empty.into_any_element();
+        };
+        let mut cards = Vec::new();
+        for (ix, path) in paths.iter().enumerate() {
+            let frame = div()
+                .id(SharedString::from(format!("{row_id}#inline-image-{ix}")))
+                .w(px(288.0))
+                .max_w_full()
+                .h(px(192.0))
+                .flex_none()
+                .overflow_hidden()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.09))
+                .bg(crate::theme::ink(0.035));
+            match self.inline_image_snapshot(&root, path, cx) {
+                InlineImageSnapshot::Failed => {}
+                InlineImageSnapshot::Loading => {}
+                InlineImageSnapshot::Reloading => cards.push(
+                    frame
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            format!("inline-image-reload-{row_id}-{ix}"),
+                            2.0,
+                            theme.text_muted,
+                            cx.entity_id(),
+                            cx,
+                        ))
+                        .into_any_element(),
+                ),
+                InlineImageSnapshot::Ready { name, image } => {
+                    let preview = crate::attachments::PreviewImage {
+                        name: name.clone(),
+                        image: image.clone(),
+                    };
+                    cards.push(
+                        frame
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(crate::theme::hairline(0.18)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.user_message_preview = None;
+                                this.attachment_preview = Some(preview.clone());
+                                window.focus(&this.attachment_preview_focus, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                img(image)
+                                    .w_full()
+                                    .h(px(164.0))
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                            .child(
+                                div()
+                                    .h(px(27.0))
+                                    .border_t_1()
+                                    .border_color(crate::theme::hairline(0.07))
+                                    .px(px(9.0))
+                                    .flex()
+                                    .items_center()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child(name),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if cards.is_empty() {
+            gpui::Empty.into_any_element()
+        } else {
+            div()
+                .w_full()
+                .pt(px(GAP_BLOCK))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .children(cards)
+                .into_any_element()
+        }
+    }
+
     /// The right-aligned thumbnail strip above a user bubble.
     fn render_user_attachments(
         &mut self,
@@ -1475,7 +4575,7 @@ impl Transcript {
             .h(px(ATT_STRIP_H))
             .flex()
             .flex_row()
-            .justify_end()
+            .justify_start()
             .items_start()
             .gap(px(8.0))
             .overflow_hidden()
@@ -1483,6 +4583,33 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
+            // The in-flight send's progress belongs ON the thumbnail
+            // (2026-08-18 user request). Two ref shapes mean "still
+            // crossing": the queued flow's `pending://` (bytes ship
+            // engine-side after the send; the host rewrites the ref to an
+            // absolute path once they land and the run starts) and the
+            // legacy echo's synthetic `pending/`. Percent sources, in order:
+            // this attachment's own relay transfer (`WatchTransfers`, by the
+            // uploadId its ref names — the leg that actually takes time),
+            // else the send-wide staging/legacy upload percent. Neither → the
+            // indeterminate spinner (staged-but-waiting, retry backoff, or
+            // committed-awaiting-rewrite), so the ring never shows a number
+            // that isn't a real transfer position (2026-08-20 report: the
+            // staging-only percent blinked out in ~100ms and lied about the
+            // slow part).
+            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let upload_id = att
+                .path
+                .strip_prefix("pending://")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(id, _)| id);
+            let uploading = upload_id
+                .and_then(|id| self.state.read(cx).transfer_percent(id))
+                .or_else(|| {
+                    sending
+                        .then(|| self.state.read(cx).upload_progress_percent())
+                        .flatten()
+                });
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -1497,19 +4624,65 @@ impl Transcript {
                     };
                     frame
                         .id(SharedString::from(format!("{row_id}#att{aix}")))
+                        .relative()
                         .border_1()
                         .border_color(crate::theme::hairline(0.11))
                         .bg(crate::theme::ink(0.035))
                         .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.user_message_preview = None;
                             this.attachment_preview = Some(preview.clone());
+                            window.focus(&this.attachment_preview_focus, cx);
                             cx.notify();
                         }))
                         .child(
                             img(image.image.clone())
-                                .size_full()
+                                // EXPLICIT dims, not size_full: img layout
+                                // honors the intrinsic aspect ratio over a
+                                // percent height (gpui f8d8a90 repoint), so
+                                // size_full let a tall photo grow past the
+                                // frame and the rectangular overflow clip
+                                // squared the bottom corners (2026-08-19).
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
+                                // The IMG needs its own radii: the frame's
+                                // rounding only clips rectangularly, so the
+                                // sprite must round its own corners (7 = the
+                                // frame's 8 minus its 1px border).
+                                .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
+                        .when(sending, |el| {
+                            // The pulse read registers this entity for frames,
+                            // so the overlay stays live even once the trailer's
+                            // 30s pending-send bridge has lapsed.
+                            let pulse = motion::pulse_wave(motion::pulse_delta(
+                                &motion::ZERON_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            ));
+                            let indicator: AnyElement = match uploading {
+                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
+                                None => crate::loaders::mini_gradient_spinner(
+                                    format!("att-sending-{row_id}-{aix}"),
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                )
+                                .into_any_element(),
+                            };
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                    .child(indicator),
+                            )
+                        })
                         .into_any_element()
                 }
                 // Errored/unavailable: the dashed "missing" thumb.
@@ -1527,7 +4700,7 @@ impl Transcript {
                     .opacity(
                         0.35 + 0.4
                             * motion::pulse_wave(motion::pulse_delta(
-                                &motion::COMET_PULSE,
+                                &motion::ZERON_PULSE,
                                 cx.entity_id(),
                                 cx,
                             )),
@@ -1541,160 +4714,389 @@ impl Transcript {
 
     // ---- rendering ----
 
+    /// The working loader, INSIDE the conversation flow: appended under the
+    /// last row while the run is live (moved out of the shell's status strip
+    /// — user request), so it reads as part of the streaming reply and
+    /// scrolls away with it. The spinner drives this entity's frames, which
+    /// keeps the elapsed timer ticking through delta-quiet tool runs.
+    /// The failed-send retry (trailer affordance): re-kick every delivery
+    /// road engine-side (fresh chat2 socket, host nudge, delivery escorts)
+    /// and restart the grace clock so the trailer returns to Sending/Queued
+    /// while the retry runs.
+    fn retry_send(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
+        let engine = self.state.read(cx).engine().cloned();
+        self.state.update(cx, |s, cx| {
+            s.retry_pending_send(&chat_id, chrono::Utc::now());
+            cx.notify();
+        });
+        if let Some(engine) = engine {
+            cx.spawn(async move |_, _| {
+                let params = serde_json::json!({ "chatId": chat_id });
+                if let Err(err) = engine
+                    .client()
+                    .call(zeron_rpc::methods::RETRY_DELIVERY, params)
+                    .await
+                {
+                    tracing::warn!(error = %err, "delivery retry RPC failed");
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let now = chrono::Utc::now();
+        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
+            // A subagent doc has no Session row — `indicator_for` would read
+            // the PARENT chat's live state into this tab. Liveness rides the
+            // doc itself instead: the sink's assistant entry streams until
+            // the subagent settles (run teardown finalizes abandoned sinks),
+            // and a trailing USER entry is a steer still awaiting its reply
+            // segment. Frozen snapshots never spin, whatever they claim.
+            if !self.doc_live {
+                return None;
+            }
+            let state = self.state.read(cx);
+            let last = state.sub_transcript(doc_id).last()?;
+            let live =
+                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
+            if !live {
+                return None;
+            }
+            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            (false, false, elapsed, flavour_seed(doc_id))
+        } else {
+            let chat_id = self.chat_id.clone()?;
+            // Failed-send state first: past the grace window the trailer IS
+            // the retry affordance, whatever the indicator fell back to.
+            if self.state.read(cx).send_undelivered(&chat_id, now) {
+                let theme = Theme::of(cx).clone();
+                return Some(
+                    div()
+                        .id("undelivered-retry")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .pt(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.danger)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
+                        .child(SharedString::from("Not delivered — click to retry"))
+                        .into_any_element(),
+                );
+            }
+            let (sending, queued, elapsed) = {
+                let state = self.state.read(cx);
+                if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+                    if state.send_queued_unacked(&chat_id, now) {
+                        let theme = Theme::of(cx).clone();
+                        return Some(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .pt(px(10.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from("Queued — waiting for connection…"))
+                                .into_any_element(),
+                        );
+                    }
+                    return None;
+                }
+                // During the send→turn window the session row's `started_at`
+                // still belongs to the PREVIOUS turn — a timer based on the
+                // send counted the round-trip and then restarted when the
+                // turn actually began (user report). Bridge it as "Sending…"
+                // with no timer instead; the word + timer start with the
+                // turn.
+                let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
+                let sending =
+                    sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+                let queued = sending && state.chat_delivery_degraded(&chat_id);
+                let elapsed = turn_started
+                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                    .unwrap_or(0);
+                (sending, queued, elapsed)
+            };
+            (sending, queued, elapsed, flavour_seed(&chat_id))
+        };
+        let word = if queued {
+            "Queued — will send automatically".to_string()
+        } else if sending {
+            "Sending…".to_string()
+        } else {
+            format!("{}…", flavour_word(seed, elapsed_secs))
+        };
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
+                .pt(px(10.0))
+                .text_size(px(11.0))
+                .child(crate::loaders::gradient_spinner(
+                    "working-indicator",
+                    &theme,
+                    2.5,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(if queued {
+                            theme.warning
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(SharedString::from(word)),
+                )
+                .when(!sending, |el| {
+                    el.child(
+                        div()
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format_elapsed(elapsed_secs))),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn row_top_gap(&self, ix: usize, row: &Row) -> f32 {
+        if ix == 0 {
+            if self.doc_override.is_some() {
+                GAP_TURN
+            } else {
+                Theme::TITLEBAR_HEIGHT + GAP_TURN + 10.0
+            }
+        } else {
+            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), row)
+        }
+    }
+
+    fn sticky_reading_row(&self) -> Option<usize> {
+        let last_ix = self.rows.len().checked_sub(1)?;
+        let viewport = self.list.viewport_bounds();
+        if f32::from(viewport.size.height) <= 0.0
+            || f32::from(self.list.max_offset_for_scrollbar().y) <= 0.5
+        {
+            return None;
+        }
+        let read_top = f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX + 0.5;
+        let mut row_ix = self.list.logical_scroll_top().item_ix.min(last_ix);
+        while row_ix < last_ix {
+            let Some(bounds) = self.list.bounds_for_item(row_ix + 1) else {
+                break;
+            };
+            if f32::from(bounds.top()) > read_top {
+                break;
+            }
+            row_ix += 1;
+        }
+        Some(row_ix)
+    }
+
+    fn sticky_user_top(&self, user_ix: usize, current_scroll_y: f32) -> Option<f32> {
+        let row = self.rows.get(user_ix)?;
+        self.list
+            .bounds_for_item(user_ix)
+            .map(|bounds| f32::from(bounds.top()) + self.row_top_gap(user_ix, row))
+            .or_else(|| {
+                self.sticky_turn
+                    .projected_top(row.id.as_ref(), current_scroll_y)
+            })
+    }
+
+    fn render_sticky_turn(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.doc_override.is_some() {
+            return None;
+        }
+        let viewport = self.list.viewport_bounds();
+        let viewport_top = f32::from(viewport.top());
+        let sticky_top = viewport_top + OWN_SEND_TOP_INSET_PX;
+        if self.sticky_turn.update_viewport(
+            f32::from(viewport.size.width),
+            f32::from(viewport.size.height),
+        ) {
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |_this: &mut Transcript, cx| cx.notify())
+                    .ok();
+            });
+            return None;
+        }
+        let current_scroll_y = self.sticky_scroll_y;
+        let fallback_reading_ix = self.sticky_reading_row();
+        let group = sticky_turn_group_for_viewport(
+            &self.sticky_turn_rows,
+            sticky_top,
+            fallback_reading_ix,
+            |position| {
+                let user_ix = *self.sticky_turn_rows.get(position)?;
+                self.sticky_user_top(user_ix, current_scroll_y)
+            },
+        )?;
+        let source = self.rows.get(group.user_ix)?.clone();
+        if self.own_turn.as_ref().is_some_and(|anchor| {
+            source.entry_id == anchor.message_id
+                && runway_owns_user_position(anchor.held, anchor.positioned, anchor.has_landed)
+        }) {
+            // The runway already owns this exact visual position. Painting a
+            // second copy would double text/attachments during the landing.
+            return None;
+        }
+
+        let source_top = self.sticky_user_top(group.user_ix, current_scroll_y);
+        let source_was_invalidated = self
+            .sticky_turn
+            .consume_layout_suppression(source.id.as_ref());
+        if source_top.is_none() && source_was_invalidated {
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |_this: &mut Transcript, cx| cx.notify())
+                    .ok();
+            });
+            return None;
+        }
+        let next_turn_top = group.next_user_ix.and_then(|ix| {
+            self.list
+                .bounds_for_item(ix)
+                .map(|bounds| f32::from(bounds.top()))
+                .or_else(|| {
+                    let body_top = self.sticky_user_top(ix, current_scroll_y)?;
+                    let row = self.rows.get(ix)?;
+                    Some(body_top - self.row_top_gap(ix, row))
+                })
+        });
+        let measured_height = self
+            .sticky_turn
+            .height(source.id.as_ref())
+            .unwrap_or(USER_MESSAGE_CARD_MAX_HEIGHT);
+        let overlay_top = sticky_turn_overlay_top(
+            sticky_top,
+            source_top,
+            fallback_reading_ix.is_some_and(|reading_ix| reading_ix > group.user_ix),
+            next_turn_top,
+            measured_height + GAP_TURN,
+        )?;
+
+        // Namespace the duplicate element ids while preserving every field
+        // and the same renderer/interaction path as the list row.
+        let mut sticky_row = source.clone();
+        sticky_row.id = SharedString::from(format!("{}#sticky", source.id));
+        let theme = Theme::of(cx).clone();
+        let surface = sticky_turn_surface(&theme);
+        let body = self.render_row_body(&sticky_row, None, window, &theme, cx);
+        let source_id = source.id.clone();
+        let weak = cx.weak_entity();
+        let measured = div()
+            .w_full()
+            .min_w_0()
+            .rounded(px(surface.occlusion_radius))
+            .block_mouse_except_scroll()
+            .when_some(surface.occlusion_background, |wrapper, background| {
+                wrapper.bg(background)
+            })
+            .child(body)
+            .on_children_prepainted(move |bounds, _, cx| {
+                let Some(height) = bounds
+                    .first()
+                    .map(|bounds| f32::from(bounds.size.height))
+                    .filter(|height| *height > 0.0)
+                else {
+                    return;
+                };
+                weak.update(cx, |this, cx| {
+                    if this.sticky_turn.record_height(source_id.clone(), height) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+
+        Some(
+            div()
+                .id(SharedString::from(format!("{}#sticky-turn", source.id)))
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(overlay_top - viewport_top))
+                .px(px(48.0))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(MAX_CONTENT_WIDTH))
+                        .min_w_0()
+                        .pb(px(GAP_TURN))
+                        .when_some(surface.outer_background, |wrapper, background| {
+                            wrapper.bg(background)
+                        })
+                        .child(crate::frost::frosted(
+                            surface.occlusion_radius,
+                            surface.occlusion_blur_radius,
+                            measured,
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
-        let top_gap = if ix == 0 {
-            GAP_TURN + 10.0
+        // The viewport spans the full window (under the titlebar): the first
+        // row's gap adds the titlebar's height so a top-scrolled transcript
+        // rests below the chrome it fades under. The right pane already pads
+        // for the titlebar — an override instance's first row keeps only the
+        // ordinary turn gap, or the content sits double-chrome low.
+        let top_gap = self.row_top_gap(ix, &row);
+        // The last row must clear the composer/status stack the transcript
+        // scrolls under PLUS the fade band above it, or the timestamp strip
+        // (the row's lowest content) renders half-faded (or hidden) when the
+        // transcript is pinned to the bottom.
+        let bottom_pad = if ix + 1 == self.rows.len() {
+            let runway = self
+                .own_turn
+                .as_ref()
+                .filter(|anchor| {
+                    self.rows
+                        .iter()
+                        .any(|candidate| candidate.entry_id == anchor.message_id)
+                })
+                .map_or(0.0, |anchor| anchor.runway);
+            self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0 + runway
         } else {
-            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
+            0.0
         };
-        let bottom_pad = if ix + 1 == self.rows.len() { 24.0 } else { 0.0 };
+        // Live-run loader rides under the LAST row's content (above its
+        // clearance pad), so it sits right beneath the working reply.
+        let trailer = (ix + 1 == self.rows.len())
+            .then(|| self.render_working_trailer(cx))
+            .flatten();
 
-        let inner: AnyElement = match &row.kind {
-            RowKind::User {
-                text,
-                mentions,
-                attachments,
-                pending,
-            } => {
-                let attachments = attachments.clone();
-                let text = text.clone();
-                let mentions = mentions.clone();
-                let pending = *pending;
-                // Attachment thumbnails ride ABOVE the bubble, right-aligned
-                // (chat-view.tsx RowView: UserAttachmentStrip then the text
-                // HStack); image-only sends show no bubble at all.
-                let mut column = div().w_full().flex().flex_col();
-                if !attachments.is_empty() {
-                    column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
-                }
-                if !text.is_empty() {
-                    // `min_w_0` is load-bearing: gpui text answers min/max-content
-                    // probes with its UNWRAPPED width, so without it the bubble's
-                    // automatic min-size is the full single-line width — the flex
-                    // item can't shrink, `justify_end` pushes the overflow off the
-                    // left edge, and long prompts render as one clipped line
-                    // instead of wrapping inside the 80% column cap.
-                    column = column.child(
-                        div().w_full().flex().justify_end().child(
-                            div()
-                                .min_w_0()
-                                .max_w(px(MAX_CONTENT_WIDTH * 0.8))
-                                .bg(theme.surface_raised)
-                                .rounded(px(Theme::BUBBLE_RADIUS))
-                                .px(px(16.0))
-                                .py(px(10.0))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
-                                .text_color(theme.text)
-                                .when(pending, |el| el.opacity(0.65))
-                                .child(if mentions.is_empty() {
-                                    text.into_any_element()
-                                } else {
-                                    user_mention_text(text, mentions, &theme)
-                                }),
-                        ),
-                    );
-                }
-                column.into_any_element()
-            }
-            RowKind::Markdown { tree, block_ix } => {
-                let opts = RenderOptions {
-                    row_key: row.id.clone(),
-                    veil: None,
-                    cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
-                    now: Instant::now(),
-                    copy: Some(self.copy_ui_for(&row.id, cx)),
-                };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
-                let Some(top) = tree.blocks.get(*block_ix) else {
-                    return gpui::Empty.into_any_element();
-                };
-                render::render_block(
-                    &top.block,
-                    *block_ix,
-                    *block_ix,
-                    &opts,
-                    &theme,
-                    window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
-                )
-            }
-            RowKind::LiveMarkdown { tree, block_ix } => {
-                // Per-appended-chunk fade veil (opacity only — layout commits
-                // instantly). Reduced motion renders with no veil at all.
-                // Baseline rows (text already streamed when the transcript
-                // attached) start seeded: the existing reply must not fade in
-                // on a session switch — only fresh appends animate.
-                let veil = (!motion::reduced_motion(cx)).then(|| {
-                    self.veils
-                        .entry(row.id.clone())
-                        .or_insert_with(|| {
-                            if self.veil_baseline.contains(&row.id) {
-                                Rc::new(RefCell::new(RowVeil::seeded()))
-                            } else {
-                                Rc::default()
-                            }
-                        })
-                        .clone()
-                });
-                let opts = RenderOptions {
-                    row_key: row.id.clone(),
-                    veil: veil.clone(),
-                    cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
-                    now: Instant::now(),
-                    copy: Some(self.copy_ui_for(&row.id, cx)),
-                };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
-                let Some(top) = tree.blocks.get(*block_ix) else {
-                    return gpui::Empty.into_any_element();
-                };
-                let timer = frame_stats_enabled().then(Instant::now);
-                let el = render::render_block(
-                    &top.block,
-                    *block_ix,
-                    *block_ix,
-                    &opts,
-                    &theme,
-                    window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
-                );
-                if let Some(start) = timer {
-                    record_live_frame_us(start.elapsed().as_micros() as u64);
-                }
-                // The attach pass for this row is done (every element rendered
-                // above seeded its baseline synchronously): elements appearing
-                // from the NEXT pass on are newly streamed and fade normally.
-                if let Some(veil) = &veil {
-                    veil.borrow_mut().finish_seeding();
-                }
-                // Drive the veil clock: while any chunk is still dissolving,
-                // repaint next frame (self-limiting — one callback per frame).
-                if veil.is_some_and(|v| v.borrow().is_fading()) {
-                    let id = cx.entity_id();
-                    window.on_next_frame(move |_, cx| cx.notify(id));
-                }
-                el
-            }
-            RowKind::ToolGroup { tools, auto_open } => {
-                self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
-            }
-            RowKind::InputChip { header, resolved } => {
-                input_chip(header.clone(), *resolved, &theme)
-            }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
-        };
+        let user_geometry = matches!(row.kind, RowKind::User { .. })
+            .then(|| (row.id.clone(), self.sticky_scroll_y));
+        let inner = self.render_row_body(&row, user_geometry, window, &theme, cx);
 
-        // Hover-revealed timestamp strip (comet chat-view.tsx `Timestamp`):
+        // Hover-revealed timestamp strip (zeron chat-view.tsx `Timestamp`):
         // a RESERVED 16px lane under the entry's last row — the label only
         // flips opacity, so revealing it never shifts the virtualizer's
         // layout. User entries align end (under the bubble), assistant start.
@@ -1770,7 +5172,7 @@ impl Transcript {
             .justify_center()
             .pt(px(top_gap))
             .pb(px(bottom_pad))
-            // Wide gutters (comet `px-4 @3xl:px-12`) around the 46rem column.
+            // Wide gutters (zeron `px-4 @3xl:px-12`) around the 46rem column.
             .px(px(48.0))
             .child(
                 div()
@@ -1778,9 +5180,803 @@ impl Transcript {
                     .max_w(px(MAX_CONTENT_WIDTH))
                     .min_w_0()
                     .child(inner)
-                    .children(strip),
+                    .children(strip)
+                    .children(trailer),
             )
             .into_any_element()
+    }
+
+    fn render_row_body(
+        &mut self,
+        row: &Row,
+        user_geometry: Option<(SharedString, f32)>,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match &row.kind {
+            RowKind::User {
+                text,
+                mentions,
+                attachments,
+                badges,
+                pending,
+            } => {
+                let attachments = attachments.clone();
+                let badges = badges.clone();
+                let text = text.clone();
+                let mentions = mentions.clone();
+                let pending = *pending;
+                // Attachment thumbnails and context badges ride above the
+                // full-width user card, aligned to the transcript's leading
+                // edge like Orchestrator.dev's AgentUserMessageBubble.
+                let mut column = div().w_full().flex().flex_col();
+                if !attachments.is_empty() {
+                    column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
+                }
+                if !badges.is_empty() {
+                    column = column.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .justify_start()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pb(px(6.0))
+                            .children(badges.iter().enumerate().map(|(bix, badge)| {
+                                crate::badges::render(
+                                    SharedString::from(format!("{}#badge{bix}", row.id)),
+                                    badge,
+                                    &theme,
+                                )
+                            })),
+                    );
+                }
+                if !text.is_empty() {
+                    let overflow = self
+                        .user_message_overflow
+                        .get(&row.id)
+                        .copied()
+                        .unwrap_or(false);
+                    let overflow_key = row.id.clone();
+                    let weak = cx.weak_entity();
+                    let preview =
+                        user_message_preview(row.id.clone(), text.clone(), mentions.clone());
+                    let mut card = div()
+                        .relative()
+                        .min_w_0()
+                        .w_full()
+                        .max_h(px(USER_MESSAGE_CARD_MAX_HEIGHT))
+                        .overflow_hidden()
+                        .rounded(px(USER_MESSAGE_CARD_RADIUS))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(user_message_card_background(&theme))
+                        .when(!theme.is_frost(), |el| el.shadow_lg())
+                        .px(px(12.0))
+                        .py(px(USER_MESSAGE_CARD_PAD_Y))
+                        .text_size(px(14.0))
+                        .line_height(px(22.0))
+                        .text_color(theme.text)
+                        .when(pending, |el| el.opacity(0.65))
+                        .child(user_bubble_text(&row.id, text, mentions, &theme))
+                        .on_children_prepainted(move |bounds, _, cx| {
+                            let measured = bounds
+                                .first()
+                                .map(|bounds| f32::from(bounds.size.height))
+                                .unwrap_or(0.0);
+                            let next = user_message_overflows(measured);
+                            weak.update(cx, |this, cx| {
+                                if this
+                                    .user_message_overflow
+                                    .insert(overflow_key.clone(), next)
+                                    != Some(next)
+                                {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .id(SharedString::from(format!("{}#user-card", row.id)));
+                    if overflow {
+                        let weak = cx.weak_entity();
+                        let fade_bg = user_message_card_background(&theme);
+                        let hover_border = theme.accent.opacity(0.40);
+                        card = card
+                            .cursor_pointer()
+                            .hover(move |style| style.border_color(hover_border))
+                            .on_click(move |_, window, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.attachment_preview = None;
+                                    this.user_message_preview = Some(preview.clone());
+                                    window.focus(&this.user_message_preview_focus, cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(USER_MESSAGE_FADE_HEIGHT))
+                                    .bg(gpui::linear_gradient(
+                                        0.0,
+                                        gpui::linear_color_stop(fade_bg, 0.0),
+                                        gpui::linear_color_stop(fade_bg.opacity(0.0), 1.0),
+                                    )),
+                            );
+                    }
+                    column = column.child(card);
+                } else if let Some(summary) = user_message_attachment_summary(attachments.len()) {
+                    column = column.child(
+                        div()
+                            .w_full()
+                            .rounded(px(USER_MESSAGE_CARD_RADIUS))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(user_message_card_background(&theme))
+                            .when(!theme.is_frost(), |el| el.shadow_lg())
+                            .px(px(12.0))
+                            .py(px(USER_MESSAGE_CARD_PAD_Y))
+                            .text_size(px(14.0))
+                            .text_color(theme.text_muted)
+                            .italic()
+                            .when(pending, |el| el.opacity(0.65))
+                            .child(summary),
+                    );
+                }
+                if let Some((geometry_id, scroll_y)) = user_geometry {
+                    let weak = cx.weak_entity();
+                    column
+                        .on_children_prepainted(move |bounds, _, cx| {
+                            let Some(first) = bounds.first() else {
+                                return;
+                            };
+                            let mut top = f32::from(first.top());
+                            let mut bottom = f32::from(first.bottom());
+                            for bounds in &bounds[1..] {
+                                top = top.min(f32::from(bounds.top()));
+                                bottom = bottom.max(f32::from(bounds.bottom()));
+                            }
+                            let height = bottom - top;
+                            if height <= 0.0 {
+                                return;
+                            }
+                            weak.update(cx, |this, cx| {
+                                if this.sticky_turn.record_geometry(
+                                    geometry_id.clone(),
+                                    top,
+                                    height,
+                                    scroll_y,
+                                ) {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .into_any_element()
+                } else {
+                    column.into_any_element()
+                }
+            }
+            RowKind::Markdown { tree, block_ix } => {
+                let Some(top) = tree.blocks.get(*block_ix) else {
+                    return gpui::Empty.into_any_element();
+                };
+                if should_render_mermaid(&top.block, false) {
+                    self.render_mermaid_block(&row.id, tree, *block_ix, window, &theme, cx)
+                } else {
+                    let opts = RenderOptions {
+                        row_key: row.id.clone(),
+                        veil: None,
+                        cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                        now: Instant::now(),
+                        copy: Some(self.copy_ui_for(&row.id, cx)),
+                    };
+                    let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                    render::render_block(
+                        &top.block,
+                        *block_ix,
+                        *block_ix,
+                        &opts,
+                        &theme,
+                        window,
+                        highlight
+                            .get(block_ix)
+                            .and_then(|o| o.as_deref())
+                            .map(|document| document.lines.as_slice()),
+                    )
+                }
+            }
+            RowKind::LiveMarkdown { tree, block_ix } => {
+                // Per-appended-chunk fade veil (opacity only — layout commits
+                // instantly). Reduced motion renders with no veil at all.
+                // Baseline rows (text already streamed when the transcript
+                // attached) start seeded: the existing reply must not fade in
+                // on a session switch — only fresh appends animate.
+                let veil = (!motion::reduced_motion(cx)).then(|| {
+                    self.veils
+                        .entry(row.id.clone())
+                        .or_insert_with(|| {
+                            if self.veil_baseline.contains(&row.id) {
+                                Rc::new(RefCell::new(RowVeil::seeded()))
+                            } else {
+                                Rc::default()
+                            }
+                        })
+                        .clone()
+                });
+                let opts = RenderOptions {
+                    row_key: row.id.clone(),
+                    veil: veil.clone(),
+                    cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                    now: Instant::now(),
+                    copy: Some(self.copy_ui_for(&row.id, cx)),
+                };
+                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let Some(top) = tree.blocks.get(*block_ix) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let timer = frame_stats_enabled().then(Instant::now);
+                let el = render::render_block(
+                    &top.block,
+                    *block_ix,
+                    *block_ix,
+                    &opts,
+                    &theme,
+                    window,
+                    highlight
+                        .get(block_ix)
+                        .and_then(|o| o.as_deref())
+                        .map(|document| document.lines.as_slice()),
+                );
+                if let Some(start) = timer {
+                    record_live_frame_us(start.elapsed().as_micros() as u64);
+                }
+                // The attach pass for this row is done (every element rendered
+                // above seeded its baseline synchronously): elements appearing
+                // from the NEXT pass on are newly streamed and fade normally.
+                if let Some(veil) = &veil {
+                    veil.borrow_mut().finish_seeding();
+                }
+                // Drive the veil clock: while any chunk is still dissolving,
+                // repaint next frame (self-limiting — one callback per frame).
+                if veil.is_some_and(|v| v.borrow().is_fading()) {
+                    let id = cx.entity_id();
+                    window.on_next_frame(move |_, cx| cx.notify(id));
+                }
+                el
+            }
+            RowKind::Reasoning {
+                tree,
+                active,
+                duration_ms,
+            } => self.render_reasoning(&row.id, tree, *active, *duration_ms, window, &theme, cx),
+            RowKind::InlineImages { paths } => {
+                self.render_inline_image_gallery(&row.id, paths, &theme, cx)
+            }
+            RowKind::ToolGroup {
+                tools,
+                auto_open,
+                detail_auto_open,
+            } => self.render_tool_group(&row.id, tools, *auto_open, *detail_auto_open, &theme, cx),
+            RowKind::FileChange { tool } => self.render_file_change(&row.id, tool, &theme, cx),
+            RowKind::TurnSteps {
+                rows,
+                summary,
+                duration_ms,
+            } => self.render_turn_steps(&row.id, rows, summary, *duration_ms, window, theme, cx),
+            RowKind::TaskSnapshot {
+                items,
+                created,
+                resolved,
+                is_error,
+            } => task_snapshot_card(items, *created, *resolved, *is_error, &theme),
+            RowKind::InputChip { header, resolved } => {
+                input_chip(header.clone(), *resolved, &theme)
+            }
+            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+        }
+    }
+
+    fn render_file_change(
+        &mut self,
+        row_id: &SharedString,
+        tool: &ToolItem,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::file_change::{
+            FILE_CARD_HEADER_HEIGHT, effective_file_path, file_card_action, file_card_body_height,
+            file_card_can_expand, file_card_should_contain_wheel,
+            file_card_should_occlude_outer_scroll, file_card_should_virtualize,
+            file_card_virtualized_footer_index, file_card_virtualized_item_count,
+        };
+
+        let Some(call_path) = file_change_path(&tool.call) else {
+            return gpui::Empty.into_any_element();
+        };
+        let kind = tool
+            .file_preview
+            .as_ref()
+            .map(|preview| preview.kind)
+            .unwrap_or_else(|| match tool.call {
+                ToolCall::EditFile { .. } => zeron_doc::FileChangeKind::Edit,
+                _ => zeron_doc::FileChangeKind::Write,
+            });
+        let loaded = self.file_change_inputs.get(row_id);
+        let ready = match loaded {
+            Some(FileInputLoad::Ready(ready)) => Some(ready.clone()),
+            _ => None,
+        };
+        let path = effective_file_path(
+            call_path,
+            ready.as_ref().map(|ready| ready.snapshot.as_ref()),
+        );
+        let preview = ready
+            .as_ref()
+            .map(|ready| ready.preview.as_ref())
+            .or_else(|| tool.file_preview.as_deref());
+        let can_expand = file_card_can_expand(tool.resolved, preview.is_some());
+        let open = can_expand && self.file_change_open.get(row_id).copied().unwrap_or(false);
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let open_target = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .and_then(|chat| file_open_target(&chat.id, chat.cwd.as_deref()?, path))
+        };
+
+        let row_toggle = row_id.clone();
+        let tool_id = tool.id.to_string();
+        let toggle_preview = tool.file_preview.clone();
+        let mut header = div()
+            .id(SharedString::from(format!("{row_id}#file-header")))
+            .h(px(FILE_CARD_HEADER_HEIGHT))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(10.0))
+            .cursor(if can_expand {
+                gpui::CursorStyle::PointingHand
+            } else {
+                gpui::CursorStyle::Arrow
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_file_change(
+                    row_toggle.clone(),
+                    tool_id.clone(),
+                    can_expand,
+                    kind,
+                    toggle_preview.clone(),
+                    cx,
+                )
+            }))
+            .child(
+                crate::icons::icon(crate::icons::DOCUMENT_ADD)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            );
+        let file_label = div()
+            .id(SharedString::from(format!("{row_id}#filename")))
+            .min_w_0()
+            .flex_1()
+            .truncate()
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .cursor_pointer()
+            .when_some(open_target, |label, (context_key, root, relative_path)| {
+                label.on_click(cx.listener(move |_this, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(TranscriptEvent::OpenFile {
+                        context_key: context_key.clone(),
+                        root: root.clone(),
+                        relative_path: relative_path.clone(),
+                    });
+                }))
+            })
+            .child(filename);
+        header = header.child(file_label);
+        if tool.resolved {
+            if let Some(preview) = preview {
+                header = header
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(theme.success_muted)
+                            .child(format!("+{}", preview.additions)),
+                    )
+                    .when(preview.deletions > 0, |header| {
+                        header.child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.danger_muted)
+                                .child(format!("-{}", preview.deletions)),
+                        )
+                    });
+            }
+        } else {
+            header = header.child(crate::loaders::mini_mono_spinner(
+                format!("{row_id}#file-spinner"),
+                2.0,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ));
+        }
+        header = header.child(
+            div()
+                .flex_none()
+                .text_size(px(10.0))
+                .text_color(if tool.is_error {
+                    theme.danger_muted
+                } else {
+                    theme.text_muted
+                })
+                .child(file_card_action(kind, tool.resolved, tool.is_error)),
+        );
+        if can_expand {
+            header = header.child(
+                crate::icons::icon(if open {
+                    crate::icons::ALT_ARROW_DOWN
+                } else {
+                    crate::icons::ALT_ARROW_RIGHT
+                })
+                .size(px(13.0))
+                .text_color(theme.text_muted),
+            );
+        }
+
+        let mut card = div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.09))
+            .bg(crate::theme::ink(0.025))
+            .child(header);
+
+        if let Some(preview) = preview {
+            let line_height = 20.0;
+            let marker_height = if !open && preview.truncated_before > 0 {
+                line_height
+            } else {
+                0.0
+            };
+            let content_height = marker_height + preview.lines.len() as f32 * line_height;
+            let status = if open {
+                match loaded {
+                    Some(FileInputLoad::Loading(_)) => Some(("Loading full content…", false)),
+                    Some(FileInputLoad::Failed) => Some(("Full content unavailable · Retry", true)),
+                    Some(FileInputLoad::Ready(ready)) if ready.snapshot.truncated => {
+                        Some(("Preview limited to 1 MiB", false))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let status_height = if status.is_some() { 24.0 } else { 0.0 };
+            let scroll_content_height = content_height + status_height;
+            let body_height = file_card_body_height(open, scroll_content_height);
+            let contain_wheel =
+                file_card_should_contain_wheel(open, scroll_content_height, body_height);
+            let occlude_outer_scroll =
+                file_card_should_occlude_outer_scroll(open, scroll_content_height, body_height);
+            let bounded_source = (ready.is_none() && tool.resolved).then(|| {
+                preview
+                    .lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            let highlights = if let Some(ready) = &ready {
+                ready.highlight.clone()
+            } else if let Some(source) = bounded_source.as_deref() {
+                comet_syntax::language_for_path(path).and_then(|language| {
+                    self.highlights
+                        .request(row_id.clone(), 0, language, source, cx)
+                })
+            } else {
+                None
+            };
+            let (plain_scroll, virtualized_scroll) = {
+                let scroll = self.file_change_scrolls.entry(row_id.clone()).or_default();
+                (scroll.plain.clone(), scroll.virtualized.clone())
+            };
+            let body_toggle = row_id.clone();
+            let body_tool = tool.id.to_string();
+            let body_preview = tool.file_preview.clone();
+            let mut body = div()
+                .id(SharedString::from(format!("{row_id}#file-body")))
+                .h(px(body_height))
+                .min_h_0()
+                .w_full()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(crate::theme::hairline(0.07))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .line_height(px(line_height))
+                .when(can_expand, |body| {
+                    body.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_file_change(
+                                body_toggle.clone(),
+                                body_tool.clone(),
+                                true,
+                                kind,
+                                body_preview.clone(),
+                                cx,
+                            )
+                        }))
+                })
+                .when(contain_wheel, |body| {
+                    body.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                })
+                .when(occlude_outer_scroll, |body| body.occlude())
+                .overflow_hidden();
+            let virtualized =
+                open && ready.is_some() && file_card_should_virtualize(preview.lines.len());
+            if virtualized {
+                let lines = ready.as_ref().unwrap().preview.clone();
+                let highlights = highlights.clone();
+                let theme = theme.clone();
+                let footer_index =
+                    file_card_virtualized_footer_index(lines.lines.len(), status.is_some());
+                let item_count =
+                    file_card_virtualized_item_count(lines.lines.len(), status.is_some());
+                let weak = cx.weak_entity();
+                let retry_target = self.file_fetch_target(cx);
+                let retry_row = row_id.clone();
+                let retry_tool = tool.id.to_string();
+                let retry_preview = tool.file_preview.clone();
+                body = body.child(
+                    uniform_list(
+                        SharedString::from(format!("{row_id}#file-lines")),
+                        item_count,
+                        move |range, _, _cx| {
+                            range
+                                .map(|index| {
+                                    if footer_index == Some(index) {
+                                        let (label, retry) = status.unwrap();
+                                        let mut footer = div()
+                                            .id(SharedString::from(format!(
+                                                "{retry_row}#file-status"
+                                            )))
+                                            .h(px(line_height))
+                                            .flex_none()
+                                            .px(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.5))
+                                            .text_color(if retry {
+                                                theme.danger_muted
+                                            } else {
+                                                theme.text_faint
+                                            });
+                                        if retry {
+                                            let weak = weak.clone();
+                                            let retry_target = retry_target.clone();
+                                            let retry_row = retry_row.clone();
+                                            let retry_tool = retry_tool.clone();
+                                            let retry_preview = retry_preview.clone();
+                                            footer = footer.cursor_pointer().on_click(
+                                                move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some((
+                                                        chat_id,
+                                                        target_device_id,
+                                                        parent_tool_use_id,
+                                                    )) = retry_target.clone()
+                                                    {
+                                                        weak.update(cx, |this, cx| {
+                                                            this.spawn_file_input_fetch(
+                                                                retry_row.clone(),
+                                                                chat_id,
+                                                                retry_tool.clone(),
+                                                                target_device_id,
+                                                                parent_tool_use_id,
+                                                                kind,
+                                                                retry_preview.clone(),
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                    }
+                                                },
+                                            );
+                                        }
+                                        return footer.child(label).into_any_element();
+                                    }
+                                    let spans = highlights
+                                        .as_ref()
+                                        .and_then(|document| document.lines.get(index))
+                                        .map(Vec::as_slice)
+                                        .unwrap_or_default();
+                                    file_change_line_row(&lines.lines[index], spans, &theme)
+                                })
+                                .collect()
+                        },
+                    )
+                    .h(px(body_height))
+                    .w_full()
+                    .track_scroll(&virtualized_scroll),
+                );
+            } else {
+                body = body
+                    .when(open, |body| {
+                        body.overflow_y_scroll().track_scroll(&plain_scroll)
+                    })
+                    .when(!open, |body| body.overflow_hidden());
+                if !open && preview.truncated_before > 0 {
+                    body = body.child(
+                        div()
+                            .h(px(line_height))
+                            .flex_none()
+                            .px(px(10.0))
+                            .text_color(theme.text_faint)
+                            .italic()
+                            .child(format!("… {} earlier lines", preview.truncated_before)),
+                    );
+                }
+                body = body.children(preview.lines.iter().enumerate().map(|(index, line)| {
+                    let spans = highlights
+                        .as_ref()
+                        .and_then(|document| document.lines.get(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    file_change_line_row(line, spans, theme)
+                }));
+            }
+
+            if open && !virtualized {
+                if let Some((label, retry)) = status {
+                    let retry_row = row_id.clone();
+                    let retry_tool = tool.id.to_string();
+                    let retry_target = self.file_fetch_target(cx);
+                    let retry_preview = tool.file_preview.clone();
+                    let mut status_row = div()
+                        .id(SharedString::from(format!("{row_id}#file-status")))
+                        .h(px(24.0))
+                        .flex_none()
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.5))
+                        .text_color(if retry {
+                            theme.danger_muted
+                        } else {
+                            theme.text_faint
+                        });
+                    if retry {
+                        status_row = status_row.cursor_pointer().on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some((chat_id, target_device_id, parent_tool_use_id)) =
+                                    retry_target.clone()
+                                {
+                                    this.spawn_file_input_fetch(
+                                        retry_row.clone(),
+                                        chat_id,
+                                        retry_tool.clone(),
+                                        target_device_id,
+                                        parent_tool_use_id,
+                                        kind,
+                                        retry_preview.clone(),
+                                        cx,
+                                    );
+                                }
+                            },
+                        ));
+                    }
+                    body = body.child(status_row.child(label));
+                }
+            }
+            card = card.child(body);
+        }
+        card.into_any_element()
+    }
+
+    fn render_turn_steps(
+        &mut self,
+        row_id: &SharedString,
+        rows: &Arc<Vec<Row>>,
+        summary: &SharedString,
+        duration_ms: Option<u64>,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = turn_steps_is_open(&self.turn_steps_open, row_id.as_ref());
+        let toggle_id = row_id.clone();
+        let mut header = div()
+            .id(SharedString::from(format!("{row_id}-hdr")))
+            .h(px(26.0))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(4.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .line_height(px(18.0))
+            .text_color(theme.text_muted)
+            .hover(|style| style.text_color(theme.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.invalidate_sticky_users_after_row(&toggle_id);
+                toggle_turn_steps_state(&mut this.turn_steps_open, toggle_id.clone());
+                cx.notify();
+            }))
+            .child(
+                crate::icons::icon(crate::icons::CHECKLIST)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.72)),
+            )
+            .child(div().min_w_0().flex_1().truncate().child(summary.clone()));
+        if let Some(duration) = turn_steps_duration_label(duration_ms) {
+            header = header.child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(SharedString::from(duration)),
+            );
+        }
+        header = header.child(
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.06))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from(if open { "▾" } else { "▸" })),
+        );
+
+        let mut disclosure = div().w_full().flex().flex_col().child(header);
+        if open {
+            let children = visible_turn_step_children(open, rows)
+                .iter()
+                .map(|child| {
+                    let body = self.render_row_body(child, None, window, theme, cx);
+                    div().id(child.id.clone()).w_full().min_w_0().child(body)
+                })
+                .collect::<Vec<_>>();
+            disclosure = disclosure.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .children(children),
+            );
+        }
+        disclosure.into_any_element()
     }
 
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
@@ -1827,14 +6023,16 @@ impl Transcript {
         tree: &Arc<BlockTree>,
         only: Option<usize>,
         cx: &mut Context<Self>,
-    ) -> HashMap<usize, Option<Arc<Vec<Vec<Token>>>>> {
+    ) -> HashMap<usize, Option<Arc<comet_syntax::HighlightedDocument>>> {
         let mut out = HashMap::new();
         for (ix, top) in tree.blocks.iter().enumerate() {
             if only.is_some_and(|o| o != ix) {
                 continue;
             }
             if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language.as_deref().and_then(lang_for_tag)
+                && let Some(lang) = language
+                    .as_deref()
+                    .and_then(comet_syntax::language_for_alias)
             {
                 out.insert(
                     ix,
@@ -1845,22 +6043,640 @@ impl Transcript {
         out
     }
 
+    fn tool_diff_highlight_for(
+        &mut self,
+        row_id: &SharedString,
+        tool_ix: usize,
+        detail: &ToolDetail,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<crate::changes::DiffHighlights>> {
+        let ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        } = detail
+        else {
+            return None;
+        };
+        let cache_row: SharedString = format!("{row_id}#tool-diff-{tool_ix}").into();
+        let old = match old_text {
+            Some(source) => {
+                let path = file.old_path.as_deref().unwrap_or(&file.path);
+                let lang = comet_syntax::language_for_path(path)?;
+                Some(
+                    self.highlights
+                        .request(cache_row.clone(), 0, lang, source, cx)?,
+                )
+            }
+            None => None,
+        };
+        let new = match new_text {
+            Some(source) => {
+                let lang = comet_syntax::language_for_path(&file.path)?;
+                Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
+            }
+            None => None,
+        };
+        Some(Arc::new(crate::changes::DiffHighlights { old, new }))
+    }
+
+    fn render_reasoning(
+        &mut self,
+        row_id: &SharedString,
+        tree: &Arc<BlockTree>,
+        active: bool,
+        duration_ms: Option<u64>,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.folds.get(row_id).and_then(|fold| fold.open);
+        let open = reasoning_is_open(open, active);
+        let label = if active {
+            let started = *self
+                .reasoning_started
+                .entry(row_id.clone())
+                .or_insert_with(Instant::now);
+            self.ensure_reasoning_tick(cx);
+            format!(
+                "Thinking · {}",
+                format_reasoning_elapsed(started.elapsed().as_millis() as u64)
+            )
+        } else {
+            self.reasoning_started.remove(row_id);
+            format_thought_duration(duration_ms).unwrap_or_else(|| "Thought".into())
+        };
+        let toggle_id = row_id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{row_id}-reasoning-header")))
+            .w_full()
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(4.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.035)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.invalidate_sticky_users_after_row(&toggle_id);
+                this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
+                cx.notify();
+            }))
+            .child(
+                crate::icons::icon(crate::icons::THOUGHT_SPARKLE)
+                    .size(px(13.0))
+                    .text_color(if active {
+                        theme.text_muted
+                    } else {
+                        theme.text_faint
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(label)),
+            )
+            .when(active, |row| {
+                row.child(crate::loaders::mini_mono_spinner(
+                    format!("{row_id}-reasoning"),
+                    1.8,
+                    theme.text_muted,
+                    cx.entity_id(),
+                    cx,
+                ))
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .size(px(18.0))
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.05))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(if open {
+                            crate::icons::ALT_ARROW_DOWN
+                        } else {
+                            crate::icons::ALT_ARROW_RIGHT
+                        })
+                        .size(px(11.0))
+                        .text_color(theme.text_faint),
+                    ),
+            );
+
+        let mut column = div().w_full().flex().flex_col().child(header);
+        if open {
+            let opts = RenderOptions {
+                row_key: SharedString::from(format!("{row_id}-reasoning")),
+                veil: None,
+                cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                now: Instant::now(),
+                copy: None,
+            };
+            let highlights = self.code_highlight_for(row_id, tree, None, cx);
+            let mut trace_theme = theme.clone();
+            trace_theme.text = theme.text_muted;
+            trace_theme.text_muted = theme.text_faint;
+            let content = render::render_tree(tree, &opts, &trace_theme, window, &|ix| {
+                highlights.get(&ix).cloned().flatten()
+            });
+            column = column.child(
+                div()
+                    .ml(px(7.0))
+                    .mt(px(3.0))
+                    .pl(px(18.0))
+                    .py(px(4.0))
+                    .border_l_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    .text_size(px(12.5))
+                    .child(content),
+            );
+        }
+        column.into_any_element()
+    }
+
+    fn mermaid_snapshot(
+        &mut self,
+        source: &str,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) -> MermaidSnapshot {
+        let key = format!("{}\0{source}", if dark { "dark" } else { "light" });
+        let used_at = self.next_media_use();
+        match self.mermaid.get_mut(&key) {
+            Some(MermaidLoad::Loading(_)) => return MermaidSnapshot::Loading,
+            Some(MermaidLoad::Failed { used_at: stamp }) => {
+                *stamp = used_at;
+                return MermaidSnapshot::Failed;
+            }
+            Some(MermaidLoad::Ready {
+                image,
+                used_at: stamp,
+                ..
+            }) => {
+                *stamp = used_at;
+                return MermaidSnapshot::Ready(image.clone());
+            }
+            None => {}
+        }
+
+        self.trim_mermaid_cache();
+        let validation_key = fnv1a(key.as_bytes());
+        let previously_ready = if let Some(stamp) = self.validated_mermaid.get_mut(&validation_key)
+        {
+            *stamp = used_at;
+            true
+        } else {
+            false
+        };
+        let inflight = self
+            .mermaid
+            .values()
+            .filter(|entry| matches!(entry, MermaidLoad::Loading(_)))
+            .count();
+        if !media_task_admitted(
+            inflight,
+            self.mermaid.len(),
+            MERMAID_MAX_INFLIGHT,
+            MERMAID_CACHE_MAX_TOTAL,
+        ) {
+            return if previously_ready {
+                MermaidSnapshot::Reloading
+            } else {
+                MermaidSnapshot::Failed
+            };
+        }
+
+        let task_key = key.clone();
+        let render_source = source.to_owned();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::inline_media::render_mermaid_svg(&render_source, dark)
+                    }))
+                    .unwrap_or_else(|_| Err("diagram renderer failed".into()))
+                })
+                .await;
+            this.update(cx, |transcript, cx| {
+                let used_at = transcript.next_media_use();
+                if result.is_ok() {
+                    remember_validated(
+                        &mut transcript.validated_mermaid,
+                        validation_key,
+                        used_at,
+                        MERMAID_CACHE_MAX_TOTAL,
+                    );
+                } else {
+                    transcript.validated_mermaid.remove(&validation_key);
+                }
+                transcript.mermaid.insert(
+                    task_key,
+                    match result {
+                        Ok(rendered) => MermaidLoad::Ready {
+                            image: rendered.image,
+                            bytes: rendered.bytes,
+                            used_at,
+                        },
+                        Err(_) => MermaidLoad::Failed { used_at },
+                    },
+                );
+                transcript.trim_mermaid_cache();
+                transcript.sticky_turn.invalidate_layout();
+                cx.notify();
+            })
+            .ok();
+        });
+        self.mermaid.insert(key, MermaidLoad::Loading(task));
+        if previously_ready {
+            MermaidSnapshot::Reloading
+        } else {
+            MermaidSnapshot::Loading
+        }
+    }
+
+    fn render_mermaid_block(
+        &mut self,
+        row_id: &SharedString,
+        tree: &Arc<BlockTree>,
+        block_ix: usize,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(top) = tree.blocks.get(block_ix) else {
+            return gpui::Empty.into_any_element();
+        };
+        let Some(source) = crate::inline_media::mermaid_source(&top.block) else {
+            return gpui::Empty.into_any_element();
+        };
+        let state = self.mermaid_snapshot(source, theme.appearance.is_dark(), cx);
+        let source_key: SharedString = format!("{row_id}#mermaid-source").into();
+        let source_open = self
+            .folds
+            .get(&source_key)
+            .and_then(|fold| fold.open)
+            .unwrap_or(false);
+        let show_source =
+            source_open || matches!(&state, MermaidSnapshot::Loading | MermaidSnapshot::Failed);
+        let opts = RenderOptions {
+            row_key: SharedString::from(format!("{row_id}#mermaid-code")),
+            veil: None,
+            cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+            now: Instant::now(),
+            copy: Some(self.copy_ui_for(row_id, cx)),
+        };
+        let source_block = show_source.then(|| {
+            let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
+            render::render_block(
+                &top.block,
+                block_ix,
+                block_ix,
+                &opts,
+                theme,
+                window,
+                highlight
+                    .get(&block_ix)
+                    .and_then(|value| value.as_deref())
+                    .map(|document| document.lines.as_slice()),
+            )
+        });
+
+        let mut header = div()
+            .h(px(32.0))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .text_size(px(11.5))
+            .text_color(theme.text_muted)
+            .child(
+                crate::icons::icon(crate::icons::WIDGET)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted),
+            );
+        header = match &state {
+            MermaidSnapshot::Loading | MermaidSnapshot::Reloading => header
+                .child("Rendering diagram…")
+                .child(div().flex_1())
+                .child(crate::loaders::mini_mono_spinner(
+                    format!("mermaid-{row_id}"),
+                    1.8,
+                    theme.text_muted,
+                    cx.entity_id(),
+                    cx,
+                )),
+            MermaidSnapshot::Failed => header
+                .child("Could not render diagram")
+                .text_color(theme.danger_muted),
+            MermaidSnapshot::Ready(_) => {
+                let toggle_key = source_key.clone();
+                header.child("Diagram").child(div().flex_1()).child(
+                    div()
+                        .id(SharedString::from(format!("{row_id}#mermaid-toggle")))
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.06)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.folds.entry(toggle_key.clone()).or_default().open =
+                                Some(!source_open);
+                            cx.notify();
+                        }))
+                        .child("Source")
+                        .child(
+                            crate::icons::icon(if source_open {
+                                crate::icons::ALT_ARROW_DOWN
+                            } else {
+                                crate::icons::ALT_ARROW_RIGHT
+                            })
+                            .size(px(10.0))
+                            .text_color(theme.text_faint),
+                        ),
+                )
+            }
+        };
+
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.08))
+            .bg(crate::theme::ink(0.028))
+            .child(header);
+        match state {
+            MermaidSnapshot::Ready(image) => {
+                let preview = crate::attachments::PreviewImage {
+                    name: "Mermaid diagram".into(),
+                    image: image.clone(),
+                };
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!("{row_id}#mermaid-preview")))
+                        .w_full()
+                        .h(px(320.0))
+                        .border_t_1()
+                        .border_color(crate::theme::hairline(0.06))
+                        .p(px(14.0))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.user_message_preview = None;
+                            this.attachment_preview = Some(preview.clone());
+                            window.focus(&this.attachment_preview_focus, cx);
+                            cx.notify();
+                        }))
+                        .child(img(image).w_full().h_full().object_fit(ObjectFit::Contain)),
+                );
+            }
+            MermaidSnapshot::Reloading => {
+                card = card.child(
+                    div()
+                        .w_full()
+                        .h(px(320.0))
+                        .border_t_1()
+                        .border_color(crate::theme::hairline(0.06))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            format!("mermaid-reload-{row_id}"),
+                            2.0,
+                            theme.text_muted,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                );
+            }
+            MermaidSnapshot::Loading | MermaidSnapshot::Failed => {}
+        }
+        if let Some(source_block) = source_block {
+            card = card.child(
+                div()
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .child(source_block),
+            );
+        }
+        card.into_any_element()
+    }
+
+    fn ensure_reasoning_tick(&mut self, cx: &mut Context<Self>) {
+        if self.reasoning_tick.is_some() {
+            return;
+        }
+        self.reasoning_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let keep_ticking = this
+                    .update(cx, |transcript, cx| {
+                        let active = transcript.rows.iter().any(|row| {
+                            matches!(&row.kind, RowKind::Reasoning { active: true, .. })
+                        });
+                        if active {
+                            cx.notify();
+                        }
+                        active
+                    })
+                    .unwrap_or(false);
+                if !keep_ticking {
+                    break;
+                }
+            }
+            this.update(cx, |transcript, _| transcript.reasoning_tick = None)
+                .ok();
+        }));
+    }
+
     fn render_tool_group(
         &mut self,
         row_id: &SharedString,
         tools: &Arc<Vec<ToolItem>>,
         auto_open: bool,
+        detail_auto_open: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
-        let open = fold.open.unwrap_or(auto_open);
-        let target = if open { chips_height(tools.len()) } else { 0.0 };
+        // Agent/spawn chips never fold: they are their own row, always open,
+        // no "Called N tools" header — a running subagent stays visible.
+        let collapses = tool_group_collapses(tools);
+        let open = !collapses || fold.open.unwrap_or(auto_open);
+        // Chips render their EFFECTIVE detail: the precomputed doc-resident
+        // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
+        // Resolved per paint (a HashMap probe per chip) so fetched content
+        // needs no row rebuild — arrival is a cx.notify, like a fold toggle.
+        let details: Vec<Option<Arc<ToolDetail>>> = tools
+            .iter()
+            .map(|tool| {
+                // Spawn chips never expand — the subagent doc is the record
+                // of what the tool did, and an inline body would only repeat
+                // it. The whole chip is the "open that doc" click instead.
+                if tool.subagent_ref.is_some() {
+                    return None;
+                }
+                // Among fetched blobs, the most recently REQUESTED one wins —
+                // a tool can carry both a diff and an output ref, and the
+                // user's last click decides which upgrade is showing.
+                let mut best: Option<(u64, Arc<ToolDetail>)> = None;
+                for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
+                    if let Some(BlobFetch::Ready(detail)) = self.blob_details.get(blob_ref) {
+                        let order = self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                        if best.as_ref().is_none_or(|(o, _)| order > *o) {
+                            best = Some((order, detail.clone()));
+                        }
+                    }
+                }
+                best.map(|(_, d)| d).or_else(|| tool.detail.clone())
+            })
+            .collect();
+        // Full-invocation blocks — with them, EVERY chip expands: the click
+        // always answers "what exactly was this call?", output or not.
+        let invocations: Vec<Option<Arc<ToolDetail>>> = tools
+            .iter()
+            .map(|tool| {
+                tool.invocation
+                    .clone()
+                    .filter(|_| tool.subagent_ref.is_none())
+            })
+            .collect();
+        // Fetch affordance under each open detail whose full payload is still
+        // sidecar-only: `(ref, label)`. Diff offered first (the richer
+        // upgrade), then the output — a fetched ref hands the affordance to
+        // the NEXT unfetched one instead of retiring it (both must stay
+        // reachable when a tool has both).
+        let affordances: Vec<Option<ChipAffordance>> = tools
+            .iter()
+            .map(|tool| {
+                // The currently-displayed ref (same recency rule as
+                // `details` above): its affordance is spent; any OTHER
+                // Ready ref stays offered as a no-fetch toggle.
+                let shown: Option<&SharedString> = {
+                    let mut best: Option<(u64, &SharedString)> = None;
+                    for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
+                        if matches!(self.blob_details.get(blob_ref), Some(BlobFetch::Ready(_))) {
+                            let order = self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                            if best.is_none_or(|(o, _)| order > o) {
+                                best = Some((order, blob_ref));
+                            }
+                        }
+                    }
+                    best.map(|(_, r)| r)
+                };
+                let candidates = [
+                    (tool.diff_ref.as_ref(), "diff", None),
+                    (tool.output_ref.as_ref(), "output", tool.output_bytes),
+                ];
+                for (blob_ref, what, bytes) in candidates {
+                    let Some(blob_ref) = blob_ref else { continue };
+                    let label = match self.blob_details.get(blob_ref) {
+                        Some(BlobFetch::Ready(_)) => {
+                            if shown == Some(blob_ref) {
+                                continue;
+                            }
+                            format!("Show full {what}")
+                        }
+                        Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
+                        Some(BlobFetch::Failed) => {
+                            format!("Couldn't load full {what} — tap to retry")
+                        }
+                        None => match bytes {
+                            Some(b) => format!("Show full {what} ({})", format_kb(b)),
+                            None => format!("Show full {what}"),
+                        },
+                    };
+                    return Some(ChipAffordance {
+                        blob_ref: blob_ref.clone(),
+                        label: SharedString::from(label),
+                    });
+                }
+                None
+            })
+            .collect();
+        // Which chips have their detail block open (render-local, analytic —
+        // the FINAL state; a mid-tween detail already counts as its target).
+        let detail_folds: Vec<FoldState> = details
+            .iter()
+            .zip(&invocations)
+            .enumerate()
+            .map(|(ix, (detail, invocation))| {
+                if detail.is_none() && invocation.is_none() {
+                    return FoldState::default();
+                }
+                self.tool_details
+                    .get(&SharedString::from(format!("{row_id}#d{ix}")))
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let detail_defaults: Vec<bool> = tools
+            .iter()
+            .enumerate()
+            .map(|(ix, tool)| {
+                tool_detail_default_open(
+                    &tool.call,
+                    tool.resolved,
+                    detail_auto_open,
+                    ix + 1 == tools.len(),
+                )
+            })
+            .collect();
+        let detail_opens: Vec<bool> = details
+            .iter()
+            .zip(&invocations)
+            .zip(&detail_folds)
+            .zip(&detail_defaults)
+            .map(|(((detail, invocation), fold), default_open)| {
+                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(*default_open)
+            })
+            .collect();
+        let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
+            .iter()
+            .enumerate()
+            .map(|(ix, detail)| {
+                detail
+                    .as_deref()
+                    .filter(|_| detail_opens[ix])
+                    .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
+            })
+            .collect();
+        let open_height = chips_height(tools.len())
+            + details
+                .iter()
+                .zip(&invocations)
+                .zip(&affordances)
+                .zip(&detail_opens)
+                .filter(|(_, open)| **open)
+                .map(|(((detail, invocation), affordance), _)| {
+                    invocation.as_deref().map_or(0.0, detail_height)
+                        + detail.as_deref().map_or(0.0, detail_height)
+                        + if affordance.is_some() {
+                            BLOB_AFFORDANCE_HEIGHT
+                        } else {
+                            0.0
+                        }
+                })
+                .sum::<f32>();
+        let target = if open { open_height } else { 0.0 };
         let summary = tool_group_summary(tools);
 
         let toggle_id = row_id.clone();
-        let tool_count = tools.len();
-        // Header (comet tool-group.tsx): a small chevron tile centered over the
+        // Header (zeron tool-group.tsx): a small chevron tile centered over the
         // chips' guide rail, then the quiet 12px summary.
         let header = div()
             .id(SharedString::from(format!("{row_id}-hdr")))
@@ -1872,15 +6688,16 @@ impl Transcript {
             .h(px(26.0))
             .cursor_pointer()
             .text_size(px(12.0))
+            .line_height(px(18.0))
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
-            // chips (destructive tint, comet tool-chip.tsx) and in the
+            // chips (destructive tint, zeron tool-chip.tsx) and in the
             // summary's "· N failed" count.
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(toggle_id.clone(), tool_count, auto_open);
+                this.toggle_fold(toggle_id.clone(), open_height, auto_open);
                 cx.notify();
             }))
             .child(
@@ -1899,6 +6716,9 @@ impl Transcript {
             .child(
                 div()
                     .min_w_0()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
                     .truncate()
                     .child(SharedString::from(summary)),
             );
@@ -1908,19 +6728,240 @@ impl Transcript {
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
-            .children(tools.iter().map(|tool| tool_chip(tool, theme)));
+            .children(tools.iter().enumerate().map(|(ix, tool)| {
+                // Spawn chips are LINKS, not accordions: the click opens the
+                // subagent's transcript as a right-pane tab (the shell hosts
+                // the surface — the chip only announces which doc it indexes).
+                if let Some(doc_id) = &tool.subagent_ref {
+                    let chat_id = self
+                        .journal_chat_id
+                        .clone()
+                        .or_else(|| self.chat_id.clone())
+                        .unwrap_or_default();
+                    let doc_id = doc_id.clone();
+                    let parent_tool_use_id = tool.id.clone();
+                    let title = subagent_tab_title(&tool.call);
+                    let frozen = matches!(
+                        tool.subagent_status,
+                        Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
+                    );
+                    return subagent_chip(
+                        tool,
+                        SharedString::from(format!("{row_id}#s{ix}")),
+                        cx.listener(move |_, _, _, cx| {
+                            cx.emit(TranscriptEvent::OpenSubagent {
+                                chat_id: chat_id.clone(),
+                                doc_id: doc_id.to_string(),
+                                parent_tool_use_id: parent_tool_use_id.to_string(),
+                                title: title.to_string(),
+                                frozen,
+                            });
+                        }),
+                        collapses,
+                        theme,
+                        cx.entity_id(),
+                        cx,
+                    );
+                }
+                let detail = details[ix].clone();
+                let invocation = invocations[ix].clone();
+                if detail.is_none() && invocation.is_none() {
+                    return tool_chip(tool, collapses, theme, cx.entity_id(), cx);
+                }
+                let affordance = affordances[ix].clone();
+                let affordance_h = if affordance.is_some() {
+                    BLOB_AFFORDANCE_HEIGHT
+                } else {
+                    0.0
+                };
+                let open = detail_opens[ix];
+                let default_open = detail_defaults[ix];
+                let dfold = detail_folds[ix];
+                let key = SharedString::from(format!("{row_id}#d{ix}"));
+                // Expandable chip: ONE card whose header row is the chip and
+                // whose body is the detail — not a floating card below it.
+                // The guide rail stretches with the row, so an open detail
+                // never breaks the rail.
+                //
+                // The card's height is EXPLICIT (border-box), not intrinsic:
+                // an auto-height card adds its 2px of borders on top of the
+                // 30px header, and with N chips that overflowed the group's
+                // analytic height by 2N px — the last chips rendered clipped
+                // (user report: "tool calls cut off at the bottom"). The
+                // explicit height is also what the open/close tween animates.
+                let closed_h = CHIP_CARD_HEIGHT;
+                let open_h = CHIP_CARD_HEIGHT
+                    + invocation.as_deref().map_or(0.0, detail_height)
+                    + detail.as_deref().map_or(0.0, detail_height)
+                    + affordance_h;
+                let card_target = if open { open_h } else { closed_h };
+                let animating = dfold.epoch > 0
+                    && dfold
+                        .toggled_at
+                        .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+                let toggle_key = key.clone();
+                let group_key = row_id.clone();
+                let mut card = div()
+                    .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
+                    .when(collapses, |el| el.ml(px(12.0)))
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(px(9.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.07))
+                    .bg(crate::theme::ink(0.03))
+                    .child(
+                        div()
+                            .id(key.clone())
+                            .h(px(CHIP_HEADER_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.invalidate_sticky_users_after_row(&group_key);
+                                let entry =
+                                    this.tool_details.entry(toggle_key.clone()).or_default();
+                                let currently_open = entry.open.unwrap_or(default_open);
+                                entry.from = if currently_open { open_h } else { closed_h };
+                                entry.open = Some(!currently_open);
+                                entry.epoch += 1;
+                                entry.toggled_at = Some(Instant::now());
+                                // Arm the GROUP body's height tween too (open
+                                // state untouched): the body's height is
+                                // analytic over the final detail state, so
+                                // without a tween the row snaps to the target
+                                // height while the card is still mid-tween —
+                                // content below teleported on expand and the
+                                // shrinking card clipped on collapse (user
+                                // report). `open_height` was computed with
+                                // the detail still in its pre-click state,
+                                // which is exactly the tween's start; both
+                                // tweens share the click instant and the
+                                // RESIZE curve, so the row tracks the card's
+                                // bottom edge frame-for-frame.
+                                let group = this.folds.entry(group_key.clone()).or_default();
+                                group.from = open_height;
+                                group.epoch += 1;
+                                group.toggled_at = Some(Instant::now());
+                                cx.notify();
+                            }))
+                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                    );
+                // The body stays mounted while the close tween shrinks over it.
+                if open || animating {
+                    if let Some(invocation) = invocation.as_deref() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(
+                                invocation,
+                                None,
+                                DetailRole::Invocation {
+                                    command: matches!(tool.call, ToolCall::Exec { .. }),
+                                },
+                                theme,
+                            ));
+                    }
+                    if let Some(detail) = detail.as_deref() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(
+                                detail,
+                                detail_highlights[ix].clone(),
+                                DetailRole::Result {
+                                    failed: tool.is_error,
+                                },
+                                theme,
+                            ));
+                    }
+                    if let Some(ChipAffordance { blob_ref, label }) = affordance {
+                        let loading = matches!(
+                            self.blob_details.get(&blob_ref),
+                            Some(BlobFetch::Loading(_))
+                        );
+                        let mut row = div()
+                            .id(SharedString::from(format!("{key}-blob")))
+                            .h(px(BLOB_AFFORDANCE_HEIGHT))
+                            .flex_none()
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(label);
+                        if !loading {
+                            row = row
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.text_muted))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                    cx.notify();
+                                }));
+                        }
+                        card = card.child(row);
+                    }
+                }
+                let card: AnyElement = if animating {
+                    let from = dfold.from;
+                    card.with_animation(
+                        SharedString::from(format!("{key}-tween{}", dfold.epoch)),
+                        RESIZE.animation(),
+                        move |el, t| el.h(px(motion::lerp(from, card_target, t))),
+                    )
+                    .into_any_element()
+                } else {
+                    card.h(px(card_target)).into_any_element()
+                };
+                let card = div().min_w_0().flex_1().child(card);
+                div()
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    // Guide rail: no fixed height — stretches to the card,
+                    // detail included. Agent-only groups skip it (no header
+                    // chevron for the rail to sit under).
+                    .when(collapses, |row| {
+                        row.child(
+                            div()
+                                .ml(px(12.0))
+                                .w(px(1.0))
+                                .flex_none()
+                                .bg(crate::theme::ink(0.08)),
+                        )
+                    })
+                    .child(card)
+                    .into_any_element()
+            }));
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
         // only within a short window of the click. Auto-open (streaming) and
         // content growth never tween, and a SETTLED fold renders at its static
         // height: leaving the tween armed replayed it on every remount, which
         // in a virtualized list means every scroll-back-into-view (only `open`
-        // toggles animate — composes with the stick spring).
-        let animating = fold.epoch > 0
+        // toggles animate — composes with the stick spring). Agent groups skip
+        // the fold entirely (always open, no header).
+        let animating = collapses
+            && fold.epoch > 0
             && fold
                 .toggled_at
                 .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
-        let body: AnyElement = if animating {
+        let body: AnyElement = if !collapses {
+            chips.into_any_element()
+        } else if animating {
             let from = fold.from;
             div()
                 .overflow_hidden()
@@ -1942,7 +6983,7 @@ impl Transcript {
         div()
             .flex()
             .flex_col()
-            .child(header)
+            .when(collapses, |el| el.child(header))
             .child(body)
             .into_any_element()
     }
@@ -1959,7 +7000,12 @@ impl Transcript {
 /// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
 /// repaints O(chips) quads — no layout work, no re-projection (spans were
 /// computed once in [`rows_for_entry`]).
-fn user_mention_text(
+/// The user bubble's text: runs split at mention-chip boundaries (one plain
+/// run when there are none), with the same selection machinery as rendered
+/// markdown — the element registers into the frame's document-ordered
+/// registry, so drags select, span into adjacent rows, and Cmd+C copies.
+fn user_bubble_text(
+    row_id: &SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     theme: &Theme,
@@ -1998,6 +7044,8 @@ fn user_mention_text(
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
     let wash = theme.code_wash;
+    let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
+    let sel_theme = theme.clone();
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
@@ -2013,6 +7061,7 @@ fn user_mention_text(
                     ));
                 }
             }
+            render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
         },
     )
     .absolute()
@@ -2024,12 +7073,105 @@ fn user_mention_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — an exact port of comet chat-view.tsx
-/// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
+fn full_message_dialog_limits(viewport: gpui::Size<Pixels>) -> (Pixels, Pixels) {
+    (
+        px((f32::from(viewport.width) - 32.0).clamp(0.0, 672.0)),
+        px(f32::from(viewport.height) * 0.80),
+    )
+}
+
+fn user_message_dialog(
+    viewport: gpui::Size<Pixels>,
+    preview: &UserMessagePreview,
+    focus: &gpui::FocusHandle,
+    theme: &Theme,
+    on_close: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let (max_w, max_h) = full_message_dialog_limits(viewport);
+    let on_close = Rc::new(on_close);
+    let close_on_key = on_close.clone();
+    let close_on_scrim = on_close.clone();
+    let message = user_bubble_text(
+        &SharedString::from(format!("{}#full", preview.row_id)),
+        preview.text.clone(),
+        preview.mentions.clone(),
+        theme,
+    );
+
+    gpui::deferred(
+        gpui::anchored()
+            .position(gpui::point(px(0.0), px(0.0)))
+            .child(
+                div()
+                    .id("full-user-message-scrim")
+                    .occlude()
+                    .track_focus(focus)
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .bg(crate::popover::scrim_alpha(0.70))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            close_on_key(window, cx);
+                        }
+                    })
+                    .on_click(move |_, window, cx| close_on_scrim(window, cx))
+                    .child(
+                        div()
+                            .id("full-user-message-card")
+                            .w(max_w)
+                            .max_h(max_h)
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .rounded(px(USER_MESSAGE_CARD_RADIUS))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.surface_dialog)
+                            .shadow_lg()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(16.0))
+                                    .pt(px(16.0))
+                                    .pb(px(10.0))
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted)
+                                    .child("Full message"),
+                            )
+                            .child(
+                                div()
+                                    .id("full-user-message-scroll")
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .px(px(16.0))
+                                    .pb(px(16.0))
+                                    .text_size(px(14.0))
+                                    .line_height(px(22.0))
+                                    .text_color(theme.text)
+                                    .child(message),
+                            ),
+                    ),
+            ),
+    )
+    .into_any_element()
+}
+
+/// The transcript ErrorChip — a port of zeron chat-view.tsx `ErrorChip`
+/// (34px-minimum row, `rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
-/// "Error" label, then the human message truncating at `text-foreground/80` —
-/// a subtle red-tinted wash, never a bare red-stroke box.
+/// "Error" label, then the human message at `text-foreground/80` — a subtle
+/// red-tinted wash, never a bare red-stroke box. Unlike the web port, the
+/// message WRAPS instead of truncating: startup-crash errors carry the
+/// agent's exit status and stderr, and a one-line ellipsis was exactly what
+/// made zeronsh/comet#95 undiagnosable from the screenshot.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
@@ -2038,7 +7180,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .w_full()
         .child(
             div()
-                .h(px(34.0))
+                .min_h(px(34.0))
                 .w_full()
                 .flex()
                 .items_center()
@@ -2049,6 +7191,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                 .border_color(danger.opacity(0.16))
                 .bg(danger.opacity(0.05))
                 .px(px(8.0))
+                .py(px(7.0))
                 .text_size(px(12.0))
                 .child(
                     div()
@@ -2076,7 +7219,6 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                     div()
                         .min_w_0()
                         .flex_1()
-                        .truncate()
                         .text_color(theme.text.opacity(0.8))
                         .child(message),
                 ),
@@ -2148,33 +7290,634 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
-/// A small glyph standing in for the tool's icon (comet uses an icon set; a
-/// quiet monochrome character keeps the tile without shipping SVGs).
-/// The glyph for a tool call (comet tool-chip.tsx `toolIcon`, Solar set).
-fn tool_icon_path(call: &ToolCall) -> &'static str {
-    match call {
-        ToolCall::Exec { .. } => crate::icons::COMMAND,
-        ToolCall::ReadFile { .. } | ToolCall::ApplyPatch { .. } => crate::icons::DOCUMENT,
-        ToolCall::WriteFile { .. } => crate::icons::DOCUMENT_ADD,
-        ToolCall::EditFile { .. } => crate::icons::PEN,
-        ToolCall::Search { .. } => crate::icons::MAGNIFER,
-        ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
-        ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
-        ToolCall::Todo { .. } => crate::icons::CHECKLIST,
-        ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
+fn tool_icon(call: &ToolCall, theme: &Theme) -> AnyElement {
+    let descriptor = crate::tool_icons::tool_icon_descriptor(call);
+    match &descriptor {
+        crate::tool_icons::ToolIconDescriptor::Material(_) => {
+            let image = descriptor
+                .material_image()
+                .expect("resolved tool icon is embedded");
+            img(image)
+                .size(px(12.0))
+                .object_fit(ObjectFit::Contain)
+                .flex_none()
+                .into_any_element()
+        }
+        crate::tool_icons::ToolIconDescriptor::Solar(path) => crate::icons::icon(*path)
+            .size(px(12.0))
+            .text_color(theme.text_muted)
+            .into_any_element(),
     }
 }
 
-/// One tool chip row: a guide rail on the left (continuous across stacked
-/// chips — the rail spans the row's full height) threading the chips to their
-/// group toggle, then the chip card (comet tool-chip.tsx).
-fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
-    let (label, detail) = tool_chip_content(&tool.call);
-    let tint = if tool.is_error {
+/// The body of an expanded chip card, under the header's separator. Diffs
+/// render through the changes pane's section body — the real component, with
+/// hunk headers, dual line-number gutters, accent bars, row washes, and
+/// syntax runs — so an inline tool diff is indistinguishable from the
+/// checkout diff sidebar. Output renders as a code block: verbatim mono
+/// lines, indentation intact, counted-tail truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailRole {
+    Invocation { command: bool },
+    Result { failed: bool },
+}
+
+fn detail_body(
+    detail: &ToolDetail,
+    diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    role: DetailRole,
+    theme: &Theme,
+) -> AnyElement {
+    let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
+    match detail {
+        // No comment layer: an inline tool diff is a record of what the
+        // agent already did, not a review surface.
+        ToolDetail::Diff { file, .. } => body
+            .child(crate::changes::render_file_body_with_syntax(
+                file,
+                diff_highlights,
+                theme,
+            ))
+            .into_any_element(),
+        ToolDetail::Stats { stats } => body
+            .py(px(6.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .children(stats.iter().map(|stat| {
+                div()
+                    .h(px(OUTPUT_LINE_HEIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme.text.opacity(0.85))
+                            .child(SharedString::from(stat.path.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.success)
+                            .child(SharedString::from(format!("+{}", stat.additions))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("−{}", stat.deletions))),
+                    )
+            }))
+            .into_any_element(),
+        ToolDetail::Output {
+            lines,
+            truncated_by,
+        } => {
+            let text_color = match role {
+                DetailRole::Invocation { .. } => theme.text.opacity(0.95),
+                DetailRole::Result { failed: true } => theme.danger_muted,
+                DetailRole::Result { failed: false } => theme.text_muted,
+            };
+            let command = matches!(role, DetailRole::Invocation { command: true });
+            body.py(px(6.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .children(lines.iter().enumerate().map(|(ix, line)| {
+                    div()
+                        .h(px(OUTPUT_LINE_HEIGHT))
+                        .w_full()
+                        .min_w_0()
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_color(text_color)
+                        .when(command && ix == 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(theme.syntax.number)
+                                    .child(SharedString::from("$")),
+                            )
+                        })
+                        .child(div().w_full().min_w_0().truncate().child(line.clone()))
+                }))
+                .when(*truncated_by > 0, |block| {
+                    block.child(
+                        div()
+                            .h(px(OUTPUT_LINE_HEIGHT))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!("… {truncated_by} more lines"))),
+                    )
+                })
+                .into_any_element()
+        }
+    }
+}
+
+/// The trailing tile on a chip header, when it has one.
+enum ChipTrail {
+    /// Expand/collapse chevron — flipped while the detail body is open.
+    Chevron { open: bool },
+    /// Top-right "opens elsewhere" arrow — the spawn chip's link to its
+    /// subagent tab.
+    OpenArrow,
+}
+
+/// The chip's content row: icon tile + label + detail line (+ trailing tile
+/// when the chip expands or links out). Shared between the plain chip, the
+/// header of an expandable chip card, and the spawn link chip.
+///
+/// Spawn chips carry their subagent's lifecycle VISUALLY, in the chip's own
+/// language: while running the mini working spinner (the sidebar's) pulses
+/// at the right of the ordinary static detail; done is the ordinary quiet
+/// chip; failed takes the danger tint — no status words, no live text (a
+/// header rewriting itself per stream delta read as noise — user report).
+fn chip_header_row(
+    tool: &ToolItem,
+    trail: Option<ChipTrail>,
+    theme: &Theme,
+    view: gpui::EntityId,
+    cx: &mut gpui::App,
+) -> gpui::Div {
+    let presentation = tool_presentation(&tool.call, tool.resolved, tool.is_error);
+    let (label, detail) = if is_agent_tool(tool) {
+        tool_chip_content(&tool.call)
+    } else {
+        (presentation.label, presentation.detail)
+    };
+    let running = tool.subagent_ref.is_some()
+        && matches!(tool.subagent_status, Some(SubagentStatus::Running));
+    let failed = tool.is_error
+        || (tool.subagent_ref.is_some()
+            && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+    let tint = if failed {
         theme.danger
     } else {
         theme.text_muted
     };
+    let header_state = if is_agent_tool(tool) {
+        ToolHeaderState::Quiet
+    } else {
+        tool_header_state(
+            tool.resolved,
+            tool.is_error,
+            presentation.show_outcome_label,
+        )
+    };
+    let trail = if header_state == ToolHeaderState::Pending {
+        None
+    } else {
+        trail
+    };
+    div()
+        .h(px(CHIP_HEADER_HEIGHT))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .text_size(px(12.0))
+        .line_height(px(18.0))
+        .child(
+            // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
+            // icon size-3).
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.08))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(tool_icon(&tool.call, theme)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(tint)
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .truncate()
+                .text_color(if failed {
+                    theme.danger
+                } else {
+                    theme.text.opacity(0.85)
+                })
+                .child(SharedString::from(detail)),
+        )
+        .when(running, |row| {
+            // The sidebar working-row spinner, in the chip's trailing slot —
+            // paint-local (fixed footprint), so it never moves the layout.
+            row.child(
+                div()
+                    .flex_none()
+                    .child(crate::loaders::mini_gradient_spinner(
+                        format!(
+                            "subagent-chip-{}",
+                            tool.subagent_ref.as_deref().unwrap_or_default()
+                        ),
+                        2.0,
+                        view,
+                        cx,
+                    )),
+            )
+        })
+        .when(
+            header_state == ToolHeaderState::Pending && !running,
+            |row| {
+                row.child(
+                    div()
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::loaders::mini_mono_spinner(
+                            "tool-pending",
+                            2.0,
+                            theme.text_muted,
+                            view,
+                            cx,
+                        )),
+                )
+            },
+        )
+        .when(
+            matches!(
+                header_state,
+                ToolHeaderState::Success | ToolHeaderState::Failed
+            ),
+            |row| {
+                let failed = header_state == ToolHeaderState::Failed;
+                let color = if failed {
+                    theme.danger
+                } else {
+                    theme.text_muted
+                };
+                row.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .text_size(px(12.0))
+                        .text_color(color)
+                        .child(
+                            crate::icons::icon(if failed {
+                                crate::icons::CLOSE
+                            } else {
+                                crate::icons::CHECK
+                            })
+                            .size(px(11.0))
+                            .text_color(color),
+                        )
+                        .child(SharedString::from(if failed {
+                            "Failed"
+                        } else {
+                            "Success"
+                        }))
+                        .when_some(
+                            tool.execution.and_then(|meta| meta.duration_ms),
+                            |status, duration_ms| {
+                                status.child(
+                                    div()
+                                        .font_family(theme.font_mono.clone())
+                                        .text_size(px(10.5))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(format_execution_duration(
+                                            duration_ms,
+                                        ))),
+                                )
+                            },
+                        ),
+                )
+            },
+        )
+        .when_some(trail, |row, trail| {
+            // Trailing tile matching the group header's: a chevron for the
+            // output/diff accordion, or the open-arrow for spawn chips.
+            let tile = div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.06))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.text_muted.opacity(0.8));
+            row.child(match trail {
+                ChipTrail::Chevron { open } => tile
+                    .text_size(px(10.0))
+                    .child(SharedString::from(if open { "▾" } else { "▸" })),
+                ChipTrail::OpenArrow => tile.child(
+                    crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
+                        .size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.8)),
+                ),
+            })
+        })
+}
+
+/// The header row of an expandable chip card.
+fn chip_header(
+    tool: &ToolItem,
+    open: bool,
+    theme: &Theme,
+    view: gpui::EntityId,
+    cx: &mut gpui::App,
+) -> gpui::Div {
+    chip_header_row(tool, Some(ChipTrail::Chevron { open }), theme, view, cx)
+}
+
+/// Max chars a subagent tab title keeps. The strip chip is fixed-width and
+/// truncates visually, but the derived title also rides drag ghosts and any
+/// future pickers — cap it at the source.
+const SUBAGENT_TITLE_MAX: usize = 40;
+
+/// First line of `text`, trimmed, capped at `max` chars with an ellipsis.
+fn title_line(text: &str, max: usize) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    let mut out: String = line.chars().take(max).collect();
+    if line.chars().count() > max {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Drop a leading "Agent"/"Task" genus (with its `:` and spacing) from a
+/// spawn-title candidate. Only a real word boundary strips — "Taskmaster"
+/// keeps its name. A bare "Agent"/"Task" strips to "" (no context at all).
+fn strip_spawn_prefix(text: &str) -> &str {
+    let t = text.trim();
+    for prefix in ["agent", "task"] {
+        if t.len() >= prefix.len()
+            && t.is_char_boundary(prefix.len())
+            && t[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            let rest = &t[prefix.len()..];
+            if rest.is_empty() {
+                return "";
+            }
+            if rest.starts_with(':') || rest.starts_with(char::is_whitespace) {
+                return rest.trim_start_matches(':').trim();
+            }
+        }
+    }
+    t
+}
+
+/// Tab title for a spawn chip's subagent surface: the BARE task description
+/// ("verify the marker pipeline"). The chip keeps the tool's fuller name —
+/// a fixed-width tab spent on "Agent: " never shows the task, so the genus
+/// is stripped here and the call input's description/prompt fields back up
+/// a bare name (older docs); "Subagent" only as the last resort.
+pub(crate) fn subagent_tab_title(call: &ToolCall) -> SharedString {
+    let (name, input) = match call {
+        ToolCall::Unknown { name, input } => (name.as_str(), input.as_ref()),
+        ToolCall::Mcp { tool, input, .. } => (tool.as_str(), input.as_ref()),
+        _ => return "Subagent".into(),
+    };
+    let candidates = [
+        Some(name),
+        input.and_then(|i| i.get("description")?.as_str()),
+        input.and_then(|i| i.get("prompt")?.as_str()),
+    ];
+    for text in candidates.into_iter().flatten() {
+        if let Some(title) = title_line(strip_spawn_prefix(text), SUBAGENT_TITLE_MAX) {
+            return title.into();
+        }
+    }
+    "Subagent".into()
+}
+
+fn task_snapshot_card(
+    items: &Arc<Vec<TaskSnapshotItem>>,
+    created: bool,
+    resolved: bool,
+    is_error: bool,
+    theme: &Theme,
+) -> AnyElement {
+    let title = task_snapshot_title(items, created, resolved, is_error);
+
+    div()
+        .w_full()
+        .overflow_hidden()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface_card)
+        .child(
+            div()
+                .h(px(36.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    crate::icons::icon(crate::icons::CHECKLIST)
+                        .size(px(15.0))
+                        .text_color(if is_error {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if is_error {
+                            theme.danger_muted
+                        } else {
+                            theme.text
+                        })
+                        .child(title),
+                ),
+        )
+        .children(items.iter().map(|item| {
+            let change_label = item.change.map(|change| match change {
+                TaskChange::Created => "Created",
+                TaskChange::Started => "Started",
+                TaskChange::Completed => "Completed",
+                TaskChange::Deleted => "Deleted",
+            });
+            div()
+                .h(px(36.0))
+                .px(px(12.0))
+                .border_t_1()
+                .border_color(theme.border.opacity(0.55))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .child(
+                    div()
+                        .size(px(15.0))
+                        .flex_none()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if item.current {
+                            theme.text
+                        } else {
+                            theme.border_strong
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(item.current, |dot| {
+                            dot.bg(theme.text).child(
+                                crate::icons::icon(crate::icons::ARROW_RIGHT)
+                                    .size(px(9.0))
+                                    .text_color(theme.bg),
+                            )
+                        })
+                        .when(item.done, |dot| {
+                            dot.bg(crate::theme::ink(0.08)).child(
+                                crate::icons::icon(crate::icons::CHECK)
+                                    .size(px(9.0))
+                                    .text_color(theme.text_muted),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(if item.done {
+                            theme.text_muted
+                        } else {
+                            theme.text
+                        })
+                        .child(format!("{}. {}", item.ordinal, item.text)),
+                )
+                .when_some(change_label, |row, label| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child(label),
+                    )
+                })
+        }))
+        .into_any_element()
+}
+
+fn task_snapshot_title(
+    items: &[TaskSnapshotItem],
+    created: bool,
+    resolved: bool,
+    is_error: bool,
+) -> String {
+    let count = items.len();
+    if is_error {
+        "Todo update failed".to_owned()
+    } else if !resolved {
+        "Updating tasks".to_owned()
+    } else if created {
+        format!(
+            "Created {count} {}",
+            if count == 1 { "task" } else { "tasks" }
+        )
+    } else if count == 0 {
+        "Updated tasks".to_owned()
+    } else if items
+        .iter()
+        .all(|item| item.change == Some(TaskChange::Completed))
+    {
+        format!(
+            "Completed {count} {}",
+            if count == 1 { "task" } else { "tasks" }
+        )
+    } else {
+        format!(
+            "{count} task {}",
+            if count == 1 { "update" } else { "updates" }
+        )
+    }
+}
+
+fn file_change_line_row(
+    line: &zeron_doc::FileChangeLine,
+    spans: &[comet_syntax::HighlightSpan],
+    theme: &Theme,
+) -> AnyElement {
+    let line_height = 20.0;
+    let (wash, rail, text_color) = match line.kind {
+        zeron_doc::FileChangeLineKind::Added => (
+            theme.success_muted.opacity(0.055),
+            theme.success_muted.opacity(0.75),
+            theme.success_muted,
+        ),
+        zeron_doc::FileChangeLineKind::Removed => (
+            theme.danger_muted.opacity(0.055),
+            theme.danger_muted.opacity(0.75),
+            theme.danger_muted,
+        ),
+        zeron_doc::FileChangeLineKind::Context => (
+            gpui::transparent_black(),
+            gpui::transparent_black(),
+            theme.text_muted,
+        ),
+    };
+    let runs = render::runs_for_syntax_line_with_plain(
+        &line.text,
+        spans,
+        &gpui::font(theme.font_mono.clone()),
+        text_color,
+        theme,
+    );
+    div()
+        .h(px(line_height))
+        .flex_none()
+        .w_full()
+        .flex()
+        .items_center()
+        .border_l_1()
+        .border_color(rail)
+        .bg(wash)
+        .px(px(9.0))
+        .overflow_hidden()
+        .child(StyledText::new(line.text.clone()).with_runs(runs))
+        .into_any_element()
+}
+
+/// A plain (non-expandable) chip: bordered card, plus the group guide rail
+/// when the chip lives under a collapsible header.
+fn tool_chip(
+    tool: &ToolItem,
+    rail: bool,
+    theme: &Theme,
+    view: gpui::EntityId,
+    cx: &mut gpui::App,
+) -> AnyElement {
     div()
         .h(px(CHIP_HEIGHT))
         .w_full()
@@ -2182,68 +7925,89 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
         .flex()
         .flex_row()
         .items_center()
-        // Guide rail: hairline centered under the header's chevron tile.
+        .when(rail, |row| {
+            row.child(
+                div()
+                    .ml(px(12.0))
+                    .h_full()
+                    .w(px(1.0))
+                    .flex_none()
+                    .bg(crate::theme::ink(0.08)),
+            )
+        })
         .child(
             div()
-                .ml(px(12.0))
-                .h_full()
-                .w(px(1.0))
-                .flex_none()
-                .bg(crate::theme::ink(0.08)),
-        )
-        .child(
-            div()
-                .ml(px(12.0))
+                .when(rail, |el| el.ml(px(12.0)))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
                 .flex_1()
                 .flex()
-                .flex_row()
                 .items_center()
-                .gap(px(8.0))
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
                 .border_color(crate::theme::hairline(0.07))
                 .bg(crate::theme::ink(0.03))
-                .px(px(8.0))
-                .text_size(px(12.0))
-                .child(
-                    // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
-                    // icon size-3).
-                    div()
-                        .size(px(18.0))
-                        .flex_none()
-                        .rounded(px(5.0))
-                        .bg(crate::theme::ink(0.08))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(tool_icon_path(&tool.call))
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(tint)
-                        .child(SharedString::from(label)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(if tool.is_error {
-                            theme.danger
-                        } else {
-                            theme.text.opacity(0.85)
-                        })
-                        .child(SharedString::from(detail)),
-                ),
+                .child(chip_header_row(tool, None, theme, view, cx)),
+        )
+        .into_any_element()
+}
+
+/// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
+/// "open the subagent tab" click (open-arrow tile in the trailing slot).
+/// No accordion — an inline body would only repeat the subagent's own
+/// transcript. The group guide rail is omitted for agent-only rows (no
+/// collapse header for it to hang from).
+fn subagent_chip(
+    tool: &ToolItem,
+    id: SharedString,
+    on_open: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    rail: bool,
+    theme: &Theme,
+    view: gpui::EntityId,
+    cx: &mut gpui::App,
+) -> AnyElement {
+    div()
+        .h(px(CHIP_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .when(rail, |row| {
+            row.child(
+                div()
+                    .ml(px(12.0))
+                    .h_full()
+                    .w(px(1.0))
+                    .flex_none()
+                    .bg(crate::theme::ink(0.08)),
+            )
+        })
+        .child(
+            div()
+                .id(id)
+                .when(rail, |el| el.ml(px(12.0)))
+                .h(px(CHIP_CARD_HEIGHT))
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.07))
+                .bg(crate::theme::ink(0.03))
+                .cursor_pointer()
+                .hover(|s| s.bg(crate::theme::ink(0.05)))
+                .on_click(on_open)
+                .child(chip_header_row(
+                    tool,
+                    Some(ChipTrail::OpenArrow),
+                    theme,
+                    view,
+                    cx,
+                )),
         )
         .into_any_element()
 }
@@ -2258,14 +8022,42 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         Some(MessageStatus::Aborted) => 3,
     });
     acc.push(pending as u8);
+    match entry.duration_ms {
+        Some(duration_ms) => {
+            acc.push(1);
+            acc.extend_from_slice(&duration_ms.to_le_bytes());
+        }
+        None => acc.push(0),
+    }
     for part in &entry.parts {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
         if let MessagePart::Tool {
-            is_error, resolved, ..
+            is_error,
+            resolved,
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
+            ..
         } = part
         {
             acc.push(*is_error as u8 | (*resolved as u8) << 1);
+            // Subagent lifecycle mutates a COMPLETED entry in place (eager-
+            // done: the spawn resolves while the subagent runs on) and
+            // `byte_len` above doesn't cover these fields — hash them or the
+            // cached rows never refresh on status/tail changes.
+            acc.push(
+                subagent_ref.is_some() as u8
+                    | match subagent_status {
+                        None => 0,
+                        Some(SubagentStatus::Running) => 1 << 1,
+                        Some(SubagentStatus::Done) => 2 << 1,
+                        Some(SubagentStatus::Failed) => 3 << 1,
+                    },
+            );
+            if let Some(tail) = subagent_tail {
+                acc.extend_from_slice(tail.as_bytes());
+            }
         }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
@@ -2279,6 +8071,27 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
+        // The row processor runs later under ListState's mutable prepaint
+        // borrow, so capture every list-derived scalar it needs now.
+        self.sticky_scroll_y = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        // Own-turn driver: measurements are only authoritative after layout,
+        // so reservation sizing, the send glide, and the outgrown-handoff
+        // each advance at most once per requested frame. Scheduled on every
+        // frame while an anchor is live (not just on kicks) so viewport
+        // resizes and streaming growth re-derive the reservation; the step
+        // only notifies on change, so a settled hold schedules no next frame.
+        if (self.own_turn.is_some() || self.own_turn_kick) && !self.own_turn_scheduled {
+            self.own_turn_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.own_turn_scheduled = false;
+                        this.step_own_turn(cx);
+                    })
+                    .ok();
+            });
+        }
         // Spring driver: one on_next_frame callback at a time; each tick
         // notifies, which re-enters render and schedules the next frame until
         // the spring parks. Reduced motion never schedules (sync snaps).
@@ -2303,19 +8116,45 @@ impl Render for Transcript {
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
         // outlet — an overlay here would be tinted by the fade.
+        let list_el = list(self.list.clone(), cx.processor(Self::render_row))
+            .size_full()
+            .with_sizing_behavior(gpui::ListSizingBehavior::Auto);
+        let content: AnyElement = if self.doc_override.is_some() {
+            // The primary transcript's fade lives on the SHELL's outlet
+            // wrapper (it spans the titlebar/composer chrome); an override
+            // instance owns its own — top edge only (nothing overlays the
+            // pane's bottom), gated on real overflow so a short top-anchored
+            // transcript shows no fade. Gated here rather than at paint via
+            // a ScrollHandle (the list isn't one); scrolls re-render this
+            // entity, so the flag can't go stale.
+            let scrolled_under_top = {
+                let max = f32::from(self.list.max_offset_for_scrollbar().y);
+                max - self.distance_from_bottom() > 1.0
+            };
+            crate::edge_fade::edge_faded(
+                Theme::TRANSCRIPT_FADE_BAND,
+                scrolled_under_top,
+                false,
+                list_el,
+            )
+            .into_any_element()
+        } else {
+            list_el.into_any_element()
+        };
+        let sticky_turn = self.render_sticky_turn(window, cx);
         let root = div()
             .relative()
             .size_full()
             .min_h_0()
+            .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
-            .child(
-                list(self.list.clone(), cx.processor(Self::render_row))
-                    .size_full()
-                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
-            )
+            .child(content)
+            .children(sticky_turn)
             .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
@@ -2324,9 +8163,27 @@ impl Render for Transcript {
             return root.child(crate::attachments::lightbox(
                 window.viewport_size(),
                 &preview,
+                &self.attachment_preview_focus,
                 move |_, cx| {
                     weak.update(cx, |this, cx| {
                         this.attachment_preview = None;
+                        cx.notify();
+                    })
+                    .ok();
+                },
+            ));
+        }
+        if let Some(preview) = self.user_message_preview.clone() {
+            let weak = cx.weak_entity();
+            let theme = Theme::of(cx).clone();
+            return root.child(user_message_dialog(
+                window.viewport_size(),
+                &preview,
+                &self.user_message_preview_focus,
+                &theme,
+                move |_, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.user_message_preview = None;
                         cx.notify();
                     })
                     .ok();
@@ -2340,7 +8197,39 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_doc::MessagePart;
+    use zeron_doc::MessagePart;
+
+    #[test]
+    fn reasoning_defaults_open() {
+        for (pinned, active, expected) in [
+            (None, true, true),
+            (None, false, true),
+            (Some(false), true, false),
+            (Some(false), false, false),
+            (Some(true), true, true),
+            (Some(true), false, true),
+        ] {
+            assert_eq!(reasoning_is_open(pinned, active), expected);
+        }
+    }
+
+    #[test]
+    fn selection_scroll_ramps_at_viewport_edges() {
+        let bounds = Bounds::new(
+            gpui::point(px(10.0), px(20.0)),
+            gpui::size(px(300.0), px(200.0)),
+        );
+        assert_eq!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(120.0))),
+            0.0
+        );
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(20.0))) < 0.0);
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0))) > 0.0);
+        assert!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0)))
+                > selection_scroll_step(bounds, gpui::point(px(20.0), px(200.0)))
+        );
+    }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 
@@ -2529,6 +8418,285 @@ mod tests {
         assert!(!Transcript::should_restick(50.0, 50.0));
     }
 
+    #[test]
+    fn own_turn_reservation_is_a_min_height_for_the_turn() {
+        let usable = 700.0;
+        // A short turn reserves the rest of the usable viewport below it.
+        assert_eq!(own_turn_reservation(usable, 100.0), 600.0);
+        // Growth consumes the reservation 1:1 — total held height is stable.
+        assert_eq!(own_turn_reservation(usable, 450.0), 250.0);
+        // At/past the fill line nothing is reserved (bottom spring takes
+        // over with no height jump).
+        assert_eq!(own_turn_reservation(usable, 700.0), 0.0);
+        assert_eq!(own_turn_reservation(usable, 1_200.0), 0.0);
+    }
+
+    fn user_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![text_part(&format!("{id}-text"), id)],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn sticky_turn_header_tracks_the_group_crossing_the_reading_line() {
+        let mut rows = Vec::new();
+        rows.extend(rows_for_entry(&user_entry("user-a"), false, &mut parse));
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-a",
+                MessageStatus::Complete,
+                vec![text_part("answer-a", "First answer")],
+            ),
+            false,
+            &mut parse,
+        ));
+        rows.extend(rows_for_entry(&user_entry("user-b"), false, &mut parse));
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-b",
+                MessageStatus::Complete,
+                vec![text_part("answer-b", "Second answer")],
+            ),
+            false,
+            &mut parse,
+        ));
+
+        let user_rows = sticky_turn_rows(&rows);
+        assert_eq!(user_rows, vec![0, 2]);
+        assert_eq!(
+            sticky_turn_group(&user_rows, 1),
+            Some(StickyTurnGroup {
+                user_ix: 0,
+                next_user_ix: Some(2),
+            })
+        );
+        assert_eq!(
+            sticky_turn_group(&user_rows, 3),
+            Some(StickyTurnGroup {
+                user_ix: 2,
+                next_user_ix: None,
+            })
+        );
+    }
+
+    #[test]
+    fn sticky_turn_header_never_duplicates_the_original_and_yields_to_the_next_turn() {
+        let sticky_top = 48.0;
+        let header_height = 64.0;
+
+        assert_eq!(
+            sticky_turn_overlay_top(sticky_top, Some(sticky_top), false, None, header_height),
+            None,
+            "the original row already occupies the sticky position"
+        );
+        assert_eq!(
+            sticky_turn_overlay_top(
+                sticky_top,
+                Some(sticky_top - 1.0),
+                false,
+                None,
+                header_height,
+            ),
+            Some(sticky_top),
+        );
+        assert_eq!(
+            sticky_turn_overlay_top(sticky_top, None, true, Some(100.0), header_height,),
+            Some(36.0),
+            "the next turn boundary pushes the previous 64px header upward"
+        );
+    }
+
+    #[test]
+    fn runway_and_sticky_copy_hand_off_without_skipping_the_restick_glide() {
+        assert!(runway_owns_user_position(true, false, false));
+        assert!(runway_owns_user_position(true, true, true));
+        assert!(!runway_owns_user_position(false, true, true));
+        assert!(
+            !runway_owns_user_position(true, false, true),
+            "after the first landing, the sticky copy stays visible during a restick glide"
+        );
+    }
+
+    #[test]
+    fn tool_fingerprint_changes_when_same_length_invocation_content_changes() {
+        let mut tool = ToolItem {
+            id: "exec".into(),
+            call: ToolCall::Exec {
+                command: "echo".into(),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            detail: None,
+            invocation: Some(Arc::new(ToolDetail::Output {
+                lines: vec!["cargo test".into()],
+                truncated_by: 0,
+            })),
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let before = tool_fingerprint(std::slice::from_ref(&tool), false, false);
+        tool.invocation = Some(Arc::new(ToolDetail::Output {
+            lines: vec!["cargo fmt ".into()],
+            truncated_by: 0,
+        }));
+        let after = tool_fingerprint(std::slice::from_ref(&tool), false, false);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn sticky_turn_state_resets_on_chat_switch_and_accepts_streaming_remeasurement() {
+        let mut state = StickyTurnState::default();
+        assert!(state.attach_chat(Some("chat-a")));
+        assert!(state.record_height("user-a".into(), 42.0));
+        assert!(!state.record_height("user-a".into(), 42.2));
+        assert!(state.record_height("user-a".into(), 68.0));
+        assert_eq!(state.height("user-a"), Some(68.0));
+        assert!(state.record_height("user-b".into(), 32.0));
+        state.retain_user_ids(&std::collections::HashSet::from([SharedString::from(
+            "user-b",
+        )]));
+        assert_eq!(state.height("user-a"), None);
+        assert_eq!(state.height("user-b"), Some(32.0));
+
+        assert!(state.attach_chat(Some("chat-b")));
+        assert_eq!(state.height("user-a"), None);
+        assert!(!state.attach_chat(Some("chat-b")));
+    }
+
+    #[test]
+    fn measured_user_geometry_prevents_a_glued_list_from_painting_a_duplicate() {
+        let mut state = StickyTurnState::default();
+        state.attach_chat(Some("chat"));
+        assert!(state.update_viewport(800.0, 600.0));
+        assert!(state.record_geometry("user".into(), 320.0, 64.0, -100.0));
+        assert_eq!(state.projected_top("user", -100.0), Some(320.0));
+        assert_eq!(state.projected_top("user", -360.0), Some(60.0));
+
+        assert_eq!(
+            sticky_turn_overlay_top(
+                48.0,
+                state.projected_top("user", -100.0),
+                true,
+                None,
+                state.height("user").unwrap(),
+            ),
+            None,
+            "logical top may be past the user while the original card is still visibly below it"
+        );
+        assert_eq!(
+            sticky_turn_overlay_top(
+                48.0,
+                state.projected_top("user", -380.0),
+                true,
+                None,
+                state.height("user").unwrap(),
+            ),
+            Some(48.0),
+        );
+
+        state.invalidate_layout();
+        assert_eq!(state.projected_top("user", -380.0), None);
+        assert!(state.consume_layout_suppression("user"));
+        assert!(!state.consume_layout_suppression("user"));
+        assert_eq!(
+            state.height("user"),
+            Some(64.0),
+            "a transcript reflow invalidates positions, not the user card's measured height"
+        );
+
+        assert!(state.record_geometry("user".into(), 80.0, 64.0, -380.0));
+        assert!(!state.update_viewport(800.2, 600.0));
+        assert!(state.update_viewport(720.0, 600.0));
+        assert_eq!(state.projected_top("user", -380.0), None);
+        assert!(state.consume_layout_suppression("user"));
+    }
+
+    #[test]
+    fn measured_turn_boundaries_override_the_bottom_glued_logical_sentinel() {
+        let user_rows = vec![0, 2];
+        let first_tops = [Some(-120.0), Some(320.0)];
+        assert_eq!(
+            sticky_turn_group_for_viewport(&user_rows, 48.0, Some(3), |position| {
+                first_tops[position]
+            }),
+            Some(StickyTurnGroup {
+                user_ix: 0,
+                next_user_ix: Some(2),
+            }),
+            "the second original bubble is visible mid-viewport, so the first turn still owns the top"
+        );
+        let second_tops = [Some(-500.0), Some(48.0)];
+        assert_eq!(
+            sticky_turn_group_for_viewport(&user_rows, 48.0, Some(3), |position| {
+                second_tops[position]
+            }),
+            Some(StickyTurnGroup {
+                user_ix: 2,
+                next_user_ix: None,
+            }),
+        );
+
+        let sparse_rows = vec![0, 10, 20, 30];
+        let sparse_tops = [None, None, None, Some(400.0)];
+        assert_eq!(
+            sticky_turn_group_for_viewport(&sparse_rows, 48.0, Some(15), |position| {
+                sparse_tops[position]
+            }),
+            Some(StickyTurnGroup {
+                user_ix: 10,
+                next_user_ix: Some(20),
+            }),
+            "a non-adjacent measurement must not replace the logical group"
+        );
+    }
+
+    #[test]
+    fn sticky_turn_index_rebuild_keeps_the_same_group_during_stream_growth() {
+        let mut rows = rows_for_entry(&user_entry("user-live"), false, &mut parse);
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-live",
+                MessageStatus::Streaming,
+                vec![text_part("stream-1", "Working")],
+            ),
+            false,
+            &mut parse,
+        ));
+        let before = sticky_turn_rows(&rows);
+        assert_eq!(
+            sticky_turn_group(&before, rows.len() - 1).unwrap().user_ix,
+            0
+        );
+
+        rows.extend(rows_for_entry(
+            &assistant(
+                "assistant-live-tail",
+                MessageStatus::Streaming,
+                vec![text_part("stream-2", "Still working")],
+            ),
+            false,
+            &mut parse,
+        ));
+        let after = sticky_turn_rows(&rows);
+        assert_eq!(
+            sticky_turn_group(&after, rows.len() - 1).unwrap().user_ix,
+            0
+        );
+    }
+
     fn parse(_: &str, text: &str) -> Arc<BlockTree> {
         Arc::new(parse_full(text))
     }
@@ -2541,6 +8709,7 @@ mod tests {
             created_at: 0,
             device_id: "dev".into(),
             status: Some(status),
+            duration_ms: None,
             continuation_of: None,
         }
     }
@@ -2552,6 +8721,759 @@ mod tests {
         }
     }
 
+    #[test]
+    fn assistant_turn_projects_completed_work_before_the_final_answer() {
+        let read = MessagePart::Tool {
+            id: "read-1".into(),
+            call: ToolCall::ReadFile {
+                path: "src/lib.rs".into(),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let entry = assistant(
+            "assistant-turn-projects",
+            MessageStatus::Complete,
+            vec![
+                text_part("narration-1", "Inspecting the implementation."),
+                read,
+                text_part("narration-2", "Now checking the gate."),
+                tool_part("exec-1", "cargo test"),
+                text_part("answer", "The issue is fixed."),
+            ],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id.as_ref(), "assistant-turn-projects#steps");
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("completed operational prefix should be one TurnSteps row");
+        };
+        assert_eq!(children.len(), 4);
+        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
+        assert!(matches!(children[1].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(children[2].kind, RowKind::Markdown { .. }));
+        assert!(matches!(children[3].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+    }
+
+    #[test]
+    fn assistant_turn_streaming_keeps_unresolved_tools_and_latest_text_top_level() {
+        let mut unresolved_a = tool_part("exec-a", "cargo test");
+        let mut unresolved_b = tool_part("exec-b", "cargo check");
+        for part in [&mut unresolved_a, &mut unresolved_b] {
+            let MessagePart::Tool { resolved, .. } = part else {
+                unreachable!();
+            };
+            *resolved = false;
+        }
+        let entry = assistant(
+            "assistant-live-tools",
+            MessageStatus::Streaming,
+            vec![
+                text_part("narration", "Inspecting."),
+                tool_part("read", "cat src/lib.rs"),
+                unresolved_a,
+                unresolved_b,
+            ],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows[0].id.as_ref(), "assistant-live-tools#steps");
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("completed prefix should be folded while streaming");
+        };
+        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
+        assert!(matches!(children[1].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::ToolGroup {
+                tools,
+                auto_open: true,
+                ..
+            } if tools.len() == 2 && tools.iter().all(|tool| !tool.resolved)
+        ));
+
+        let latest_text = assistant(
+            "assistant-live-text",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                text_part("latest", "Writing the answer now."),
+            ],
+        );
+        let rows = rows_for_entry(&latest_text, false, &mut parse);
+        assert_eq!(rows[0].id.as_ref(), "assistant-live-text#steps");
+        assert!(matches!(rows[1].kind, RowKind::LiveMarkdown { .. }));
+    }
+
+    #[test]
+    fn assistant_turn_keeps_active_reasoning_input_and_subagent_outside() {
+        let active_reasoning = assistant(
+            "assistant-live-reasoning",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                MessagePart::Reasoning {
+                    id: "reasoning".into(),
+                    text: "Still checking".into(),
+                    completed: false,
+                    duration_ms: None,
+                },
+            ],
+        );
+        let rows = rows_for_entry(&active_reasoning, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(
+            rows[1].kind,
+            RowKind::Reasoning { active: true, .. }
+        ));
+
+        let unresolved_input = assistant(
+            "assistant-live-input",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                MessagePart::Input {
+                    id: "input".into(),
+                    request_id: "request".into(),
+                    questions: Vec::new(),
+                    resolved: false,
+                },
+            ],
+        );
+        let rows = rows_for_entry(&unresolved_input, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(
+            rows[1].kind,
+            RowKind::InputChip {
+                resolved: false,
+                ..
+            }
+        ));
+
+        let running_subagent = assistant(
+            "assistant-live-agent",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                agent_part("agent", "Audit"),
+            ],
+        );
+        let rows = rows_for_entry(&running_subagent, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
+    }
+
+    #[test]
+    fn assistant_turn_preserves_specialized_children_and_stable_identity() {
+        let todo = MessagePart::Tool {
+            id: "todo".into(),
+            call: ToolCall::Todo {
+                items: vec![TodoItem {
+                    text: "Inspect".into(),
+                    done: true,
+                }],
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let parts = vec![
+            text_part("artifact", "Preview ![chart](artifacts/chart.png)"),
+            todo,
+            text_part("answer", "Done."),
+        ];
+        let live = assistant(
+            "assistant-specialized",
+            MessageStatus::Streaming,
+            parts.clone(),
+        );
+        let done = assistant("assistant-specialized", MessageStatus::Complete, parts);
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+
+        assert_eq!(live_rows[0].id, done_rows[0].id);
+        assert_eq!(live_rows[0].id.as_ref(), "assistant-specialized#steps");
+        let RowKind::TurnSteps { rows: children, .. } = &done_rows[0].kind else {
+            panic!("specialized prefix should be preserved inside TurnSteps");
+        };
+        assert!(
+            children
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::InlineImages { .. }))
+        );
+        assert!(
+            children
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::TaskSnapshot { .. }))
+        );
+        assert!(children.iter().all(|row| row.timestamp.is_none()));
+        assert_eq!(done_rows.last().unwrap().timestamp, Some(done.created_at));
+    }
+
+    fn write_file_part(
+        id: &str,
+        resolved: bool,
+        preview: Option<zeron_doc::FileChangePreview>,
+    ) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: None,
+            },
+            is_error: false,
+            resolved,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: preview,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }
+    }
+
+    fn two_line_write_preview() -> zeron_doc::FileChangePreview {
+        zeron_doc::FileChangePreview {
+            kind: zeron_doc::FileChangeKind::Write,
+            lines: vec![
+                zeron_doc::FileChangeLine {
+                    kind: zeron_doc::FileChangeLineKind::Added,
+                    text: "first".into(),
+                },
+                zeron_doc::FileChangeLine {
+                    kind: zeron_doc::FileChangeLineKind::Added,
+                    text: "second".into(),
+                },
+            ],
+            total_lines: 2,
+            additions: 2,
+            deletions: 0,
+            truncated_before: 0,
+        }
+    }
+
+    #[test]
+    fn file_change_projects_one_stable_specialized_row_across_live_refreshes() {
+        let first = assistant(
+            "file-change-live",
+            MessageStatus::Streaming,
+            vec![write_file_part(
+                "write-1",
+                false,
+                Some(two_line_write_preview()),
+            )],
+        );
+        let mut grown_preview = two_line_write_preview();
+        grown_preview.lines.push(zeron_doc::FileChangeLine {
+            kind: zeron_doc::FileChangeLineKind::Added,
+            text: "third".into(),
+        });
+        grown_preview.total_lines = 3;
+        grown_preview.additions = 3;
+        let second = assistant(
+            "file-change-live",
+            MessageStatus::Streaming,
+            vec![write_file_part("write-1", false, Some(grown_preview))],
+        );
+
+        let first_rows = rows_for_entry(&first, false, &mut parse);
+        let second_rows = rows_for_entry(&second, false, &mut parse);
+        assert_eq!(first_rows.len(), 1);
+        assert_eq!(second_rows.len(), 1);
+        assert_eq!(first_rows[0].id.as_ref(), "file-change-live#write-1");
+        assert_eq!(first_rows[0].id, second_rows[0].id);
+        assert_ne!(first_rows[0].version, second_rows[0].version);
+        assert!(matches!(
+            &second_rows[0].kind,
+            RowKind::FileChange { tool }
+                if tool.file_preview.as_ref().is_some_and(|preview| preview.total_lines == 3)
+        ));
+    }
+
+    #[test]
+    fn resolved_file_change_moves_inside_turn_steps_without_changing_identity() {
+        let live = assistant(
+            "file-change-turn",
+            MessageStatus::Streaming,
+            vec![write_file_part(
+                "write-1",
+                false,
+                Some(two_line_write_preview()),
+            )],
+        );
+        let done = assistant(
+            "file-change-turn",
+            MessageStatus::Complete,
+            vec![
+                write_file_part("write-1", true, Some(two_line_write_preview())),
+                text_part("answer", "Created the file."),
+            ],
+        );
+
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        assert!(matches!(live_rows[0].kind, RowKind::FileChange { .. }));
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+        let RowKind::TurnSteps { rows, .. } = &done_rows[0].kind else {
+            panic!("resolved file change should be folded with completed work")
+        };
+        assert_eq!(rows[0].id, live_rows[0].id);
+        assert!(matches!(rows[0].kind, RowKind::FileChange { .. }));
+    }
+
+    #[test]
+    fn path_only_write_does_not_invent_preview_lines() {
+        let entry = assistant(
+            "file-change-path-only",
+            MessageStatus::Streaming,
+            vec![write_file_part("write-1", false, None)],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::FileChange { tool } if tool.file_preview.is_none()
+        ));
+    }
+
+    #[test]
+    fn completed_path_only_write_keeps_the_file_card_without_inventing_a_body() {
+        let entry = assistant(
+            "legacy-file-change",
+            MessageStatus::Complete,
+            vec![write_file_part("write-1", true, None)],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::FileChange { tool } if tool.file_preview.is_none()
+        ));
+    }
+
+    #[test]
+    fn file_change_state_survives_inside_turn_steps_and_prunes_with_its_row() {
+        let entry = assistant(
+            "file-change-state",
+            MessageStatus::Complete,
+            vec![
+                write_file_part("write-1", true, Some(two_line_write_preview())),
+                text_part("answer", "Done."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let live = live_file_change_ids(&rows);
+        assert!(live.contains("file-change-state#write-1"));
+
+        let mut open = HashMap::from([
+            (SharedString::from("file-change-state#write-1"), true),
+            (SharedString::from("removed#write-2"), true),
+        ]);
+        open.retain(|id, _| live.contains(id));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open.get("file-change-state#write-1"), Some(&true));
+    }
+
+    #[test]
+    fn file_input_fetch_is_single_flight_cached_and_retryable() {
+        assert!(file_input_should_fetch(None));
+        assert!(file_input_should_fetch(Some(&FileInputLoad::Failed)));
+        let snapshot = zeron_proto::FileToolInputSnapshot {
+            path: "notes/new.txt".into(),
+            content: Some("body".into()),
+            old_string: None,
+            new_string: None,
+            truncated: false,
+        };
+        let preview =
+            crate::file_change::snapshot_preview(zeron_doc::FileChangeKind::Write, &snapshot)
+                .unwrap();
+        let ready = FileInputLoad::Ready(Arc::new(FileInputReady {
+            snapshot: Arc::new(snapshot),
+            preview: Arc::new(preview),
+            highlight: None,
+        }));
+        assert!(!file_input_should_fetch(Some(&ready)));
+    }
+
+    #[test]
+    fn filename_open_target_is_workspace_jailed_and_separate_from_fold_state() {
+        let target = file_open_target("chat", "/repo", "src/main.rs").unwrap();
+        assert_eq!(target.0, "chat");
+        assert_eq!(target.1, std::path::PathBuf::from("/repo"));
+        assert_eq!(target.2, "src/main.rs");
+        assert!(file_open_target("chat", "/repo", "/outside/secret.txt").is_none());
+    }
+
+    #[test]
+    fn assistant_turn_without_final_text_keeps_independent_rows() {
+        let entry = assistant(
+            "assistant-no-answer",
+            MessageStatus::Complete,
+            vec![
+                text_part("narration", "Inspecting."),
+                tool_part("read", "ls"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
+    }
+
+    #[test]
+    fn turn_step_disclosures_are_closed_by_default_and_independent() {
+        let mut state = HashMap::new();
+        assert!(!turn_steps_is_open(&state, "a#steps"));
+        toggle_turn_steps_state(&mut state, "a#steps".into());
+        assert!(turn_steps_is_open(&state, "a#steps"));
+        assert!(!turn_steps_is_open(&state, "b#steps"));
+        toggle_turn_steps_state(&mut state, "a#steps".into());
+        assert!(!turn_steps_is_open(&state, "a#steps"));
+    }
+
+    #[test]
+    fn turn_duration_matches_the_reference_thresholds() {
+        assert_eq!(format_turn_duration(850), "850ms");
+        assert_eq!(format_turn_duration(12_500), "12.5s");
+        assert_eq!(format_turn_duration(125_000), "2m 5s");
+        assert_eq!(turn_steps_duration_label(None), None);
+        assert_eq!(turn_steps_duration_label(Some(0)), None);
+        assert_eq!(
+            turn_steps_duration_label(Some(12_500)).as_deref(),
+            Some("12.5s")
+        );
+    }
+
+    #[test]
+    fn turn_steps_children_mount_only_when_open_and_keep_nested_fold_state() {
+        let entry = assistant(
+            "turn-steps-render",
+            MessageStatus::Complete,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Done."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("expected disclosure row");
+        };
+        assert!(visible_turn_step_children(false, children).is_empty());
+        assert_eq!(visible_turn_step_children(true, children).len(), 1);
+
+        let child_id = children[0].id.clone();
+        let mut nested_folds = HashMap::new();
+        nested_folds.insert(
+            child_id.clone(),
+            FoldState {
+                open: Some(true),
+                ..FoldState::default()
+            },
+        );
+        let mut outer = HashMap::new();
+        toggle_turn_steps_state(&mut outer, rows[0].id.clone());
+        toggle_turn_steps_state(&mut outer, rows[0].id.clone());
+        assert_eq!(nested_folds[&child_id].open, Some(true));
+        assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+    }
+
+    #[test]
+    fn turn_steps_invalidation_visits_composite_before_changed_child() {
+        let entry = assistant(
+            "assistant",
+            MessageStatus::Complete,
+            vec![
+                text_part("text", "Inspecting."),
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Done."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let ids = row_render_ids(&rows[0]);
+        assert_eq!(
+            ids,
+            vec![
+                SharedString::from("assistant#steps"),
+                SharedString::from("assistant#text.0"),
+                SharedString::from("assistant#g0"),
+            ]
+        );
+
+        let mut replacement = rows[0].clone();
+        let RowKind::TurnSteps { rows: children, .. } = &mut replacement.kind else {
+            unreachable!();
+        };
+        Arc::make_mut(children)[0].version ^= 1;
+        replacement.version ^= 1;
+        assert_eq!(replacement.id, rows[0].id);
+        assert_ne!(replacement.version, rows[0].version);
+        assert!(row_render_ids(&rows[0]).contains(&SharedString::from("assistant#text.0")));
+    }
+
+    #[test]
+    fn turn_steps_transition_keeps_id_while_prefix_and_duration_change() {
+        let first = assistant(
+            "assistant-transition",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Working."),
+            ],
+        );
+        let grown = assistant(
+            "assistant-transition",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "cat src/lib.rs"),
+                tool_part("check", "cargo check"),
+                text_part("answer", "Working."),
+            ],
+        );
+        let first_rows = rows_for_entry(&first, false, &mut parse);
+        let grown_rows = rows_for_entry(&grown, false, &mut parse);
+        assert_eq!(first_rows[0].id, grown_rows[0].id);
+        assert_ne!(first_rows[0].version, grown_rows[0].version);
+
+        let mut settled = grown.clone();
+        settled.status = Some(MessageStatus::Complete);
+        let settled_rows = rows_for_entry(&settled, false, &mut parse);
+        assert_eq!(settled_rows[0].id, grown_rows[0].id);
+        assert!(matches!(grown_rows[1].kind, RowKind::LiveMarkdown { .. }));
+        assert!(matches!(settled_rows[1].kind, RowKind::Markdown { .. }));
+
+        let mut timed = settled.clone();
+        timed.duration_ms = Some(12_500);
+        let timed_rows = rows_for_entry(&timed, false, &mut parse);
+        assert_eq!(timed_rows[0].id, settled_rows[0].id);
+        assert_ne!(timed_rows[0].version, settled_rows[0].version);
+        assert_ne!(
+            entry_fingerprint(&timed, false),
+            entry_fingerprint(&settled, false)
+        );
+    }
+
+    #[test]
+    fn turn_steps_transition_settles_folded_markdown_and_owns_no_timestamp() {
+        let entry = assistant(
+            "assistant-veil",
+            MessageStatus::Streaming,
+            vec![
+                text_part("narration", "Inspecting."),
+                tool_part("read", "cat src/lib.rs"),
+                text_part("answer", "Working."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("expected streaming disclosure");
+        };
+        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
+        assert!(children.iter().all(|child| child.timestamp.is_none()));
+        assert!(rows[0].timestamp.is_none());
+        assert!(rows[1].timestamp.is_none());
+    }
+
+    #[test]
+    fn turn_steps_state_prunes_removed_rows_and_keeps_consecutive_turns_independent() {
+        let first = assistant(
+            "assistant-a",
+            MessageStatus::Complete,
+            vec![tool_part("read", "ls"), text_part("answer", "A")],
+        );
+        let second = assistant(
+            "assistant-b",
+            MessageStatus::Complete,
+            vec![tool_part("read", "pwd"), text_part("answer", "B")],
+        );
+        let mut rows = rows_for_entry(&first, false, &mut parse);
+        rows.extend(rows_for_entry(&second, false, &mut parse));
+        let ids = live_turn_step_ids(&rows);
+        assert!(ids.contains("assistant-a#steps"));
+        assert!(ids.contains("assistant-b#steps"));
+
+        let mut state = HashMap::from([
+            (SharedString::from("assistant-a#steps"), true),
+            (SharedString::from("assistant-b#steps"), false),
+            (SharedString::from("stale#steps"), true),
+        ]);
+        prune_turn_steps_state(&mut state, &rows);
+        assert_eq!(state.len(), 2);
+        assert!(!state.contains_key("stale#steps"));
+
+        rows.retain(|row| row.entry_id.as_ref() == "assistant-b");
+        prune_turn_steps_state(&mut state, &rows);
+        assert_eq!(state.len(), 1);
+        assert!(state.contains_key("assistant-b#steps"));
+    }
+
+    #[test]
+    fn turn_steps_updates_do_not_rebuild_unrelated_rows_or_legacy_messages() {
+        let user = SessionMessageEntry {
+            id: "user".into(),
+            role: MessageRole::User,
+            parts: vec![text_part("prompt", "Hi")],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        };
+        let first = assistant(
+            "assistant-diff",
+            MessageStatus::Streaming,
+            vec![tool_part("read", "ls"), text_part("answer", "Working")],
+        );
+        let grown = assistant(
+            "assistant-diff",
+            MessageStatus::Streaming,
+            vec![
+                tool_part("read", "ls"),
+                tool_part("check", "pwd"),
+                text_part("answer", "Working"),
+            ],
+        );
+        let mut old = rows_for_entry(&user, false, &mut parse);
+        old.extend(rows_for_entry(&first, false, &mut parse));
+        let mut new = rows_for_entry(&user, false, &mut parse);
+        new.extend(rows_for_entry(&grown, false, &mut parse));
+        assert_eq!(diff_rows(&old, &new), Some((1..2, 1)));
+
+        let legacy = assistant(
+            "assistant-legacy",
+            MessageStatus::Complete,
+            vec![text_part("narration", "Inspecting"), tool_part("run", "ls")],
+        );
+        let legacy_rows = rows_for_entry(&legacy, false, &mut parse);
+        assert_eq!(
+            legacy_rows
+                .iter()
+                .map(|row| row.id.as_ref())
+                .collect::<Vec<_>>(),
+            ["assistant-legacy#narration.0", "assistant-legacy#g0"]
+        );
+        assert!(
+            legacy_rows
+                .iter()
+                .all(|row| !matches!(row.kind, RowKind::TurnSteps { .. }))
+        );
+    }
+
+    #[test]
+    fn workflow_activity_does_not_create_a_transcript_row() {
+        let entry = assistant(
+            "workflow-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::WorkflowTask {
+                id: "workflow-wf-1".into(),
+                task: zeron_proto::WorkflowTaskUpdate {
+                    task_id: "wf-1".into(),
+                    status: zeron_proto::WorkflowTaskStatus::Running,
+                    workflow_name: Some("Audit".into()),
+                    description: None,
+                    usage: None,
+                    progress: Vec::new(),
+                    agent_count: None,
+                    task_type: Some("local_workflow".into()),
+                    subagent_type: None,
+                },
+            }],
+        );
+
+        assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn workflow_activity_does_not_split_transcript_tool_groups() {
+        let workflow = MessagePart::WorkflowTask {
+            id: "workflow-wf-1".into(),
+            task: zeron_proto::WorkflowTaskUpdate {
+                task_id: "wf-1".into(),
+                status: zeron_proto::WorkflowTaskStatus::Running,
+                workflow_name: Some("Audit".into()),
+                description: None,
+                usage: None,
+                progress: Vec::new(),
+                agent_count: None,
+                task_type: Some("local_workflow".into()),
+                subagent_type: None,
+            },
+        };
+        let entry = assistant(
+            "workflow-between-tools",
+            MessageStatus::Complete,
+            vec![
+                tool_part("tool-1", "pwd"),
+                workflow,
+                tool_part("tool-2", "ls"),
+            ],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup { tools, .. } if tools.len() == 2
+        ));
+    }
+
+    #[test]
+    fn trailing_workflow_activity_keeps_last_tool_group_auto_open() {
+        let workflow = MessagePart::WorkflowTask {
+            id: "workflow-wf-1".into(),
+            task: zeron_proto::WorkflowTaskUpdate {
+                task_id: "wf-1".into(),
+                status: zeron_proto::WorkflowTaskStatus::Running,
+                workflow_name: Some("Audit".into()),
+                description: None,
+                usage: None,
+                progress: Vec::new(),
+                agent_count: None,
+                task_type: Some("local_workflow".into()),
+                subagent_type: None,
+            },
+        };
+        let entry = assistant(
+            "workflow-after-tool",
+            MessageStatus::Streaming,
+            vec![tool_part("tool-1", "pwd"), workflow],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup {
+                auto_open: true,
+                ..
+            }
+        ));
+    }
+
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
             id: id.into(),
@@ -2560,7 +9482,233 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
         }
+    }
+
+    #[test]
+    fn todo_snapshot_renders_outside_the_generic_tool_group() {
+        let entry = assistant(
+            "todo-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::Tool {
+                id: "todo-1".into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        zeron_proto::TodoItem {
+                            text: "Inspect state".into(),
+                            done: false,
+                        },
+                        zeron_proto::TodoItem {
+                            text: "Run gates".into(),
+                            done: false,
+                        },
+                    ],
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+        );
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            matches!(
+                &rows[0].kind,
+                RowKind::TaskSnapshot {
+                    items,
+                    created: true,
+                    resolved: true,
+                    is_error: false,
+                } if items.len() == 2
+            ),
+            "todo snapshot lost its dedicated inline card or payload"
+        );
+    }
+
+    #[test]
+    fn task_snapshot_title_reflects_lifecycle_and_progress() {
+        let pending = [
+            zeron_proto::TodoItem {
+                text: "Inspect state".into(),
+                done: false,
+            },
+            zeron_proto::TodoItem {
+                text: "Run gates".into(),
+                done: false,
+            },
+        ];
+        let created_pending = task_snapshot_items(&[], &pending, true);
+        assert_eq!(
+            task_snapshot_title(&created_pending, true, false, false),
+            "Updating tasks"
+        );
+        assert_eq!(
+            task_snapshot_title(&created_pending, true, true, false),
+            "Created 2 tasks"
+        );
+        let unchanged = task_snapshot_items(&pending, &pending, false);
+        assert_eq!(
+            task_snapshot_title(&unchanged, false, true, false),
+            "Updated tasks"
+        );
+
+        let updated = [
+            zeron_proto::TodoItem {
+                text: "Inspect state".into(),
+                done: true,
+            },
+            zeron_proto::TodoItem {
+                text: "Run gates".into(),
+                done: false,
+            },
+        ];
+        let update_rows = task_snapshot_items(&pending, &updated, false);
+        assert_eq!(
+            task_snapshot_title(&update_rows, false, true, false),
+            "2 task updates"
+        );
+        assert_eq!(
+            task_snapshot_title(&update_rows, false, true, true),
+            "Todo update failed"
+        );
+    }
+
+    #[test]
+    fn prior_snapshot_marks_pending_append_as_an_update() {
+        let previous = vec![zeron_proto::TodoItem {
+            text: "Inspect state".into(),
+            done: false,
+        }];
+        let entry = assistant(
+            "todo-append-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::Tool {
+                id: "todo-append".into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        previous[0].clone(),
+                        zeron_proto::TodoItem {
+                            text: "Run gates".into(),
+                            done: false,
+                        },
+                    ],
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+        );
+
+        let rows = rows_for_entry_with_todo_history(&entry, false, &previous, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::TaskSnapshot { created: false, .. }
+        ));
+    }
+
+    #[test]
+    fn updated_snapshot_card_contains_only_changed_tasks() {
+        let make_items = |completed: usize| {
+            (1..=7)
+                .map(|index| zeron_proto::TodoItem {
+                    text: format!("Task {index}"),
+                    done: index <= completed,
+                })
+                .collect::<Vec<_>>()
+        };
+        let previous = make_items(2);
+        let entry = assistant(
+            "todo-progress-entry",
+            MessageStatus::Complete,
+            vec![MessagePart::Tool {
+                id: "todo-progress".into(),
+                call: ToolCall::Todo {
+                    items: make_items(3),
+                },
+                is_error: false,
+                resolved: true,
+                execution: None,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+        );
+
+        let rows = rows_for_entry_with_todo_history(&entry, false, &previous, &mut parse);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::TaskSnapshot {
+                items,
+                created: false,
+                ..
+            } if items.len() == 2
+                && items[0].text == "Task 3" && items[0].done
+                && items[0].change == Some(TaskChange::Completed)
+                && items[1].text == "Task 4" && !items[1].done
+                && items[1].current
+                && items[1].change == Some(TaskChange::Started)
+        ));
+    }
+
+    #[test]
+    fn todo_snapshot_version_delimits_item_boundaries() {
+        let split = vec![
+            zeron_proto::TodoItem {
+                text: "a".into(),
+                done: false,
+            },
+            zeron_proto::TodoItem {
+                text: "b".into(),
+                done: false,
+            },
+        ];
+        let joined = vec![zeron_proto::TodoItem {
+            text: "a\0b".into(),
+            done: false,
+        }];
+        assert_ne!(
+            todo_snapshot_version(&[], &split, true, false, false),
+            todo_snapshot_version(&[], &joined, true, false, false)
+        );
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
@@ -2615,6 +9763,124 @@ mod tests {
     }
 
     #[test]
+    fn assistant_image_references_add_one_stable_deduplicated_gallery_row() {
+        let text = "Rendered ![chart](artifacts/chart.png). Same: artifacts/chart.png";
+        let live = assistant(
+            "media",
+            MessageStatus::Streaming,
+            vec![text_part("t0", text)],
+        );
+        let done = assistant(
+            "media",
+            MessageStatus::Complete,
+            vec![text_part("t0", text)],
+        );
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+
+        assert_eq!(live_rows.len(), 2);
+        assert_eq!(done_rows.len(), 2);
+        assert_eq!(live_rows[1].id, done_rows[1].id);
+        assert!(matches!(
+            &done_rows[1].kind,
+            RowKind::InlineImages { paths }
+                if paths.as_slice() == ["artifacts/chart.png"]
+        ));
+        assert_eq!(top_gap_for(Some(&done_rows[0]), &done_rows[1]), 0.0);
+        assert!(done_rows[0].timestamp.is_some());
+        assert!(done_rows[1].timestamp.is_none());
+    }
+
+    #[test]
+    fn assistant_image_tool_outputs_add_a_gallery_after_the_tool_group() {
+        let mut tool = tool_part("render", "python render.py");
+        let MessagePart::Tool { output, .. } = &mut tool else {
+            unreachable!();
+        };
+        *output = Some("saved artifacts/final.webp".into());
+        let entry = assistant("tool-media", MessageStatus::Complete, vec![tool]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::InlineImages { paths }
+                if paths.as_slice() == ["artifacts/final.webp"]
+        ));
+    }
+
+    #[test]
+    fn assistant_image_read_tool_adds_a_gallery_without_output_text() {
+        let tool = MessagePart::Tool {
+            id: "read-image".into(),
+            call: ToolCall::ReadFile {
+                path: "artifacts/screenshot.png".into(),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let entry = assistant("read-media", MessageStatus::Complete, vec![tool]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::InlineImages { paths }
+                if paths.as_slice() == ["artifacts/screenshot.png"]
+        ));
+    }
+
+    #[test]
+    fn mermaid_blocks_render_only_after_the_markdown_row_settles() {
+        let mermaid = Block::CodeBlock {
+            language: Some("mermaid".into()),
+            code: "flowchart LR\nA --> B".into(),
+        };
+        let alias = Block::CodeBlock {
+            language: Some("mmd".into()),
+            code: "flowchart TD\nA --> B".into(),
+        };
+        let rust = Block::CodeBlock {
+            language: Some("rust".into()),
+            code: "fn main() {}".into(),
+        };
+
+        assert!(should_render_mermaid(&mermaid, false));
+        assert!(should_render_mermaid(&alias, false));
+        assert!(!should_render_mermaid(&mermaid, true));
+        assert!(!should_render_mermaid(&rust, false));
+    }
+
+    #[test]
+    fn inline_media_admission_bounds_inflight_and_total_work() {
+        assert!(media_task_admitted(3, 20, 4, 32));
+        assert!(!media_task_admitted(4, 20, 4, 32));
+        assert!(!media_task_admitted(1, 32, 4, 32));
+    }
+
+    #[test]
+    fn validated_media_metadata_evicts_the_oldest_compact_key() {
+        let mut cache = HashMap::new();
+        remember_validated(&mut cache, 11, 1, 2);
+        remember_validated(&mut cache, 22, 2, 2);
+        remember_validated(&mut cache, 33, 3, 2);
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key(&11));
+        assert!(cache.contains_key(&22) && cache.contains_key(&33));
+    }
+
+    #[test]
     fn split_sibling_gaps_match_live_internal_spacing() {
         // The live row spaces its internal blocks by MD_BLOCK_GAP; after the
         // live→split handoff the same boundaries are inter-row gaps. They must
@@ -2629,14 +9895,26 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&done, false, &mut parse);
-        // Rows: t0.0, t0.1, t0.2 (three MD blocks), g0, t1.0.
-        assert_eq!(rows.len(), 5);
+        // The completed operational prefix is projected into TurnSteps while
+        // the final answer remains top-level.
+        assert_eq!(rows.len(), 2);
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("expected completed prefix disclosure");
+        };
+        assert_eq!(children.len(), 4);
         // Sibling markdown blocks from the same part: md block gap.
-        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
-        assert_eq!(top_gap_for(Some(&rows[1]), &rows[2]), render::MD_BLOCK_GAP);
-        // Markdown → tool group and tool group → next part: block gap.
-        assert_eq!(top_gap_for(Some(&rows[2]), &rows[3]), GAP_BLOCK);
-        assert_eq!(top_gap_for(Some(&rows[3]), &rows[4]), GAP_BLOCK);
+        assert_eq!(
+            top_gap_for(Some(&children[0]), &children[1]),
+            render::MD_BLOCK_GAP
+        );
+        assert_eq!(
+            top_gap_for(Some(&children[1]), &children[2]),
+            render::MD_BLOCK_GAP
+        );
+        // Markdown → tool group inside the disclosure and disclosure → final
+        // answer retain the ordinary block gap.
+        assert_eq!(top_gap_for(Some(&children[2]), &children[3]), GAP_BLOCK);
+        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), GAP_BLOCK);
         // Turn starts get the turn gap regardless.
         assert_eq!(top_gap_for(None, &rows[0]), GAP_TURN);
     }
@@ -2664,34 +9942,207 @@ mod tests {
         assert!(rows[0].turn_start && !rows[1].turn_start);
     }
 
+    fn agent_part(id: &str, description: &str) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: format!("Agent: {description}"),
+                input: Some(serde_json::json!({ "description": description })),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: Some(format!("chat--sub--{id}")),
+            subagent_status: Some(SubagentStatus::Running),
+            subagent_tail: None,
+        }
+    }
+
     #[test]
-    fn trailing_group_auto_opens_only_while_streaming() {
+    fn agent_calls_split_out_of_ordinary_tool_groups() {
+        // Agent/spawn chips must not share a collapse with Reads/Runs: a
+        // lone Agent used to hide behind "Called 1 tool", and a mixed
+        // group hid the running subagent until the user opened the fold.
+        let entry = assistant(
+            "m-agent",
+            MessageStatus::Complete,
+            vec![
+                text_part("t0", "before"),
+                tool_part("a", "ls"),
+                tool_part("b", "pwd"),
+                agent_part("s1", "Map URL import ingest path"),
+                tool_part("c", "make"),
+                agent_part("s2", "Audit the fold path"),
+                agent_part("s3", "Verify the commit cadence"),
+                text_part("t1", "after"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            [
+                "m-agent#t0.0",
+                "m-agent#g0",
+                "m-agent#g1",
+                "m-agent#g2",
+                "m-agent#g3",
+                "m-agent#t1.0",
+            ]
+        );
+
+        let RowKind::ToolGroup {
+            tools, auto_open, ..
+        } = &rows[1].kind
+        else {
+            panic!("ordinary group expected")
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(tool_group_collapses(tools));
+        assert!(!*auto_open);
+
+        let RowKind::ToolGroup { tools, .. } = &rows[2].kind else {
+            panic!("agent group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(!tool_group_collapses(tools));
+        assert!(is_agent_tool(&tools[0]));
+
+        let RowKind::ToolGroup { tools, .. } = &rows[3].kind else {
+            panic!("ordinary group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(tool_group_collapses(tools));
+
+        let RowKind::ToolGroup { tools, .. } = &rows[4].kind else {
+            panic!("consecutive agents share a group")
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(!tool_group_collapses(tools));
+        assert!(tools.iter().all(is_agent_tool));
+    }
+
+    #[test]
+    fn lone_completed_agent_stays_uncollapsed() {
+        let entry = assistant(
+            "m-lone",
+            MessageStatus::Complete,
+            vec![agent_part("s1", "scan repo")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        let RowKind::ToolGroup {
+            tools, auto_open, ..
+        } = &rows[0].kind
+        else {
+            panic!("agent group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(!tool_group_collapses(tools), "no 'Called 1 tool' wrap");
+        assert!(
+            !*auto_open,
+            "auto_open is a streaming flag; agent rows ignore it at paint"
+        );
+    }
+
+    #[test]
+    fn pre_spawn_agent_name_is_enough_to_split() {
+        // Before the engine stamps subagent_ref the chip is already named
+        // "Agent: …" — that genus must split, or the spawn hides until the
+        // first tagged event.
+        let mut part = agent_part("s1", "scan repo");
+        if let MessagePart::Tool {
+            subagent_ref,
+            subagent_status,
+            ..
+        } = &mut part
+        {
+            *subagent_ref = None;
+            *subagent_status = None;
+        }
+        let entry = assistant(
+            "m-pre",
+            MessageStatus::Complete,
+            vec![tool_part("a", "ls"), part],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!()
+        };
+        assert!(tool_group_collapses(tools));
+        let RowKind::ToolGroup { tools, .. } = &rows[1].kind else {
+            panic!()
+        };
+        assert!(!tool_group_collapses(tools));
+        assert!(is_agent_call(&tools[0].call));
+    }
+
+    #[test]
+    fn active_tail_and_turn_steps_tool_groups_show_cards_without_opening_details() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[1].kind else {
+        let RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } = rows[1].kind
+        else {
             panic!()
         };
-        assert!(auto_open, "trailing group opens while streaming");
+        assert!(auto_open, "tool group opens while streaming");
+        assert!(
+            detail_auto_open,
+            "current tool detail keeps its old default"
+        );
 
         let complete = assistant("m3", MessageStatus::Complete, parts);
         let rows = rows_for_entry(&complete, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[1].kind else {
+        let RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } = rows[1].kind
+        else {
             panic!()
         };
         assert!(!auto_open);
+        assert!(!detail_auto_open);
 
-        // A non-trailing group never auto-opens.
+        // Earlier groups in the active streaming turn stay open too.
         let mid = assistant(
             "m4",
             MessageStatus::Streaming,
             vec![tool_part("a", "ls"), text_part("t0", "hi")],
         );
         let rows = rows_for_entry(&mid, false, &mut parse);
-        let RowKind::ToolGroup { auto_open, .. } = rows[0].kind else {
+        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
+            panic!("completed prefix should be folded");
+        };
+        let RowKind::ToolGroup {
+            auto_open,
+            detail_auto_open,
+            ..
+        } = children[0].kind
+        else {
             panic!()
         };
-        assert!(!auto_open);
+        assert!(
+            auto_open,
+            "completed prefix tool cards remain visible inside TurnSteps"
+        );
+        assert!(
+            !detail_auto_open,
+            "completed prefix command output remains collapsed by default"
+        );
     }
 
     #[test]
@@ -2749,13 +10200,75 @@ mod tests {
         assert_eq!(attachments.len(), 1);
     }
 
+    #[test]
+    fn user_message_overflow_uses_the_measured_content_height() {
+        let content_limit = USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0;
+        assert!(!user_message_overflows(content_limit));
+        assert!(user_message_overflows(content_limit + 0.5));
+    }
+
+    #[test]
+    fn image_only_user_messages_receive_the_reference_summary() {
+        assert_eq!(user_message_attachment_summary(0), None);
+        assert_eq!(
+            user_message_attachment_summary(1).as_deref(),
+            Some("Using image")
+        );
+        assert_eq!(
+            user_message_attachment_summary(3).as_deref(),
+            Some("Using 3 images"),
+        );
+    }
+
+    #[test]
+    fn user_message_preview_preserves_text_and_mentions() {
+        let mentions = Arc::new(vec![crate::composer::SentMentionSpan {
+            range: 0..7,
+            path: "src/lib.rs".into(),
+            is_dir: false,
+        }]);
+        let preview = user_message_preview("row-1".into(), "src/lib".into(), mentions.clone());
+        assert_eq!(preview.row_id, "row-1");
+        assert_eq!(preview.text, "src/lib");
+        assert_eq!(preview.mentions, mentions);
+    }
+
+    #[test]
+    fn full_message_dialog_respects_the_reference_viewport_cap() {
+        let viewport = gpui::size(px(1200.0), px(800.0));
+        let (max_width, max_height) = full_message_dialog_limits(viewport);
+        assert_eq!(max_width, px(672.0));
+        assert_eq!(max_height, px(640.0));
+    }
+
+    #[test]
+    fn user_message_card_matches_the_composer_background() {
+        let theme = Theme::dark();
+        assert_eq!(user_message_card_background(&theme), theme.input_glass_bg());
+    }
+
+    #[test]
+    fn sticky_turn_occludes_scrolling_text_only_inside_the_user_card_shape() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let surface = sticky_turn_surface(&theme);
+            assert_eq!(surface.outer_background, None);
+            if theme.is_frost() {
+                assert_eq!(surface.occlusion_background, None);
+            } else {
+                assert_eq!(surface.occlusion_background, Some(theme.bg));
+            }
+            assert_eq!(surface.occlusion_radius, USER_MESSAGE_CARD_RADIUS);
+            assert_eq!(surface.occlusion_blur_radius, 16.0);
+        }
+    }
+
     /// A sent prompt's file mentions render as chips in the transcript: the
     /// row carries the projected display text plus spans, while ordinary
     /// prompts keep the empty-spans fast path. The row version derives from
     /// the RAW text either way, so projection never perturbs the diff key.
     #[test]
     fn user_rows_project_file_mentions_into_chips() {
-        let raw = "look at [composer.rs](comet-file:crates/ui/src/composer.rs) please";
+        let raw = "look at [composer.rs](zeron-file:crates/ui/src/composer.rs) please";
         let mut entry = assistant("u3", MessageStatus::Complete, vec![]);
         entry.role = MessageRole::User;
         entry.status = None;
@@ -2765,7 +10278,7 @@ mod tests {
             panic!("expected a user row");
         };
         assert!(
-            !text.contains("comet-file:"),
+            !text.contains("zeron-file:"),
             "raw link left visible: {text}"
         );
         assert!(text.contains("composer.rs"));
@@ -2828,13 +10341,106 @@ mod tests {
     }
 
     #[test]
+    fn tool_diff_builds_real_hunks_with_context_and_numbers() {
+        use crate::changes::LineKind;
+        let old = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        let mut new = old.clone();
+        new[9] = "LINE 10".into();
+        let diff = zeron_proto::ToolDiff {
+            path: "/w/a.rs".into(),
+            old_text: Some(old.join("\n") + "\n"),
+            new_text: new.join("\n") + "\n",
+        };
+        let Some(ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        }) = tool_detail(None, Some(&diff), None)
+        else {
+            panic!("expected diff detail");
+        };
+        // One hunk: the change plus 3 context lines each side, real numbers.
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        assert_eq!(hunk.header, "@@ -7,7 +7,7 @@");
+        assert_eq!(hunk.lines.len(), 8); // 6 context + 1 del + 1 add
+        let del = hunk
+            .lines
+            .iter()
+            .find(|l| l.kind == LineKind::Del)
+            .expect("del line");
+        assert_eq!(del.old_no, Some(10));
+        assert_eq!(del.new_no, None);
+        assert_eq!(del.text, "line 10");
+        let add = hunk
+            .lines
+            .iter()
+            .find(|l| l.kind == LineKind::Add)
+            .expect("add line");
+        assert_eq!(add.new_no, Some(10));
+        assert_eq!(add.text, "LINE 10");
+        assert_eq!((file.additions, file.deletions), (1, 1));
+        assert_eq!(old_text.as_deref(), diff.old_text.as_deref());
+        assert_eq!(new_text.as_deref(), Some(diff.new_text.as_str()));
+        // New files carry Added status (and no old numbers).
+        let created = zeron_proto::ToolDiff {
+            path: "/w/new.txt".into(),
+            old_text: None,
+            new_text: "only\n".into(),
+        };
+        let Some(ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        }) = tool_detail(None, Some(&created), None)
+        else {
+            panic!("expected diff detail");
+        };
+        assert_eq!(file.status, crate::changes::FileStatus::Added);
+        assert!(old_text.is_none());
+        assert_eq!(new_text.as_deref(), Some("only\n"));
+
+        // Output: verbatim lines (indentation intact), counted-tail cap.
+        let output = (0..40)
+            .map(|i| format!("    indented {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = tool_detail(Some(&output), None, None)
+        else {
+            panic!("expected output detail");
+        };
+        assert_eq!(lines.len(), OUTPUT_DETAIL_MAX_LINES);
+        assert_eq!(truncated_by, 40 - OUTPUT_DETAIL_MAX_LINES);
+        assert_eq!(lines[0].as_ref(), "    indented 0");
+
+        // Nothing → no affordance.
+        assert!(tool_detail(None, None, None).is_none());
+        assert!(tool_detail(Some("\n\n"), None, None).is_none());
+    }
+
+    #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
+            id: format!("exec-{c}").into(),
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
+            execution: None,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
         };
         let edit = |p: &str| ToolItem {
+            id: format!("edit-{p}").into(),
             call: ToolCall::EditFile {
                 path: p.into(),
                 old_string: None,
@@ -2842,6 +10448,16 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            execution: None,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
         };
         let tools = vec![
             exec("ls"),
@@ -2864,24 +10480,233 @@ mod tests {
         // Reads / searches / misc.
         let tools = vec![
             ToolItem {
+                id: "read-x".into(),
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
+                execution: None,
+                detail: None,
+                invocation: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             },
             ToolItem {
+                id: "glob-rs".into(),
                 call: ToolCall::Glob {
                     pattern: "*.rs".into(),
                 },
                 is_error: false,
                 resolved: true,
+                execution: None,
+                detail: None,
+                invocation: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             },
             ToolItem {
+                id: "web-q".into(),
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
+                execution: None,
+                detail: None,
+                invocation: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
+    }
+
+    #[test]
+    fn active_command_details_open_only_for_the_live_tail() {
+        let exec = ToolCall::Exec {
+            command: "cargo test".into(),
+        };
+        let edit = ToolCall::EditFile {
+            path: "src/lib.rs".into(),
+            old_string: None,
+            new_string: None,
+        };
+        let read = ToolCall::ReadFile {
+            path: "src/lib.rs".into(),
+        };
+        let patch = ToolCall::ApplyPatch { path: None };
+
+        assert!(tool_detail_default_open(&exec, false, true, true));
+        assert!(tool_detail_default_open(&exec, true, true, true));
+        assert!(tool_detail_default_open(&edit, false, true, false));
+        assert!(tool_detail_default_open(&patch, false, true, false));
+        assert!(!tool_detail_default_open(&exec, true, false, true));
+        assert!(!tool_detail_default_open(&read, false, true, true));
+    }
+
+    #[test]
+    fn command_header_state_uses_resolution_and_error_truth() {
+        assert_eq!(
+            tool_header_state(false, false, true),
+            ToolHeaderState::Pending
+        );
+        assert_eq!(
+            tool_header_state(true, false, true),
+            ToolHeaderState::Success
+        );
+        assert_eq!(tool_header_state(true, true, true), ToolHeaderState::Failed);
+        assert_eq!(
+            tool_header_state(true, false, false),
+            ToolHeaderState::Quiet
+        );
+        assert_eq!(tool_header_state(true, true, false), ToolHeaderState::Quiet);
+    }
+
+    #[test]
+    fn command_duration_formats_compactly_for_the_status_trail() {
+        assert_eq!(format_execution_duration(80), "0.1s");
+        assert_eq!(format_execution_duration(4_868), "4.9s");
+        assert_eq!(format_execution_duration(65_000), "1m 05s");
+    }
+
+    #[test]
+    fn reasoning_rows_keep_identity_across_live_to_settled_transition() {
+        let live = assistant(
+            "m-reasoning",
+            MessageStatus::Streaming,
+            vec![MessagePart::Reasoning {
+                id: "r0".into(),
+                text: "checking the result".into(),
+                completed: false,
+                duration_ms: None,
+            }],
+        );
+        let settled = assistant(
+            "m-reasoning",
+            MessageStatus::Complete,
+            vec![MessagePart::Reasoning {
+                id: "r0".into(),
+                text: "checking the result".into(),
+                completed: true,
+                duration_ms: Some(4_100),
+            }],
+        );
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        let settled_rows = rows_for_entry(&settled, false, &mut parse);
+        assert_eq!(live_rows.len(), 1);
+        assert_eq!(settled_rows.len(), 1);
+        assert_eq!(live_rows[0].id, settled_rows[0].id);
+        assert_ne!(live_rows[0].version, settled_rows[0].version);
+        assert!(matches!(
+            &live_rows[0].kind,
+            RowKind::Reasoning { active: true, .. }
+        ));
+        assert!(matches!(
+            &settled_rows[0].kind,
+            RowKind::Reasoning {
+                active: false,
+                duration_ms: Some(4_100),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_reasoning_creates_no_transcript_row() {
+        let entry = assistant(
+            "m-empty-reasoning",
+            MessageStatus::Streaming,
+            vec![MessagePart::Reasoning {
+                id: "r0".into(),
+                text: String::new(),
+                completed: false,
+                duration_ms: None,
+            }],
+        );
+        assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn thought_duration_uses_honest_measured_seconds() {
+        assert_eq!(format_thought_duration(Some(900)), None);
+        assert_eq!(
+            format_thought_duration(Some(4_100)).as_deref(),
+            Some("Thought for 4 seconds")
+        );
+        assert_eq!(
+            format_thought_duration(Some(65_000)).as_deref(),
+            Some("Thought for 1 minute 5 seconds")
+        );
+        assert_eq!(format_thought_duration(None), None);
+    }
+
+    #[test]
+    fn live_reasoning_elapsed_uses_tenths_then_minutes() {
+        assert_eq!(format_reasoning_elapsed(0), "0.0s");
+        assert_eq!(format_reasoning_elapsed(4_100), "4.1s");
+        assert_eq!(format_reasoning_elapsed(65_000), "1m 05s");
+    }
+
+    #[test]
+    fn subagent_tab_titles() {
+        // The tab is the BARE task — the "Agent:" genus is stripped.
+        let named = ToolCall::Unknown {
+            name: "Agent: scan repo".into(),
+            input: None,
+        };
+        assert_eq!(subagent_tab_title(&named).as_ref(), "scan repo");
+        // A bare "Task"/"Agent" digs the description out of the call input
+        // (which sheds any genus of its own).
+        let bare = ToolCall::Unknown {
+            name: "Task".into(),
+            input: Some(serde_json::json!({
+                "description": "Agent: audit the auth flow",
+                "prompt": "very long instructions…",
+            })),
+        };
+        assert_eq!(subagent_tab_title(&bare).as_ref(), "audit the auth flow");
+        // Word boundaries only — a name that merely STARTS with the genus
+        // keeps itself.
+        let compound = ToolCall::Unknown {
+            name: "Taskmaster".into(),
+            input: None,
+        };
+        assert_eq!(subagent_tab_title(&compound).as_ref(), "Taskmaster");
+        // Nothing to derive → the generic label.
+        let blank = ToolCall::Unknown {
+            name: "agent".into(),
+            input: None,
+        };
+        assert_eq!(subagent_tab_title(&blank).as_ref(), "Subagent");
+        // Absurd lengths cap with an ellipsis; multiline prompts keep only
+        // their first line.
+        let long = ToolCall::Unknown {
+            name: "x".repeat(120),
+            input: None,
+        };
+        let title = subagent_tab_title(&long);
+        assert_eq!(title.chars().count(), SUBAGENT_TITLE_MAX + 1);
+        assert!(title.ends_with('…'));
+        // Non-spawn-shaped calls stay generic.
+        assert_eq!(
+            subagent_tab_title(&ToolCall::Exec {
+                command: "ls".into()
+            })
+            .as_ref(),
+            "Subagent"
+        );
     }
 
     #[test]
@@ -2913,11 +10738,11 @@ mod tests {
         );
         let todo = ToolCall::Todo {
             items: vec![
-                comet_proto::TodoItem {
+                zeron_proto::TodoItem {
                     text: "a".into(),
                     done: true,
                 },
-                comet_proto::TodoItem {
+                zeron_proto::TodoItem {
                     text: "b".into(),
                     done: false,
                 },
@@ -2947,6 +10772,83 @@ mod tests {
     }
 
     #[test]
+    fn call_block_carries_the_full_invocation() {
+        // Multi-line command: verbatim lines, not the flattened chip line.
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = call_block(&ToolCall::Exec {
+            command: "set -e\ncargo test".into(),
+        })
+        else {
+            panic!("expected an output block")
+        };
+        assert_eq!(truncated_by, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["set -e", "cargo test"]
+        );
+
+        // A long single-line command soft-wraps instead of ellipsizing.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Exec {
+            command: "x".repeat(CALL_WRAP_COLS * 2 + 10),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.chars().count() <= CALL_WRAP_COLS));
+
+        // MCP input pretty-prints under the `server · tool` line.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Mcp {
+            server: "gh".into(),
+            tool: "issues".into(),
+            input: Some(serde_json::json!({"repo": "zeron"})),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines[0].as_ref(), "gh · issues");
+        assert!(lines.iter().any(|l| l.contains("\"repo\": \"zeron\"")));
+
+        assert!(
+            call_block(&ToolCall::Mcp {
+                server: "comet-workers".into(),
+                tool: "launch_worker".into(),
+                input: None,
+            })
+            .is_none(),
+            "the chip header already names an MCP call with no visible input"
+        );
+
+        // Todos list one item per line with checkbox state.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
+            items: vec![
+                zeron_proto::TodoItem {
+                    text: "a".into(),
+                    done: true,
+                },
+                zeron_proto::TodoItem {
+                    text: "b".into(),
+                    done: false,
+                },
+            ],
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["[x] a", "[ ] b"]
+        );
+
+        // Blank invocation → no block; the chip stays a plain card.
+        assert!(
+            call_block(&ToolCall::Exec {
+                command: "  \n ".into()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
     fn timestamp_strip_lands_on_the_last_settled_row() {
         use chrono::FixedOffset;
         // Fixed zone (UTC−4): "Jul 1, 3:45 PM" — the exact formatTimestamp
@@ -2965,6 +10867,7 @@ mod tests {
             created_at: ms,
             device_id: "dev".into(),
             status: None,
+            duration_ms: None,
             continuation_of: None,
         };
         let rows = rows_for_entry(&user, true, &mut parse);
@@ -3023,6 +10926,23 @@ mod tests {
         assert_eq!(format_elapsed(59), "59s");
         assert_eq!(format_elapsed(92), "1m 32s");
         assert_eq!(format_elapsed(-5), "0s");
+    }
+
+    #[test]
+    fn sending_bridge_holds_until_the_turn_outdates_the_send() {
+        let send = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let before = send - chrono::Duration::seconds(90);
+        let after = send + chrono::Duration::seconds(2);
+        // In flight, row still on the previous turn (or no row yet).
+        assert!(sending_bridge(Some(send), Some(before)));
+        assert!(sending_bridge(Some(send), None));
+        // The turn started after the send fired — timer takes over.
+        assert!(!sending_bridge(Some(send), Some(after)));
+        // No send in flight: never a bridge, whatever the row says.
+        assert!(!sending_bridge(None, Some(before)));
+        assert!(!sending_bridge(None, None));
     }
 
     #[test]

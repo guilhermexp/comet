@@ -16,6 +16,7 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 - Steering é mailbox: comando chega enquanto o run está vivo e é entregue no ponto de corte; sem run vivo, vira o próximo turno.
 - Resolução de ambiente de shell (`shell_env_resolution.rs`) existe porque o agente herda o ambiente errado quando invocado fora de um shell de login — mudanças aqui quebram o spawn em máquinas reais sem quebrar teste.
 - Fixtures de transcript vivem em `tests/fixtures/` — é o que fixa o parse de stream-json contra mudança de formato do vendor.
+- Write/Edit progressivos emitem `ToolCallPreview` transitório com o mesmo id: o parser consome cada chunk uma vez, retém tail de 8 KiB e coalesce refresh a cada 16 KiB; só o `ToolCall` autoritativo posterior carrega input completo.
 
 ## Work Guidance
 

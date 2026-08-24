@@ -1,5 +1,5 @@
 //! UI settings persisted to a small JSON file in the data dir — pane widths and
-//! collapse flags (comet persisted the same set in localStorage).
+//! collapse flags (zeron persisted the same set in localStorage).
 //!
 //! Loaded once at boot; saved debounced by the shell ([`SAVE_DEBOUNCE_MS`]).
 //! Corrupt or missing files fall back to defaults; loaded values are clamped so a
@@ -15,6 +15,8 @@ pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
+pub mod harnesses;
+pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
 
@@ -23,10 +25,26 @@ pub const SIDEBAR_MIN: f32 = 208.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
-/// Shared right utility pane drag-resize bounds (px).
+/// Shared right utility pane drag-resize floor and default (px). Its runtime
+/// maximum is the window space remaining after the left sidebar and the
+/// conversation's [`CHAT_PANEL_MIN`] reservation.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
-pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+/// Minimum width retained for the conversation when the right pane is open.
+pub const CHAT_PANEL_MIN: f32 = 300.0;
+
+/// Unified Details / Files sidebar bounds (Orchestrator.dev parity).
+pub const DETAILS_SIDEBAR_MIN: f32 = 300.0;
+pub const DETAILS_SIDEBAR_MAX: f32 = 700.0;
+pub const DETAILS_SIDEBAR_DEFAULT: f32 = 500.0;
+
+/// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
+/// viewport-relative cap applies at runtime; the absolute cap here only heals
+/// hand-edited files.
+pub const TERMINAL_MIN_HEIGHT: f32 = 160.0;
+pub const TERMINAL_MAX_VH: f32 = 0.55;
+pub const TERMINAL_ABS_MAX_HEIGHT: f32 = 2000.0;
+pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
@@ -41,25 +59,50 @@ pub struct UiSettings {
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
     /// folder inherently). Kept for file compatibility; no longer read.
     pub sidebar_grouped: bool,
-    /// The last selected space — restored on boot when the row still exists.
+    /// The last selected space — restored on boot when the row still exists;
+    /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
-    /// Manual session-tab order per space (drag-reorder; device-local).
-    /// Missing chats are skipped; new chats append in creation order.
+    /// Open session tabs in visual order (drag-reorder edits in place).
+    /// Device-local: a tab is a local viewport onto the synced session list —
+    /// closing one never archives the session. Ids of archived/deleted chats
+    /// are pruned against the doc ([`Shell::sync_open_tabs`]). `None` = file
+    /// written by a pre-tabs build; seeded once from the last space's sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_tabs: Option<Vec<String>>,
+    /// Sidebar session filter: a space id, or `None` for "All spaces".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_filter: Option<String>,
+    /// Legacy: per-space tab order, from when tabs were the selected space's
+    /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tab_order: std::collections::HashMap<String, Vec<String>>,
-    /// Manual sidebar space order (drag-reorder; device-local). Missing spaces
-    /// are skipped; new spaces append in creation order.
+    /// Legacy: manual sidebar space order, from when spaces were a sidebar
+    /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
+    /// Session notification chimes (done / awaiting-input). `ZERON_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// Desktop banner notifications on the same transitions.
+    /// `ZERON_DISABLE_NOTIFICATIONS` overrides.
+    pub notifications_enabled: bool,
+    /// Suppress the banner while a Zeron window is focused (the chime covers
+    /// the foreground case).
+    pub notifications_background_only: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
-    /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
+    /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
     pub right_pane_open: bool,
+    pub details_sidebar_width: f32,
+    pub details_sidebar_open: bool,
+    pub details_sidebar_preferences: crate::details_sidebar::view::DetailsSidebarPreferences,
+    #[serde(skip_serializing)]
+    pub terminal_height: f32,
+    /// Legacy — see [`Self::right_pane_open`].
+    #[serde(skip_serializing)]
+    pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
@@ -73,11 +116,21 @@ impl Default for UiSettings {
             sidebar_collapsed: false,
             sidebar_grouped: false,
             last_space_id: None,
+            open_tabs: None,
+            space_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
+            notifications_enabled: true,
+            notifications_background_only: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
+            details_sidebar_width: DETAILS_SIDEBAR_DEFAULT,
+            details_sidebar_open: false,
+            details_sidebar_preferences:
+                crate::details_sidebar::view::DetailsSidebarPreferences::default(),
+            terminal_height: TERMINAL_DEFAULT_HEIGHT,
+            terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
         }
@@ -94,21 +147,24 @@ pub enum ShortcutId {
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
+    NewSession,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 3] = [
+    pub const ALL: [ShortcutId; 4] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
+        ShortcutId::NewSession,
     ];
 
-    /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
+    /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
+            ShortcutId::NewSession => "New session",
         }
     }
 
@@ -117,6 +173,7 @@ impl ShortcutId {
             ShortcutId::ToggleSidebar => "mod-s",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-j",
+            ShortcutId::NewSession => "mod-n",
         }
     }
 }
@@ -129,6 +186,7 @@ pub struct KeymapConfig {
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
+    pub new_session: String,
 }
 
 impl Default for KeymapConfig {
@@ -137,6 +195,7 @@ impl Default for KeymapConfig {
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
+            new_session: ShortcutId::NewSession.default_combo().into(),
         }
     }
 }
@@ -147,6 +206,7 @@ impl KeymapConfig {
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
+            ShortcutId::NewSession => &self.new_session,
         }
     }
 
@@ -155,6 +215,7 @@ impl KeymapConfig {
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
+            ShortcutId::NewSession => self.new_session = combo,
         }
     }
 
@@ -259,11 +320,20 @@ impl UiSettings {
             SIDEBAR_MAX,
             SIDEBAR_DEFAULT,
         );
-        self.right_pane_width = clamp_or(
-            self.right_pane_width,
-            RIGHT_PANE_MIN,
-            RIGHT_PANE_MAX,
-            RIGHT_PANE_DEFAULT,
+        // The right pane has no persisted upper bound: its live drag clamps
+        // against the current window, which is unavailable while loading.
+        self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
+        self.details_sidebar_width = clamp_or(
+            self.details_sidebar_width,
+            DETAILS_SIDEBAR_MIN,
+            DETAILS_SIDEBAR_MAX,
+            DETAILS_SIDEBAR_DEFAULT,
+        );
+        self.terminal_height = clamp_or(
+            self.terminal_height,
+            TERMINAL_MIN_HEIGHT,
+            TERMINAL_ABS_MAX_HEIGHT,
+            TERMINAL_DEFAULT_HEIGHT,
         );
         self
     }
@@ -306,6 +376,14 @@ fn clamp_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
     }
 }
 
+fn min_or(value: f32, min: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.max(min)
+    } else {
+        default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,14 +396,24 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
+            open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
+            space_filter: Some("space-1".into()),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sound_enabled: false,
+            notifications_enabled: false,
+            notifications_background_only: false,
             right_pane_width: 700.0,
             right_pane_open: true,
+            details_sidebar_width: 540.0,
+            details_sidebar_open: true,
+            details_sidebar_preferences:
+                crate::details_sidebar::view::DetailsSidebarPreferences::default(),
+            terminal_height: TERMINAL_DEFAULT_HEIGHT,
+            terminal_open: false,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
@@ -351,6 +439,14 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert!(
+            loaded.notifications_enabled,
+            "pre-banner files default banners on"
+        );
+        assert!(
+            loaded.notifications_background_only,
+            "pre-banner files default background-only on"
+        );
     }
 
     #[test]
@@ -393,6 +489,16 @@ mod tests {
     }
 
     #[test]
+    fn large_right_pane_width_is_preserved() {
+        let loaded = UiSettings {
+            right_pane_width: 2400.0,
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(loaded.right_pane_width, 2400.0);
+    }
+
+    #[test]
     fn nan_heals_to_default() {
         let healed = UiSettings {
             sidebar_width: f32::NAN,
@@ -403,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_comet() {
+    fn defaults_match_zeron() {
         let d = UiSettings::default();
         assert_eq!(d.sidebar_width, 256.0);
         assert_eq!(d.right_pane_width, 520.0);

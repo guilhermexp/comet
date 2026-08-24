@@ -1,12 +1,12 @@
 //! Repos — this device's git repositories, branches, worktrees, and the folder
-//! browser (feature-inventory §3.5; port of comet's `repos.ts` + `folder-lister.ts`).
+//! browser (feature-inventory §3.5; port of zeron's `repos.ts` + `folder-lister.ts`).
 //!
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.comet-native/worktrees/<repoName>/<worktreeName>` (NOT the data
+//! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `comet/<name>` branch. `COMET_WORKTREES_DIR` overrides the root.
+//! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use comet_proto::{FileSearchMatch, FolderEntry, FolderListing, Repo, RepoRef, Worktree};
+use zeron_proto::{
+    DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage,
+    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, Worktree,
+};
 
 use crate::EngineError;
 
@@ -29,17 +32,22 @@ const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
+/// Cap on returned drives (a machine with more mounts than this is a server
+/// farm, not a laptop picking a project folder).
+const DRIVE_LIST_MAX_ENTRIES: usize = 50;
 /// File mentions should remain responsive even in very large checkouts.
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
+pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
 
 const ADJECTIVES: &[&str] = &[
     "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
     "sharp", "gentle", "vivid", "amber", "cobalt",
 ];
 const NOUNS: &[&str] = &[
-    "otter", "harbor", "falcon", "cedar", "meadow", "comet", "delta", "ember", "lynx", "maple",
+    "otter", "harbor", "falcon", "cedar", "meadow", "zeron", "delta", "ember", "lynx", "maple",
     "onyx", "quartz", "raven", "summit", "willow", "aspen",
 ];
 
@@ -68,13 +76,13 @@ pub(crate) fn home_dir() -> PathBuf {
 }
 
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `COMET_WORKTREES_DIR` overrides
+/// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
 fn default_worktrees_root() -> PathBuf {
-    std::env::var_os("COMET_WORKTREES_DIR")
+    std::env::var_os("ZERON_WORKTREES_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".comet-native").join("worktrees"))
+        .unwrap_or_else(|| home_dir().join(".zeron").join("worktrees"))
 }
 
 struct ReposInner {
@@ -91,7 +99,7 @@ pub struct Repos {
 
 impl Repos {
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$COMET_WORKTREES_DIR` or `~/.comet-native/worktrees`.
+    /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
     }
@@ -193,6 +201,14 @@ impl Repos {
         } else {
             branch
         })
+    }
+
+    /// Fetch every configured remote without pruning or integrating anything
+    /// into the active branch. This intentionally updates refs only.
+    pub async fn fetch_all(&self, repo_path: &Path) -> Result<(), EngineError> {
+        self.git(&["fetch", "--all", "--quiet"], Some(repo_path))
+            .await
+            .map(drop)
     }
 
     /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
@@ -433,6 +449,99 @@ impl Repos {
             .collect())
     }
 
+    /// Public commit history in topological order. Only user-facing branches,
+    /// remotes, and tags seed the walk, so Zeron's internal refs never leak
+    /// into the graph or keep otherwise-unreachable checkpoints visible.
+    pub async fn history(
+        &self,
+        repo_path: &Path,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<GitHistoryPage, EngineError> {
+        let limit = limit.clamp(1, GIT_HISTORY_MAX_LIMIT);
+        let head_sha = self
+            .git(&["rev-parse", "--verify", "HEAD^{commit}"], Some(repo_path))
+            .await
+            .ok()
+            .filter(|sha| !sha.is_empty());
+
+        let refs_out = self
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)%00%(symref)%00",
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags",
+                ],
+                Some(repo_path),
+            )
+            .await?;
+        let refs_by_sha = parse_history_refs(&refs_out);
+
+        if head_sha.is_none() && refs_by_sha.is_empty() {
+            return Ok(GitHistoryPage {
+                commits: Vec::new(),
+                head_sha: None,
+                next_cursor: None,
+                total_count: Some(0),
+                head_commit_count: Some(0),
+            });
+        }
+
+        let skip = format!("--skip={cursor}");
+        let max_count = format!("--max-count={}", limit + 1);
+        let mut log_args = vec![
+            "log",
+            "--topo-order",
+            "--no-color",
+            "--no-decorate",
+            "--no-show-signature",
+            "--no-patch",
+            skip.as_str(),
+            max_count.as_str(),
+            "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
+        ];
+        if head_sha.is_some() {
+            log_args.push("HEAD");
+        }
+        log_args.extend(["--branches", "--remotes", "--tags"]);
+        let log = self.git(&log_args, Some(repo_path)).await?;
+        let mut commits = parse_history_log(&log, &refs_by_sha);
+        let has_next = commits.len() > limit;
+        commits.truncate(limit);
+
+        let total_count = if cursor == 0 {
+            let mut count_args = vec!["rev-list", "--count"];
+            if head_sha.is_some() {
+                count_args.push("HEAD");
+            }
+            count_args.extend(["--branches", "--remotes", "--tags"]);
+            self.git(&count_args, Some(repo_path))
+                .await
+                .ok()
+                .and_then(|count| count.parse().ok())
+        } else {
+            None
+        };
+        let head_commit_count = if cursor == 0 && head_sha.is_some() {
+            self.git(&["rev-list", "--count", "HEAD"], Some(repo_path))
+                .await
+                .ok()
+                .and_then(|count| count.parse().ok())
+        } else {
+            None
+        };
+
+        Ok(GitHistoryPage {
+            next_cursor: has_next.then_some(cursor + commits.len()),
+            commits,
+            head_sha,
+            total_count,
+            head_commit_count,
+        })
+    }
+
     /// Whether `candidate` is the repository root or one of its linked
     /// worktrees. Filesystem resolution happens on a disposable thread because
     /// user-selected paths may be dead mounts.
@@ -508,7 +617,7 @@ impl Repos {
     // ── worktrees ───────────────────────────────────────────────────────────
 
     /// `git worktree add` an isolated checkout under
-    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `comet/<name>`
+    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `zeron/<name>`
     /// branch off `branch`.
     pub async fn create_worktree(
         &self,
@@ -540,7 +649,7 @@ impl Repos {
                 ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
                 NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
             );
-            if !base.join(&candidate).exists() && !existing.contains(&format!("comet/{candidate}"))
+            if !base.join(&candidate).exists() && !existing.contains(&format!("zeron/{candidate}"))
             {
                 name = Some(candidate);
                 break;
@@ -549,7 +658,7 @@ impl Repos {
         let name =
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
-        let branch_name = format!("comet/{name}");
+        let branch_name = format!("zeron/{name}");
         self.git(
             &[
                 "worktree",
@@ -586,10 +695,10 @@ impl Repos {
         .is_ok()
     }
 
-    /// Rename a comet-created worktree branch after its chat's generated title
-    /// (port of comet's `renameWorktreeBranch`). Guards:
+    /// Rename a zeron-created worktree branch after its chat's generated title
+    /// (port of zeron's `renameWorktreeBranch`). Guards:
     /// - respect an external checkout/rename: only act while the worktree is still
-    ///   on `expected_branch` AND that branch is the original `comet/<folderName>`;
+    ///   on `expected_branch` AND that branch is the original `zeron/<folderName>`;
     /// - a title-slug collision gets a stable 6-hex suffix (hash of the worktree
     ///   path); a collision on THAT too fails.
     ///
@@ -606,7 +715,7 @@ impl Repos {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if current != expected_branch || expected_branch != format!("comet/{folder}") {
+        if current != expected_branch || expected_branch != format!("zeron/{folder}") {
             return Ok(current);
         }
         let preferred = worktree_branch_from_title(title);
@@ -635,7 +744,7 @@ impl Repos {
     }
 
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when comet created it (`comet/…`) — the
+    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) — the
     /// user may have checked out their own branch inside the worktree.
     pub async fn delete_worktree(
         &self,
@@ -665,7 +774,7 @@ impl Repos {
             }
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("comet/") {
+        if branch.starts_with("zeron/") {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
@@ -745,7 +854,7 @@ impl Repos {
     /// The walk runs on a DETACHED OS thread (not the tokio blocking pool): a
     /// readdir wedged in the kernel can't be cancelled, and a poisoned blocking
     /// pool — or a runtime shutdown waiting on it — must never be possible. On
-    /// timeout the thread is simply abandoned (the comet backend's disposable
+    /// timeout the thread is simply abandoned (the zeron backend's disposable
     /// worker, minus the terminate()).
     #[doc(hidden)]
     pub async fn list_folders_with(
@@ -781,6 +890,23 @@ impl Repos {
             )),
         }
     }
+
+    // ── ListDrives ──────────────────────────────────────────────────────────
+
+    /// Mounted drives/volumes — the browse roots beyond home. Same disposable
+    /// worker + wall-clock ceiling as `ListFolders`: a dead network mount can
+    /// wedge the probe (macOS `canonicalize` stats each volume), and that must
+    /// fail this listing, not the runtime.
+    pub async fn list_drives(&self) -> Result<Vec<DriveEntry>, EngineError> {
+        let worker = disposable_worker("drive-list", list_drives_blocking);
+        match tokio::time::timeout(FOLDER_LIST_TIMEOUT, worker).await {
+            Ok(Some(drives)) => Ok(drives),
+            Ok(None) => Err(EngineError::Other("drive listing worker exited".into())),
+            Err(_) => Err(EngineError::Other(
+                "drive listing timed out on the device".into(),
+            )),
+        }
+    }
 }
 
 struct CancelOnDrop(std::sync::Arc<AtomicBool>);
@@ -813,7 +939,7 @@ fn list_folders_blocking(
 ) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
-            EngineError::Other("Comet doesn't have access to this folder on the device.".into())
+            EngineError::Other("Zeron doesn't have access to this folder on the device.".into())
         }
         _ => EngineError::Other(format!("could not read that folder: {e}")),
     })?;
@@ -844,6 +970,176 @@ fn list_folders_blocking(
         entries,
         truncated,
     })
+}
+
+/// The blocking drive walk. Best-effort everywhere: the list is navigation
+/// sugar for the folder browser, so an unreadable source means fewer rows,
+/// never an error (home always remains reachable without it).
+fn list_drives_blocking() -> Vec<DriveEntry> {
+    #[cfg(target_os = "macos")]
+    let drives = macos_drives();
+    #[cfg(target_os = "linux")]
+    let drives = linux_drives(&std::fs::read_to_string("/proc/mounts").unwrap_or_default());
+    #[cfg(windows)]
+    let drives = windows_drives();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let drives = Vec::new();
+    finish_drives(drives)
+}
+
+/// `/Volumes` holds every mounted volume; the boot volume is a symlink to `/`,
+/// which `canonicalize` resolves — so the system drive arrives under its real
+/// name ("Macintosh HD") and the fallback "System" row never shows on macOS.
+#[cfg(target_os = "macos")]
+fn macos_drives() -> Vec<DriveEntry> {
+    let mut drives: Vec<DriveEntry> = Vec::new();
+    if let Ok(read) = std::fs::read_dir("/Volumes") {
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            // Follows the symlink — a dangling one (mid-eject) drops out here.
+            if !path.is_dir() {
+                continue;
+            }
+            let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+            drives.push(DriveEntry {
+                name,
+                path: resolved.to_string_lossy().to_string(),
+            });
+        }
+    }
+    drives
+}
+
+/// Top-level directories the FHS (or its de-facto extensions) owns. A
+/// depth-one mount point OUTSIDE this set is a user-created drive root
+/// (`/disk2`, `/data`, `/tank`) — the system's own split partitions
+/// (`/boot`, a separate `/var` or `/home`) are plumbing, not drives.
+#[cfg(any(target_os = "linux", test))]
+const FHS_TOP_LEVEL: &[&str] = &[
+    "bin",
+    "boot",
+    "dev",
+    "efi",
+    "etc",
+    "home",
+    "lib",
+    "lib32",
+    "lib64",
+    "libx32",
+    "lost+found",
+    "media",
+    "mnt",
+    "nix",
+    "opt",
+    "proc",
+    "root",
+    "run",
+    "sbin",
+    "snap",
+    "srv",
+    "sys",
+    "tmp",
+    "usr",
+    "var",
+];
+
+/// Mounted drives from `/proc/mounts`: the conventional removable locations
+/// (`/media`, `/run/media`, `/mnt` — udisks, WSL drive letters, manual
+/// mounts, whatever the filesystem) plus block-device partitions mounted at
+/// custom top-level paths like `/disk2` (PR #144 feedback) — `/dev/*`
+/// sources at depth-one non-FHS points, minus squashfs/erofs images (snaps).
+/// Plus "System" for `/`: anything mounted deeper stays reachable by
+/// browsing from the root, and the palette accepts typed paths besides.
+#[cfg(any(target_os = "linux", test))]
+fn linux_drives(mounts: &str) -> Vec<DriveEntry> {
+    let mut drives: Vec<DriveEntry> = Vec::new();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(point), fstype) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let point = unescape_mount_point(point);
+        let conventional = point.starts_with("/media/")
+            || point.starts_with("/run/media/")
+            || point == "/mnt"
+            || point.starts_with("/mnt/");
+        let custom_block = source.starts_with("/dev/")
+            && !matches!(fstype, Some("squashfs") | Some("erofs"))
+            && point
+                .strip_prefix('/')
+                .is_some_and(|p| !p.is_empty() && !p.contains('/') && !FHS_TOP_LEVEL.contains(&p));
+        if !conventional && !custom_block {
+            continue;
+        }
+        let name = point
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Drive")
+            .to_string();
+        drives.push(DriveEntry { name, path: point });
+    }
+    drives.push(DriveEntry {
+        name: "System".into(),
+        path: "/".into(),
+    });
+    drives
+}
+
+/// Probe the drive letters. `exists` on a wedged network letter can hang —
+/// covered by the caller's disposable-worker timeout.
+#[cfg(windows)]
+fn windows_drives() -> Vec<DriveEntry> {
+    ('A'..='Z')
+        .filter_map(|letter| {
+            let path = format!("{letter}:\\");
+            std::path::Path::new(&path).exists().then(|| DriveEntry {
+                name: format!("{letter}:"),
+                path,
+            })
+        })
+        .collect()
+}
+
+/// Dedupe by mount point (first mention wins — the named row beats a
+/// late generic duplicate), system root first, then name order, capped.
+fn finish_drives(mut drives: Vec<DriveEntry>) -> Vec<DriveEntry> {
+    let mut seen = HashSet::new();
+    drives.retain(|d| seen.insert(d.path.clone()));
+    drives.sort_by(|a, b| {
+        (a.path != "/")
+            .cmp(&(b.path != "/"))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    drives.truncate(DRIVE_LIST_MAX_ENTRIES);
+    drives
+}
+
+/// `/proc/mounts` octal-escapes whitespace in mount points (`\040` = space).
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mount_point(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let digits: String = chars.clone().take(3).collect();
+            if digits.len() == 3
+                && let Ok(code) = u8::from_str_radix(&digits, 8)
+            {
+                out.push(code as char);
+                chars.nth(2);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Case-insensitive subsequence score. Lower is better: adjacent and earlier
@@ -988,8 +1284,8 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
         .collect())
 }
 
-/// Turn a generated chat title into the semantic portion of a Comet branch
-/// (port of comet's `worktreeBranchFromTitle`). Comet NFKD-normalizes accented
+/// Turn a generated chat title into the semantic portion of a Zeron branch
+/// (port of zeron's `worktreeBranchFromTitle`). Zeron NFKD-normalizes accented
 /// letters first; native keeps it ASCII-only (generated titles are Title Case
 /// English), so non-ASCII characters collapse into the `-` separator.
 pub fn worktree_branch_from_title(title: &str) -> String {
@@ -1006,7 +1302,99 @@ pub fn worktree_branch_from_title(title: &str) -> String {
     }
     slug.truncate(48);
     let slug = slug.trim_matches('-');
-    format!("comet/{}", if slug.is_empty() { "update" } else { slug })
+    format!("zeron/{}", if slug.is_empty() { "update" } else { slug })
+}
+
+fn bounded_field(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn parse_history_log(
+    output: &str,
+    refs_by_sha: &HashMap<String, Vec<GitHistoryRef>>,
+) -> Vec<GitHistoryCommit> {
+    let fields: Vec<&str> = output.split('\0').collect();
+    fields
+        .chunks(6)
+        .filter_map(|record| {
+            if record.len() != 6 {
+                return None;
+            }
+            let sha = record[0].trim_start_matches(['\r', '\n']);
+            if sha.is_empty() {
+                return None;
+            }
+            Some(GitHistoryCommit {
+                sha: sha.to_string(),
+                parent_shas: record[1]
+                    .split_ascii_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                subject: bounded_field(record[2], 4_096),
+                author_name: bounded_field(record[3], 512),
+                author_email: bounded_field(record[4], 512),
+                authored_at: bounded_field(record[5], 128),
+                refs: refs_by_sha.get(sha).cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn parse_history_refs(output: &str) -> HashMap<String, Vec<GitHistoryRef>> {
+    let fields: Vec<&str> = output.split('\0').collect();
+    let mut refs_by_sha: HashMap<String, Vec<GitHistoryRef>> = HashMap::new();
+    for record in fields.chunks(6) {
+        if record.len() != 6 {
+            continue;
+        }
+        let full_name = record[0].trim_start_matches(['\r', '\n']);
+        let object_sha = record[1];
+        let object_type = record[2];
+        let peeled_sha = record[3];
+        let peeled_type = record[4];
+        let symbolic_target = record[5];
+        if full_name.is_empty() || !symbolic_target.is_empty() {
+            continue;
+        }
+        let Some((kind, label)) = (if let Some(label) = full_name.strip_prefix("refs/heads/") {
+            Some((GitHistoryRefKind::Branch, label))
+        } else if let Some(label) = full_name.strip_prefix("refs/remotes/") {
+            Some((GitHistoryRefKind::Remote, label))
+        } else {
+            full_name
+                .strip_prefix("refs/tags/")
+                .map(|label| (GitHistoryRefKind::Tag, label))
+        }) else {
+            continue;
+        };
+        let target_sha = if object_type == "commit" {
+            object_sha
+        } else if object_type == "tag" && peeled_type == "commit" {
+            peeled_sha
+        } else {
+            continue;
+        };
+        refs_by_sha
+            .entry(target_sha.to_string())
+            .or_default()
+            .push(GitHistoryRef {
+                kind,
+                label: bounded_field(label, 1_024),
+            });
+    }
+    for refs in refs_by_sha.values_mut() {
+        refs.sort_by(|left, right| {
+            let order = |kind| match kind {
+                GitHistoryRefKind::Branch => 0,
+                GitHistoryRefKind::Tag => 1,
+                GitHistoryRefKind::Remote => 2,
+            };
+            order(left.kind)
+                .cmp(&order(right.kind))
+                .then_with(|| left.label.cmp(&right.label))
+        });
+    }
+    refs_by_sha
 }
 
 /// Absolute form of a possibly-relative path (no filesystem access).
@@ -1031,6 +1419,90 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_drives_take_media_and_mnt_mounts_system_first() {
+        let mounts = "\
+sysfs /sys sysfs rw 0 0
+/dev/nvme0n1p2 / ext4 rw 0 0
+tmpfs /run tmpfs rw 0 0
+/dev/sda1 /media/wing/T7\\040Shield exfat rw 0 0
+/dev/sdb1 /run/media/wing/Backup ext4 rw 0 0
+/dev/sdc1 /mnt/scratch ext4 rw 0 0
+/dev/nvme0n1p2 /var/lib/docker ext4 rw 0 0
+";
+        let drives = finish_drives(linux_drives(mounts));
+        let rows: Vec<(&str, &str)> = drives
+            .iter()
+            .map(|d| (d.name.as_str(), d.path.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("System", "/"),
+                ("Backup", "/run/media/wing/Backup"),
+                ("scratch", "/mnt/scratch"),
+                ("T7 Shield", "/media/wing/T7 Shield"),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_drives_take_custom_top_level_block_mounts_not_system_splits() {
+        let mounts = "\
+/dev/nvme0n1p2 / ext4 rw 0 0
+/dev/sdb1 /disk2 ext4 rw 0 0
+/dev/mapper/vault /tank btrfs rw 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw 0 0
+/dev/sdd1 /boot ext4 rw 0 0
+/dev/sde1 /home ext4 rw 0 0
+/dev/sdf1 /data/disks/a ext4 rw 0 0
+/dev/loop3 /snap/core22/1234 squashfs ro 0 0
+/dev/loop9 /disk3 ext4 rw 0 0
+";
+        let drives = finish_drives(linux_drives(mounts));
+        let rows: Vec<&str> = drives.iter().map(|d| d.path.as_str()).collect();
+        // /disk2 and /tank are user drive roots; a loop-mounted ext4 image at
+        // a custom root counts too (it's squashfs snaps that are noise). The
+        // system's own split partitions and deep mounts stay out.
+        assert_eq!(rows, vec!["/", "/disk2", "/disk3", "/tank"]);
+    }
+
+    #[test]
+    fn finish_drives_dedupes_by_mount_point_keeping_the_first_name() {
+        let drives = finish_drives(vec![
+            DriveEntry {
+                name: "Macintosh HD".into(),
+                path: "/".into(),
+            },
+            DriveEntry {
+                name: "System".into(),
+                path: "/".into(),
+            },
+        ]);
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].name, "Macintosh HD");
+    }
+
+    #[test]
+    fn mount_point_unescape_handles_octal_and_lone_backslash() {
+        assert_eq!(unescape_mount_point("/media/a\\040b"), "/media/a b");
+        assert_eq!(unescape_mount_point("/media/tab\\011x"), "/media/tab\tx");
+        assert_eq!(unescape_mount_point("/media/plain"), "/media/plain");
+        assert_eq!(unescape_mount_point("/media/tail\\"), "/media/tail\\");
+    }
+
+    #[tokio::test]
+    async fn list_drives_resolves_on_this_platform() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        // Content is machine-dependent; the call must succeed and dedupe.
+        let drives = repos.list_drives().await.unwrap();
+        let mut paths: Vec<&String> = drives.iter().map(|d| &d.path).collect();
+        paths.dedup();
+        assert_eq!(paths.len(), drives.len());
+    }
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {

@@ -1,24 +1,19 @@
-//! Uploads — attachment staging + the content-addressed edge mirror
-//! (feature-inventory §3.7 "Uploads"; port of comet's `uploads.ts`).
+//! Uploads — attachment staging on the chat's host device
+//! (feature-inventory §3.7 "Uploads"; port of zeron's `uploads.ts`).
 //!
 //! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{data_dir}/uploads/tmp/
-//! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike comet's
+//! target device is remote); chunks stage on disk under `{uploads_root}/tmp/
+//! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike zeron's
 //! in-memory buffers), and `commit` assembles them into
-//! `{data_dir}/uploads/{id8}-{name}` and returns the absolute path, which the
+//! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the
 //! composer appends to the prompt so the agent can read the file from disk.
-//!
-//! On commit the assembled bytes are also mirrored to the edge, best-effort:
-//! `PUT {edge}/attachments/{sha256}` (bearer auth, content-addressed R2 —
-//! `edge/src/index.ts`). A device that doesn't hold the file locally can fall
-//! back to `GET {edge}/attachments/{sha256}` with the same bearer; native keeps
-//! reads local-first (`read_chunk` proxies through the owning device), so the
-//! GET fallback is the disaster path, not the hot path.
+//! Attachments live only on the host device — every read proxies through the
+//! owning device via `ReadAttachmentChunk`; nothing is mirrored to the edge.
 //!
 //! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
 //! only files under the uploads dir or a workspace-known chat cwd are readable
 //! (the RPC layer supplies the cwd roots) — and only supported image types, as
-//! in comet.
+//! in zeron.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,15 +22,62 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::EngineError;
-use crate::doc_host::EdgeConfig;
-use crate::repos::hex;
 
 /// A pending upload must finish within this window (covers slow mesh links).
 const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Hard cap on an assembled file (matches the edge's 32MB attachment cap).
+
+/// Queued-attachment ref scheme (2026-08-19 incident: attachment staging was
+/// a blocking pre-step in front of QueueCommand, so a send died with the peer
+/// link instead of queueing). A ref names bytes by identity instead of by a
+/// device-local absolute path: `pending://{uploadId}/{fileName}`. The sender
+/// commits the bytes to its OWN uploads dir first (fast, offline-safe), the
+/// command queues immediately carrying refs, and the bytes chase it over the
+/// peer link. Any device resolves a ref against its own uploads dir — the
+/// deterministic committed name `{id8}-{sanitize(fileName)}` makes sender and
+/// host land the same file at the same relative path.
+pub const PENDING_REF_PREFIX: &str = "pending://";
+
+pub fn is_pending_ref(path: &str) -> bool {
+    path.starts_with(PENDING_REF_PREFIX)
+}
+
+/// `pending://{uploadId}/{fileName}` (fileName is the ORIGINAL name; sanitize
+/// happens at resolution so both ends agree by construction).
+pub fn pending_ref(upload_id: &str, file_name: &str) -> String {
+    format!("{PENDING_REF_PREFIX}{upload_id}/{file_name}")
+}
+
+/// Split a pending ref into `(upload_id, file_name)`.
+pub fn parse_pending_ref(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix(PENDING_REF_PREFIX)?;
+    let (id, name) = rest.split_once('/')?;
+    (!id.is_empty() && !name.is_empty()).then_some((id, name))
+}
+
+/// One queued attachment a `QueueCommand` asks the engine to deliver: the
+/// bytes are already committed to THIS device's uploads dir under
+/// `{id8}-{sanitize(file_name)}`; the transfer pushes them to the chat's
+/// host device by upload identity (never by arbitrary path).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentTransfer {
+    pub upload_id: String,
+    pub file_name: String,
+}
+
+/// Pending refs listed on a text's attachment-ref lines (`- pending://…`).
+/// Line-wise so file names with spaces survive intact.
+pub fn pending_refs_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let path = line.trim_start().strip_prefix("- ")?.trim();
+            is_pending_ref(path).then(|| path.to_string())
+        })
+        .collect()
+}
+/// Hard cap on an assembled file.
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
@@ -53,12 +95,14 @@ pub struct AttachmentChunk {
 }
 
 struct UploadsInner {
-    /// Durable home for committed attachments (`{data_dir}/uploads`).
+    /// Profile-scoped durable home for new committed attachments.
     dir: PathBuf,
-    /// Chunk staging (`{data_dir}/uploads/tmp/{uploadId}/`).
+    /// Chunk staging (`{uploads_root}/tmp/{uploadId}/`).
     tmp: PathBuf,
-    edge: Option<EdgeConfig>,
-    http: reqwest::Client,
+    /// Historical roots accepted for reads only. Writes and staging never use
+    /// them. RwLock: a local-profile import adds its source root at runtime so
+    /// imported transcripts resolve without an engine restart.
+    read_only_roots: std::sync::RwLock<Vec<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -67,17 +111,28 @@ pub struct Uploads {
 }
 
 impl Uploads {
-    pub fn new(data_dir: &Path, edge: Option<EdgeConfig>) -> Self {
-        let dir = data_dir.join("uploads");
+    /// Use the historical device-global uploads directory.
+    pub fn new(data_dir: &Path) -> Self {
+        Self::from_root(&data_dir.join("uploads"))
+    }
+
+    /// Use an already-resolved profile uploads directory.
+    pub fn from_root(dir: &Path) -> Self {
+        Self::from_root_with_fallback(dir, None)
+    }
+
+    /// Use a profile root for all writes and an optional legacy read-only root.
+    pub fn from_root_with_fallback(dir: &Path, legacy_read_root: Option<&Path>) -> Self {
         Self {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
-                dir,
-                edge,
-                http: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new()),
+                dir: dir.to_path_buf(),
+                read_only_roots: std::sync::RwLock::new(
+                    legacy_read_root
+                        .into_iter()
+                        .map(Path::to_path_buf)
+                        .collect(),
+                ),
             }),
         }
     }
@@ -85,6 +140,20 @@ impl Uploads {
     /// The durable uploads dir (a path-jail root).
     pub fn dir(&self) -> &Path {
         &self.inner.dir
+    }
+
+    /// Accept `root` for reads from now on (idempotent). Profile import calls
+    /// this so transcripts that embed absolute paths under the local profile's
+    /// uploads root keep resolving after the switch to a synced profile.
+    pub fn add_read_only_root(&self, root: &Path) {
+        let mut roots = self
+            .inner
+            .read_only_roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !roots.iter().any(|r| r == root) {
+            roots.push(root.to_path_buf());
+        }
     }
 
     /// Stage one base64 chunk. Positional (`seq`) writes are IDEMPOTENT: a client
@@ -116,7 +185,7 @@ impl Uploads {
     }
 
     /// Assemble the staged chunks into a durable file and return its absolute
-    /// path. Also mirrors the bytes to the edge (content-addressed), best-effort.
+    /// path.
     pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
         let dir = self.staging_dir(upload_id)?;
         let mut parts = chunk_files(&dir)?;
@@ -146,8 +215,29 @@ impl Uploads {
         let path = self.inner.dir.join(format!("{id8}-{name}"));
         std::fs::write(&path, &bytes)?;
         let _ = std::fs::remove_dir_all(&dir);
-        self.mirror_to_edge(&path, bytes);
         Ok(path.to_string_lossy().to_string())
+    }
+
+    /// The committed absolute path a pending ref resolves to on THIS device
+    /// (`{uploads_dir}/{id8}-{sanitize(name)}`), whether or not it exists yet.
+    pub fn pending_target(&self, upload_id: &str, file_name: &str) -> PathBuf {
+        let id8: String = upload_id.chars().take(8).collect();
+        // The id8 fragment becomes part of a file name — jail its charset the
+        // same way staging does (a hostile ref must not traverse).
+        let id8 = sanitize(&id8);
+        self.inner
+            .dir
+            .join(format!("{id8}-{}", sanitize(file_name)))
+    }
+
+    /// Resolve a `pending://` ref against this device's uploads dir.
+    /// `Some(absolute)` iff the bytes have landed here.
+    pub fn resolve_pending(&self, path: &str) -> Option<String> {
+        let (upload_id, file_name) = parse_pending_ref(path)?;
+        let target = self.pending_target(upload_id, file_name);
+        target
+            .is_file()
+            .then(|| target.to_string_lossy().to_string())
     }
 
     /// Read one 45KB chunk of an attachment. `extra_roots` are the workspace's
@@ -214,9 +304,15 @@ impl Uploads {
                 .flatten()
                 .filter_map(|f| f.metadata().ok()?.modified().ok())
                 .max();
+            // An empty dir is NOT free to reclaim: `append` creates the dir
+            // before writing the first chunk, and parallel chunk uploads run
+            // 3-wide — a sibling's sweep landing in that window deleted the
+            // dir out from under the first write (v0.2.12 "Couldn't stage the
+            // attachment locally"). Judge an empty dir by its own age.
+            let newest = newest.or_else(|| entry.metadata().ok()?.modified().ok());
             let expired = match newest {
                 Some(at) => at.elapsed().map(|age| age > STAGING_TTL).unwrap_or(false),
-                None => true, // empty dir — reclaim
+                None => false,
             };
             if expired {
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -226,9 +322,25 @@ impl Uploads {
 
     fn inspect(&self, path: &str, extra_roots: &[PathBuf]) -> Result<InspectedFile, EngineError> {
         let outside = || EngineError::Other("Attachment is outside the upload cache".into());
+        // Queued-attachment refs resolve against this device's uploads dir
+        // (present only once the transfer landed) — then jail as usual.
+        let resolved_ref;
+        let path = if is_pending_ref(path) {
+            resolved_ref = self.resolve_pending(path).ok_or_else(outside)?;
+            resolved_ref.as_str()
+        } else {
+            path
+        };
         // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
         let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
+        let read_roots = self
+            .inner
+            .read_only_roots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let allowed = std::iter::once(&self.inner.dir)
+            .chain(read_roots.iter())
             .chain(extra_roots.iter())
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .any(|root| resolved.starts_with(&root) && resolved != root);
@@ -253,45 +365,6 @@ impl Uploads {
             size: meta.len(),
             resolved,
         })
-    }
-
-    /// Best-effort content-addressed mirror (`PUT /attachments/{sha256}`, bearer
-    /// auth). Failures only log — local commit already succeeded.
-    fn mirror_to_edge(&self, path: &Path, bytes: Vec<u8>) {
-        let Some(edge) = self.inner.edge.clone() else {
-            return;
-        };
-        let sha = hex(&Sha256::digest(&bytes));
-        let mime = mime_by_ext(path)
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let url = format!("{}/attachments/{sha}", edge.url.trim_end_matches('/'));
-        let http = self.inner.http.clone();
-        tokio::spawn(async move {
-            // Fresh bearer per request — never the boot-time snapshot.
-            let Some(bearer) = edge.bearer().await else {
-                tracing::warn!(sha = %sha, "attachment mirror skipped: signed out");
-                return;
-            };
-            let sent = http
-                .put(&url)
-                .bearer_auth(&bearer)
-                .header("content-type", mime)
-                .body(bytes)
-                .send()
-                .await;
-            match sent {
-                Ok(res) if res.status().is_success() => {
-                    tracing::debug!(sha = %sha, "attachment mirrored to edge");
-                }
-                Ok(res) => {
-                    tracing::warn!(sha = %sha, status = %res.status(), "edge attachment mirror rejected");
-                }
-                Err(err) => {
-                    tracing::warn!(sha = %sha, error = %err, "edge attachment mirror failed");
-                }
-            }
-        });
     }
 }
 
@@ -384,5 +457,94 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+    }
+
+    #[test]
+    fn sweep_spares_a_fresh_empty_staging_dir() {
+        // The parallel-chunk race: uploader A has created its staging dir but
+        // not yet written chunk 0 when uploader B's sweep runs. The empty dir
+        // must survive; only an ABANDONED empty dir (older than the TTL) goes.
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(dir.path());
+        let racing = dir.path().join("tmp").join("upload-racing");
+        std::fs::create_dir_all(&racing).unwrap();
+
+        uploads.append("upload-other", "aGk=", Some(0)).unwrap();
+        assert!(racing.exists(), "fresh empty staging dir was reclaimed");
+
+        let stale = std::time::SystemTime::now() - (STAGING_TTL + Duration::from_secs(60));
+        std::fs::File::open(&racing)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        uploads.append("upload-other", "aGk=", Some(0)).unwrap();
+        assert!(
+            !racing.exists(),
+            "abandoned empty staging dir must be swept"
+        );
+    }
+
+    #[test]
+    fn commit_assembles_chunks_into_a_durable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(dir.path());
+        uploads
+            .append("upload-1", &BASE64.encode(b"local"), Some(0))
+            .unwrap();
+
+        let path = uploads.commit("upload-1", "image.png").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"local");
+        assert!(!dir.path().join("tmp").join("upload-1").exists());
+    }
+
+    #[test]
+    fn pending_refs_round_trip_and_resolve_after_commit() {
+        assert_eq!(
+            pending_ref("abcd1234-rest", "my photo (1).png"),
+            "pending://abcd1234-rest/my photo (1).png"
+        );
+        assert_eq!(
+            parse_pending_ref("pending://abcd1234-rest/my photo (1).png"),
+            Some(("abcd1234-rest", "my photo (1).png"))
+        );
+        assert_eq!(parse_pending_ref("pending://no-slash"), None);
+        assert_eq!(parse_pending_ref("/tmp/plain.png"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(dir.path());
+        let r = pending_ref("abcd1234-rest", "my photo (1).png");
+        // Not landed yet.
+        assert_eq!(uploads.resolve_pending(&r), None);
+        // Commit under the SAME identity → the ref resolves to the committed
+        // path (the invariant sender and host both rely on).
+        uploads
+            .append("abcd1234-rest", &BASE64.encode(b"img"), Some(0))
+            .unwrap();
+        let committed = uploads.commit("abcd1234-rest", "my photo (1).png").unwrap();
+        assert_eq!(uploads.resolve_pending(&r), Some(committed));
+    }
+
+    #[test]
+    fn pending_refs_in_scans_ref_lines_only() {
+        let text = "See the attached image(s).\n\nAttached images (local files — open them to view):\n- pending://u1/a b.png\n- /abs/other.png\n- pending://u2/c.png";
+        assert_eq!(
+            pending_refs_in(text),
+            vec![
+                "pending://u1/a b.png".to_string(),
+                "pending://u2/c.png".to_string()
+            ]
+        );
+        assert!(pending_refs_in("mentions pending://u1/x.png inline only").is_empty());
+    }
+
+    #[test]
+    fn pending_ref_traversal_cannot_escape_the_jail() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(dir.path());
+        // Hostile names sanitize into the jail rather than traversing out.
+        let target = uploads.pending_target("../../../etc", "../../passwd");
+        assert!(target.starts_with(dir.path()));
+        assert!(!target.to_string_lossy().contains(".."));
     }
 }

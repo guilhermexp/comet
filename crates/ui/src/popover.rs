@@ -15,7 +15,7 @@ use gpui::{
     Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px,
 };
 
-use crate::motion::{self, COMET_PULSE};
+use crate::motion::{self, ZERON_PULSE};
 use crate::theme::{Theme, hairline, ink};
 
 // ---------------------------------------------------------------------------
@@ -51,6 +51,157 @@ impl<T> Loadable<T> {
             _ => None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Popup — open/closing/closed lifecycle (exit animations)
+// ---------------------------------------------------------------------------
+
+/// Popup state with an exit phase. gpui unmounts an element the frame its
+/// state drops, so a closing animation needs the state held alive while
+/// [`motion::menu_out`] plays: `open` → `begin_close` (render keeps mounting,
+/// with the out animation and dead hit-testing) → [`reap_popup`]'s timer
+/// `finish_close`es ~[`motion::MENU_OUT`] later. Use [`Self::is_open`] for
+/// logic (a closing popup already reads as closed) and [`Self::get`] /
+/// [`Self::is_closing`] for rendering.
+pub struct Popup<T> {
+    /// `Some((state, closing_since))` while mounted; `closing_since` is the
+    /// exit-phase start.
+    inner: Option<(T, Option<std::time::Instant>)>,
+    /// Whether the popup was still mounted when the current trigger press
+    /// began — see [`Self::note_trigger_press`].
+    pressed_while_open: bool,
+}
+
+impl<T> Default for Popup<T> {
+    fn default() -> Self {
+        Self {
+            inner: None,
+            pressed_while_open: false,
+        }
+    }
+}
+
+impl<T> Popup<T> {
+    pub fn open(&mut self, value: T) {
+        self.inner = Some((value, None));
+    }
+
+    /// Open and interactive (not closing).
+    pub fn is_open(&self) -> bool {
+        matches!(self.inner, Some((_, None)))
+    }
+
+    pub fn is_closing(&self) -> bool {
+        matches!(self.inner, Some((_, Some(_))))
+    }
+
+    /// When the exit phase began — what the render path hands to the popover
+    /// wrappers, which derive the eased exit progress from it each frame.
+    pub fn closing_since(&self) -> Option<std::time::Instant> {
+        match &self.inner {
+            Some((_, Some(since))) => Some(*since),
+            _ => None,
+        }
+    }
+
+    /// The state while mounted — open OR playing the exit animation. Render
+    /// paths use this; logic paths use [`Self::as_open`]/[`Self::open_mut`].
+    pub fn get(&self) -> Option<&T> {
+        self.inner.as_ref().map(|(value, _)| value)
+    }
+
+    /// The state only while genuinely open — `None` during the exit phase, so
+    /// event handlers on a dying popup fall through.
+    pub fn as_open(&self) -> Option<&T> {
+        match &self.inner {
+            Some((value, None)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn open_mut(&mut self) -> Option<&mut T> {
+        match &mut self.inner {
+            Some((value, None)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Enter the exit phase. Returns `true` when this call started it (the
+    /// caller then schedules [`reap_popup`]); `false` if already closing or
+    /// closed.
+    pub fn begin_close(&mut self) -> bool {
+        match &mut self.inner {
+            Some((_, closing @ None)) => {
+                *closing = Some(std::time::Instant::now());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record, from the trigger's `on_mouse_down`, whether this popup is
+    /// still mounted. The anchored card's `on_mouse_down_out` fires on that
+    /// same press and begins the close, so by click (mouse-up) time the
+    /// popup already reads as closed — the click handler alone cannot tell
+    /// "this press dismissed it; stay closed" from "open fresh", and a
+    /// plain toggle closes-and-reopens (user report). Both handler orders
+    /// work: open and mid-exit each count as mounted. Every trigger click
+    /// is preceded by a trigger mouse-down, so the note is never stale.
+    pub fn note_trigger_press(&mut self) {
+        self.note_trigger_press_matching(|_| true);
+    }
+
+    /// [`Self::note_trigger_press`] for popups whose state distinguishes
+    /// which trigger owns them (e.g. one `Popup<PickerKind>` shared by
+    /// several triggers): only a press on the OWNING trigger counts, so
+    /// clicking a different trigger switches menus instead of swallowing.
+    pub fn note_trigger_press_matching(&mut self, owns: impl FnOnce(&T) -> bool) {
+        self.pressed_while_open = self.inner.as_ref().is_some_and(|(value, _)| owns(value));
+    }
+
+    /// Consume the press note: `true` when the press that produced the
+    /// current click found the popup mounted — the click should leave it
+    /// closed rather than reopen it.
+    pub fn take_press_was_open(&mut self) -> bool {
+        std::mem::take(&mut self.pressed_while_open)
+    }
+
+    /// Drop the state if the exit phase has run its course. A popup reopened
+    /// (or re-closed) since the matching [`begin_close`] is left alone — the
+    /// newer phase's own reap handles it.
+    pub fn finish_close(&mut self) {
+        if let Some((_, Some(since))) = &self.inner
+            && since.elapsed() >= motion::MENU_OUT.total().mul_f32(motion::speed_scale())
+        {
+            self.inner = None;
+        }
+    }
+}
+
+/// Schedule the reap for a [`Popup::begin_close`]: after the exit animation's
+/// span, drop the popup state and repaint. `popup` re-borrows the field from
+/// the view (the state can't be captured — the view owns it).
+pub fn reap_popup<V: 'static, T: 'static>(
+    cx: &mut gpui::Context<V>,
+    popup: impl Fn(&mut V) -> &mut Popup<T> + 'static,
+) {
+    cx.spawn(async move |view, cx| {
+        cx.background_executor()
+            .timer(
+                motion::MENU_OUT
+                    .total()
+                    .mul_f32(motion::speed_scale())
+                    .saturating_add(std::time::Duration::from_millis(20)),
+            )
+            .await;
+        view.update(cx, |view, cx| {
+            popup(view).finish_close();
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +276,11 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
     match key {
         "up" => MenuKey::Up,
         "down" => MenuKey::Down,
+        // Readline/emacs motion: ctrl-n/ctrl-p mirror ↓/↑ in every picker.
+        // Safe to claim frame-wide — neither chord is a text-editing binding
+        // in the palette keymaps, so they always bubble here unconsumed.
+        "n" if ctrl => MenuKey::Down,
+        "p" if ctrl => MenuKey::Up,
         "enter" if cmd || ctrl => MenuKey::ModEnter,
         "enter" => MenuKey::Enter,
         "escape" => MenuKey::Escape,
@@ -137,23 +293,28 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 // Elements
 // ---------------------------------------------------------------------------
 
-/// The floating-menu surface (comet `.glass-surface` + `menuSurface`):
-/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
-/// gpui has no backdrop blur at the pinned rev, so the glass
-/// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
-/// the near-opaque tone it composites to on the dark panels (~#161616), plus
-/// the same hairline + baked-in shadow.
+/// The floating-menu surface (zeron `.glass-surface` + `menuSurface`):
+/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint —
+/// the real recipe now that the fork paints backdrop blur: the
+/// [`Theme::glass_overlay`] tint (`oklch(0.33 0 0 / 34%)` on dark) over the
+/// [`crate::frost::MENU_BLUR`] blur from the mount helpers below, plus the
+/// same hairline + baked-in shadow. Opaque platforms keep the near-opaque
+/// tone the reference composites to on the dark panels (~#161616).
+/// Corner radius of every floating card. The frost wrapper masks its backdrop
+/// blur to the same value, so the two must agree.
+pub const CARD_RADIUS: f32 = 12.0;
+
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
         .border_color(hairline(0.10))
-        .rounded(px(12.0))
+        .rounded(px(CARD_RADIUS))
         .shadow_lg()
         .p(px(4.0))
         .overflow_hidden()
         .text_size(px(13.0))
         .text_color(theme.text);
-    if theme.is_glass() {
+    if theme.is_frost() {
         // Translucent tint — the backdrop blur beneath it comes from the
         // [`crate::frost::frosted`] wrapper at the mount helpers below.
         card.bg(theme.glass_overlay())
@@ -183,21 +344,69 @@ fn pinned_layer(layer: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
+/// Eased exit progress (0..=1) for a [`Popup`] closing instant, computed from
+/// the wall clock at render time. Monotonic by construction — unlike the
+/// animation element's own clock, it can never replay from 0 mid-exit.
+fn exit_progress(since: std::time::Instant) -> f32 {
+    let total = motion::MENU_OUT
+        .total()
+        .mul_f32(motion::speed_scale())
+        .as_secs_f32();
+    let raw = if total <= 0.0 {
+        1.0
+    } else {
+        (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0)
+    };
+    motion::MENU_OUT.progress(raw)
+}
+
+/// The frosted card for a popover layer: full blur while open; while exiting
+/// the blur radius rides the exit progress down to 0 — the `BackdropBlur`
+/// primitive ignores `element_opacity`, so without this the glass slab would
+/// hold full strength through the fade and pop off at unmount.
+fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
+    let blur = crate::frost::MENU_BLUR * (1.0 - exit.unwrap_or(0.0));
+    crate::frost::frosted(CARD_RADIUS, blur, content).into_any_element()
+}
+
+/// Entrance or exit motion for a popover layer. While exiting (the [`Popup`]
+/// closing phase, `exit = Some(progress)`) the content plays
+/// [`motion::menu_out`] under a fresh animation id (same-id reuse would
+/// inherit the entrance's finished clock and snap to the end state) and gets
+/// an occluding overlay on top — the dying menu's rows must not take clicks,
+/// and the overlay also keeps stray clicks from reaching whatever sits
+/// underneath.
+fn menu_motion(id: SharedString, exit: Option<f32>, inner: gpui::Div) -> AnyElement {
+    if let Some(t) = exit {
+        let inner = inner.relative().child(div().absolute().inset_0().occlude());
+        motion::menu_out(SharedString::from(format!("{id}-out")), t, inner).into_any_element()
+    } else {
+        motion::menu_in(id, inner).into_any_element()
+    }
+}
+
 /// Wrap popover content in a floating anchored layer attached to the trigger:
 /// the caller `.child(anchored_menu(...))`s this from the trigger element while
-/// open. Plays `menu-in` (0.14s fade + 2px drop). Dismissal is the caller's
+/// open. Plays `menu-in` (0.14s fade + 2px drop); `closing` (the [`Popup`]
+/// exit phase) swaps in `menu-out`. Dismissal is the caller's
 /// `.on_mouse_down_out` on the content. The layer `.occlude()`s: hitboxes are
 /// paint-order only in gpui, so without it clicks on menu rows would ALSO fire
 /// whatever clickable sits under the floating layer.
-pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+pub fn anchored_menu(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
                 .anchor(Anchor::TopLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(
-                    id,
+                .child(menu_motion(
+                    id.into(),
+                    exit,
                     div().occlude().pt(px(6.0)).child(content),
                 )),
         )
@@ -206,18 +415,69 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
     )
 }
 
+/// [`anchored_menu`] opening DOWNWARD from the trigger's bottom edge — a
+/// dropdown proper (the sidebar's space filter). The default variant pins to
+/// the trigger's top-left, which reads fine for context-style menus but
+/// covers a button-shaped trigger.
+pub fn anchored_menu_below(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    anchored_menu_below_gap(id, content, closing, 6.0)
+}
+
+/// [`anchored_menu_below`] with a caller-chosen trigger→card gap — the
+/// changes-header dropdowns hang off a tight titlebar band and need more
+/// breathing room than the default 6px (user report; t3code sits near 10).
+pub fn anchored_menu_below_gap(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    gap: f32,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
+                        div().occlude().pt(px(gap)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
+}
+
 /// [`anchored_menu`] opening UPWARD from the trigger (composer pickers, the
 /// user menu — anything anchored near the window bottom; Radix flips these
 /// automatically, gpui's `anchored` needs the side picked).
-pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+pub fn anchored_menu_above(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
                 .anchor(Anchor::BottomLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(
-                    id,
+                .child(menu_motion(
+                    id.into(),
+                    exit,
                     div().occlude().pb(px(6.0)).child(content),
                 )),
         )
@@ -230,24 +490,30 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
 /// completions, whose natural anchor is the token/caret rather than the input
 /// element's outer edge.
 pub fn anchored_menu_above_at(
-    id: impl Into<ElementId>,
+    id: impl Into<SharedString>,
     position: Point<Pixels>,
     content: AnyElement,
+    closing: Option<std::time::Instant>,
 ) -> AnyElement {
     div()
         .absolute()
         .left(position.x)
         .top(position.y)
         .size_0()
-        .child(anchored_menu_above(id, content))
+        .child(anchored_menu_above(id, content, closing))
         .into_any_element()
 }
 
 /// [`anchored_menu_above`] right-aligned to the trigger's right edge (t3code
 /// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
 /// picker open leftward instead of running off the window).
-pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+pub fn anchored_menu_above_end(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     div()
         .absolute()
         .top_0()
@@ -258,8 +524,9 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
                 gpui::anchored()
                     .anchor(Anchor::BottomRight)
                     .snap_to_window_with_margin(px(8.0))
-                    .child(motion::menu_in(
-                        id,
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
                         div().occlude().pb(px(6.0)).child(content),
                     )),
             )
@@ -272,17 +539,19 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
 /// A floating menu at an explicit window position (context menus). Occludes
 /// like [`anchored_menu`] so row clicks never reach elements underneath.
 pub fn menu_at(
-    id: impl Into<ElementId>,
+    id: impl Into<SharedString>,
     position: Point<Pixels>,
     content: AnyElement,
+    closing: Option<std::time::Instant>,
 ) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     gpui::deferred(
         gpui::anchored()
             .position(position)
             .anchor(Anchor::TopLeft)
             .snap_to_window_with_margin(px(8.0))
-            .child(motion::menu_in(id, div().occlude().child(content))),
+            .child(menu_motion(id.into(), exit, div().occlude().child(content))),
     )
     .priority(1)
     .into_any_element()
@@ -303,13 +572,39 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
 /// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
 /// The scrim swallows clicks; the caller wires its own dismiss/confirm.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
-/// so the scrim needs explicit dimensions).
+/// so the scrim needs explicit dimensions). The frost radius matches
+/// [`dialog_card`]'s 16px rounding.
 pub fn modal(
     id: impl Into<ElementId>,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
-    let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
+    modal_with(id, viewport, card, 16.0, 0.6)
+}
+
+/// [`modal`] for glass-tinted cards (the add-space palette): a LIGHTER scrim,
+/// so the frosted card reads like the popovers — the standard 0.6 dim buried
+/// the backdrop hue under the blur and the palette came out a flat grey slab
+/// next to the hue-inheriting menus (user report). `corner_radius` must match
+/// the card's rounding.
+pub fn modal_glass(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    corner_radius: f32,
+) -> AnyElement {
+    modal_with(id, viewport, card, corner_radius, 0.35)
+}
+
+fn modal_with(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    corner_radius: f32,
+    scrim: f32,
+) -> AnyElement {
+    let card =
+        crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -318,7 +613,7 @@ pub fn modal(
                     .occlude()
                     .w(viewport.width)
                     .h(viewport.height)
-                    .bg(scrim_alpha(0.6))
+                    .bg(scrim_alpha(scrim))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -329,7 +624,7 @@ pub fn modal(
     .into_any_element()
 }
 
-/// One menu row (comet `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5
+/// One menu row (zeron `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5
 /// text-[13px]`, active = `bg-white/10 text-foreground`, hover wash
 /// `white/[0.08]` fading over `transition-colors` (floating-styles.ts) via the
 /// per-`fade_key` [`motion::hover_blend`]. The caller adds the id/click
@@ -372,7 +667,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
 
 /// [`menu_row`] with a distinct keyboard-navigation highlight: a selected row
 /// carries the full `bg-white/10` wash, the keyboard cursor the lighter
-/// `bg-white/[0.08]` (comet's `data-[highlighted]` styling) — two selected-
+/// `bg-white/[0.08]` (zeron's `data-[highlighted]` styling) — two selected-
 /// looking rows never appear at once.
 pub fn menu_row_nav(
     theme: &Theme,
@@ -389,7 +684,7 @@ pub fn menu_row_nav(
     }
 }
 
-/// Small uppercase section heading inside a floating menu (comet
+/// Small uppercase section heading inside a floating menu (zeron
 /// `MenuHeading`): `px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase
 /// tracking-[0.1em] text-muted-foreground/60`. gpui has no letter-spacing at
 /// the pinned rev; the tracking is approximated with hair spaces.
@@ -419,20 +714,12 @@ pub fn tracked_upper(label: &str) -> String {
     out
 }
 
-/// Hairline divider between menu sections (comet `MenuSeparator`:
+/// Hairline divider between menu sections (zeron `MenuSeparator`:
 /// `mx-1 my-1 h-px bg-white/[0.07]`).
 pub fn menu_separator() -> gpui::Div {
     // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
     // runs border to border (user request).
     div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(hairline(0.07))
-}
-
-/// The trailing check on the selected row (comet `MenuCheck`): 14px,
-/// `text-foreground/70`, pushed to the row end by the caller's flex.
-pub fn menu_check(theme: &Theme) -> impl IntoElement {
-    crate::icons::icon(crate::icons::CHECK)
-        .size(px(14.0))
-        .text_color(theme.text.opacity(0.7))
 }
 
 /// The recessed band tone for a palette/picker header or footer strip — a
@@ -488,6 +775,24 @@ pub fn key_hint(theme: &Theme, icon_path: &'static str, label: &'static str) -> 
         .child(key_hint_label(theme, label))
 }
 
+/// A footer legend whose cap holds a WORD ("tab", "esc") instead of a glyph
+/// — for keys with no icon in the set.
+pub fn key_hint_text(theme: &Theme, cap: &'static str, label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .child(
+            key_cap(theme)
+                .text_size(px(11.0))
+                .font_family(theme.font_mono.clone())
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from(cap)),
+        )
+        .child(key_hint_label(theme, label))
+}
+
 /// A footer legend whose cap holds TWO glyphs split by a hairline
 /// ("[ ↑ | ↓ ] Navigate") sharing one verb.
 pub fn key_hint_pair(
@@ -532,7 +837,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .child(SharedString::from(label.to_string()))
 }
 
-/// The search/text input frame at the top of a picker popover (comet
+/// The search/text input frame at the top of a picker popover (zeron
 /// `searchInput`: `w-full rounded-lg bg-white/[0.04] px-2.5 py-1.5
 /// text-[13px]` + `mb-1`, borderless — full width inside the card's own
 /// p-1, only a 4px bottom margin).
@@ -547,7 +852,7 @@ pub fn search_input_frame(_theme: &Theme, input: AnyElement) -> gpui::Div {
         .child(input)
 }
 
-/// A bordered trailing menu section (comet picker action groups /
+/// A bordered trailing menu section (zeron picker action groups /
 /// branch-picker worktree block: `mt-1 flex flex-col gap-0.5 border-t
 /// border-white/[0.06] pt-1` — the hairline runs edge-to-edge of the card's
 /// p-1 inset, unlike [`menu_separator`]'s mx-1).
@@ -563,7 +868,7 @@ pub fn menu_section() -> gpui::Div {
 }
 
 // ---------------------------------------------------------------------------
-// Dialog primitives (comet dialog.tsx / sidebar dialogs.tsx)
+// Dialog primitives (zeron dialog.tsx / sidebar dialogs.tsx)
 // ---------------------------------------------------------------------------
 
 /// The centered dialog card (`dialog-pop`): `w-[360px] rounded-2xl border
@@ -616,7 +921,7 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
 }
 
 /// Ghost button (`btnGhost`): quiet text, hover wash fading over
-/// `transition-colors` (comet dialogs.tsx). Caller adds id + click; `fade_key`
+/// `transition-colors` (zeron dialogs.tsx). Caller adds id + click; `fade_key`
 /// as in [`menu_row`].
 pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
     let fade_key = fade_key.into();
@@ -668,7 +973,7 @@ pub fn btn_danger(theme: &Theme, label: &str) -> gpui::Div {
         .child(SharedString::from(label.to_string()))
 }
 
-/// Pulsing skeleton rows shown while a list loads (comet:
+/// Pulsing skeleton rows shown while a list loads (zeron:
 /// `h-7 animate-pulse rounded-md bg-white/[0.04]`).
 pub fn skeleton_rows(
     _id: &'static str,
@@ -678,7 +983,7 @@ pub fn skeleton_rows(
     cx: &mut gpui::App,
 ) -> AnyElement {
     let wash = ink(0.04);
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&ZERON_PULSE, view, cx);
     div()
         .flex()
         .flex_col()
@@ -711,6 +1016,40 @@ pub fn error_row(theme: &Theme, message: &str) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_press_note_distinguishes_dismiss_from_open() {
+        let mut popup: Popup<u8> = Popup::default();
+
+        // Fresh open: press finds nothing mounted → click opens.
+        popup.note_trigger_press();
+        assert!(!popup.take_press_was_open());
+        popup.open(1);
+
+        // Trigger click while open: the card's mouse-down-out begins the
+        // close on the press (either handler order) — the note still reads
+        // mounted, so the click must NOT reopen.
+        popup.note_trigger_press();
+        popup.begin_close();
+        assert!(popup.take_press_was_open());
+        // Out-handler first, trigger note second: mid-exit still counts.
+        popup.open(1);
+        popup.begin_close();
+        popup.note_trigger_press();
+        assert!(popup.take_press_was_open());
+
+        // The note is consumed — a later click starts clean.
+        assert!(!popup.take_press_was_open());
+
+        // Kind-keyed popups: a press on a DIFFERENT trigger doesn't count,
+        // so that click switches menus instead of swallowing.
+        let mut popup: Popup<u8> = Popup::default();
+        popup.open(1);
+        popup.note_trigger_press_matching(|kind| *kind == 2);
+        assert!(!popup.take_press_was_open());
+        popup.note_trigger_press_matching(|kind| *kind == 1);
+        assert!(popup.take_press_was_open());
+    }
 
     #[test]
     fn menu_step_wraps_and_enters() {
@@ -758,6 +1097,11 @@ mod tests {
         assert_eq!(classify_key("escape", false, false), MenuKey::Escape);
         assert_eq!(classify_key("backspace", false, false), MenuKey::Backspace);
         assert_eq!(classify_key("a", false, false), MenuKey::Other);
+        // Readline motion — only with ctrl held.
+        assert_eq!(classify_key("n", false, true), MenuKey::Down);
+        assert_eq!(classify_key("p", false, true), MenuKey::Up);
+        assert_eq!(classify_key("n", false, false), MenuKey::Other);
+        assert_eq!(classify_key("p", true, false), MenuKey::Other);
     }
 
     #[test]

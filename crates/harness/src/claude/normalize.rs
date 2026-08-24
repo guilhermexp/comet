@@ -1,10 +1,21 @@
-//! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
-//! (init dedupe, subagent filtering, tool decoding, error-code mapping).
+//! Frame → [`AgentEvent`] normalization (init dedupe, subagent tagging, tool
+//! decoding, error-code mapping).
 
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 use serde_json::Value;
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall, WorkflowProgressNode,
+    WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
+};
 
-use super::wire::{ContentBlock, Frame};
+use super::wire::{ContentBlock, Frame, SystemFrame};
+use crate::partial_tool_input::PartialFileToolInput;
+
+#[derive(Debug)]
+struct StreamingToolInput {
+    id: String,
+    input: PartialFileToolInput,
+    parent_tool_use_id: Option<String>,
+}
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -67,6 +78,38 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+const TOOL_RESULT_OUTPUT_MAX: usize = 64 * 1024;
+
+fn tool_result_output(block: &ContentBlock) -> Option<String> {
+    let text = if let Some(text) = block.content.as_str() {
+        text.to_owned()
+    } else {
+        block
+            .content
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    if text.trim().is_empty()
+        || text.contains("internal metadata — never quote")
+        || (text.contains("agentId:") && text.contains("output_file:"))
+    {
+        return None;
+    }
+    let mut end = text.len().min(TOOL_RESULT_OUTPUT_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(text[..end].to_owned())
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -112,6 +155,20 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
                 })
                 .collect(),
         },
+        // The subagent spawn: name the chip — and the tab it opens — after
+        // the TASK, not the bare tool ("Agent" alone says nothing in a tab
+        // strip; the tool's `description` is where the work is named).
+        "Agent" | "Task" => {
+            let description = str_field(input, "description");
+            ToolCall::Unknown {
+                name: if description.is_empty() {
+                    "Agent".into()
+                } else {
+                    format!("Agent: {description}")
+                },
+                input: (!input.is_null()).then(|| input.clone()),
+            }
+        }
         // MCP tools arrive as `mcp__<server>__<tool>`.
         _ => match name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
             Some((server, tool)) => ToolCall::Mcp {
@@ -131,28 +188,152 @@ fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Wrap an event as subagent-attributed traffic.
+fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
+    AgentEvent::Subagent {
+        parent_tool_use_id: parent.to_owned(),
+        event: Box::new(event),
+    }
+}
+
+fn non_empty(value: Option<&String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty()).cloned()
+}
+
+fn workflow_status(frame: &SystemFrame) -> WorkflowTaskStatus {
+    let raw = frame
+        .patch
+        .as_ref()
+        .and_then(|patch| patch.get("status"))
+        .and_then(Value::as_str)
+        .or(frame.status.as_deref())
+        .unwrap_or("running");
+    match raw {
+        "completed" | "complete" | "succeeded" | "success" => WorkflowTaskStatus::Completed,
+        "failed" | "errored" | "error" => WorkflowTaskStatus::Failed,
+        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
+            WorkflowTaskStatus::Cancelled
+        }
+        _ => WorkflowTaskStatus::Running,
+    }
+}
+
+fn u64_field(value: &Value, snake_case: &str, camel_case: &str) -> Option<u64> {
+    value
+        .get(snake_case)
+        .or_else(|| value.get(camel_case))
+        .and_then(Value::as_u64)
+}
+
+fn workflow_usage(value: Option<&Value>) -> Option<WorkflowUsage> {
+    let value = value?.as_object()?;
+    let value = Value::Object(value.clone());
+    let usage = WorkflowUsage {
+        total_tokens: u64_field(&value, "total_tokens", "totalTokens"),
+        tool_uses: u64_field(&value, "tool_uses", "toolUses"),
+        duration_ms: u64_field(&value, "duration_ms", "durationMs"),
+    };
+    (usage.total_tokens.is_some() || usage.tool_uses.is_some() || usage.duration_ms.is_some())
+        .then_some(usage)
+}
+
+fn u32_field(value: &Value, snake_case: &str, camel_case: &str) -> Option<u32> {
+    u64_field(value, snake_case, camel_case).and_then(|number| u32::try_from(number).ok())
+}
+
+fn workflow_progress(value: Option<&Value>) -> Vec<WorkflowProgressNode> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| match node.get("type").and_then(Value::as_str) {
+            Some("workflow_phase" | "phase") => Some(WorkflowProgressNode::Phase {
+                index: u32_field(node, "index", "index")?,
+                title: node.get("title")?.as_str()?.to_owned(),
+            }),
+            Some("workflow_agent" | "agent") => Some(WorkflowProgressNode::Agent {
+                index: u32_field(node, "index", "index")?,
+                label: node.get("label")?.as_str()?.to_owned(),
+                phase_index: u32_field(node, "phase_index", "phaseIndex")?,
+                phase_title: node
+                    .get("phase_title")
+                    .or_else(|| node.get("phaseTitle"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                agent_id: node
+                    .get("agent_id")
+                    .or_else(|| node.get("agentId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                model: node.get("model").and_then(Value::as_str).map(str::to_owned),
+                state: node.get("state").and_then(Value::as_str).map(str::to_owned),
+                prompt_preview: node
+                    .get("prompt_preview")
+                    .or_else(|| node.get("promptPreview"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn agent_count(summary: Option<&Value>) -> Option<u32> {
+    let summary = match summary? {
+        Value::String(summary) => summary.clone(),
+        value => serde_json::to_string(value).ok()?,
+    };
+    let start = summary.find("<agent_count>")? + "<agent_count>".len();
+    let end = summary[start..].find("</agent_count>")? + start;
+    summary[start..end].parse().ok()
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
-/// is re-invoked WITHIN one session (a background-task notification, a
-/// scheduled wakeup), not just at start. Downstream, `SessionStarted` is the
-/// fold's run boundary (it resets accumulated parts), so one run ⇒ one
-/// `SessionStarted`.
+/// is re-invoked WITHIN one session (a background-subagent wake turn, a
+/// scheduled wakeup), not just at start (live-verified against 2.1.228: a
+/// background subagent finishing produces a second init with the SAME session
+/// id, then a second `result`). Downstream, `SessionStarted` is the fold's run
+/// boundary (it resets accumulated parts), so one run ⇒ one `SessionStarted`;
+/// the wake turn's own frames flow through and the engine's parked-session
+/// resume turns them into the done→Working→done wake.
 pub(crate) struct Normalizer {
     saw_init: bool,
+    /// Background-agent ids (`task_started.task_id`) → the spawning Agent
+    /// tool_use id. `SendMessage` steers address the AGENT id; this map
+    /// re-keys them onto the spawn chip's feed (the wire never echoes the
+    /// steer on the child feed — live-verified 2.1.228).
+    agent_tasks: std::collections::HashMap<String, String>,
+    /// Structured task ids already observed. Later lifecycle frames can be
+    /// sparse, so identity is the only provider context retained here.
+    workflow_tasks: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
+    context_window: Option<u64>,
+    streaming_tools: std::collections::HashMap<usize, StreamingToolInput>,
 }
 
 impl Normalizer {
     pub fn new() -> Self {
         Self {
             saw_init: false,
+            agent_tasks: std::collections::HashMap::new(),
+            workflow_tasks: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
+            context_window: None,
+            streaming_tools: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_context_window(context_window: u64) -> Self {
+        Self {
+            context_window: Some(context_window),
+            ..Self::new()
         }
     }
 
@@ -163,13 +344,151 @@ impl Normalizer {
         (prev, self.assistant_message_id.clone())
     }
 
+    fn start_streaming_tool(
+        &mut self,
+        index: usize,
+        block: ContentBlock,
+        parent_tool_use_id: Option<String>,
+    ) -> Option<AgentEvent> {
+        let mut input = PartialFileToolInput::new(&block.name)?;
+        let call = block
+            .input
+            .as_object()
+            .filter(|value| !value.is_empty())
+            .and_then(|_| serde_json::to_string(&block.input).ok())
+            .and_then(|raw| input.push(&raw));
+        self.streaming_tools.insert(
+            index,
+            StreamingToolInput {
+                id: block.id.clone(),
+                input,
+                parent_tool_use_id: parent_tool_use_id.clone(),
+            },
+        );
+        call.map(|call| {
+            let event = AgentEvent::ToolCallPreview { id: block.id, call };
+            parent_tool_use_id
+                .as_deref()
+                .map(|parent| tag(parent, event.clone()))
+                .unwrap_or(event)
+        })
+    }
+
+    fn update_streaming_tool(&mut self, index: usize, delta: &str) -> Option<AgentEvent> {
+        let state = self.streaming_tools.get_mut(&index)?;
+        let call = state.input.push(delta)?;
+        let event = AgentEvent::ToolCallPreview {
+            id: state.id.clone(),
+            call,
+        };
+        Some(
+            state
+                .parent_tool_use_id
+                .as_deref()
+                .map(|parent| tag(parent, event.clone()))
+                .unwrap_or(event),
+        )
+    }
+
+    fn finish_streaming_tool(&mut self, index: usize) -> Option<AgentEvent> {
+        let mut state = self.streaming_tools.remove(&index)?;
+        let call = state.input.force_preview()?;
+        let event = AgentEvent::ToolCallPreview { id: state.id, call };
+        Some(
+            state
+                .parent_tool_use_id
+                .as_deref()
+                .map(|parent| tag(parent, event.clone()))
+                .unwrap_or(event),
+        )
+    }
+
     /// Normalize one stdout frame into 0+ unified events. `interrupted` folds
     /// a post-interrupt `result` into `Done { status: Interrupted }`.
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
             Frame::System(f) => {
+                let is_task_lifecycle = matches!(
+                    f.subtype.as_str(),
+                    "task_started" | "task_updated" | "task_progress" | "task_notification"
+                );
+                let task_id = f.task_id.as_deref().filter(|task| !task.is_empty());
+                let explicitly_structured = f.task_type.as_deref() == Some("local_workflow")
+                    || f.workflow_name
+                        .as_ref()
+                        .is_some_and(|name| !name.is_empty())
+                    || f.workflow_progress.as_ref().is_some_and(Value::is_array);
+                let excluded =
+                    matches!(f.task_type.as_deref(), Some("local_bash" | "local_command"));
+                let workflow = (is_task_lifecycle && !excluded)
+                    .then_some(task_id)
+                    .flatten()
+                    .filter(|task| explicitly_structured || self.workflow_tasks.contains(*task))
+                    .map(|task| {
+                        self.workflow_tasks.insert(task.to_owned());
+                        AgentEvent::WorkflowTask {
+                            task: WorkflowTaskUpdate {
+                                task_id: task.to_owned(),
+                                status: workflow_status(&f),
+                                workflow_name: non_empty(f.workflow_name.as_ref()),
+                                description: non_empty(f.description.as_ref()),
+                                usage: workflow_usage(f.usage.as_ref()),
+                                progress: workflow_progress(f.workflow_progress.as_ref()),
+                                agent_count: agent_count(f.summary.as_ref()),
+                                task_type: non_empty(f.task_type.as_ref()),
+                                subagent_type: non_empty(f.subagent_type.as_ref()),
+                            },
+                        }
+                    });
+                // A background subagent's completion arrives as an UNTAGGED
+                // `task_notification` carrying the spawning tool's id — the
+                // wire's only terminal signal for it (live-verified 2.1.228:
+                // no tagged frame follows; the subagent's stream just stops).
+                // Surface it as the subagent's tagged Done so the chip flips
+                // done/failed and the transcript freezes.
+                if f.subtype == "task_notification" {
+                    let done =
+                        f.tool_use_id
+                            .as_deref()
+                            .filter(|tool| !tool.is_empty())
+                            .and_then(|parent| {
+                                let status = match f.status.as_deref().unwrap_or("") {
+                                    "completed" | "complete" | "succeeded" | "success" => {
+                                        DoneStatus::Completed
+                                    }
+                                    "failed" | "errored" | "error" => DoneStatus::Errored,
+                                    "killed" | "cancelled" | "canceled" | "stopped"
+                                    | "interrupted" => DoneStatus::Interrupted,
+                                    // Non-terminal notification shapes: nothing to close.
+                                    _ => return None,
+                                };
+                                Some(tag(
+                                    parent,
+                                    AgentEvent::Done {
+                                        status,
+                                        result: None,
+                                        error: None,
+                                        session_id: None,
+                                    },
+                                ))
+                            });
+                    return workflow.into_iter().chain(done).collect();
+                }
+                // An AGENT task starting (subagent_type present — subagent-
+                // owned shell tasks carry the same subtype without it):
+                // record agentId → spawn id for SendMessage steer re-keying.
+                if f.subtype == "task_started"
+                    && f.subagent_type.is_some()
+                    && let (Some(task), Some(tool)) = (
+                        f.task_id.as_deref().filter(|t| !t.is_empty()),
+                        f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+                    )
+                {
+                    self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+                    return workflow.into_iter().collect();
+                }
                 if f.subtype != "init" || self.saw_init {
-                    return Vec::new();
+                    return workflow.into_iter().collect();
                 }
                 self.saw_init = true;
                 self.session_id = Some(f.session_id.clone());
@@ -184,13 +503,58 @@ impl Normalizer {
             }
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
-            // nested transcript; a background Task runs concurrently with the
-            // parent's text stream, so folding them in would split a contiguous
-            // text block around a phantom tool call. Only null-parent frames
-            // are this turn's own content.
+            // nested transcript: a background subagent runs concurrently with
+            // the parent's own stream, so folding them into the parent feed
+            // would split a contiguous text block around phantom tool calls
+            // (and a subagent's message boundaries must never rotate the
+            // parent's assistant message id). They are wrapped in
+            // `AgentEvent::Subagent` instead — the engine routes them to the
+            // subagent's own doc.
             Frame::StreamEvent(f) => {
-                if f.parent_tool_use_id.is_some() || f.event.kind != "content_block_delta" {
+                if f.event.kind == "content_block_start" {
+                    return f
+                        .event
+                        .content_block
+                        .and_then(|block| {
+                            self.start_streaming_tool(f.event.index, block, f.parent_tool_use_id)
+                        })
+                        .into_iter()
+                        .collect();
+                }
+                if f.event.kind == "content_block_stop" {
+                    return self
+                        .finish_streaming_tool(f.event.index)
+                        .into_iter()
+                        .collect();
+                }
+                if f.event.kind != "content_block_delta" {
                     return Vec::new();
+                }
+                if f.event.delta.kind == "input_json_delta" {
+                    let progressive =
+                        self.update_streaming_tool(f.event.index, &f.event.delta.partial_json);
+                    if progressive.is_some() {
+                        return progressive.into_iter().collect();
+                    }
+                }
+                if let Some(parent) = &f.parent_tool_use_id {
+                    return match f.event.delta.kind.as_str() {
+                        "text_delta" => vec![tag(
+                            parent,
+                            AgentEvent::TextDelta {
+                                text: f.event.delta.text,
+                            },
+                        )],
+                        "thinking_delta" if !f.event.delta.thinking.is_empty() => vec![tag(
+                            parent,
+                            AgentEvent::ReasoningDelta {
+                                text: f.event.delta.thinking,
+                            },
+                        )],
+                        // Subagent liveness heartbeats have no consumer; the
+                        // parent turn is already done (eager-done policy).
+                        _ => Vec::new(),
+                    };
                 }
                 match f.event.delta.kind.as_str() {
                     "text_delta" => vec![AgentEvent::TextDelta {
@@ -212,16 +576,95 @@ impl Normalizer {
             }
 
             Frame::Assistant(f) => {
-                if f.parent_tool_use_id.is_some() {
-                    return Vec::new();
+                if let Some(parent) = &f.parent_tool_use_id {
+                    // Subagent content, attributed. The 2.1.x wire streams NO
+                    // tagged partial deltas (live-verified): a subagent's text
+                    // arrives only as full text blocks on its tagged
+                    // assistant frames — emit them, in block order with the
+                    // tool calls, or subagent transcripts are tool-chips-only.
+                    let mut out: Vec<AgentEvent> = f
+                        .message
+                        .blocks()
+                        .filter_map(|b: ContentBlock| match b.kind.as_str() {
+                            "text" if !b.text.is_empty() => Some(tag(
+                                parent,
+                                AgentEvent::TextDelta {
+                                    text: format!("{}\n\n", b.text.trim_end()),
+                                },
+                            )),
+                            "tool_use" => Some(tag(
+                                parent,
+                                AgentEvent::ToolCall {
+                                    id: b.id.clone(),
+                                    call: decode_tool_use(&b.name, &b.input),
+                                },
+                            )),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(code) = &f.error {
+                        out.push(tag(
+                            parent,
+                            AgentEvent::Error {
+                                message: assistant_error_text(code),
+                            },
+                        ));
+                    }
+                    self.streaming_tools
+                        .retain(|_, tool| tool.parent_tool_use_id.as_deref() != Some(parent));
+                    return out;
                 }
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_use")
-                    .map(|b| AgentEvent::ToolCall {
-                        id: b.id.clone(),
-                        call: decode_tool_use(&b.name, &b.input),
+                    .flat_map(|b| {
+                        let call = AgentEvent::ToolCall {
+                            id: b.id.clone(),
+                            call: decode_tool_use(&b.name, &b.input),
+                        };
+                        // A spawn's `prompt` is the subagent's opening user
+                        // message — the wire never echoes it on the child
+                        // feed (child user frames carry tool results and
+                        // steers only), so seed it here and the subagent
+                        // transcript starts the way every chat does.
+                        let opening = matches!(b.name.as_str(), "Agent" | "Task")
+                            .then(|| b.input.get("prompt"))
+                            .flatten()
+                            .and_then(Value::as_str)
+                            .filter(|p| !p.trim().is_empty())
+                            .map(|prompt| {
+                                tag(
+                                    &b.id,
+                                    AgentEvent::UserMessage {
+                                        text: prompt.to_owned(),
+                                    },
+                                )
+                            });
+                        // A SendMessage steer never echoes on the child feed
+                        // (live-verified) — surface it from the parent's own
+                        // call, re-keyed onto the spawn it addresses.
+                        let steer = (b.name == "SendMessage")
+                            .then(|| {
+                                let to = ["to", "recipient"]
+                                    .iter()
+                                    .find_map(|k| b.input.get(*k))
+                                    .and_then(Value::as_str)?;
+                                let spawn = self.agent_tasks.get(to)?;
+                                let text = ["message", "content"]
+                                    .iter()
+                                    .find_map(|k| b.input.get(*k))
+                                    .and_then(Value::as_str)
+                                    .filter(|m| !m.trim().is_empty())?;
+                                Some(tag(
+                                    spawn,
+                                    AgentEvent::UserMessage {
+                                        text: text.to_owned(),
+                                    },
+                                ))
+                            })
+                            .flatten();
+                        std::iter::once(call).chain(opening).chain(steer)
                     })
                     .collect();
                 // A failed turn (usage limit, billing, auth, overloaded, …)
@@ -232,6 +675,8 @@ impl Normalizer {
                         message: assistant_error_text(code),
                     });
                 }
+                self.streaming_tools
+                    .retain(|_, tool| tool.parent_tool_use_id.is_some());
                 // The enclosing assistant frame closes the streamed message
                 // item; rotate so post-boundary deltas get a fresh id.
                 let (prev, _next) = self.rotate_for_steer();
@@ -242,8 +687,41 @@ impl Normalizer {
             }
 
             Frame::User(f) => {
-                if f.parent_tool_use_id.is_some() {
-                    return Vec::new();
+                if let Some(parent) = &f.parent_tool_use_id {
+                    // A subagent's tool results echo on the main channel too;
+                    // they belong to its transcript, attributed like its calls.
+                    let mut out: Vec<AgentEvent> = f
+                        .message
+                        .blocks()
+                        .filter(|b: &ContentBlock| b.kind == "tool_result")
+                        .map(|b| {
+                            tag(
+                                parent,
+                                AgentEvent::ToolResult {
+                                    id: b.tool_use_id.clone(),
+                                    is_error: b.is_error.unwrap_or(false),
+                                    output: tool_result_output(&b),
+                                    diff: None,
+                                    execution: None,
+                                },
+                            )
+                        })
+                        .collect();
+                    // A tagged user frame's TEXT blocks are the parent
+                    // steering its subagent (SendMessage-style follow-ups —
+                    // tool results ride their own blocks, filtered above).
+                    // Synthetic harness injections are not conversation.
+                    out.extend(
+                        f.message
+                            .blocks()
+                            .filter(|b: &ContentBlock| {
+                                b.kind == "text"
+                                    && !b.text.trim().is_empty()
+                                    && !b.text.trim_start().starts_with("<system-reminder>")
+                            })
+                            .map(|b| tag(parent, AgentEvent::UserMessage { text: b.text })),
+                    );
+                    return out;
                 }
                 f.message
                     .blocks()
@@ -251,6 +729,9 @@ impl Normalizer {
                     .map(|b| AgentEvent::ToolResult {
                         id: b.tool_use_id.clone(),
                         is_error: b.is_error.unwrap_or(false),
+                        output: tool_result_output(&b),
+                        diff: None,
+                        execution: None,
                     })
                     .collect()
             }
@@ -277,6 +758,18 @@ impl Normalizer {
                 let usage = AgentEvent::Usage {
                     input_tokens: f.usage.input_tokens,
                     output_tokens: f.usage.output_tokens,
+                    context_usage: self.context_window.and_then(|context_window| {
+                        let tokens = f
+                            .usage
+                            .input_tokens
+                            .saturating_add(f.usage.cache_read_input_tokens)
+                            .saturating_add(f.usage.cache_creation_input_tokens)
+                            .saturating_add(f.usage.output_tokens);
+                        (tokens > 0 && context_window > 0).then_some(zeron_proto::ContextUsage {
+                            tokens,
+                            context_window,
+                        })
+                    }),
                 };
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
@@ -303,7 +796,7 @@ impl Normalizer {
                         .partition(|m| is_internal_diagnostic(m));
                     for diagnostic in &diagnostics {
                         tracing::debug!(
-                            target: "comet_harness::claude",
+                            target: "zeron_harness::claude",
                             "internal CLI diagnostic (not surfaced): {diagnostic}"
                         );
                     }
@@ -398,27 +891,47 @@ mod tests {
         ));
     }
 
-    fn result_done(raw: &str) -> AgentEvent {
+    fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-        let events = Normalizer::new().normalize(frame, false);
+        Normalizer::new().normalize(frame, false)
+    }
+
+    fn result_done(raw: &str) -> AgentEvent {
+        let events = normalize_one(raw);
         assert_eq!(events.len(), 2, "usage + done");
         events.into_iter().nth(1).expect("done event")
     }
 
     #[test]
+    fn result_usage_reports_current_context_including_cache_tokens() {
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"cache_read_input_tokens":80,"cache_creation_input_tokens":5,"output_tokens":7}}"#,
+        )
+        .unwrap();
+        let events = Normalizer::with_context_window(200_000).normalize(frame, false);
+        assert_eq!(
+            events.first(),
+            Some(&AgentEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 7,
+                context_usage: Some(zeron_proto::ContextUsage {
+                    tokens: 102,
+                    context_window: 200_000,
+                }),
+            })
+        );
+    }
+
+    #[test]
     fn stream_deltas_map_to_text_reasoning_and_heartbeats() {
-        let normalize = |raw: &str| {
-            let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-            Normalizer::new().normalize(frame, false)
-        };
         // Real thinking text streams as a reasoning delta.
-        let ev = normalize(
+        let ev = normalize_one(
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}"#,
         );
         assert_eq!(ev, vec![AgentEvent::ReasoningDelta { text: "hmm".into() }]);
         // Redacted thinking (estimated_tokens only) yields the empty
         // heartbeat shape the engine filters.
-        let ev = normalize(
+        let ev = normalize_one(
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}"#,
         );
         assert_eq!(
@@ -430,7 +943,7 @@ mod tests {
         // A tool input being generated (input_json_delta) is a liveness
         // heartbeat, not silence — minutes of a big Write must not read as
         // a stalled run.
-        let ev = normalize(
+        let ev = normalize_one(
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"file_"}}}"#,
         );
         assert_eq!(
@@ -440,10 +953,552 @@ mod tests {
             }]
         );
         // Signature deltas stay dropped.
-        let ev = normalize(
+        let ev = normalize_one(
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"abc"}}}"#,
         );
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn progressive_write_input_refreshes_one_tool_id_until_authoritative_frame() {
+        let mut normalizer = Normalizer::new();
+        let frames = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool-write","name":"Write","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"notes/new.txt\",\"content\":\"first"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\\nsecond\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":2}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-write","name":"Write","input":{"file_path":"notes/new.txt","content":"first\nsecond"}}]}}"#,
+        ];
+
+        let events = frames
+            .into_iter()
+            .flat_map(|raw| {
+                let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+                normalizer.normalize(frame, false)
+            })
+            .collect::<Vec<_>>();
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
+                    Some((id, call))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.len() >= 2, "events: {events:#?}");
+        assert!(calls.iter().all(|(id, _)| id.as_str() == "tool-write"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| matches!(event, AgentEvent::ToolCall { id, .. } if id == "tool-write")
+                )
+                .count(),
+            1,
+            "only the authoritative frame may carry the full durable call: {events:#?}"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallPreview { id, .. } if id == "tool-write")
+        ));
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolCallPreview { id, .. } if id == "tool-write"))
+                .count()
+                >= 2,
+            "small newline update must refresh before the authoritative call: {events:#?}"
+        );
+        assert_eq!(
+            calls.last().map(|(_, call)| *call),
+            Some(&ToolCall::WriteFile {
+                path: "notes/new.txt".into(),
+                content: Some("first\nsecond".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn initial_claude_tool_input_is_unicode_safely_capped() {
+        let mut normalizer = Normalizer::new();
+        let oversized = "€".repeat((1024 * 1024 / 3) + 32);
+        normalizer.start_streaming_tool(
+            7,
+            ContentBlock {
+                kind: "tool_use".into(),
+                id: "large-write".into(),
+                name: "Write".into(),
+                input: json!({ "file_path": "large.txt", "content": oversized }),
+                ..ContentBlock::default()
+            },
+            None,
+        );
+
+        let ToolCall::WriteFile {
+            content: Some(content),
+            ..
+        } = normalizer.streaming_tools[&7]
+            .input
+            .preview_call()
+            .expect("bounded preview")
+        else {
+            panic!("write preview")
+        };
+        assert!(content.len() <= crate::partial_tool_input::PARTIAL_PREVIEW_BODY_MAX_BYTES);
+    }
+
+    fn claude_progressive_stream_stats(body_bytes: usize) -> (usize, usize) {
+        let mut normalizer = Normalizer::new();
+        normalizer.start_streaming_tool(
+            9,
+            ContentBlock {
+                kind: "tool_use".into(),
+                id: "bounded-write".into(),
+                name: "Write".into(),
+                input: json!({}),
+                ..ContentBlock::default()
+            },
+            None,
+        );
+        let mut events = normalizer
+            .update_streaming_tool(9, "{\"file_path\":\"large.txt\",\"content\":\"")
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)) {
+            events.extend(normalizer.update_streaming_tool(9, &chunk));
+        }
+        let serialized_bytes = events
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum();
+        (events.len(), serialized_bytes)
+    }
+
+    #[test]
+    fn claude_progressive_megabyte_is_linear_and_coalesced() {
+        let half = claude_progressive_stream_stats(512 * 1024);
+        let full = claude_progressive_stream_stats(1024 * 1024);
+
+        assert!(full.0 <= 70, "too many refreshes: {full:?}");
+        assert!(full.1 <= 2 * 1024 * 1024, "too many bytes: {full:?}");
+        assert!(
+            full.1 <= half.1 * 3,
+            "growth is superlinear: {half:?} -> {full:?}"
+        );
+    }
+
+    #[test]
+    fn progressive_edit_input_preserves_growing_new_string() {
+        let mut normalizer = Normalizer::new();
+        let frames = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"tool-edit","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"src/a.rs\",\"old_string\":\"old\",\"new_string\":\"new"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":" value\"}"}}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-edit","name":"Edit","input":{"file_path":"src/a.rs","old_string":"old","new_string":"new value"}}]}}"#,
+        ];
+
+        let events = frames
+            .into_iter()
+            .flat_map(|raw| {
+                let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+                normalizer.normalize(frame, false)
+            })
+            .collect::<Vec<_>>();
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call }
+                    if id == "tool-edit" =>
+                {
+                    Some(call)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.len() >= 2, "events: {events:#?}");
+        assert_eq!(
+            calls.last().copied(),
+            Some(&ToolCall::EditFile {
+                path: "src/a.rs".into(),
+                old_string: Some("old".into()),
+                new_string: Some("new value".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn subagent_stream_deltas_arrive_tagged() {
+        let ev = normalize_one(
+            r#"{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"sub text"}}}"#,
+        );
+        assert_eq!(
+            ev,
+            vec![AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "sub text".into()
+                }),
+            }]
+        );
+        // Subagent input_json heartbeats are dropped — the parent turn is
+        // already done under the eager-done policy, nothing to keep alive.
+        let ev = normalize_one(
+            r#"{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#,
+        );
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn subagent_tool_calls_and_results_arrive_tagged_without_boundary_rotation() {
+        let mut norm = Normalizer::new();
+        let before = norm.assistant_message_id.clone();
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(frame, false);
+        assert_eq!(
+            ev,
+            vec![AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    call: ToolCall::Exec {
+                        command: "ls".into()
+                    },
+                }),
+            }]
+        );
+        // A subagent's assistant frame must NOT rotate the parent's message
+        // id (it would split the parent's contiguous text mid-stream).
+        assert_eq!(norm.assistant_message_id, before);
+
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(frame, false);
+        assert_eq!(
+            ev,
+            vec![AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::ToolResult {
+                    id: "t1".into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                    execution: None,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn top_level_tool_result_preserves_renderable_text_content() {
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t-output","is_error":false,"content":"11 alpha.txt\n"}]}}"#,
+        )
+        .expect("parses");
+        let events = Normalizer::new().normalize(frame, false);
+        assert_eq!(
+            events,
+            vec![AgentEvent::ToolResult {
+                id: "t-output".into(),
+                is_error: false,
+                output: Some("11 alpha.txt\n".into()),
+                diff: None,
+                execution: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn spawn_prompt_seeds_the_subagent_opening_user_message() {
+        // The wire never echoes a Task's prompt on the child feed, so the
+        // spawn itself seeds the subagent's opening user entry.
+        let ev = normalize_one(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_sub","name":"Task","input":{"description":"probe","prompt":"scan the fold path"}}]}}"#,
+        );
+        assert!(matches!(
+            &ev[..],
+            [
+                AgentEvent::ToolCall { id, .. },
+                AgentEvent::Subagent { parent_tool_use_id, event },
+                AgentEvent::AssistantMessageCompleted { .. },
+            ] if id == "toolu_sub"
+                && parent_tool_use_id == "toolu_sub"
+                && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "scan the fold path")
+        ));
+        // No prompt → no synthetic opening; ordinary tools never spawn one.
+        for frame in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Task","input":{"description":"probe"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls","prompt":"red herring"}}]}}"#,
+        ] {
+            let ev = normalize_one(frame);
+            assert!(
+                !ev.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                "{frame}: {ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_message_steers_rekey_onto_the_spawn_feed() {
+        // Live 2.1.228: the steer NEVER echoes on the child feed; the only
+        // wire evidence is the parent's SendMessage call addressed to the
+        // agent id that task_started paired with the spawn tool id.
+        let mut norm = Normalizer::new();
+        let started = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"a20b2336","tool_use_id":"toolu_spawn","subagent_type":"general-purpose","prompt":"p","description":"d"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(started, false).is_empty());
+        let send = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{"to":"a20b2336","message":"Also read the rebuild.","summary":"s"}}]}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(send, false);
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "toolu_spawn"
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "Also read the rebuild.")
+            )),
+            "{ev:?}"
+        );
+        // Unknown recipient (no task_started seen) or a subagent-owned shell
+        // task's task_started: no steer synthesized.
+        let mut norm = Normalizer::new();
+        let shell_task = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(shell_task, false).is_empty());
+        let send = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"bg1","message":"x"}}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !norm
+                .normalize(send, false)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Subagent { .. }))
+        );
+    }
+
+    #[test]
+    fn tagged_user_text_becomes_a_subagent_steer() {
+        // A tagged user frame's TEXT block is the parent steering its
+        // subagent — forwarded as a tagged UserMessage so the subagent doc
+        // grows a user entry.
+        let ev = normalize_one(
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"Also check the rebuild path."}]}}"#,
+        );
+        assert_eq!(
+            ev,
+            vec![AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::UserMessage {
+                    text: "Also check the rebuild path.".into(),
+                }),
+            }]
+        );
+        // Synthetic harness injections are not conversation, and blank text
+        // is noise; an UNTAGGED user text frame is not a steer at all (the
+        // parent chat's user messages come from doc commands).
+        for frame in [
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"<system-reminder>tick</system-reminder>"}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"   "}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"typed into the parent"}]}}"#,
+        ] {
+            assert_eq!(normalize_one(frame), Vec::new(), "frame: {frame}");
+        }
+        // Mixed frames keep both: the tool result AND the steer text.
+        let ev = normalize_one(
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false},{"type":"text","text":"Keep going."}]}}"#,
+        );
+        assert!(matches!(
+            &ev[..],
+            [
+                AgentEvent::Subagent { event: first, .. },
+                AgentEvent::Subagent { event: second, .. },
+            ] if matches!(first.as_ref(), AgentEvent::ToolResult { .. })
+                && matches!(second.as_ref(), AgentEvent::UserMessage { text } if text == "Keep going.")
+        ));
+    }
+
+    #[test]
+    fn task_notification_settles_the_subagent_with_a_tagged_done() {
+        // The wire's ONLY terminal signal for a background subagent
+        // (live-verified 2.1.228): an untagged system frame carrying the
+        // spawning tool's id. Shape from the captured fixture.
+        let ev = normalize_one(
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_agent","status":"completed","summary":"DONE."}"#,
+        );
+        assert_eq!(
+            ev,
+            vec![AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_agent".into(),
+                event: Box::new(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            }]
+        );
+        let ev = normalize_one(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"failed"}"#,
+        );
+        assert!(matches!(
+            &ev[..],
+            [AgentEvent::Subagent { event, .. }]
+                if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Errored, .. })
+        ));
+        // Non-terminal or id-less notifications close nothing.
+        assert!(normalize_one(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"running"}"#,
+        )
+        .is_empty());
+        assert!(
+            normalize_one(
+                r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn claude_task_progress_emits_workflow_activity() {
+        let events = normalize_one(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf-1","task_type":"local_workflow","workflow_name":"Audit","description":"Review repository","usage":{"total_tokens":1200,"tool_uses":4,"duration_ms":2500},"workflow_progress":[{"type":"workflow_phase","index":0,"title":"Review"},{"type":"workflow_agent","index":0,"label":"Repository reviewer","phaseIndex":0,"phaseTitle":"Review","agentId":"agent-1","model":"claude-opus-4-1","state":"running","promptPreview":"Inspect the repository"}],"summary":"<usage><agent_count>1</agent_count></usage>"}"#,
+        );
+
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::WorkflowTask { task }]
+                if task.task_id == "wf-1"
+                    && task.workflow_name.as_deref() == Some("Audit")
+                    && task.description.as_deref() == Some("Review repository")
+                    && task.usage == Some(zeron_proto::WorkflowUsage {
+                        total_tokens: Some(1_200),
+                        tool_uses: Some(4),
+                        duration_ms: Some(2_500),
+                    })
+                    && task.progress.len() == 2
+                    && task.agent_count == Some(1)
+                    && task.task_type.as_deref() == Some("local_workflow")
+        ));
+    }
+
+    #[test]
+    fn claude_sparse_terminal_notification_preserves_subagent_done() {
+        let mut normalizer = Normalizer::new();
+        let started = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"wf-1","task_type":"local_workflow","workflow_name":"Audit"}"#,
+        )
+        .expect("start parses");
+        assert!(matches!(
+            normalizer.normalize(started, false).as_slice(),
+            [AgentEvent::WorkflowTask { .. }]
+        ));
+        let completed = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"wf-1","tool_use_id":"toolu_agent","status":"completed"}"#,
+        )
+        .expect("terminal notification parses");
+        let events = normalizer.normalize(completed, false);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowTask { task }
+                if task.task_id == "wf-1"
+                    && task.status == zeron_proto::WorkflowTaskStatus::Completed
+                    && task.workflow_name.is_none()
+                    && task.progress.is_empty()
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Subagent { parent_tool_use_id, event }
+                if parent_tool_use_id == "toolu_agent"
+                    && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        )));
+    }
+
+    #[test]
+    fn claude_local_bash_and_malformed_tasks_emit_no_workflow_activity() {
+        for frame in [
+            r#"{"type":"system","subtype":"task_started","task_id":"bash-1","task_type":"local_bash","description":"sleep 10"}"#,
+            r#"{"type":"system","subtype":"task_progress","task_type":"local_workflow","workflow_name":"Missing id"}"#,
+        ] {
+            let events = normalize_one(frame);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::WorkflowTask { .. })),
+                "frame should be ignored: {frame}; events: {events:?}"
+            );
+        }
+
+        let events = normalize_one(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf-1","task_type":"local_workflow","workflow_progress":"not-an-array","usage":42}"#,
+        );
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::WorkflowTask { task }]
+                if task.task_id == "wf-1" && task.progress.is_empty() && task.usage.is_none()
+        ));
+    }
+
+    #[test]
+    fn subagent_assistant_text_blocks_emit_tagged_text() {
+        // No tagged partial deltas exist on the 2.1.x wire: a subagent's text
+        // arrives only as full blocks on its tagged assistant frames.
+        let ev = normalize_one(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"working on it"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        assert_eq!(ev.len(), 2);
+        assert_eq!(
+            ev[0],
+            AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "working on it\n\n".into()
+                }),
+            }
+        );
+        assert!(matches!(&ev[1], AgentEvent::Subagent { event, .. }
+            if matches!(event.as_ref(), AgentEvent::ToolCall { .. })));
+    }
+
+    #[test]
+    fn wake_turn_init_is_deduped_but_second_result_still_emits_done() {
+        // Live-verified 2.1.228 shape: background subagent → eager result,
+        // then a second init (same session id) + second result on completion.
+        let mut norm = Normalizer::new();
+        let init = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s1"}"#;
+        let frame = crate::claude::wire::parse_frame(init).unwrap();
+        assert_eq!(norm.normalize(frame, false).len(), 1, "first init");
+        let frame = crate::claude::wire::parse_frame(init).unwrap();
+        assert!(
+            norm.normalize(frame, false).is_empty(),
+            "wake init deduped — SessionStarted is the fold's run boundary"
+        );
+        let result = r#"{"type":"result","subtype":"success","session_id":"s1"}"#;
+        let frame = crate::claude::wire::parse_frame(result).unwrap();
+        let events = norm.normalize(frame, false);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                })
+            ),
+            "wake turn settles with its own Done"
+        );
     }
 
     #[test]
