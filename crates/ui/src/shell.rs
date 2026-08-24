@@ -52,7 +52,7 @@ use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
-    SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    SIDEBAR_MAX, SIDEBAR_MIN, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -7367,102 +7367,6 @@ impl Shell {
                 .child(header)
                 .into_any_element(),
         )
-    }
-
-    /// The right pane's empty state: the "Open a surface" heading over a
-    /// compact vertical list of surface rows (icon + label) — the Capy
-    /// arrangement (user request): the old two-card grid clipped in narrow
-    /// panes and wasted short ones.
-    fn render_surface_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let text = theme.text;
-        let muted = theme.text_muted;
-        let border = theme.border;
-        let border_strong = theme.border_strong;
-        let row = |id: &'static str, icon_path: &'static str, title: &'static str| {
-            div()
-                .id(id)
-                .w_full()
-                .h(px(44.0))
-                .px(px(14.0))
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(border)
-                .bg(crate::theme::ink(0.02))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.0))
-                .cursor_pointer()
-                .hover(move |s| s.bg(crate::theme::ink(0.05)).border_color(border_strong))
-                .child(icon(icon_path).size(px(15.0)).flex_none().text_color(muted))
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(text)
-                        .child(SharedString::from(title)),
-                )
-        };
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px(16.0))
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(280.0))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_center()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(text)
-                            .child(SharedString::from("Open a surface")),
-                    )
-                    .child(
-                        div()
-                            .mt(px(4.0))
-                            .text_center()
-                            .text_size(px(11.5))
-                            .text_color(muted)
-                            .child(SharedString::from(
-                                "Choose what to show in the right panel.",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .mt(px(16.0))
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .child(
-                                row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.add_terminal_surface(cx);
-                                    }),
-                                ),
-                            )
-                            // Git only where there IS git — the pane itself
-                            // no longer gates on it (terminals work anywhere).
-                            .when(self.space_git_detected(cx), |el| {
-                                el.child(
-                                    row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            this.add_diff_surface(cx);
-                                        }),
-                                    ),
-                                )
-                            }),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn close_right_plus(&mut self, cx: &mut Context<Self>) {

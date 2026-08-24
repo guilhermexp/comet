@@ -3371,7 +3371,7 @@ impl Transcript {
         if !held {
             return;
         }
-        let Some(anchor_bounds) = self.list.bounds_for_item(anchor_ix) else {
+        if self.list.bounds_for_item(anchor_ix).is_none() {
             // The anchor is outside the measured window (a send fired while
             // scrolled deep into history): teleport onto it; the glide covers
             // the remaining error once it measures.
@@ -3383,9 +3383,7 @@ impl Transcript {
             self.own_turn_kick = true;
             cx.notify();
             return;
-        };
-        let err =
-            f32::from(anchor_bounds.top()) - (f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX);
+        }
         if positioned {
             // Landed: re-assert the prompt's position after every layout.
             // scroll_to is absolute and bounds-independent, so neither glue
@@ -3528,8 +3526,7 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else {
-            self.list
-                .scroll_by(px(err * (1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames))));
+            self.list.scroll_by(px(err * ease));
         }
         self.own_turn_kick = true;
         cx.notify();
