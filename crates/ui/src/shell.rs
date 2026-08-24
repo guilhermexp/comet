@@ -379,14 +379,6 @@ fn expanded_right_column_widths(
     (budget, 0.0)
 }
 
-fn orchestrator_capture_right_offset(
-    right_open: bool,
-    right_width: f32,
-    details_width: f32,
-) -> f32 {
-    (if right_open { right_width } else { 0.0 }) + details_width + 10.0
-}
-
 /// One right-pane surface tab (t3code RightPanelSurface): a git-diff page
 /// (each tab its own [`Changes`] viewer — multiple diff panels, user request),
 /// an embedded terminal keyed by its [`TerminalPanel`] tab key, or a file
@@ -9109,13 +9101,6 @@ mod tests {
             titlebar_capabilities(SidebarMode::Workers, true, false),
             TitlebarCapabilities::default()
         );
-    }
-
-    #[test]
-    fn orchestrator_capture_stays_on_the_chat_side_of_right_columns() {
-        assert_eq!(orchestrator_capture_right_offset(false, 520.0, 0.0), 10.0);
-        assert_eq!(orchestrator_capture_right_offset(true, 520.0, 0.0), 530.0);
-        assert_eq!(orchestrator_capture_right_offset(true, 520.0, 360.0), 890.0);
     }
 
     #[test]

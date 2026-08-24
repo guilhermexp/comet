@@ -149,27 +149,6 @@ impl Shell {
         } else {
             0.0
         };
-        let capture_action = (right_open
-            && !on_canvas
-            && titlebar_capabilities(
-                SidebarMode::Orchestrator,
-                !self.active_chat.is_empty(),
-                false,
-            )
-            .capture)
-            .then(|| {
-                div()
-                    .absolute()
-                    .top(px(6.0))
-                    .right(px(orchestrator_capture_right_offset(
-                        right_open,
-                        right_now,
-                        details_now,
-                    )))
-                    .occlude()
-                    .child(self.render_orchestrator_capture_button(&theme, cx))
-            });
-
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
         // cluster as it collapses.
@@ -211,39 +190,21 @@ impl Shell {
         } else {
             content_left
         };
+        // Trailing cluster. It used to be sized like the PANE'S HEADER
+        // (`width = right_now - pr`) because the surface chips lived up here;
+        // they moved into the pane, and that width now only reached backwards
+        // across the chat column - the capture button landed on top of the
+        // conversation title. A content-sized cluster needs no geometry: the
+        // row's own right padding already ends at the chat column's edge.
         let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
-            let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let pr = self.titlebar_right_pad(Theme::SPACE_LG);
-            // The row's own left padding is part of its content box: a strip
-            // wider than what's left after it overflows and clips at the right
-            // edge (flex_none never shrinks) — cap to the available width. The
-            // row's 8px child gaps sit OUTSIDE the strip's width (one before
-            // the strip in takeover, two with the title row present): without
-            // budgeting them the capped strip overflows by exactly one gap and
-            // the buttons slide right on expand (user report).
-            let gap_budget = if takeover { 8.0 } else { 16.0 };
-            let avail = self.viewport_width - row_left - pr - gap_budget;
             Some(
                 div()
                     .flex_none()
-                    .h_full()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
-                    .overflow_hidden()
-                    // Right edge already sits at viewport − pr (the row's own
-                    // padding), so this width starts the strip exactly at the
-                    // pane's left border — and rides the open/close tween.
-                    .w(px((right_now - pr).min(avail).max(0.0)))
-                    // 8 + the trigger's own 8px pad = the pane's 16px text
-                    // gutter, so the scope label sits flush over the stats
-                    // strip below.
-                    .pl(px(8.0))
-                    // No capture button here: `capture_action` below already
-                    // renders it whenever the pane is open, and a second copy
-                    // meant two elements with the same ids (`orchestrator-
-                    // capture`, `-menu`) fighting over hover/click state.
+                    .gap(px(6.0))
+                    .child(self.render_orchestrator_capture_button(&theme, cx))
                     .when(!details_open && self.details_context(cx).is_some(), |el| {
                         el.child(self.render_details_sidebar_button(
                             "orchestrator-toggle-details-sidebar-with-panel",
@@ -251,13 +212,6 @@ impl Shell {
                             cx,
                         ))
                     })
-                    // The surface chips render INSIDE the pane (one strip, one
-                    // set of element ids): drawing them here too painted a
-                    // second copy of the same ids, and this band's width math
-                    // lands left of the pane whenever the details sidebar is
-                    // open - the chips landed on top of the chat title. Only
-                    // the spacer stays, so expand/close keep their edge.
-                    .child(div().flex_1().min_w_0().h_full())
                     .child(header_icon_button(
                         "expand-changes",
                         icons::EXPAND_ARROWS,
@@ -400,8 +354,7 @@ impl Shell {
             .relative()
             .h(px(Theme::TITLEBAR_HEIGHT))
             .flex_none()
-            .child(inner)
-            .children(capture_action);
+            .child(inner);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
     }
