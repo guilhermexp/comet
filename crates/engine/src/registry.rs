@@ -683,6 +683,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kimi_provider_identity_is_not_a_runnable_harness() {
+        let registry = default_registry();
+        assert!(
+            registry
+                .descriptors()
+                .iter()
+                .all(|descriptor| descriptor.id != HarnessId::Kimi)
+        );
+        assert!(registry.resolve(HarnessId::Kimi).is_err());
+    }
+
     /// Catalogs serialized by engines that predate the `installed`/`enabled`
     /// fields must keep deserializing — installed, and enabled per the
     /// detection fallback.

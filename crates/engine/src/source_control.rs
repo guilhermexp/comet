@@ -1115,10 +1115,11 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
 
         assert_eq!(source.branch.upstream_ref, None);
         assert_eq!(source.branch.remote_name.as_deref(), Some("origin"));
-        assert_eq!(
-            source.branch.remote_url.as_deref(),
-            Some("git@github.com:contributor/zeron.git")
-        );
+        // `git remote get-url --push` honors the user's `url.<base>.insteadOf`
+        // rewrites, so the literal scheme is machine-dependent. Assert the
+        // identity the resolver extracts — that is what providers consume.
+        assert_eq!(source.branch.host.as_deref(), Some("github.com"));
+        assert_eq!(source.branch.repository.as_deref(), Some("zeron"));
         assert_eq!(source.branch.owner.as_deref(), Some("contributor"));
         assert_eq!(
             source.branch.head_selectors,

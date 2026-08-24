@@ -247,6 +247,8 @@ impl Render for ShortcutsPage {
 
         div()
             .id("shortcuts-page")
+            .role(gpui::Role::Group)
+            .aria_label("Keyboard shortcuts")
             .size_full()
             .overflow_y_scroll()
             .track_focus(&self.focus)

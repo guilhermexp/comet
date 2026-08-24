@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use gpui::{Context, Entity, Global, Subscription, Task};
 
-use super::activity_menu::{WorkersActivityMenu, project_activity_menu};
+use super::activity_menu::project_activity_menu;
 use super::model::{WorkersModel, WorkersSessionTarget};
 
 pub const ALL_RECENT_TAG: i64 = 10_000;

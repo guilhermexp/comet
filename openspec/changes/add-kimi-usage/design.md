@@ -33,7 +33,7 @@ The Kimi client id is the public OAuth application identifier used by the offici
 
 ### Usage request
 
-The base URL is `${KIMI_CODE_BASE_URL:-https://api.kimi.com/coding/v1}` with trailing slashes removed. Comet performs `GET {base}/usages` with `Authorization: Bearer`, `Accept: application/json`, and an 8-second timeout. HTTP 401 becomes an authentication warning; 404 means managed Usage is unavailable; malformed rows are ignored without hiding valid rows.
+Production always sends the bearer credential to the canonical `https://api.kimi.com/coding/v1/usages` origin and rejects cross-origin redirects. Tests inject a loopback transport/config directly without reading environment overrides or real credentials. Requests use `Accept: application/json` and an 8-second timeout; HTTP 401 becomes an authentication warning, 404 means managed Usage is unavailable, and malformed rows are ignored without hiding valid rows.
 
 ### Payload mapping
 

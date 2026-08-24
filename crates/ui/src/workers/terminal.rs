@@ -1222,6 +1222,7 @@ impl Render for WorkersTerminal {
         let jump_to_bottom = self.render_jump_to_bottom(cx);
         div()
             .id("workers-terminal")
+            .role(gpui::Role::Terminal)
             .size_full()
             .relative()
             .key_context("Terminal")

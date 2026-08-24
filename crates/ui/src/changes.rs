@@ -3012,6 +3012,8 @@ impl Changes {
         };
 
         popover::popover_card(theme)
+            .id("ref-menu")
+            .role(gpui::Role::Menu)
             .w(px(240.0))
             .track_focus(&focus)
             .on_key_down(

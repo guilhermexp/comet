@@ -7,8 +7,7 @@ use gpui::{
 };
 use zeron_workers_unpeel::resources::WorkersSessionResource;
 use zeron_workers_unpeel::{
-    PresetPatch, WorkersAppearanceSettings, WorkersNotificationSettings, WorkersResourceSettings,
-    WorkersTranscriptSettings,
+    PresetPatch, WorkersNotificationSettings, WorkersResourceSettings, WorkersTranscriptSettings,
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};

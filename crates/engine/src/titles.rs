@@ -200,17 +200,86 @@ impl TitleGenerator {
 /// The cheapest model a harness offers (zeron's `cheapestModel` heuristic):
 /// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
 /// listed model; `None` when the catalog is empty (harness picks its default).
+///
+/// Curated catalogs (claude, codex) carry one row per tier, but the OMP harness
+/// forwards its runtime's RAW provider inventory — every historical model, in
+/// alphabetical order. There a plain first-match picked
+/// `anthropic/claude-3-haiku-20240307`, retired at Anthropic, so every titling
+/// attempt 404'd and fell back to the prompt's first words. So the first
+/// small-tier row only decides the FAMILY (provider prefix + tier word) and the
+/// newest member of that family wins. The provider stays pinned: the same
+/// family is also listed under providers we may hold no credentials for.
 fn cheapest_model(models: &[Model]) -> Option<String> {
-    if models.is_empty() {
-        return None;
-    }
-    let small = models.iter().find(|m| {
+    let tier_of = |m: &Model| {
         let haystack = format!("{} {}", m.id, m.label).to_lowercase();
-        ["haiku", "mini", "nano", "flash", "small", "lite"]
+        SMALL_TIERS
+            .into_iter()
+            .find(move |tier| haystack.contains(tier))
+    };
+    let small = models.iter().find_map(|first| {
+        let tier = tier_of(first)?;
+        let provider = model_provider(&first.id);
+        models
             .iter()
-            .any(|tier| haystack.contains(tier))
+            .filter(|m| model_provider(&m.id) == provider && tier_of(m) == Some(tier))
+            .max_by_key(|m| generation_rank(&m.id))
     });
     small.or(models.last()).map(|m| m.id.clone())
+}
+
+const SMALL_TIERS: [&str; 6] = ["haiku", "mini", "nano", "flash", "small", "lite"];
+
+/// OMP ids are `{provider}/{id}` and the inner id may itself hold slashes
+/// (`openrouter:pseudo-api/anthropic/claude-3.5-haiku`), so the provider is the
+/// first segment. Curated catalog ids have no slash at all.
+fn model_provider(id: &str) -> Option<&str> {
+    id.split_once('/').map(|(provider, _)| provider)
+}
+
+/// Generation order inside one small-tier family: the id's numeric groups with
+/// snapshot dates dropped, then the floating alias ranked above its dated pin
+/// (`claude-haiku-4-5` over `claude-haiku-4-5-20251001` — same model, stable
+/// id). `max_by_key` keeps the LAST maximum, preserving the old "last listed
+/// wins" tie-break.
+///
+/// Both spellings of a snapshot date have to go: packed (`20251001`) and split
+/// (`gpt-4o-mini-2024-07-18`). Leaking the split form's components into the
+/// version vector ranks `[4, 2024, 7, 18]` above `gpt-4.1-mini`'s `[4, 1]` —
+/// the dated pin beating the stable alias, exactly backwards.
+fn generation_rank(id: &str) -> (Vec<u32>, bool) {
+    let groups: Vec<&str> = id
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|g| !g.is_empty())
+        .collect();
+    let mut version = Vec::new();
+    let mut dated = false;
+    let mut i = 0;
+    while i < groups.len() {
+        let group = groups[i];
+        if group.len() == 8 && group.starts_with("20") {
+            dated = true;
+            i += 1;
+            continue;
+        }
+        let split_date = group.len() == 4
+            && group.starts_with("20")
+            && groups[i + 1..]
+                .iter()
+                .take(2)
+                .filter(|g| g.len() == 2)
+                .count()
+                == 2;
+        if split_date {
+            dated = true;
+            i += 3;
+            continue;
+        }
+        if let Ok(n) = group.parse::<u32>() {
+            version.push(n);
+        }
+        i += 1;
+    }
+    (version, !dated)
 }
 
 /// First line, stripped of quote/heading dressing, capped at 60 chars.
@@ -292,6 +361,56 @@ mod tests {
         let no_small = vec![model("opus-4", "Opus"), model("sonnet-4", "Sonnet")];
         assert_eq!(cheapest_model(&no_small).as_deref(), Some("sonnet-4"));
         assert_eq!(cheapest_model(&[]), None);
+    }
+
+    #[test]
+    fn cheapest_picks_the_newest_row_of_the_small_tier_family() {
+        // The OMP harness forwards its runtime's raw inventory, alphabetically
+        // sorted: retired Haiku 3 sorts ahead of the current Haiku 4.5, and
+        // picking it 404'd every titling attempt.
+        let models = vec![
+            model("anthropic/claude-3-5-sonnet-20241022", "Claude Sonnet 3.5"),
+            model("anthropic/claude-3-haiku-20240307", "Claude Haiku 3"),
+            model("anthropic/claude-haiku-4-5", "Claude Haiku 4.5"),
+            model("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+            model("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
+        ];
+        assert_eq!(
+            cheapest_model(&models).as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+    }
+
+    #[test]
+    fn cheapest_ignores_snapshot_dates_split_by_hyphens() {
+        // `2024-07-18` used to leak into the version vector as [4, 2024, 7, 18]
+        // and outrank the floating 4.1 alias's [4, 1].
+        let models = vec![
+            model("openai/gpt-4.1-mini", "GPT-4.1 mini"),
+            model("openai/gpt-4o-mini-2024-07-18", "GPT-4o mini"),
+        ];
+        assert_eq!(
+            cheapest_model(&models).as_deref(),
+            Some("openai/gpt-4.1-mini")
+        );
+    }
+
+    #[test]
+    fn cheapest_stays_on_the_first_matching_provider() {
+        // Same family under three providers: drifting off `anthropic` would
+        // pick a route we may hold no credentials for.
+        let models = vec![
+            model("anthropic/claude-haiku-4-5", "Claude Haiku 4.5"),
+            model(
+                "google-vertex/claude-haiku-4-5@20251001",
+                "Claude Haiku 4.5",
+            ),
+            model("zenmux/anthropic/claude-haiku-4.5", "Claude Haiku 4.5"),
+        ];
+        assert_eq!(
+            cheapest_model(&models).as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
     }
 
     #[test]

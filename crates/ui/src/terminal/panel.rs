@@ -1711,6 +1711,7 @@ impl Render for TerminalPanel {
             .child(
                 div()
                     .id("terminal-body")
+                    .role(gpui::Role::Terminal)
                     .relative()
                     .flex_1()
                     .min_h_0()

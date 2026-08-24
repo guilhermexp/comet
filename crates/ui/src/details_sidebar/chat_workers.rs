@@ -119,6 +119,10 @@ fn subagent_task(task: &WorkflowTaskUpdate) -> bool {
         && (task.subagent_type.is_some() || task.task_type.as_deref() == Some("subagent"))
 }
 
+pub(crate) fn compact_activity_label(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
     let is_subagent = task.task_type.as_deref() == Some("subagent");
     let title = if is_subagent {
@@ -137,6 +141,7 @@ fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
             task.task_id.clone()
         }
     });
+    let title = compact_activity_label(&title);
     ChatActivityRow {
         id: task.task_id,
         title,
@@ -288,8 +293,8 @@ mod tests {
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
     use super::{
-        WorkerSemantic, activity_tasks_from_entries, format_usage, project_chat_workers,
-        worker_semantic,
+        WorkerSemantic, activity_tasks_from_entries, compact_activity_label, format_usage,
+        project_chat_workers, worker_semantic,
     };
 
     fn workflow_task(id: &str) -> WorkflowTaskUpdate {
@@ -345,6 +350,16 @@ mod tests {
             updated_at_unix_ms: 1,
             capabilities: WorkersSessionCapabilities::default(),
         }
+    }
+
+    #[test]
+    fn activity_labels_collapse_multiline_whitespace_for_fixed_rows() {
+        assert_eq!(
+            compact_activity_label(
+                "Repo de referência de terceiro, read-only, em:\n  ~/Documents/Projetos",
+            ),
+            "Repo de referência de terceiro, read-only, em: ~/Documents/Projetos"
+        );
     }
 
     fn spawn_part(id: &str, status: SubagentStatus, tail: &str) -> MessagePart {

@@ -52,9 +52,10 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageLine, AgentUsageWindow, HarnessId,
 };
 
+use crate::kimi_usage::KimiUsage;
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
 
@@ -138,6 +139,17 @@ impl AgentAccountsConfig {
 
     fn root_dir(&self) -> PathBuf {
         self.data_dir.join("agent-accounts")
+    }
+
+    /// Only the canonical production constructor may resolve the default
+    /// `~/.kimi` store. Explicit configs are test/integration seams and must
+    /// never accidentally fall through to a real user credential.
+    fn uses_detected_paths(&self) -> bool {
+        let detected = Self::detect(&self.data_dir);
+        self.claude_config_dir == detected.claude_config_dir
+            && self.claude_config_file == detected.claude_config_file
+            && self.codex_home == detected.codex_home
+            && self.cursor_sdk_auth_file == detected.cursor_sdk_auth_file
     }
 }
 
@@ -245,6 +257,8 @@ struct Inner {
     /// Slots with a token refresh in flight — a second refresh of the same
     /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
+    kimi_usage: Option<KimiUsage>,
+    kimi_setup_warning: Option<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -258,6 +272,27 @@ pub struct AgentAccounts {
 
 impl AgentAccounts {
     pub fn new(config: AgentAccountsConfig) -> Self {
+        let (kimi_usage, kimi_setup_warning) = if config.uses_detected_paths() {
+            match KimiUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+        Self::new_inner(config, kimi_usage, kimi_setup_warning)
+    }
+
+    #[cfg(test)]
+    fn new_with_kimi_usage(config: AgentAccountsConfig, kimi_usage: KimiUsage) -> Self {
+        Self::new_inner(config, Some(kimi_usage), None)
+    }
+
+    fn new_inner(
+        config: AgentAccountsConfig,
+        kimi_usage: Option<KimiUsage>,
+        kimi_setup_warning: Option<String>,
+    ) -> Self {
         // Startup sweep: a previous process that crashed mid-login leaves
         // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
         // tokens — with no owner to clean them. Reclaim them at boot.
@@ -281,6 +316,8 @@ impl AgentAccounts {
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
+                kimi_usage,
+                kimi_setup_warning,
             }),
         }
     }
@@ -292,27 +329,45 @@ impl AgentAccounts {
         if force_usage {
             lock(&self.inner.usage_cache).clear();
         }
-        let mut warnings: Vec<AgentAccountWarning> = Vec::new();
+        let mut warnings: Vec<AgentAccountWarning> = self
+            .inner
+            .kimi_setup_warning
+            .iter()
+            .cloned()
+            .map(|message| AgentAccountWarning {
+                harness: HarnessId::Kimi,
+                message,
+            })
+            .collect();
         let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
         let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
-        let mut local_usage = HashMap::new();
-        if force_usage {
-            let codex_root = self.inner.config.codex_home.join("sessions");
-            let claude_root = self.inner.config.claude_config_dir.join("projects");
-            let now = Utc::now();
-            let (codex, claude) = tokio::join!(
-                tokio::task::spawn_blocking(move || {
-                    crate::provider_usage_archive::codex_usage_lines(&codex_root, now)
-                }),
-                tokio::task::spawn_blocking(move || {
-                    crate::provider_usage_archive::claude_usage_lines(&claude_root, now)
-                }),
-            );
-            local_usage.insert(HarnessId::Codex, codex.unwrap_or_default());
-            local_usage.insert(HarnessId::ClaudeCode, claude.unwrap_or_default());
-        }
-
-        let (claude, claude_warning) = self.detect_claude().await;
+        let local_usage = async {
+            let mut usage = HashMap::new();
+            if force_usage {
+                let codex_root = self.inner.config.codex_home.join("sessions");
+                let claude_root = self.inner.config.claude_config_dir.join("projects");
+                let now = Utc::now();
+                let (codex, claude) = tokio::join!(
+                    tokio::task::spawn_blocking(move || {
+                        crate::provider_usage_archive::codex_usage_lines(&codex_root, now)
+                    }),
+                    tokio::task::spawn_blocking(move || {
+                        crate::provider_usage_archive::claude_usage_lines(&claude_root, now)
+                    }),
+                );
+                usage.insert(HarnessId::Codex, codex.unwrap_or_default());
+                usage.insert(HarnessId::ClaudeCode, claude.unwrap_or_default());
+            }
+            usage
+        };
+        let kimi = async {
+            match &self.inner.kimi_usage {
+                Some(usage) => Some(usage.snapshot(force_usage, Utc::now().timestamp()).await),
+                None => None,
+            }
+        };
+        let (local_usage, (claude, claude_warning), kimi) =
+            tokio::join!(local_usage, self.detect_claude(), kimi);
         if let Some(message) = claude_warning {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::ClaudeCode,
@@ -345,58 +400,119 @@ impl AgentAccounts {
             }
         }
 
+        let (claude_accounts, codex_accounts, cursor_accounts) = tokio::join!(
+            self.provider_accounts(
+                HarnessId::ClaudeCode,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+            self.provider_accounts(
+                HarnessId::Codex,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+            self.provider_accounts(
+                HarnessId::Cursor,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+        );
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
-        let mut accounts: Vec<AgentAccount> = Vec::new();
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Cursor] {
-            let active_key = active_keys.get(&harness).cloned();
-            let slots = self.read_slots(harness);
-            for slot in &slots {
-                let active = active_key.as_deref() == Some(slot.account_key.as_str());
-                let usage = self.usage_for(harness, slot, active, force_usage).await;
-                accounts.push(AgentAccount {
-                    id: slot.id.clone(),
-                    harness,
-                    email: Some(slot.profile.email.clone()),
-                    // A live plan from the usage probe (Codex `plan_type`)
-                    // supersedes the login-time snapshot; fall back to the
-                    // snapshot when the probe wasn't forced or failed.
-                    plan_label: usage
-                        .as_ref()
-                        .and_then(|usage| usage.plan_label.clone())
-                        .or_else(|| slot.profile.plan.clone()),
-                    active,
-                    usage_windows: usage.map(|usage| usage.windows).unwrap_or_default(),
-                    usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
-                    display_name: slot.profile.display_name.clone(),
-                    organization: slot.profile.organization.clone(),
-                    auth_kind: Some(slot.profile.auth_kind),
-                    switchable: true,
-                    saved_at: Some(slot.saved_at),
+        let mut accounts = claude_accounts;
+        accounts.extend(codex_accounts);
+        if let Some(kimi) = &kimi {
+            if let Some(message) = &kimi.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Kimi,
+                    message: message.clone(),
                 });
             }
-            // A live login whose credentials we couldn't read has no slot — still
-            // show it (active, but not re-activatable until the Keychain relents).
-            if let Some(u) = unreadable.get(&harness)
-                && !slots.iter().any(|s| s.account_key == u.account_key)
-            {
+            if kimi.present {
                 accounts.push(AgentAccount {
-                    id: slot_id_for(harness, &u.account_key),
-                    harness,
-                    email: Some(u.profile.email.clone()),
-                    plan_label: u.profile.plan.clone(),
+                    id: "kimi-code-managed".into(),
+                    harness: HarnessId::Kimi,
+                    email: None,
+                    plan_label: Some("Managed".into()),
                     active: true,
-                    usage_windows: Vec::new(),
-                    usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
-                    display_name: u.profile.display_name.clone(),
-                    organization: u.profile.organization.clone(),
-                    auth_kind: Some(u.profile.auth_kind),
+                    usage_windows: kimi.usage_windows.clone(),
+                    usage_lines: Vec::new(),
+                    display_name: Some("Kimi Code".into()),
+                    organization: None,
+                    auth_kind: Some(AgentAuthKind::Oauth),
                     switchable: false,
                     saved_at: None,
                 });
             }
         }
+        accounts.extend(cursor_accounts);
         Ok(AgentAccountsSnapshot { accounts, warnings })
+    }
+
+    async fn provider_accounts(
+        &self,
+        harness: HarnessId,
+        active_keys: &HashMap<HarnessId, String>,
+        unreadable: &HashMap<HarnessId, Detected>,
+        local_usage: &HashMap<HarnessId, Vec<AgentUsageLine>>,
+        force_usage: bool,
+    ) -> Vec<AgentAccount> {
+        let active_key = active_keys.get(&harness).cloned();
+        let slots = self.read_slots(harness);
+        let mut accounts = Vec::new();
+        for slot in &slots {
+            let active = active_key.as_deref() == Some(slot.account_key.as_str());
+            let usage = self.usage_for(harness, slot, active, force_usage).await;
+            accounts.push(AgentAccount {
+                id: slot.id.clone(),
+                harness,
+                email: Some(slot.profile.email.clone()),
+                // A live plan from the usage probe (Codex `plan_type`)
+                // supersedes the login-time snapshot; fall back to the
+                // snapshot when the probe wasn't forced or failed.
+                plan_label: usage
+                    .as_ref()
+                    .and_then(|usage| usage.plan_label.clone())
+                    .or_else(|| slot.profile.plan.clone()),
+                active,
+                usage_windows: usage.map(|usage| usage.windows).unwrap_or_default(),
+                usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
+                display_name: slot.profile.display_name.clone(),
+                organization: slot.profile.organization.clone(),
+                auth_kind: Some(slot.profile.auth_kind),
+                switchable: true,
+                saved_at: Some(slot.saved_at),
+            });
+        }
+        // A live login whose credentials we couldn't read has no slot — still
+        // show it (active, but not re-activatable until the Keychain relents).
+        if let Some(unreadable) = unreadable.get(&harness)
+            && !slots
+                .iter()
+                .any(|slot| slot.account_key == unreadable.account_key)
+        {
+            accounts.push(AgentAccount {
+                id: slot_id_for(harness, &unreadable.account_key),
+                harness,
+                email: Some(unreadable.profile.email.clone()),
+                plan_label: unreadable.profile.plan.clone(),
+                active: true,
+                usage_windows: Vec::new(),
+                usage_lines: local_usage.get(&harness).cloned().unwrap_or_default(),
+                display_name: unreadable.profile.display_name.clone(),
+                organization: unreadable.profile.organization.clone(),
+                auth_kind: Some(unreadable.profile.auth_kind),
+                switchable: false,
+                saved_at: None,
+            });
+        }
+        accounts
     }
 
     // ── swap ────────────────────────────────────────────────────────────────
@@ -1063,16 +1179,29 @@ impl AgentAccounts {
 
     /// Read the live Claude credentials. `None` payload + warning ⇒ we know a
     /// login exists but couldn't read the secret (Keychain denied us).
+    ///
+    /// macOS has TWO possible stores — the login Keychain (the CLI's default)
+    /// and `~/.claude/.credentials.json` — and either can be a stale leftover.
+    /// Observed: a two-day-old expired FILE shadowing a live Keychain item, so
+    /// every usage probe read an expired token and the whole Claude quota lane
+    /// rendered empty. [`claude_live_store`] picks the one the CLI rotated
+    /// last instead of hard-coding a precedence.
     async fn read_claude_credentials(&self) -> (Option<serde_json::Value>, Option<String>) {
-        if let Some(creds) = read_json(&self.inner.config.claude_creds_file()) {
-            return (Some(creds), None);
-        }
+        let file = read_json(&self.inner.config.claude_creds_file());
+        // Explicit configs are test/integration seams and must never fall
+        // through to a real user credential (same rule as the Kimi store).
         #[cfg(target_os = "macos")]
-        {
-            return keychain::read_credentials().await;
+        if self.inner.config.uses_detected_paths() {
+            let (keychain, warning) = keychain::read_credentials().await;
+            return match claude_live_store(keychain.as_ref(), file.as_ref()) {
+                ClaudeStore::Keychain if keychain.is_some() => (keychain, None),
+                _ => match file {
+                    Some(file) => (Some(file), None),
+                    None => (None, warning),
+                },
+            };
         }
-        #[cfg(not(target_os = "macos"))]
-        (None, None)
+        (file, None)
     }
 
     async fn write_claude_credentials(
@@ -1080,12 +1209,24 @@ impl AgentAccounts {
         credentials: &serde_json::Value,
     ) -> Result<(), EngineError> {
         let json = credentials.to_string();
+        // Write where the CLI reads (see `read_claude_credentials`): an account
+        // switch persisted into a stale credentials FILE is invisible to Claude
+        // Code, which keeps using the Keychain item.
         #[cfg(target_os = "macos")]
-        {
-            // claude-swap's primitive: update the Keychain item in place — but only
-            // when no credentials FILE exists (the file wins when present).
-            if !self.inner.config.claude_creds_file().exists() {
-                return keychain::write_credentials(&json).await;
+        if self.inner.config.uses_detected_paths() {
+            let (keychain, warning) = keychain::read_credentials().await;
+            // A denied or unparseable read still means an ENTRY EXISTS (the
+            // probe passed before either failure), and it must not be left
+            // behind holding the previous login.
+            let (write_keychain, write_file) = claude_write_stores(
+                keychain.is_some() || warning.is_some(),
+                self.inner.config.claude_creds_file().exists(),
+            );
+            if write_keychain {
+                keychain::write_credentials(&json).await?;
+            }
+            if !write_file {
+                return Ok(());
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -1358,6 +1499,52 @@ impl AgentAccounts {
     }
 }
 
+// ── Claude credential store selection (macOS keeps two) ─────────────────────
+
+/// Which store holds the credentials Claude Code is actually using.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeStore {
+    Keychain,
+    File,
+}
+
+/// The store the CLI rotated last, judged by `claudeAiOauth.expiresAt`: tokens
+/// live ~8h, so the later expiry is the live pair and the other store is a
+/// leftover. The Keychain wins every tie and every undated comparison — it is
+/// the CLI's default store, and a credentials FILE only appears when older
+/// tooling (or a non-Keychain install) put one there.
+#[cfg(target_os = "macos")]
+fn claude_live_store(
+    keychain: Option<&serde_json::Value>,
+    file: Option<&serde_json::Value>,
+) -> ClaudeStore {
+    let Some(file_expiry) = file.and_then(claude_oauth_expiry) else {
+        return ClaudeStore::Keychain;
+    };
+    match keychain.and_then(claude_oauth_expiry) {
+        Some(keychain_expiry) if keychain_expiry >= file_expiry => ClaudeStore::Keychain,
+        _ => ClaudeStore::File,
+    }
+}
+
+/// Stores a credential write has to land in: EVERY store that already holds a
+/// login. Reads (and the CLI) pick by expiry, so persisting a switch into only
+/// today's winner leaves the other store on the OLD account — and it takes the
+/// read back the moment the expiries flip, restoring the login the user just
+/// left. With nothing stored anywhere the CLI default (Keychain) is enough; a
+/// file-only install keeps its file and never grows a Keychain item.
+#[cfg(target_os = "macos")]
+fn claude_write_stores(keychain_present: bool, file_present: bool) -> (bool, bool) {
+    (keychain_present || !file_present, file_present)
+}
+
+/// `claudeAiOauth.expiresAt` (epoch ms) out of a credential blob.
+#[cfg(target_os = "macos")]
+fn claude_oauth_expiry(credentials: &serde_json::Value) -> Option<i64> {
+    credentials.get("claudeAiOauth")?.get("expiresAt")?.as_i64()
+}
+
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
 //
 // Claude Code stores its credentials in the login Keychain under the service
@@ -1458,6 +1645,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
+        HarnessId::Kimi => "kimi",
         HarnessId::Cursor => "cursor",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
@@ -1900,6 +2088,167 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_store_follows_the_fresher_token_not_a_fixed_precedence() {
+        let creds =
+            |expires_at: i64| serde_json::json!({"claudeAiOauth": {"expiresAt": expires_at}});
+        let live = creds(2_000);
+        let stale = creds(1_000);
+        // The leftover FILE that shadowed a live Keychain item and emptied the
+        // Claude usage lane.
+        assert_eq!(
+            claude_live_store(Some(&live), Some(&stale)),
+            ClaudeStore::Keychain
+        );
+        // A genuinely file-based install (non-Keychain login) still wins.
+        assert_eq!(
+            claude_live_store(Some(&stale), Some(&live)),
+            ClaudeStore::File
+        );
+        // Ties, undatable blobs and empty stores all fall to the CLI default.
+        assert_eq!(
+            claude_live_store(Some(&live), Some(&live)),
+            ClaudeStore::Keychain
+        );
+        assert_eq!(
+            claude_live_store(Some(&serde_json::json!({"mcpOAuth": {}})), Some(&live)),
+            ClaudeStore::File
+        );
+        assert_eq!(claude_live_store(None, Some(&live)), ClaudeStore::File);
+        assert_eq!(claude_live_store(Some(&live), None), ClaudeStore::Keychain);
+        assert_eq!(claude_live_store(None, None), ClaudeStore::Keychain);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_switch_lands_in_every_store_that_already_holds_a_login() {
+        // Both stores present: writing only the current winner leaves the other
+        // on the old account, and it wins the next read as soon as the fresh
+        // token's expiry falls behind the leftover's.
+        assert_eq!(claude_write_stores(true, true), (true, true));
+        assert_eq!(claude_write_stores(true, false), (true, false));
+        assert_eq!(claude_write_stores(false, true), (false, true));
+        // Nothing stored yet ⇒ the CLI default.
+        assert_eq!(claude_write_stores(false, false), (true, false));
+    }
+
+    #[tokio::test]
+    async fn kimi_managed_credential_is_a_non_switchable_device_local_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+        };
+        let credential = root
+            .path()
+            .join("kimi")
+            .join("credentials")
+            .join("kimi-code.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credential,
+            r#"{"access_token":"test-access-private","refresh_token":"test-refresh-private","expires_at":4102444800,"expires_in":3600}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let kimi = crate::kimi_usage::KimiUsage::from_paths(
+            credential,
+            "http://127.0.0.1:1/coding/v1".into(),
+            "http://127.0.0.1:1/api/oauth/token".into(),
+            Duration::from_millis(10),
+            [Duration::ZERO, Duration::ZERO],
+            [Duration::ZERO; 5],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_kimi_usage(config, kimi);
+
+        let snapshot = accounts.list(false).await.unwrap();
+
+        let kimi = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Kimi)
+            .unwrap();
+        assert!(kimi.active);
+        assert!(!kimi.switchable);
+        assert_eq!(kimi.auth_kind, Some(AgentAuthKind::Oauth));
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("test-access-private"));
+        assert!(!wire.contains("test-refresh-private"));
+    }
+
+    #[tokio::test]
+    async fn kimi_windows_survive_forced_then_non_forced_account_lists() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+        };
+        let credential = root
+            .path()
+            .join("kimi")
+            .join("credentials")
+            .join("kimi-code.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credential,
+            r#"{"access_token":"test-access","refresh_token":"test-refresh","expires_at":4102444800.5,"expires_in":3600.5}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"usage":{"used":"40","limit":"1000"},"limits":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let kimi = crate::kimi_usage::KimiUsage::from_paths(
+            credential,
+            format!("http://{address}/coding/v1"),
+            format!("http://{address}/api/oauth/token"),
+            Duration::from_secs(1),
+            [Duration::ZERO, Duration::ZERO],
+            [Duration::ZERO; 5],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_kimi_usage(config, kimi);
+
+        let forced = accounts.list(true).await.unwrap();
+        server.await.unwrap();
+        let cached = accounts.list(false).await.unwrap();
+        let windows = |snapshot: &AgentAccountsSnapshot| {
+            snapshot
+                .accounts
+                .iter()
+                .find(|account| account.harness == HarnessId::Kimi)
+                .map(|account| account.usage_windows.len())
+        };
+
+        assert_eq!(windows(&forced), Some(1));
+        assert_eq!(windows(&cached), Some(1));
+    }
 
     #[test]
     fn plan_labels() {

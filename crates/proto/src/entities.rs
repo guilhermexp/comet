@@ -674,6 +674,42 @@ mod tests {
     }
 
     #[test]
+    fn kimi_account_snapshot_serializes_only_normalized_device_local_fields() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![AgentAccount {
+                id: "kimi-code-managed".into(),
+                harness: HarnessId::Kimi,
+                email: None,
+                plan_label: Some("Managed".into()),
+                active: true,
+                usage_windows: vec![AgentUsageWindow {
+                    label: "Weekly".into(),
+                    used_fraction: 0.4,
+                    resets_at: None,
+                }],
+                usage_lines: Vec::new(),
+                display_name: Some("Kimi Code".into()),
+                organization: None,
+                auth_kind: Some(AgentAuthKind::Oauth),
+                switchable: false,
+                saved_at: None,
+            }],
+            warnings: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["accounts"][0]["harness"], "kimi");
+        assert_eq!(value["accounts"][0]["usageWindows"][0]["label"], "Weekly");
+        assert!(value["accounts"][0].get("credentials").is_none());
+        assert!(value["accounts"][0].get("accessToken").is_none());
+        assert!(value["accounts"][0].get("refreshToken").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentAccountsSnapshot>(value).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
     fn checkout_change_request_status_round_trips_all_states_as_camel_case() {
         for (state, encoded_state) in [
             (ChangeRequestState::Open, "open"),

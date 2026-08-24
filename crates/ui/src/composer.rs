@@ -3239,6 +3239,18 @@ impl Render for ComposerInput {
             theme.text
         };
         div()
+            // Focus without an a11y node makes screen readers announce the
+            // whole window instead of the field (gpui logs it every focus
+            // change) — an id + role is what puts it in the AccessKit tree.
+            .id(("composer-input", cx.entity_id()))
+            .role(if self.key_context == "PaletteSearch" {
+                gpui::Role::SearchInput
+            } else {
+                gpui::Role::MultilineTextInput
+            })
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
+            .aria_value(self.content.clone())
             .key_context(self.key_context)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
@@ -5520,6 +5532,8 @@ impl Composer {
 
         div()
             .id("question-panel")
+            .role(gpui::Role::Group)
+            .aria_label("Agent question")
             .track_focus(&self.wizard_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)

@@ -132,7 +132,7 @@ use gpui::{
     px,
 };
 use zeron_proto::{
-    AgentAccountsSnapshot, HarnessId,
+    AgentAccountsSnapshot,
     agent::{WorkflowProgressNode, WorkflowTaskStatus},
 };
 
@@ -141,14 +141,14 @@ use crate::{
     details_sidebar::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
-            activity_tasks_from_entries, project_chat_workers,
+            activity_tasks_from_entries, compact_activity_label, project_chat_workers,
         },
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, scan_checkout},
         files_view::{file_glyph, material_icon_path},
         subagent_avatars::blobatar_subagent_avatar_path,
         todos::{latest_todos, todo_status_layout},
-        usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows},
+        usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows, usage_provider_icon},
         widgets::{
             ChatWorkersTab, ChatWorkersWidgetState, property_row, widget_card, workers_tab_presence,
         },
@@ -829,7 +829,7 @@ impl DetailsSidebar {
                             .border_color(theme.border.opacity(0.55))
                             .text_size(px(10.0))
                             .text_color(theme.text_muted)
-                            .child(title.clone()),
+                            .child(compact_activity_label(title)),
                     );
                 }
                 WorkflowProgressNode::Agent {
@@ -853,7 +853,7 @@ impl DetailsSidebar {
                                 .border_color(theme.border.opacity(0.55))
                                 .text_size(px(10.0))
                                 .text_color(theme.text_muted)
-                                .child(title.clone()),
+                                .child(compact_activity_label(title)),
                         );
                     }
                     let state_color = match state.as_deref() {
@@ -885,7 +885,7 @@ impl DetailsSidebar {
                                     .truncate()
                                     .text_size(px(11.0))
                                     .text_color(theme.text)
-                                    .child(label.clone()),
+                                    .child(compact_activity_label(label)),
                             )
                             .when_some(model.clone(), |line, model| {
                                 line.child(
@@ -1426,11 +1426,7 @@ impl DetailsSidebar {
         let expandable = row.state == ProviderUsageState::Ready
             && (!row.windows.is_empty() || !row.usage_lines.is_empty());
         let expanded = expandable && self.usage_expanded.contains(&key);
-        let icon_path = if row.harness == HarnessId::ClaudeCode {
-            icons::CLAUDE_MARK
-        } else {
-            icons::OPENAI_MARK
-        };
+        let (icon_path, claude_tint) = usage_provider_icon(row.harness);
         let summary: SharedString = match row.state {
             ProviderUsageState::Ready => row
                 .weekly_summary
@@ -1463,13 +1459,15 @@ impl DetailsSidebar {
                                 cx.notify();
                             }))
                     })
-                    .child(icons::icon(icon_path).size(px(15.0)).text_color(
-                        if row.harness == HarnessId::ClaudeCode {
-                            icons::claude_brand()
-                        } else {
-                            theme.text_muted
-                        },
-                    ))
+                    .child(
+                        icons::icon(icon_path)
+                            .size(px(15.0))
+                            .text_color(if claude_tint {
+                                icons::claude_brand()
+                            } else {
+                                theme.text_muted
+                            }),
+                    )
                     .child(
                         div()
                             .text_size(px(12.5))

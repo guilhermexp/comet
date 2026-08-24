@@ -25,7 +25,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Input histórico de arquivo é derivado/highlighted fora do render; corpos grandes usam `uniform_list`, e linhas lógicas patológicas são divididas em paint rows completos de até 512 caracteres antes do cache.
 - `crates/ui/src/terminal/` é o **painel de terminal dentro do app**. Não confundir com o `crates/tui` deletado (viewport ratatui do upstream, removido).
 - Presença de terminal se reconcilia por `reconcile_terminal_presence` + evento. Dispatchar `ToggleTerminal` no fechamento da última aba (como o upstream faz) dispara em dobro aqui.
-- Provider autenticado fica expansível quando houver janela remota **ou** linha de usage local. `NoUsage` significa que ambas estão vazias; linhas locais de 24h/7d/30d continuam acessíveis sem quota remota.
+- Provider autenticado fica expansível quando houver janela remota **ou** linha de usage local. `NoUsage` significa que ambas estão vazias; linhas locais de 24h/7d/30d continuam acessíveis sem quota remota. Providers managed renderam na ordem fixa Claude, Codex, Kimi; Kimi reusa a marca embutida `WORKER_KIMI` e não tem ação de login/add/switch em Accounts.
+- Overflow do widget Details: o card Workers mantém o viewport interno compacto de 152px de scroll. Labels de workflow, subagent e progresso precisam ser normalizados para uma linha visual antes de entrar em rows de altura fixa; label multilinha cru causa sobreposição de texto e é proibido.
 - Activities do widget Workers começam colapsadas; toggles explícitos permanecem keyed pelo id estável. Linhas de subagent preservam avatar e status lifecycle, incluindo spinner paint-only durante `Running`.
 - Linhas do To-dos usam um único slot circular não encolhível, com check/seta
   centralizados nos dois eixos e a mesma geometria `36/12/9` do card inline;
@@ -35,6 +36,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 - "Não atualizou na tela" começa em `comet-doc` (mirror), não aqui.
 - Não há harness de render: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando. Screenshot antes de dizer pronto.
+- Toda raiz de `track_focus` precisa de `.id()` + `.role()` (mais `aria_label` / `aria_value` quando o controle carrega texto). Sem role o gpui deixa o elemento fora da árvore AccessKit, loga `a11y: focused element … has no accessibility node` a cada mudança de foco, e a tecnologia assistiva anuncia a janela inteira em vez do controle focado.
 
 ## Verification
 
