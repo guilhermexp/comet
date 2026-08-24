@@ -1214,10 +1214,19 @@ impl AgentAccounts {
         // Code, which keeps using the Keychain item.
         #[cfg(target_os = "macos")]
         if self.inner.config.uses_detected_paths() {
-            let keychain = keychain::read_credentials().await.0;
-            let file = read_json(&self.inner.config.claude_creds_file());
-            if claude_live_store(keychain.as_ref(), file.as_ref()) == ClaudeStore::Keychain {
-                return keychain::write_credentials(&json).await;
+            let (keychain, warning) = keychain::read_credentials().await;
+            // A denied or unparseable read still means an ENTRY EXISTS (the
+            // probe passed before either failure), and it must not be left
+            // behind holding the previous login.
+            let (write_keychain, write_file) = claude_write_stores(
+                keychain.is_some() || warning.is_some(),
+                self.inner.config.claude_creds_file().exists(),
+            );
+            if write_keychain {
+                keychain::write_credentials(&json).await?;
+            }
+            if !write_file {
+                return Ok(());
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -1517,6 +1526,17 @@ fn claude_live_store(
         Some(keychain_expiry) if keychain_expiry >= file_expiry => ClaudeStore::Keychain,
         _ => ClaudeStore::File,
     }
+}
+
+/// Stores a credential write has to land in: EVERY store that already holds a
+/// login. Reads (and the CLI) pick by expiry, so persisting a switch into only
+/// today's winner leaves the other store on the OLD account — and it takes the
+/// read back the moment the expiries flip, restoring the login the user just
+/// left. With nothing stored anywhere the CLI default (Keychain) is enough; a
+/// file-only install keeps its file and never grows a Keychain item.
+#[cfg(target_os = "macos")]
+fn claude_write_stores(keychain_present: bool, file_present: bool) -> (bool, bool) {
+    (keychain_present || !file_present, file_present)
 }
 
 /// `claudeAiOauth.expiresAt` (epoch ms) out of a credential blob.
@@ -2098,6 +2118,19 @@ mod tests {
         assert_eq!(claude_live_store(None, Some(&live)), ClaudeStore::File);
         assert_eq!(claude_live_store(Some(&live), None), ClaudeStore::Keychain);
         assert_eq!(claude_live_store(None, None), ClaudeStore::Keychain);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_switch_lands_in_every_store_that_already_holds_a_login() {
+        // Both stores present: writing only the current winner leaves the other
+        // on the old account, and it wins the next read as soon as the fresh
+        // token's expiry falls behind the leftover's.
+        assert_eq!(claude_write_stores(true, true), (true, true));
+        assert_eq!(claude_write_stores(true, false), (true, false));
+        assert_eq!(claude_write_stores(false, true), (false, true));
+        // Nothing stored yet ⇒ the CLI default.
+        assert_eq!(claude_write_stores(false, false), (true, false));
     }
 
     #[tokio::test]

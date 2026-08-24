@@ -237,26 +237,49 @@ fn model_provider(id: &str) -> Option<&str> {
 }
 
 /// Generation order inside one small-tier family: the id's numeric groups with
-/// 8-digit snapshot dates (`20251001`) dropped, then the floating alias ranked
-/// above its dated pin (`claude-haiku-4-5` over `claude-haiku-4-5-20251001` —
-/// same model, stable id). `max_by_key` keeps the LAST maximum, preserving the
-/// old "last listed wins" tie-break.
+/// snapshot dates dropped, then the floating alias ranked above its dated pin
+/// (`claude-haiku-4-5` over `claude-haiku-4-5-20251001` — same model, stable
+/// id). `max_by_key` keeps the LAST maximum, preserving the old "last listed
+/// wins" tie-break.
+///
+/// Both spellings of a snapshot date have to go: packed (`20251001`) and split
+/// (`gpt-4o-mini-2024-07-18`). Leaking the split form's components into the
+/// version vector ranks `[4, 2024, 7, 18]` above `gpt-4.1-mini`'s `[4, 1]` —
+/// the dated pin beating the stable alias, exactly backwards.
 fn generation_rank(id: &str) -> (Vec<u32>, bool) {
-    let mut groups = Vec::new();
-    let mut dated = false;
-    for group in id
+    let groups: Vec<&str> = id
         .split(|c: char| !c.is_ascii_digit())
         .filter(|g| !g.is_empty())
-    {
+        .collect();
+    let mut version = Vec::new();
+    let mut dated = false;
+    let mut i = 0;
+    while i < groups.len() {
+        let group = groups[i];
         if group.len() == 8 && group.starts_with("20") {
             dated = true;
+            i += 1;
+            continue;
+        }
+        let split_date = group.len() == 4
+            && group.starts_with("20")
+            && groups[i + 1..]
+                .iter()
+                .take(2)
+                .filter(|g| g.len() == 2)
+                .count()
+                == 2;
+        if split_date {
+            dated = true;
+            i += 3;
             continue;
         }
         if let Ok(n) = group.parse::<u32>() {
-            groups.push(n);
+            version.push(n);
         }
+        i += 1;
     }
-    (groups, !dated)
+    (version, !dated)
 }
 
 /// First line, stripped of quote/heading dressing, capped at 60 chars.
@@ -355,6 +378,20 @@ mod tests {
         assert_eq!(
             cheapest_model(&models).as_deref(),
             Some("anthropic/claude-haiku-4-5")
+        );
+    }
+
+    #[test]
+    fn cheapest_ignores_snapshot_dates_split_by_hyphens() {
+        // `2024-07-18` used to leak into the version vector as [4, 2024, 7, 18]
+        // and outrank the floating 4.1 alias's [4, 1].
+        let models = vec![
+            model("openai/gpt-4.1-mini", "GPT-4.1 mini"),
+            model("openai/gpt-4o-mini-2024-07-18", "GPT-4o mini"),
+        ];
+        assert_eq!(
+            cheapest_model(&models).as_deref(),
+            Some("openai/gpt-4.1-mini")
         );
     }
 
