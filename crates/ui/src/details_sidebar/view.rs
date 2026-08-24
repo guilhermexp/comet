@@ -989,6 +989,18 @@ impl DetailsSidebar {
         let event = open_subagent_event(&chat_id, &row);
         let doc_id = row.id.clone();
         let avatar_path = subagent_row_avatar_path(&row.id);
+        let status = div()
+            .size(px(15.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(self.render_activity_status(
+                row.status,
+                SharedString::from(format!("subagent-status-{}", row.id)),
+                theme,
+                cx,
+            ));
         let transcript = div()
             .id(SharedString::from(format!("subagent-open-{}", row.id)))
             .min_w_0()
@@ -1025,7 +1037,8 @@ impl DetailsSidebar {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text)
                     .child(row.title.clone()),
-            );
+            )
+            .child(status);
         div()
             .id(SharedString::from(format!("chat-subagent-{}", row.id)))
             .border_t_1()
@@ -1318,13 +1331,13 @@ impl DetailsSidebar {
             let todo_body =
                 div().children(todos.items.into_iter().enumerate().map(|(index, todo)| {
                     div()
-                        .h(px(32.0))
-                        .px(px(10.0))
+                        .h(px(status_layout.row_height_px))
+                        .px(px(status_layout.horizontal_padding_px))
                         .border_t_1()
                         .border_color(theme.border.opacity(0.55))
                         .flex()
                         .items_center()
-                        .gap(px(8.0))
+                        .gap(px(status_layout.gap_px))
                         .child(
                             div()
                                 .size(px(status_layout.slot_px))

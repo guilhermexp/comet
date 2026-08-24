@@ -3,12 +3,18 @@ use zeron_proto::ToolCall;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TodoStatusLayout {
+    pub row_height_px: f32,
+    pub horizontal_padding_px: f32,
+    pub gap_px: f32,
     pub slot_px: f32,
     pub glyph_px: f32,
 }
 
 pub fn todo_status_layout() -> TodoStatusLayout {
     TodoStatusLayout {
+        row_height_px: 36.0,
+        horizontal_padding_px: 12.0,
+        gap_px: 9.0,
         slot_px: 15.0,
         glyph_px: 9.0,
     }
@@ -130,6 +136,9 @@ mod tests {
     #[test]
     fn todo_status_slot_centers_the_shared_glyph_geometry() {
         let layout = todo_status_layout();
+        assert_eq!(layout.row_height_px, 36.0);
+        assert_eq!(layout.horizontal_padding_px, 12.0);
+        assert_eq!(layout.gap_px, 9.0);
         assert_eq!(layout.slot_px, 15.0);
         assert_eq!(layout.glyph_px, 9.0);
     }

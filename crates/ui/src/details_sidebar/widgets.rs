@@ -59,11 +59,10 @@ impl ChatWorkersWidgetState {
         let present = activity_ids.iter().copied().collect::<HashSet<_>>();
         self.activity_expansion
             .retain(|activity_id, _| present.contains(activity_id.as_str()));
-        let expand_first = self.activity_expansion.is_empty();
-        for (index, activity_id) in activity_ids.into_iter().enumerate() {
+        for activity_id in activity_ids {
             self.activity_expansion
                 .entry(activity_id.to_owned())
-                .or_insert(expand_first && index == 0);
+                .or_insert(false);
         }
     }
 
@@ -196,12 +195,14 @@ mod tests {
     }
 
     #[test]
-    fn workers_widget_keeps_expansion_bound_to_identity_after_reordering() {
+    fn workers_widget_starts_collapsed_and_preserves_explicit_expansion() {
         let mut state = ChatWorkersWidgetState::default();
         state.sync_activities(["workflow-a", "workflow-b"]);
 
-        assert!(state.activity_expanded_with_default("workflow-a", false));
+        assert!(!state.activity_expanded_with_default("workflow-a", false));
         assert!(!state.activity_expanded_with_default("workflow-b", false));
+
+        state.toggle_activity_with_default("workflow-a", false);
 
         state.sync_activities(["workflow-b", "workflow-a", "workflow-c"]);
 
@@ -226,6 +227,7 @@ mod tests {
     fn workers_widget_prunes_expansion_state_for_absent_workflows() {
         let mut state = ChatWorkersWidgetState::default();
         state.sync_activities(["workflow-a", "workflow-b"]);
+        state.toggle_activity_with_default("workflow-a", false);
         assert!(state.activity_expanded_with_default("workflow-a", false));
 
         state.sync_activities(["workflow-b"]);

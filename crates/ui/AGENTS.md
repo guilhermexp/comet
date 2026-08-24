@@ -26,8 +26,10 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - `crates/ui/src/terminal/` é o **painel de terminal dentro do app**. Não confundir com o `crates/tui` deletado (viewport ratatui do upstream, removido).
 - Presença de terminal se reconcilia por `reconcile_terminal_presence` + evento. Dispatchar `ToggleTerminal` no fechamento da última aba (como o upstream faz) dispara em dobro aqui.
 - Provider autenticado fica expansível quando houver janela remota **ou** linha de usage local. `NoUsage` significa que ambas estão vazias; linhas locais de 24h/7d/30d continuam acessíveis sem quota remota.
+- Activities do widget Workers começam colapsadas; toggles explícitos permanecem keyed pelo id estável. Linhas de subagent preservam avatar e status lifecycle, incluindo spinner paint-only durante `Running`.
 - Linhas do To-dos usam um único slot circular não encolhível, com check/seta
-  centralizados nos dois eixos; estados não recebem offsets ópticos próprios.
+  centralizados nos dois eixos e a mesma geometria `36/12/9` do card inline;
+  estados não recebem offsets ópticos próprios.
 
 ## Work Guidance
 
