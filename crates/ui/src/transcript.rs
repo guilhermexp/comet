@@ -159,6 +159,26 @@ fn user_message_card_background(theme: &Theme) -> gpui::Hsla {
     theme.input_glass_bg()
 }
 
+#[derive(Clone, Copy)]
+struct StickyTurnSurface {
+    outer_background: Option<gpui::Hsla>,
+    occlusion_background: Option<gpui::Hsla>,
+    occlusion_radius: f32,
+    occlusion_blur_radius: f32,
+}
+
+/// The positioning wrapper is layout-only. The card-shaped inner layer blurs
+/// scrolling content before the reused translucent user card paints, avoiding
+/// both text ghosting and the old full-width rectangular plate.
+fn sticky_turn_surface(theme: &Theme) -> StickyTurnSurface {
+    StickyTurnSurface {
+        outer_background: None,
+        occlusion_background: (!theme.is_frost()).then_some(theme.bg),
+        occlusion_radius: USER_MESSAGE_CARD_RADIUS,
+        occlusion_blur_radius: 16.0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
 // which follows the shape of stackblitz/use-stick-to-bottom)
@@ -4907,29 +4927,33 @@ impl Transcript {
         let mut sticky_row = source.clone();
         sticky_row.id = SharedString::from(format!("{}#sticky", source.id));
         let theme = Theme::of(cx).clone();
+        let surface = sticky_turn_surface(&theme);
         let body = self.render_row_body(&sticky_row, None, window, &theme, cx);
         let source_id = source.id.clone();
         let weak = cx.weak_entity();
-        let measured =
-            div()
-                .w_full()
-                .min_w_0()
-                .child(body)
-                .on_children_prepainted(move |bounds, _, cx| {
-                    let Some(height) = bounds
-                        .first()
-                        .map(|bounds| f32::from(bounds.size.height))
-                        .filter(|height| *height > 0.0)
-                    else {
-                        return;
-                    };
-                    weak.update(cx, |this, cx| {
-                        if this.sticky_turn.record_height(source_id.clone(), height) {
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                });
+        let measured = div()
+            .w_full()
+            .min_w_0()
+            .rounded(px(surface.occlusion_radius))
+            .when_some(surface.occlusion_background, |wrapper, background| {
+                wrapper.bg(background)
+            })
+            .child(body)
+            .on_children_prepainted(move |bounds, _, cx| {
+                let Some(height) = bounds
+                    .first()
+                    .map(|bounds| f32::from(bounds.size.height))
+                    .filter(|height| *height > 0.0)
+                else {
+                    return;
+                };
+                weak.update(cx, |this, cx| {
+                    if this.sticky_turn.record_height(source_id.clone(), height) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
 
         Some(
             div()
@@ -4947,8 +4971,14 @@ impl Transcript {
                         .max_w(px(MAX_CONTENT_WIDTH))
                         .min_w_0()
                         .pb(px(GAP_TURN))
-                        .bg(theme.bg)
-                        .child(measured),
+                        .when_some(surface.outer_background, |wrapper, background| {
+                            wrapper.bg(background)
+                        })
+                        .child(crate::frost::frosted(
+                            surface.occlusion_radius,
+                            surface.occlusion_blur_radius,
+                            measured,
+                        )),
                 )
                 .into_any_element(),
         )
@@ -10107,6 +10137,21 @@ mod tests {
     fn user_message_card_matches_the_composer_background() {
         let theme = Theme::dark();
         assert_eq!(user_message_card_background(&theme), theme.input_glass_bg());
+    }
+
+    #[test]
+    fn sticky_turn_occludes_scrolling_text_only_inside_the_user_card_shape() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let surface = sticky_turn_surface(&theme);
+            assert_eq!(surface.outer_background, None);
+            if theme.is_frost() {
+                assert_eq!(surface.occlusion_background, None);
+            } else {
+                assert_eq!(surface.occlusion_background, Some(theme.bg));
+            }
+            assert_eq!(surface.occlusion_radius, USER_MESSAGE_CARD_RADIUS);
+            assert_eq!(surface.occlusion_blur_radius, 16.0);
+        }
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
