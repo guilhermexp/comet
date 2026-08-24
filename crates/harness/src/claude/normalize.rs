@@ -8,16 +8,12 @@ use zeron_proto::{
 };
 
 use super::wire::{ContentBlock, Frame, SystemFrame};
-use crate::partial_tool_input::{cap_partial_json, partial_file_tool_call};
-
-const MAX_STREAMING_TOOL_INPUT_BYTES: usize = 1024 * 1024;
+use crate::partial_tool_input::PartialFileToolInput;
 
 #[derive(Debug)]
 struct StreamingToolInput {
     id: String,
-    name: String,
-    raw_json: String,
-    last_emitted: Option<ToolCall>,
+    input: PartialFileToolInput,
     parent_tool_use_id: Option<String>,
 }
 
@@ -354,30 +350,23 @@ impl Normalizer {
         block: ContentBlock,
         parent_tool_use_id: Option<String>,
     ) -> Option<AgentEvent> {
-        if !matches!(block.name.to_ascii_lowercase().as_str(), "write" | "edit") {
-            return None;
-        }
-        let raw_json = cap_partial_json(
-            block
-                .input
-                .as_object()
-                .filter(|input| !input.is_empty())
-                .and_then(|_| serde_json::to_string(&block.input).ok())
-                .unwrap_or_default(),
-        );
-        let call = partial_file_tool_call(&block.name, &raw_json);
+        let mut input = PartialFileToolInput::new(&block.name)?;
+        let call = block
+            .input
+            .as_object()
+            .filter(|value| !value.is_empty())
+            .and_then(|_| serde_json::to_string(&block.input).ok())
+            .and_then(|raw| input.push(&raw));
         self.streaming_tools.insert(
             index,
             StreamingToolInput {
                 id: block.id.clone(),
-                name: block.name,
-                raw_json,
-                last_emitted: call.clone(),
+                input,
                 parent_tool_use_id: parent_tool_use_id.clone(),
             },
         );
         call.map(|call| {
-            let event = AgentEvent::ToolCall { id: block.id, call };
+            let event = AgentEvent::ToolCallPreview { id: block.id, call };
             parent_tool_use_id
                 .as_deref()
                 .map(|parent| tag(parent, event.clone()))
@@ -387,23 +376,24 @@ impl Normalizer {
 
     fn update_streaming_tool(&mut self, index: usize, delta: &str) -> Option<AgentEvent> {
         let state = self.streaming_tools.get_mut(&index)?;
-        let remaining = MAX_STREAMING_TOOL_INPUT_BYTES.saturating_sub(state.raw_json.len());
-        if remaining > 0 {
-            let mut end = delta.len().min(remaining);
-            while !delta.is_char_boundary(end) {
-                end -= 1;
-            }
-            state.raw_json.push_str(&delta[..end]);
-        }
-        let call = partial_file_tool_call(&state.name, &state.raw_json)?;
-        if state.last_emitted.as_ref() == Some(&call) {
-            return None;
-        }
-        state.last_emitted = Some(call.clone());
-        let event = AgentEvent::ToolCall {
+        let call = state.input.push(delta)?;
+        let event = AgentEvent::ToolCallPreview {
             id: state.id.clone(),
             call,
         };
+        Some(
+            state
+                .parent_tool_use_id
+                .as_deref()
+                .map(|parent| tag(parent, event.clone()))
+                .unwrap_or(event),
+        )
+    }
+
+    fn finish_streaming_tool(&mut self, index: usize) -> Option<AgentEvent> {
+        let mut state = self.streaming_tools.remove(&index)?;
+        let call = state.input.force_preview()?;
+        let event = AgentEvent::ToolCallPreview { id: state.id, call };
         Some(
             state
                 .parent_tool_use_id
@@ -532,8 +522,10 @@ impl Normalizer {
                         .collect();
                 }
                 if f.event.kind == "content_block_stop" {
-                    self.streaming_tools.remove(&f.event.index);
-                    return Vec::new();
+                    return self
+                        .finish_streaming_tool(f.event.index)
+                        .into_iter()
+                        .collect();
                 }
                 if f.event.kind != "content_block_delta" {
                     return Vec::new();
@@ -986,13 +978,36 @@ mod tests {
         let calls = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::ToolCall { id, call } => Some((id, call)),
+                AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
+                    Some((id, call))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert!(calls.len() >= 3, "events: {events:#?}");
+        assert!(calls.len() >= 2, "events: {events:#?}");
         assert!(calls.iter().all(|(id, _)| id.as_str() == "tool-write"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| matches!(event, AgentEvent::ToolCall { id, .. } if id == "tool-write")
+                )
+                .count(),
+            1,
+            "only the authoritative frame may carry the full durable call: {events:#?}"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallPreview { id, .. } if id == "tool-write")
+        ));
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolCallPreview { id, .. } if id == "tool-write"))
+                .count()
+                >= 2,
+            "small newline update must refresh before the authoritative call: {events:#?}"
+        );
         assert_eq!(
             calls.last().map(|(_, call)| *call),
             Some(&ToolCall::WriteFile {
@@ -1005,7 +1020,7 @@ mod tests {
     #[test]
     fn initial_claude_tool_input_is_unicode_safely_capped() {
         let mut normalizer = Normalizer::new();
-        let oversized = "€".repeat((MAX_STREAMING_TOOL_INPUT_BYTES / 3) + 32);
+        let oversized = "€".repeat((1024 * 1024 / 3) + 32);
         normalizer.start_streaming_tool(
             7,
             ContentBlock {
@@ -1018,9 +1033,57 @@ mod tests {
             None,
         );
 
-        let stored = &normalizer.streaming_tools[&7].raw_json;
-        assert!(stored.len() <= MAX_STREAMING_TOOL_INPUT_BYTES);
-        assert!(stored.is_char_boundary(stored.len()));
+        let ToolCall::WriteFile {
+            content: Some(content),
+            ..
+        } = normalizer.streaming_tools[&7]
+            .input
+            .preview_call()
+            .expect("bounded preview")
+        else {
+            panic!("write preview")
+        };
+        assert!(content.len() <= crate::partial_tool_input::PARTIAL_PREVIEW_BODY_MAX_BYTES);
+    }
+
+    fn claude_progressive_stream_stats(body_bytes: usize) -> (usize, usize) {
+        let mut normalizer = Normalizer::new();
+        normalizer.start_streaming_tool(
+            9,
+            ContentBlock {
+                kind: "tool_use".into(),
+                id: "bounded-write".into(),
+                name: "Write".into(),
+                input: json!({}),
+                ..ContentBlock::default()
+            },
+            None,
+        );
+        let mut events = normalizer
+            .update_streaming_tool(9, "{\"file_path\":\"large.txt\",\"content\":\"")
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)) {
+            events.extend(normalizer.update_streaming_tool(9, &chunk));
+        }
+        let serialized_bytes = events
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum();
+        (events.len(), serialized_bytes)
+    }
+
+    #[test]
+    fn claude_progressive_megabyte_is_linear_and_coalesced() {
+        let half = claude_progressive_stream_stats(512 * 1024);
+        let full = claude_progressive_stream_stats(1024 * 1024);
+
+        assert!(full.0 <= 70, "too many refreshes: {full:?}");
+        assert!(full.1 <= 2 * 1024 * 1024, "too many bytes: {full:?}");
+        assert!(
+            full.1 <= half.1 * 3,
+            "growth is superlinear: {half:?} -> {full:?}"
+        );
     }
 
     #[test]
@@ -1043,12 +1106,16 @@ mod tests {
         let calls = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::ToolCall { id, call } if id == "tool-edit" => Some(call),
+                AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call }
+                    if id == "tool-edit" =>
+                {
+                    Some(call)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert!(calls.len() >= 3, "events: {events:#?}");
+        assert!(calls.len() >= 2, "events: {events:#?}");
         assert_eq!(
             calls.last().copied(),
             Some(&ToolCall::EditFile {

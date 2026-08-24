@@ -1,189 +1,419 @@
 use zeron_proto::ToolCall;
 
-const MAX_PARTIAL_TOOL_INPUT_BYTES: usize = 1024 * 1024;
+pub(crate) const PARTIAL_PREVIEW_BODY_MAX_BYTES: usize = 8 * 1024;
+pub(crate) const PARTIAL_REFRESH_BYTES: usize = 16 * 1024;
+const PARTIAL_PATH_MAX_BYTES: usize = 4 * 1024;
 
-pub(crate) fn cap_partial_json(mut raw: String) -> String {
-    if raw.len() <= MAX_PARTIAL_TOOL_INPUT_BYTES {
-        return raw;
-    }
-    let mut end = MAX_PARTIAL_TOOL_INPUT_BYTES;
-    while !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    raw.truncate(end);
-    raw
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileToolKind {
+    Write,
+    Edit,
 }
 
-/// Decode a named JSON string from a possibly incomplete tool-input object.
-///
-/// This deliberately recognizes only string keys followed by string values;
-/// it is not JSON repair. A trailing, incomplete escape is omitted rather
-/// than guessed, which keeps every returned character grounded in bytes that
-/// have already arrived from the runtime.
-pub(crate) fn partial_json_string_field(raw: &str, aliases: &[&str]) -> Option<String> {
-    let raw = capped_input(raw);
-    let bytes = raw.as_bytes();
-    let mut cursor = 0;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileField {
+    Path,
+    Content,
+    Old,
+    New,
+}
 
-    while cursor < bytes.len() {
-        if bytes[cursor] != b'"' {
-            cursor += 1;
-            continue;
+#[derive(Debug, Clone)]
+enum ObjectPhase {
+    Key,
+    Colon(Option<FileField>),
+    Value(Option<FileField>),
+    AfterValue,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StringRole {
+    Key,
+    Value(Option<FileField>),
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EscapeState {
+    Normal,
+    Escaped,
+    Unicode { value: u32, digits: u8 },
+}
+
+#[derive(Debug, Clone)]
+struct ActiveString {
+    role: StringRole,
+    escape: EscapeState,
+    key: String,
+    pending_high_surrogate: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalFileFields {
+    depth: usize,
+    phase: ObjectPhase,
+    active: Option<ActiveString>,
+    path: Option<String>,
+    content: Option<String>,
+    old_string: Option<String>,
+    new_string: Option<String>,
+}
+
+impl Default for IncrementalFileFields {
+    fn default() -> Self {
+        Self {
+            depth: 0,
+            phase: ObjectPhase::Key,
+            active: None,
+            path: None,
+            content: None,
+            old_string: None,
+            new_string: None,
         }
+    }
+}
 
-        let (key, key_end, key_terminated) = decode_json_string(bytes, cursor + 1);
-        if !key_terminated {
+/// Incremental, bounded decoder for progressive Write/Edit JSON input.
+/// Every incoming character is consumed once; only the path and bounded body
+/// tails survive between chunks.
+#[derive(Debug, Clone)]
+pub(crate) struct PartialFileToolInput {
+    kind: FileToolKind,
+    fields: IncrementalFileFields,
+    bytes_since_emit: usize,
+    emission_count: u32,
+    last_emitted: Option<ToolCall>,
+}
+
+impl PartialFileToolInput {
+    pub(crate) fn new(tool_name: &str) -> Option<Self> {
+        let kind = match tool_name.to_ascii_lowercase().as_str() {
+            "write" => FileToolKind::Write,
+            "edit" => FileToolKind::Edit,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            fields: IncrementalFileFields::default(),
+            bytes_since_emit: 0,
+            emission_count: 0,
+            last_emitted: None,
+        })
+    }
+
+    pub(crate) fn push(&mut self, delta: &str) -> Option<ToolCall> {
+        self.bytes_since_emit = self.bytes_since_emit.saturating_add(delta.len());
+        let had_body = self.has_body();
+        self.fields.push(delta);
+        let first = self.last_emitted.is_none();
+        let body_started = !had_body && self.has_body();
+        let first_semantic_followup =
+            self.emission_count == 1 && (body_started || has_line_boundary(delta));
+        if !first && !first_semantic_followup && self.bytes_since_emit < PARTIAL_REFRESH_BYTES {
             return None;
         }
-        cursor = key_end;
-        if !aliases.iter().any(|alias| *alias == key) {
-            continue;
+        let call = self.preview_call()?;
+        if self.last_emitted.as_ref() == Some(&call) {
+            return None;
         }
-
-        let mut value_start = skip_json_whitespace(bytes, cursor);
-        if bytes.get(value_start) != Some(&b':') {
-            continue;
-        }
-        value_start = skip_json_whitespace(bytes, value_start + 1);
-        if bytes.get(value_start) != Some(&b'"') {
-            continue;
-        }
-
-        let (value, _, _) = decode_json_string(bytes, value_start + 1);
-        return Some(value);
+        self.last_emitted = Some(call.clone());
+        self.bytes_since_emit = 0;
+        self.emission_count = self.emission_count.saturating_add(1);
+        Some(call)
     }
 
-    None
+    pub(crate) fn force_preview(&mut self) -> Option<ToolCall> {
+        let call = self.preview_call()?;
+        if self.last_emitted.as_ref() == Some(&call) {
+            return None;
+        }
+        self.last_emitted = Some(call.clone());
+        self.bytes_since_emit = 0;
+        self.emission_count = self.emission_count.saturating_add(1);
+        Some(call)
+    }
+
+    pub(crate) fn preview_call(&self) -> Option<ToolCall> {
+        let path = self.fields.path.clone().filter(|path| !path.is_empty())?;
+        Some(match self.kind {
+            FileToolKind::Write => ToolCall::WriteFile {
+                path,
+                content: self.fields.content.clone(),
+            },
+            FileToolKind::Edit => ToolCall::EditFile {
+                path,
+                old_string: self.fields.old_string.clone(),
+                new_string: self.fields.new_string.clone(),
+            },
+        })
+    }
+
+    fn has_body(&self) -> bool {
+        match self.kind {
+            FileToolKind::Write => self.fields.content.is_some(),
+            FileToolKind::Edit => {
+                self.fields.old_string.is_some() || self.fields.new_string.is_some()
+            }
+        }
+    }
 }
 
-/// Build only typed file calls whose safely decoded fields are already
-/// present. Other tool names intentionally return `None`.
-pub(crate) fn partial_file_tool_call(tool_name: &str, raw: &str) -> Option<ToolCall> {
-    let path = || partial_json_string_field(raw, &["path", "file_path", "filePath"]);
-    match tool_name.to_ascii_lowercase().as_str() {
-        "write" => Some(ToolCall::WriteFile {
-            path: path().filter(|path| !path.is_empty())?,
-            content: partial_json_string_field(raw, &["content"]),
-        }),
-        "edit" => Some(ToolCall::EditFile {
-            path: path().filter(|path| !path.is_empty())?,
-            old_string: partial_json_string_field(raw, &["old_string", "oldText"]),
-            new_string: partial_json_string_field(raw, &["new_string", "newText"]),
-        }),
+impl IncrementalFileFields {
+    fn push(&mut self, delta: &str) {
+        for character in delta.chars() {
+            if self.active.is_some() {
+                self.push_string_character(character);
+                continue;
+            }
+
+            match character {
+                '"' => {
+                    let role = if self.depth == 1 {
+                        match self.phase {
+                            ObjectPhase::Key => StringRole::Key,
+                            ObjectPhase::Value(field) => {
+                                self.start_field(field);
+                                StringRole::Value(field)
+                            }
+                            _ => StringRole::Ignore,
+                        }
+                    } else {
+                        StringRole::Ignore
+                    };
+                    self.active = Some(ActiveString {
+                        role,
+                        escape: EscapeState::Normal,
+                        key: String::new(),
+                        pending_high_surrogate: None,
+                    });
+                }
+                '{' | '[' => {
+                    self.depth = self.depth.saturating_add(1);
+                    if self.depth == 1 {
+                        self.phase = ObjectPhase::Key;
+                    }
+                }
+                '}' | ']' => {
+                    let before = self.depth;
+                    self.depth = self.depth.saturating_sub(1);
+                    if before > 1 && self.depth == 1 {
+                        self.phase = ObjectPhase::AfterValue;
+                    }
+                }
+                ':' if self.depth == 1 => {
+                    if let ObjectPhase::Colon(field) = self.phase {
+                        self.phase = ObjectPhase::Value(field);
+                    }
+                }
+                ',' if self.depth == 1 => self.phase = ObjectPhase::Key,
+                c if self.depth == 1 && !c.is_whitespace() => {
+                    if matches!(self.phase, ObjectPhase::Value(_)) {
+                        self.phase = ObjectPhase::AfterValue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.bound_body_tails();
+    }
+
+    fn push_string_character(&mut self, character: char) {
+        let Some(escape) = self.active.as_ref().map(|active| active.escape) else {
+            return;
+        };
+        match escape {
+            EscapeState::Normal => match character {
+                '"' => {
+                    let active = self.active.take().expect("active string");
+                    self.finish_string(active);
+                }
+                '\\' => {
+                    if let Some(active) = self.active.as_mut() {
+                        active.escape = EscapeState::Escaped;
+                    }
+                }
+                other => {
+                    if let Some(active) = self.active.as_mut() {
+                        active.pending_high_surrogate = None;
+                    }
+                    self.append_active(other);
+                }
+            },
+            EscapeState::Escaped => {
+                let (decoded, next) = match character {
+                    '"' => (Some('"'), EscapeState::Normal),
+                    '\\' => (Some('\\'), EscapeState::Normal),
+                    '/' => (Some('/'), EscapeState::Normal),
+                    'b' => (Some('\u{0008}'), EscapeState::Normal),
+                    'f' => (Some('\u{000c}'), EscapeState::Normal),
+                    'n' => (Some('\n'), EscapeState::Normal),
+                    'r' => (Some('\r'), EscapeState::Normal),
+                    't' => (Some('\t'), EscapeState::Normal),
+                    'u' => (
+                        None,
+                        EscapeState::Unicode {
+                            value: 0,
+                            digits: 0,
+                        },
+                    ),
+                    _ => (None, EscapeState::Normal),
+                };
+                if let Some(decoded) = decoded {
+                    if let Some(active) = self.active.as_mut() {
+                        active.pending_high_surrogate = None;
+                    }
+                    self.append_active(decoded);
+                }
+                if !matches!(next, EscapeState::Unicode { .. })
+                    && let Some(active) = self.active.as_mut()
+                {
+                    active.pending_high_surrogate = None;
+                }
+                if let Some(active) = self.active.as_mut() {
+                    active.escape = next;
+                }
+            }
+            EscapeState::Unicode { value, digits } => {
+                let Some(hex) = character.to_digit(16) else {
+                    if let Some(active) = self.active.as_mut() {
+                        active.escape = EscapeState::Normal;
+                    }
+                    return;
+                };
+                let value = (value << 4) | hex;
+                let digits = digits + 1;
+                if digits == 4 {
+                    let code = value as u16;
+                    let decoded = if (0xD800..=0xDBFF).contains(&code) {
+                        if let Some(active) = self.active.as_mut() {
+                            active.pending_high_surrogate = Some(code);
+                        }
+                        None
+                    } else if (0xDC00..=0xDFFF).contains(&code) {
+                        self.active
+                            .as_mut()
+                            .and_then(|active| active.pending_high_surrogate.take())
+                            .and_then(|high| {
+                                let scalar = 0x10000
+                                    + ((u32::from(high) - 0xD800) << 10)
+                                    + (u32::from(code) - 0xDC00);
+                                char::from_u32(scalar)
+                            })
+                    } else {
+                        if let Some(active) = self.active.as_mut() {
+                            active.pending_high_surrogate = None;
+                        }
+                        char::from_u32(value)
+                    };
+                    if let Some(decoded) = decoded {
+                        self.append_active(decoded);
+                    }
+                    if let Some(active) = self.active.as_mut() {
+                        active.escape = EscapeState::Normal;
+                    }
+                } else if let Some(active) = self.active.as_mut() {
+                    active.escape = EscapeState::Unicode { value, digits };
+                }
+            }
+        }
+    }
+
+    fn append_active(&mut self, character: char) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        match active.role {
+            StringRole::Key => {
+                if active.key.len() + character.len_utf8() <= 64 {
+                    active.key.push(character);
+                }
+            }
+            StringRole::Value(Some(field)) => self.append_field(field, character),
+            StringRole::Value(None) | StringRole::Ignore => {}
+        }
+    }
+
+    fn finish_string(&mut self, active: ActiveString) {
+        self.phase = match active.role {
+            StringRole::Key => ObjectPhase::Colon(field_alias(&active.key)),
+            StringRole::Value(_) => ObjectPhase::AfterValue,
+            StringRole::Ignore => self.phase.clone(),
+        };
+    }
+
+    fn start_field(&mut self, field: Option<FileField>) {
+        let slot = match field {
+            Some(FileField::Path) => &mut self.path,
+            Some(FileField::Content) => &mut self.content,
+            Some(FileField::Old) => &mut self.old_string,
+            Some(FileField::New) => &mut self.new_string,
+            None => return,
+        };
+        slot.get_or_insert_with(String::new);
+    }
+
+    fn append_field(&mut self, field: FileField, character: char) {
+        match field {
+            FileField::Path => {
+                let path = self.path.get_or_insert_with(String::new);
+                if path.len() + character.len_utf8() <= PARTIAL_PATH_MAX_BYTES {
+                    path.push(character);
+                }
+            }
+            FileField::Content => self.content.get_or_insert_with(String::new).push(character),
+            FileField::Old => self
+                .old_string
+                .get_or_insert_with(String::new)
+                .push(character),
+            FileField::New => self
+                .new_string
+                .get_or_insert_with(String::new)
+                .push(character),
+        }
+    }
+
+    fn bound_body_tails(&mut self) {
+        for body in [
+            &mut self.content,
+            &mut self.old_string,
+            &mut self.new_string,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            truncate_to_tail(body, PARTIAL_PREVIEW_BODY_MAX_BYTES);
+        }
+    }
+}
+
+fn field_alias(key: &str) -> Option<FileField> {
+    match key {
+        "path" | "file_path" | "filePath" => Some(FileField::Path),
+        "content" => Some(FileField::Content),
+        "old_string" | "oldText" => Some(FileField::Old),
+        "new_string" | "newText" => Some(FileField::New),
         _ => None,
     }
 }
 
-fn capped_input(raw: &str) -> &str {
-    if raw.len() <= MAX_PARTIAL_TOOL_INPUT_BYTES {
-        return raw;
+fn truncate_to_tail(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
     }
-    let mut end = MAX_PARTIAL_TOOL_INPUT_BYTES;
-    while !raw.is_char_boundary(end) {
-        end -= 1;
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
     }
-    &raw[..end]
+    value.drain(..start);
 }
 
-fn skip_json_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
-    {
-        cursor += 1;
-    }
-    cursor
-}
-
-/// Decode the string whose opening quote precedes `cursor`. Returns the
-/// decoded prefix, the byte after the closing quote (or input end), and
-/// whether a closing quote was observed.
-fn decode_json_string(bytes: &[u8], mut cursor: usize) -> (String, usize, bool) {
-    let mut decoded = String::new();
-    let mut literal_start = cursor;
-
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'"' => {
-                push_utf8_slice(&mut decoded, &bytes[literal_start..cursor]);
-                return (decoded, cursor + 1, true);
-            }
-            b'\\' => {
-                push_utf8_slice(&mut decoded, &bytes[literal_start..cursor]);
-                let Some(escape) = bytes.get(cursor + 1).copied() else {
-                    return (decoded, bytes.len(), false);
-                };
-                match escape {
-                    b'"' => decoded.push('"'),
-                    b'\\' => decoded.push('\\'),
-                    b'/' => decoded.push('/'),
-                    b'b' => decoded.push('\u{0008}'),
-                    b'f' => decoded.push('\u{000c}'),
-                    b'n' => decoded.push('\n'),
-                    b'r' => decoded.push('\r'),
-                    b't' => decoded.push('\t'),
-                    b'u' => {
-                        let Some((character, consumed)) = decode_unicode_escape(bytes, cursor + 2)
-                        else {
-                            return (decoded, bytes.len(), false);
-                        };
-                        decoded.push(character);
-                        cursor = consumed;
-                        literal_start = cursor;
-                        continue;
-                    }
-                    _ => return (decoded, cursor + 2, false),
-                }
-                cursor += 2;
-                literal_start = cursor;
-                continue;
-            }
-            _ => cursor += 1,
-        }
-    }
-
-    push_utf8_slice(&mut decoded, &bytes[literal_start..]);
-    (decoded, bytes.len(), false)
-}
-
-fn decode_unicode_escape(bytes: &[u8], hex_start: usize) -> Option<(char, usize)> {
-    let first_end = hex_start.checked_add(4)?;
-    let first = decode_hex_quad(bytes.get(hex_start..first_end)?)?;
-    if !(0xD800..=0xDBFF).contains(&first) {
-        return char::from_u32(u32::from(first)).map(|character| (character, first_end));
-    }
-
-    let second_hex_start = first_end.checked_add(2)?;
-    if bytes.get(first_end..second_hex_start)? != b"\\u" {
-        return None;
-    }
-    let second_end = second_hex_start.checked_add(4)?;
-    let second = decode_hex_quad(bytes.get(second_hex_start..second_end)?)?;
-    if !(0xDC00..=0xDFFF).contains(&second) {
-        return None;
-    }
-    let scalar = 0x10000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00);
-    char::from_u32(scalar).map(|character| (character, second_end))
-}
-
-fn decode_hex_quad(hex: &[u8]) -> Option<u16> {
-    (hex.len() == 4).then_some(())?;
-    hex.iter().try_fold(0_u16, |value, byte| {
-        let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => return None,
-        };
-        Some((value << 4) | u16::from(digit))
-    })
-}
-
-fn push_utf8_slice(output: &mut String, bytes: &[u8]) {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => output.push_str(text),
-        Err(error) => output.push_str(std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap()),
-    }
+fn has_line_boundary(delta: &str) -> bool {
+    delta.contains('\n')
+        || delta.contains('\r')
+        || delta
+            .as_bytes()
+            .windows(2)
+            .any(|pair| matches!(pair, b"\\n" | b"\\r"))
 }
 
 #[cfg(test)]
@@ -193,72 +423,125 @@ mod tests {
     #[test]
     fn decodes_complete_and_unterminated_file_strings_without_general_json_repair() {
         let raw = r#"{"file_path":"src/a.rs","content":"line 1\nline 2"#;
-
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(raw);
         assert_eq!(
-            partial_json_string_field(raw, &["file_path"]),
-            Some("src/a.rs".into())
-        );
-        assert_eq!(
-            partial_json_string_field(raw, &["content"]),
-            Some("line 1\nline 2".into())
+            parser.preview_call(),
+            Some(ToolCall::WriteFile {
+                path: "src/a.rs".into(),
+                content: Some("line 1\nline 2".into()),
+            })
         );
     }
 
     #[test]
     fn incomplete_escape_is_not_invented() {
-        assert_eq!(
-            partial_json_string_field(r#"{"content":"line\"#, &["content"]),
-            Some("line".into()),
-        );
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(r#"{"file_path":"a","content":"line\"#);
+        assert!(matches!(
+            parser.preview_call(),
+            Some(ToolCall::WriteFile { content: Some(content), .. }) if content == "line"
+        ));
     }
 
     #[test]
     fn ignores_alias_text_inside_another_json_string() {
-        let raw = r#"{"note":"\"content\":\"wrong\"","content":"right"#;
+        let raw = r#"{"note":"\"content\":\"wrong\"","file_path":"a","content":"right"#;
 
-        assert_eq!(
-            partial_json_string_field(raw, &["content"]),
-            Some("right".into())
-        );
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(raw);
+        assert!(matches!(
+            parser.preview_call(),
+            Some(ToolCall::WriteFile { content: Some(content), .. }) if content == "right"
+        ));
     }
 
     #[test]
     fn decodes_complete_unicode_escapes_and_stops_before_incomplete_ones() {
-        assert_eq!(
-            partial_json_string_field(r#"{"content":"caf\u00e9 \u12"#, &["content"]),
-            Some("café ".into())
-        );
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(r#"{"file_path":"a","content":"caf\u00e9 \u12"#);
+        assert!(matches!(
+            parser.preview_call(),
+            Some(ToolCall::WriteFile { content: Some(content), .. }) if content == "café "
+        ));
     }
 
     #[test]
     fn builds_only_file_calls_from_supported_names() {
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
         assert!(matches!(
-            partial_file_tool_call(
-                "Write",
-                r#"{"file_path":"a.txt","content":"hi"#,
-            ),
+            parser.push(r#"{"file_path":"a.txt","content":"hi"#),
             Some(ToolCall::WriteFile { path, content: Some(content) })
                 if path == "a.txt" && content == "hi"
         ));
-        assert_eq!(
-            partial_file_tool_call("Bash", r#"{"command":"echo hi"#),
-            None
-        );
+        assert!(PartialFileToolInput::new("Bash").is_none());
     }
 
     #[test]
     fn maps_edit_aliases_without_inventing_missing_fields() {
+        let mut parser = PartialFileToolInput::new("edit").unwrap();
+        parser.push(r#"{"path":"a.txt","oldText":"before","newText":"after"#);
         assert_eq!(
-            partial_file_tool_call(
-                "edit",
-                r#"{"path":"a.txt","oldText":"before","newText":"after"#,
-            ),
+            parser.preview_call(),
             Some(ToolCall::EditFile {
                 path: "a.txt".into(),
                 old_string: Some("before".into()),
                 new_string: Some("after".into()),
             })
         );
-        assert_eq!(partial_file_tool_call("Write", r#"{"content":"hi"#), None);
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(r#"{"content":"hi"#);
+        assert_eq!(parser.preview_call(), None);
+    }
+
+    #[test]
+    fn incremental_parser_decodes_each_chunk_and_bounds_live_body() {
+        let mut parser = PartialFileToolInput::new("Write").expect("file tool");
+        assert_eq!(
+            parser.push(r#"{"file_path":"live.txt","content":"first"#),
+            Some(ToolCall::WriteFile {
+                path: "live.txt".into(),
+                content: Some("first".into()),
+            })
+        );
+        let tail = "€".repeat(PARTIAL_PREVIEW_BODY_MAX_BYTES);
+        let _ = parser.push(&tail);
+
+        let ToolCall::WriteFile {
+            content: Some(content),
+            ..
+        } = parser.preview_call().expect("preview")
+        else {
+            panic!("write preview")
+        };
+        assert!(content.len() <= PARTIAL_PREVIEW_BODY_MAX_BYTES);
+    }
+
+    #[test]
+    fn incremental_parser_combines_surrogate_pair_across_chunks() {
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(r#"{"file_path":"emoji.txt","content":"smile \uD83D"#);
+        parser.push(r#"\uDE00"#);
+
+        assert!(matches!(
+            parser.preview_call(),
+            Some(ToolCall::WriteFile { content: Some(content), .. }) if content == "smile 😀"
+        ));
+    }
+
+    #[test]
+    fn body_start_refreshes_a_path_only_preview_before_size_threshold() {
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        assert!(matches!(
+            parser.push("{\"file_path\":\"small.txt\""),
+            Some(ToolCall::WriteFile { content: None, .. })
+        ));
+        assert_eq!(
+            parser.push(r#", "content":"small body"#),
+            Some(ToolCall::WriteFile {
+                path: "small.txt".into(),
+                content: Some("small body".into()),
+            })
+        );
     }
 }

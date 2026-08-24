@@ -7,10 +7,9 @@ use zeron_proto::{
 };
 
 use super::protocol::sanitize_diagnostic;
-use crate::partial_tool_input::{cap_partial_json, partial_file_tool_call};
+use crate::partial_tool_input::PartialFileToolInput;
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_STREAMING_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEndDisposition {
@@ -31,9 +30,7 @@ struct SubagentContext {
 #[derive(Debug, Clone)]
 struct StreamingToolInput {
     id: String,
-    name: String,
-    raw_json: String,
-    last_emitted: Option<ToolCall>,
+    input: PartialFileToolInput,
 }
 
 pub struct OmpNormalizer {
@@ -184,12 +181,10 @@ impl OmpNormalizer {
             }],
             Some("toolcall_start") => self.start_streaming_tool(event).into_iter().collect(),
             Some("toolcall_delta") => self.update_streaming_tool(event).into_iter().collect(),
-            Some("toolcall_end") => {
-                if let Some(index) = content_index(event) {
-                    self.streaming_tools.remove(&index);
-                }
-                event_tool_call(event).into_iter().collect()
-            }
+            Some("toolcall_end") => content_index(event)
+                .and_then(|index| self.finish_streaming_tool(index))
+                .into_iter()
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -207,27 +202,21 @@ impl OmpNormalizer {
             .or_else(|| call.get("toolName"))?
             .as_str()?
             .to_owned();
-        if !matches!(name.to_ascii_lowercase().as_str(), "write" | "edit") {
-            return None;
-        }
-        let raw_json = cap_partial_json(
-            call.get("arguments")
-                .or_else(|| call.get("args"))
-                .filter(|value| !value.is_null())
-                .and_then(|value| serde_json::to_string(value).ok())
-                .unwrap_or_default(),
-        );
-        let typed = partial_file_tool_call(&name, &raw_json);
+        let mut input = PartialFileToolInput::new(&name)?;
+        let typed = call
+            .get("arguments")
+            .or_else(|| call.get("args"))
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::to_string(value).ok())
+            .and_then(|raw| input.push(&raw));
         self.streaming_tools.insert(
             index,
             StreamingToolInput {
                 id: id.clone(),
-                name,
-                raw_json,
-                last_emitted: typed.clone(),
+                input,
             },
         );
-        typed.map(|call| AgentEvent::ToolCall { id, call })
+        typed.map(|call| AgentEvent::ToolCallPreview { id, call })
     }
 
     fn update_streaming_tool(&mut self, event: &Value) -> Option<AgentEvent> {
@@ -238,23 +227,19 @@ impl OmpNormalizer {
             .or_else(|| event.get("partial_json"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let remaining = MAX_STREAMING_TOOL_INPUT_BYTES.saturating_sub(state.raw_json.len());
-        if remaining > 0 {
-            let mut end = delta.len().min(remaining);
-            while !delta.is_char_boundary(end) {
-                end -= 1;
-            }
-            state.raw_json.push_str(&delta[..end]);
-        }
-        let call = partial_file_tool_call(&state.name, &state.raw_json)?;
-        if state.last_emitted.as_ref() == Some(&call) {
-            return None;
-        }
-        state.last_emitted = Some(call.clone());
-        Some(AgentEvent::ToolCall {
+        let call = state.input.push(delta)?;
+        Some(AgentEvent::ToolCallPreview {
             id: state.id.clone(),
             call,
         })
+    }
+
+    fn finish_streaming_tool(&mut self, index: usize) -> Option<AgentEvent> {
+        let mut state = self.streaming_tools.remove(&index)?;
+        state
+            .input
+            .force_preview()
+            .map(|call| AgentEvent::ToolCallPreview { id: state.id, call })
     }
 
     fn subagent_lifecycle(&mut self, frame: &Value) -> Vec<AgentEvent> {
@@ -639,27 +624,6 @@ fn nested_event(frame: &Value) -> Option<AgentEvent> {
     }
 }
 
-fn event_tool_call(event: &Value) -> Option<AgentEvent> {
-    let call = event_tool_call_value(event)?;
-    let id = call
-        .get("id")
-        .or_else(|| call.get("toolCallId"))?
-        .as_str()?;
-    let name = call
-        .get("name")
-        .or_else(|| call.get("toolName"))?
-        .as_str()?;
-    let input = call
-        .get("arguments")
-        .or_else(|| call.get("args"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    Some(AgentEvent::ToolCall {
-        id: id.to_owned(),
-        call: normalize_tool(name, &input),
-    })
-}
-
 /// OMP exposes an authoritative `toolCall` directly on `toolcall_end`; start
 /// and delta snapshots keep the same record under
 /// `partial.content[contentIndex]`. Read both lifecycle shapes through one
@@ -914,12 +878,14 @@ mod tests {
         let calls = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::ToolCall { id, call } => Some((id, call)),
+                AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
+                    Some((id, call))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert!(calls.len() >= 4, "events: {events:#?}");
+        assert!(calls.len() >= 2, "events: {events:#?}");
         assert!(calls.iter().all(|(id, _)| id.as_str() == "omp-real-write"));
         assert_eq!(
             calls.last().map(|(_, call)| *call),
@@ -958,7 +924,7 @@ mod tests {
                     "delta": "{\"path\":\"first.txt\",\"content\":\"one"
                 }
             })).as_slice(),
-            [AgentEvent::ToolCall { id, .. }] if id == "first-write"
+            [AgentEvent::ToolCallPreview { id, .. }] if id == "first-write"
         ));
 
         normalizer.push(json!({ "type": "message_end", "message": {} }));
@@ -1001,14 +967,14 @@ mod tests {
                     "delta": "{\"path\":\"second.txt\",\"content\":\"two"
                 }
             })).as_slice(),
-            [AgentEvent::ToolCall { id, .. }] if id == "second-write"
+            [AgentEvent::ToolCallPreview { id, .. }] if id == "second-write"
         ));
     }
 
     #[test]
     fn initial_omp_tool_input_is_unicode_safely_capped() {
         let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
-        let oversized = "€".repeat((MAX_STREAMING_TOOL_INPUT_BYTES / 3) + 32);
+        let oversized = "€".repeat((1024 * 1024 / 3) + 32);
         normalizer.push(json!({
             "type": "message_update",
             "assistantMessageEvent": {
@@ -1026,9 +992,73 @@ mod tests {
             }
         }));
 
-        let stored = &normalizer.streaming_tools[&0].raw_json;
-        assert!(stored.len() <= MAX_STREAMING_TOOL_INPUT_BYTES);
-        assert!(stored.is_char_boundary(stored.len()));
+        let ToolCall::WriteFile {
+            content: Some(content),
+            ..
+        } = normalizer.streaming_tools[&0]
+            .input
+            .preview_call()
+            .expect("bounded preview")
+        else {
+            panic!("write preview")
+        };
+        assert!(content.len() <= crate::partial_tool_input::PARTIAL_PREVIEW_BODY_MAX_BYTES);
+    }
+
+    fn omp_progressive_stream_stats(body_bytes: usize) -> (usize, usize) {
+        let mut normalizer = OmpNormalizer::new("/repo", "openai-codex/gpt-5.6-sol");
+        normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "partial": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "bounded-omp-write",
+                        "name": "write",
+                        "arguments": {}
+                    }]
+                }
+            }
+        }));
+        let mut events = normalizer.push(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_delta",
+                "contentIndex": 0,
+                "delta": "{\"path\":\"large.txt\",\"content\":\""
+            }
+        }));
+        for chunk in std::iter::repeat_n("x".repeat(8 * 1024), body_bytes.div_ceil(8 * 1024)) {
+            events.extend(normalizer.push(json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_delta",
+                    "contentIndex": 0,
+                    "delta": chunk
+                }
+            })));
+        }
+        let serialized_bytes = events
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum();
+        (events.len(), serialized_bytes)
+    }
+
+    #[test]
+    fn omp_progressive_megabyte_is_linear_and_coalesced() {
+        let half = omp_progressive_stream_stats(512 * 1024);
+        let full = omp_progressive_stream_stats(1024 * 1024);
+
+        assert!(full.0 <= 70, "too many refreshes: {full:?}");
+        assert!(full.1 <= 2 * 1024 * 1024, "too many bytes: {full:?}");
+        assert!(
+            full.1 <= half.1 * 3,
+            "growth is superlinear: {half:?} -> {full:?}"
+        );
     }
 
     #[test]
@@ -1086,13 +1116,36 @@ mod tests {
         let calls = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::ToolCall { id, call } => Some((id, call)),
+                AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
+                    Some((id, call))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert!(calls.len() >= 4, "events: {events:#?}");
+        assert!(calls.len() >= 2, "events: {events:#?}");
         assert!(calls.iter().all(|(id, _)| id.as_str() == "omp-write"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| matches!(event, AgentEvent::ToolCall { id, .. } if id == "omp-write")
+                )
+                .count(),
+            1,
+            "only tool_execution_start may carry the full durable call: {events:#?}"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallPreview { id, .. } if id == "omp-write")
+        ));
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolCallPreview { id, .. } if id == "omp-write"))
+                .count()
+                >= 2,
+            "small newline update must refresh before tool_execution_start: {events:#?}"
+        );
         assert_eq!(
             calls.last().map(|(_, call)| *call),
             Some(&ToolCall::WriteFile {

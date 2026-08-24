@@ -577,6 +577,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     let closes_reasoning = match event {
         AgentEvent::TextDelta { text } | AgentEvent::Error { message: text } => !text.is_empty(),
         AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolCallPreview { .. }
         | AgentEvent::InputRequested { .. }
         | AgentEvent::Done { .. } => true,
         _ => false,
@@ -620,7 +621,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::ToolCall { id, call } => {
+        AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
             if let Some((existing, preview)) = out.iter_mut().find_map(|p| match p {
                 MessagePart::Tool {
                     id: pid,
@@ -1608,6 +1609,41 @@ mod tests {
                 .iter()
                 .all(|line| line.kind == FileChangeLineKind::Added)
         );
+    }
+
+    #[test]
+    fn transient_tool_preview_refreshes_same_file_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCallPreview {
+                id: "write-live".into(),
+                call: ToolCall::WriteFile {
+                    path: "live.txt".into(),
+                    content: Some("first".into()),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCallPreview {
+                id: "write-live".into(),
+                call: ToolCall::WriteFile {
+                    path: "live.txt".into(),
+                    content: Some("second".into()),
+                },
+            },
+        );
+
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                id,
+                call: ToolCall::WriteFile { content: Some(content), .. },
+                ..
+            } if id == "write-live" && content == "second"
+        ));
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //! journal + broadcast fan-out, and 120ms coalesced doc streaming.
 //!
 //! Pragmatic port of zeron's `sessions.ts` (spec: feature-inventory §3.2):
-//! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
-//!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
-//!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
+//! - durable `AgentEvent`s are appended to the on-disk run journal, broadcast,
+//!   and folded via `fold_event_into_parts`; bounded `ToolCallPreview` events
+//!   are broadcast/folded only. Doc diffs reach the chat's `SessionDoc`
+//!   through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
 //! - the user message entry is pushed to the doc immediately on dispatch (id = the
 //!   command's client-minted message id, so optimistic echoes never flicker);
 //! - a `Steered` event splits the assistant entry at the exact boundary;
@@ -39,7 +40,8 @@ use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
-/// One journaled event: the durable seq plus the event, as broadcast to subscribers.
+/// One published event. Durable events carry their journal seq; transient
+/// previews use seq 0 and exist only on the live broadcast.
 #[derive(Debug, Clone)]
 pub struct JournaledEvent {
     pub seq: u64,
@@ -839,14 +841,19 @@ impl SessionsEngine {
 }
 
 impl Inner {
-    /// Journal + broadcast one event (the two unconditional legs of the pipeline).
+    /// Persist durable events and broadcast every event. File previews stay
+    /// live-only; their later authoritative ToolCall is journaled in full.
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
-        let seq = match self.journal.append(chat_id, event) {
-            Ok(seq) => seq,
-            Err(err) => {
-                tracing::error!(chat = %chat_id, error = %err, "journal append failed");
-                0
+        let seq = if should_journal_event(event) {
+            match self.journal.append(chat_id, event) {
+                Ok(seq) => seq,
+                Err(err) => {
+                    tracing::error!(chat = %chat_id, error = %err, "journal append failed");
+                    0
+                }
             }
+        } else {
+            0
         };
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
             let _ = hub.send(JournaledEvent {
@@ -1071,6 +1078,14 @@ impl Inner {
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
         }
+    }
+}
+
+fn should_journal_event(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::ToolCallPreview { .. } => false,
+        AgentEvent::Subagent { event, .. } => should_journal_event(event),
+        _ => true,
     }
 }
 
@@ -2307,17 +2322,60 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        PendingInput, RuntimeConfig, SubagentSink, apply_context_usage_to_session, finish_segment,
-        resolve_pending_question, segment_duration_ms, subagent_doc_id,
-        workflow_tasks_from_entries,
+        HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine, SubagentSink,
+        apply_context_usage_to_session, finish_segment, resolve_pending_question,
+        segment_duration_ms, should_journal_event, subagent_doc_id, workflow_tasks_from_entries,
     };
     use chrono::Utc;
     use tokio::sync::oneshot;
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     use zeron_proto::{
-        ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus,
-        WorkflowTaskStatus, WorkflowTaskUpdate,
+        AgentEvent, ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus,
+        ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
     };
+
+    #[test]
+    fn journal_policy_skips_transient_preview_but_keeps_authoritative_file_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let (_, mut live) = engine.subscribe("chat", 0).unwrap();
+        let preview = AgentEvent::ToolCallPreview {
+            id: "write-live".into(),
+            call: ToolCall::WriteFile {
+                path: "live.txt".into(),
+                content: Some("bounded".into()),
+            },
+        };
+        let final_call = AgentEvent::ToolCall {
+            id: "write-live".into(),
+            call: ToolCall::WriteFile {
+                path: "live.txt".into(),
+                content: Some("complete historical body".into()),
+            },
+        };
+
+        assert!(!should_journal_event(&preview));
+        assert!(should_journal_event(&final_call));
+        assert!(!should_journal_event(&AgentEvent::Subagent {
+            parent_tool_use_id: "parent".into(),
+            event: Box::new(preview.clone()),
+        }));
+
+        assert_eq!(engine.inner.publish("chat", &preview), 0);
+        let live_preview = live.try_recv().expect("preview broadcast");
+        assert_eq!(live_preview.seq, 0);
+        assert_eq!(live_preview.event, preview);
+        assert!(journal.replay("chat", 0).unwrap().is_empty());
+
+        assert_eq!(engine.inner.publish("chat", &final_call), 1);
+        let replay = journal.replay("chat", 0).unwrap();
+        assert_eq!(replay, vec![(1, final_call)]);
+    }
 
     fn workflow_entry(index: usize, status: WorkflowTaskStatus) -> SessionMessageEntry {
         SessionMessageEntry {

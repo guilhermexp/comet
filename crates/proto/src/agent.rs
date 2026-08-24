@@ -408,6 +408,14 @@ pub enum AgentEvent {
         id: String,
         call: ToolCall,
     },
+    /// Bounded, transient shape refresh for an in-flight file tool. Engines
+    /// broadcast and fold this event for live UI, but never append it to the
+    /// run journal; the later authoritative [`AgentEvent::ToolCall`] remains
+    /// the sole durable source of the complete historical input.
+    ToolCallPreview {
+        id: String,
+        call: ToolCall,
+    },
     #[serde(rename_all = "camelCase")]
     ToolResult {
         id: String,
@@ -508,6 +516,24 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn transient_tool_preview_has_a_distinct_wire_shape() {
+        let event = AgentEvent::ToolCallPreview {
+            id: "write-live".into(),
+            call: ToolCall::WriteFile {
+                path: "live.txt".into(),
+                content: Some("bounded".into()),
+            },
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("toolCallPreview")
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), event);
     }
 
     #[test]
