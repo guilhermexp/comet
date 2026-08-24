@@ -1055,7 +1055,10 @@ fn settle_turn_steps_child(row: &mut Row) {
         ..
     } = &mut row.kind
     {
-        *auto_open = false;
+        // TurnSteps is already the disclosure for the completed prefix. Keep
+        // its tool cards visible by default without opening command output,
+        // diffs, or other per-card detail bodies.
+        *auto_open = true;
         *detail_auto_open = false;
     }
 }
@@ -9981,7 +9984,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tail_tool_groups_open_while_folded_prefix_groups_settle() {
+    fn active_tail_and_turn_steps_tool_groups_show_cards_without_opening_details() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
@@ -10030,7 +10033,10 @@ mod tests {
         else {
             panic!()
         };
-        assert!(!auto_open);
+        assert!(
+            auto_open,
+            "completed prefix tool cards remain visible inside TurnSteps"
+        );
         assert!(
             !detail_auto_open,
             "completed prefix command output remains collapsed by default"
