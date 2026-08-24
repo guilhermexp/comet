@@ -888,7 +888,7 @@ async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
     let snapshot = capture_diff(&core.repos, &repo_dir)
         .await
         .expect("diff snapshot");
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
 
     let response = client
         .call(
@@ -903,7 +903,7 @@ async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
         )
         .await
         .expect("GetCheckoutFileDiffText");
-    let response: comet_proto::CheckoutFileDiffText =
+    let response: zeron_proto::CheckoutFileDiffText =
         serde_json::from_value(response).expect("typed response");
     assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
     assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));

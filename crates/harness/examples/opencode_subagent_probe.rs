@@ -38,6 +38,7 @@ async fn main() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        chat_id: String::new(),
     };
     // Optional second arg overrides the prompt (e.g. the mock rig's
     // "TWO subagents" variant exercising concurrent binding).
@@ -56,6 +57,8 @@ async fn main() {
         cwd,
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         resume: None,
         worktree: None,

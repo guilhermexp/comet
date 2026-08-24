@@ -31,6 +31,7 @@ async fn main() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        chat_id: String::new(),
     };
     let request = RunRequest {
         prompt: "Use spawn_subagent to launch ONE subagent of type general with description \
@@ -45,6 +46,8 @@ async fn main() {
         cwd,
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,

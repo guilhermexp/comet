@@ -44,6 +44,8 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -71,6 +73,7 @@ fn controls(
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        chat_id: String::new(),
     };
     (controls, steer_tx, token)
 }
@@ -309,6 +312,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        chat_id: String::new(),
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;
 

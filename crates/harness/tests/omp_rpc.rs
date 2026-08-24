@@ -102,6 +102,7 @@ fn controls_with_answer(
         }),
         steering: steer_rx,
         interrupt: interrupt.clone(),
+        chat_id: String::new(),
     };
     (controls, steer_tx, interrupt)
 }
@@ -122,6 +123,7 @@ fn controls_with_pending_answer() -> (
         }),
         steering: steer_rx,
         interrupt: interrupt.clone(),
+        chat_id: String::new(),
     };
     (controls, steer_tx, interrupt)
 }

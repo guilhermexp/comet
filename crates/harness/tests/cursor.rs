@@ -37,6 +37,8 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        enable_workers_mcp: false,
+        workers_parent_chat_id: None,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -54,6 +56,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        chat_id: String::new(),
     };
     (controls, steer_tx, token)
 }

@@ -48,7 +48,8 @@ async fn engine_with_chat() -> (tempfile::TempDir, EngineCore, WorkerTools<RpcEn
     core.workspace
         .create_chat(
             CHAT,
-            "space-worker-e2e",
+            Some("space-worker-e2e"),
+            None,
             None,
             Some(cwd.to_string_lossy().into_owned()),
         )

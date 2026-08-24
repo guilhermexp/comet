@@ -19,9 +19,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_engine::{EngineCore, HarnessRegistry};
-use comet_harness::{Harness, HarnessError, RunControls};
-use comet_proto::{
+use zeron_engine::{EngineCore, HarnessRegistry};
+use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SteeringMode,
 };
@@ -104,7 +104,13 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
         .create_space(SPACE, &core.device_id, &cwd.to_string_lossy(), None, true)
         .expect("create space");
     core.workspace
-        .create_chat(CHAT, SPACE, None, Some(cwd.to_string_lossy().into_owned()))
+        .create_chat(
+            CHAT,
+            Some(SPACE),
+            None,
+            None,
+            Some(cwd.to_string_lossy().into_owned()),
+        )
         .expect("create chat");
 
     core.sessions
@@ -113,6 +119,7 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
             HarnessId::Mock,
             RunRequest {
                 prompt: "hello".into(),
+                harness: None,
                 model: None,
                 reasoning: None,
                 model_options: serde_json::Map::new(),
@@ -120,7 +127,10 @@ async fn dispatch_hands_the_chat_id_to_the_harness() {
                 // Distinct from the titling run's read-only sandbox.
                 sandbox: SandboxLevel::WorkspaceWrite,
                 auto_approve: true,
+                enable_workers_mcp: false,
+                workers_parent_chat_id: None,
                 attachments: Vec::new(),
+                worktree: None,
                 resume: None,
             },
             None,

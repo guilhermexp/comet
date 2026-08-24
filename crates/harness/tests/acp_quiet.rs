@@ -76,6 +76,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        chat_id: String::new(),
     };
     (controls, steer_tx, token)
 }
