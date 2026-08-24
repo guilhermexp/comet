@@ -9376,11 +9376,11 @@ impl Render for Shell {
         let root = match self.splash {
             SplashPhase::Visible => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false))
+                root.child(loaders::splash_overlay(&theme, false, cx.entity_id(), cx))
             }
             SplashPhase::FadingOut => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true))
+                root.child(loaders::splash_overlay(&theme, true, cx.entity_id(), cx))
             }
             SplashPhase::Gone => root,
         };
