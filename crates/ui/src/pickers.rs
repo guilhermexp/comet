@@ -623,8 +623,10 @@ impl Pickers {
         });
         // Dev/testing knob: `ZERON_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
-        // headless compositors, so captures need a data-side path.
-        let boot_open = match std::env::var("ZERON_OPEN_PICKER").ok().as_deref() {
+        // headless compositors, so captures need a data-side path. Gated on
+        // `ZERON_UI_CAPTURE` so a stale export cannot pop a popover in a
+        // normal run.
+        let boot_open = match crate::capture::knob("ZERON_OPEN_PICKER").as_deref() {
             Some("model") => Some(PickerKind::HarnessModel),
             Some("traits") => Some(PickerKind::HarnessModel),
             Some("branch") => Some(PickerKind::Branch),

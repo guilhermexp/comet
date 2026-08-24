@@ -1464,8 +1464,10 @@ impl Shell {
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
-        // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
+        // synthetic input can't reach them on headless compositors. Gated on
+        // `ZERON_UI_CAPTURE`: a normal run always boots into the chat, however
+        // stale the shell's exports are.
+        let route = match crate::capture::knob("ZERON_OPEN_ROUTE").as_deref() {
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
@@ -1487,12 +1489,12 @@ impl Shell {
         // the combined harness/model menu once the shell is Ready;
         // `ZERON_FORCE_GATE=signin|org|failed` renders that gate regardless of
         // real auth state (display-only — for styling passes).
-        let debug_dialog = std::env::var("ZERON_OPEN_DIALOG").ok();
+        let debug_dialog = crate::capture::knob("ZERON_OPEN_DIALOG");
         // `ZERON_DEMO_UPLOAD=<pct>:<image path>` fabricates an in-flight image
         // send on the selected chat (echo bubble + frozen thumbnail progress
         // ring) — display-only; a real upload can't be paused for a capture.
-        let debug_upload = std::env::var("ZERON_DEMO_UPLOAD").ok();
-        let debug_gate = match std::env::var("ZERON_FORCE_GATE").ok().as_deref() {
+        let debug_upload = crate::capture::knob("ZERON_DEMO_UPLOAD");
+        let debug_gate = match crate::capture::knob("ZERON_FORCE_GATE").as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
