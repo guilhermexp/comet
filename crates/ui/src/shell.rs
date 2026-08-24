@@ -58,7 +58,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
-use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, TerminalPanelEvent, ToggleTerminal};
+use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, ToggleTerminal};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workers::model::{WorkersModel, WorkersRoute};
@@ -516,9 +516,6 @@ fn remove_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatPanelState {
     visible: bool,
-    active: UtilityPane,
-    changes_open: bool,
-    diff_open: bool,
     right_active: RightSurface,
 }
 
@@ -526,16 +523,17 @@ impl Default for ChatPanelState {
     fn default() -> Self {
         Self {
             visible: false,
-            active: UtilityPane::Terminal,
-            changes_open: false,
-            diff_open: false,
             right_active: RightSurface::Picker,
         }
     }
 }
 
-/// Session-scoped utility tabs. Missing keys use a closed state; the new-chat
-/// canvas uses a space-specific key. State is intentionally in memory only.
+/// Session-scoped right-pane state. The pane is ONE host for surface tabs
+/// (terminal, diff, preview, subagent, worker), so the only state per chat is
+/// whether the column is open and which tab is picked — a second registry is
+/// what made terminals and diffs live beside file previews instead of in the
+/// same strip. Missing keys are closed; the new-chat canvas uses a
+/// space-specific key. In memory only.
 #[derive(Debug, Default)]
 pub struct SessionPanels {
     map: std::collections::HashMap<String, ChatPanelState>,
@@ -546,22 +544,12 @@ impl SessionPanels {
         self.map.get(key).copied().unwrap_or_default()
     }
 
-    pub fn active(&self, key: &str) -> Option<UtilityPane> {
-        let state = self.get(key);
-        state.visible.then_some(state.active)
+    pub fn is_visible(&self, key: &str) -> bool {
+        self.get(key).visible
     }
 
-    fn show_terminal(&mut self, key: &str) {
-        let state = self.map.entry(key.to_string()).or_default();
-        state.visible = true;
-        state.active = UtilityPane::Terminal;
-    }
-
-    fn show_changes(&mut self, key: &str) {
-        let state = self.map.entry(key.to_string()).or_default();
-        state.visible = true;
-        state.active = UtilityPane::Changes;
-        state.changes_open = true;
+    fn show(&mut self, key: &str) {
+        self.map.entry(key.to_string()).or_default().visible = true;
     }
 
     fn hide(&mut self, key: &str) -> bool {
@@ -573,54 +561,7 @@ impl SessionPanels {
         was_visible
     }
 
-    fn restore(&mut self, key: &str, has_terminal: bool, has_changes: bool) -> bool {
-        let state = self.map.entry(key.to_string()).or_default();
-        let active_exists = match state.active {
-            UtilityPane::Terminal => has_terminal,
-            UtilityPane::Changes => has_changes && state.changes_open,
-        };
-
-        if !active_exists {
-            if has_terminal {
-                state.active = UtilityPane::Terminal;
-            } else if has_changes && state.changes_open {
-                state.active = UtilityPane::Changes;
-            } else {
-                state.visible = false;
-                return false;
-            }
-        }
-
-        state.visible = true;
-        true
-    }
-
-    fn close_changes(&mut self, key: &str, has_terminal: bool) {
-        let state = self.map.entry(key.to_string()).or_default();
-        state.changes_open = false;
-        if state.active == UtilityPane::Changes {
-            state.active = UtilityPane::Terminal;
-            state.visible = has_terminal;
-        }
-    }
-
-    fn reconcile_terminal_presence(&mut self, key: &str, has_terminal: bool) {
-        if has_terminal {
-            return;
-        }
-        let Some(state) = self.map.get_mut(key) else {
-            return;
-        };
-        if state.active == UtilityPane::Terminal {
-            if state.changes_open {
-                state.active = UtilityPane::Changes;
-            } else {
-                state.visible = false;
-            }
-        }
-    }
-
-    /// Mutate `key`'s flags in place (right-pane surface bookkeeping).
+    /// Mutate `key`'s state in place (right-pane surface bookkeeping).
     fn update(&mut self, key: &str, f: impl FnOnce(&mut ChatPanelState)) {
         f(self.map.entry(key.to_string()).or_default());
     }
@@ -1145,16 +1086,15 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
-    /// Lazy panes: no entity (and no RPC) until first opened.
-    terminal: Option<Entity<TerminalPanel>>,
-    terminal_events: Option<Subscription>,
-    /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
-    /// entity from the bottom drawer's (own PTYs, own grid geometry; one
-    /// panel can only size one visible grid at a time).
+    /// Lazy panes: no entity (and no RPC) until first opened. The right pane's
+    /// terminal host is embedded (own PTYs, own grid geometry; one panel can
+    /// only size one visible grid at a time).
     right_terminal: Option<Entity<TerminalPanel>>,
     /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
     right_plus: popover::Popup<()>,
-    changes: Option<Entity<Changes>>,
+    /// Last surface the strip scrolled into view — reveals a newly selected
+    /// chip exactly once, leaving manual scrolling alone.
+    right_tab_revealed: Option<RightSurface>,
     utility_add_menu_open: bool,
     /// Suppresses the trigger click following an outside mouse-down dismissal.
     utility_add_menu_dismissed_at: Option<std::time::Instant>,
@@ -1585,11 +1525,9 @@ impl Shell {
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
-            terminal: None,
-            terminal_events: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
-            changes: None,
+            right_tab_revealed: None,
             utility_add_menu_open: false,
             utility_add_menu_dismissed_at: None,
             diffs: std::collections::HashMap::new(),
@@ -1946,19 +1884,8 @@ impl Shell {
                 }
             }
             self.right_tween = None;
-            let active = self.active_utility_pane(cx);
-            if let Some(panel) = self.terminal.clone() {
-                panel.update(cx, |panel, cx| {
-                    panel.set_open(active == Some(UtilityPane::Terminal), cx)
-                });
-            }
-            if active == Some(UtilityPane::Changes) {
-                let changes = self.changes_pane(cx);
-                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-            }
-            let panels = self.panels.get(&self.panel_key(cx));
-            if panels.changes_open
-                && let RightSurface::Diff(id) = self.resolved_right_active(cx)
+            // One registry: whatever tab this chat had picked is what reloads.
+            if let RightSurface::Diff(id) = self.resolved_right_active(cx)
                 && let Some(changes) = self.diffs.get(&id).cloned()
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
@@ -2049,19 +1976,17 @@ impl Shell {
         }
     }
 
-    fn active_utility_pane(&self, cx: &App) -> Option<UtilityPane> {
-        match self.panels.active(&self.panel_key(cx)) {
-            Some(UtilityPane::Changes) if !self.space_git_detected(cx) => None,
-            active => active,
-        }
-    }
-
+    /// The pane is open when the column is visible AND it still hosts a tab:
+    /// no surface, no column. Nothing here consults git - a file preview must
+    /// open in a folder without a repo just like a terminal does.
     fn right_pane_open(&self, cx: &App) -> bool {
         let context_available = match self.sidebar_mode {
             SidebarMode::Orchestrator => !self.active_chat.is_empty(),
             SidebarMode::Workers => self.worker_panel_context(cx).is_some(),
         };
-        context_available && self.active_utility_pane(cx).is_some()
+        context_available
+            && self.panels.is_visible(&self.panel_key(cx))
+            && !self.right_surface_rows(cx).is_empty()
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -2095,7 +2020,7 @@ impl Shell {
     /// pre-mutation target.
     fn finish_right_transition(&mut self, from: f32, cx: &mut Context<Self>) {
         self.utility_add_menu_open = false;
-        if self.active_utility_pane(cx) != Some(UtilityPane::Changes) {
+        if !self.right_pane_open(cx) {
             self.right_pane_expanded = false;
         }
         // A Terminal↔Changes switch inside an open column keeps the same
@@ -2193,30 +2118,36 @@ impl Shell {
         cx.notify();
     }
 
-    fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `cmd-b` / the Changes entry: select this chat's diff tab, opening one
+    /// if the strip has none. It is a surface like any other, so it shares the
+    /// pane, the strip and the close button with previews and terminals.
+    fn show_changes(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.space_git_detected(cx) {
             return;
         }
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        self.panels.show_changes(&key);
-        if let Some(terminal) = self.terminal.clone() {
-            let was_focused = terminal
-                .read(cx)
-                .focus_handle()
-                .contains_focused(window, cx);
-            terminal.update(cx, |panel, cx| panel.set_open(false, cx));
-            if was_focused {
-                window.focus(&self.composer.focus_handle(cx), cx);
+        self.panels.show(&key);
+        match self
+            .right_surface_rows(cx)
+            .into_iter()
+            .find(|(surface, _)| matches!(surface, RightSurface::Diff(_)))
+        {
+            Some((surface, _)) => {
+                self.set_right_active(surface, cx);
+                if let RightSurface::Diff(id) = surface
+                    && let Some(changes) = self.diffs.get(&id).cloned()
+                {
+                    changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                }
             }
+            None => self.add_diff_surface(cx),
         }
-        let changes = self.changes_pane(cx);
-        changes.update(cx, |changes, cx| changes.ensure_watch(cx));
         self.finish_right_transition(from, cx);
     }
 
     fn toggle_right_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_utility_pane(cx) == Some(UtilityPane::Changes) {
+        if self.right_pane_open(cx) {
             let from = self.right_target(cx);
             let key = self.panel_key(cx);
             self.panels.hide(&key);
@@ -2455,11 +2386,10 @@ impl Shell {
                 .or_default()
                 .push(surface);
         }
-        // Opening a file must OPEN the pane, not just record the surface:
-        // `panels.active` reports `None` while `visible` is false, so
-        // `right_pane_open` stays false and the pane tweens to width 0 - the
-        // click looked dead. `show_changes` flips visible/active together.
-        self.panels.show_changes(&key);
+        // Opening a file must OPEN the pane, not just record the surface: the
+        // column stays at width 0 while `visible` is false, so the click
+        // looked dead.
+        self.panels.show(&key);
         self.panels.update(&key, |panels| {
             panels.right_active = surface;
         });
@@ -2544,7 +2474,7 @@ impl Shell {
         if !self.right_pane_open(cx) {
             let from = self.right_target(cx);
             let key = self.panel_key(cx);
-            self.panels.show_changes(&key);
+            self.panels.show(&key);
             self.finish_right_transition(from, cx);
         }
         let (surface, inserted) = register_worker_surface(
@@ -2623,7 +2553,7 @@ impl Shell {
         if !self.right_pane_open(cx) {
             let from = self.right_target(cx);
             let key = self.panel_key(cx);
-            self.panels.show_changes(&key);
+            self.panels.show(&key);
             self.finish_right_transition(from, cx);
         }
         if let Some((&id, _)) = self
@@ -2777,110 +2707,46 @@ impl Shell {
         }
     }
 
-    fn changes_pane(&mut self, cx: &mut Context<Self>) -> Entity<Changes> {
-        if let Some(changes) = &self.changes {
-            return changes.clone();
-        }
-        let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
-        self.changes = Some(changes.clone());
-        changes
-    }
-
-    fn on_terminal_panel_event(
-        &mut self,
-        terminal: &Entity<TerminalPanel>,
-        event: &TerminalPanelEvent,
-        cx: &mut Context<Self>,
-    ) {
+    /// `cmd-j` / the Terminal entry: select this chat's terminal tab, opening
+    /// one when the strip has none. Terminals are surfaces like previews and
+    /// diffs - same pane, same strip, same close button.
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
-        let current_key = self.panel_key(cx);
-        let event_chat = match event {
-            TerminalPanelEvent::Changed { chat } | TerminalPanelEvent::Activated { chat } => chat,
-        };
-        match event {
-            TerminalPanelEvent::Changed { chat } => {
-                let has_terminal = terminal.read(cx).has_tabs(chat);
-                self.panels.reconcile_terminal_presence(chat, has_terminal);
-            }
-            TerminalPanelEvent::Activated { chat } => {
-                self.panels.show_terminal(chat);
-            }
-        }
-        if current_key == event_chat.as_str() {
-            if self.active_utility_pane(cx) != Some(UtilityPane::Changes) {
-                self.right_pane_expanded = false;
-            }
-            let to = self.right_target(cx);
-            if from != to {
-                self.right_tween = Some(WidthTween::new(from, to));
-            }
-            self.utility_add_menu_open = false;
-            cx.notify();
-        }
-    }
-
-    fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
-        if let Some(terminal) = &self.terminal {
-            return terminal.clone();
-        }
-        let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), cx));
-        let terminal_for_events = terminal.clone();
-        let events = cx.subscribe(&terminal, move |this, _, event: &TerminalPanelEvent, cx| {
-            this.on_terminal_panel_event(&terminal_for_events, event, cx);
-        });
-        self.terminal_events = Some(events);
-        self.terminal = Some(terminal.clone());
-        terminal
-    }
-
-    /// Select the Terminal tab, but only once the panel really holds a tab for
-    /// this session: no selected chat (the new-chat canvas) and an unavailable
-    /// engine both leave zero tabs, and the column must never show up empty.
-    fn reveal_terminal(
-        &mut self,
-        new_tab: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
         let key = self.panel_key(cx);
-        let panel = self.terminal_panel(cx);
-        panel.update(cx, |panel, cx| {
-            if new_tab {
-                panel.open_new_tab(cx);
-            } else {
-                panel.set_open(true, cx);
-            }
-        });
-        if !panel.read(cx).has_tabs(&key) {
-            panel.update(cx, |panel, cx| panel.set_open(false, cx));
-            return false;
+        if self.right_pane_open(cx)
+            && matches!(self.resolved_right_active(cx), RightSurface::Terminal(_))
+        {
+            self.panels.hide(&key);
+            window.focus(&self.composer.focus_handle(cx), cx);
+            self.finish_right_transition(from, cx);
+            return;
         }
-        self.panels.show_terminal(&key);
-        window.focus(&panel.read(cx).focus_handle(), cx);
-        true
+        self.panels.show(&key);
+        match self
+            .right_surface_rows(cx)
+            .into_iter()
+            .find(|(surface, _)| matches!(surface, RightSurface::Terminal(_)))
+        {
+            Some((surface, _)) => self.set_right_active(surface, cx),
+            None => self.add_terminal_surface(cx),
+        }
+        self.focus_right_terminal(window, cx);
+        self.finish_right_transition(from, cx);
     }
 
     fn create_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
-        if !self.reveal_terminal(true, window, cx) {
-            return;
-        }
+        let key = self.panel_key(cx);
+        self.panels.show(&key);
+        self.add_terminal_surface(cx);
+        self.focus_right_terminal(window, cx);
         self.finish_right_transition(from, cx);
     }
 
-    /// Toggle the shared utility column while selecting Terminal when opening.
-    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.right_target(cx);
-        if self.active_utility_pane(cx) == Some(UtilityPane::Terminal) {
-            let key = self.panel_key(cx);
-            self.panels.hide(&key);
-            let panel = self.terminal_panel(cx);
-            panel.update(cx, |panel, cx| panel.set_open(false, cx));
-            window.focus(&self.composer.focus_handle(cx), cx);
-        } else if !self.reveal_terminal(false, window, cx) {
-            return;
+    fn focus_right_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.right_terminal.clone() {
+            window.focus(&terminal.read(cx).focus_handle(), cx);
         }
-        self.finish_right_transition(from, cx);
     }
 
     fn toggle_utility_add_menu(&mut self) {
@@ -2896,51 +2762,16 @@ impl Shell {
             self.close_utility_pane(window, cx);
             return;
         }
-
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
-        let has_terminal = self
-            .terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).has_tabs(&key));
-        let has_changes = self.space_git_detected(cx);
-
-        if !self.panels.restore(&key, has_terminal, has_changes) {
+        self.panels.show(&key);
+        // An empty strip has nothing to reveal: offer the chooser instead of
+        // tweening open a blank column.
+        if !self.right_pane_open(cx) {
+            self.panels.hide(&key);
             self.toggle_utility_add_menu();
             cx.notify();
             return;
-        }
-
-        match self.active_utility_pane(cx) {
-            Some(UtilityPane::Terminal) => {
-                let terminal = self.terminal_panel(cx);
-                terminal.update(cx, |panel, cx| panel.set_open(true, cx));
-                window.focus(&terminal.read(cx).focus_handle(), cx);
-            }
-            Some(UtilityPane::Changes) => {
-                let changes = self.changes_pane(cx);
-                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-            }
-            None => {}
-        }
-        self.finish_right_transition(from, cx);
-    }
-
-    fn close_changes_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.right_target(cx);
-        let key = self.panel_key(cx);
-        let has_terminal = self
-            .terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).has_tabs(&key));
-        self.panels.close_changes(&key, has_terminal);
-        if self.active_utility_pane(cx) == Some(UtilityPane::Terminal) {
-            if let Some(terminal) = self.terminal.clone() {
-                terminal.update(cx, |panel, cx| panel.set_open(true, cx));
-                window.focus(&terminal.read(cx).focus_handle(), cx);
-            }
-        } else if !self.right_pane_open(cx) {
-            window.focus(&self.composer.focus_handle(cx), cx);
         }
         self.finish_right_transition(from, cx);
     }
@@ -2950,9 +2781,6 @@ impl Shell {
         let key = self.panel_key(cx);
         if !self.panels.hide(&key) {
             return;
-        }
-        if let Some(terminal) = self.terminal.clone() {
-            terminal.update(cx, |panel, cx| panel.set_open(false, cx));
         }
         window.focus(&self.composer.focus_handle(cx), cx);
         self.finish_right_transition(from, cx);
@@ -7056,161 +6884,14 @@ impl Shell {
             .into_any_element()
     }
 
-    fn render_utility_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let key = self.panel_key(cx);
-        let state = self.panels.get(&key);
-        let active = self.active_utility_pane(cx);
-        let terminal_group = self
-            .terminal
-            .clone()
-            .filter(|terminal| terminal.read(cx).has_tabs(&key))
-            .map(|terminal| {
-                terminal.update(cx, |panel, cx| {
-                    panel.render_tab_group(active == Some(UtilityPane::Terminal), cx)
-                })
-            })
-            .unwrap_or_else(|| gpui::Empty.into_any_element());
-
-        let changes_tab = if state.changes_open && self.space_git_detected(cx) {
-            let selected = active == Some(UtilityPane::Changes);
-            let (text_color, bg, glyph_alpha) = if selected {
-                (theme.text, crate::theme::ink(0.08), 0.8)
-            } else {
-                (
-                    theme.text_muted.opacity(0.6),
-                    gpui::transparent_black(),
-                    0.6,
-                )
-            };
-            let close = div()
-                .id("changes-tab-close")
-                .size(px(20.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .when(!selected, |element| element.opacity(0.45))
-                .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::ink(0.09)))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.close_changes_tab(window, cx);
-                }))
-                .child(
-                    icon(icons::CLOSE)
-                        .size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.8)),
-                );
-            div()
-                .id("changes-utility-tab")
-                .w(px(crate::terminal::panel::TAB_WIDTH))
-                .h(px(28.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .pl(px(8.0))
-                .pr(px(4.0))
-                .rounded(px(8.0))
-                .bg(motion::hover_blend(
-                    "changes-utility-tab",
-                    bg,
-                    theme.element_hover,
-                ))
-                .on_hover(motion::hover_listener("changes-utility-tab"))
-                .text_size(px(12.0))
-                .text_color(text_color)
-                .cursor_pointer()
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.show_changes(window, cx);
-                }))
-                .child(
-                    icon(icons::DIFF)
-                        .size(px(16.0))
-                        .text_color(text_color.opacity(glyph_alpha)),
-                )
-                .child(div().flex_1().min_w_0().truncate().child("Changes"))
-                .child(close)
-                .into_any_element()
-        } else {
-            gpui::Empty.into_any_element()
-        };
-        let add_menu = self
-            .utility_add_menu_open
-            .then(|| self.render_utility_menu(false, cx));
-        let add = div()
-            .id("utility-add-tab")
-            .size(px(28.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.0))
-            .cursor_pointer()
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .bg(motion::hover_blend(
-                "utility-add-tab",
-                gpui::transparent_black(),
-                crate::theme::ink(0.05),
-            ))
-            .on_hover(motion::hover_listener("utility-add-tab"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.toggle_utility_add_menu();
-                cx.notify();
-            }))
-            .child(
-                icon(icons::PLUS)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted.opacity(0.6)),
-            )
-            .when_some(add_menu, |element, menu| {
-                element.child(popover::anchored_menu("utility-add-menu", menu, None))
-            });
-        let drag_space =
-            self.titlebar_drag_region("utility-tab-strip-drag", div().h_full().flex_1(), cx);
-        let collapse = header_icon_button(
-            "collapse-utility-pane",
-            icons::ALT_ARROW_DOWN,
-            false,
-            &theme,
-            cx.listener(|this, _, window, cx| this.close_utility_pane(window, cx)),
-        );
-
-        div()
-            .h(px(TAB_BAR_HEIGHT))
-            .flex_none()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0))
-            .pl(px(8.0))
-            .pr(px(6.0))
-            .child(terminal_group)
-            .child(changes_tab)
-            .child(add)
-            .child(drag_space)
-            .child(collapse)
-            .into_any_element()
-    }
-
-    /// Full-height right utility column — Terminal or Changes, hidden by
-    /// default, glass-friendly, and drag-resizable from its left seam.
+    /// Full-height right utility column: ONE host for every surface tab -
+    /// terminal, diff, file preview, subagent, worker - hidden by default,
+    /// glass-friendly, drag-resizable from its left seam.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let active = self.active_utility_pane(cx);
         let surface = self.resolved_right_active(cx);
         let tab_strip = match surface {
-            RightSurface::Picker => match active {
-                Some(_) => self.render_utility_tab_strip(cx),
-                None => gpui::Empty.into_any_element(),
-            },
+            RightSurface::Picker => gpui::Empty.into_any_element(),
             _ => self.render_right_tab_strip(cx),
         };
         let content: AnyElement = match surface {
@@ -7270,20 +6951,8 @@ impl Shell {
                 .terminal()
                 .clone()
                 .into_any_element(),
-            RightSurface::Picker => match active {
-                Some(UtilityPane::Terminal) => {
-                    let panel = self.terminal_panel(cx);
-                    let resize_suspended = self.tween_active(self.right_tween);
-                    panel.update(cx, |panel, _| panel.set_resize_suspended(resize_suspended));
-                    panel.into_any_element()
-                }
-                Some(UtilityPane::Changes) => {
-                    let changes = self.changes_pane(cx);
-                    changes.update(cx, |changes, cx| changes.ensure_watch(cx));
-                    changes.into_any_element()
-                }
-                None => gpui::Empty.into_any_element(),
-            },
+            // No tabs: the column is closed, so nothing to host.
+            RightSurface::Picker => gpui::Empty.into_any_element(),
         };
         // Flush panel (user request — the inset card is gone): full window
         // height with a left hairline, glass-friendly for either utility
@@ -7385,8 +7054,10 @@ impl Shell {
     /// living in the top row; the diff options moved into the pane below.
     pub(crate) fn render_right_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         /// Fixed chip slot — the terminal drawer's drag mechanics (drop-index
-        /// quantisation + slide offsets) assume uniform widths.
-        const CHIP_W: f32 = 112.0;
+        /// quantisation + slide offsets) assume uniform widths. Same width as
+        /// the utility strip's chips: both bands host the same pane, so a file
+        /// surface must not open looking different from Changes/Terminal.
+        const CHIP_W: f32 = crate::terminal::panel::TAB_WIDTH;
         const CHIP_SLOT: f32 = CHIP_W + 4.0; // + the strip's own gap
 
         let theme = Theme::of(cx).clone();
@@ -7397,6 +7068,16 @@ impl Shell {
         let rows = self.right_surface_rows(cx);
         let count = rows.len();
         let active = self.resolved_right_active(cx);
+        // A newly selected tab must be VISIBLE: the strip scrolls, so with
+        // three chips in a 344px pane the active one sat past the right edge
+        // (user report: the terminal opened with no chip). Only on change -
+        // every frame would fight the user's own scrolling.
+        if self.right_tab_revealed != Some(active)
+            && let Some(ix) = rows.iter().position(|(surface, _)| *surface == active)
+        {
+            self.right_tab_scroll.scroll_to_item(ix);
+            self.right_tab_revealed = Some(active);
+        }
         let drag = self
             .right_tab_drag
             .as_ref()
@@ -7750,7 +7431,6 @@ impl Shell {
                 10.0,
             ));
         }
-        strip = strip.child(plus);
         // Edge fades on whichever side hides tabs (flags computed above).
         // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
         // opaque: painted gradients in the shell surface tone.
@@ -7760,12 +7440,14 @@ impl Shell {
         // strip claim the whole column height inside the pane's flex_col, so
         // the chips centred vertically and the surface below got zero height -
         // every non-picker surface (preview, diff tab) opened blank.
+        // Natural width, shrinking when the chips outgrow the band: `flex_1`
+        // here split the leftover space with the drag region below, so the
+        // strip stopped halfway across the pane and the rest of the band was
+        // dead space (user report).
         let region = div()
             .relative()
             .min_w_0()
-            .w_full()
-            .h(px(TAB_BAR_HEIGHT))
-            .flex_none()
+            .h_full()
             .flex()
             .items_center()
             .child(strip)
@@ -7799,14 +7481,37 @@ impl Shell {
                         )),
                 )
             });
-        if glass {
+        let chips: AnyElement = if glass {
             crate::edge_fade::edge_faded(FADE_WIDTH, false, false, region)
                 .fade_left(fade_left)
                 .fade_right(fade_right)
                 .into_any_element()
         } else {
             region.into_any_element()
-        }
+        };
+        // Same band the utility strip had: scrolling chips, then `+`, then the
+        // window-drag gap, then the collapse chevron. `+` sits OUTSIDE the
+        // scroller so a full strip can never push it out of reach.
+        div()
+            .h(px(TAB_BAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .pl(px(8.0))
+            .pr(px(6.0))
+            .child(chips)
+            .child(plus)
+            .child(self.titlebar_drag_region("surface-tab-strip-drag", div().h_full().flex_1(), cx))
+            .child(header_icon_button(
+                "collapse-surface-pane",
+                icons::ALT_ARROW_DOWN,
+                false,
+                &theme,
+                cx.listener(|this, _, window, cx| this.close_utility_pane(window, cx)),
+            ))
+            .into_any_element()
     }
 
     /// Toggle the surface-host takeover (the header's expand button, t3code
@@ -9496,119 +9201,41 @@ mod tests {
     }
 
     #[test]
-    fn session_panels_flags_are_chat_scoped() {
+    fn session_panels_are_chat_scoped() {
         let mut panels = SessionPanels::default();
-        panels.show_changes("chat-a");
-        panels.show_terminal("chat-a");
+        panels.show("chat-a");
+        panels.update("chat-a", |state| {
+            state.right_active = RightSurface::Preview(7)
+        });
 
-        let state = panels.get("chat-a");
-        assert!(state.visible);
-        assert_eq!(state.active, UtilityPane::Terminal);
-        assert!(state.changes_open);
+        assert!(panels.is_visible("chat-a"));
+        assert_eq!(panels.get("chat-a").right_active, RightSurface::Preview(7));
+        // A chat nobody opened is closed and holds no pick.
+        assert!(!panels.is_visible("chat-b"));
+        assert_eq!(panels.get("chat-b").right_active, RightSurface::Picker);
     }
 
     #[test]
-    fn utility_tabs_hide_without_forgetting_open_tabs() {
+    fn hiding_the_pane_keeps_the_picked_surface() {
         let mut panels = SessionPanels::default();
-        panels.show_changes("chat-a");
+        panels.show("chat-a");
+        panels.update("chat-a", |state| state.right_active = RightSurface::Diff(2));
+
         assert!(panels.hide("chat-a"));
-        assert!(!panels.get("chat-a").visible);
-        assert!(panels.get("chat-a").changes_open);
-
-        panels.show_changes("chat-a");
-        assert!(panels.get("chat-a").visible);
+        assert!(!panels.is_visible("chat-a"));
+        // Reopening must land on the same tab, not on a fresh pick.
+        assert_eq!(panels.get("chat-a").right_active, RightSurface::Diff(2));
+        panels.show("chat-a");
+        assert_eq!(panels.get("chat-a").right_active, RightSurface::Diff(2));
     }
 
     #[test]
-    fn utility_tabs_close_with_neighbor_fallback() {
+    fn hiding_a_pane_nobody_opened_reports_no_change() {
         let mut panels = SessionPanels::default();
-        panels.show_changes("chat-a");
-        panels.close_changes("chat-a", true);
-
-        let state = panels.get("chat-a");
-        assert!(state.visible);
-        assert_eq!(state.active, UtilityPane::Terminal);
-        assert!(!state.changes_open);
-
-        panels.show_changes("chat-a");
-        panels.show_terminal("chat-a");
-        panels.reconcile_terminal_presence("chat-a", false);
-        let state = panels.get("chat-a");
-        assert!(state.visible);
-        assert_eq!(state.active, UtilityPane::Changes);
-
-        panels.close_changes("chat-a", false);
-        assert!(!panels.get("chat-a").visible);
-
-        panels.show_terminal("chat-a");
-        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Terminal));
-    }
-
-    #[test]
-    fn utility_panel_restore_keeps_the_last_valid_tab() {
-        let mut panels = SessionPanels::default();
-        panels.show_terminal("chat-a");
-        panels.show_changes("chat-a");
-        panels.hide("chat-a");
-
-        assert!(panels.restore("chat-a", true, true));
-        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Changes));
-        assert!(panels.get("chat-a").changes_open);
-    }
-
-    #[test]
-    fn utility_panel_restore_falls_back_to_an_available_tab() {
-        let mut panels = SessionPanels::default();
-        panels.show_changes("chat-a");
-        panels.show_terminal("chat-a");
-        panels.hide("chat-a");
-
-        assert!(panels.restore("chat-a", false, true));
-        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Changes));
-    }
-
-    #[test]
-    fn utility_panel_restore_skips_unavailable_changes() {
-        let mut panels = SessionPanels::default();
-        panels.show_terminal("chat-a");
-        panels.show_changes("chat-a");
-        panels.hide("chat-a");
-
-        assert!(panels.restore("chat-a", true, false));
-        assert_eq!(panels.active("chat-a"), Some(UtilityPane::Terminal));
-    }
-
-    #[test]
-    fn utility_panel_restore_rejects_unavailable_changes_only() {
-        let mut panels = SessionPanels::default();
-        panels.show_changes("chat-a");
-        panels.hide("chat-a");
-
-        assert!(!panels.restore("chat-a", false, false));
-        assert_eq!(panels.active("chat-a"), None);
-    }
-
-    #[test]
-    fn utility_panel_restore_rejects_an_empty_panel() {
-        let mut panels = SessionPanels::default();
-        assert!(!panels.restore("chat-a", false, false));
-        assert_eq!(panels.active("chat-a"), None);
-    }
-
-    #[test]
-    fn background_terminal_close_does_not_change_the_selected_session() {
-        let mut panels = SessionPanels::default();
-        panels.show_changes("selected");
-        panels.show_terminal("selected");
-        panels.show_terminal("background");
-
-        panels.reconcile_terminal_presence("background", false);
-
-        let selected = panels.get("selected");
-        assert!(selected.visible);
-        assert_eq!(selected.active, UtilityPane::Terminal);
-        assert!(selected.changes_open);
-        assert_eq!(panels.active("background"), None);
+        assert!(!panels.hide("chat-a"));
+        panels.show("chat-a");
+        assert!(panels.hide("chat-a"));
+        assert!(!panels.hide("chat-a"));
     }
 
     #[test]

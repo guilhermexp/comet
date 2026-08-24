@@ -18,17 +18,15 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollHandle, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Subscription, Task,
+    Window, actions, div, prelude::*, px,
 };
 
-use zeron_proto::{TerminalEvent, TerminalSession};
-use zeron_rpc::methods;
-
-use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+use zeron_proto::{TerminalEvent, TerminalSession};
+use zeron_rpc::methods;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::scroll::{
@@ -47,12 +45,6 @@ pub const TAB_BAR_HEIGHT: f32 = 40.0;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
 
 actions!(terminal, [ToggleTerminal]);
-
-#[derive(Debug, Clone)]
-pub(crate) enum TerminalPanelEvent {
-    Changed { chat: String },
-    Activated { chat: String },
-}
 
 /// Bind the terminal keymap (global): Cmd+J on macOS, Ctrl+J elsewhere.
 pub fn init(cx: &mut App) {
@@ -265,45 +257,6 @@ struct ChatTabs {
     active: usize,
 }
 
-/// Drag-reorder state; `epoch` keys the 150 ms slide animation restarts.
-struct DragState {
-    from: usize,
-    over: usize,
-    epoch: usize,
-    prev_over: usize,
-}
-
-/// The dragged-tab payload (gpui drag-and-drop).
-struct TabDragPayload {
-    chat: String,
-    from: usize,
-    title: SharedString,
-}
-
-struct TabGhost {
-    title: SharedString,
-}
-
-impl Render for TabGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .w(px(TAB_WIDTH))
-            .h(px(28.0))
-            .px(px(Theme::SPACE_SM))
-            .flex()
-            .items_center()
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(theme.surface_raised)
-            .border_1()
-            .border_color(theme.border_strong)
-            .text_size(px(12.0))
-            .text_color(theme.text)
-            .opacity(0.85)
-            .child(div().truncate().child(self.title.clone()))
-    }
-}
-
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
@@ -323,8 +276,6 @@ pub struct TerminalPanel {
     /// emulator: alternate-screen rows truncate rather than reflow.
     resize_suspended: bool,
     tab_seq: u64,
-    drag: Option<DragState>,
-    tabs_scroll: ScrollHandle,
     last_selected: Option<String>,
     /// Last reported grid placement; `None` until the first prepaint.
     geometry: Option<GridGeometry>,
@@ -343,8 +294,6 @@ pub struct TerminalPanel {
     _observe: Subscription,
 }
 
-impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
-
 impl TerminalPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -357,8 +306,6 @@ impl TerminalPanel {
             render_context: None,
             resize_suspended: false,
             tab_seq: 0,
-            drag: None,
-            tabs_scroll: ScrollHandle::new(),
             last_selected: None,
             geometry: None,
             selection_drag: None,
@@ -380,19 +327,6 @@ impl TerminalPanel {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
-    }
-
-    pub(crate) fn has_tabs(&self, chat: &str) -> bool {
-        self.chats
-            .get(chat)
-            .is_some_and(|tabs| !tabs.tabs.is_empty())
-    }
-
-    pub(crate) fn open_new_tab(&mut self, cx: &mut Context<Self>) {
-        self.open = true;
-        if let Some(chat) = self.selected_chat(cx) {
-            self.open_tab(chat, cx);
-        }
     }
 
     pub fn set_resize_suspended(&mut self, suspended: bool) {
@@ -513,7 +447,6 @@ impl TerminalPanel {
         let switched = selected != self.last_selected;
         if switched {
             self.last_selected = selected;
-            self.drag = None;
         }
         if self.open && !self.embedded {
             // Returning to a chat with tabs restores them; a fresh chat (or an
@@ -612,9 +545,6 @@ impl TerminalPanel {
         if let Some(tab) = self.tab_mut(&context, key) {
             tab._run = Some(run);
         }
-        cx.emit(TerminalPanelEvent::Changed {
-            chat: context.clone(),
-        });
         cx.notify();
     }
 
@@ -1383,9 +1313,6 @@ impl TerminalPanel {
         {
             tabs.active = ix;
             self.open = true;
-            cx.emit(TerminalPanelEvent::Activated {
-                chat: chat.to_string(),
-            });
             cx.notify();
         }
     }
@@ -1402,13 +1329,9 @@ impl TerminalPanel {
         let tab = tabs.tabs.remove(ix);
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
-        self.drag = None;
         if now_empty {
             self.open = false;
         }
-        cx.emit(TerminalPanelEvent::Changed {
-            chat: chat.to_string(),
-        });
         if let (Some(engine), Some(id)) = (engine, tab.terminal_id.clone()) {
             cx.spawn(async move |_, _| {
                 let _ = engine
@@ -1423,253 +1346,6 @@ impl TerminalPanel {
         }
         cx.notify();
     }
-
-    fn commit_reorder(&mut self, chat: &str, from: usize, to: usize, cx: &mut Context<Self>) {
-        if let Some(tabs) = self.chats.get_mut(chat) {
-            let active = tabs.active;
-            reorder_tabs(&mut tabs.tabs, from, to);
-            tabs.active = active_after_reorder(active, from, to);
-        }
-        self.drag = None;
-        cx.emit(TerminalPanelEvent::Changed {
-            chat: chat.to_string(),
-        });
-        cx.notify();
-    }
-
-    fn update_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
-        let changed = match &mut self.drag {
-            Some(drag) if drag.over != over => {
-                drag.prev_over = drag.over;
-                drag.over = over;
-                drag.epoch += 1;
-                true
-            }
-            Some(_) => false,
-            None => {
-                self.drag = Some(DragState {
-                    from,
-                    over,
-                    epoch: 0,
-                    prev_over: from,
-                });
-                true
-            }
-        };
-        if changed {
-            if let Some(chat) = self.selected_chat(cx) {
-                cx.emit(TerminalPanelEvent::Changed { chat });
-            }
-            cx.notify();
-        }
-    }
-
-    // ---- render ----
-
-    pub(crate) fn render_tab_group(
-        &mut self,
-        terminal_active: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if self.drag.is_some() && !cx.has_active_drag() {
-            self.drag = None;
-        }
-        let Some(chat) = self.selected_chat(cx) else {
-            return gpui::Empty.into_any_element();
-        };
-        let theme = Theme::of(cx).clone();
-        let tabs = self.chats.get(&chat);
-        let (active, count) = tabs
-            .map(|tabs| (tabs.active, tabs.tabs.len()))
-            .unwrap_or((0, 0));
-        let drag = self
-            .drag
-            .as_ref()
-            .map(|drag| (drag.from, drag.over, drag.epoch, drag.prev_over));
-        let scroll_for_drag = self.tabs_scroll.clone();
-        let chat_owned = chat.clone();
-
-        let tab_elements: Vec<_> = tabs
-            .map(|tabs| {
-                tabs.tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, tab)| {
-                        let selected = terminal_active && ix == active;
-                        let key = tab.key;
-                        // Contextual label (user request): the OSC title —
-                        // the shell's own cwd/command name — wins over the
-                        // fixed "Terminal N" fallback.
-                        let title = Self::display_title(tab);
-                        let exited = tab.exited.is_some();
-                        (ix, key, title, selected, exited)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let bar_chat = chat_owned.clone();
-        let drop_chat = chat_owned.clone();
-        div()
-            .id("terminal-tab-group")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0))
-            .min_w_0()
-            .overflow_x_scroll()
-            .track_scroll(&self.tabs_scroll)
-            .on_drag_move::<TabDragPayload>(cx.listener(
-                move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
-                    let payload = event.drag(cx);
-                    if payload.chat != bar_chat {
-                        return;
-                    }
-                    let rel_x = f32::from(event.event.position.x) - f32::from(event.bounds.left())
-                        + -f32::from(scroll_for_drag.offset().x);
-                    let over = drop_index(rel_x, TAB_WIDTH, count);
-                    this.update_drag_over(payload.from, over, cx);
-                },
-            ))
-            .on_drop::<TabDragPayload>(cx.listener(move |this, payload: &TabDragPayload, _, cx| {
-                if payload.chat != drop_chat {
-                    this.drag = None;
-                    cx.emit(TerminalPanelEvent::Changed {
-                        chat: drop_chat.clone(),
-                    });
-                    cx.notify();
-                    return;
-                }
-                let to = this
-                    .drag
-                    .as_ref()
-                    .map(|drag| drag.over)
-                    .unwrap_or(payload.from);
-                let chat = drop_chat.clone();
-                this.commit_reorder(&chat, payload.from, to, cx);
-            }))
-            .children(
-                tab_elements
-                    .into_iter()
-                    .map(|(ix, key, title, selected, exited)| {
-                        let chat_select = chat_owned.clone();
-                        let chat_close = chat_owned.clone();
-                        let chat_close2 = chat_owned.clone();
-                        let chat_drag = chat_owned.clone();
-                        let ghost_title = title.clone();
-                        let (text_color, bg, glyph_alpha) = if selected {
-                            (theme.text, crate::theme::ink(0.08), 0.8)
-                        } else {
-                            (
-                                theme.text_muted.opacity(0.6),
-                                gpui::transparent_black(),
-                                0.6,
-                            )
-                        };
-                        let close_btn = div()
-                            .id(("terminal-tab-close", key))
-                            .size(px(20.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .when(!selected, |el| el.opacity(0.45))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(crate::theme::ink(0.09)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(&chat_close2, key, cx);
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::CLOSE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_muted.opacity(0.8)),
-                            );
-                        let tab = div()
-                            .id(("terminal-tab", key))
-                            .w(px(TAB_WIDTH))
-                            .h(px(28.0))
-                            .flex_none()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.0))
-                            .pl(px(8.0))
-                            .pr(px(4.0))
-                            .rounded(px(8.0))
-                            .bg(motion::hover_blend(
-                                &format!("term-tab-{key}"),
-                                bg,
-                                theme.element_hover,
-                            ))
-                            .on_hover(motion::hover_listener(format!("term-tab-{key}")))
-                            .text_size(px(12.0))
-                            .text_color(text_color)
-                            .cursor_pointer()
-                            .block_mouse_except_scroll()
-                            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.prevent_default()
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                window.focus(&this.focus_handle, cx);
-                                this.select_tab(&chat_select, ix, cx);
-                            }))
-                            .on_mouse_down(
-                                MouseButton::Middle,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.close_tab(&chat_close, key, cx);
-                                }),
-                            )
-                            .on_drag(
-                                TabDragPayload {
-                                    chat: chat_drag,
-                                    from: ix,
-                                    title: ghost_title,
-                                },
-                                |payload, _point, _, cx| {
-                                    let title = payload.title.clone();
-                                    cx.stop_propagation();
-                                    cx.new(|_| TabGhost { title })
-                                },
-                            )
-                            .when(exited, |element| element.opacity(0.55))
-                            .child(
-                                crate::icons::icon(crate::icons::TERMINAL)
-                                    .size(px(16.0))
-                                    .text_color(text_color.opacity(glyph_alpha)),
-                            )
-                            .child(div().flex_1().min_w_0().truncate().child(title))
-                            .child(close_btn);
-
-                        match drag {
-                            Some((from, over, epoch, prev_over)) if ix != from => {
-                                let target = slide_offset(ix, from, over) * TAB_WIDTH;
-                                let start = slide_offset(ix, from, prev_over) * TAB_WIDTH;
-                                div()
-                                    .relative()
-                                    .child(tab.with_animation(
-                                        ("terminal-tab-slide", key | ((epoch as u64) << 32)),
-                                        TAB_SLIDE.animation(),
-                                        move |element, t| {
-                                            element.left(px(motion::lerp(start, target, t)))
-                                        },
-                                    ))
-                                    .into_any_element()
-                            }
-                            Some((from, ..)) if ix == from => div()
-                                .w(px(TAB_WIDTH))
-                                .h(px(28.0))
-                                .flex_none()
-                                .into_any_element(),
-                            _ => tab.into_any_element(),
-                        }
-                    }),
-            )
-            .into_any_element()
-    }
 }
 
 enum StreamDisposition {
@@ -1680,10 +1356,6 @@ enum StreamDisposition {
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        // Heal drag state if the pointer was released outside the bar.
-        if self.drag.is_some() && !cx.has_active_drag() {
-            self.drag = None;
-        }
         // Embedded, the RIGHT PANE's own surface shows through — a second
         // fill here stacked another shade on the pane (user report); the
         // drawer keeps its own tone.

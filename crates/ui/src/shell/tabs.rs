@@ -126,8 +126,10 @@ impl Shell {
             }
         };
         let has_space = !self.state.read(cx).spaces.is_empty();
-        let active_utility = self.active_utility_pane(cx);
-        let terminal_active = active_utility == Some(UtilityPane::Terminal);
+        // One registry: the pane is either open (hosting some surface) or not.
+        let pane_open = self.right_pane_open(cx);
+        let terminal_active =
+            pane_open && matches!(self.resolved_right_active(cx), RightSurface::Terminal(_));
 
         // The new-session `+` renders in the WINDOW-CONTROL CLUSTER while the
         // sidebar is collapsed (`render_titlebar_cluster`) — this row only
@@ -173,7 +175,7 @@ impl Shell {
         // cluster as it collapses.
         let content_left =
             (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
-        let launcher_menu = (has_space && active_utility.is_none() && self.utility_add_menu_open)
+        let launcher_menu = (has_space && !pane_open && self.utility_add_menu_open)
             .then(|| self.render_utility_menu(true, cx));
 
         // Trailing titlebar section. With the changes pane open this is the
@@ -183,7 +185,7 @@ impl Shell {
         // titlebar overlay owns this band's hit-testing: controls mounted in
         // the pane itself would sit under the drag region and never see a
         // click. Hidden on the new-session canvas — nothing to diff yet.
-        let changes_active = active_utility == Some(UtilityPane::Changes);
+        let changes_active = pane_open;
         let takeover = changes_active && self.right_pane_expanded;
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
@@ -372,7 +374,7 @@ impl Shell {
                         .child(header_icon_button(
                             "toggle-utility-panel",
                             icons::SIDEBAR_MINIMALISTIC,
-                            active_utility.is_some(),
+                            pane_open,
                             &theme,
                             cx.listener(|this, _, window, cx| {
                                 this.toggle_utility_panel(window, cx)
