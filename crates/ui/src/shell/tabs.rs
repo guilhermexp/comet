@@ -221,10 +221,6 @@ impl Shell {
             // the buttons slide right on expand (user report).
             let gap_budget = if takeover { 8.0 } else { 16.0 };
             let avail = self.viewport_width - row_left - pr - gap_budget;
-            // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
-            // options that used to live here moved into the pane's own
-            // second row; expand/close stay in this band (user request).
-            let controls = self.render_right_tab_strip(cx);
             Some(
                 div()
                     .flex_none()
@@ -250,16 +246,13 @@ impl Shell {
                             cx,
                         ))
                     })
-                    // Clipped: a long base-ref name must truncate inside the
-                    // controls, never paint under the buttons to the right.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(controls),
-                    )
+                    // The surface chips render INSIDE the pane (one strip, one
+                    // set of element ids): drawing them here too painted a
+                    // second copy of the same ids, and this band's width math
+                    // lands left of the pane whenever the details sidebar is
+                    // open - the chips landed on top of the chat title. Only
+                    // the spacer stays, so expand/close keep their edge.
+                    .child(div().flex_1().min_w_0().h_full())
                     .child(header_icon_button(
                         "expand-changes",
                         icons::EXPAND_ARROWS,

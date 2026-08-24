@@ -2455,8 +2455,12 @@ impl Shell {
                 .or_default()
                 .push(surface);
         }
+        // Opening a file must OPEN the pane, not just record the surface:
+        // `panels.active` reports `None` while `visible` is false, so
+        // `right_pane_open` stays false and the pane tweens to width 0 - the
+        // click looked dead. `show_changes` flips visible/active together.
+        self.panels.show_changes(&key);
         self.panels.update(&key, |panels| {
-            panels.changes_open = true;
             panels.right_active = surface;
         });
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
@@ -7752,10 +7756,16 @@ impl Shell {
         // opaque: painted gradients in the shell surface tone.
         let glass = theme.is_glass();
         let bar_bg = theme.surface;
+        // A fixed band, like the utility strip: `size_full` here made the
+        // strip claim the whole column height inside the pane's flex_col, so
+        // the chips centred vertically and the surface below got zero height -
+        // every non-picker surface (preview, diff tab) opened blank.
         let region = div()
             .relative()
             .min_w_0()
-            .size_full()
+            .w_full()
+            .h(px(TAB_BAR_HEIGHT))
+            .flex_none()
             .flex()
             .items_center()
             .child(strip)
