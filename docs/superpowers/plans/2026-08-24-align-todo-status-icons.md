@@ -33,4 +33,4 @@
 - [x] **Step 2: Run the focused test and verify RED**
 - [x] **Step 3: Apply the layout contract to the status circle**
 - [x] **Step 4: Run focused and UI tests and verify GREEN**
-- [ ] **Step 5: Validate in the headed app and commit**
+- [x] **Step 5: Validate in the headed app and commit**

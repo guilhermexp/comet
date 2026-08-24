@@ -32,4 +32,4 @@
 - [x] **Step 2: Run the focused test and verify RED**
 - [x] **Step 3: Remove only the fresh-process context clear**
 - [x] **Step 4: Run focused and engine tests and verify GREEN**
-- [ ] **Step 5: Commit with the companion UI fix after shared gates**
+- [x] **Step 5: Commit with the companion UI fix after shared gates**
