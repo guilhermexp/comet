@@ -337,11 +337,13 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(16.0))
+        .gap(px(12.0))
+        // Cell 2.5 — the size every other surface runs this spinner at (the
+        // "Sending…" strip, the transcript working trailer).
         .child(gradient_spinner(
             "boot-splash-spinner",
             theme,
-            5.0,
+            2.5,
             view,
             cx,
         ))
