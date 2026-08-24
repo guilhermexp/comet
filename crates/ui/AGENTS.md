@@ -36,6 +36,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 - "Não atualizou na tela" começa em `comet-doc` (mirror), não aqui.
 - Não há harness de render: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando. Screenshot antes de dizer pronto.
+- Toda raiz de `track_focus` precisa de `.id()` + `.role()` (mais `aria_label` / `aria_value` quando o controle carrega texto). Sem role o gpui deixa o elemento fora da árvore AccessKit, loga `a11y: focused element … has no accessibility node` a cada mudança de foco, e a tecnologia assistiva anuncia a janela inteira em vez do controle focado.
 
 ## Verification
 

@@ -754,7 +754,10 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
 /// sits four rows ahead of the live `claude-haiku-4-5`.
 const OMP_ANTHROPIC_INVENTORY: &[(&str, &str)] = &[
     ("anthropic/claude-3-5-sonnet-20240620", "Claude Sonnet 3.5"),
-    ("anthropic/claude-3-5-sonnet-20241022", "Claude Sonnet 3.5 v2"),
+    (
+        "anthropic/claude-3-5-sonnet-20241022",
+        "Claude Sonnet 3.5 v2",
+    ),
     ("anthropic/claude-3-7-sonnet-20250219", "Claude Sonnet 3.7"),
     ("anthropic/claude-3-haiku-20240307", "Claude Haiku 3"),
     ("anthropic/claude-3-opus-20240229", "Claude Opus 3"),

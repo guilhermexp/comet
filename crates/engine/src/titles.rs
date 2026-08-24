@@ -401,7 +401,10 @@ mod tests {
         // pick a route we may hold no credentials for.
         let models = vec![
             model("anthropic/claude-haiku-4-5", "Claude Haiku 4.5"),
-            model("google-vertex/claude-haiku-4-5@20251001", "Claude Haiku 4.5"),
+            model(
+                "google-vertex/claude-haiku-4-5@20251001",
+                "Claude Haiku 4.5",
+            ),
             model("zenmux/anthropic/claude-haiku-4.5", "Claude Haiku 4.5"),
         ];
         assert_eq!(

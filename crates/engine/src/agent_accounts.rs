@@ -2092,7 +2092,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn claude_store_follows_the_fresher_token_not_a_fixed_precedence() {
-        let creds = |expires_at: i64| serde_json::json!({"claudeAiOauth": {"expiresAt": expires_at}});
+        let creds =
+            |expires_at: i64| serde_json::json!({"claudeAiOauth": {"expiresAt": expires_at}});
         let live = creds(2_000);
         let stale = creds(1_000);
         // The leftover FILE that shadowed a live Keychain item and emptied the

@@ -236,8 +236,9 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
   cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
   sidecar.
-- **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
-  elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
+- **Agent accounts**: credential-slot swap (macOS keeps both a Keychain item and a credentials
+  file — store selection rules in `crates/engine/AGENTS.md`), plan labels, usage probes,
+  paste-code/browser-poll OAuth flows.
 - **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
   callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
 
