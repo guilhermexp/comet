@@ -625,6 +625,14 @@ struct Capture {
 
 /// Run git capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
+///
+/// Reads through `take(cap + 1)` straight into `out` instead of a stack chunk:
+/// any buffer alive across the `.await` lands *inside this future*, and a debug
+/// build then reserves that much stack in every frame the future is built in —
+/// including the ~100-arm `EngineRpc::handle` match, whose unoptimized frame
+/// gives each arm its own slot. A 64KiB chunk here cost 128KiB of `capture_diff`
+/// frame plus hundreds of KiB across the handler and overflowed the 2MiB tokio
+/// worker stack (crash: `tokio-rt-worker has overflowed its stack`).
 async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("-C").arg(cwd).args(args);
@@ -638,25 +646,17 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
         .stdout
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
+    // One byte past the cap distinguishes "exactly full" from "more to come".
     let mut out: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut truncated = false;
-    loop {
-        let n = stdout
-            .read(&mut buf)
-            .await
-            .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        let remaining = max_bytes.saturating_sub(out.len());
-        if n > remaining {
-            out.extend_from_slice(&buf[..remaining]);
-            truncated = true;
-            let _ = child.start_kill();
-            break;
-        }
-        out.extend_from_slice(&buf[..n]);
+    (&mut stdout)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut out)
+        .await
+        .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
+    let truncated = out.len() > max_bytes;
+    if truncated {
+        out.truncate(max_bytes);
+        let _ = child.start_kill();
     }
     let output = child
         .wait_with_output()
@@ -1451,5 +1451,41 @@ mod watch_budget_tests {
         // A self-referential symlink cycle must not send the walk into a spin.
         std::os::unix::fs::symlink(root.join("real"), root.join("real/inner/loop")).unwrap();
         assert!(!exceeds_watch_budget(root)); // terminates, under budget
+    }
+}
+
+#[cfg(test)]
+mod future_size_tests {
+    /// The diff capture futures must stay small. A buffer held across an
+    /// `.await` lives inside the future, and a debug build reserves that much
+    /// stack in every frame that builds it — the ~100-arm `EngineRpc::handle`
+    /// match inflates arm by arm until the 2MiB tokio worker stack is gone. A
+    /// 64KiB read chunk here used to abort the app with
+    /// `tokio-rt-worker has overflowed its stack` on the first checkout diff.
+    #[test]
+    fn diff_capture_futures_hold_no_bulk_buffer() {
+        const BUDGET: usize = 8 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = crate::repos::Repos::new(tmp.path(), "device-1");
+        let root = tmp.path().to_path_buf();
+        for (name, size) in [
+            (
+                "capture_git",
+                std::mem::size_of_val(&super::capture_git(&root, &["status"], 1024)),
+            ),
+            (
+                "capture_diff_against",
+                std::mem::size_of_val(&super::capture_diff_against(&repos, &root, None)),
+            ),
+            (
+                "capture_diff",
+                std::mem::size_of_val(&super::capture_diff(&repos, &root)),
+            ),
+        ] {
+            assert!(
+                size <= BUDGET,
+                "{name} future is {size} bytes, over the {BUDGET}-byte budget"
+            );
+        }
     }
 }
