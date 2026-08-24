@@ -4732,9 +4732,7 @@ impl Transcript {
                                 .pt(px(10.0))
                                 .text_size(px(12.0))
                                 .text_color(theme.text_faint)
-                                .child(SharedString::from(
-                                    "Queued — waiting for connection…",
-                                ))
+                                .child(SharedString::from("Queued — waiting for connection…"))
                                 .into_any_element(),
                         );
                     }

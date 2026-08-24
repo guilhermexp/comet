@@ -521,10 +521,6 @@ fn settle_turn_steps_child(row: &mut Row) {
                 block_ix: *block_ix,
             };
         }
-        RowKind::ToolGroup { auto_open, detail_auto_open, .. } => {
-            *auto_open = false;
-            *detail_auto_open = false;
-        }
         _ => {}
     }
 }
@@ -532,6 +528,9 @@ fn settle_turn_steps_child(row: &mut Row) {
 
 Implement this without assigning to `row.kind` while it is mutably borrowed;
 use a cloned replacement value or a helper returning `Option<RowKind>`.
+Nested tool-group disclosure policy is intentionally omitted here; its
+authoritative contract is
+[`turn-step-tool-groups`](../../../openspec/specs/turn-step-tool-groups/spec.md).
 
 - [ ] **Step 6: Add stable versioning and timestamp ownership**
 

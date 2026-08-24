@@ -1,6 +1,7 @@
 # sticky-turn-headers Specification
 
 ## Purpose
+
 Keep the prompt context for the turn being read visible while a native virtualized transcript scrolls through long assistant output.
 
 ## Requirements
@@ -56,6 +57,21 @@ Test: deterministic chat-state reset and streaming projection tests.
 - **WHEN** the selected chat changes or streaming changes row measurements
 - **THEN** stale geometry from the previous chat is discarded
 - **AND** the active turn remains derived from the current row projection
+
+### Requirement: Limit sticky occlusion and input capture to the card
+
+The sticky header SHALL keep its positioning wrapper transparent and SHALL
+limit visual occlusion and pointer capture to the rounded user-card surface.
+
+#### Scenario: Transcript content passes beneath the sticky card
+
+Test: sticky-surface policy regression plus headed OMP smoke.
+
+- **WHEN** Thought, tool, or response content scrolls beneath the sticky header
+- **THEN** the outer wrapper paints no background
+- **AND** blur and occlusion remain inside the rounded card without a rectangular plate or text ghosting
+- **AND** hidden content cannot receive mouse or hover events through the card
+- **AND** wheel or touch scrolling continues to the transcript
 
 ### Requirement: Preserve own-turn arrival behavior
 

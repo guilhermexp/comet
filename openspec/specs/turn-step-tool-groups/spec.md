@@ -1,7 +1,9 @@
 # turn-step-tool-groups Specification
 
 ## Purpose
-TBD - created by archiving change default-open-turn-tool-groups. Update Purpose after archive.
+
+Keep every nested tool card visible when an assistant turn's operational steps
+are expanded, without opening each card's invocation, output, or diff details.
 
 ## Requirements
 
