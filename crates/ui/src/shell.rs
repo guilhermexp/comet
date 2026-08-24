@@ -8545,7 +8545,15 @@ impl Render for Shell {
                             .child(details),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .children(self.render_details_header_overlay(cx))
+                    // Route-gated like the columns above: on a settings page
+                    // there is no details column, so its header (the
+                    // Details/Files tabs plus the eye/search/collapse icons)
+                    // has nothing to sit over - it just leaked onto the page.
+                    .children(
+                        on_chat
+                            .then(|| self.render_details_header_overlay(cx))
+                            .flatten(),
+                    )
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
