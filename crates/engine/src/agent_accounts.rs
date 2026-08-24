@@ -1179,16 +1179,29 @@ impl AgentAccounts {
 
     /// Read the live Claude credentials. `None` payload + warning ⇒ we know a
     /// login exists but couldn't read the secret (Keychain denied us).
+    ///
+    /// macOS has TWO possible stores — the login Keychain (the CLI's default)
+    /// and `~/.claude/.credentials.json` — and either can be a stale leftover.
+    /// Observed: a two-day-old expired FILE shadowing a live Keychain item, so
+    /// every usage probe read an expired token and the whole Claude quota lane
+    /// rendered empty. [`claude_live_store`] picks the one the CLI rotated
+    /// last instead of hard-coding a precedence.
     async fn read_claude_credentials(&self) -> (Option<serde_json::Value>, Option<String>) {
-        if let Some(creds) = read_json(&self.inner.config.claude_creds_file()) {
-            return (Some(creds), None);
-        }
+        let file = read_json(&self.inner.config.claude_creds_file());
+        // Explicit configs are test/integration seams and must never fall
+        // through to a real user credential (same rule as the Kimi store).
         #[cfg(target_os = "macos")]
-        {
-            return keychain::read_credentials().await;
+        if self.inner.config.uses_detected_paths() {
+            let (keychain, warning) = keychain::read_credentials().await;
+            return match claude_live_store(keychain.as_ref(), file.as_ref()) {
+                ClaudeStore::Keychain if keychain.is_some() => (keychain, None),
+                _ => match file {
+                    Some(file) => (Some(file), None),
+                    None => (None, warning),
+                },
+            };
         }
-        #[cfg(not(target_os = "macos"))]
-        (None, None)
+        (file, None)
     }
 
     async fn write_claude_credentials(
@@ -1196,11 +1209,14 @@ impl AgentAccounts {
         credentials: &serde_json::Value,
     ) -> Result<(), EngineError> {
         let json = credentials.to_string();
+        // Write where the CLI reads (see `read_claude_credentials`): an account
+        // switch persisted into a stale credentials FILE is invisible to Claude
+        // Code, which keeps using the Keychain item.
         #[cfg(target_os = "macos")]
-        {
-            // claude-swap's primitive: update the Keychain item in place — but only
-            // when no credentials FILE exists (the file wins when present).
-            if !self.inner.config.claude_creds_file().exists() {
+        if self.inner.config.uses_detected_paths() {
+            let keychain = keychain::read_credentials().await.0;
+            let file = read_json(&self.inner.config.claude_creds_file());
+            if claude_live_store(keychain.as_ref(), file.as_ref()) == ClaudeStore::Keychain {
                 return keychain::write_credentials(&json).await;
             }
         }
@@ -1472,6 +1488,41 @@ impl AgentAccounts {
         }
         Some(access_token)
     }
+}
+
+// ── Claude credential store selection (macOS keeps two) ─────────────────────
+
+/// Which store holds the credentials Claude Code is actually using.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeStore {
+    Keychain,
+    File,
+}
+
+/// The store the CLI rotated last, judged by `claudeAiOauth.expiresAt`: tokens
+/// live ~8h, so the later expiry is the live pair and the other store is a
+/// leftover. The Keychain wins every tie and every undated comparison — it is
+/// the CLI's default store, and a credentials FILE only appears when older
+/// tooling (or a non-Keychain install) put one there.
+#[cfg(target_os = "macos")]
+fn claude_live_store(
+    keychain: Option<&serde_json::Value>,
+    file: Option<&serde_json::Value>,
+) -> ClaudeStore {
+    let Some(file_expiry) = file.and_then(claude_oauth_expiry) else {
+        return ClaudeStore::Keychain;
+    };
+    match keychain.and_then(claude_oauth_expiry) {
+        Some(keychain_expiry) if keychain_expiry >= file_expiry => ClaudeStore::Keychain,
+        _ => ClaudeStore::File,
+    }
+}
+
+/// `claudeAiOauth.expiresAt` (epoch ms) out of a credential blob.
+#[cfg(target_os = "macos")]
+fn claude_oauth_expiry(credentials: &serde_json::Value) -> Option<i64> {
+    credentials.get("claudeAiOauth")?.get("expiresAt")?.as_i64()
 }
 
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
@@ -2017,6 +2068,37 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_store_follows_the_fresher_token_not_a_fixed_precedence() {
+        let creds = |expires_at: i64| serde_json::json!({"claudeAiOauth": {"expiresAt": expires_at}});
+        let live = creds(2_000);
+        let stale = creds(1_000);
+        // The leftover FILE that shadowed a live Keychain item and emptied the
+        // Claude usage lane.
+        assert_eq!(
+            claude_live_store(Some(&live), Some(&stale)),
+            ClaudeStore::Keychain
+        );
+        // A genuinely file-based install (non-Keychain login) still wins.
+        assert_eq!(
+            claude_live_store(Some(&stale), Some(&live)),
+            ClaudeStore::File
+        );
+        // Ties, undatable blobs and empty stores all fall to the CLI default.
+        assert_eq!(
+            claude_live_store(Some(&live), Some(&live)),
+            ClaudeStore::Keychain
+        );
+        assert_eq!(
+            claude_live_store(Some(&serde_json::json!({"mcpOAuth": {}})), Some(&live)),
+            ClaudeStore::File
+        );
+        assert_eq!(claude_live_store(None, Some(&live)), ClaudeStore::File);
+        assert_eq!(claude_live_store(Some(&live), None), ClaudeStore::Keychain);
+        assert_eq!(claude_live_store(None, None), ClaudeStore::Keychain);
+    }
 
     #[tokio::test]
     async fn kimi_managed_credential_is_a_non_switchable_device_local_account() {
