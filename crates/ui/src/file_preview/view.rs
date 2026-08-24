@@ -1,10 +1,10 @@
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
+use comet_syntax::HighlightedDocument;
 use gpui::{
     AnyElement, ClipboardItem, Context, EventEmitter, Image, IntoElement, ObjectFit, Render,
     SharedString, StyledText, Task, Window, div, font, img, prelude::*, px,
 };
-use zeron_syntax::HighlightedDocument;
 
 use crate::{
     details_sidebar::files_view::material_icon_path,

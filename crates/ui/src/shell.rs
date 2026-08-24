@@ -50,8 +50,8 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN, KeymapConfig,
-    RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
+    CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
     SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
@@ -1749,8 +1749,7 @@ impl Shell {
             self.debug_upload = None;
             if let Some((pct, img_path)) = spec.split_once(':')
                 && let Ok(pct) = pct.parse::<u64>()
-                && let Ok(att) =
-                    crate::attachments::stage_file(std::path::Path::new(img_path))
+                && let Ok(att) = crate::attachments::stage_file(std::path::Path::new(img_path))
             {
                 let pending_path = format!("pending/{}/{}", att.id, att.name);
                 let device_ids: Vec<String> = {
@@ -1903,18 +1902,7 @@ impl Shell {
         }
         // Persist the selected space (the new-tab fallback under "All").
         {
-            let (selected_space, selected_chat, chat_space) = {
-                let s = state.read(cx);
-                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
-                (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
-                    chat_space,
-                )
-            };
-            if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
-                self.space_last_chat.insert(space, chat);
-            }
+            let selected_space = state.read(cx).selected_space.clone();
             if selected_space != self.settings.last_space_id {
                 self.utility_add_menu_open = false;
                 self.utility_add_menu_dismissed_at = None;
@@ -2420,7 +2408,7 @@ impl Shell {
     /// (user request).
     fn add_commit_diff_surface(
         &mut self,
-        commit: comet_proto::GitHistoryCommit,
+        commit: zeron_proto::GitHistoryCommit,
         cx: &mut Context<Self>,
     ) {
         let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
@@ -4187,12 +4175,14 @@ impl Shell {
                     .child(header_icon_button(
                         "workers-expand-right-pane",
                         icons::EXPAND_ARROWS,
+                        self.right_pane_expanded,
                         &theme,
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))
                     .child(header_icon_button(
                         "workers-close-right-pane",
                         icons::SIDEBAR_MINIMALISTIC,
+                        true,
                         &theme,
                         cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
                     ))
@@ -4406,6 +4396,7 @@ impl Shell {
         header_icon_button(
             "workers-toggle-right-pane",
             icons::SIDEBAR_MINIMALISTIC,
+            self.right_pane_open(cx),
             theme,
             cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
         )
@@ -4421,6 +4412,7 @@ impl Shell {
         header_icon_button(
             id,
             icons::SIDEBAR_MINIMALISTIC,
+            self.details_sidebar_open(cx),
             theme,
             cx.listener(|this, _, _, cx| this.toggle_details_sidebar(cx)),
         )
@@ -6752,18 +6744,20 @@ impl Shell {
                     div()
                         .absolute()
                         .inset_0()
-                        .child(crate::edge_fade::edge_faded(
-                            Theme::TRANSCRIPT_FADE_BAND,
-                            true,
-                            true,
-                            div().size_full().child(outlet),
+                        .child(
+                            crate::edge_fade::edge_faded(
+                                Theme::TRANSCRIPT_FADE_BAND,
+                                true,
+                                true,
+                                div().size_full().child(outlet),
+                            )
+                            // Fully faded BY the titlebar's bottom edge (the
+                            // title text is opaque — overlap read as collision),
+                            // ramping in the band just below it.
+                            .inset_top(Theme::TITLEBAR_HEIGHT)
+                            .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                            .band_bottom(bottom_band),
                         )
-                        // Fully faded BY the titlebar's bottom edge (the
-                        // title text is opaque — overlap read as collision),
-                        // ramping in the band just below it.
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
-                        .band_top(Theme::TRANSCRIPT_FADE_BAND)
-                        .band_bottom(bottom_band))
                         .children(self.render_jump_to_bottom(stack_h, cx))
                 },
             )
@@ -7274,12 +7268,10 @@ impl Shell {
                 .into_any_element(),
             RightSurface::Picker => match active {
                 Some(UtilityPane::Terminal) => {
-                let panel = self.terminal_panel(cx);
-                let resize_suspended = self.tween_active(self.right_tween);
-                panel.update(cx, |panel, _| {
-                    panel.set_resize_suspended(resize_suspended)
-                });
-                panel.into_any_element()
+                    let panel = self.terminal_panel(cx);
+                    let resize_suspended = self.tween_active(self.right_tween);
+                    panel.update(cx, |panel, _| panel.set_resize_suspended(resize_suspended));
+                    panel.into_any_element()
                 }
                 Some(UtilityPane::Changes) => {
                     let changes = self.changes_pane(cx);
@@ -7320,11 +7312,7 @@ impl Shell {
         self.pane_container(
             self.right_tween,
             target,
-            div()
-                .h_full()
-                .relative()
-                .child(column)
-                .into_any_element(),
+            div().h_full().relative().child(column).into_any_element(),
         )
     }
 
@@ -7406,9 +7394,7 @@ impl Shell {
                 .items_center()
                 .gap(px(10.0))
                 .cursor_pointer()
-                .hover(move |s| {
-                    s.bg(crate::theme::ink(0.05)).border_color(border_strong)
-                })
+                .hover(move |s| s.bg(crate::theme::ink(0.05)).border_color(border_strong))
                 .child(icon(icon_path).size(px(15.0)).flex_none().text_color(muted))
                 .child(
                     div()
@@ -7457,14 +7443,11 @@ impl Shell {
                             .flex_col()
                             .gap(px(8.0))
                             .child(
-                                row(
-                                    "surface-card-terminal",
-                                    icons::TERMINAL,
-                                    "Terminal",
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_terminal_surface(cx);
-                                })),
+                                row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_terminal_surface(cx);
+                                    }),
+                                ),
                             )
                             // Git only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
@@ -7547,22 +7530,20 @@ impl Shell {
                     this.update_right_tab_drag_over(from, over, cx);
                 },
             ))
-            .on_drop::<RightTabDrag>(cx.listener(
-                move |this, payload: &RightTabDrag, _, cx| {
-                    if payload.panel_key != this.panel_key(cx) {
-                        this.right_tab_drag = None;
-                        cx.notify();
-                        return;
-                    }
-                    let to = this
-                        .right_tab_drag
-                        .as_ref()
-                        .map(|d| d.over)
-                        .unwrap_or(payload.from);
+            .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                if payload.panel_key != this.panel_key(cx) {
                     this.right_tab_drag = None;
-                    this.reorder_right_tabs(payload.from, to, cx);
-                },
-            ));
+                    cx.notify();
+                    return;
+                }
+                let to = this
+                    .right_tab_drag
+                    .as_ref()
+                    .map(|d| d.over)
+                    .unwrap_or(payload.from);
+                this.right_tab_drag = None;
+                this.reorder_right_tabs(payload.from, to, cx);
+            }));
         for (ix, (surface, title)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let surface_icon: AnyElement = match surface {
@@ -7630,127 +7611,126 @@ impl Shell {
             let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
             let chip = div()
-                    .id(("right-surface-tab", ix))
-                    .group(group.clone())
-                    .h(px(24.0))
-                    .w(px(CHIP_W))
-                    .flex_none()
-                    .pl(px(4.0))
-                    .pr(px(8.0))
-                    .rounded(px(6.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(3.0))
-                    .cursor_pointer()
-                    // The old session-tab strip's solved carve-out: NOT
-                    // `.occlude()` — a BlockMouse hitbox ends the hit test,
-                    // so the scroll container behind the tabs never saw
-                    // wheel events and an overflowing strip could not be
-                    // scrolled (tabs tile the whole region). ExceptScroll
-                    // keeps the titlebar drag-region carve-out and lets the
-                    // strip scroll.
-                    .block_mouse_except_scroll()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                        window.prevent_default()
-                    })
-                    .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
-                    .when(!is_active, |el| {
-                        el.hover(|s| s.bg(crate::theme::wash(0.06)))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                .id(("right-surface-tab", ix))
+                .group(group.clone())
+                .h(px(24.0))
+                .w(px(CHIP_W))
+                .flex_none()
+                .pl(px(4.0))
+                .pr(px(8.0))
+                .rounded(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.0))
+                .cursor_pointer()
+                // The old session-tab strip's solved carve-out: NOT
+                // `.occlude()` — a BlockMouse hitbox ends the hit test,
+                // so the scroll container behind the tabs never saw
+                // wheel events and an overflowing strip could not be
+                // scrolled (tabs tile the whole region). ExceptScroll
+                // keeps the titlebar drag-region carve-out and lets the
+                // strip scroll.
+                .block_mouse_except_scroll()
+                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                    window.prevent_default()
+                })
+                .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
+                .when(!is_active, |el| {
+                    el.hover(|s| s.bg(crate::theme::wash(0.06)))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_right_active(surface, cx);
+                }))
+                // Middle-click closes, like every tab strip.
+                .on_mouse_down(
+                    gpui::MouseButton::Middle,
+                    cx.listener(move |this, _, window, cx| {
+                        this.close_right_surface(surface, window, cx);
+                    }),
+                )
+                .on_drag(
+                    RightTabDrag {
+                        panel_key: self.panel_key(cx),
+                        from: ix,
+                        title: ghost_title,
+                    },
+                    |payload, _point, _, cx| {
+                        let title = payload.title.clone();
                         cx.stop_propagation();
-                        this.set_right_active(surface, cx);
-                    }))
-                    // Middle-click closes, like every tab strip.
-                    .on_mouse_down(
-                        gpui::MouseButton::Middle,
-                        cx.listener(move |this, _, window, cx| {
-                            this.close_right_surface(surface, window, cx);
-                        }),
-                    )
-                    .on_drag(
-                        RightTabDrag {
-                            panel_key: self.panel_key(cx),
-                            from: ix,
-                            title: ghost_title,
-                        },
-                        |payload, _point, _, cx| {
-                            let title = payload.title.clone();
+                        cx.new(|_| SurfaceTabGhost { title })
+                    },
+                )
+                .child(
+                    // Leading slot: icon normally, ✕ on tab hover — two
+                    // stacked layers opacity-swapped by the group hover.
+                    div()
+                        .id(("right-surface-close", ix))
+                        .flex_none()
+                        .size(px(18.0))
+                        .rounded(px(4.0))
+                        .relative()
+                        .hover(|s| s.bg(crate::theme::wash(0.12)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            cx.new(|_| SurfaceTabGhost { title })
-                        },
-                    )
-                    .child(
-                        // Leading slot: icon normally, ✕ on tab hover — two
-                        // stacked layers opacity-swapped by the group hover.
-                        div()
-                            .id(("right-surface-close", ix))
-                            .flex_none()
-                            .size(px(18.0))
-                            .rounded(px(4.0))
-                            .relative()
-                            .hover(|s| s.bg(crate::theme::wash(0.12)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_right_surface(surface, window, cx);
-                            }))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .group_hover(group.clone(), |s| s.opacity(0.0))
-                                    .child(if subagent_running {
-                                        loaders::mini_gradient_spinner(
-                                            format!("subagent-tab-{ix}"),
-                                            2.0,
-                                            cx.entity_id(),
-                                            cx,
-                                        )
-                                        .into_any_element()
-                                    } else {
-                                        surface_icon
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .opacity(0.0)
-                                    .group_hover(group.clone(), |s| s.opacity(1.0))
-                                    .child(
-                                        icon(icons::CLOSE)
-                                            .size(px(12.0))
-                                            .text_color(theme.text_muted),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.5))
-                            .text_color(if is_active {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            })
-                            .child(title),
-                    );
+                            this.close_right_surface(surface, window, cx);
+                        }))
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .group_hover(group.clone(), |s| s.opacity(0.0))
+                                .child(if subagent_running {
+                                    loaders::mini_gradient_spinner(
+                                        format!("subagent-tab-{ix}"),
+                                        2.0,
+                                        cx.entity_id(),
+                                        cx,
+                                    )
+                                    .into_any_element()
+                                } else {
+                                    surface_icon
+                                }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .opacity(0.0)
+                                .group_hover(group.clone(), |s| s.opacity(1.0))
+                                .child(
+                                    icon(icons::CLOSE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(if is_active {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(title),
+                );
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
             // ghost carries it.
             let wrapped: AnyElement = match drag {
                 Some((from, over, epoch, prev_over)) if ix != from => {
-                    let target =
-                        crate::terminal::panel::slide_offset(ix, from, over) * CHIP_SLOT;
+                    let target = crate::terminal::panel::slide_offset(ix, from, over) * CHIP_SLOT;
                     let start =
                         crate::terminal::panel::slide_offset(ix, from, prev_over) * CHIP_SLOT;
                     div()

@@ -740,7 +740,7 @@ fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights>
     Some(DiffHighlights { old, new })
 }
 
-fn sources_match_patch(file: &FileDiff, response: &comet_proto::CheckoutFileDiffText) -> bool {
+fn sources_match_patch(file: &FileDiff, response: &zeron_proto::CheckoutFileDiffText) -> bool {
     let old = response
         .old_text
         .as_deref()
@@ -773,7 +773,7 @@ fn sources_match_patch(file: &FileDiff, response: &comet_proto::CheckoutFileDiff
 fn full_highlights(
     file: &FileDiff,
     language: Lang,
-    response: &comet_proto::CheckoutFileDiffText,
+    response: &zeron_proto::CheckoutFileDiffText,
 ) -> Option<DiffHighlights> {
     if response.stale
         || response.binary
@@ -1562,29 +1562,29 @@ impl Changes {
             return history.clone();
         }
         let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
-        self.history_events = Some(cx.subscribe(
-            &history,
-            |this: &mut Self, _, event, cx| match event {
-                GitHistoryEvent::OpenCommit(commit) => {
-                    // Bubble to the host — the surface strip opens the tab.
-                    cx.emit(ChangesEvent::OpenCommit(commit.clone()));
-                }
-                GitHistoryEvent::FetchSucceeded => {
-                    // Remote refs affect branch choices and every scoped diff
-                    // based on a ref. Force fresh reads after the engine has
-                    // also kicked its checkout-status watcher.
-                    this.branches_for = None;
-                    this.scoped_for = None;
-                    this.scoped_inflight = None;
-                    this.scoped_task = None;
-                    this.ensure_branches(cx);
-                    if this.scope != DiffScope::History {
-                        this.ensure_scoped(cx);
+        self.history_events =
+            Some(
+                cx.subscribe(&history, |this: &mut Self, _, event, cx| match event {
+                    GitHistoryEvent::OpenCommit(commit) => {
+                        // Bubble to the host — the surface strip opens the tab.
+                        cx.emit(ChangesEvent::OpenCommit(commit.clone()));
                     }
-                    cx.notify();
-                }
-            },
-        ));
+                    GitHistoryEvent::FetchSucceeded => {
+                        // Remote refs affect branch choices and every scoped diff
+                        // based on a ref. Force fresh reads after the engine has
+                        // also kicked its checkout-status watcher.
+                        this.branches_for = None;
+                        this.scoped_for = None;
+                        this.scoped_inflight = None;
+                        this.scoped_task = None;
+                        this.ensure_branches(cx);
+                        if this.scope != DiffScope::History {
+                            this.ensure_scoped(cx);
+                        }
+                        cx.notify();
+                    }
+                }),
+            );
         self.history = Some(history.clone());
         history
     }
@@ -2284,7 +2284,7 @@ impl Changes {
         let fetch_path = path.clone();
         let fetch_task = match (active, engine) {
             (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
-                let request = comet_proto::GetCheckoutFileDiffTextRequest {
+                let request = zeron_proto::GetCheckoutFileDiffTextRequest {
                     checkout_id: diff.checkout_id,
                     cwd: diff.cwd,
                     path: fetch_path.clone(),
@@ -2310,7 +2310,7 @@ impl Changes {
                     .await
                     .ok()
                     .and_then(|value| {
-                        serde_json::from_value::<comet_proto::CheckoutFileDiffText>(value).ok()
+                        serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value).ok()
                     });
                 let highlights = match response {
                     Some(response) => {
@@ -4376,7 +4376,7 @@ rename to new_name.rs
             deletions: 1,
             max_line: 1,
         };
-        let response = comet_proto::CheckoutFileDiffText {
+        let response = zeron_proto::CheckoutFileDiffText {
             diff_checksum: "sum".into(),
             old_text: Some("let old = 1;\n".into()),
             new_text: Some("different snapshot\n".into()),

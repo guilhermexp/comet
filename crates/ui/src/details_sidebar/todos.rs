@@ -1,6 +1,25 @@
 use zeron_doc::{MessagePart, SessionMessageEntry};
 use zeron_proto::ToolCall;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TodoStatusLayout {
+    pub slot_px: f32,
+    pub glyph_px: f32,
+}
+
+impl TodoStatusLayout {
+    pub fn glyph_inset_px(self) -> f32 {
+        (self.slot_px - self.glyph_px) / 2.0
+    }
+}
+
+pub fn todo_status_layout() -> TodoStatusLayout {
+    TodoStatusLayout {
+        slot_px: 15.0,
+        glyph_px: 9.0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetailsTodo {
     pub text: String,
@@ -52,7 +71,7 @@ mod tests {
     use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
     use zeron_proto::{TodoItem, ToolCall};
 
-    use super::latest_todos;
+    use super::{latest_todos, todo_status_layout};
 
     fn todo_entry(id: &str, items: &[(&str, bool)]) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -112,5 +131,13 @@ mod tests {
     #[test]
     fn no_todo_payload_hides_the_widget() {
         assert!(latest_todos(&[]).is_none());
+    }
+
+    #[test]
+    fn todo_status_slot_centers_the_shared_glyph_geometry() {
+        let layout = todo_status_layout();
+        assert_eq!(layout.slot_px, 15.0);
+        assert_eq!(layout.glyph_px, 9.0);
+        assert_eq!(layout.glyph_inset_px(), 3.0);
     }
 }

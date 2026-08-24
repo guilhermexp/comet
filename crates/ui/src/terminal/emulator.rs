@@ -804,4 +804,3 @@ mod tests {
         assert_eq!(e.lines(), before);
     }
 }
-

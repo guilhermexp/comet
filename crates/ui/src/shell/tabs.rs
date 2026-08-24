@@ -307,9 +307,9 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
             .pl(px(row_left))
-            .pr(px(
-                self.titlebar_right_pad(Theme::SPACE_LG) + details_now + right_now,
-            ))
+            .pr(px(self.titlebar_right_pad(Theme::SPACE_LG)
+                + details_now
+                + right_now))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
@@ -403,7 +403,6 @@ impl Shell {
             .h(px(Theme::TITLEBAR_HEIGHT))
             .flex_none()
             .child(inner)
-            .children(panel_header)
             .children(capture_action);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()

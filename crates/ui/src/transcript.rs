@@ -236,6 +236,10 @@ fn runway_owns_user_position(held: bool, positioned: bool, has_landed: bool) -> 
     held && (!has_landed || positioned)
 }
 
+fn own_turn_step_active(held: bool) -> bool {
+    held
+}
+
 /// Pure stick-to-bottom spring stepper — the mugen `tick()` integration:
 /// velocity relaxes toward `(damping·v + stiffness·diff)/mass` per 60fps
 /// sub-frame, position advances by `v + target_vel` where `target_vel` is a
@@ -328,6 +332,8 @@ pub struct ToolItem {
     /// Precomputed here because rows are cached by fingerprint — diffing and
     /// tokenizing per paint would run on every scroll frame.
     pub detail: Option<Arc<ToolDetail>>,
+    /// Full invocation rendered above the result when a card opens.
+    pub invocation: Option<Arc<ToolDetail>>,
     /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
     /// a one-line summary; expanding offers a lazy "Show full output" fetch.
     pub output_ref: Option<SharedString>,
@@ -992,6 +998,37 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool)
                 }
             }
         }
+        // Invocation changes can preserve the same header summary and byte
+        // length, so hash the actual payload rather than only its presence.
+        match t.invocation.as_deref() {
+            None => acc.push(0),
+            Some(ToolDetail::Output {
+                lines,
+                truncated_by,
+            }) => {
+                acc.push(1);
+                acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+                for line in lines {
+                    acc.extend_from_slice(&(line.len() as u32).to_le_bytes());
+                    acc.extend_from_slice(line.as_bytes());
+                }
+            }
+            Some(ToolDetail::Diff { file, .. }) => {
+                acc.push(2);
+                acc.extend_from_slice(file.path.as_bytes());
+                acc.extend_from_slice(&file.additions.to_le_bytes());
+                acc.extend_from_slice(&file.deletions.to_le_bytes());
+                acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+            }
+            Some(ToolDetail::Stats { stats }) => {
+                acc.push(3);
+                for stat in stats.iter() {
+                    acc.extend_from_slice(stat.path.as_bytes());
+                    acc.extend_from_slice(&stat.additions.to_le_bytes());
+                    acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                }
+            }
+        }
         // Sidecar refs arriving after the resolve tick must re-splice too —
         // they add the fetch affordance without changing the detail payload.
         acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
@@ -1364,6 +1401,7 @@ fn rows_for_entry_with_todo_history(
                     execution: *execution,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
+                    invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
@@ -2246,6 +2284,8 @@ struct OwnTurnAnchor {
     message_id: SharedString,
     /// Current reservation pad on the last row (`usable − turn_height`).
     runway: f32,
+    /// Whether the own-turn step still owns the viewport position.
+    held: bool,
     /// The send glide has landed; the anchor now holds position exactly.
     positioned: bool,
     /// Distinguishes the initial send glide from a later return-to-bottom
@@ -2625,7 +2665,7 @@ enum FileInputLoad {
 struct FileInputReady {
     snapshot: Arc<zeron_proto::FileToolInputSnapshot>,
     preview: Arc<FileChangePreview>,
-    highlight: Option<Arc<zeron_syntax::HighlightedDocument>>,
+    highlight: Option<Arc<comet_syntax::HighlightedDocument>>,
 }
 
 struct FileChangeScroll {
@@ -3149,6 +3189,7 @@ impl Transcript {
         self.spring_settled_at = None;
         self.spring_kick = false;
         self.scroll_anim = None;
+        self.materialize_scroll_anchor();
         // Replacing a still-held previous anchor: its pad collapses on the
         // next remeasure while the glide re-targets the new prompt — one
         // continuous motion, no release frame needed.
@@ -3156,6 +3197,7 @@ impl Transcript {
             chat_id,
             message_id: SharedString::from(message_id),
             runway: 0.0,
+            held: true,
             positioned: false,
             has_landed: false,
         });
@@ -3164,6 +3206,32 @@ impl Transcript {
         self.own_turn_kick = true;
         self.remeasure_last_row();
         cx.notify();
+    }
+
+    fn materialize_scroll_anchor(&mut self) {
+        if !self.is_glued() {
+            return;
+        }
+        let vp_top = f32::from(self.list.viewport_bounds().top());
+        for ix in 0..self.rows.len() {
+            if let Some(bounds) = self.list.bounds_for_item(ix)
+                && f32::from(bounds.bottom()) > vp_top + 0.5
+            {
+                self.list.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(vp_top - f32::from(bounds.top())),
+                });
+                return;
+            }
+        }
+    }
+
+    fn own_send_inset(anchor_ix: usize) -> f32 {
+        if anchor_ix == 0 {
+            0.0
+        } else {
+            OWN_SEND_TOP_INSET_PX
+        }
     }
 
     fn own_turn_anchor_ix(&self) -> Option<usize> {
@@ -3180,6 +3248,9 @@ impl Transcript {
         if self.own_turn_release_pending {
             self.own_turn_release_pending = false;
             self.engage_pin(cx);
+            return;
+        }
+        if !own_turn_step_active(self.own_turn.as_ref().is_some_and(|anchor| anchor.held)) {
             return;
         }
         // Layout moves the bottom too (pad refinement, streaming growth):
@@ -3935,8 +4006,8 @@ impl Transcript {
                             durable_preview.as_deref(),
                         )?;
                         let highlight = derived.source.as_deref().and_then(|source| {
-                            zeron_syntax::language_for_path(&snapshot.path).and_then(|_language| {
-                                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                            comet_syntax::language_for_path(&snapshot.path).and_then(|_language| {
+                                comet_syntax::highlight(comet_syntax::HighlightRequest {
                                     source,
                                     path: Some(&snapshot.path),
                                     fence_tag: None,
@@ -5619,7 +5690,7 @@ impl Transcript {
             let highlights = if let Some(ready) = &ready {
                 ready.highlight.clone()
             } else if let Some(source) = bounded_source.as_deref() {
-                zeron_syntax::language_for_path(path).and_then(|language| {
+                comet_syntax::language_for_path(path).and_then(|language| {
                     self.highlights
                         .request(row_id.clone(), 0, language, source, cx)
                 })
@@ -7795,7 +7866,7 @@ fn task_snapshot_title(
 
 fn file_change_line_row(
     line: &zeron_doc::FileChangeLine,
-    spans: &[zeron_syntax::HighlightSpan],
+    spans: &[comet_syntax::HighlightSpan],
     theme: &Theme,
 ) -> AnyElement {
     let line_height = 20.0;
@@ -8451,6 +8522,39 @@ mod tests {
             !runway_owns_user_position(true, false, true),
             "after the first landing, the sticky copy stays visible during a restick glide"
         );
+        assert!(!own_turn_step_active(false));
+    }
+
+    #[test]
+    fn tool_fingerprint_changes_when_same_length_invocation_content_changes() {
+        let mut tool = ToolItem {
+            id: "exec".into(),
+            call: ToolCall::Exec {
+                command: "echo".into(),
+            },
+            is_error: false,
+            resolved: true,
+            execution: None,
+            detail: None,
+            invocation: Some(Arc::new(ToolDetail::Output {
+                lines: vec!["cargo test".into()],
+                truncated_by: 0,
+            })),
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let before = tool_fingerprint(std::slice::from_ref(&tool), false, false);
+        tool.invocation = Some(Arc::new(ToolDetail::Output {
+            lines: vec!["cargo fmt ".into()],
+            truncated_by: 0,
+        }));
+        let after = tool_fingerprint(std::slice::from_ref(&tool), false, false);
+        assert_ne!(before, after);
     }
 
     #[test]
@@ -10327,6 +10431,7 @@ mod tests {
             resolved: true,
             execution: None,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -10346,6 +10451,7 @@ mod tests {
             resolved: true,
             execution: None,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -10381,6 +10487,7 @@ mod tests {
                 resolved: true,
                 execution: None,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -10398,6 +10505,7 @@ mod tests {
                 resolved: true,
                 execution: None,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -10413,6 +10521,7 @@ mod tests {
                 resolved: true,
                 execution: None,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,

@@ -5,8 +5,8 @@ use std::{
 };
 
 use calamine::{Data, Range, Reader, open_workbook_auto};
+use comet_syntax::HighlightedDocument;
 use gpui::{Image, ImageFormat, SharedString};
-use zeron_syntax::HighlightedDocument;
 
 use super::model::{PreviewKind, classify_preview_kind};
 use crate::markdown::parser::BlockTree;
@@ -148,7 +148,7 @@ pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, 
                 .map(SharedString::from)
                 .collect::<Vec<_>>()
                 .into(),
-            highlights: zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+            highlights: comet_syntax::highlight(comet_syntax::HighlightRequest {
                 source: &source,
                 path: Some(path.as_ref()),
                 fence_tag: None,

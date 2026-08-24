@@ -246,14 +246,14 @@ fn main() -> anyhow::Result<()> {
 /// stdout carries MCP frames and nothing else — the tracing subscriber above
 /// is pointed at stderr for this subcommand.
 async fn mcp_server(chat: String, port: u16, depth: usize) -> anyhow::Result<()> {
-    let rpc = comet_rpc::connect_ws(&format!("ws://127.0.0.1:{port}"))
+    let rpc = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{port}"))
         .await
         .map_err(|err| anyhow::anyhow!("could not reach the engine on port {port}: {err}"))?;
-    let tools = comet_mcp::WorkerTools::new(
-        comet_mcp::RpcEngineClient::new(std::sync::Arc::new(rpc)),
-        comet_mcp::WorkerConfig::new(chat, depth),
+    let tools = zeron_mcp::WorkerTools::new(
+        zeron_mcp::RpcEngineClient::new(std::sync::Arc::new(rpc)),
+        zeron_mcp::WorkerConfig::new(chat, depth),
     );
-    comet_mcp::WorkerToolsServer::new(std::sync::Arc::new(tools))
+    zeron_mcp::WorkerToolsServer::new(std::sync::Arc::new(tools))
         .serve_stdio()
         .await?;
     Ok(())

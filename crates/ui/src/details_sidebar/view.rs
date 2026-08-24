@@ -147,7 +147,7 @@ use crate::{
         file_tree::{FileNode, flatten_visible_rows, scan_checkout},
         files_view::{file_glyph, material_icon_path},
         subagent_avatars::blobatar_subagent_avatar_path,
-        todos::latest_todos,
+        todos::{latest_todos, todo_status_layout},
         usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows},
         widgets::{
             ChatWorkersTab, ChatWorkersWidgetState, property_row, widget_card, workers_tab_presence,
@@ -1314,6 +1314,7 @@ impl DetailsSidebar {
         if context.mode == super::context::DetailsMode::Orchestrator
             && let Some(todos) = latest_todos(&self.app_state.read(cx).transcript)
         {
+            let status_layout = todo_status_layout();
             let todo_body =
                 div().children(todos.items.into_iter().enumerate().map(|(index, todo)| {
                     div()
@@ -1326,7 +1327,11 @@ impl DetailsSidebar {
                         .gap(px(8.0))
                         .child(
                             div()
-                                .size(px(15.0))
+                                .size(px(status_layout.slot_px))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded_full()
                                 .border_1()
                                 .border_color(if todo.current {
@@ -1337,14 +1342,14 @@ impl DetailsSidebar {
                                 .when(todo.current, |dot| {
                                     dot.bg(theme.text).child(
                                         icons::icon(icons::ARROW_RIGHT)
-                                            .size(px(9.0))
+                                            .size(px(status_layout.glyph_px))
                                             .text_color(theme.bg),
                                     )
                                 })
                                 .when(todo.done, |dot| {
                                     dot.bg(crate::theme::ink(0.08)).child(
                                         icons::icon(icons::CHECK)
-                                            .size(px(9.0))
+                                            .size(px(status_layout.glyph_px))
                                             .text_color(theme.text_muted),
                                     )
                                 }),

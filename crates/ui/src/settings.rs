@@ -98,8 +98,10 @@ pub struct UiSettings {
     pub details_sidebar_width: f32,
     pub details_sidebar_open: bool,
     pub details_sidebar_preferences: crate::details_sidebar::view::DetailsSidebarPreferences,
+    #[serde(skip_serializing)]
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
+    #[serde(skip_serializing)]
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
@@ -320,11 +322,7 @@ impl UiSettings {
         );
         // The right pane has no persisted upper bound: its live drag clamps
         // against the current window, which is unavailable while loading.
-        self.right_pane_width = min_or(
-            self.right_pane_width,
-            RIGHT_PANE_MIN,
-            RIGHT_PANE_DEFAULT,
-        );
+        self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
         self.details_sidebar_width = clamp_or(
             self.details_sidebar_width,
             DETAILS_SIDEBAR_MIN,
@@ -414,8 +412,8 @@ mod tests {
             details_sidebar_open: true,
             details_sidebar_preferences:
                 crate::details_sidebar::view::DetailsSidebarPreferences::default(),
-            terminal_height: 320.0,
-            terminal_open: true,
+            terminal_height: TERMINAL_DEFAULT_HEIGHT,
+            terminal_open: false,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()

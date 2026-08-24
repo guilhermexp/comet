@@ -129,10 +129,13 @@ fn apply_context_usage_to_session(
     session: &mut Session,
     context_usage: Option<zeron_proto::ContextUsage>,
 ) -> bool {
-    if session.context_usage == context_usage {
+    let Some(context_usage) = context_usage else {
+        return false;
+    };
+    if session.context_usage == Some(context_usage) {
         return false;
     }
-    session.context_usage = context_usage;
+    session.context_usage = Some(context_usage);
     true
 }
 
@@ -448,10 +451,6 @@ impl SessionsEngine {
             // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
         }
-
-        // This turn needs a fresh process. Until that runtime reports its own
-        // snapshot, the previous process's context measurement is stale.
-        self.inner.set_context_usage(chat_id, None);
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
@@ -1563,8 +1562,7 @@ async fn drive_run(
     // the freeze must not mint a new doc entry or wedge the transcript back
     // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
     // settled subagent: it announces more work is coming.
-    let mut settled_subagents: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -2537,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn context_snapshot_updates_deduplicates_and_resets() {
+    fn context_snapshot_updates_deduplicates_and_retains_last_known_value() {
         let mut session = Session {
             chat_id: "chat-1".into(),
             device_id: "device-1".into(),
@@ -2553,8 +2551,8 @@ mod tests {
         assert!(apply_context_usage_to_session(&mut session, Some(usage)));
         assert_eq!(session.context_usage, Some(usage));
         assert!(!apply_context_usage_to_session(&mut session, Some(usage)));
-        assert!(apply_context_usage_to_session(&mut session, None));
-        assert_eq!(session.context_usage, None);
+        assert!(!apply_context_usage_to_session(&mut session, None));
+        assert_eq!(session.context_usage, Some(usage));
         assert!(!apply_context_usage_to_session(&mut session, None));
     }
 
@@ -2571,6 +2569,8 @@ mod tests {
             resume: None,
             attachments: Vec::new(),
             worktree: None,
+            enable_workers_mcp: false,
+            workers_parent_chat_id: None,
         }
     }
 

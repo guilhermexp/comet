@@ -501,11 +501,11 @@ impl TerminalPanel {
         &mut self,
         context: &str,
         key: u64,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.render_context = Some(context.to_owned());
-        self.close_tab(context, key, window, cx);
+        self.close_tab(context, key, cx);
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -612,7 +612,9 @@ impl TerminalPanel {
         if let Some(tab) = self.tab_mut(&context, key) {
             tab._run = Some(run);
         }
-        cx.emit(TerminalPanelEvent::Changed { chat });
+        cx.emit(TerminalPanelEvent::Changed {
+            chat: context.clone(),
+        });
         cx.notify();
     }
 
@@ -1311,12 +1313,7 @@ impl TerminalPanel {
         cx.stop_propagation();
     }
 
-    fn on_terminal_hover(
-        &mut self,
-        hovered: &bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_terminal_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal_hovered != *hovered {
             self.terminal_hovered = *hovered;
             if !*hovered {
