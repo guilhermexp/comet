@@ -538,6 +538,7 @@ async fn run_session(
         request_input,
         mut steering,
         interrupt,
+        chat_id: _,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
