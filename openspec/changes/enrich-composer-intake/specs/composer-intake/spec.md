@@ -16,6 +16,8 @@ Test: UI unit test over the paste-precedence decision; engine attachment test fo
 - **AND** sending delivers the file and lists its local path in the prompt
 
 #### Scenario: Paste at or under the threshold
+Test: unit — composer.rs paste-decision tests (`paste_decision_*`).
+
 - **WHEN** the user pastes text of 5 000 characters or fewer
 - **THEN** it inserts at the caret as plain text
 
@@ -27,11 +29,15 @@ truncation and rejection (full input) SHALL surface the composer's failure
 notice stating what happened; nothing is dropped silently.
 
 #### Scenario: Paste into a nearly full input
+Test: unit — composer.rs cap/truncation tests over the pure paste decision.
+
 - **WHEN** a paste would push the input past 10 000 characters
 - **THEN** only the fitting prefix is inserted
 - **AND** the failure notice reports the truncation
 
 #### Scenario: Paste into a full input
+Test: unit — composer.rs full-input rejection test.
+
 - **WHEN** the input is already at the cap
 - **THEN** the paste inserts nothing
 - **AND** the failure notice says the input is full
@@ -68,5 +74,7 @@ images.
 - **AND** its remove control deletes only that item
 
 #### Scenario: Failed send restores the stage
+Test: unit — composer.rs restore-on-failed-send test (`pasted_text_stages_bytes_name_preview_and_survives_restore_merge`).
+
 - **WHEN** a send carrying staged text attachments fails
 - **THEN** the chips return to the strip with the composer text
