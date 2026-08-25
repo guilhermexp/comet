@@ -161,6 +161,12 @@ pub const RESIZE_SETTLE_MS: u64 = 150;
 pub const SLASH_NAME_SIZE: f32 = 15.0;
 pub const SLASH_DESCRIPTION_SIZE: f32 = 13.5;
 
+/// The slash list scrolls at whole rows: a clipped half-row reads as the end
+/// of the list, which is exactly how the menu hid its own tail.
+const SLASH_ROW_HEIGHT: f32 = 40.0;
+const SLASH_VISIBLE_ROWS: f32 = 8.0;
+const SLASH_LIST_MAX_HEIGHT: f32 = SLASH_ROW_HEIGHT * SLASH_VISIBLE_ROWS;
+
 /// Left inset of the text input inside the pill (`pl-4` compact, `px-4`
 /// expanded). The completion layer is anchored INSIDE that inset, so the
 /// slash popup shifts back by it to line up with the pill's own edge.
@@ -3562,6 +3568,9 @@ pub struct Composer {
     route_snap_until: Option<Instant>,
     /// First Escape of a pending double-tap (see [`DOUBLE_ESCAPE_MS`]).
     escape_armed: Option<Instant>,
+    /// Scroll offset of the slash list, so keyboard navigation can reveal the
+    /// active row past the fold.
+    slash_scroll: gpui::ScrollHandle,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -3684,6 +3693,7 @@ impl Composer {
             morph_clock: Instant::now(),
             route_snap_until: None,
             escape_armed: None,
+            slash_scroll: gpui::ScrollHandle::new(),
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -4369,6 +4379,9 @@ impl Composer {
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
+        // A fresh ranking starts at the top: a leftover offset would open the
+        // list mid-scroll with the selection out of view.
+        self.slash_scroll.set_offset(gpui::Point::default());
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4376,8 +4389,17 @@ impl Composer {
     fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.slash.active =
             crate::popover::menu_step(self.slash.active, self.slash.filtered.len(), delta);
+        self.reveal_active_slash_row();
         self.sync_mention_controls(cx);
         cx.notify();
+    }
+
+    /// Keep the selected row on screen. The rows are the scroll container's
+    /// direct children, so the row index maps 1:1 to the scroll item.
+    fn reveal_active_slash_row(&self) {
+        if let Some(active) = self.slash.active {
+            self.slash_scroll.scroll_to_item(active);
+        }
     }
 
     fn dismiss_slash(&mut self, cx: &mut Context<Self>) {
@@ -4447,7 +4469,6 @@ impl Composer {
         // every description mid-word at the card's edge.
         let mut card = crate::popover::popover_card(theme)
             .w(px(pill_width(self.last_available_width)))
-            .max_h(px(360.0))
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
         if self.slash.loading && commands.is_empty() {
@@ -4481,6 +4502,16 @@ impl Composer {
                     }),
             );
         } else {
+            // The rows live in their own scroll container — the card used to
+            // clip whatever ran past its max height, so a long command list
+            // simply ended mid-row with no way to reach the rest.
+            let mut list = div()
+                .id("slash-list")
+                .flex()
+                .flex_col()
+                .max_h(px(SLASH_LIST_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .track_scroll(&self.slash_scroll);
             for (row_ix, &cmd_ix) in self.slash.filtered.iter().enumerate() {
                 let Some(command) = commands.get(cmd_ix) else {
                     continue;
@@ -4496,11 +4527,12 @@ impl Composer {
                     }
                 }
                 let description: SharedString = description.into();
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
                         .id(("slash-result", row_ix))
                         .px(px(10.0))
-                        .py(px(9.0))
+                        .h(px(SLASH_ROW_HEIGHT))
+                        .flex_none()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.slash.active = Some(row_ix);
                             this.accept_slash(cx);
@@ -4537,6 +4569,7 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(list);
         }
         // Vertically the popup rides the `/` token's line; horizontally it
         // ignores the caret and lines up with the pill, spanning it edge to
