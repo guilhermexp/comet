@@ -942,28 +942,45 @@ fn truncate_tail(text: &str, max_bytes: usize) -> String {
     format!("…{}", &text[start..])
 }
 
+/// The declaration the orchestrator actually reads. A compound action-dispatch
+/// tool whose fields carry no documentation is not callable on the first try:
+/// the caller has to spend a `help` round-trip to learn which field belongs to
+/// which action, while editing a file locally costs nothing. That asymmetry is
+/// what makes an orchestrator inspect and never delegate, so every field names
+/// its owning action and the description states when this tool is the right
+/// substance at all.
 fn tool_definition() -> Value {
     json!({
         "name": "workers",
-        "description": "Launch and coordinate Comet CLI Workers. Start with action=help or list_projects.",
+        "description": "Launch and coordinate Comet CLI Workers — separate agent \
+        processes that do implementation work inside a target project's own checkout \
+        or worktree. Every change to a real project goes through a worker; `task` \
+        subagents stay inside the caller's session for read-only research and never \
+        write to a project. Loop: `list_projects` to resolve the project, \
+        `list_presets` to pick a preset, `launch_worker` with a self-contained \
+        briefing in `initial_text`, `wait_for_status` instead of polling, \
+        `read_output` to inspect evidence, then `stop_worker` or `archive_worker`. \
+        Launch one worker per independent slice: N calls for N slices is the normal \
+        shape of parallel delegation. `action=help` returns the live per-action \
+        contract and limits.",
         "inputSchema": {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": { "type": "string", "enum": ACTIONS },
-                "project_id": { "type": "string" },
-                "preset_id": { "type": "string" },
-                "command": { "type": "string" },
-                "session_id": { "type": "string" },
-                "text": { "type": "string" },
-                "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
-                "submit": { "type": "boolean" },
-                "status": { "type": "string" },
-                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 },
-                "entries": { "type": "integer", "minimum": 1, "maximum": 500 },
-                "initial_text": { "type": "string" },
-                "worktree_path": { "type": "string" },
-                "worktree_branch": { "type": "string" }
+                "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
+                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects. list_presets: optional scope filter." },
+                "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
+                "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
+                "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker and archive_worker." },
+                "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
+                "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },
+                "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },
+                "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
+                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120, "description": "wait_for_status: bounded wait in seconds. A blocking wait replaces manual polling." },
+                "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
+                "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing submitted once the worker is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
+                "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
+                "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." }
             },
             "additionalProperties": false
         }

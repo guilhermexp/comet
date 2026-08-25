@@ -64,6 +64,55 @@ fn initialize_and_tools_list_advertise_one_compact_workers_tool() {
     assert_eq!(tools[0]["name"], "workers");
 }
 
+/// A compound action-dispatch tool is callable on the first try only if the
+/// schema says which field belongs to which action. Without that, delegating
+/// costs a `help` round-trip while editing locally costs nothing — and an
+/// orchestrator under that gradient inspects forever instead of delegating.
+#[test]
+fn the_workers_schema_documents_every_action_and_names_the_other_substance() {
+    let tools = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }))
+    .expect("tools/list responds");
+    let tool = &tools["result"]["tools"][0];
+
+    let description = tool["description"].as_str().expect("tool description");
+    assert!(
+        description.contains("`task`"),
+        "the description must also say when workers is NOT the right substance: {description}"
+    );
+
+    let properties = tool["inputSchema"]["properties"]
+        .as_object()
+        .expect("schema properties");
+    let mut documentation = description.to_owned();
+    for (name, property) in properties {
+        let field = property["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("field {name} carries no description"));
+        assert!(
+            !field.trim().is_empty(),
+            "field {name} carries an empty description"
+        );
+        documentation.push('\n');
+        documentation.push_str(field);
+    }
+
+    for action in properties["action"]["enum"]
+        .as_array()
+        .expect("action enum")
+    {
+        let action = action.as_str().expect("action is a string");
+        assert!(
+            documentation.contains(action),
+            "action {action} is named in no description, so a caller cannot build the call without a help round-trip"
+        );
+    }
+}
+
 #[test]
 fn notifications_do_not_receive_json_rpc_responses() {
     assert!(

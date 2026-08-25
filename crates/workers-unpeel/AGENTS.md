@@ -61,6 +61,15 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   exit push (`{gen}:{episode}:exited`) both fired, minting ~2 800 notifications
   and a 13 MB parent doc. Never emit a second spelling of an event the pass
   already carries.
+- **The tool declaration is product surface, not decoration.** `workers` is
+  action-dispatch: with no per-field `description` naming its owning action, a
+  caller cannot build a valid `launch_worker` on the first try and pays a
+  `help` round-trip to delegate, while editing a file locally costs nothing —
+  the asymmetry that makes an orchestrator inspect and never delegate. The
+  tool `description` also states when this is *not* the right substance
+  (`task` stays inside the caller's session, read-only).
+  `tests/controller_mcp.rs` locks both: every action in the enum appears in
+  some description, and no field is left without one.
 
 ## Work Guidance
 
