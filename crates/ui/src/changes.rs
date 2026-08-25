@@ -2675,7 +2675,6 @@ impl Changes {
             .when(sticky, |el| {
                 el.border_b_1()
                     .border_color(sticky_paint.expect("sticky paint").border)
-                    .shadow_sm()
                     .block_mouse_except_scroll()
             })
             .flex_none()
