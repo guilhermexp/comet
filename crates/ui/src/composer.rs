@@ -155,11 +155,23 @@ pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
 pub const RESIZE_SETTLE_MS: u64 = 150;
 
 /// Slash-command popup geometry. The `/` menu is read as a LIST OF COMMANDS,
-/// not as a dense picker: it is wider and a size up from the mention popup so
-/// the name reads at a glance and the description has room to finish.
-pub const SLASH_POPUP_WIDTH: f32 = 520.0;
+/// not as a dense picker: it spans the composer pill and sits a size up from
+/// the mention popup, so the name reads at a glance and the description has
+/// room to finish.
 pub const SLASH_NAME_SIZE: f32 = 15.0;
 pub const SLASH_DESCRIPTION_SIZE: f32 = 13.5;
+
+/// Left inset of the text input inside the pill (`pl-4` compact, `px-4`
+/// expanded). The completion layer is anchored INSIDE that inset, so the
+/// slash popup shifts back by it to line up with the pill's own edge.
+const INPUT_PILL_INSET: f32 = 16.0;
+
+/// Pill width for a given composer column — the slash popup matches it, so a
+/// narrower window narrows the menu instead of letting it run past the edge.
+fn pill_width(available: Option<f32>) -> f32 {
+    let composer = available.unwrap_or(COMPOSER_MAX_WIDTH);
+    (composer - 2.0 * Theme::SPACE_LG).max(0.0)
+}
 
 /// How long the first Escape stays armed for the Esc-Esc stop gesture.
 pub const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(1000);
@@ -4434,7 +4446,7 @@ impl Composer {
         // plus a sentence of description, and the compact menu geometry cut
         // every description mid-word at the card's edge.
         let mut card = crate::popover::popover_card(theme)
-            .w(px(SLASH_POPUP_WIDTH))
+            .w(px(pill_width(self.last_available_width)))
             .max_h(px(360.0))
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
@@ -4526,13 +4538,17 @@ impl Composer {
                 );
             }
         }
+        // Vertically the popup rides the `/` token's line; horizontally it
+        // ignores the caret and lines up with the pill, spanning it edge to
+        // edge (the caret anchor pushed a wide card off the right of a narrow
+        // window).
         let anchor = self
             .input
             .read(cx)
             .visible_point_for_index(token.range.start)?;
         Some(crate::popover::anchored_menu_above_at(
             "slash-popup",
-            anchor,
+            gpui::point(px(-INPUT_PILL_INSET), anchor.y),
             card.into_any_element(),
             None,
         ))
@@ -6337,6 +6353,19 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_slash_popup_spans_the_pill_at_every_column_width() {
+        // Full column: the pill is the composer minus its own gutters.
+        assert_eq!(pill_width(Some(COMPOSER_MAX_WIDTH)), 736.0);
+        // Narrow window: the menu shrinks with the pill instead of running
+        // past the window edge.
+        assert_eq!(pill_width(Some(420.0)), 388.0);
+        // Before the first measurement, assume the widest column.
+        assert_eq!(pill_width(None), 736.0);
+        // Degenerate column stays a width, never a negative.
+        assert_eq!(pill_width(Some(8.0)), 0.0);
+    }
 
     #[test]
     fn only_a_second_escape_inside_the_window_stops_the_run() {
