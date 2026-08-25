@@ -50,14 +50,20 @@ chip; non-image files outside the space stage as attachments; failures surface
 the composer failure notice naming the file.
 
 #### Scenario: Drop a project text file
+Test: unit — add_paths classification tests (project-relative text file → mention).
+
 - **WHEN** the user drops a text file that lives inside the selected space
 - **THEN** a file mention chip for its project-relative path is inserted
 
 #### Scenario: Drop an external file
+Test: unit — add_paths classification tests (external path → staged attachment).
+
 - **WHEN** the user drops a non-image file outside the selected space
 - **THEN** it stages as an attachment delivered by path on send
 
 #### Scenario: Drop something unusable
+Test: unit — add_paths classification tests (unreadable path → failure notice).
+
 - **WHEN** a dropped path cannot be read or classified
 - **THEN** the failure notice names the file instead of silence
 
@@ -69,6 +75,8 @@ remove control, persisting per chat key across navigation exactly like staged
 images.
 
 #### Scenario: Review and remove before send
+Test: unit — composer staged-strip persistence/removal tests.
+
 - **WHEN** a text attachment is staged and the user navigates away and back
 - **THEN** the chip is still present
 - **AND** its remove control deletes only that item

@@ -4,7 +4,7 @@
 
 | Fase | U-IDs | Seções | Depends on | Audit state | Audited commit | Entrega | UAT mode |
 |---|---|---|---|---|---|---|---|
-| F1 | C1-C4 | §1 | — | pending | — | Paste discipline + text attachment end-to-end | human-driven |
+| F1 | C1-C4 | §1 | — | human_needed | f69f5f23 | Paste discipline + text attachment end-to-end | human-driven |
 | F2 | C5-C6 | §2 | F1 | pending | — | Honest drop/add_paths | human-driven |
 | F3 | C7-C8 | §3 | F1 | pending | — | Staged chips row | human-driven |
 | F4 | C9-C11 | §4 | — | pending | — | Markdown decoration in the input | human-driven |
