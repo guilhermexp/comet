@@ -661,7 +661,10 @@ fn staged_text_chip(attachment: &StagedAttachment) -> Option<StagedTextChip> {
     let subtitle = if attachment.source_path().is_some() {
         attachment.name.clone()
     } else {
-        format!("Pasted Text · {}", format_attachment_size(attachment.byte_len()))
+        format!(
+            "Pasted Text · {}",
+            format_attachment_size(attachment.byte_len())
+        )
     };
     let text_chars = title.chars().count().max(subtitle.chars().count()) as f32;
     let width = (60.0 + text_chars * 6.0).clamp(TEXT_CHIP_MIN_WIDTH, TEXT_CHIP_MAX_WIDTH);
@@ -7123,17 +7126,26 @@ mod tests {
     fn attachment_strip_height_wraps_real_thumbnail_and_text_chip_sizes() {
         assert_eq!(attachment_strip_height(&[], 240.0), 0.0);
         assert_eq!(
-            attachment_strip_height(&[(STRIP_THUMB, STRIP_THUMB), (120.0, TEXT_CHIP_HEIGHT)], 240.0),
+            attachment_strip_height(
+                &[(STRIP_THUMB, STRIP_THUMB), (120.0, TEXT_CHIP_HEIGHT)],
+                240.0
+            ),
             STRIP_PAD_TOP + STRIP_THUMB,
             "a thumbnail and minimum-width chip fit the same row"
         );
         assert_eq!(
-            attachment_strip_height(&[(120.0, TEXT_CHIP_HEIGHT), (120.0, TEXT_CHIP_HEIGHT)], 240.0),
+            attachment_strip_height(
+                &[(120.0, TEXT_CHIP_HEIGHT), (120.0, TEXT_CHIP_HEIGHT)],
+                240.0
+            ),
             STRIP_PAD_TOP + TEXT_CHIP_HEIGHT * 2.0 + STRIP_GAP,
             "chip widths, not item count, decide wrapping"
         );
         assert_eq!(
-            attachment_strip_height(&[(200.0, TEXT_CHIP_HEIGHT), (STRIP_THUMB, STRIP_THUMB)], 240.0),
+            attachment_strip_height(
+                &[(200.0, TEXT_CHIP_HEIGHT), (STRIP_THUMB, STRIP_THUMB)],
+                240.0
+            ),
             STRIP_PAD_TOP + TEXT_CHIP_HEIGHT + STRIP_GAP + STRIP_THUMB,
             "each row contributes its tallest real child"
         );
