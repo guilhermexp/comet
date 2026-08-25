@@ -8498,6 +8498,32 @@ impl Render for Shell {
                     this.toggle_right_pane(window, cx)
                 }
             }))
+            // Chat-scoped like the panel toggles: Settings has no current
+            // session to archive. Quiet under an open popover, like the other
+            // session-nav shortcuts.
+            .on_action(cx.listener(|this, _: &ArchiveSession, _, cx| {
+                if matches!(this.route, Route::Chat) && !this.overlay_owns_keyboard(cx) {
+                    this.archive_selected_chat(cx)
+                }
+            }))
+            // A jump routes back to chat itself, so Settings is not a dead
+            // spot — the same call a click on that sidebar row makes. But an
+            // open picker/palette owns the keyboard: no jumping underneath
+            // it. The MODEL menu advertises these same slots on its rows and
+            // this matched binding beats its key handler to the dispatch —
+            // forward the slot instead of eating it.
+            .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
+                let pickers = this.composer.read(cx).pickers().clone();
+                let handled = pickers.update(cx, |pickers, cx| {
+                    pickers.jump_model_slot(jump.0, cx)
+                });
+                if !handled && !this.overlay_owns_keyboard(cx) {
+                    this.jump_to_session(jump.0, cx)
+                }
+            }))
+            .on_modifiers_changed(
+                cx.listener(|this, event, _, cx| this.on_modifiers_changed(event, cx)),
+            )
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
                 if this.add_space.is_some() {
                     this.add_space = None;
