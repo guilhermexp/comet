@@ -23,8 +23,8 @@
 
 **must_haves:** no dropped file is silently discarded; project files become mentions; external files become attachments.
 
-- [ ] C5 `Composer::add_paths` classifies instead of filtering: image → stage (unchanged); path inside the selected space → insert file mention chip; other → stage as TextFile/path attachment; unreadable → failure notice naming the file. files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer`.
-- [ ] C6 Port the reference's text-extension table as the mention-vs-attachment hint and unit-test the classification (image ext, project text file, external file, extensionless, unreadable). files: `crates/ui/src/composer.rs` or `crates/ui/src/attachments.rs`. verify: `cargo test -p zeron-ui`.
+- [x] C5 `Composer::add_paths` classifies instead of filtering: image → stage (unchanged); path inside the selected space → insert file mention chip; other → stage as TextFile/path attachment; unreadable → failure notice naming the file. files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer`.
+- [x] C6 Port the reference's text-extension table as the mention-vs-attachment hint and unit-test the classification (image ext, project text file, external file, extensionless, unreadable). files: `crates/ui/src/composer.rs` or `crates/ui/src/attachments.rs`. verify: `cargo test -p zeron-ui`.
 
 ## 3. Staged chips
 

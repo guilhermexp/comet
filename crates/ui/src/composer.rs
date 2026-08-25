@@ -1848,6 +1848,10 @@ impl ComposerInput {
         cx.notify();
     }
 
+    fn insert_file_mention(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.replace_mention(self.selected_range.clone(), path, false, cx);
+    }
+
     /// Replace a completed plain-text token (slash commands) as one
     /// non-coalescing undo step. Unlike [`Self::replace_mention`], the
     /// replacement is ordinary text — no link, no chip projection.
@@ -4160,25 +4164,47 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// Classify every picker/drop/paste path. Images keep the upload path;
+    /// project text files become mentions; everything else stages as a
+    /// source-path chip. No path disappears without a named failure.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let selected_space = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .map(|space| PathBuf::from(&space.path));
         let mut staged = Vec::new();
-        for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
-                Err(message) => {
+        for path in paths {
+            match attachments::classify_dropped_path(&path, selected_space.as_deref()) {
+                attachments::DroppedPathKind::Image => match attachments::stage_file(&path) {
+                    Ok(attachment) => staged.push(attachment),
+                    Err(message) => {
+                        self.failure = Some(message.into());
+                        self.failure_key = Some(self.current_key.clone());
+                    }
+                },
+                attachments::DroppedPathKind::ProjectMention { relative_path } => {
+                    self.input.update(cx, |input, cx| {
+                        input.insert_file_mention(&relative_path, cx);
+                    });
+                }
+                attachments::DroppedPathKind::ExternalFile { path, size } => {
+                    match attachments::stage_path_file(&path, size) {
+                        Ok(attachment) => staged.push(attachment),
+                        Err(message) => {
+                            self.failure = Some(message.into());
+                            self.failure_key = Some(self.current_key.clone());
+                        }
+                    }
+                }
+                attachments::DroppedPathKind::Failure(message) => {
                     self.failure = Some(message.into());
                     self.failure_key = Some(self.current_key.clone());
-                    cx.notify();
                 }
             }
         }
         self.add_staged(staged, cx);
+        cx.notify();
     }
 
     pub(crate) fn set_failure(&mut self, message: String, cx: &mut Context<Self>) {
@@ -5217,7 +5243,10 @@ impl Composer {
         let host_is_remote = host_device_id
             .as_deref()
             .is_some_and(|id| local_device_id.as_deref() != Some(id));
-        let queued_flow = !staged.is_empty() && {
+        let has_uploads = staged
+            .iter()
+            .any(|attachment| attachment.source_path().is_none());
+        let queued_flow = has_uploads && {
             let state = self.state.read(cx);
             let local_ok = local_device_id
                 .as_deref()
@@ -5231,9 +5260,14 @@ impl Composer {
         // Upload identities minted NOW: in the queued flow the `pending://`
         // ref IS the persisted transport until the host rewrites it, so the
         // id must exist before any bytes move.
-        let upload_ids: Vec<String> = staged
+        let upload_ids: Vec<Option<String>> = staged
             .iter()
-            .map(|_| uuid::Uuid::new_v4().to_string())
+            .map(|attachment| {
+                attachment
+                    .source_path()
+                    .is_none()
+                    .then(|| uuid::Uuid::new_v4().to_string())
+            })
             .collect();
         // The echo carries attachment refs from the first frame, so photos
         // render while the send is still pending. Queued flow: the refs are
@@ -5246,12 +5280,20 @@ impl Composer {
             staged
                 .iter()
                 .zip(&upload_ids)
-                .map(|(att, id)| format!("pending://{id}/{}", att.name))
+                .map(|(att, id)| match (att.source_path(), id) {
+                    (Some(path), _) => path.display().to_string(),
+                    (None, Some(id)) => format!("pending://{id}/{}", att.name),
+                    (None, None) => unreachable!("upload attachments always have an id"),
+                })
                 .collect()
         } else {
             staged
                 .iter()
-                .map(|att| format!("pending/{}/{}", att.id, att.name))
+                .map(|att| {
+                    att.source_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| format!("pending/{}/{}", att.id, att.name))
+                })
                 .collect()
         };
         let echo_text = attachments::with_attachments(&text, &echo_paths);
@@ -5262,6 +5304,7 @@ impl Composer {
         // rewrite instead of blanking into a reload skeleton.
         if queued_flow {
             for (upload_id, att) in upload_ids.iter().zip(&staged) {
+                let Some(upload_id) = upload_id else { continue };
                 let Some(image) = att.image() else { continue };
                 attachments::seed_attachment_alias(&device_id, upload_id, &att.name, image.clone());
                 if let Some(local) = local_device_id.as_deref()
@@ -5346,7 +5389,11 @@ impl Composer {
                     // Local staging is disk-speed; publish progress anyway so
                     // huge files still narrate.
                     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
+                    let total: u64 = staged
+                        .iter()
+                        .filter(|attachment| attachment.source_path().is_none())
+                        .map(StagedAttachment::byte_len)
+                        .sum();
                     {
                         let progress = progress.clone();
                         this.update(cx, |composer, cx| {
@@ -5358,6 +5405,7 @@ impl Composer {
                         .ok();
                     }
                     for (att, upload_id) in staged.iter().zip(&upload_ids) {
+                        let Some(upload_id) = upload_id else { continue };
                         if let Err(err) = attachments::upload_attachment(
                             &engine,
                             cx.background_executor(),
@@ -5381,7 +5429,11 @@ impl Composer {
                     content = echo_text.clone();
                 } else if !staged.is_empty() {
                     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
+                    let total: u64 = staged
+                        .iter()
+                        .filter(|attachment| attachment.source_path().is_none())
+                        .map(StagedAttachment::byte_len)
+                        .sum();
                     const LEGACY_UPLOAD_BUDGET: std::time::Duration =
                         std::time::Duration::from_secs(300);
                     let upload_started = std::time::Instant::now();
@@ -5396,6 +5448,13 @@ impl Composer {
                         .ok();
                     }
                     for (att, upload_id) in staged.iter().zip(&upload_ids) {
+                        if let Some(path) = att.source_path() {
+                            attachment_paths.push(path.display().to_string());
+                            continue;
+                        }
+                        let Some(upload_id) = upload_id else {
+                            unreachable!("upload attachments always have an id");
+                        };
                         let Some(remaining) =
                             LEGACY_UPLOAD_BUDGET.checked_sub(upload_started.elapsed())
                         else {
