@@ -208,6 +208,18 @@ while IFS= read -r line; do
         emit '{"type":"agent_start"}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" resumed"}}'
         emit '{"type":"agent_end","messages":[]}'
+      elif [ "$scenario" = "decline-question" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"extension_ui_request","id":"question-1","method":"confirm","title":"Continue?","message":"Run the checks?"}'
+        read -r answer
+        has "$answer" '"type":"extension_ui_response"' || fail_stage decline 28
+        has "$answer" '"id":"question-1"' || fail_stage decline 28
+        # Declining is `cancelled` WITHOUT a timeout: the user was asked and
+        # chose not to answer. This is what the question panel's Skip sends.
+        has "$answer" '"cancelled":true' || fail_stage decline 28
+        has "$answer" '"timedOut":false' || fail_stage decline 28
+        if has "$answer" '"confirmed"'; then fail_stage decline 29; fi
+        emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "require-system-prompt" ]; then
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "reject-system-prompt" ]; then

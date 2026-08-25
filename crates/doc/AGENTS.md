@@ -14,6 +14,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 - Corpo de mensagem é **LoroText**, nunca reescrita LWW de valor — é a forma medida em 1.03× de oplog. Trocar isso multiplica o histórico.
 - Command ledger segue as regras 1–3: entradas append-only por device; outcome só do host; dedupe/TTL/supersede avaliados na leitura.
+- `set_command_status` carimba **toda** entrada com aquele id, não a primeira. Id é a identidade do comando; docs de antes de 2026-08-25 carregam milhares de gêmeos `pending` de um mesmo id (loop de retry no produtor), e carimbar só o primeiro deixava o resto inalcançável — o dead-command sweep do host reportava os restos em todo drain, para sempre.
 - Constantes carregadas do comet original (`STREAM_COMMIT_MS=120`, `DO_FLUSH_MS=5s`, compactação em 8MB, retenção 30d, tail 64) são compatibilidade, não preferência — mudar exige olhar o lado do edge.
 - Split de continuação em 256KB. Tool parts renderizáveis vão pro doc; inputs completos ficam no run journal local do host.
 - Write/Edit nunca sincronizam o corpo completo: um único sanitizer em fold/read/write/salvage/rebuild limita o preview a 15 linhas × 512 escalares Unicode; o input histórico integral fica no run journal local do host. Write usa `split('\n')`, contando conteúdo vazio e newline final como linhas adicionadas; `old_text` não muda Write para semântica de Edit.

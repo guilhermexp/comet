@@ -40,21 +40,6 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Speak MCP on stdio, exposing the worker tools to the agent running in
-    /// `--chat`. Launched by the harness through `--mcp-config`, not by hand.
-    /// stdout is the MCP transport: logs go to stderr.
-    McpServer {
-        /// The chat whose terminals the workers are opened under.
-        #[arg(long)]
-        chat: String,
-        /// The engine's IPC port (`ws://127.0.0.1:<port>`).
-        #[arg(long)]
-        port: u16,
-        /// This server's worker depth; a server that hands its own config to a
-        /// worker must launch it at `depth + 1`.
-        #[arg(long, default_value_t = 0)]
-        depth: usize,
-    },
     /// Inspect local worker sessions without starting the headed app.
     Workers {
         #[command(subcommand)]
@@ -152,15 +137,7 @@ fn main() -> anyhow::Result<()> {
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        // `mcp-server` is the one mode that must not log to stdout: its stdout
-        // IS the MCP transport, so a single line there is a frame the client
-        // cannot parse. Everything else keeps the console on stdout.
-        let console: tracing_subscriber::fmt::writer::BoxMakeWriter =
-            if matches!(cli.command, Some(Command::McpServer { .. })) {
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
-            } else {
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
-            };
+        let console = tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout);
         let registry = tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().with_writer(console));
@@ -204,10 +181,6 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
         }
-        Some(Command::McpServer { chat, port, depth }) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(mcp_server(chat, port, depth))
-        }
         Some(Command::Workers { command }) => workers_cli::run(command),
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
@@ -238,25 +211,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-/// `zeron mcp-server`: an MCP server on stdio backed by the engine's terminal
-/// RPCs over IPC. The harness launches one per run through `--mcp-config`.
-///
-/// stdout carries MCP frames and nothing else — the tracing subscriber above
-/// is pointed at stderr for this subcommand.
-async fn mcp_server(chat: String, port: u16, depth: usize) -> anyhow::Result<()> {
-    let rpc = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{port}"))
-        .await
-        .map_err(|err| anyhow::anyhow!("could not reach the engine on port {port}: {err}"))?;
-    let tools = zeron_mcp::WorkerTools::new(
-        zeron_mcp::RpcEngineClient::new(std::sync::Arc::new(rpc)),
-        zeron_mcp::WorkerConfig::new(chat, depth),
-    );
-    zeron_mcp::WorkerToolsServer::new(std::sync::Arc::new(tools))
-        .serve_stdio()
-        .await?;
-    Ok(())
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,

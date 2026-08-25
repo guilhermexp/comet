@@ -175,6 +175,26 @@ pub fn toggle_expanded(expanded: &mut HashSet<String>, project_id: &str) {
     }
 }
 
+/// Expand `project_id` together with every ancestor. The sidebar hides a
+/// project whose parent chain is collapsed, so revealing one row means
+/// expanding the whole chain. Iteration is bounded by the project count
+/// because a malformed parent link would otherwise cycle.
+fn expand_project_chain(
+    expanded: &mut HashSet<String>,
+    projects: &[WorkersProject],
+    project_id: &str,
+) {
+    let mut next = Some(project_id);
+    for _ in 0..=projects.len() {
+        let Some(current) = next else { return };
+        expanded.insert(current.to_owned());
+        next = projects
+            .iter()
+            .find(|project| project.id == current)
+            .and_then(|project| project.parent_project_id.as_deref());
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingReplacement {
     source_id: String,
@@ -1556,6 +1576,19 @@ impl WorkersModel {
 
     fn apply_snapshot(&mut self, snapshot: WorkersBootstrap, app_focused: bool) {
         let notification_settings = notification_settings_for_snapshot(self.settings.as_ref());
+        // A worker can appear without this app launching it (the MCP sidecar,
+        // another instance). `notification_state` is the per-session ledger
+        // this pass maintains, so a missing entry is the first sighting:
+        // reveal that project once instead of hiding the row behind a
+        // collapsed parent, and never re-expand what the user later collapsed.
+        let revealed_project_ids = snapshot
+            .sessions
+            .iter()
+            .filter(|session| {
+                !session.archived && !self.notification_state.contains_key(&session.id)
+            })
+            .map(|session| session.project_id.clone())
+            .collect::<Vec<_>>();
         for session in &snapshot.sessions {
             let (next_state, notification) = reduce_notification(
                 self.notification_state.get(&session.id),
@@ -1686,6 +1719,13 @@ impl WorkersModel {
                 .extend(snapshot.projects.iter().map(|project| project.id.clone()));
             self.initialized_expansion = true;
         } else {
+            for project_id in &revealed_project_ids {
+                expand_project_chain(
+                    &mut self.expanded_project_ids,
+                    &snapshot.projects,
+                    project_id,
+                );
+            }
             self.expanded_project_ids
                 .retain(|id| snapshot.projects.iter().any(|project| &project.id == id));
         }

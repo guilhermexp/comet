@@ -432,6 +432,11 @@ impl SessionDoc {
         resolution: Option<&str>,
     ) -> Result<(), DocError> {
         let commands = self.doc.get_list("commands");
+        let mut stamped = false;
+        // Every entry carrying this id IS this command: a pre-2026-08-25 doc can
+        // hold thousands of Pending twins minted by retry, and stamping only the
+        // first left the rest unreachable — the host's dead-command sweep then
+        // re-reported them on every drain, forever. Terminalize all of them.
         for i in 0..commands.len() {
             if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
                 commands.get(i)
@@ -450,12 +455,15 @@ impl SessionDoc {
                     if let Some(r) = resolution {
                         map.insert("resolution", r)?;
                     }
-                    self.doc.commit();
-                    return Ok(());
+                    stamped = true;
                 }
             }
         }
-        Err(DocError::Schema(format!("command {command_id} not found")))
+        if !stamped {
+            return Err(DocError::Schema(format!("command {command_id} not found")));
+        }
+        self.doc.commit();
+        Ok(())
     }
 
     /// Stamp a terminal status on an existing message entry by id (recovery:
@@ -1990,6 +1998,50 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+    }
+
+    /// Pre-2026-08-25 docs hold Pending twins of one command id (a retry loop
+    /// appended one per attempt). An outcome must terminalize every twin, or
+    /// the host's dead-command sweep re-reports the leftovers forever.
+    #[test]
+    fn command_outcome_stamps_every_twin_of_an_id() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let entry = SessionCommandEntry {
+            id: "worker-notify:w1:1:exited".into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "worker exited".into(),
+                message_id: None,
+            },
+            issued_by: "dev-b".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        for _ in 0..3 {
+            doc.queue_command(&entry).unwrap();
+        }
+        doc.set_command_status(
+            &entry.id,
+            SessionCommandStatus::Rejected,
+            Some("interrupted"),
+        )
+        .unwrap();
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(
+            commands
+                .iter()
+                .all(|c| c.status == SessionCommandStatus::Rejected
+                    && c.resolution.as_deref() == Some("interrupted")),
+            "every twin terminalized: {commands:?}"
+        );
+        assert!(
+            doc.set_command_status("absent", SessionCommandStatus::Rejected, None)
+                .is_err()
+        );
     }
 
     #[test]

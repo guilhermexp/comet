@@ -129,6 +129,34 @@ fn controls_with_pending_answer() -> (
     (controls, steer_tx, interrupt)
 }
 
+/// Answers with NO labels — exactly what the question panel's Skip submits.
+fn controls_declining() -> (
+    RunControls,
+    tokio::sync::mpsc::Sender<SteerMessage>,
+    CancellationToken,
+) {
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
+    let interrupt = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let answers = questions
+                .into_iter()
+                .map(|question| UserInputAnswer {
+                    question_id: question.id,
+                    labels: Vec::new(),
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: interrupt.clone(),
+        chat_id: String::new(),
+    };
+    (controls, steer_tx, interrupt)
+}
+
 async fn collect_until_done(
     stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>,
 ) -> Vec<AgentEvent> {
@@ -477,6 +505,31 @@ async fn workers_host_tool_is_registered_only_when_enabled() {
     assert_eq!(result["isError"], false);
     assert_eq!(result["result"]["content"][0]["text"], "worker help");
     enabled.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn declining_a_question_reaches_omp_as_a_cancelled_response() {
+    // The Skip button submits an answer with no labels. That has to arrive as
+    // `cancelled: true, timedOut: false` — a distinct thing from a timeout and
+    // from `confirmed: false`, which would be a real "no". The fixture exits
+    // non-zero if any of those three details is wrong, so a silent drift shows
+    // up as a failed turn instead of a question the user cannot escape.
+    let harness = fake_harness("decline-question");
+    let (controls, _steer, _interrupt) = controls_declining();
+
+    let mut stream = harness.run(request("hello"), controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "declining must let the turn finish: {events:?}"
+    );
 }
 
 #[tokio::test]

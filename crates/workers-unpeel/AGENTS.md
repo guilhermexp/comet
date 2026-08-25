@@ -39,9 +39,10 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   at startup dispatches into the host instead of the app. **Never kill
   `__session_host__` processes when rebuilding the app** — kill only the exact
   main PID (root AGENTS.md). Other internal host modes dispatched here:
-  `CONTROLLER_MCP_ARG`, `MCP_HOST_ARG`, `BROWSER_MCP_ARG`, `MCP_GATE_ARG`, the
-  browser/computer cleanup args, `COMPACT_OUTPUT_JOURNALS_ARG`, and legacy MCP
-  gate kinds (`unpeel_core::integrations::legacy_mcp_gate_kind`).
+  `CONTROLLER_MCP_ARG`, `MCP_HOST_ARG`, `MCP_GATE_ARG`, the browser/computer
+  cleanup args, `COMPACT_OUTPUT_JOURNALS_ARG`, and legacy MCP gate kinds
+  (`unpeel_core::integrations::legacy_mcp_gate_kind`). Browser is a *domain* of
+  `MCP_HOST_ARG`, never its own server.
 - **Controller MCP is Comet-owned.** Only ACP controller sessions receive this
   process in their `mcpServers` list (injected by zeron-harness's
   `workers_mcp_servers*`); it is NOT Unpeel's worker-to-worker MCP host.
@@ -51,6 +52,24 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
+- **One lifecycle fact carries one event id.** `parent_notifications.rs` derives
+  a notification id per event; acknowledging in production compacts the journal,
+  which CLEARS `acknowledged_notification_ids` (journal sequences stop meaning
+  anything). So a fact spelled two ways can never be acknowledged: the spellings
+  alternate forever, one parent command per pass. That is what a dead worker did
+  on 2026-08-25 — the journal-less fallback (`{gen}:exited`) and the synthetic
+  exit push (`{gen}:{episode}:exited`) both fired, minting ~2 800 notifications
+  and a 13 MB parent doc. Never emit a second spelling of an event the pass
+  already carries.
+- **The tool declaration is product surface, not decoration.** `workers` is
+  action-dispatch: with no per-field `description` naming its owning action, a
+  caller cannot build a valid `launch_worker` on the first try and pays a
+  `help` round-trip to delegate, while editing a file locally costs nothing —
+  the asymmetry that makes an orchestrator inspect and never delegate. The
+  tool `description` also states when this is *not* the right substance
+  (`task` stays inside the caller's session, read-only).
+  `tests/controller_mcp.rs` locks both: every action in the enum appears in
+  some description, and no field is left without one.
 
 ## Work Guidance
 
@@ -72,7 +91,7 @@ Requires the main checkout (submodule pin not fetchable elsewhere).
 |---|---|---|
 | `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (18) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
-| `tests/parent_notifications.rs` (14) | integration | `--test parent_notifications` |
+| `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (8) — settings snapshot/persistence | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (3), `tests/local_bootstrap.rs` (2) — client actions over a local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

@@ -8,7 +8,6 @@ members = [
     "crates/harness",
     "crates/engine",
     "crates/rpc",
-    "crates/mcp",
     "crates/update",
     "crates/workers-unpeel",
     "crates/ui",
@@ -29,22 +28,11 @@ zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
 zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
-# The MCP crate arrived after the global rename and still exposes its original
-# package/dependency keys; aliases keep it buildable without dropping it.
-zeron-mcp = { package = "comet-mcp", path = "crates/mcp" }
-comet-proto = { package = "zeron-proto", path = "crates/proto" }
-comet-engine = { package = "zeron-engine", path = "crates/engine" }
-comet-rpc = { package = "zeron-rpc", path = "crates/rpc" }
 comet-syntax = { path = "crates/syntax" }
 zeron-update = { path = "crates/update" }
 zeron-workers-unpeel = { path = "crates/workers-unpeel" }
 zeron-ui = { path = "crates/ui" }
 unpeel-core = { path = "third_party/unpeel/crates/unpeel-core" }
-
-# MCP server for the worker tools (`zeron mcp-server`). `transport-io` is the
-# stdio SERVER transport; the defaults (server, macros, base64) stay on —
-# without `server` this compiles into a client-only build.
-rmcp = { version = "3", features = ["transport-io"] }
 
 # CRDT
 loro = "1.13"

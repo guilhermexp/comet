@@ -14,8 +14,9 @@ pub use hook_migration::remove_legacy_hook_root_at;
 pub use parent_notifications::{
     WorkerCompletionEvidence, WorkerParentLink, WorkerParentNotification,
     WorkerParentNotificationKind, ack_worker_parent_notification,
-    ack_worker_parent_notification_at, activate_worker_parent_task, activate_worker_parent_task_at,
-    begin_worker_parent_task, begin_worker_parent_task_at, build_worker_parent_notification_prompt,
+    ack_worker_parent_notification_at, ack_worker_parent_notification_compacted_at,
+    activate_worker_parent_task, activate_worker_parent_task_at, begin_worker_parent_task,
+    begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task, cancel_worker_parent_task_at, confirm_worker_parent_task_submission,
     pending_worker_parent_notifications, pending_worker_parent_notifications_at,
     pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
@@ -51,7 +52,6 @@ fn is_internal_host_mode(args: &[String]) -> bool {
         argument,
         controller_mcp::CONTROLLER_MCP_ARG
             | mcp_host::MCP_HOST_ARG
-            | browser_mcp::BROWSER_MCP_ARG
             | mcp_gate::MCP_GATE_ARG
             | browser_mcp::BROWSER_CLEANUP_ARG
             | computer_mcp::COMPUTER_CLEANUP_ARG
@@ -109,10 +109,6 @@ pub fn run_session_host_mode_if_requested() -> Result<bool, String> {
     }
     if args.first().map(String::as_str) == Some(mcp_host::MCP_HOST_ARG) {
         mcp_host::run_stdio()?;
-        return Ok(true);
-    }
-    if args.first().map(String::as_str) == Some(browser_mcp::BROWSER_MCP_ARG) {
-        browser_mcp::run_stdio()?;
         return Ok(true);
     }
     if args.first().map(String::as_str) == Some(mcp_gate::MCP_GATE_ARG) {
@@ -1138,6 +1134,15 @@ impl LocalWorkersClient {
     }
 
     pub fn launch_session(&self, launch: &WorkersLaunchRequest) -> Result<String, WorkersError> {
+        // A pi-family launch resolves `--extension` under the legacy hook
+        // root at spawn time; a missing asset means the session never emits
+        // lifecycle events and stays visually idle forever. Best-effort:
+        // failing the launch over a spinner would be the wrong trade.
+        if let Err(error) = hook_migration::ensure_upstream_owned_launch_assets() {
+            unpeel_core::hook_assets::append_trace_log_line(&format!(
+                "Launch-time hook asset restore failed: {error}"
+            ));
+        }
         let bootstrap = self.bootstrap()?;
         let launch = workspace_trust::prepare_launch_workspace_trust(
             launch,
@@ -2784,7 +2789,6 @@ mod host_mode_tests {
             session_host::SESSION_HOST_ARG,
             session_host::COMPACT_OUTPUT_JOURNALS_ARG,
             mcp_host::MCP_HOST_ARG,
-            browser_mcp::BROWSER_MCP_ARG,
             mcp_gate::MCP_GATE_ARG,
             browser_mcp::BROWSER_CLEANUP_ARG,
             computer_mcp::COMPUTER_CLEANUP_ARG,

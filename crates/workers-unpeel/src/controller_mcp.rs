@@ -427,21 +427,28 @@ fn dispatch_action(
                     )
                 })?;
             }
-            if let Some(ref briefing) = briefing {
+            // The worker exists from here on: returning Err would orphan a
+            // live session the caller never learns the id of. Report the real
+            // delivery outcome instead so the caller can retry submission on
+            // the worker it now owns.
+            let mut briefing_error = None;
+            if let Some(briefing) = &briefing {
                 let track_episode = tracks_task_episode(parent_chat_id, true);
-                submit_initial_briefing(client, &session_id, briefing, track_episode).map_err(
-                    |error| {
-                        format!(
-                            "Worker {session_id} was created, but its initial briefing could not be submitted: {error}"
-                        )
-                    },
-                )?;
+                if let Err(error) =
+                    submit_initial_briefing(client, &session_id, briefing, track_episode)
+                {
+                    briefing_error = Some(error);
+                }
             }
-            Ok(json!({
+            let mut response = json!({
                 "session_id": session_id,
                 "launched": true,
-                "briefing_submitted": briefing.is_some()
-            }))
+                "briefing_submitted": briefing.is_some() && briefing_error.is_none()
+            });
+            if let Some(error) = briefing_error {
+                response["briefing_error"] = error.into();
+            }
+            Ok(response)
         }
         "list_workers" => {
             let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
@@ -608,18 +615,40 @@ fn capture_process_baseline(session_id: &str) -> Result<Vec<(u32, u64)>, String>
     }
 }
 
+/// How long a just-created worker gets to publish its manifest.
+const MANIFEST_WAIT: Duration = Duration::from_secs(5);
+/// How long the agent prompt gets to become ready once the manifest exists.
+const BRIEFING_READY_WAIT: Duration = Duration::from_secs(8);
+
+/// Poll until the session host has published this worker's manifest, and
+/// return the runtime that owns its prompt.
+fn wait_for_session_runtime(session_id: &str, wait: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(manifest) = unpeel_core::session_host::load_manifest(session_id) {
+            return Ok(
+                unpeel_core::integrations::command_head(&manifest.session.command).to_owned(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("worker {session_id} manifest is unavailable"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn submit_initial_briefing(
     client: &LocalWorkersClient,
     session_id: &str,
     briefing: &str,
     capture_baseline: bool,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let runtime = unpeel_core::session_host::load_manifest(session_id)
-        .map(|manifest| {
-            unpeel_core::integrations::command_head(&manifest.session.command).to_owned()
-        })
-        .ok_or_else(|| format!("worker {session_id} manifest is unavailable"))?;
+    // The session host publishes the manifest asynchronously, so a launch that
+    // just returned an id may still have nothing on disk. Wait for it, then
+    // start the readiness deadline: otherwise the whole budget can burn before
+    // the runtime even exists and the brief is silently never delivered.
+    let runtime = wait_for_session_runtime(session_id, MANIFEST_WAIT)?;
+    let deadline = Instant::now() + BRIEFING_READY_WAIT;
     let mut last_screen = String::new();
     let mut stable_since = Instant::now();
     loop {
@@ -913,28 +942,45 @@ fn truncate_tail(text: &str, max_bytes: usize) -> String {
     format!("…{}", &text[start..])
 }
 
+/// The declaration the orchestrator actually reads. A compound action-dispatch
+/// tool whose fields carry no documentation is not callable on the first try:
+/// the caller has to spend a `help` round-trip to learn which field belongs to
+/// which action, while editing a file locally costs nothing. That asymmetry is
+/// what makes an orchestrator inspect and never delegate, so every field names
+/// its owning action and the description states when this tool is the right
+/// substance at all.
 fn tool_definition() -> Value {
     json!({
         "name": "workers",
-        "description": "Launch and coordinate Comet CLI Workers. Start with action=help or list_projects.",
+        "description": "Launch and coordinate Comet CLI Workers — separate agent \
+        processes that do implementation work inside a target project's own checkout \
+        or worktree. Every change to a real project goes through a worker; `task` \
+        subagents stay inside the caller's session for read-only research and never \
+        write to a project. Loop: `list_projects` to resolve the project, \
+        `list_presets` to pick a preset, `launch_worker` with a self-contained \
+        briefing in `initial_text`, `wait_for_status` instead of polling, \
+        `read_output` to inspect evidence, then `stop_worker` or `archive_worker`. \
+        Launch one worker per independent slice: N calls for N slices is the normal \
+        shape of parallel delegation. `action=help` returns the live per-action \
+        contract and limits.",
         "inputSchema": {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": { "type": "string", "enum": ACTIONS },
-                "project_id": { "type": "string" },
-                "preset_id": { "type": "string" },
-                "command": { "type": "string" },
-                "session_id": { "type": "string" },
-                "text": { "type": "string" },
-                "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
-                "submit": { "type": "boolean" },
-                "status": { "type": "string" },
-                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 },
-                "entries": { "type": "integer", "minimum": 1, "maximum": 500 },
-                "initial_text": { "type": "string" },
-                "worktree_path": { "type": "string" },
-                "worktree_branch": { "type": "string" }
+                "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
+                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects. list_presets: optional scope filter." },
+                "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
+                "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
+                "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker and archive_worker." },
+                "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
+                "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },
+                "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },
+                "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
+                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120, "description": "wait_for_status: bounded wait in seconds. A blocking wait replaces manual polling." },
+                "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
+                "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing submitted once the worker is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
+                "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },
+                "worktree_branch": { "type": "string", "description": "launch_worker: the branch that worktree_path is checked out on." }
             },
             "additionalProperties": false
         }
