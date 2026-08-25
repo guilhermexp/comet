@@ -31,6 +31,7 @@ pub mod icons;
 pub mod inline_media;
 pub mod loaders;
 pub mod markdown;
+pub mod markdown_decor;
 pub mod motion;
 pub mod notify;
 pub mod pickers;

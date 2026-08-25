@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context,
     CursorStyle, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels,
-    Point, ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad,
+    PathPromptOptions, Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
+    StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1004,6 +1004,139 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
 struct TextProjection {
     display: String,
     mentions: Vec<(FileMentionLink, Range<usize>)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ComposerRunPlan {
+    len: usize,
+    decor: crate::markdown_decor::DecorStyle,
+    mention: bool,
+    marked: bool,
+}
+
+fn composer_run_plan(
+    raw: &str,
+    projection: &TextProjection,
+    marked: Option<&Range<usize>>,
+) -> Vec<ComposerRunPlan> {
+    composer_run_plan_enabled(raw, projection, marked, true)
+}
+
+fn composer_run_plan_enabled(
+    raw: &str,
+    projection: &TextProjection,
+    marked: Option<&Range<usize>>,
+    decorate: bool,
+) -> Vec<ComposerRunPlan> {
+    let mut cells = vec![ComposerRunPlan::default(); projection.display.len()];
+    if decorate {
+        for decor in crate::markdown_decor::scan(raw) {
+            let start = projection.raw_to_display(decor.range.start);
+            let end = projection.raw_to_display(decor.range.end);
+            for cell in cells.get_mut(start..end).into_iter().flatten() {
+                cell.decor = decor.style;
+            }
+        }
+    }
+
+    if let Some(marked) = marked {
+        let start = projection.raw_to_display(marked.start.min(raw.len()));
+        let end = projection.raw_to_display(marked.end.min(raw.len()));
+        for cell in cells.get_mut(start..end).into_iter().flatten() {
+            cell.decor = Default::default();
+            cell.marked = true;
+        }
+    }
+
+    for (_, mention) in &projection.mentions {
+        for cell in &mut cells[mention.clone()] {
+            cell.decor = Default::default();
+            cell.marked = false;
+            cell.mention = true;
+        }
+    }
+
+    let mut runs = Vec::<ComposerRunPlan>::new();
+    for mut cell in cells {
+        cell.len = 1;
+        match runs.last_mut() {
+            Some(last)
+                if last.decor == cell.decor
+                    && last.mention == cell.mention
+                    && last.marked == cell.marked =>
+            {
+                last.len += 1;
+            }
+            _ => runs.push(cell),
+        }
+    }
+    runs
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextMeasurements {
+    width: f32,
+    height: f32,
+}
+
+fn stable_flip_measurements(
+    base: TextMeasurements,
+    _decorated: TextMeasurements,
+) -> TextMeasurements {
+    base
+}
+
+/// Same compact heading scale as the transcript markdown renderer. The input
+/// keeps its fixed line-height; only glyph size changes, so decoration remains
+/// paint-only with respect to the composer's box geometry.
+fn heading_font_size(level: Option<u8>, base: f32) -> f32 {
+    match level {
+        Some(1) => base.max(19.0),
+        Some(2) => base.max(16.0),
+        Some(3) => base.max(15.0),
+        Some(4..=6) => base.max(14.0),
+        _ => base,
+    }
+}
+
+fn heading_for_range(plans: &[ComposerRunPlan], range: Range<usize>) -> Option<u8> {
+    let mut at = 0;
+    let mut heading: Option<u8> = None;
+    for plan in plans {
+        let end = at + plan.len;
+        if at < range.end && end > range.start {
+            heading = match (heading, plan.decor.heading) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+        }
+        at = end;
+        if at >= range.end {
+            break;
+        }
+    }
+    heading
+}
+
+fn text_runs_for_range(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
+    let mut sliced = Vec::new();
+    let mut at = 0;
+    for run in runs {
+        let end = at + run.len;
+        let start_in_range = at.max(range.start);
+        let end_in_range = end.min(range.end);
+        if start_in_range < end_in_range {
+            let mut run = run.clone();
+            run.len = end_in_range - start_in_range;
+            sliced.push(run);
+        }
+        at = end;
+        if at >= range.end {
+            break;
+        }
+    }
+    sliced
 }
 
 /// A path alone is not enough: two identical relative paths can appear in a
@@ -2701,66 +2834,126 @@ impl ComposerInput {
         let font_size = style.font_size.to_pixels(window.rem_size());
         self.line_height = px(INPUT_LINE_HEIGHT);
 
-        // Chips read as inline code: the markdown renderer's recipe (mono font
-        // + `code_text` violet) over the rounded `code_wash` painted beneath.
-        let (chip_font, chip_color) = {
-            let theme = Theme::of(cx);
-            (gpui::font(theme.font_mono.clone()), theme.code_text)
+        let plans = if is_placeholder {
+            vec![ComposerRunPlan {
+                len: display.len(),
+                ..ComposerRunPlan::default()
+            }]
+        } else {
+            composer_run_plan_enabled(
+                &self.content,
+                &self.projection,
+                self.marked_range.as_ref(),
+                self.mentions_enabled,
+            )
         };
-        let run_for = |len: usize, underline: bool, chip: bool| TextRun {
-            len,
-            font: if chip {
-                chip_font.clone()
+        debug_assert_eq!(
+            plans.iter().map(|plan| plan.len).sum::<usize>(),
+            display.len()
+        );
+
+        let theme = Theme::of(cx);
+        let run_for = |plan: &ComposerRunPlan, decorated: bool| {
+            let decor = decorated
+                .then_some(plan.decor)
+                .unwrap_or_else(crate::markdown_decor::DecorStyle::default);
+            let mono = plan.mention || decor.code || decor.code_block;
+            let mut font = if mono {
+                gpui::font(theme.font_mono.clone())
             } else {
                 style.font()
-            },
-            color: if chip { chip_color } else { style.color },
-            // Rounded mention washes are painted explicitly beneath the text;
-            // TextRun backgrounds are square and can disappear in wrapped runs.
-            background_color: None,
-            underline: underline.then_some(UnderlineStyle {
-                color: Some(style.color),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            strikethrough: None,
-        };
-        let runs: Vec<TextRun> = match self.marked_range.as_ref() {
-            Some(marked) if !is_placeholder => {
-                let start = self.projection.raw_to_display(marked.start);
-                let end = self.projection.raw_to_display(marked.end);
-                vec![
-                    run_for(start, false, false),
-                    run_for(end.saturating_sub(start), true, false),
-                    run_for(display.len() - end, false, false),
-                ]
-                .into_iter()
-                .filter(|r| r.len > 0)
-                .collect()
+            };
+            if (decor.bold || decor.heading.is_some()) && font.weight.0 < FontWeight::SEMIBOLD.0 {
+                font.weight = FontWeight::SEMIBOLD;
             }
-            _ if is_placeholder => vec![run_for(display.len(), false, false)],
-            _ => {
-                let mut runs = Vec::new();
-                let mut at = 0;
-                for (_, chip) in &self.projection.mentions {
-                    if at < chip.start {
-                        runs.push(run_for(chip.start - at, false, false));
-                    }
-                    runs.push(run_for(chip.len(), false, true));
-                    at = chip.end;
-                }
-                if at < display.len() {
-                    runs.push(run_for(display.len() - at, false, false));
-                }
-                runs
+            if decor.italic || decor.quote {
+                font.style = FontStyle::Italic;
             }
-        };
 
-        let lines = window
+            let color = if plan.mention {
+                theme.code_text
+            } else if decor.list_marker {
+                theme.accent
+            } else if decor.marker {
+                theme.text_faint
+            } else if decor.code || decor.code_block {
+                theme.code_text
+            } else {
+                style.color
+            };
+            let underline = if plan.marked {
+                Some(UnderlineStyle {
+                    color: Some(style.color),
+                    thickness: px(1.0),
+                    wavy: false,
+                })
+            } else if decor.link {
+                Some(UnderlineStyle {
+                    color: Some(theme.text_muted),
+                    thickness: px(1.0),
+                    wavy: false,
+                })
+            } else {
+                None
+            };
+
+            TextRun {
+                len: plan.len,
+                font,
+                color,
+                // Mention chips keep their explicit rounded quads. Markdown
+                // code uses the theme wash directly in the text run.
+                background_color: (!plan.mention
+                    && !decor.marker
+                    && (decor.code || decor.code_block))
+                    .then_some(theme.code_wash),
+                underline,
+                strikethrough: decor.strike.then_some(StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: Some(theme.text_muted),
+                }),
+            }
+        };
+        let base_runs: Vec<TextRun> = plans.iter().map(|plan| run_for(plan, false)).collect();
+        let runs: Vec<TextRun> = plans.iter().map(|plan| run_for(plan, true)).collect();
+
+        // Shape the undecorated projection separately. These metrics alone
+        // drive compact↔expanded hysteresis, so heading glyph size and bold/
+        // mono widths cannot cause decorate→measure→flip feedback.
+        let base_lines = window
             .text_system()
-            .shape_text(display, font_size, &runs, Some(width), None)
+            .shape_text(display.clone(), font_size, &base_runs, Some(width), None)
             .map(|small| small.into_vec())
             .unwrap_or_default();
+        let has_sized_heading = plans.iter().any(|plan| plan.decor.heading.is_some());
+        let lines = if has_sized_heading {
+            let display_text: &str = display.as_ref();
+            let mut shaped = Vec::new();
+            let mut line_start = 0;
+            for line in display_text.split('\n') {
+                let line_range = line_start..line_start + line.len();
+                let line_runs = text_runs_for_range(&runs, line_range.clone());
+                let line_size =
+                    heading_font_size(heading_for_range(&plans, line_range), f32::from(font_size));
+                if let Ok(line) = window.text_system().shape_text(
+                    SharedString::from(line.to_owned()),
+                    px(line_size),
+                    &line_runs,
+                    Some(width),
+                    None,
+                ) {
+                    shaped.extend(line);
+                }
+                line_start += line.len() + 1;
+            }
+            shaped
+        } else {
+            window
+                .text_system()
+                .shape_text(display.clone(), font_size, &runs, Some(width), None)
+                .map(|small| small.into_vec())
+                .unwrap_or_default()
+        };
 
         // Logical line byte offsets (each shaped line covers one \n-split line).
         let mut line_starts = Vec::with_capacity(lines.len());
@@ -2777,16 +2970,37 @@ impl ComposerInput {
             .iter()
             .map(|l| f32::from(l.size(self.line_height).height))
             .sum();
-        let max_line_width: f32 = lines
+        let decorated_width: f32 = lines
             .iter()
             .map(|l| f32::from(l.unwrapped_layout.width))
             .fold(0.0, f32::max);
+        let base_measurements = TextMeasurements {
+            width: base_lines
+                .iter()
+                .map(|line| f32::from(line.unwrapped_layout.width))
+                .fold(0.0, f32::max),
+            height: base_lines
+                .iter()
+                .map(|line| f32::from(line.size(self.line_height).height))
+                .sum(),
+        };
+        let flip_measurements = stable_flip_measurements(
+            base_measurements,
+            TextMeasurements {
+                width: decorated_width,
+                height: content_height,
+            },
+        );
 
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
         self.content_height = content_height.max(INPUT_LINE_HEIGHT);
-        self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
+        self.max_line_width = if is_placeholder {
+            0.0
+        } else {
+            flip_measurements.width
+        };
         self.last_width = f32::from(width);
         self.layout_epoch += 1;
         self.content_height
@@ -6520,6 +6734,17 @@ impl Render for Composer {
 mod tests {
     use super::*;
 
+    fn planned_run_at(runs: &[ComposerRunPlan], offset: usize) -> &ComposerRunPlan {
+        let mut at = 0;
+        for run in runs {
+            if offset < at + run.len {
+                return run;
+            }
+            at += run.len;
+        }
+        panic!("offset {offset} is covered by the exact run plan");
+    }
+
     #[test]
     fn paste_decision_enforces_media_precedence_and_long_text_threshold() {
         let long = "x".repeat(5_001);
@@ -7005,6 +7230,70 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn markdown_run_plan_exactly_covers_display_and_preserves_mentions() {
+        let raw = "## **See** [lib.rs](zeron-file:src/lib.rs)";
+        let projection = TextProjection::new(raw);
+        let runs = composer_run_plan(raw, &projection, None);
+
+        assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            projection.display.len()
+        );
+        let see = projection.display.find("See").unwrap();
+        let see_run = planned_run_at(&runs, see);
+        assert_eq!(see_run.decor.heading, Some(2));
+        assert!(see_run.decor.bold);
+
+        let mention = &projection.mentions[0].1;
+        let mention_run = planned_run_at(&runs, mention.start);
+        assert!(mention_run.mention);
+        assert_eq!(
+            mention_run.decor,
+            crate::markdown_decor::DecorStyle::default()
+        );
+        assert_eq!(raw, "## **See** [lib.rs](zeron-file:src/lib.rs)");
+    }
+
+    #[test]
+    fn markdown_run_plan_skips_marked_text_and_oversized_inputs() {
+        let raw = "**bold** and `code`";
+        let projection = TextProjection::new(raw);
+        let runs = composer_run_plan(raw, &projection, Some(&(2..6)));
+
+        let bold = projection.display.find("bold").unwrap();
+        let bold_run = planned_run_at(&runs, bold);
+        assert!(bold_run.marked);
+        assert_eq!(bold_run.decor, crate::markdown_decor::DecorStyle::default());
+        let code = projection.display.find("code").unwrap();
+        assert!(planned_run_at(&runs, code).decor.code);
+
+        let oversized = format!("**{}**", "x".repeat(crate::markdown_decor::MAX_DECOR_CHARS));
+        let projection = TextProjection::new(&oversized);
+        let runs = composer_run_plan(&oversized, &projection, None);
+        assert!(runs.iter().all(|run| run.decor == Default::default()));
+    }
+
+    #[test]
+    fn markdown_heading_paint_metrics_do_not_feed_back_into_flip() {
+        assert_eq!(heading_font_size(Some(1), INPUT_TEXT_SIZE), 19.0);
+        assert_eq!(heading_font_size(Some(2), INPUT_TEXT_SIZE), 16.0);
+        assert_eq!(heading_font_size(Some(3), INPUT_TEXT_SIZE), 15.0);
+        assert_eq!(heading_font_size(Some(6), INPUT_TEXT_SIZE), INPUT_TEXT_SIZE);
+
+        let base = TextMeasurements {
+            width: 290.0,
+            height: INPUT_LINE_HEIGHT,
+        };
+        let decorated = TextMeasurements {
+            width: 360.0,
+            height: 27.0,
+        };
+        let flip = stable_flip_measurements(base, decorated);
+        assert_eq!(flip, base);
+        assert!(!composer_flip(false, flip.width, 300.0, false, false));
     }
 
     #[test]
