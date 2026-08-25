@@ -289,7 +289,7 @@ fn apply_links(text: &str, claimed: &mut [bool], layers: &mut [DecorStyle]) {
             claimed[open..end].fill(true);
             apply_style(
                 layers,
-                open..end,
+                open + 1..middle,
                 DecorStyle {
                     link: true,
                     ..DecorStyle::default()
@@ -300,8 +300,7 @@ fn apply_links(text: &str, claimed: &mut [bool], layers: &mut [DecorStyle]) {
                 ..DecorStyle::default()
             };
             apply_style(layers, open..open + 1, marker_style);
-            apply_style(layers, middle..url_start, marker_style);
-            apply_style(layers, close..end, marker_style);
+            apply_style(layers, middle..end, marker_style);
         }
         cursor = end;
     }
@@ -398,7 +397,18 @@ fn apply_delimited(
         };
         let close = content_start + close_rel;
         let end = close + delimiter.len();
-        if close > content_start && !claimed[open..end].iter().any(|claimed| *claimed) {
+        let content = &text[content_start..close];
+        let valid_content = !content.contains(['\n', '\r'])
+            && content.chars().next().is_some_and(|ch| !ch.is_whitespace())
+            && content
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !ch.is_whitespace());
+        if !valid_content {
+            cursor = content_start;
+            continue;
+        }
+        if !claimed[open..end].iter().any(|claimed| *claimed) {
             claimed[open..end].fill(true);
             apply_style(layers, content_start..close, content_style);
             let marker_style = DecorStyle {
@@ -555,7 +565,9 @@ mod tests {
 
         assert!(style_for(text, &ranges, "code").code);
         assert!(style_for(text, &ranges, "label").link);
-        assert!(style_for(text, &ranges, "https://example.com").link);
+        let target = style_for(text, &ranges, "https://example.com");
+        assert!(target.marker);
+        assert!(!target.link);
         assert!(style_for(text, &ranges, "gone").strike);
         assert!(style_for(text, &ranges, "em").italic);
     }
@@ -567,5 +579,18 @@ mod tests {
 
         assert!(style.code);
         assert!(!style.bold);
+    }
+
+    #[test]
+    fn inline_delimiters_do_not_cross_lines_or_pad_content() {
+        for text in ["**a\nb**", "`a\nb`", "** a **", "~~ gone ~~", "* em *"] {
+            let ranges = scan(text);
+            assert!(
+                !ranges.iter().any(|range| {
+                    range.style.bold || range.style.code || range.style.strike || range.style.italic
+                }),
+                "invalid inline fixture was styled: {text:?}"
+            );
+        }
     }
 }

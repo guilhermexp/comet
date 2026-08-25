@@ -45,6 +45,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - A faixa de status mostra o **motivo** da falha quando a session row traz um (`view::run_failure_text`), truncado na própria linha; `"Run failed"` é só o fallback de quando não há motivo. A constante crua escondia mensagens acionáveis que a engine já tinha em mãos e journalava.
 - **Escape no composer é gesto de duas etapas**: um Esc mantém tudo que já fazia (fecha o popup de menção, volta uma página do painel de pergunta); dois Escs dentro de `DOUBLE_ESCAPE_WINDOW` param o run vivo — o botão Stop pelo teclado. O painel de pergunta **na primeira página não consome** o Esc: ele cobre o composer inteiro, inclusive o Stop, então essa é a única saída de uma pergunta cujo run travou.
 - **Paste no composer tem precedência e limites explícitos**: imagem → paths → texto longo (`> 5.000` caracteres) como `TextFile` staged → texto plano. O input limita-se a `10.000` caracteres e qualquer truncagem/rejeição usa `self.failure`; imagens e texto compartilham o mesmo rail de bytes, persistência por chat, restore e prompt `Attached files`. O parser do transcript aceita também o trailer legado `Attached images`.
+- **Markdown no composer é decoração paint-only**: `markdown_decor::scan` produz ranges por byte sem mutar o texto; o shaping projeta esses ranges sobre o display, mas mention chips e o marked range do IME têm prioridade. Markers permanecem visíveis, inputs acima de 10.000 caracteres pulam o scanner, e somente métricas do shaping base dirigem o flip compacto↔expandido.
 
 ## Work Guidance
 
@@ -60,8 +61,9 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 |---|---|---|
 | `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p comet-ui` |
 | `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p comet-ui` |
+| `src/markdown_decor.rs` + mapping em `src/composer.rs` | unit — scanner, exact-cover/projeção, IME/cap e estabilidade do flip | `cargo test -p zeron-ui markdown_decor && cargo test -p zeron-ui composer` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 
 ## Child DOX Index
 
-Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Adensar aqui quando alguma ganhar contrato próprio.
+Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Os módulos-raiz `composer.rs` e `markdown_decor.rs` também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.

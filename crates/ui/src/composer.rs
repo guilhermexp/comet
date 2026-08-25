@@ -1014,14 +1014,6 @@ struct ComposerRunPlan {
     marked: bool,
 }
 
-fn composer_run_plan(
-    raw: &str,
-    projection: &TextProjection,
-    marked: Option<&Range<usize>>,
-) -> Vec<ComposerRunPlan> {
-    composer_run_plan_enabled(raw, projection, marked, true)
-}
-
 fn composer_run_plan_enabled(
     raw: &str,
     projection: &TextProjection,
@@ -1117,6 +1109,21 @@ fn heading_for_range(plans: &[ComposerRunPlan], range: Range<usize>) -> Option<u
         }
     }
     heading
+}
+
+fn heading_font_size_for_range(plans: &[ComposerRunPlan], range: Range<usize>, base: f32) -> f32 {
+    let mut at = 0;
+    for plan in plans {
+        let end = at + plan.len;
+        if at < range.end && end > range.start && (plan.mention || plan.marked) {
+            return base;
+        }
+        at = end;
+        if at >= range.end {
+            break;
+        }
+    }
+    heading_font_size(heading_for_range(plans, range), base)
 }
 
 fn text_runs_for_range(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
@@ -2934,7 +2941,7 @@ impl ComposerInput {
                 let line_range = line_start..line_start + line.len();
                 let line_runs = text_runs_for_range(&runs, line_range.clone());
                 let line_size =
-                    heading_font_size(heading_for_range(&plans, line_range), f32::from(font_size));
+                    heading_font_size_for_range(&plans, line_range, f32::from(font_size));
                 if let Ok(line) = window.text_system().shape_text(
                     SharedString::from(line.to_owned()),
                     px(line_size),
@@ -3530,6 +3537,19 @@ impl gpui::Element for ComposerTextElement {
         });
 
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            let mut y = bounds.top() - px(scroll);
+            for line in &lines {
+                let height = line.size(line_height).height;
+                let _ = line.paint_background(
+                    point(bounds.left(), y),
+                    line_height,
+                    gpui::TextAlign::Left,
+                    Some(bounds),
+                    window,
+                    cx,
+                );
+                y += height;
+            }
             for quad in prepaint.mention_quads.drain(..) {
                 window.paint_quad(quad);
             }
@@ -7236,7 +7256,7 @@ mod tests {
     fn markdown_run_plan_exactly_covers_display_and_preserves_mentions() {
         let raw = "## **See** [lib.rs](zeron-file:src/lib.rs)";
         let projection = TextProjection::new(raw);
-        let runs = composer_run_plan(raw, &projection, None);
+        let runs = composer_run_plan_enabled(raw, &projection, None, true);
 
         assert_eq!(
             runs.iter().map(|run| run.len).sum::<usize>(),
@@ -7261,7 +7281,7 @@ mod tests {
     fn markdown_run_plan_skips_marked_text_and_oversized_inputs() {
         let raw = "**bold** and `code`";
         let projection = TextProjection::new(raw);
-        let runs = composer_run_plan(raw, &projection, Some(&(2..6)));
+        let runs = composer_run_plan_enabled(raw, &projection, Some(&(2..6)), true);
 
         let bold = projection.display.find("bold").unwrap();
         let bold_run = planned_run_at(&runs, bold);
@@ -7272,7 +7292,7 @@ mod tests {
 
         let oversized = format!("**{}**", "x".repeat(crate::markdown_decor::MAX_DECOR_CHARS));
         let projection = TextProjection::new(&oversized);
-        let runs = composer_run_plan(&oversized, &projection, None);
+        let runs = composer_run_plan_enabled(&oversized, &projection, None, true);
         assert!(runs.iter().all(|run| run.decor == Default::default()));
     }
 
@@ -7294,6 +7314,31 @@ mod tests {
         let flip = stable_flip_measurements(base, decorated);
         assert_eq!(flip, base);
         assert!(!composer_flip(false, flip.width, 300.0, false, false));
+    }
+
+    #[test]
+    fn markdown_heading_sizing_never_reaches_mentions_or_marked_text() {
+        let raw = "# [lib.rs](zeron-file:src/lib.rs)";
+        let projection = TextProjection::new(raw);
+        let plans = composer_run_plan_enabled(raw, &projection, None, true);
+        assert_eq!(
+            heading_font_size_for_range(&plans, 0..projection.display.len(), INPUT_TEXT_SIZE),
+            INPUT_TEXT_SIZE
+        );
+
+        let raw = "# heading";
+        let projection = TextProjection::new(raw);
+        let plans = composer_run_plan_enabled(raw, &projection, Some(&(2..5)), true);
+        assert_eq!(
+            heading_font_size_for_range(&plans, 0..projection.display.len(), INPUT_TEXT_SIZE),
+            INPUT_TEXT_SIZE
+        );
+
+        let plans = composer_run_plan_enabled(raw, &projection, None, true);
+        assert_eq!(
+            heading_font_size_for_range(&plans, 0..projection.display.len(), INPUT_TEXT_SIZE),
+            19.0
+        );
     }
 
     #[test]

@@ -37,9 +37,9 @@
 
 **must_haves:** text is never mutated by decoration; caret and mention chips are unaffected; markers stay visible; >10 000 chars skips decoration.
 
-- [ ] C9 New pure scanner `crates/ui/src/markdown_decor.rs`: block rules (fence, heading 1-6, hr, quote, list) + inline rules (code, link, bold, strike, italic with word-boundary guards), per-char claim, flatten to coalesced style ranges; unit tests incl. fence state across lines, nested heading+bold, `snake_case` non-italic, idempotence by construction. files: `crates/ui/src/markdown_decor.rs`, `crates/ui/src/lib.rs`. verify: `cargo test -p zeron-ui markdown_decor`.
-- [ ] C10 Map scanner ranges to `TextRun`s in `ComposerInput`'s shaping pass alongside the mention-chip runs, translating display-projection offsets the same way chip runs do; style table: faint markers, sized headings, mono+wash code, underline links, italic quote, tinted list markers. files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer` + visual check.
-- [ ] C11 Guard rails: decoration skips inputs over the cap and never runs inside the marked (IME) range; assert no layout feedback (decoration must not change measured width/height inputs to the flip hysteresis). files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer`.
+- [x] C9 New pure scanner `crates/ui/src/markdown_decor.rs`: block rules (fence, heading 1-6, hr, quote, list) + inline rules (code, link, bold, strike, italic with word-boundary guards), per-char claim, flatten to coalesced style ranges; unit tests incl. fence state across lines, nested heading+bold, `snake_case` non-italic, idempotence by construction. files: `crates/ui/src/markdown_decor.rs`, `crates/ui/src/lib.rs`. verify: `cargo test -p zeron-ui markdown_decor`.
+- [x] C10 Map scanner ranges to `TextRun`s in `ComposerInput`'s shaping pass alongside the mention-chip runs, translating display-projection offsets the same way chip runs do; style table: faint markers, sized headings, mono+wash code, underline links, italic quote, tinted list markers. files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer` + visual check.
+- [x] C11 Guard rails: decoration skips inputs over the cap and never runs inside the marked (IME) range; assert no layout feedback (decoration must not change measured width/height inputs to the flip hysteresis). files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer`.
 
 ## 5. URL chips in sent messages
 
