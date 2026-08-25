@@ -45,5 +45,5 @@
 
 **must_haves:** GitHub/YouTube URLs in user messages render as clickable chips; trailing punctuation is not swallowed; every other URL stays text.
 
-- [ ] C12 Pure URL segmentation (port `normalizeDetectedUrl` + host matching; GitHub label = `owner/repo` from path segments) with unit tests for trailing `.,;:!?)]`, bare-host, and non-matching URLs. files: `crates/ui/src/transcript.rs` (or a small `url_chips` module). verify: `cargo test -p zeron-ui`.
-- [ ] C13 Render the chips in user-message text (GitHub: wash + icon + owner/repo; YouTube: red wash + "YouTube"), click opens externally; assistant messages unchanged. files: `crates/ui/src/transcript.rs`. verify: `cargo test -p zeron-ui transcript` + visual check.
+- [x] C12 Pure URL segmentation (port `normalizeDetectedUrl` + host matching; GitHub label = `owner/repo` from path segments) with unit tests for trailing `.,;:!?)]`, bare-host, and non-matching URLs. files: `crates/ui/src/transcript.rs` (or a small `url_chips` module). verify: `cargo test -p zeron-ui`.
+- [x] C13 Render the chips in user-message text (GitHub: wash + icon + owner/repo; YouTube: red wash + "YouTube"), click opens externally; assistant messages unchanged. files: `crates/ui/src/transcript.rs`. verify: `cargo test -p zeron-ui transcript` + visual check.

@@ -21,7 +21,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 |---|---|
 | Build do app | `cargo build -p comet` |
 | Suite completa | `cargo test` |
-| Testes de uma crate | `cargo test -p comet-ui` |
+| Testes de uma crate | `cargo test -p zeron-ui` |
 | Formatação (obrigatória antes de merge do upstream) | `cargo fmt --all` |
 | Demo local offline (harness mock, seeded) | `scripts/dev-demo.sh` (`--slow` pra ver streaming) |
 | Smoke e2e | `scripts/e2e-smoke.sh` |
