@@ -144,13 +144,15 @@ use crate::{
             activity_tasks_from_entries, compact_activity_label, project_chat_workers,
         },
         context::detect_git_branch,
-        file_tree::{FileNode, flatten_visible_rows, scan_checkout},
+        file_tree::{FileNode, flatten_visible_rows, is_denied_relative, scan_checkout},
         files_view::{file_glyph, material_icon_path},
+        recency::{FileRecency, RECENCY_TICK, RecencyLevel},
         subagent_avatars::blobatar_subagent_avatar_path,
-        todos::{latest_todos, todo_status_layout},
+        todos::{latest_todos, todo_status_layout, todo_viewport_height_px},
         usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows, usage_provider_icon},
         widgets::{
-            ChatWorkersTab, ChatWorkersWidgetState, property_row, widget_card, workers_tab_presence,
+            CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
+            chat_workers_viewport_height_px, property_row, widget_card, workers_tab_presence,
         },
     },
     icons,
@@ -161,6 +163,10 @@ use crate::{
 
 const FILE_SCAN_LIMIT: usize = 5_000;
 const RENDERED_FILE_ROW_LIMIT: usize = 800;
+/// Debounce between a filesystem event and the silent rescan it triggers. The
+/// rescan keeps the current tree on screen: flipping to `Loading` on every
+/// save flashed the pane empty.
+const RECENCY_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextFileAccess {
@@ -228,6 +234,29 @@ fn subagent_row_avatar_path(row_id: &str) -> &'static str {
     blobatar_subagent_avatar_path(row_id)
 }
 
+/// Settled-success badge for activity and worker rows: a ringed check, not a
+/// bare glyph. The loose checkmark read as punctuation next to the row's
+/// avatar, while every other terminal state in the same column already
+/// carries a ring (`CLOSE_CIRCLE`) — the ring is what makes "done" land as a
+/// status instead of a tick.
+fn settled_success_badge(theme: &Theme) -> AnyElement {
+    div()
+        .size(px(15.0))
+        .flex_none()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.success)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            icons::icon(icons::CHECK)
+                .size(px(9.0))
+                .text_color(theme.success),
+        )
+        .into_any_element()
+}
+
 fn open_worker_event(chat_id: &str, worker: &ChatWorkerRow) -> DetailsSidebarEvent {
     DetailsSidebarEvent::OpenWorkerSession {
         chat_id: chat_id.to_owned(),
@@ -261,6 +290,12 @@ pub struct DetailsSidebar {
     resolved_branch: Option<String>,
     file_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
+    recency: FileRecency,
+    recency_root: Option<std::path::PathBuf>,
+    recency_watch: Option<Task<()>>,
+    recency_tick: Option<Task<()>>,
+    recency_ticking: bool,
+    recency_refresh: Option<Task<()>>,
     usage_task: Option<Task<()>>,
     _state_observe: Subscription,
     _workers_observe: Subscription,
@@ -315,6 +350,12 @@ impl DetailsSidebar {
             file_task: None,
             branch_task: None,
             usage_task: None,
+            recency: FileRecency::default(),
+            recency_root: None,
+            recency_watch: None,
+            recency_tick: None,
+            recency_ticking: false,
+            recency_refresh: None,
             _state_observe: state_observe,
             _workers_observe: workers_observe,
             _search_events: search_events,
@@ -370,6 +411,16 @@ impl DetailsSidebar {
     }
 
     fn reload_files(&mut self, cx: &mut Context<Self>) {
+        self.load_files(false, cx);
+    }
+
+    /// Rescan without flipping to `Loading`, so a watcher-driven refresh keeps
+    /// the current rows (and their recency tint) visible while it runs.
+    fn refresh_files(&mut self, cx: &mut Context<Self>) {
+        self.load_files(true, cx);
+    }
+
+    fn load_files(&mut self, silent: bool, cx: &mut Context<Self>) {
         let Some(context) = self.sidebar.context().cloned() else {
             self.files = LoadState::Idle;
             return;
@@ -384,19 +435,24 @@ impl DetailsSidebar {
                     "Files are unavailable for projects hosted on another device.".into(),
                 );
                 self.file_task = None;
+                self.stop_recency_watch();
                 cx.notify();
                 return;
             }
             ContextFileAccess::WaitingForDevice => {
                 self.files = LoadState::Error("Waiting for the project device connection…".into());
                 self.file_task = None;
+                self.stop_recency_watch();
                 cx.notify();
                 return;
             }
         }
+        self.ensure_recency_watch(context.cwd.clone(), cx);
         let show_hidden = self.sidebar.show_hidden();
         let query = self.search.read(cx).text().to_string();
-        self.files = LoadState::Loading;
+        if !silent {
+            self.files = LoadState::Loading;
+        }
         self.file_task = Some(cx.spawn(async move |this, cx| {
             let result =
                 cx.background_executor()
@@ -416,6 +472,151 @@ impl DetailsSidebar {
             });
         }));
         cx.notify();
+    }
+
+    fn stop_recency_watch(&mut self) {
+        self.recency_root = None;
+        self.recency_watch = None;
+        self.recency_refresh = None;
+        self.recency.clear();
+    }
+
+    /// Watches the pane's root for changes so rows can advertise recency. The
+    /// tree carries no timestamps, so the mark is the instant the event
+    /// arrived — never the file's mtime.
+    fn ensure_recency_watch(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.recency_root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        self.recency_root = Some(root.clone());
+        self.recency.clear();
+        self.recency_refresh = None;
+        self.recency_watch = Some(cx.spawn(async move |this, cx| {
+            let (events_tx, mut events_rx) =
+                futures::channel::mpsc::unbounded::<Vec<std::path::PathBuf>>();
+            let watch_root = root.clone();
+            // fsevents reports canonical paths (/private/var over /var), so the
+            // marks are stripped against the canonical root or nothing matches.
+            let canonical_root = cx
+                .background_executor()
+                .spawn(async move { watch_root.canonicalize().unwrap_or(watch_root) })
+                .await;
+            let watch_root = canonical_root.clone();
+            let watcher = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut watcher =
+                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                            let Ok(event) = event else {
+                                return;
+                            };
+                            if !matches!(
+                                event.kind,
+                                notify::EventKind::Create(_)
+                                    | notify::EventKind::Modify(_)
+                                    | notify::EventKind::Remove(_)
+                            ) {
+                                return;
+                            }
+                            let _ = events_tx.unbounded_send(event.paths);
+                        })
+                        .ok()?;
+                    notify::Watcher::watch(
+                        &mut watcher,
+                        &watch_root,
+                        notify::RecursiveMode::Recursive,
+                    )
+                    .ok()?;
+                    Some(watcher)
+                })
+                .await;
+            // The watcher lives exactly as long as this task: dropping the
+            // task (context switch, remote project) stops the watch.
+            let Some(_watcher) = watcher else {
+                return;
+            };
+            while let Some(paths) = futures::StreamExt::next(&mut events_rx).await {
+                let marks: Vec<String> = paths
+                    .iter()
+                    .filter_map(|path| {
+                        let relative = path.strip_prefix(&canonical_root).ok()?;
+                        if relative.as_os_str().is_empty() || is_denied_relative(relative) {
+                            return None;
+                        }
+                        Some(
+                            relative
+                                .components()
+                                .filter_map(|component| match component {
+                                    std::path::Component::Normal(value) => value.to_str(),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("/"),
+                        )
+                    })
+                    .filter(|relative| !relative.is_empty())
+                    .collect();
+                if marks.is_empty() {
+                    continue;
+                }
+                let alive = this
+                    .update(cx, |this, cx| {
+                        let now = std::time::Instant::now();
+                        for relative in marks {
+                            this.recency.mark(relative, now);
+                        }
+                        this.ensure_recency_tick(cx);
+                        this.schedule_recency_refresh(cx);
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Re-evaluates tiers and prunes expired marks while any mark is alive.
+    fn ensure_recency_tick(&mut self, cx: &mut Context<Self>) {
+        if self.recency_ticking {
+            return;
+        }
+        self.recency_ticking = true;
+        self.recency_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(RECENCY_TICK).await;
+                let keep_ticking = this.update(cx, |this, cx| {
+                    let pruned = this.recency.prune(std::time::Instant::now());
+                    let remaining = !this.recency.is_empty();
+                    // Notify on the emptying tick too, otherwise the last
+                    // faded row keeps a stale tint until an unrelated render.
+                    if pruned || remaining {
+                        cx.notify();
+                    }
+                    remaining
+                });
+                if !matches!(keep_ticking, Ok(true)) {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, _| {
+                this.recency_ticking = false;
+            });
+        }));
+    }
+
+    /// Coalesces a burst of filesystem events into one silent rescan, so a new
+    /// file appears as a row and not only as a mark.
+    fn schedule_recency_refresh(&mut self, cx: &mut Context<Self>) {
+        self.recency_refresh = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(RECENCY_REFRESH_DEBOUNCE)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.refresh_files(cx);
+            });
+        }));
     }
 
     fn load_usage(&mut self, cx: &mut Context<Self>) {
@@ -692,10 +893,7 @@ impl DetailsSidebar {
                 crate::loaders::mini_mono_spinner(key, 2.0, theme.accent, cx.entity_id(), cx)
                     .into_any_element()
             }
-            WorkflowTaskStatus::Completed => icons::icon(icons::CHECK)
-                .size(px(13.0))
-                .text_color(theme.success)
-                .into_any_element(),
+            WorkflowTaskStatus::Completed => settled_success_badge(theme),
             WorkflowTaskStatus::Failed => icons::icon(icons::CLOSE_CIRCLE)
                 .size(px(13.0))
                 .text_color(theme.danger)
@@ -740,10 +938,7 @@ impl DetailsSidebar {
                     .text_color(theme.text_muted)
                     .into_any_element()
             }
-            WorkerSemantic::Terminal => icons::icon(icons::CHECK)
-                .size(px(13.0))
-                .text_color(theme.success)
-                .into_any_element(),
+            WorkerSemantic::Terminal => settled_success_badge(theme),
             WorkerSemantic::Idle => div()
                 .size(px(7.0))
                 .rounded_full()
@@ -1025,7 +1220,7 @@ impl DetailsSidebar {
             }))
             .child(
                 img(avatar_path)
-                    .size(px(16.0))
+                    .size(px(20.0))
                     .object_fit(ObjectFit::Contain),
             )
             .child(
@@ -1045,7 +1240,7 @@ impl DetailsSidebar {
             .border_color(theme.border.opacity(0.45))
             .child(
                 div()
-                    .h(px(32.0))
+                    .h(px(CHAT_WORKERS_ROW_HEIGHT))
                     .px(px(8.0))
                     .flex()
                     .items_center()
@@ -1237,7 +1432,7 @@ impl DetailsSidebar {
             div().child(tabs).child(
                 div()
                     .id("chat-workers-body")
-                    .max_h(px(152.0))
+                    .max_h(px(chat_workers_viewport_height_px()))
                     .overflow_y_scroll()
                     .child(body),
             ),
@@ -1328,7 +1523,7 @@ impl DetailsSidebar {
             && let Some(todos) = latest_todos(&self.app_state.read(cx).transcript)
         {
             let status_layout = todo_status_layout();
-            let todo_body =
+            let todo_rows =
                 div().children(todos.items.into_iter().enumerate().map(|(index, todo)| {
                     div()
                         .h(px(status_layout.row_height_px))
@@ -1380,6 +1575,13 @@ impl DetailsSidebar {
                                 .child(format!("{}. {}", index + 1, todo.text)),
                         )
                 }));
+            let todo_body = div().child(
+                div()
+                    .id("todos-widget-body")
+                    .max_h(px(todo_viewport_height_px(status_layout)))
+                    .overflow_y_scroll()
+                    .child(todo_rows),
+            );
             content = content.child(widget_card(
                 "todos-widget",
                 icons::CHECKLIST,
@@ -1436,6 +1638,12 @@ impl DetailsSidebar {
             ProviderUsageState::NoUsage => "No usage yet".into(),
             ProviderUsageState::NotSignedIn => "Not signed in".into(),
         };
+        let reset_badge: Option<SharedString> = row
+            .weekly_reset_badge
+            .clone()
+            .map(SharedString::from)
+            .filter(|_| row.state == ProviderUsageState::Ready);
+        let reset_soon = reset_badge.is_some();
         let windows = row.windows.clone();
         let usage_lines = row.usage_lines.clone();
         div()
@@ -1476,12 +1684,40 @@ impl DetailsSidebar {
                             .child(row.label),
                     )
                     .child(
+                        // Badge + percent read as one right-aligned cluster, so
+                        // the countdown sits next to the number it qualifies.
                         div()
                             .flex_1()
-                            .text_right()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(summary),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .when_some(reset_badge, |cluster, badge| {
+                                cluster.child(
+                                    div()
+                                        .flex_none()
+                                        .rounded(px(4.0))
+                                        .px(px(4.0))
+                                        .py(px(2.0))
+                                        .bg(theme.warning.opacity(0.12))
+                                        .text_size(px(10.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.warning)
+                                        .child(badge),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(12.0))
+                                    .text_color(if reset_soon {
+                                        theme.warning
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child(summary),
+                            ),
                     )
                     .when(expandable, |header| {
                         header.child(
@@ -1780,6 +2016,18 @@ impl DetailsSidebar {
         let expanded = self.sidebar.expanded_paths().contains(&relative);
         let active = self.active_file.as_deref() == Some(relative.as_str());
         let material_icon = self.material_icon(file_glyph(&row.node, expanded));
+        // Tier is read at render against a wall clock; the 5s tick re-renders
+        // so a row decays without an animation replaying on every rescan.
+        let recency_color =
+            match self
+                .recency
+                .row_level(&relative, is_dir, std::time::Instant::now())
+            {
+                Some(RecencyLevel::Fresh) => theme.success,
+                Some(RecencyLevel::Recent) => theme.warning,
+                Some(RecencyLevel::Fading) => theme.warning_muted,
+                None => theme.text,
+            };
         div()
             .id(("details-file-row", index))
             .h(px(26.0))
@@ -1819,7 +2067,7 @@ impl DetailsSidebar {
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.0))
-                    .text_color(theme.text)
+                    .text_color(recency_color)
                     .child(row.node.name),
             )
             .when_some(active.then_some(absolute).flatten(), |row, absolute| {

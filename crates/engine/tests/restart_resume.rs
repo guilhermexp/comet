@@ -985,3 +985,190 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
     }
     core.shutdown().await;
 }
+
+/// A crash can land AFTER the journal closed with `Done` and BEFORE the doc
+/// fold settled — the journal append is synchronous, the doc fold and its
+/// snapshot are not. The closed journal made boot recovery skip the chat, so
+/// the assistant entry stayed `streaming` forever: an eternal "Thinking"
+/// spinner over a run that is long dead.
+#[tokio::test]
+async fn closed_journal_still_stamps_a_streaming_doc_aborted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-user-1".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "long task".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "partial…".into(),
+            }],
+            created_at: 2,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Streaming),
+            duration_ms: None,
+            continuation_of: None,
+        })
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+
+        // The journal DID close cleanly — this is the window the old
+        // journal-only gauge could not see.
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-crash".into(),
+                    assistant_message_id: "msg-assistant-1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some("hs-crash".into()),
+                },
+            )
+            .unwrap();
+    }
+
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            session_id: "hs-after-crash".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    let entries = entries_now(&core);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].status,
+        Some(MessageStatus::Aborted),
+        "an abandoned stream must settle even when its journal closed"
+    );
+    assert!(
+        entries[1].parts.iter().any(
+            |p| matches!(p, MessagePart::Error { message, .. } if message.contains("interrupted"))
+        ),
+        "the settled turn must say WHY it ended"
+    );
+}
+
+/// A question whose run died leaves an OPEN input part on an entry that may
+/// still read `streaming` (no restart happened, so no boot sweep settled it).
+/// The orphan fallback used to refuse those — the panel re-asked the same
+/// question forever, every answer bouncing off. With no live run there is no
+/// resolver to race, so the answer is honored as a new turn.
+#[tokio::test]
+async fn orphaned_question_on_a_streaming_entry_is_answerable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-orphan").unwrap();
+
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Input {
+                id: "in-req-1".into(),
+                request_id: "req-1".into(),
+                questions: vec![zeron_proto::UserInputQuestion {
+                    id: "q1".into(),
+                    header: "Pick".into(),
+                    question: "A or B?".into(),
+                    options: vec!["a".into(), "b".into()],
+                    multi_select: false,
+                }],
+                resolved: false,
+            }],
+            created_at: 1,
+            device_id: "dev-orphan".into(),
+            status: Some(MessageStatus::Streaming),
+            duration_ms: None,
+            continuation_of: None,
+        })
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+    }
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-orphan".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    pre_title(&core);
+
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::RespondInput {
+                request_id: "req-1".into(),
+                answers: vec![zeron_proto::UserInputAnswer {
+                    question_id: "q1".into(),
+                    labels: vec!["b".into()],
+                }],
+            },
+        )
+        .expect("queue answer");
+
+    wait_for(
+        || !requests.lock().unwrap().is_empty(),
+        "the orphaned answer to dispatch a turn",
+    )
+    .await;
+    assert!(
+        requests.lock().unwrap()[0].prompt.contains('b'),
+        "the answer must ride the resumed turn"
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Input { resolved: true, .. }))
+            })
+        },
+        "the question to close",
+    )
+    .await;
+}

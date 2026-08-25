@@ -233,7 +233,7 @@ fn main() -> anyhow::Result<()> {
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
                 org_id: std::env::var("ZERON_ORG_ID").ok(),
-                default_harness: zeron_ui::HarnessId::ClaudeCode,
+                default_harness: harness_from_env(),
             });
             Ok(())
         }
@@ -286,16 +286,37 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
 }
 
 /// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
-/// config row — `mock` powers the e2e smoke; default `claude-code`.
+/// config row — `mock` powers the e2e smoke; default `omp`.
 fn harness_from_env() -> zeron_engine::HarnessId {
-    match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
-        Ok("mock") => zeron_engine::HarnessId::Mock,
-        Ok("codex") => zeron_engine::HarnessId::Codex,
-        Ok("cursor") => zeron_engine::HarnessId::Cursor,
-        Ok("grok") => zeron_engine::HarnessId::Grok,
-        Ok("hermes") => zeron_engine::HarnessId::Hermes,
-        Ok("pi") => zeron_engine::HarnessId::Pi,
-        _ => zeron_engine::HarnessId::ClaudeCode,
+    let selected = std::env::var("ZERON_HARNESS").ok();
+    harness_from_value(selected.as_deref().map(str::trim))
+}
+
+fn harness_from_value(selected: Option<&str>) -> zeron_engine::HarnessId {
+    match selected {
+        Some("mock") => zeron_engine::HarnessId::Mock,
+        Some("claude-code") => zeron_engine::HarnessId::ClaudeCode,
+        Some("codex") => zeron_engine::HarnessId::Codex,
+        Some("cursor") => zeron_engine::HarnessId::Cursor,
+        Some("grok") => zeron_engine::HarnessId::Grok,
+        Some("hermes") => zeron_engine::HarnessId::Hermes,
+        Some("pi") => zeron_engine::HarnessId::Pi,
+        Some("omp") | None | Some("") => zeron_engine::HarnessId::Omp,
+        Some(_) => zeron_engine::HarnessId::Omp,
+    }
+}
+
+#[cfg(test)]
+mod harness_default_tests {
+    use super::harness_from_value;
+    use zeron_engine::HarnessId;
+
+    #[test]
+    fn omp_is_the_default_and_remains_explicitly_selectable() {
+        assert_eq!(harness_from_value(None), HarnessId::Omp);
+        assert_eq!(harness_from_value(Some("")), HarnessId::Omp);
+        assert_eq!(harness_from_value(Some("omp")), HarnessId::Omp);
+        assert_eq!(harness_from_value(Some("codex")), HarnessId::Codex);
     }
 }
 

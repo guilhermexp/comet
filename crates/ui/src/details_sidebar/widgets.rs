@@ -11,6 +11,19 @@ pub enum ChatWorkersTab {
     Workers,
 }
 
+/// Tallest row inside the Workers card (the subagent row; workflow rows are
+/// 30px). The viewport is sized off this one so six of the tallest rows always
+/// land whole.
+pub const CHAT_WORKERS_ROW_HEIGHT: f32 = 32.0;
+
+/// Rows the Workers card shows before its own body scrolls. The card used a
+/// flat 152px, which cut the fifth row mid-glyph.
+pub const CHAT_WORKERS_VISIBLE_ROWS: usize = 6;
+
+pub fn chat_workers_viewport_height_px() -> f32 {
+    CHAT_WORKERS_ROW_HEIGHT * CHAT_WORKERS_VISIBLE_ROWS as f32
+}
+
 pub fn auto_tab(workflows: usize, subagents: usize, workers: usize) -> ChatWorkersTab {
     if workflows > 0 {
         ChatWorkersTab::Workflows

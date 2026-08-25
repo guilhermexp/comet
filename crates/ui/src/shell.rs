@@ -6774,9 +6774,14 @@ impl Shell {
             // No label: the QuestionPanel right below IS the awaiting-input
             // surface — a strip caption above it was redundant (user request).
             Indicator::AwaitingInput => strip.into_any_element(),
+            // The harness's own reason when the run left one (an oversized
+            // attachment, a rejected provider); the generic label only when it
+            // did not. Truncated in place — the strip is one line tall.
             Indicator::Errored => strip
                 .text_color(theme.danger)
-                .child(SharedString::from("Run failed"))
+                .child(div().min_w_0().truncate().child(SharedString::from(
+                    zeron_proto::view::run_failure_text(state.session_for(&chat_id)).to_owned(),
+                )))
                 .into_any_element(),
             Indicator::None if sending => strip
                 .child(loaders::gradient_spinner(

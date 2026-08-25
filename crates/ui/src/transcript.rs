@@ -7478,6 +7478,14 @@ fn chip_header_row(
     } else {
         trail
     };
+    // A spawn chip carries the SAME blobatar face the Workers widget shows for
+    // this subagent: both seed off `subagent_ref` (the widget's row id IS that
+    // ref), so the sidebar row and the inline chip read as one agent instead
+    // of two anonymous robots.
+    let subagent_avatar = tool
+        .subagent_ref
+        .as_deref()
+        .map(crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path);
     div()
         .h(px(CHIP_HEADER_HEIGHT))
         .w_full()
@@ -7490,17 +7498,29 @@ fn chip_header_row(
         .text_size(px(12.0))
         .line_height(px(18.0))
         .child(
-            // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
-            // icon size-3).
+            // Icon tile (`rounded-[5px] bg-white/[0.08]`). A blobatar face gets a
+            // bigger tile than a tool glyph: at 18/14 the agent avatars read as
+            // specks next to the label. Tool chips keep the original 18px.
             div()
-                .size(px(18.0))
+                .size(px(if subagent_avatar.is_some() {
+                    22.0
+                } else {
+                    18.0
+                }))
                 .flex_none()
                 .rounded(px(5.0))
                 .bg(crate::theme::ink(0.08))
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(tool_icon(&tool.call, theme)),
+                .child(match subagent_avatar {
+                    Some(avatar) => img(avatar)
+                        .size(px(18.0))
+                        .object_fit(ObjectFit::Contain)
+                        .flex_none()
+                        .into_any_element(),
+                    None => tool_icon(&tool.call, theme),
+                }),
         )
         .child(
             div()

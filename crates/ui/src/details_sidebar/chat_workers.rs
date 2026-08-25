@@ -172,7 +172,6 @@ fn bounded_activity(tasks: Vec<WorkflowTaskUpdate>) -> Vec<WorkflowTaskUpdate> {
         }
         selected.push(task);
     }
-    selected.reverse();
     selected
 }
 
@@ -194,6 +193,14 @@ pub fn project_chat_workers(
             subagents.push(activity_row(task));
         }
     }
+    let mut sessions = sessions;
+    sessions.sort_unstable_by(|newer, older| {
+        older
+            .created_at_unix_ms
+            .cmp(&newer.created_at_unix_ms)
+            .then_with(|| older.updated_at_unix_ms.cmp(&newer.updated_at_unix_ms))
+            .then_with(|| older.id.cmp(&newer.id))
+    });
     let workers = sessions
         .into_iter()
         .map(|session| ChatWorkerRow {
@@ -620,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn document_order_controls_the_settled_bound_across_activity_sources() {
+    fn newest_document_rows_lead_the_settled_bound_across_activity_sources() {
         let mut entries = vec![SessionMessageEntry {
             id: "entry-spawn".into(),
             role: MessageRole::Assistant,
@@ -649,12 +656,12 @@ mod tests {
 
         assert!(snapshot.subagents.is_empty());
         assert_eq!(snapshot.workflows.len(), 100);
-        assert_eq!(snapshot.workflows[0].id, "workflow-0");
-        assert_eq!(snapshot.workflows[99].id, "workflow-99");
+        assert_eq!(snapshot.workflows[0].id, "workflow-99");
+        assert_eq!(snapshot.workflows[99].id, "workflow-0");
     }
 
     #[test]
-    fn active_rows_sort_first_without_reordering_peers() {
+    fn active_rows_stay_first_and_each_group_is_newest_first() {
         let mut settled_a = workflow_task("settled-a");
         let mut active_a = workflow_task("active-a");
         active_a.status = WorkflowTaskStatus::Running;
@@ -663,15 +670,17 @@ mod tests {
         active_b.status = WorkflowTaskStatus::Running;
         settled_a.status = WorkflowTaskStatus::Failed;
 
-        let snapshot = project_chat_workers(
-            vec![settled_a, active_a, settled_b, active_b],
-            vec![
-                worker_session("idle-a", "running", "idle"),
-                worker_session("working-a", "running", "working"),
-                worker_session("idle-b", "running", "idle"),
-                worker_session("blocked-a", "running", "blocked"),
-            ],
-        );
+        let mut workers = vec![
+            worker_session("idle-a", "running", "idle"),
+            worker_session("working-a", "running", "working"),
+            worker_session("idle-b", "running", "idle"),
+            worker_session("blocked-a", "running", "blocked"),
+        ];
+        for (index, worker) in workers.iter_mut().enumerate() {
+            worker.created_at_unix_ms = index as u64 + 1;
+        }
+        let snapshot =
+            project_chat_workers(vec![settled_a, active_a, settled_b, active_b], workers);
 
         assert_eq!(
             snapshot
@@ -679,7 +688,7 @@ mod tests {
                 .iter()
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["active-a", "active-b", "settled-a", "settled-b"]
+            vec!["active-b", "active-a", "settled-b", "settled-a"]
         );
         assert_eq!(
             snapshot
@@ -687,7 +696,7 @@ mod tests {
                 .iter()
                 .map(|row| row.session_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["working-a", "blocked-a", "idle-a", "idle-b"]
+            vec!["blocked-a", "working-a", "idle-b", "idle-a"]
         );
     }
 

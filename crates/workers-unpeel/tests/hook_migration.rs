@@ -51,6 +51,29 @@ fn verified_unreferenced_legacy_hook_root_is_deleted() {
 }
 
 #[test]
+fn legacy_hook_pruning_keeps_the_upstream_owned_lifecycle_extension() {
+    let temp = TempDir::new().unwrap();
+    let legacy = temp.path().join(".unpeel/hooks");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("notify-hook.sh"), "#!/bin/sh\n").unwrap();
+    let extension = legacy.join("pi-family-lifecycle-extension.js");
+    std::fs::write(&extension, "// lifecycle\n").unwrap();
+    let config = temp.path().join("settings.json");
+    std::fs::write(
+        &config,
+        r#"{"command":"/Users/me/.zeron/workers/hooks/notify-hook.sh"}"#,
+    )
+    .unwrap();
+
+    assert!(remove_legacy_hook_root_at(&legacy, &[config], false).unwrap());
+    assert!(!legacy.join("notify-hook.sh").exists());
+    assert!(
+        extension.exists(),
+        "pi-family launches with --extension pointing at this path"
+    );
+}
+
+#[test]
 fn stale_temporary_managed_hook_blocks_verification_even_without_legacy_root() {
     let temp = TempDir::new().unwrap();
     let legacy = temp.path().join(".unpeel/hooks");

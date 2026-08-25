@@ -10,6 +10,14 @@ pub struct TodoStatusLayout {
     pub glyph_px: f32,
 }
 
+/// The To-dos card shows ten complete rows before its own scrollbar takes over.
+/// The outer Details sidebar must not keep growing with an agent's task count.
+pub const TODO_VISIBLE_ROWS: usize = 10;
+
+pub fn todo_viewport_height_px(layout: TodoStatusLayout) -> f32 {
+    layout.row_height_px * TODO_VISIBLE_ROWS as f32
+}
+
 pub fn todo_status_layout() -> TodoStatusLayout {
     TodoStatusLayout {
         row_height_px: 36.0,
@@ -71,7 +79,7 @@ mod tests {
     use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
     use zeron_proto::{TodoItem, ToolCall};
 
-    use super::{latest_todos, todo_status_layout};
+    use super::{TODO_VISIBLE_ROWS, latest_todos, todo_status_layout, todo_viewport_height_px};
 
     fn todo_entry(id: &str, items: &[(&str, bool)]) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -141,5 +149,12 @@ mod tests {
         assert_eq!(layout.gap_px, 9.0);
         assert_eq!(layout.slot_px, 15.0);
         assert_eq!(layout.glyph_px, 9.0);
+    }
+
+    #[test]
+    fn todo_viewport_shows_at_most_ten_full_rows() {
+        let layout = todo_status_layout();
+        assert_eq!(TODO_VISIBLE_ROWS, 10);
+        assert_eq!(todo_viewport_height_px(layout), 360.0);
     }
 }

@@ -63,6 +63,60 @@ pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Ind
     }
 }
 
+/// Fallback label when a failed run carries no reason of its own.
+pub const RUN_FAILED_LABEL: &str = "Run failed";
+
+/// What the status strip shows for a failed run: the harness's own reason when
+/// the row carries one, else [`RUN_FAILED_LABEL`]. The engine already journals
+/// that reason, so a run that failed for a knowable cause — an oversized
+/// attachment, a rejected provider — must say so instead of "Run failed". Pure.
+pub fn run_failure_text(session: Option<&Session>) -> &str {
+    session
+        .and_then(|session| session.error.as_deref())
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(RUN_FAILED_LABEL)
+}
+
+#[cfg(test)]
+mod failure_text_tests {
+    use super::*;
+
+    fn errored(reason: Option<&str>) -> Session {
+        Session {
+            chat_id: "chat-1".into(),
+            device_id: "dev-1".into(),
+            status: SessionStatus::Errored,
+            started_at: None,
+            updated_at: Utc::now(),
+            context_usage: None,
+            error: reason.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_failed_run_shows_its_own_reason() {
+        let session = errored(Some(
+            "harness protocol error: OMP image attachments exceed the RPC frame budget",
+        ));
+        assert_eq!(
+            run_failure_text(Some(&session)),
+            "harness protocol error: OMP image attachments exceed the RPC frame budget"
+        );
+    }
+
+    #[test]
+    fn a_reasonless_failure_keeps_the_generic_label() {
+        assert_eq!(run_failure_text(Some(&errored(None))), RUN_FAILED_LABEL);
+        // Whitespace is not a reason: a blank string must not blank the strip.
+        assert_eq!(
+            run_failure_text(Some(&errored(Some("  \n")))),
+            RUN_FAILED_LABEL
+        );
+        assert_eq!(run_failure_text(None), RUN_FAILED_LABEL);
+    }
+}
+
 /// The full display status for a chat row / tab dot: live states win, then the
 /// synced seen marker decides completed-vs-idle. Staleness gating rides on
 /// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].

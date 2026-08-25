@@ -32,6 +32,10 @@ pub struct ProviderUsageRow {
     pub state: ProviderUsageState,
     pub weekly_summary: Option<String>,
     pub windows: Vec<UsageWindowRow>,
+    /// Collapsed-header badge for a weekly window about to roll over
+    /// (`Reset 12h 16m`), present only inside [`RESET_SOON_HOURS`]. Its presence
+    /// IS the emphasis gate: the header tints warning exactly when it is set.
+    pub weekly_reset_badge: Option<String>,
     pub usage_lines: Vec<AgentUsageLine>,
 }
 
@@ -45,6 +49,14 @@ pub fn usage_provider_icon(harness: HarnessId) -> (&'static str, bool) {
     }
 }
 
+/// How close a weekly reset has to be for the collapsed header to speak up.
+///
+/// Emphasis is deliberately about reset PROXIMITY, not about how much quota is
+/// left: a window at 5% remaining that rolls over next week is not urgent, and
+/// one at 95% remaining that rolls over tonight is the one worth reading. The
+/// remaining-percent thresholds keep driving the bar tones in the expanded body.
+pub const RESET_SOON_HOURS: i64 = 48;
+
 fn reset_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     let resets_at = resets_at?;
     let duration = resets_at.signed_duration_since(now);
@@ -53,15 +65,26 @@ fn reset_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<St
     }
     let days = duration.num_days();
     let hours = duration.num_hours() % 24;
+    let minutes = duration.num_minutes() % 60;
     Some(if days > 0 {
         format!("Resets in {days}d {hours}h")
+    } else if duration.num_hours() > 0 {
+        format!("Resets in {}h {minutes}m", duration.num_hours())
     } else {
-        format!(
-            "Resets in {}h {}m",
-            duration.num_hours(),
-            duration.num_minutes() % 60
-        )
+        format!("Resets in {minutes}m")
     })
+}
+
+/// [`reset_text`] restated as a badge (`Reset 12h 16m`) while the window is
+/// inside [`RESET_SOON_HOURS`]. Reusing one formatter keeps the badge and the
+/// expanded row from ever disagreeing about the same countdown.
+fn reset_badge_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
+    let resets_at = resets_at?;
+    let left = resets_at.signed_duration_since(now);
+    if left.num_seconds() <= 0 || left > chrono::Duration::hours(RESET_SOON_HOURS) {
+        return None;
+    }
+    Some(reset_text(Some(resets_at), now)?.replacen("Resets in ", "Reset ", 1))
 }
 
 fn compact_duration(duration: chrono::Duration) -> Option<String> {
@@ -161,6 +184,7 @@ pub fn provider_usage_rows(
                 state: ProviderUsageState::NotSignedIn,
                 weekly_summary: None,
                 windows: Vec::new(),
+                weekly_reset_badge: None,
                 usage_lines: Vec::new(),
             };
         };
@@ -196,6 +220,11 @@ pub fn provider_usage_rows(
             .iter()
             .find(|window| window.label.to_lowercase().contains("week"))
             .map(|window| format!("Weekly {}%", window.remaining_percent));
+        let weekly_reset_badge = account
+            .usage_windows
+            .iter()
+            .find(|window| window.label.to_lowercase().contains("week"))
+            .and_then(|window| reset_badge_text(window.resets_at, now));
         ProviderUsageRow {
             harness,
             label,
@@ -207,6 +236,7 @@ pub fn provider_usage_rows(
             },
             weekly_summary,
             windows,
+            weekly_reset_badge,
             usage_lines: account.usage_lines.clone(),
         }
     })
@@ -220,7 +250,9 @@ mod tests {
         AgentAccount, AgentAccountsSnapshot, AgentUsageLine, AgentUsageWindow, HarnessId,
     };
 
-    use super::{ProviderUsageState, derive_usage_pace, provider_usage_rows, usage_provider_icon};
+    use super::{
+        ProviderUsageState, derive_usage_pace, provider_usage_rows, reset_text, usage_provider_icon,
+    };
 
     #[test]
     fn weekly_pace_reports_deficit_and_projected_exhaustion() {
@@ -364,5 +396,50 @@ mod tests {
         assert_eq!(rows[0].state, ProviderUsageState::NotSignedIn);
         assert_eq!(rows[1].state, ProviderUsageState::NotSignedIn);
         assert_eq!(rows[2].state, ProviderUsageState::NotSignedIn);
+    }
+
+    #[test]
+    fn weekly_reset_badge_only_inside_the_emphasis_window() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        let badge = |reset| {
+            let snapshot = AgentAccountsSnapshot {
+                accounts: vec![account(
+                    "claude-active",
+                    HarnessId::ClaudeCode,
+                    true,
+                    vec![AgentUsageWindow {
+                        label: "Weekly".into(),
+                        used_fraction: 0.10,
+                        resets_at: Some(reset),
+                    }],
+                )],
+                warnings: Vec::new(),
+            };
+            provider_usage_rows(&snapshot, now)[0]
+                .weekly_reset_badge
+                .clone()
+        };
+
+        // Emphasis tracks RESET PROXIMITY, never how much quota is left: this
+        // window sits at 10% used and still earns the badge.
+        assert_eq!(
+            badge(now + chrono::Duration::minutes(12 * 60 + 16)).as_deref(),
+            Some("Reset 12h 16m")
+        );
+        assert_eq!(badge(now + chrono::Duration::hours(72)), None);
+        assert_eq!(badge(now - chrono::Duration::minutes(1)), None);
+    }
+
+    #[test]
+    fn reset_countdown_drops_an_empty_hours_segment() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        assert_eq!(
+            reset_text(Some(now + chrono::Duration::minutes(45)), now).as_deref(),
+            Some("Resets in 45m")
+        );
+        assert_eq!(
+            reset_text(Some(now + chrono::Duration::minutes(12 * 60 + 16)), now).as_deref(),
+            Some("Resets in 12h 16m")
+        );
     }
 }

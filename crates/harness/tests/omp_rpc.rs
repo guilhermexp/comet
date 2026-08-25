@@ -43,6 +43,7 @@ fn fake_launch(scenario: &str) -> OmpLaunch {
         executable: fixture_path(),
         cwd: std::env::current_dir().unwrap(),
         ephemeral: true,
+        system_prompt_append: None,
         env: Some(fake_env(scenario)),
         handshake_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(1),
@@ -293,30 +294,50 @@ fn normalizer_maps_text_reasoning_and_tools() {
             }),
         }]
     );
+    let edited = normalizer.push(json!({
+        "type": "tool_execution_end",
+        "toolCallId": "tool-2",
+        "toolName": "edit",
+        "result": {
+            "path": "src/main.rs",
+            "oldText": "old",
+            "newText": "new"
+        },
+        "isError": false
+    }));
+    let [
+        AgentEvent::ToolResult {
+            id,
+            is_error,
+            output,
+            diff,
+            execution,
+        },
+    ] = &edited[..]
+    else {
+        panic!("one tool result expected, got {edited:?}");
+    };
+    assert_eq!(id, "tool-2");
+    assert!(!is_error);
+    // `output` is the raw result object re-serialized, so its key ORDER follows
+    // whichever map serde_json was built with: sorted with the default BTreeMap,
+    // insertion order once anything in the graph turns on `preserve_order` (the
+    // workspace does, so the shipped app runs the second one). Compare the
+    // parsed value — the contract is the payload, never the byte order.
     assert_eq!(
-        normalizer.push(json!({
-            "type": "tool_execution_end",
-            "toolCallId": "tool-2",
-            "toolName": "edit",
-            "result": {
-                "path": "src/main.rs",
-                "oldText": "old",
-                "newText": "new"
-            },
-            "isError": false
-        })),
-        vec![AgentEvent::ToolResult {
-            id: "tool-2".into(),
-            is_error: false,
-            output: Some(r#"{"newText":"new","oldText":"old","path":"src/main.rs"}"#.into()),
-            diff: Some(ToolDiff {
-                path: "src/main.rs".into(),
-                old_text: Some("old".into()),
-                new_text: "new".into(),
-            }),
-            execution: None,
-        }]
+        serde_json::from_str::<serde_json::Value>(output.as_deref().expect("output"))
+            .expect("output is json"),
+        json!({ "path": "src/main.rs", "oldText": "old", "newText": "new" })
     );
+    assert_eq!(
+        diff.as_ref().expect("diff"),
+        &ToolDiff {
+            path: "src/main.rs".into(),
+            old_text: Some("old".into()),
+            new_text: "new".into(),
+        }
+    );
+    assert!(execution.is_none());
 }
 
 #[test]
@@ -459,6 +480,96 @@ async fn workers_host_tool_is_registered_only_when_enabled() {
 }
 
 #[tokio::test]
+async fn orchestrator_cwd_receives_the_omp_system_prompt() {
+    let root = tempfile::tempdir().unwrap();
+    let orchestrator = root.path().join(".orchestrator");
+    std::fs::create_dir(&orchestrator).unwrap();
+    let harness =
+        fake_harness("require-system-prompt").with_orchestrator_workspace(orchestrator.clone());
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut request = request("hello");
+    request.cwd = orchestrator.to_string_lossy().into_owned();
+    assert!(!request.enable_workers_mcp);
+
+    let events = harness
+        .run(request, controls)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(events.iter().all(Result::is_ok));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        )
+    }));
+}
+
+#[tokio::test]
+async fn every_omp_launch_scopes_skills_to_the_project() {
+    // The fixture exits non-zero unless `--config` names a readable overlay
+    // that turns off EVERY user-level skill root. Without it a chat inherits
+    // the personal skills mirrored under `~` (176 here) on top of the repo's
+    // own — one workspace's skills leaked into every other project.
+    let harness = fake_harness("require-skill-scope");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+
+    let events = harness
+        .run(request("hello"), controls)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(events.iter().all(Result::is_ok));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        )
+    }));
+}
+
+#[tokio::test]
+async fn non_orchestrator_cwd_does_not_receive_the_omp_system_prompt() {
+    let root = tempfile::tempdir().unwrap();
+    let orchestrator = root.path().join(".orchestrator");
+    let project = root.path().join("project");
+    std::fs::create_dir(&orchestrator).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    let harness = fake_harness("reject-system-prompt").with_orchestrator_workspace(orchestrator);
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut request = request("hello");
+    request.cwd = project.to_string_lossy().into_owned();
+
+    let events = harness
+        .run(request, controls)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(events.iter().all(Result::is_ok));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        )
+    }));
+}
+
+#[tokio::test]
 async fn workers_bridge_rejects_duplicate_and_excess_pending_calls() {
     let bridge = WorkersBridge::start(WorkersBridgeOptions {
         enabled: true,
@@ -592,7 +703,22 @@ async fn run_rejects_state_without_resume_identity() {
 }
 
 #[tokio::test]
-async fn run_rejects_image_that_cannot_fit_the_outbound_rpc_frame() {
+async fn a_dying_child_reports_its_own_stderr_not_a_bare_transport_error() {
+    let harness = fake_harness("stderr-crash");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let error = match harness.run(request("hello"), controls).await {
+        Ok(_) => panic!("a child that exits before ready must fail the run"),
+        Err(error) => error,
+    };
+    let error = error.to_string();
+    // The transport frame stays, but the child's own reason rides with it —
+    // "OMP RPC exited before ready" alone sent the user to the debug log.
+    assert!(error.contains("exited before ready"), "{error}");
+    assert!(error.contains("no credentials for anthropic"), "{error}");
+}
+
+#[tokio::test]
+async fn an_oversized_image_degrades_to_its_path_instead_of_failing_the_run() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("large.png");
     tokio::fs::write(&path, vec![0_u8; MAX_OUTBOUND_BYTES])
@@ -602,11 +728,14 @@ async fn run_rejects_image_that_cannot_fit_the_outbound_rpc_frame() {
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");
     let mut run_request = request("with image");
     run_request.attachments = vec![path.to_string_lossy().into_owned()];
-    let error = match harness.run(run_request, controls).await {
-        Ok(_) => panic!("oversized OMP image must be rejected"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("RPC frame budget"), "{error}");
+    // The prompt text already lists the local path and OMP reads files itself,
+    // so an attachment that cannot ride the frame is not a failed send: the
+    // turn is ACCEPTED without inline images (three screenshots used to make
+    // `run` return `Err` before the first token).
+    assert!(
+        harness.run(run_request, controls).await.is_ok(),
+        "an oversized attachment must degrade to its path, not reject the turn"
+    );
 }
 
 #[tokio::test]

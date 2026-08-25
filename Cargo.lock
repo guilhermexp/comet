@@ -9544,6 +9544,7 @@ dependencies = [
  "gpui_tokio",
  "ignore",
  "mermaid-rs-renderer",
+ "notify",
  "objc",
  "pulldown-cmark",
  "serde",

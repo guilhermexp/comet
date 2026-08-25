@@ -6,6 +6,72 @@ use std::{
 
 use ignore::WalkBuilder;
 
+/// Directories the tree never walks. The pane deliberately does NOT consult
+/// `.gitignore`, global excludes or `.ignore`: a workspace root is a live
+/// state directory as often as a checkout, and honoring its ignore rules hid
+/// the operational entries the pane exists to show (`~/.orchestrator` ignores
+/// `logs/`, `sessions/`, `data/`, `brain-source/`…). Build and dependency
+/// output is denied by NAME instead, so the scan budget still reaches source.
+const DENIED_DIRECTORIES: &[&str] = &[
+    ".git",
+    ".astro",
+    ".cache",
+    ".netlify",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".svelte-kit",
+    ".turbo",
+    ".venv",
+    ".vercel",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+    "release",
+    "target",
+    "venv",
+];
+
+/// Files that are pure filesystem noise on every platform.
+const DENIED_FILES: &[&str] = &[".DS_Store", "Thumbs.db"];
+
+/// A symlink keeps its own `file_type`, so a linked directory would land in
+/// the tree as a file row. Stat through the link to classify it as a folder;
+/// `follow_links(false)` still refuses to traverse it, matching the reference
+/// pane (linked folder, never expanded). A broken link stays a file.
+fn entry_is_dir(entry: &ignore::DirEntry) -> bool {
+    match entry.file_type() {
+        Some(kind) if kind.is_dir() => true,
+        Some(kind) if kind.is_symlink() => entry.path().is_dir(),
+        _ => false,
+    }
+}
+
+/// Whether a workspace-relative path lies inside denied structural output.
+/// The change watcher reuses the scan's rule so build directories cannot
+/// flood the recency map with paths the tree never renders.
+pub fn is_denied_relative(relative: &Path) -> bool {
+    let mut names = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .peekable();
+    while let Some(name) = names.next() {
+        if DENIED_DIRECTORIES.contains(&name) {
+            return true;
+        }
+        if names.peek().is_none() && DENIED_FILES.contains(&name) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileNode {
     pub name: String,
@@ -128,11 +194,22 @@ pub fn scan_checkout(
     let mut builder = WalkBuilder::new(&root);
     builder
         .hidden(!show_hidden)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .ignore(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
         .follow_links(false)
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git");
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            match entry.file_name().to_str() {
+                Some(name) if entry_is_dir(entry) => !DENIED_DIRECTORIES.contains(&name),
+                Some(name) => !DENIED_FILES.contains(&name),
+                None => true,
+            }
+        });
 
     let mut tree = Vec::new();
     let mut count = 0usize;
@@ -158,11 +235,7 @@ pub fn scan_checkout(
         if components.is_empty() {
             continue;
         }
-        insert_path(
-            &mut tree,
-            &components,
-            entry.file_type().is_some_and(|kind| kind.is_dir()),
-        );
+        insert_path(&mut tree, &components, entry_is_dir(&entry));
         count += 1;
     }
     sort_nodes(&mut tree);
@@ -300,9 +373,24 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        FileActionError, delete_entry, flatten_visible_rows, move_entry, rename_entry,
-        scan_checkout,
+        FileActionError, delete_entry, flatten_visible_rows, is_denied_relative, move_entry,
+        rename_entry, scan_checkout,
     };
+
+    #[test]
+    fn denied_relative_matches_the_scan_rule() {
+        use std::path::Path;
+
+        assert!(is_denied_relative(Path::new("target/debug/app")));
+        assert!(is_denied_relative(Path::new(
+            "web/node_modules/pkg/index.js"
+        )));
+        assert!(is_denied_relative(Path::new(".git/HEAD")));
+        assert!(is_denied_relative(Path::new("docs/.DS_Store")));
+        assert!(!is_denied_relative(Path::new("docs/targeting.md")));
+        assert!(!is_denied_relative(Path::new("logs/today.log")));
+        assert!(!is_denied_relative(Path::new("events.jsonl")));
+    }
 
     #[test]
     fn scan_sorts_directories_before_files_and_prunes_git() {
@@ -336,6 +424,82 @@ mod tests {
         assert_eq!(searched[0].name, "src");
         assert_eq!(searched[0].children[0].name, "deep");
         assert_eq!(searched[0].children[0].children[0].name, "needle.rs");
+    }
+
+    #[test]
+    fn workspace_state_survives_a_repo_gitignore() {
+        // A workspace root is a live state directory as often as a checkout:
+        // honoring its .gitignore hid exactly the operational entries the pane
+        // exists to show (~/.orchestrator ignores logs/, sessions/, data/…).
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(
+            root.path().join(".gitignore"),
+            "logs/\nevents.jsonl\nbrain-source/\n",
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("logs")).unwrap();
+        fs::write(root.path().join("logs/today.log"), "").unwrap();
+        fs::create_dir(root.path().join("brain-source")).unwrap();
+        fs::write(root.path().join("events.jsonl"), "").unwrap();
+
+        let tree = scan_checkout(root.path(), false, "", 100).unwrap();
+        let names: Vec<_> = tree.iter().map(|node| node.name.as_str()).collect();
+        assert!(names.contains(&"logs"), "{names:?}");
+        assert!(names.contains(&"brain-source"), "{names:?}");
+        assert!(names.contains(&"events.jsonl"), "{names:?}");
+        let logs = tree.iter().find(|node| node.name == "logs").unwrap();
+        assert_eq!(
+            logs.children
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["today.log"],
+        );
+    }
+
+    #[test]
+    fn structural_output_directories_are_denied_by_name() {
+        // Without git ignore rules the walk would otherwise descend into build
+        // and dependency output and burn the scan budget before reaching src.
+        let root = tempdir().unwrap();
+        for denied in ["node_modules", "target", "dist", "__pycache__"] {
+            fs::create_dir(root.path().join(denied)).unwrap();
+            fs::write(root.path().join(denied).join("noise"), "").unwrap();
+        }
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join(".DS_Store"), "").unwrap();
+
+        let tree = scan_checkout(root.path(), true, "", 1_000).unwrap();
+        let names: Vec<_> = tree.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(names, ["src"], "{names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_is_a_folder_and_is_not_traversed() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("real")).unwrap();
+        fs::write(root.path().join("real/inside.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("real/inside.txt"),
+            root.path().join("file-link"),
+        )
+        .unwrap();
+
+        let tree = scan_checkout(root.path(), false, "", 100).unwrap();
+        let linked = tree.iter().find(|node| node.name == "linked").unwrap();
+        assert!(
+            linked.is_dir,
+            "a symlinked directory must render as a folder"
+        );
+        assert!(
+            linked.children.is_empty(),
+            "a symlinked directory must not be traversed",
+        );
+        let file_link = tree.iter().find(|node| node.name == "file-link").unwrap();
+        assert!(!file_link.is_dir);
     }
 
     #[test]

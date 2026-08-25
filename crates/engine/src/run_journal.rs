@@ -322,23 +322,44 @@ impl RunJournal {
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
         let mut stale = Vec::new();
+        for (chat_id, path) in self.journal_files()? {
+            let last = read_lines(&path)?.into_iter().next_back();
+            match last {
+                Some((_, AgentEvent::Done { .. })) | None => {}
+                Some(_) => stale.push(chat_id),
+            }
+        }
+        stale.sort();
+        Ok(stale)
+    }
+
+    /// Every chat this device journaled here, `Done`-closed or not. A closed
+    /// journal does NOT prove the doc settled — the journal append is
+    /// synchronous while the doc fold lands later — so boot recovery sweeps
+    /// this wider set for abandoned `streaming` entries.
+    pub fn journaled_chats(&self) -> Result<Vec<String>, JournalError> {
+        let mut chats: Vec<String> = self
+            .journal_files()?
+            .into_iter()
+            .map(|(chat_id, _)| chat_id)
+            .collect();
+        chats.sort();
+        Ok(chats)
+    }
+
+    fn journal_files(&self) -> Result<Vec<(String, PathBuf)>, JournalError> {
+        let mut files = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
             let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let last = read_lines(&path)?.into_iter().next_back();
-            match last {
-                Some((_, AgentEvent::Done { .. })) | None => {}
-                Some(_) => stale.push(chat_id.to_string()),
-            }
+            files.push((chat_id.to_string(), path));
         }
-        stale.sort();
-        Ok(stale)
+        Ok(files)
     }
 
     /// Remove a chat's journal file entirely (tests / future compaction).

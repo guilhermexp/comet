@@ -2,6 +2,19 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Assets the pinned upstream still resolves under the legacy hook root.
+///
+/// `third_party/unpeel/runtimes/_shared/pi-family/adapter/setup.rs` both writes
+/// and reads the pi-family lifecycle extension at `<unpeel_home>/hooks`, while
+/// every Comet-managed hook script lives under `app_hooks_root()`. Deleting the
+/// legacy root wholesale therefore strips a live launch dependency: pi-family
+/// runtimes (`omp`) are started with `--extension <that path>`, and a missing
+/// file makes the runtime load no extension at all, so the session never emits
+/// Start/Stop/PermissionRequest and its activity stays pinned at `idle` while
+/// the PTY streams. Vendored code is read-only here, so the migration keeps
+/// what upstream still owns instead of patching the path.
+const UPSTREAM_OWNED_LEGACY_ASSETS: &[&str] = &["pi-family-lifecycle-extension.js"];
+
 pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
     static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     INSTALL_RESULT
@@ -105,6 +118,48 @@ pub fn remove_legacy_hook_root_at(
     }
     if has_live_sessions {
         return Ok(false);
+    }
+    prune_legacy_hook_root(legacy_root)
+}
+
+/// Delete every migrated asset in the legacy root, keeping the entries the
+/// pinned upstream still resolves there. The root itself is removed only once
+/// nothing upstream-owned is left, so a repeat migration is a no-op.
+fn prune_legacy_hook_root(legacy_root: &Path) -> Result<bool, String> {
+    let read_error = |error: std::io::Error| {
+        format!(
+            "Failed to read verified legacy hook root {}: {error}",
+            legacy_root.display()
+        )
+    };
+    let mut removed = false;
+    let mut retained = false;
+    for entry in std::fs::read_dir(legacy_root).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let path = entry.path();
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| UPSTREAM_OWNED_LEGACY_ASSETS.contains(&name))
+        {
+            retained = true;
+            continue;
+        }
+        let outcome = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        outcome.map_err(|error| {
+            format!(
+                "Failed to delete verified legacy hook asset {}: {error}",
+                path.display()
+            )
+        })?;
+        removed = true;
+    }
+    if retained {
+        return Ok(removed);
     }
     std::fs::remove_dir_all(legacy_root).map_err(|error| {
         format!(

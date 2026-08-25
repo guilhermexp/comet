@@ -193,6 +193,11 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsage>,
+    /// Why the last run ended in [`SessionStatus::Errored`] — the harness's own
+    /// message, mirrored onto the row for the status strip. Any non-error
+    /// transition clears it, so a stale reason never outlives its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +19,7 @@ pub struct OmpLaunch {
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub ephemeral: bool,
+    pub system_prompt_append: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub handshake_timeout: Duration,
     pub request_timeout: Duration,
@@ -27,6 +28,47 @@ pub struct OmpLaunch {
 enum WriteMessage {
     Frame(String),
     Close,
+}
+
+/// Stderr lines retained for the next transport failure. A dying OMP explains
+/// itself on stderr; without this the user only ever saw "OMP RPC exited before
+/// ready" while the child's own reason went to a debug log nobody opens.
+const STDERR_TAIL_LINES: usize = 4;
+
+/// Config overlay that keeps USER-level skill roots out of every OMP run:
+/// `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`, `~/.pi/skills`.
+/// A chat should see the skills of the repo it is standing in, not the personal
+/// catalog — and because those roots are mirrors of one workspace's own skills,
+/// they leaked that workspace's vocabulary into every other project (measured:
+/// 98 of 200 available commands in an unrelated repo). Project-level roots stay
+/// on, so a repo that ships skills keeps them.
+///
+/// Keys MUST be nested. OMP reads an overlay as `config.yml`-shaped settings and
+/// silently ignores a dotted `skills.enableClaudeUser` key.
+const SKILL_SCOPE_OVERLAY: &str = "skills:\n  enableClaudeUser: false\n  enableAgentsUser: false\n  enableCodexUser: false\n  enablePiUser: false\n";
+
+/// Path to the materialized [`SKILL_SCOPE_OVERLAY`], written on first need.
+///
+/// The content is constant, so an existing match is reused as-is. Otherwise the
+/// write goes through a staging file unique per call — pid AND a counter,
+/// because two launches in the SAME process would otherwise stage onto one path
+/// and the loser's rename fails with `ENOENT` — then renames into place, so a
+/// concurrent reader sees the whole old file or the whole new one, never a torn
+/// one.
+fn skill_scope_overlay() -> std::io::Result<PathBuf> {
+    static STAGING: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join("zeron-omp-skill-scope.yml");
+    if std::fs::read_to_string(&path).is_ok_and(|body| body == SKILL_SCOPE_OVERLAY) {
+        return Ok(path);
+    }
+    let staging = std::env::temp_dir().join(format!(
+        "zeron-omp-skill-scope.{}.{}.yml",
+        std::process::id(),
+        STAGING.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&staging, SKILL_SCOPE_OVERLAY)?;
+    std::fs::rename(&staging, &path)?;
+    Ok(path)
 }
 
 struct Pending {
@@ -41,6 +83,8 @@ struct Inner {
     request_timeout: Duration,
     fatal: Mutex<Option<String>>,
     closed: AtomicBool,
+    /// Most recent child stderr lines, oldest first (see [`STDERR_TAIL_LINES`]).
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 pub struct OmpProcess {
@@ -78,6 +122,25 @@ impl OmpProcess {
             ])
             .arg("--cwd")
             .arg(&launch.cwd);
+        // Losing skill scoping must never cost the turn: without the overlay the
+        // run proceeds with the personal catalog loaded.
+        match skill_scope_overlay() {
+            Ok(overlay) => {
+                command.arg("--config").arg(overlay);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zeron_harness::omp",
+                    error = %error,
+                    "skill scope overlay unavailable; user-level skills stay loaded"
+                );
+            }
+        }
+        if let Some(system_prompt_append) = launch.system_prompt_append.as_deref() {
+            command
+                .arg("--append-system-prompt")
+                .arg(system_prompt_append);
+        }
         if launch.ephemeral {
             command.arg("--no-session");
         }
@@ -130,7 +193,9 @@ impl OmpProcess {
             }
         });
 
+        let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stderr) = stderr {
+            let tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 loop {
@@ -139,6 +204,11 @@ impl OmpProcess {
                             let diagnostic = sanitize_diagnostic(&String::from_utf8_lossy(&line));
                             if !diagnostic.is_empty() {
                                 tracing::debug!(target: "zeron_harness::omp", "stderr: {diagnostic}");
+                                let mut tail = lock(&tail);
+                                if tail.len() == STDERR_TAIL_LINES {
+                                    tail.pop_front();
+                                }
+                                tail.push_back(diagnostic);
                             }
                         }
                         Ok(None) => break,
@@ -158,6 +228,7 @@ impl OmpProcess {
             request_timeout: launch.request_timeout,
             fatal: Mutex::new(None),
             closed: AtomicBool::new(false),
+            stderr_tail,
         });
         let (event_tx, event_rx) = mpsc::channel(256);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -177,11 +248,17 @@ impl OmpProcess {
             }
             Ok(Err(_)) => {
                 let _ = process.shutdown().await;
-                Err(HarnessError::Protocol("OMP RPC exited before ready".into()))
+                Err(HarnessError::Protocol(fatal_message(
+                    &process.inner,
+                    "OMP RPC exited before ready",
+                )))
             }
             Err(_) => {
                 let _ = process.shutdown().await;
-                Err(HarnessError::Protocol("OMP RPC handshake timed out".into()))
+                Err(HarnessError::Protocol(fatal_message(
+                    &process.inner,
+                    "OMP RPC handshake timed out",
+                )))
             }
         }
     }
@@ -297,6 +374,7 @@ async fn read_stdout(
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(message) => {
+                let message = fatal_message(&inner, &message);
                 fail(&inner, message.clone());
                 if let Some(ready) = ready_tx.take() {
                     let _ = ready.send(Err(message));
@@ -307,7 +385,7 @@ async fn read_stdout(
         let line = match std::str::from_utf8(&line) {
             Ok(line) => line,
             Err(_) => {
-                let message = "OMP RPC emitted non-UTF-8 JSONL".to_owned();
+                let message = fatal_message(&inner, "OMP RPC emitted non-UTF-8 JSONL");
                 fail(&inner, message.clone());
                 if let Some(ready) = ready_tx.take() {
                     let _ = ready.send(Err(message));
@@ -339,14 +417,17 @@ async fn read_stdout(
             }
         }
     }
-    let message = if ready_tx.is_some() {
-        "OMP RPC exited before ready"
-    } else {
-        "OMP RPC stdout closed"
-    };
-    fail(&inner, message.into());
+    let message = fatal_message(
+        &inner,
+        if ready_tx.is_some() {
+            "OMP RPC exited before ready"
+        } else {
+            "OMP RPC stdout closed"
+        },
+    );
+    fail(&inner, message.clone());
     if let Some(ready) = ready_tx.take() {
-        let _ = ready.send(Err(message.into()));
+        let _ = ready.send(Err(message));
     }
 }
 
@@ -418,6 +499,22 @@ fn route_response(inner: &Inner, frame: Value) {
         .send(Ok(frame.get("data").cloned().unwrap_or(Value::Null)));
 }
 
+/// A transport failure in the child's own words: the retained stderr tail is
+/// appended when there is one. "OMP RPC exited before ready" alone tells the
+/// user nothing; the reason the child printed does.
+fn fatal_message(inner: &Inner, message: &str) -> String {
+    let tail = lock(&inner.stderr_tail)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if tail.is_empty() {
+        message.to_owned()
+    } else {
+        format!("{message}: {tail}")
+    }
+}
+
 fn fail(inner: &Inner, message: String) {
     *lock(&inner.fatal) = Some(message.clone());
     fail_pending(inner, &message);
@@ -431,4 +528,47 @@ fn fail_pending(inner: &Inner, message: &str) {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_skill_scope_overlay_is_nested_yaml_and_idempotent() {
+        let first = skill_scope_overlay().unwrap();
+        let second = skill_scope_overlay().unwrap();
+        assert_eq!(first, second, "a stable path, not one file per launch");
+        let body = std::fs::read_to_string(&first).unwrap();
+        assert_eq!(body, SKILL_SCOPE_OVERLAY);
+
+        // Every USER-level skill root off, every PROJECT root untouched: a repo
+        // that ships skills keeps them.
+        for key in [
+            "enableClaudeUser",
+            "enableAgentsUser",
+            "enableCodexUser",
+            "enablePiUser",
+        ] {
+            assert!(body.contains(&format!("  {key}: false")), "{key} missing");
+        }
+        assert!(!body.contains("Project"), "project roots must stay enabled");
+
+        // The shape is load-bearing: OMP reads an overlay as config.yml-shaped
+        // settings and silently IGNORES a dotted key, which looks like it works.
+        assert!(body.starts_with("skills:\n"));
+        assert!(!body.contains("skills.enable"));
+
+        // No staging leftovers next to the overlay.
+        let stem = format!("zeron-omp-skill-scope.{}", std::process::id());
+        let leftovers = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&stem))
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "staging files must be renamed, not left behind"
+        );
+    }
 }

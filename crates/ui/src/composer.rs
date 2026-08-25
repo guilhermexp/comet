@@ -154,6 +154,15 @@ pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
 /// immediate so a narrowing panel never traps the controls in a compact row.
 pub const RESIZE_SETTLE_MS: u64 = 150;
 
+/// How long the first Escape stays armed for the Esc-Esc stop gesture.
+pub const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Does this Escape complete the Esc-Esc stop gesture? `armed` is when the
+/// previous Escape landed. Pure so the gesture is testable without a window.
+pub fn escape_stops_run(armed: Option<Instant>, now: Instant) -> bool {
+    armed.is_some_and(|first| now.duration_since(first) <= DOUBLE_ESCAPE_WINDOW)
+}
+
 /// The rendered layout follows the measured compact/expanded mode for both
 /// existing and new chats. `new_chat` remains explicit here so the parity
 /// contract cannot accidentally regress into forcing every new chat open.
@@ -3532,6 +3541,8 @@ pub struct Composer {
     /// Set on every session/route change: flips committed before this instant
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
+    /// First Escape of a pending double-tap (see [`DOUBLE_ESCAPE_MS`]).
+    escape_armed: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -3653,6 +3664,7 @@ impl Composer {
             last_rendered_height: 0.0,
             morph_clock: Instant::now(),
             route_snap_until: None,
+            escape_armed: None,
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -5265,6 +5277,26 @@ impl Composer {
         }));
     }
 
+    /// Escape twice inside [`DOUBLE_ESCAPE_MS`] stops the live run — the
+    /// keyboard twin of the Stop button. A single Escape keeps every meaning
+    /// it already had (dismiss the mention popup, step the question panel
+    /// back), which is why stopping needs the second tap.
+    fn on_escape_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
+            return;
+        }
+        if !self.run_live(cx) {
+            self.escape_armed = None; // nothing to stop — don't arm a stale tap
+            return;
+        }
+        let now = Instant::now();
+        if escape_stops_run(self.escape_armed.take(), now) {
+            self.interrupt(cx);
+        } else {
+            self.escape_armed = Some(now);
+        }
+    }
+
     fn interrupt(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -5433,6 +5465,13 @@ impl Composer {
                 cx.stop_propagation();
             }
         } else if key == "escape" && (!input_focused || input_empty) {
+            if self.wizard.as_ref().is_some_and(|wizard| wizard.page == 0) {
+                // Nothing to step back to. Let Escape bubble instead of
+                // eating it: the panel covers the composer (and its Stop
+                // button), so Esc-Esc is the only way out of a question
+                // whose run is stuck.
+                return;
+            }
             self.wizard_back(cx);
             cx.stop_propagation();
         }
@@ -5530,7 +5569,7 @@ impl Composer {
                 })
         });
 
-        div()
+        let panel = div()
             .id("question-panel")
             .role(gpui::Role::Group)
             .aria_label("Agent question")
@@ -5646,8 +5685,20 @@ impl Composer {
                             .when(!can_advance, |el| el.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
                     ),
-            )
-            .into_any_element()
+            );
+        // Frosted, like the composer pill this panel replaces: the fill is a 3%
+        // white wash, so without a backdrop blur the transcript reads straight
+        // through the option rows and the two texts interleave (user report).
+        // The blur — not the tint — is what makes it an overlay; `shadow_lg`
+        // above only covers platforms that have no blur. Radius must match
+        // `.rounded(26)`.
+        //
+        // Blur is the DIALOG sigma, not the pill's 16: this is a multi-row card
+        // standing over arbitrary transcript, which is the exact case where
+        // [`crate::frost::MENU_BLUR`] documents 16 as leaving backdrop detail
+        // ghosting through rows. The pill gets away with 16 because it is one
+        // line tall.
+        crate::frost::frosted(26.0, crate::frost::MENU_BLUR, panel).into_any_element()
     }
 
     fn render_send_button(
@@ -5905,6 +5956,12 @@ impl Render for Composer {
         };
         // Centered composer column (zeron `mx-auto w-full max-w-3xl`).
         let container = div()
+            // Bubbles up from the input (and the question panel) — gpui
+            // dispatches matched keybindings first, and the composer's
+            // `escape` binding propagates when it has no popup to close.
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_escape_key(event, cx)),
+            )
             .w_full()
             .max_w(px(COMPOSER_MAX_WIDTH))
             .mx_auto()
@@ -6268,6 +6325,20 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_second_escape_inside_the_window_stops_the_run() {
+        let now = Instant::now();
+        assert!(!escape_stops_run(None, now), "a first Escape never stops");
+        assert!(escape_stops_run(
+            Some(now - Duration::from_millis(300)),
+            now
+        ));
+        assert!(
+            !escape_stops_run(Some(now - Duration::from_millis(1_500)), now),
+            "a stale first tap must not arm the gesture"
+        );
+    }
 
     #[test]
     fn context_indicator_formats_neutral_and_reported_snapshots() {

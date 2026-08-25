@@ -136,6 +136,16 @@ fn apply_context_usage_to_session(
     true
 }
 
+/// Stamp (or clear) the reason a run failed on a session row. Only
+/// [`SessionStatus::Errored`] may carry one: every other transition clears it,
+/// so the strip can never show a stale reason from a run two turns back. Pure.
+fn apply_run_error_to_session(session: &mut Session, status: SessionStatus, error: Option<String>) {
+    session.error = match status {
+        SessionStatus::Errored => error.filter(|reason| !reason.trim().is_empty()),
+        _ => None,
+    };
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
@@ -698,11 +708,21 @@ impl SessionsEngine {
 
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
+        let mut swept: Vec<String> = Vec::new();
         for chat_id in stale {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }
-            let handle = self.doc_handle(&chat_id)?;
+            swept.push(chat_id.clone());
+            // One unreadable doc must not abandon every chat behind it in the
+            // sweep (a `?` here left the rest spinning forever).
+            let handle = match self.doc_handle(&chat_id) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "recovery skipped: doc unavailable");
+                    continue;
+                }
+            };
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
@@ -812,7 +832,48 @@ impl SessionsEngine {
                 }
             });
         }
+        recovered += self.sweep_abandoned_streams(&swept)?;
         Ok(recovered)
+    }
+
+    /// Second recovery pass: a journal closed with `Done` does NOT prove the
+    /// doc settled. [`Inner::publish`] appends to the journal synchronously
+    /// while the doc fold (and its debounced snapshot) land later, so a crash
+    /// in that window leaves the assistant entry `streaming` forever — an
+    /// eternal "Thinking" spinner, and a question the `RespondInput` orphan
+    /// fallback then refuses to answer. Stamp those entries `aborted` too.
+    /// `already_swept` are the chats the journal pass just handled.
+    fn sweep_abandoned_streams(&self, already_swept: &[String]) -> Result<usize, EngineError> {
+        const NOTE: &str = "Run interrupted by engine restart";
+        let mut recovered = 0usize;
+        for chat_id in self.inner.journal.journaled_chats()? {
+            if already_swept.contains(&chat_id) || lock(&self.inner.runs).contains_key(&chat_id) {
+                continue;
+            }
+            let Ok(handle) = self.doc_handle(&chat_id) else {
+                continue;
+            };
+            let stamped = match handle.mark_abandoned_streams(NOTE) {
+                Ok(stamped) => stamped.len(),
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "abandoned-stream sweep failed");
+                    continue;
+                }
+            };
+            if stamped == 0 {
+                continue;
+            }
+            self.set_status(&chat_id, SessionStatus::Idle, false);
+            tracing::info!(chat = %chat_id, stamped, "stamped abandoned streams on a closed journal");
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    /// Is a run for this chat live in THIS process right now? The orphan
+    /// fallbacks (a dead run's question, boot recovery) gate on it.
+    pub fn has_live_run(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
     }
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
@@ -892,6 +953,19 @@ impl Inner {
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
+        self.set_status_with_error(chat_id, status, fresh_start, None);
+    }
+
+    /// [`Self::set_status`] carrying the reason a run failed. One write: the
+    /// reason lands on the row in the same transition the strip reads, so the
+    /// UI never renders `Errored` with no cause and then a late correction.
+    fn set_status_with_error(
+        &self,
+        chat_id: &str,
+        status: SessionStatus,
+        fresh_start: bool,
+        error: Option<String>,
+    ) {
         let now = Utc::now();
         let session = {
             let mut statuses = lock(&self.statuses);
@@ -904,6 +978,7 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                     context_usage: None,
+                    error: None,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -926,6 +1001,7 @@ impl Inner {
                     entry.started_at = None;
                 }
             }
+            apply_run_error_to_session(entry, status, error);
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
             list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
@@ -1454,12 +1530,12 @@ async fn drive_run(
                 &AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
-                    error: Some(message),
+                    error: Some(message.clone()),
                     session_id: None,
                 },
             );
             inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
+            inner.set_status_with_error(&chat_id, SessionStatus::Errored, false, Some(message));
             return;
         }
     };
@@ -1564,7 +1640,7 @@ async fn drive_run(
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
 
-    let final_status = loop {
+    let (final_status, final_error) = loop {
         let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
@@ -1601,7 +1677,7 @@ async fn drive_run(
                 {
                     token.cancel();
                 }
-                break SessionStatus::Idle;
+                break (SessionStatus::Idle, None);
             }
             Some(event) = engine_rx.recv() => event,
             next = stream.next() => match next {
@@ -1611,7 +1687,7 @@ async fn drive_run(
                 // instead of stamping a completed session Errored.
                 Some(Err(err)) if idle_since.is_some() => {
                     tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
-                    break SessionStatus::Idle;
+                    break (SessionStatus::Idle, None);
                 }
                 Some(Err(err)) => AgentEvent::Done {
                     status: DoneStatus::Errored,
@@ -1629,7 +1705,7 @@ async fn drive_run(
                 // after its final Done — a clean end, not a crash (the turn
                 // was already finalized). Persistent adapters keep the
                 // stream open and never hit this.
-                None if idle_since.is_some() => break SessionStatus::Idle,
+                None if idle_since.is_some() => break (SessionStatus::Idle, None),
                 None => AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
@@ -2159,7 +2235,7 @@ async fn drive_run(
             // still in place and tested.
         }
 
-        if let AgentEvent::Done { status, .. } = &event {
+        if let AgentEvent::Done { status, error, .. } = &event {
             // A question still pending at turn end can never be legitimately
             // answered (its turn is over): drain the resolvers NOW, or a late
             // `respond_input` finds one, emits InputResolved, and un-parks
@@ -2234,8 +2310,8 @@ async fn drive_run(
                 continue;
             }
             break match status {
-                DoneStatus::Errored => SessionStatus::Errored,
-                _ => SessionStatus::Idle,
+                DoneStatus::Errored => (SessionStatus::Errored, error.clone()),
+                _ => (SessionStatus::Idle, None),
             };
         }
 
@@ -2274,7 +2350,7 @@ async fn drive_run(
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
+    inner.set_status_with_error(&chat_id, final_status, false, final_error);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
@@ -2318,8 +2394,9 @@ mod tests {
 
     use super::{
         HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine, SubagentSink,
-        apply_context_usage_to_session, finish_segment, resolve_pending_question,
-        segment_duration_ms, should_journal_event, subagent_doc_id, workflow_tasks_from_entries,
+        apply_context_usage_to_session, apply_run_error_to_session, finish_segment,
+        resolve_pending_question, segment_duration_ms, should_journal_event, subagent_doc_id,
+        workflow_tasks_from_entries,
     };
     use chrono::Utc;
     use tokio::sync::oneshot;
@@ -2540,6 +2617,7 @@ mod tests {
             started_at: None,
             updated_at: Utc::now(),
             context_usage: None,
+            error: None,
         };
         let usage = ContextUsage {
             tokens: 392_000,
@@ -2555,6 +2633,39 @@ mod tests {
         };
         assert!(apply_context_usage_to_session(&mut session, next));
         assert_eq!(session.context_usage, Some(next));
+    }
+
+    #[test]
+    fn only_an_errored_row_carries_a_reason_and_the_next_turn_clears_it() {
+        let mut session = Session {
+            chat_id: "chat-1".into(),
+            device_id: "device-1".into(),
+            status: SessionStatus::Idle,
+            started_at: None,
+            updated_at: Utc::now(),
+            context_usage: None,
+            error: None,
+        };
+        apply_run_error_to_session(
+            &mut session,
+            SessionStatus::Errored,
+            Some(
+                "harness protocol error: OMP image attachments exceed the RPC frame budget".into(),
+            ),
+        );
+        assert_eq!(
+            session.error.as_deref(),
+            Some("harness protocol error: OMP image attachments exceed the RPC frame budget")
+        );
+        // The next turn owns the row: a stale reason must never outlive it.
+        apply_run_error_to_session(&mut session, SessionStatus::Working, None);
+        assert_eq!(session.error, None);
+        // Errored with nothing to say stays empty rather than storing blanks.
+        apply_run_error_to_session(&mut session, SessionStatus::Errored, Some("  ".into()));
+        assert_eq!(session.error, None);
+        // A reason can never ride a non-error transition.
+        apply_run_error_to_session(&mut session, SessionStatus::Idle, Some("late".into()));
+        assert_eq!(session.error, None);
     }
 
     fn request() -> RunRequest {

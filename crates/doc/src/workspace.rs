@@ -724,6 +724,10 @@ impl From<RawSession> for Session {
                     })
                 })
                 .filter(|usage| usage.context_window > 0),
+            // Live-only: the failure reason rides `WatchSessions` for the
+            // status strip on the device that ran the turn. The synced row
+            // carries status alone — remote sidebars show a dot, not a cause.
+            error: None,
         }
     }
 }
@@ -796,6 +800,7 @@ mod tests {
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
             context_usage: None,
+            error: None,
         }
     }
 

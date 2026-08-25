@@ -3290,16 +3290,20 @@ impl DocHost {
                     return Ok((SessionCommandStatus::Applied, None));
                 }
                 // No live resolver. Only a request id the doc shows as an
-                // OPEN question on a SETTLED entry gets the orphan fallback:
-                // a mismatched or already-resolved id is a stale/buggy answer
-                // and must still reject, and a still-streaming entry's
-                // question belongs to the live run (a just-consumed resolver
-                // racing a second answer must not spawn a duplicate turn).
+                // OPEN question gets the orphan fallback: a mismatched or
+                // already-resolved id is a stale/buggy answer and must still
+                // reject. While a run IS live, a still-streaming entry's
+                // question belongs to it (a just-consumed resolver racing a
+                // second answer must not spawn a duplicate turn) — but with
+                // no live run there is nothing to race, and the entry may be
+                // a crash orphan still stamped `streaming`. Refusing those
+                // left the panel re-asking the same question forever.
+                let live_run = sessions.has_live_run(chat_id);
                 let questions = handle.doc.read_entries().ok().and_then(|entries| {
                     entries
                         .iter()
                         .rev()
-                        .filter(|e| e.status != Some(MessageStatus::Streaming))
+                        .filter(|e| !live_run || e.status != Some(MessageStatus::Streaming))
                         .find_map(|e| {
                             e.parts.iter().find_map(|p| match p {
                                 MessagePart::Input {
