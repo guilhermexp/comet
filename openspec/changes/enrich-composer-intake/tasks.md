@@ -8,7 +8,7 @@
 | F2 | C5-C6 | §2 | F1 | pending | — | Honest drop/add_paths | human-driven |
 | F3 | C7-C8 | §3 | F1 | pending | — | Staged chips row | human-driven |
 | F4 | C9-C11 | §4 | — | pending | — | Markdown decoration in the input | human-driven |
-| F5 | C12-C13 | §5 | — | pending | — | URL chips in sent messages | human-driven |
+| F5 | C12-C13 | §5 | — | human_needed | f58e6f73 | URL chips in sent messages | human-driven |
 
 ## 1. Paste discipline and the text-attachment rail
 
