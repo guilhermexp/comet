@@ -154,6 +154,13 @@ pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
 /// immediate so a narrowing panel never traps the controls in a compact row.
 pub const RESIZE_SETTLE_MS: u64 = 150;
 
+/// Slash-command popup geometry. The `/` menu is read as a LIST OF COMMANDS,
+/// not as a dense picker: it is wider and a size up from the mention popup so
+/// the name reads at a glance and the description has room to finish.
+pub const SLASH_POPUP_WIDTH: f32 = 520.0;
+pub const SLASH_NAME_SIZE: f32 = 15.0;
+pub const SLASH_DESCRIPTION_SIZE: f32 = 13.5;
+
 /// How long the first Escape stays armed for the Esc-Esc stop gesture.
 pub const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(1000);
 
@@ -4156,7 +4163,7 @@ impl Composer {
                 div()
                     .px(px(12.0))
                     .py(px(10.0))
-                    .text_size(px(12.0))
+                    .text_size(px(SLASH_DESCRIPTION_SIZE))
                     .text_color(theme.danger_muted)
                     .child(error),
             );
@@ -4423,9 +4430,12 @@ impl Composer {
             .and_then(|h| self.slash_cache.get(&h))
             .map(Vec::as_slice)
             .unwrap_or_default();
+        // Roomier than the mention popup on purpose: a command row is a NAME
+        // plus a sentence of description, and the compact menu geometry cut
+        // every description mid-word at the card's edge.
         let mut card = crate::popover::popover_card(theme)
-            .w(px(380.0))
-            .max_h(px(280.0))
+            .w(px(SLASH_POPUP_WIDTH))
+            .max_h(px(360.0))
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
         if self.slash.loading && commands.is_empty() {
@@ -4450,7 +4460,7 @@ impl Composer {
                 div()
                     .px(px(12.0))
                     .py(px(10.0))
-                    .text_size(px(12.0))
+                    .text_size(px(SLASH_DESCRIPTION_SIZE))
                     .text_color(theme.text_muted)
                     .child(if commands.is_empty() {
                         "This agent has no slash commands"
@@ -4477,6 +4487,8 @@ impl Composer {
                 card = card.child(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
                         .id(("slash-result", row_ix))
+                        .px(px(10.0))
+                        .py(px(9.0))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.slash.active = Some(row_ix);
                             this.accept_slash(cx);
@@ -4486,16 +4498,16 @@ impl Composer {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(8.0))
+                                .gap(px(10.0))
                                 .child(
                                     crate::icons::icon(crate::icons::COMMAND)
-                                        .size(px(14.0))
+                                        .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
                                 .child(
                                     div()
                                         .flex_none()
-                                        .text_size(px(12.5))
+                                        .text_size(px(SLASH_NAME_SIZE))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text)
                                         .child(name),
@@ -4506,7 +4518,7 @@ impl Composer {
                                         .flex_1()
                                         .overflow_hidden()
                                         .truncate()
-                                        .text_size(px(12.0))
+                                        .text_size(px(SLASH_DESCRIPTION_SIZE))
                                         .text_color(theme.text_muted)
                                         .child(description),
                                 ),
