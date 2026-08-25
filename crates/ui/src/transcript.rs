@@ -632,6 +632,9 @@ pub enum RowKind {
         /// once per entry change in [`rows_for_entry`] (rows are cached by
         /// fingerprint), never per frame. Empty for ordinary prompts.
         mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+        /// GitHub/YouTube chips over the projected display text. Like file
+        /// mentions, these are derived once while building the cached row.
+        url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
@@ -1233,9 +1236,18 @@ fn rows_for_entry_with_todo_history(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
-        let (text, mentions) = match crate::composer::sent_mention_display(&body) {
+        let (text, mut mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
+        };
+        let (text, url_chips) = match crate::url_chips::project_urls(&text) {
+            Some(projection) => {
+                for mention in &mut mentions {
+                    mention.range = projection.project_range(mention.range.clone());
+                }
+                (projection.text, projection.chips)
+            }
+            None => (text, Vec::new()),
         };
         return vec![Row {
             id: entry.id.clone().into(),
@@ -1244,6 +1256,7 @@ fn rows_for_entry_with_todo_history(
             kind: RowKind::User {
                 text: text.into(),
                 mentions: Arc::new(mentions),
+                url_chips: Arc::new(url_chips),
                 attachments: Arc::new(parsed.attachments),
                 badges: Arc::new(badges),
                 pending,
@@ -2295,6 +2308,7 @@ struct UserMessagePreview {
     row_id: SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+    url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2468,11 +2482,13 @@ fn user_message_preview(
     row_id: SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+    url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
 ) -> UserMessagePreview {
     UserMessagePreview {
         row_id,
         text,
         mentions,
+        url_chips,
     }
 }
 
@@ -5195,6 +5211,7 @@ impl Transcript {
             RowKind::User {
                 text,
                 mentions,
+                url_chips,
                 attachments,
                 badges,
                 pending,
@@ -5203,6 +5220,7 @@ impl Transcript {
                 let badges = badges.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
+                let url_chips = url_chips.clone();
                 let pending = *pending;
                 // Attachment thumbnails and context badges ride above the
                 // full-width user card, aligned to the transcript's leading
@@ -5239,8 +5257,12 @@ impl Transcript {
                         .unwrap_or(false);
                     let overflow_key = row.id.clone();
                     let weak = cx.weak_entity();
-                    let preview =
-                        user_message_preview(row.id.clone(), text.clone(), mentions.clone());
+                    let preview = user_message_preview(
+                        row.id.clone(),
+                        text.clone(),
+                        mentions.clone(),
+                        url_chips.clone(),
+                    );
                     let mut card = div()
                         .relative()
                         .min_w_0()
@@ -5258,7 +5280,7 @@ impl Transcript {
                         .line_height(px(22.0))
                         .text_color(theme.text)
                         .when(pending, |el| el.opacity(0.65))
-                        .child(user_bubble_text(&row.id, text, mentions, &theme))
+                        .child(user_bubble_text(&row.id, text, mentions, url_chips, &theme))
                         .on_children_prepainted(move |bounds, _, cx| {
                             let measured = bounds
                                 .first()
@@ -7005,6 +7027,7 @@ fn user_bubble_text(
     row_id: &SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+    url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
     theme: &Theme,
 ) -> AnyElement {
     // Split runs at chip boundaries (spans are in order): body text keeps the
@@ -7018,36 +7041,99 @@ fn user_bubble_text(
         underline: None,
         strikethrough: None,
     };
-    let chip_run = |len: usize| TextRun {
+    let chip_run = |len: usize, color| TextRun {
         len,
         font: gpui::font(theme.font_mono.clone()),
-        color: theme.code_text,
+        color,
         background_color: None,
         underline: None,
         strikethrough: None,
     };
-    let mut runs = Vec::with_capacity(mentions.len() * 2 + 1);
+    #[derive(Clone, Copy)]
+    enum InlineChipStyle {
+        Mention,
+        GitHub,
+        YouTube,
+    }
+    let mut spans = Vec::with_capacity(mentions.len() + url_chips.len());
+    spans.extend(
+        mentions
+            .iter()
+            .map(|span| (span.range.clone(), InlineChipStyle::Mention)),
+    );
+    spans.extend(url_chips.iter().map(|span| {
+        let style = match span.kind {
+            crate::url_chips::UrlChipKind::GitHub => InlineChipStyle::GitHub,
+            crate::url_chips::UrlChipKind::YouTube => InlineChipStyle::YouTube,
+        };
+        (span.range.clone(), style)
+    }));
+    spans.sort_unstable_by_key(|(range, _)| range.start);
+
+    let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
     let mut at = 0;
-    for span in mentions.iter() {
-        if at < span.range.start {
-            runs.push(body_run(span.range.start - at));
+    for (range, style) in spans {
+        if at < range.start {
+            runs.push(body_run(range.start - at));
         }
-        runs.push(chip_run(span.range.len()));
-        at = span.range.end;
+        let color = match style {
+            InlineChipStyle::Mention | InlineChipStyle::GitHub => theme.code_text,
+            InlineChipStyle::YouTube => theme.danger_muted,
+        };
+        runs.push(chip_run(range.len(), color));
+        at = range.end;
     }
     if at < text.len() {
         runs.push(body_run(text.len() - at));
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    let wash = theme.code_wash;
+    let text_element: AnyElement = if url_chips.is_empty() {
+        styled.into_any_element()
+    } else {
+        let (click_ranges, click_urls): (Vec<_>, Vec<_>) = url_chips
+            .iter()
+            .map(|chip| (chip.range.clone(), chip.url.clone()))
+            .unzip();
+        gpui::InteractiveText::new(SharedString::from(format!("{row_id}#url-chips")), styled)
+            .on_click(click_ranges, move |clicked_ix, _, cx| {
+                if let Some(url) = click_urls.get(clicked_ix) {
+                    cx.stop_propagation();
+                    cx.open_url(url);
+                }
+            })
+            .into_any_element()
+    };
+    let mention_wash = theme.code_wash;
+    let github_wash = theme.code_wash;
+    let youtube_wash = theme.danger.opacity(0.10);
+    let github_ink = theme.code_text;
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
+    let painted_url_chips = url_chips.clone();
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |_, _, window, cx| {
             for span in mentions.iter() {
                 for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(5.0),
+                        mention_wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
+            }
+            for chip in painted_url_chips.iter() {
+                let rects = render::range_rects(&layout, &chip.range, 4.0, 2.0);
+                let icon_rect = rects.first().cloned();
+                let wash = match chip.kind {
+                    crate::url_chips::UrlChipKind::GitHub => github_wash,
+                    crate::url_chips::UrlChipKind::YouTube => youtube_wash,
+                };
+                for rect in rects {
                     window.paint_quad(quad(
                         rect,
                         px(5.0),
@@ -7056,6 +7142,26 @@ fn user_bubble_text(
                         gpui::transparent_black(),
                         BorderStyle::default(),
                     ));
+                }
+                if chip.kind == crate::url_chips::UrlChipKind::GitHub
+                    && let Some(rect) = icon_rect
+                {
+                    let icon_size = px(11.0);
+                    let icon_bounds = Bounds::new(
+                        gpui::point(
+                            rect.left() + px(2.0),
+                            rect.top() + (rect.size.height - icon_size) / 2.0,
+                        ),
+                        gpui::size(icon_size, icon_size),
+                    );
+                    let _ = window.paint_svg(
+                        icon_bounds,
+                        SharedString::from(crate::icons::GIT_BRANCH),
+                        None,
+                        Default::default(),
+                        github_ink,
+                        cx,
+                    );
                 }
             }
             render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
@@ -7066,7 +7172,7 @@ fn user_bubble_text(
     div()
         .relative()
         .child(underlay)
-        .child(styled)
+        .child(text_element)
         .into_any_element()
 }
 
@@ -7092,6 +7198,7 @@ fn user_message_dialog(
         &SharedString::from(format!("{}#full", preview.row_id)),
         preview.text.clone(),
         preview.mentions.clone(),
+        preview.url_chips.clone(),
         theme,
     );
 
@@ -10246,10 +10353,68 @@ mod tests {
             path: "src/lib.rs".into(),
             is_dir: false,
         }]);
-        let preview = user_message_preview("row-1".into(), "src/lib".into(), mentions.clone());
+        let url_chips = Arc::new(Vec::new());
+        let preview = user_message_preview(
+            "row-1".into(),
+            "src/lib".into(),
+            mentions.clone(),
+            url_chips.clone(),
+        );
         assert_eq!(preview.row_id, "row-1");
         assert_eq!(preview.text, "src/lib");
         assert_eq!(preview.mentions, mentions);
+        assert_eq!(preview.url_chips, url_chips);
+    }
+
+    #[test]
+    fn user_rows_cache_url_chip_projection_but_assistant_rows_do_not() {
+        let raw = concat!(
+            "before [composer.rs](zeron-file:crates/ui/src/composer.rs) see ",
+            "https://github.com/rust-lang/rust. then ",
+            "[lib.rs](zeron-file:crates/ui/src/lib.rs)"
+        );
+        let user = SessionMessageEntry {
+            id: "u-url".into(),
+            role: MessageRole::User,
+            parts: vec![text_part("p1", raw)],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        };
+        let rows = rows_for_entry(&user, false, &mut parse);
+        let RowKind::User {
+            text,
+            mentions,
+            url_chips,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected user row")
+        };
+        assert_eq!(rows[0].id, "u-url");
+        assert_eq!(rows[0].version, (raw.len() as u64) << 1);
+        assert_eq!(mentions.len(), 2);
+        assert_eq!(
+            &text[mentions[0].range.clone()],
+            "\u{00A0}@composer.rs\u{00A0}"
+        );
+        assert_eq!(&text[mentions[1].range.clone()], "\u{00A0}@lib.rs\u{00A0}");
+        assert_eq!(url_chips.len(), 1);
+        assert_eq!(url_chips[0].url, "https://github.com/rust-lang/rust");
+        assert_eq!(&text[url_chips[0].range.clone()], "  rust-lang/rust");
+
+        let assistant = assistant(
+            "a-url",
+            MessageStatus::Complete,
+            vec![text_part("p1", "https://github.com/rust-lang/rust")],
+        );
+        let rows = rows_for_entry(&assistant, false, &mut parse);
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.kind, RowKind::User { .. }))
+        );
     }
 
     #[test]

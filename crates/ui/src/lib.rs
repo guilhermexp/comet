@@ -46,6 +46,7 @@ pub mod theme;
 pub mod tool_icons;
 pub mod transcript;
 mod turn_steps;
+mod url_chips;
 pub mod workers;
 
 use std::borrow::Cow;

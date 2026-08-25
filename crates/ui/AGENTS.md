@@ -18,6 +18,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Animação é camada de **paint**: `with_animation` sobre opacidade nunca altera layout. `prefers-reduced-motion` é honrado.
 - Altura de linha em code block = linhas × line-height, independente do highlight; o highlight roda time-sliced em background e entra como run de texto (paint-only).
 - Transcript é por **bloco**, não por mensagem: id estável `msgId#blockId`, turno vivo não splitado, re-split na persistência. Eco otimista compartilha o id cunhado no cliente pra persistência não piscar.
+- Chips GitHub/YouTube existem só em mensagens de usuário já enviadas: `url_chips.rs` segmenta e projeta o texto uma vez em `rows_for_entry`, e a row cacheia spans clicáveis. O paint só consome esses spans; input, assistente e outras URLs continuam texto, a pontuação final fica fora do chip e a mensagem persistida nunca muda.
 - Cards do usuário são sticky por turno: um clone paint-only do renderer existente ocupa o inset do runway e é empurrado pelo próximo user row. A geometria é per-chat, não altera altura da lista, não substitui o runway e não duplica o original quando ele já ocupa a posição.
 - O wrapper externo do sticky é transparente; a oclusão/blur e o bloqueio de mouse/hover subjacente ficam limitados ao card interno arredondado, enquanto wheel/touch continuam chegando ao transcript.
 - `TurnSteps` e a projeção de mudanças de arquivo mantêm ids estáveis; previews de Write/Edit renderizam somente o conteúdo limitado que veio do doc.
@@ -53,12 +54,14 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Verification
 
-- Comandos: `cargo test -p comet-ui` · `scripts/dev-demo.sh`
+- Comandos: `cargo test -p zeron-ui` · `scripts/dev-demo.sh`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p comet-ui` |
-| `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p comet-ui` |
+| `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p zeron-ui` |
+| `src/url_chips.rs` + projeção da row de usuário | unit | `cargo test -p zeron-ui url_chips` · `cargo test -p zeron-ui transcript` |
+| `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p zeron-ui` |
+| `src/transcript.rs` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 
 ## Child DOX Index
