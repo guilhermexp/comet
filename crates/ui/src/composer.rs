@@ -501,6 +501,95 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
+const LONG_PASTE_CHARS: usize = 5_000;
+const INPUT_CAP_CHARS: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteNotice {
+    Truncated,
+    Full,
+}
+
+impl PasteNotice {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Truncated => "Pasted text was truncated to the 10,000-character input limit.",
+            Self::Full => "The composer input is full (10,000 characters); nothing was pasted.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasteDecision {
+    Images,
+    Paths,
+    LongText(String),
+    PlainText {
+        text: String,
+        notice: Option<PasteNotice>,
+    },
+    Ignore,
+}
+
+fn decide_paste(
+    image_count: usize,
+    path_count: usize,
+    clipboard_text: Option<&str>,
+    input_chars: usize,
+    selected_chars: usize,
+) -> PasteDecision {
+    if image_count > 0 {
+        return PasteDecision::Images;
+    }
+    if path_count > 0 {
+        return PasteDecision::Paths;
+    }
+    let Some(text) = clipboard_text else {
+        return PasteDecision::Ignore;
+    };
+    let text_chars = text.chars().count();
+    if text_chars > LONG_PASTE_CHARS {
+        return PasteDecision::LongText(text.to_string());
+    }
+
+    let occupied = input_chars.saturating_sub(selected_chars.min(input_chars));
+    let available = INPUT_CAP_CHARS.saturating_sub(occupied);
+    let inserted: String = text.chars().take(available).collect();
+    let notice = if text_chars == 0 || text_chars <= available {
+        None
+    } else if available == 0 {
+        Some(PasteNotice::Full)
+    } else {
+        Some(PasteNotice::Truncated)
+    };
+    PasteDecision::PlainText {
+        text: inserted,
+        notice,
+    }
+}
+
+fn staged_pasted_text(index: u64, text: String) -> StagedAttachment {
+    let preview = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(50)
+        .collect();
+    attachments::stage_text_file(format!("pasted-{index}.txt"), text.into_bytes(), preview)
+}
+
+fn merge_restored_attachments(
+    restored: &mut Vec<StagedAttachment>,
+    fresh: impl IntoIterator<Item = StagedAttachment>,
+) {
+    for attachment in fresh {
+        if !restored.iter().any(|existing| existing.id == attachment.id) {
+            restored.push(attachment);
+        }
+    }
+}
+
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     match (run_live, has_text) {
         (false, _) => SendButtonMode::Send,
@@ -1367,6 +1456,12 @@ pub enum ComposerInputEvent {
     PastedPaths(Vec<PathBuf>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedLongText(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteNoticeEvent(pub PasteNotice);
+
 /// Multiline input entity: content + selection + IME marked text + measured
 /// layout (wrapped lines) for mouse mapping and auto-grow.
 pub struct ComposerInput {
@@ -2221,17 +2316,32 @@ impl ComposerInput {
                 ClipboardEntry::String(_) => {}
             }
         }
-        if !images.is_empty() {
-            cx.emit(ComposerInputEvent::PastedImages(images));
-            return;
-        }
-        if !paths.is_empty() {
-            cx.emit(ComposerInputEvent::PastedPaths(paths));
-            return;
-        }
-        if let Some(text) = item.text() {
-            // Multiline input: newlines are welcome (unlike the single-line example).
-            self.replace_text_in_range(None, &text, window, cx);
+        let text = item.text();
+        let replace_range = self.projection.normalize_range(
+            self.marked_range
+                .clone()
+                .unwrap_or_else(|| self.selected_range.clone()),
+        );
+        let selected_chars = self.content[replace_range].chars().count();
+        match decide_paste(
+            images.len(),
+            paths.len(),
+            text.as_deref(),
+            self.content.chars().count(),
+            selected_chars,
+        ) {
+            PasteDecision::Images => cx.emit(ComposerInputEvent::PastedImages(images)),
+            PasteDecision::Paths => cx.emit(ComposerInputEvent::PastedPaths(paths)),
+            PasteDecision::LongText(text) => cx.emit(PastedLongText(text)),
+            PasteDecision::PlainText { text, notice } => {
+                if !text.is_empty() {
+                    self.replace_text_in_range(None, &text, window, cx);
+                }
+                if let Some(notice) = notice {
+                    cx.emit(PasteNoticeEvent(notice));
+                }
+            }
+            PasteDecision::Ignore => {}
         }
     }
 
@@ -2704,6 +2814,8 @@ impl ComposerInput {
 }
 
 impl EventEmitter<ComposerInputEvent> for ComposerInput {}
+impl EventEmitter<PastedLongText> for ComposerInput {}
+impl EventEmitter<PasteNoticeEvent> for ComposerInput {}
 
 impl Focusable for ComposerInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -3496,6 +3608,8 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Monotonic display name source for pasted text files.
+    next_pasted_text: u64,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -3574,6 +3688,8 @@ pub struct Composer {
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
+    _long_paste_events: Subscription,
+    _paste_notice_events: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -3654,6 +3770,20 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
+        let long_paste_events =
+            cx.subscribe(&input, |this: &mut Self, _, event: &PastedLongText, cx| {
+                this.next_pasted_text += 1;
+                let staged = staged_pasted_text(this.next_pasted_text, event.0.clone());
+                this.add_staged(vec![staged], cx);
+            });
+        let paste_notice_events = cx.subscribe(
+            &input,
+            |this: &mut Self, _, event: &PasteNoticeEvent, cx| {
+                this.failure = Some(event.0.message().into());
+                this.failure_key = Some(this.current_key.clone());
+                cx.notify();
+            },
+        );
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
             state,
@@ -3661,6 +3791,7 @@ impl Composer {
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
+            next_pasted_text: 0,
             preview: None,
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
@@ -3697,6 +3828,8 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
+            _long_paste_events: long_paste_events,
+            _paste_notice_events: paste_notice_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -3717,10 +3850,11 @@ impl Composer {
                 .collect();
             if std::env::var("ZERON_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
+                && let Some(image) = first.image()
             {
                 composer.preview = Some(attachments::PreviewImage {
                     name: first.name.clone().into(),
-                    image: first.image.clone(),
+                    image,
                 });
                 composer.preview_focus_pending = true;
             }
@@ -3849,7 +3983,11 @@ impl Composer {
     /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
     /// revealed on hover, click opens the full-size preview.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let staged = self.staged();
+        let staged: Vec<_> = self
+            .staged()
+            .iter()
+            .filter_map(|attachment| attachment.image().map(|image| (attachment, image)))
+            .collect();
         if staged.is_empty() {
             return None;
         }
@@ -3860,11 +3998,11 @@ impl Composer {
             .gap(px(STRIP_GAP))
             .px(px(STRIP_PAD_X))
             .pt(px(STRIP_PAD_TOP));
-        for (ix, att) in staged.iter().enumerate() {
+        for (ix, (att, image)) in staged.into_iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
             let preview = attachments::PreviewImage {
                 name: att.name.clone().into(),
-                image: att.image.clone(),
+                image: image.clone(),
             };
             let remove_id = att.id.clone();
             strip = strip.child(
@@ -3886,7 +4024,7 @@ impl Composer {
                                 cx.notify();
                             }))
                             .child(
-                                img(att.image.clone())
+                                img(image)
                                     // EXPLICIT dims, not size_full: img layout
                                     // honors the image's intrinsic aspect
                                     // ratio over a percent height (gpui
@@ -4871,30 +5009,22 @@ impl Composer {
         // rewrite instead of blanking into a reload skeleton.
         if queued_flow {
             for (upload_id, att) in upload_ids.iter().zip(&staged) {
-                attachments::seed_attachment_alias(
-                    &device_id,
-                    upload_id,
-                    &att.name,
-                    att.image.clone(),
-                );
+                let Some(image) = att.image() else { continue };
+                attachments::seed_attachment_alias(&device_id, upload_id, &att.name, image.clone());
                 if let Some(local) = local_device_id.as_deref()
                     && local != device_id
                 {
-                    attachments::seed_attachment_alias(
-                        local,
-                        upload_id,
-                        &att.name,
-                        att.image.clone(),
-                    );
+                    attachments::seed_attachment_alias(local, upload_id, &att.name, image.clone());
                 }
             }
         }
         for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            let Some(image) = att.image() else { continue };
+            attachments::seed_attachment(&device_id, path, &att.name, image.clone());
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
             {
-                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+                attachments::seed_attachment(local, path, &att.name, image.clone());
             }
         }
 
@@ -5054,9 +5184,11 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
-                        if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                        if let Some(image) = att.image() {
+                            attachments::seed_attachment(&seed_device, path, &att.name, image.clone());
+                            if seed_device != device_id {
+                                attachments::seed_attachment(&device_id, path, &att.name, image);
+                            }
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -5322,11 +5454,8 @@ impl Composer {
                         let mut merged = staged.clone();
                         for key in [err_chat_id.clone(), restore_key.clone()] {
                             if let Some(slot) = composer.attachments.get_mut(&key) {
-                                let fresh: Vec<_> = slot
-                                    .drain(..)
-                                    .filter(|e| !merged.iter().any(|f| f.id == e.id))
-                                    .collect();
-                                merged.extend(fresh);
+                                let fresh: Vec<_> = slot.drain(..).collect();
+                                merge_restored_attachments(&mut merged, fresh);
                             }
                         }
                         composer.attachments.insert(restore_key, merged);
@@ -6149,7 +6278,11 @@ impl Render for Composer {
         // `morph_t`) animates. Steady state renders exactly the target.
         // Staged attachments add the wrap strip's height to the pill in BOTH
         // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
-        let staged_count = self.staged().len();
+        let staged_count = self
+            .staged()
+            .iter()
+            .filter(|attachment| attachment.image().is_some())
+            .count();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
@@ -6386,6 +6519,93 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_decision_enforces_media_precedence_and_long_text_threshold() {
+        let long = "x".repeat(5_001);
+        assert_eq!(decide_paste(1, 1, Some(&long), 0, 0), PasteDecision::Images);
+        assert_eq!(decide_paste(0, 1, Some(&long), 0, 0), PasteDecision::Paths);
+        assert_eq!(
+            decide_paste(0, 0, Some(&long), 0, 0),
+            PasteDecision::LongText(long)
+        );
+
+        let at_threshold = "y".repeat(5_000);
+        assert_eq!(
+            decide_paste(0, 0, Some(&at_threshold), 0, 0),
+            PasteDecision::PlainText {
+                text: at_threshold,
+                notice: None,
+            }
+        );
+    }
+
+    #[test]
+    fn paste_decision_caps_in_characters_and_reports_truncation_or_full_input() {
+        assert_eq!(
+            decide_paste(0, 0, Some("abcd"), 9_998, 0),
+            PasteDecision::PlainText {
+                text: "ab".into(),
+                notice: Some(PasteNotice::Truncated),
+            }
+        );
+        assert_eq!(
+            decide_paste(0, 0, Some("anything"), 10_000, 0),
+            PasteDecision::PlainText {
+                text: String::new(),
+                notice: Some(PasteNotice::Full),
+            }
+        );
+        assert_eq!(
+            decide_paste(0, 0, Some("éé"), 9_999, 0),
+            PasteDecision::PlainText {
+                text: "é".into(),
+                notice: Some(PasteNotice::Truncated),
+            },
+            "the cap counts characters without splitting UTF-8"
+        );
+        assert_eq!(
+            decide_paste(0, 0, Some("abc"), 10_000, 2),
+            PasteDecision::PlainText {
+                text: "ab".into(),
+                notice: Some(PasteNotice::Truncated),
+            },
+            "replacing a selection first frees its character capacity"
+        );
+    }
+
+    #[test]
+    fn pasted_text_stages_bytes_name_preview_and_survives_restore_merge() {
+        let first_line = format!("{}\nsecond line", "é".repeat(55));
+        let attachment = staged_pasted_text(7, first_line.clone());
+        assert_eq!(attachment.name, "pasted-7.txt");
+        assert_eq!(attachment.bytes(), first_line.as_bytes());
+        match &attachment.kind {
+            attachments::StagedAttachmentKind::TextFile { preview, .. } => {
+                assert_eq!(preview.chars().count(), 50);
+                assert_eq!(preview, &"é".repeat(50));
+            }
+            attachments::StagedAttachmentKind::Image => {
+                panic!("long pasted text must not become an image")
+            }
+        }
+
+        let duplicate = attachment.clone();
+        let fresh = staged_pasted_text(8, "fresh while send was in flight".into());
+        let mut restored = vec![attachment];
+        merge_restored_attachments(&mut restored, vec![duplicate, fresh]);
+        assert_eq!(
+            restored
+                .iter()
+                .map(|attachment| attachment.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pasted-7.txt", "pasted-8.txt"]
+        );
+        assert!(restored.iter().all(|attachment| matches!(
+            &attachment.kind,
+            attachments::StagedAttachmentKind::TextFile { .. }
+        )));
+    }
 
     #[test]
     fn the_slash_popup_spans_the_pill_at_every_column_width() {

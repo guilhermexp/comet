@@ -44,6 +44,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Rescan disparado por watcher é **silencioso** (`refresh_files`): manter `LoadState::Loading` piscava o pane vazio a cada save. Debounce de 500ms coalesce a rajada de eventos.
 - A faixa de status mostra o **motivo** da falha quando a session row traz um (`view::run_failure_text`), truncado na própria linha; `"Run failed"` é só o fallback de quando não há motivo. A constante crua escondia mensagens acionáveis que a engine já tinha em mãos e journalava.
 - **Escape no composer é gesto de duas etapas**: um Esc mantém tudo que já fazia (fecha o popup de menção, volta uma página do painel de pergunta); dois Escs dentro de `DOUBLE_ESCAPE_WINDOW` param o run vivo — o botão Stop pelo teclado. O painel de pergunta **na primeira página não consome** o Esc: ele cobre o composer inteiro, inclusive o Stop, então essa é a única saída de uma pergunta cujo run travou.
+- **Paste no composer tem precedência e limites explícitos**: imagem → paths → texto longo (`> 5.000` caracteres) como `TextFile` staged → texto plano. O input limita-se a `10.000` caracteres e qualquer truncagem/rejeição usa `self.failure`; imagens e texto compartilham o mesmo rail de bytes, persistência por chat, restore e prompt `Attached files`. O parser do transcript aceita também o trailer legado `Attached images`.
 
 ## Work Guidance
 

@@ -45,8 +45,9 @@ const MAX_READ_CHUNKS: usize = 1_000;
 // Text transport (message-attachments.ts)
 // ---------------------------------------------------------------------------
 
-/// The body used for image-only sends (`use-attachments.ts`).
-pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
+/// The body used for attachment-only sends (`use-attachments.ts`).
+pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached file(s).";
+const LEGACY_ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
 
 /// How attachments ride the prompt (use-attachments.ts `withAttachments`):
 /// plain local paths appended to the text — the files are staged on the device
@@ -63,9 +64,35 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         text
     };
     format!(
-        "{body}\n\nAttached images (local files — open them to view):\n{}",
+        "{body}\n\nAttached files (local files — open them to view):\n{}",
         refs.join("\n")
     )
+}
+
+#[cfg(test)]
+mod neutral_attachment_wording_tests {
+    use super::{parse_user_message_images, with_attachments};
+
+    #[test]
+    fn builder_is_neutral_and_parser_finds_new_and_legacy_trailers() {
+        let paths = vec!["/tmp/pasted-1.txt".to_string()];
+        let neutral = with_attachments("Review this", &paths);
+        assert_eq!(
+            neutral,
+            "Review this\n\nAttached files (local files — open them to view):\n- /tmp/pasted-1.txt"
+        );
+        let parsed = parse_user_message_images(&neutral);
+        assert_eq!(parsed.text, "Review this");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].path, "/tmp/pasted-1.txt");
+
+        let legacy =
+            "Review this\n\nAttached images (local files — open them to view):\n- /tmp/old.png";
+        let parsed = parse_user_message_images(legacy);
+        assert_eq!(parsed.text, "Review this");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].path, "/tmp/old.png");
+    }
 }
 
 /// An attachment ref parsed back out of a user message's text.
@@ -97,12 +124,13 @@ fn name_from_path(path: &str) -> String {
 }
 
 /// Find the refs trailer: a blank line, then a line starting (case-insensitive)
-/// with `Attached images (local files` and ending `):`. Returns
+/// with `Attached files (local files` or the legacy image-only wording and
+/// ending `):`. Returns
 /// `(body_end, refs_start)` byte offsets — the tolerant equivalent of zeron's
 /// `ATTACHED_IMAGES_RE`.
 fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
-    let needle = "\n\nattached images (local files";
+    let needle = "\n\nattached ";
     let mut from = 0usize;
     while let Some(rel) = lower[from..].find(needle) {
         let gap = from + rel;
@@ -112,7 +140,10 @@ fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
             .map(|p| line_start + p)
             .unwrap_or(content.len());
         let line = content[line_start..line_end].trim_end_matches('\r');
-        if line.ends_with("):") {
+        let lower_line = line.to_ascii_lowercase();
+        let supported = lower_line.starts_with("attached files (local files")
+            || lower_line.starts_with("attached images (local files");
+        if supported && line.ends_with("):") {
             let refs_start = (line_end + 1).min(content.len());
             return Some((gap, refs_start));
         }
@@ -151,7 +182,10 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         };
     }
     ParsedUserMessage {
-        text: if body.trim() == ATTACHMENT_ONLY_TEXT {
+        text: if matches!(
+            body.trim(),
+            ATTACHMENT_ONLY_TEXT | LEGACY_ATTACHMENT_ONLY_TEXT
+        ) {
             String::new()
         } else {
             body.to_string()
@@ -169,8 +203,8 @@ pub fn user_message_rail_text(content: &str) -> String {
     }
     match parsed.attachments.len() {
         0 => content.to_string(),
-        1 => "Attached image".to_string(),
-        n => format!("{n} attached images"),
+        1 => "Attached file".to_string(),
+        n => format!("{n} attached files"),
     }
 }
 
@@ -178,21 +212,55 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// An image staged in the composer, before upload. The raw bytes live inside
-/// the [`Image`] (gpui decodes them at paint; the same Arc feeds thumbnails,
-/// the lightbox, the upload, and the post-send cache seed).
+/// Content carried by the single staged-attachment rail.
+#[derive(Clone)]
+pub enum StagedAttachmentKind {
+    /// Raw bytes live in the compatibility `image` field below.
+    Image,
+    /// Plain bytes delivered like any other attachment; `preview` is the
+    /// first line truncated to 50 characters for the later staged chip.
+    TextFile { bytes: Arc<[u8]>, preview: String },
+}
+
+/// A file staged in the composer, before upload.
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
     /// File name with a type-matching extension (use-attachments.ts
     /// `ensureExtension` — agents sniff images by extension).
     pub name: String,
+    pub kind: StagedAttachmentKind,
+    /// Kept for image-only consumers outside the composer. Text files carry
+    /// an unpainted empty sentinel; `kind` is authoritative and composer
+    /// image paths must go through [`Self::image`].
     pub image: Arc<Image>,
 }
 
 impl StagedAttachment {
     pub fn bytes(&self) -> &[u8] {
-        &self.image.bytes
+        match &self.kind {
+            StagedAttachmentKind::Image => &self.image.bytes,
+            StagedAttachmentKind::TextFile { bytes, .. } => bytes,
+        }
+    }
+
+    pub fn image(&self) -> Option<Arc<Image>> {
+        match &self.kind {
+            StagedAttachmentKind::Image => Some(self.image.clone()),
+            StagedAttachmentKind::TextFile { .. } => None,
+        }
+    }
+}
+
+pub fn stage_text_file(name: String, bytes: Vec<u8>, preview: String) -> StagedAttachment {
+    StagedAttachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        kind: StagedAttachmentKind::TextFile {
+            bytes: Arc::from(bytes),
+            preview,
+        },
+        image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
     }
 }
 
@@ -247,6 +315,7 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     Ok(StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension(&display_name, format),
+        kind: StagedAttachmentKind::Image,
         image: Arc::new(Image::from_bytes(format, bytes)),
     })
 }
@@ -257,6 +326,7 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
     StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension("image", format),
+        kind: StagedAttachmentKind::Image,
         image: Arc::new(image),
     }
 }
@@ -871,11 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn rail_text_summarizes_image_only_sends() {
+    fn rail_text_summarizes_attachment_only_sends_neutrally() {
         let one = with_attachments("", &["/a/b.png".to_string()]);
-        assert_eq!(user_message_rail_text(&one), "Attached image");
+        assert_eq!(user_message_rail_text(&one), "Attached file");
         let two = with_attachments("", &["/a/b.png".to_string(), "/c/d.png".into()]);
-        assert_eq!(user_message_rail_text(&two), "2 attached images");
+        assert_eq!(user_message_rail_text(&two), "2 attached files");
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");

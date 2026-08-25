@@ -42,8 +42,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `comet-doc` | [`doc/AGENTS.md`](doc/AGENTS.md) | Schemas Loro (session/workspace) + mirror layer |
 | `comet-sync` | [`sync/AGENTS.md`](sync/AGENTS.md) | Cliente de room Loro + DocsStore |
 | `comet-harness` | [`harness/AGENTS.md`](harness/AGENTS.md) | Adaptadores Claude Code / Codex / mock |
-| `comet-engine` | [`engine/AGENTS.md`](engine/AGENTS.md) | Backend: sessões, doc host, repos, terminais, auth |
+| `comet-engine` | [`engine/AGENTS.md`](engine/AGENTS.md) | Backend: sessões, doc host, repos, terminais, uploads, auth |
 | `comet-rpc` | [`rpc/AGENTS.md`](rpc/AGENTS.md) | UiRpc/ControlRpc tipados sobre WS + transporte in-memory |
 | `comet-mcp` | [`mcp/AGENTS.md`](mcp/AGENTS.md) | Servidor MCP stdio com as worker tools |
-| `comet-ui` | [`ui/AGENTS.md`](ui/AGENTS.md) | App gpui: shell, transcript, composer, terminal, diff |
+| `comet-ui` | [`ui/AGENTS.md`](ui/AGENTS.md) | App gpui: shell, transcript, composer/intake, terminal, diff |
 | `comet-update` | — | Auto-update do binário (arquivo único, sem doc próprio) |
