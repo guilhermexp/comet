@@ -427,21 +427,28 @@ fn dispatch_action(
                     )
                 })?;
             }
-            if let Some(ref briefing) = briefing {
+            // The worker exists from here on: returning Err would orphan a
+            // live session the caller never learns the id of. Report the real
+            // delivery outcome instead so the caller can retry submission on
+            // the worker it now owns.
+            let mut briefing_error = None;
+            if let Some(briefing) = &briefing {
                 let track_episode = tracks_task_episode(parent_chat_id, true);
-                submit_initial_briefing(client, &session_id, briefing, track_episode).map_err(
-                    |error| {
-                        format!(
-                            "Worker {session_id} was created, but its initial briefing could not be submitted: {error}"
-                        )
-                    },
-                )?;
+                if let Err(error) =
+                    submit_initial_briefing(client, &session_id, briefing, track_episode)
+                {
+                    briefing_error = Some(error);
+                }
             }
-            Ok(json!({
+            let mut response = json!({
                 "session_id": session_id,
                 "launched": true,
-                "briefing_submitted": briefing.is_some()
-            }))
+                "briefing_submitted": briefing.is_some() && briefing_error.is_none()
+            });
+            if let Some(error) = briefing_error {
+                response["briefing_error"] = error.into();
+            }
+            Ok(response)
         }
         "list_workers" => {
             let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
@@ -608,18 +615,40 @@ fn capture_process_baseline(session_id: &str) -> Result<Vec<(u32, u64)>, String>
     }
 }
 
+/// How long a just-created worker gets to publish its manifest.
+const MANIFEST_WAIT: Duration = Duration::from_secs(5);
+/// How long the agent prompt gets to become ready once the manifest exists.
+const BRIEFING_READY_WAIT: Duration = Duration::from_secs(8);
+
+/// Poll until the session host has published this worker's manifest, and
+/// return the runtime that owns its prompt.
+fn wait_for_session_runtime(session_id: &str, wait: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(manifest) = unpeel_core::session_host::load_manifest(session_id) {
+            return Ok(
+                unpeel_core::integrations::command_head(&manifest.session.command).to_owned(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("worker {session_id} manifest is unavailable"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn submit_initial_briefing(
     client: &LocalWorkersClient,
     session_id: &str,
     briefing: &str,
     capture_baseline: bool,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let runtime = unpeel_core::session_host::load_manifest(session_id)
-        .map(|manifest| {
-            unpeel_core::integrations::command_head(&manifest.session.command).to_owned()
-        })
-        .ok_or_else(|| format!("worker {session_id} manifest is unavailable"))?;
+    // The session host publishes the manifest asynchronously, so a launch that
+    // just returned an id may still have nothing on disk. Wait for it, then
+    // start the readiness deadline: otherwise the whole budget can burn before
+    // the runtime even exists and the brief is silently never delivered.
+    let runtime = wait_for_session_runtime(session_id, MANIFEST_WAIT)?;
+    let deadline = Instant::now() + BRIEFING_READY_WAIT;
     let mut last_screen = String::new();
     let mut stable_since = Instant::now();
     loop {

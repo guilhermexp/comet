@@ -2128,6 +2128,24 @@ impl DocHost {
         transfers: Vec<crate::uploads::AttachmentTransfer>,
     ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
+        // Deterministic-id retries (worker notifications; a resend after a lost
+        // RPC reply) must reuse the entry they already queued. The processed
+        // ledger stops a twin from EXECUTING, but a twin still sits Pending in
+        // the doc forever: no drain can reach it and the dead-command sweep
+        // re-reports it on every pass (2026-08-25: ~2 800 twins of one
+        // worker-notify command, 13 MB chat doc, endless "consumed but never
+        // resolved" warnings). Re-drive delivery instead — the relay dedupes on
+        // the same id.
+        if let Some(existing) = handle
+            .doc
+            .read_commands()?
+            .into_iter()
+            .find(|entry| entry.id == id)
+        {
+            self.nudge_remote_host(chat_id);
+            self.spawn_command_delivery(chat_id, existing, transfers);
+            return Ok(id);
+        }
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
             turn_id: Some(m.id.clone()),

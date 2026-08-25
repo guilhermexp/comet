@@ -783,6 +783,22 @@ async fn deterministic_queue_command_id_is_returned_and_executes_once() {
         .unwrap();
     assert_eq!(first["commandId"], "worker-notify:worker-1:7:completed");
     assert_eq!(second["commandId"], "worker-notify:worker-1:7:completed");
+    // A retry under the same id must REUSE the queued entry: a second doc
+    // entry would sit Pending forever (the ledger blocks its execution) and
+    // the dead-command sweep would re-report it on every drain.
+    assert_eq!(
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.id == "worker-notify:worker-1:7:completed")
+            .count(),
+        1,
+        "deterministic id queues exactly one command entry"
+    );
 
     wait_for(
         || {

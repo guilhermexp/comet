@@ -14,6 +14,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 - **Executor é gated por ownership do chat**: só o device host de um chat executa comandos dele. Marcar como processado vem **antes** de executar, nunca depois.
 - Comando é entrada durável no session doc, não chamada direta — send/steer/interrupt/respondInput passam pelo ledger. Envio offline enfileira no doc.
+- Fila com id determinístico (`queue_command_with_id`, `QueueWorkerNotification`) é **idempotente no doc**: existindo entrada com aquele id, o retry reusa a entrada e só re-dirige a entrega. O ledger de processados barra apenas a re-execução — um gêmeo `pending` fica inalcançável no doc para sempre e o dead-command sweep o reporta em todo drain (2026-08-25: ~2 800 gêmeos de um `worker-notify`, doc de 13 MB, warning `command consumed but never resolved` em loop).
 - Só `AgentEvent` durável entra no run journal; `ToolCallPreview` limitado é broadcast/fold sem journal, e o `ToolCall` autoritativo é a única cópia completa do input de arquivo.
 - Fechamentos confiáveis de segmentos parent/subagent persistem `duration_ms` medido pela engine; recovery não deriva duração de session rows mutáveis.
 - Privacidade de input de arquivo: a projeção no session doc retém só o preview limitado de Write/Edit; o input não sanitizado permanece apenas no run journal local deste device. `FetchToolInput` limita o `ServerFrame` unary completo a 1 MiB e só lê após validar ownership local do chat.

@@ -648,14 +648,39 @@ impl Wizard {
         self.select(number - 1)
     }
 
-    pub fn set_typed(&mut self, text: String) {
+    fn set_typed(&mut self, text: String) {
         if let Some(slot) = self.typed.get_mut(self.page) {
             *slot = text;
         }
     }
 
+    /// Answer NOTHING and finish. The OMP bridge turns an answer whose label
+    /// set is empty into `{"cancelled": true, "timedOut": false}`
+    /// (`omp/mod.rs` `spawn_interactive_answer`) — precisely "the user declined
+    /// to choose" — so declining needs no separate wire verb, just empty
+    /// labels. Every page is cleared: skipping is about the whole request, not
+    /// one page, and a stale pick left behind would be sent as a real answer.
+    pub fn skip(&mut self) -> WizardStep {
+        for slot in &mut self.picked {
+            slot.clear();
+        }
+        for slot in &mut self.typed {
+            slot.clear();
+        }
+        WizardStep::Done(self.answers())
+    }
+
     /// Explicit submit / auto-advance landing.
-    pub fn advance(&mut self) -> WizardStep {
+    ///
+    /// `typed` is the free-text input's current content, taken as a PARAMETER
+    /// rather than trusting the caller to have stored it first. Three call
+    /// sites land here — the Submit button, Enter with the input unfocused, and
+    /// the single-select auto-advance timer — and only one of them remembered,
+    /// so a typed answer submitted with the BUTTON was dropped and the picked
+    /// "Other (type your own)" label went to the agent, which could only ask
+    /// again (user report). A parameter makes that class of miss unreachable.
+    pub fn advance(&mut self, typed: &str) -> WizardStep {
+        self.set_typed(typed.trim().to_string());
         if self.page + 1 < self.questions.len() {
             self.page += 1;
             WizardStep::Stay
@@ -4682,9 +4707,6 @@ impl Composer {
         )
     }
 
-    /// New-chat sends need a project and a runnable agent. If either selection
-    /// is missing, the send button dims and submit is a no-op. Existing chats
-    /// carry both in their persisted state, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
         if state.selected_chat.is_some() {
@@ -4708,11 +4730,8 @@ impl Composer {
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
         if self.wizard.is_some() {
-            // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
-            if let Some(w) = self.wizard.as_mut() {
-                w.set_typed(typed);
-            }
+            // Enter inside the panel's free-text input submits the page;
+            // `wizard_advance` reads the input itself.
             self.wizard_advance(cx);
             return;
         }
@@ -5422,10 +5441,13 @@ impl Composer {
     }
 
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
+        // Read the free text HERE, at the single choke point every path funnels
+        // through (Submit, Enter, the auto-advance timer, a number key).
+        let typed = self.input.read(cx).text();
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
-        match wizard.advance() {
+        match wizard.advance(&typed) {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
                 // Moving on: clear the shared free-text input for the next page.
@@ -5433,6 +5455,17 @@ impl Composer {
                 cx.notify();
             }
         }
+    }
+
+    /// Decline the whole question set — see [`Wizard::skip`].
+    fn wizard_skip(&mut self, cx: &mut Context<Self>) {
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        let WizardStep::Done(answers) = wizard.skip() else {
+            return;
+        };
+        self.wizard_finish(answers, cx);
     }
 
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
@@ -5731,14 +5764,31 @@ impl Composer {
                     .px(px(16.0))
                     .pb(px(16.0))
                     .pt(px(4.0))
-                    .child(if page > 0 {
-                        crate::popover::btn_ghost(&theme, "Back", "wizard-back")
-                            .id("wizard-back")
-                            .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
-                            .into_any_element()
-                    } else {
-                        gpui::Empty.into_any_element()
-                    })
+                    // Left cluster: Back (paged only) + Skip. Skip is ALWAYS
+                    // live — it is the only way out of a question the user does
+                    // not want to answer, and `can_advance` deliberately does
+                    // not gate it.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when(page > 0, |cluster| {
+                                cluster.child(
+                                    crate::popover::btn_ghost(&theme, "Back", "wizard-back")
+                                        .id("wizard-back")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.wizard_back(cx)),
+                                        ),
+                                )
+                            })
+                            .child(
+                                crate::popover::btn_ghost(&theme, "Skip", "wizard-skip")
+                                    .id("wizard-skip")
+                                    .on_click(cx.listener(|this, _, _, cx| this.wizard_skip(cx))),
+                            ),
+                    )
                     .child(
                         crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
                             .id("wizard-submit")
@@ -7096,10 +7146,10 @@ mod tests {
         assert_eq!(w.counter(), "1/2");
         assert_eq!(w.select(1), WizardStep::AutoAdvance);
         assert!(w.is_picked(1));
-        assert_eq!(w.advance(), WizardStep::Stay);
+        assert_eq!(w.advance(""), WizardStep::Stay);
         assert_eq!(w.counter(), "2/2");
         assert_eq!(w.select(0), WizardStep::AutoAdvance);
-        let WizardStep::Done(answers) = w.advance() else {
+        let WizardStep::Done(answers) = w.advance("") else {
             panic!("expected Done")
         };
         assert_eq!(answers.len(), 2);
@@ -7116,7 +7166,7 @@ mod tests {
         // Toggle off.
         assert_eq!(w.select(0), WizardStep::Stay);
         assert!(!w.is_picked(0));
-        let WizardStep::Done(answers) = w.advance() else {
+        let WizardStep::Done(answers) = w.advance("") else {
             panic!()
         };
         assert_eq!(answers[0].labels, vec!["c"]);
@@ -7142,14 +7192,13 @@ mod tests {
             ],
         );
         w.select(0);
-        w.advance();
+        w.advance("");
         assert_eq!(w.page, 1);
         assert!(w.back());
         assert_eq!(w.page, 0);
         assert!(!w.back(), "already at first page");
-        w.advance();
-        w.set_typed("  custom answer  ".into());
-        let WizardStep::Done(answers) = w.advance() else {
+        w.advance("");
+        let WizardStep::Done(answers) = w.advance("  custom answer  ") else {
             panic!()
         };
         assert_eq!(answers[0].labels, vec!["a"]);
@@ -7157,6 +7206,54 @@ mod tests {
             answers[1].labels,
             vec!["custom answer"],
             "typed overrides picked, trimmed"
+        );
+    }
+
+    #[test]
+    fn wizard_advance_takes_the_typed_answer_over_a_pick() {
+        // The reported miss: pick "Other (type your own)", type the real
+        // answer, hit Submit. The button reached `advance` without storing the
+        // text, so the agent received the literal option label and re-asked.
+        let mut w = Wizard::new(
+            "req".into(),
+            vec![question(
+                "q",
+                &["macOS agora", "Other (type your own)"],
+                false,
+            )],
+        );
+        w.select(1);
+        let WizardStep::Done(answers) = w.advance("  macOS + Linux com fallback  ") else {
+            panic!("last page finishes")
+        };
+        assert_eq!(
+            answers[0].labels,
+            vec!["macOS + Linux com fallback"],
+            "typed wins over the picked label, trimmed"
+        );
+    }
+
+    #[test]
+    fn wizard_skip_discards_every_pick_and_answers_nothing() {
+        let mut w = Wizard::new(
+            "req".into(),
+            vec![
+                question("q1", &["a"], false),
+                question("q2", &["x", "y"], false),
+            ],
+        );
+        w.select(0);
+        w.advance("typed on page one");
+        w.select(1);
+        let WizardStep::Done(answers) = w.skip() else {
+            panic!("skip finishes the panel")
+        };
+        assert_eq!(answers.len(), 2, "every question still reports");
+        // Empty labels ARE the wire's "declined": omp/mod.rs maps a missing
+        // first label onto `cancelled: true, timedOut: false`.
+        assert!(
+            answers.iter().all(|answer| answer.labels.is_empty()),
+            "skip must not smuggle a stale pick or typed text through: {answers:?}"
         );
     }
 

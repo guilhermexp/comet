@@ -2,7 +2,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
     WorkerCompletionEvidence, WorkerParentNotificationKind, WorkersSession,
-    WorkersSessionCapabilities, ack_worker_parent_notification_at, activate_worker_parent_task_at,
+    WorkersSessionCapabilities, ack_worker_parent_notification_at,
+    ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task_at, pending_worker_parent_notifications_at,
     pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task_at,
@@ -446,6 +447,32 @@ fn exited_without_a_completed_lifecycle_is_actionable() {
     .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].kind, WorkerParentNotificationKind::Exited);
+}
+
+#[test]
+fn acknowledged_exit_never_re_notifies_under_a_second_spelling() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    let dead = [session("worker-1", 3, "idle", "exited")];
+    let pending = pending_worker_parent_notifications_at(&path, &dead, &sessions_root).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, WorkerParentNotificationKind::Exited);
+    assert!(
+        pending[0].superseded_event_ids.is_empty(),
+        "one exit is one event: {:?}",
+        pending[0].superseded_event_ids
+    );
+    // Production acks compact the journal, which drops every previously
+    // acknowledged id. A second spelling of the same exit would come back
+    // un-acknowledged here and the pair would alternate forever.
+    ack_worker_parent_notification_compacted_at(&path, &pending[0]).unwrap();
+    assert!(
+        pending_worker_parent_notifications_at(&path, &dead, &sessions_root)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

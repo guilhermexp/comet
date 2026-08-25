@@ -65,6 +65,25 @@ fn install_comet_managed_hooks() -> Result<(), String> {
     Ok(())
 }
 
+/// Restore the upstream-owned launch assets when any is missing.
+///
+/// The pinned upstream resolves the pi-family lifecycle extension under the
+/// legacy hook root at spawn time (`--extension <unpeel_home>/hooks/...`): a
+/// missing file launches the runtime with no extension at all, so the session
+/// never emits Start/Stop and stays visually idle. Installation is otherwise
+/// lazy and per-process, which lets the first launch of a fresh process race
+/// the install. Cheap when healthy: one metadata probe per asset.
+pub(crate) fn ensure_upstream_owned_launch_assets() -> Result<(), String> {
+    let legacy_root = unpeel_core::app_paths::unpeel_home().join("hooks");
+    if UPSTREAM_OWNED_LEGACY_ASSETS
+        .iter()
+        .all(|asset| legacy_root.join(asset).is_file())
+    {
+        return Ok(());
+    }
+    install_comet_managed_hooks()
+}
+
 fn managed_provider_config_paths() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();

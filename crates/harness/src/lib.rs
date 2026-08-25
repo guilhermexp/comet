@@ -101,7 +101,6 @@ pub mod acp;
 pub(crate) mod adapter_install;
 pub mod claude;
 pub mod codex;
-pub mod comet_bin;
 pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
@@ -109,7 +108,6 @@ pub mod omp;
 pub use omp::OmpHarness;
 mod partial_tool_input;
 pub mod shell_env;
-pub mod worker_tools;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell

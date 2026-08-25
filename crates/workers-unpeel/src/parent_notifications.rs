@@ -586,7 +586,18 @@ fn pending_from_state(
         let has_completed_event = events
             .iter()
             .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed);
+        // A dead worker is ONE fact and must carry ONE id. The journal-less
+        // fallback above already emits an `Exited` event (`{gen}:exited`); a
+        // second, episode-qualified spelling (`{gen}:{episode}:exited`) of the
+        // same fact made the two alternate forever, because acknowledging
+        // either one clears the acknowledged set (production acks compact the
+        // journal) and re-arms the other. 2026-08-25: ~2 800 notifications for
+        // one exit, each appending a command twin to the parent chat doc.
+        let has_exited_event = events
+            .iter()
+            .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Exited);
         if !session.is_live()
+            && !has_exited_event
             && binding.acknowledged_completed_episode != Some(binding.active_task_episode)
             && (!completion_permitted || !has_completed_event)
         {
@@ -764,6 +775,20 @@ pub fn ack_worker_parent_notification_at(
 ) -> Result<(), String> {
     unpeel_core::app_state::edit_at(path, |state| {
         acknowledge_in_state(state, notification, false)
+    })
+}
+
+/// Test shim for the PRODUCTION ack path: acknowledging always compacts the
+/// journal, which drops every previously acknowledged id (their sequence
+/// numbers no longer mean anything). Only ids that survive compaction —
+/// lifecycle ids, which carry no sequence — must keep the worker quiet.
+#[doc(hidden)]
+pub fn ack_worker_parent_notification_compacted_at(
+    path: &Path,
+    notification: &WorkerParentNotification,
+) -> Result<(), String> {
+    unpeel_core::app_state::edit_at(path, |state| {
+        acknowledge_in_state(state, notification, true)
     })
 }
 
