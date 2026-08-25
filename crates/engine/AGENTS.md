@@ -33,6 +33,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Motivo de falha é espelhado na session row (`Session.error`) na **mesma transição** que carimba `Errored`, e qualquer transição não-erro o limpa — reason velho não sobrevive ao turno seguinte. O campo é live-only: trafega no `WatchSessions` do device que rodou, nunca no session doc.
 - **Journal fechado com `Done` não prova que o doc assentou**: `publish` grava no journal de forma síncrona enquanto o fold no doc (e o snapshot debounced) chegam depois. Boot recovery varre os dois conjuntos — os journals stale (`stale_sessions`) e **todo** chat journalado (`journaled_chats` → `sweep_abandoned_streams`). Sem o segundo passe, um crash nessa janela deixava a entry `streaming` para sempre: spinner de "Thinking" eterno e pergunta que o fallback de `RespondInput` recusava. Doc ilegível pula o chat, nunca aborta a varredura dos outros.
 - Fallback órfão de `RespondInput` é gated por `has_live_run`, não pelo status da entry: com run vivo o guard de entry `streaming` continua (resolver recém-consumido não pode virar turno duplicado); sem run vivo não há nada pra correr, então pergunta aberta em entry `streaming` é respondível e entra como turno novo.
+- O rail de anexos queued é content-agnostic: bytes de imagem ou texto chegam pelo mesmo `pending://`, são materializados no device do run e têm o path absoluto reescrito tanto em `RunRequest.attachments` quanto no trailer do prompt.
 
 ## Work Guidance
 
@@ -48,6 +49,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/**` (sessões, doc host, repos, terminais) | unit | `cargo test -p comet-engine` |
 | `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p comet-engine` |
 | `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p comet-engine` |
+| `tests/queued_attachments.rs` | integration — bytes + path local no prompt do run | `cargo test -p zeron-engine --test queued_attachments` |
 | Superfície multi-device real | e2e manual | `scripts/e2e-smoke.sh` |
 
 ## Child DOX Index

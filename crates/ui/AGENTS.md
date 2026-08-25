@@ -18,6 +18,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Animação é camada de **paint**: `with_animation` sobre opacidade nunca altera layout. `prefers-reduced-motion` é honrado.
 - Altura de linha em code block = linhas × line-height, independente do highlight; o highlight roda time-sliced em background e entra como run de texto (paint-only).
 - Transcript é por **bloco**, não por mensagem: id estável `msgId#blockId`, turno vivo não splitado, re-split na persistência. Eco otimista compartilha o id cunhado no cliente pra persistência não piscar.
+- Chips GitHub/YouTube existem só em mensagens de usuário já enviadas: `url_chips.rs` segmenta e projeta o texto uma vez em `rows_for_entry`, e a row cacheia spans clicáveis. O paint só consome esses spans; input, assistente e outras URLs continuam texto, a pontuação final fica fora do chip e a mensagem persistida nunca muda.
 - Cards do usuário são sticky por turno: um clone paint-only do renderer existente ocupa o inset do runway e é empurrado pelo próximo user row. A geometria é per-chat, não altera altura da lista, não substitui o runway e não duplica o original quando ele já ocupa a posição.
 - O wrapper externo do sticky é transparente; a oclusão/blur e o bloqueio de mouse/hover subjacente ficam limitados ao card interno arredondado, enquanto wheel/touch continuam chegando ao transcript.
 - `TurnSteps` e a projeção de mudanças de arquivo mantêm ids estáveis; previews de Write/Edit renderizam somente o conteúdo limitado que veio do doc.
@@ -44,6 +45,9 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Rescan disparado por watcher é **silencioso** (`refresh_files`): manter `LoadState::Loading` piscava o pane vazio a cada save. Debounce de 500ms coalesce a rajada de eventos.
 - A faixa de status mostra o **motivo** da falha quando a session row traz um (`view::run_failure_text`), truncado na própria linha; `"Run failed"` é só o fallback de quando não há motivo. A constante crua escondia mensagens acionáveis que a engine já tinha em mãos e journalava.
 - **Escape no composer é gesto de duas etapas**: um Esc mantém tudo que já fazia (fecha o popup de menção, volta uma página do painel de pergunta); dois Escs dentro de `DOUBLE_ESCAPE_WINDOW` param o run vivo — o botão Stop pelo teclado. O painel de pergunta **na primeira página não consome** o Esc: ele cobre o composer inteiro, inclusive o Stop, então essa é a única saída de uma pergunta cujo run travou.
+- **Intake do composer tem precedência e falha visível**: paste segue imagem → paths → texto longo (`> 5.000` caracteres) como `TextFile` staged → texto plano; o input limita-se a `10.000` caracteres e qualquer truncagem/rejeição usa `self.failure`. No drop, imagem usa o upload existente, arquivo de texto dentro do space vira mention relativa e outro arquivo vira `TextFile` staged por path, sem cachear o conteúdo integral; path ilegível nomeia o arquivo em `self.failure`. Imagens e texto compartilham persistência por chat, restore e prompt `Attached files`; o parser do transcript aceita também o trailer legado `Attached images`.
+- **O rail staged mede o conteúdo real**: thumbnails têm `56×56`; `TextFile` renderiza chip de `120..200×52` com título de primeira linha, subtítulo de origem/tamanho e remoção no hover. A altura do wrap soma a maior altura real de cada linha; voltar a derivá-la só pela contagem reintroduz feedback na histerese do pill.
+- **Markdown no composer é decoração paint-only**: `markdown_decor::scan` produz ranges por byte sem mutar o texto; o shaping projeta esses ranges sobre o display, mas mention chips e o marked range do IME têm prioridade. Markers permanecem visíveis, inputs acima de 10.000 caracteres pulam o scanner, e somente métricas do shaping base dirigem o flip compacto↔expandido.
 - O painel de pergunta colhe o texto livre em `wizard_advance`, **nunca no call site**: Submit, Enter com input desfocado e o timer de auto-advance do single-select caem todos ali, e quando só um lembrava de gravar, escolher "Other (type your own)" + digitar + Submit mandava a label literal pro agente, que só podia perguntar de novo. `Wizard::advance` recebe o texto como **parâmetro** pra tornar esse esquecimento inexpressável.
 - Declinar é primeira classe: o botão **Skip** submete labels vazias e o bridge do OMP traduz isso em `{"cancelled": true, "timedOut": false}` (`omp/mod.rs` `spawn_interactive_answer`) — coisa distinta de timeout e de `confirmed: false`, que seria um "não" de verdade. Skip limpa **todas** as páginas (pick velho iria como resposta real) e nunca é gated por `can_advance`: é a única saída de uma pergunta que o usuário não quer responder.
 
@@ -55,14 +59,18 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Verification
 
-- Comandos: `cargo test -p comet-ui` · `scripts/dev-demo.sh`
+- Comandos: `cargo test -p zeron-ui` · `scripts/dev-demo.sh`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p comet-ui` |
-| `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p comet-ui` |
+| `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p zeron-ui` |
+| `src/url_chips.rs` + projeção da row de usuário | unit | `cargo test -p zeron-ui url_chips` · `cargo test -p zeron-ui transcript` |
+| `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p zeron-ui` |
+| `src/transcript.rs` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
+| `src/markdown_decor.rs` + mapping em `src/composer.rs` | unit — scanner, exact-cover/projeção, IME/cap e estabilidade do flip | `cargo test -p zeron-ui markdown_decor && cargo test -p zeron-ui composer` |
+| `src/{attachments,composer}.rs` (paste/drop e rail staged) | unit — precedência/cap, classificação de path, persistência e restore | `cargo test -p zeron-ui attachments && cargo test -p zeron-ui composer` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 
 ## Child DOX Index
 
-Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Adensar aqui quando alguma ganhar contrato próprio.
+Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Os módulos-raiz `composer.rs` e `markdown_decor.rs` também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.

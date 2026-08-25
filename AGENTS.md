@@ -21,7 +21,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 |---|---|
 | Build do app | `cargo build -p comet` |
 | Suite completa | `cargo test` |
-| Testes de uma crate | `cargo test -p comet-ui` |
+| Testes de uma crate | `cargo test -p zeron-ui` |
 | Formatação (obrigatória antes de merge do upstream) | `cargo fmt --all` |
 | Demo local offline (harness mock, seeded) | `scripts/dev-demo.sh` (`--slow` pra ver streaming) |
 | Smoke e2e | `scripts/e2e-smoke.sh` |
@@ -82,7 +82,7 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 
 | Domínio | Doc | O que mora ali |
 |---|---|---|
-| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 9 crates da lib: wire types, docs CRDT, sync, harnesses, engine, RPC, MCP, updater, UI |
+| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 9 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, MCP, updater, UI/composer e decoração markdown |
 | Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/comet` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |

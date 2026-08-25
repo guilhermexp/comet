@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context,
     CursorStyle, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels,
-    Point, ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad,
+    PathPromptOptions, Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
+    StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -309,18 +309,37 @@ pub const STRIP_THUMB: f32 = 56.0;
 pub const STRIP_GAP: f32 = 8.0;
 pub const STRIP_PAD_TOP: f32 = 12.0;
 pub const STRIP_PAD_X: f32 = 16.0;
+pub const TEXT_CHIP_MIN_WIDTH: f32 = 120.0;
+pub const TEXT_CHIP_MAX_WIDTH: f32 = 200.0;
+pub const TEXT_CHIP_HEIGHT: f32 = 52.0;
 
-/// Height the wrap strip adds to the pill for `count` staged thumbnails at an
-/// `inner_width` pill content width (0 when empty). Mirrors flex-wrap: as many
-/// 56px thumbs per row as fit with 8px gaps inside the 16px side insets.
-pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
-    if count == 0 {
+/// Height the wrap strip adds to the pill for its actual child sizes. Text
+/// chips are wider and shorter than thumbnails, so a count-only estimate can
+/// disagree with flex-wrap and feed unstable heights into the pill flip.
+pub fn attachment_strip_height(items: &[(f32, f32)], inner_width: f32) -> f32 {
+    if items.is_empty() {
         return 0.0;
     }
-    let usable = (inner_width - 2.0 * STRIP_PAD_X).max(STRIP_THUMB);
-    let per_row = (((usable + STRIP_GAP) / (STRIP_THUMB + STRIP_GAP)).floor() as usize).max(1);
-    let rows = count.div_ceil(per_row);
-    STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
+    let usable = (inner_width - 2.0 * STRIP_PAD_X).max(1.0);
+    let mut height = STRIP_PAD_TOP;
+    let mut row_width = 0.0;
+    let mut row_height: f32 = 0.0;
+    for &(width, item_height) in items {
+        let next_width = if row_width == 0.0 {
+            width
+        } else {
+            row_width + STRIP_GAP + width
+        };
+        if row_width > 0.0 && next_width > usable {
+            height += row_height + STRIP_GAP;
+            row_width = width;
+            row_height = item_height;
+        } else {
+            row_width = next_width;
+            row_height = row_height.max(item_height);
+        }
+    }
+    height + row_height
 }
 
 pub fn comment_strip_height(count: usize) -> f32 {
@@ -499,6 +518,161 @@ pub enum SendButtonMode {
 /// a legal send — and during a live run has to read as Steer, not Stop.
 pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
     !text.trim().is_empty() || attachments > 0 || comments > 0
+}
+
+const LONG_PASTE_CHARS: usize = 5_000;
+const INPUT_CAP_CHARS: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteNotice {
+    Truncated,
+    Full,
+}
+
+impl PasteNotice {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Truncated => "Pasted text was truncated to the 10,000-character input limit.",
+            Self::Full => "The composer input is full (10,000 characters); nothing was pasted.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasteDecision {
+    Images,
+    Paths,
+    LongText(String),
+    PlainText {
+        text: String,
+        notice: Option<PasteNotice>,
+    },
+    Ignore,
+}
+
+fn decide_paste(
+    image_count: usize,
+    path_count: usize,
+    clipboard_text: Option<&str>,
+    input_chars: usize,
+    selected_chars: usize,
+) -> PasteDecision {
+    if image_count > 0 {
+        return PasteDecision::Images;
+    }
+    if path_count > 0 {
+        return PasteDecision::Paths;
+    }
+    let Some(text) = clipboard_text else {
+        return PasteDecision::Ignore;
+    };
+    let text_chars = text.chars().count();
+    if text_chars > LONG_PASTE_CHARS {
+        return PasteDecision::LongText(text.to_string());
+    }
+
+    let occupied = input_chars.saturating_sub(selected_chars.min(input_chars));
+    let available = INPUT_CAP_CHARS.saturating_sub(occupied);
+    let inserted: String = text.chars().take(available).collect();
+    let notice = if text_chars == 0 || text_chars <= available {
+        None
+    } else if available == 0 {
+        Some(PasteNotice::Full)
+    } else {
+        Some(PasteNotice::Truncated)
+    };
+    PasteDecision::PlainText {
+        text: inserted,
+        notice,
+    }
+}
+
+fn staged_pasted_text(index: u64, text: String) -> StagedAttachment {
+    let preview = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(50)
+        .collect();
+    attachments::stage_text_file(format!("pasted-{index}.txt"), text.into_bytes(), preview)
+}
+
+fn merge_restored_attachments(
+    restored: &mut Vec<StagedAttachment>,
+    fresh: impl IntoIterator<Item = StagedAttachment>,
+) {
+    for attachment in fresh {
+        if !restored.iter().any(|existing| existing.id == attachment.id) {
+            restored.push(attachment);
+        }
+    }
+}
+
+fn remove_staged_attachment(
+    attachments: &mut HashMap<String, Vec<StagedAttachment>>,
+    key: &str,
+    id: &str,
+) -> bool {
+    let Some(list) = attachments.get_mut(key) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|attachment| attachment.id != id);
+    let removed = list.len() != before;
+    if list.is_empty() {
+        attachments.remove(key);
+    }
+    removed
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StagedTextChip {
+    title: String,
+    subtitle: String,
+    width: f32,
+}
+
+fn format_attachment_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn staged_text_chip(attachment: &StagedAttachment) -> Option<StagedTextChip> {
+    let attachments::StagedAttachmentKind::TextFile { preview, .. } = &attachment.kind else {
+        return None;
+    };
+    let source = preview.lines().next().unwrap_or_default().trim();
+    let source = if source.is_empty() {
+        attachment.name.as_str()
+    } else {
+        source
+    };
+    let mut chars = source.chars();
+    let mut title: String = chars.by_ref().take(20).collect();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    let subtitle = if attachment.source_path().is_some() {
+        attachment.name.clone()
+    } else {
+        format!(
+            "Pasted Text · {}",
+            format_attachment_size(attachment.byte_len())
+        )
+    };
+    let text_chars = title.chars().count().max(subtitle.chars().count()) as f32;
+    let width = (60.0 + text_chars * 6.0).clamp(TEXT_CHIP_MIN_WIDTH, TEXT_CHIP_MAX_WIDTH);
+    Some(StagedTextChip {
+        title,
+        subtitle,
+        width,
+    })
 }
 
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
@@ -940,6 +1114,146 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
 struct TextProjection {
     display: String,
     mentions: Vec<(FileMentionLink, Range<usize>)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ComposerRunPlan {
+    len: usize,
+    decor: crate::markdown_decor::DecorStyle,
+    mention: bool,
+    marked: bool,
+}
+
+fn composer_run_plan_enabled(
+    raw: &str,
+    projection: &TextProjection,
+    marked: Option<&Range<usize>>,
+    decorate: bool,
+) -> Vec<ComposerRunPlan> {
+    let mut cells = vec![ComposerRunPlan::default(); projection.display.len()];
+    if decorate {
+        for decor in crate::markdown_decor::scan(raw) {
+            let start = projection.raw_to_display(decor.range.start);
+            let end = projection.raw_to_display(decor.range.end);
+            for cell in cells.get_mut(start..end).into_iter().flatten() {
+                cell.decor = decor.style;
+            }
+        }
+    }
+
+    if let Some(marked) = marked {
+        let start = projection.raw_to_display(marked.start.min(raw.len()));
+        let end = projection.raw_to_display(marked.end.min(raw.len()));
+        for cell in cells.get_mut(start..end).into_iter().flatten() {
+            cell.decor = Default::default();
+            cell.marked = true;
+        }
+    }
+
+    for (_, mention) in &projection.mentions {
+        for cell in &mut cells[mention.clone()] {
+            cell.decor = Default::default();
+            cell.marked = false;
+            cell.mention = true;
+        }
+    }
+
+    let mut runs = Vec::<ComposerRunPlan>::new();
+    for mut cell in cells {
+        cell.len = 1;
+        match runs.last_mut() {
+            Some(last)
+                if last.decor == cell.decor
+                    && last.mention == cell.mention
+                    && last.marked == cell.marked =>
+            {
+                last.len += 1;
+            }
+            _ => runs.push(cell),
+        }
+    }
+    runs
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextMeasurements {
+    width: f32,
+    height: f32,
+}
+
+fn stable_flip_measurements(
+    base: TextMeasurements,
+    _decorated: TextMeasurements,
+) -> TextMeasurements {
+    base
+}
+
+/// Same compact heading scale as the transcript markdown renderer. The input
+/// keeps its fixed line-height; only glyph size changes, so decoration remains
+/// paint-only with respect to the composer's box geometry.
+fn heading_font_size(level: Option<u8>, base: f32) -> f32 {
+    match level {
+        Some(1) => base.max(19.0),
+        Some(2) => base.max(16.0),
+        Some(3) => base.max(15.0),
+        Some(4..=6) => base.max(14.0),
+        _ => base,
+    }
+}
+
+fn heading_for_range(plans: &[ComposerRunPlan], range: Range<usize>) -> Option<u8> {
+    let mut at = 0;
+    let mut heading: Option<u8> = None;
+    for plan in plans {
+        let end = at + plan.len;
+        if at < range.end && end > range.start {
+            heading = match (heading, plan.decor.heading) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+        }
+        at = end;
+        if at >= range.end {
+            break;
+        }
+    }
+    heading
+}
+
+fn heading_font_size_for_range(plans: &[ComposerRunPlan], range: Range<usize>, base: f32) -> f32 {
+    let mut at = 0;
+    for plan in plans {
+        let end = at + plan.len;
+        if at < range.end && end > range.start && (plan.mention || plan.marked) {
+            return base;
+        }
+        at = end;
+        if at >= range.end {
+            break;
+        }
+    }
+    heading_font_size(heading_for_range(plans, range), base)
+}
+
+fn text_runs_for_range(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
+    let mut sliced = Vec::new();
+    let mut at = 0;
+    for run in runs {
+        let end = at + run.len;
+        let start_in_range = at.max(range.start);
+        let end_in_range = end.min(range.end);
+        if start_in_range < end_in_range {
+            let mut run = run.clone();
+            run.len = end_in_range - start_in_range;
+            sliced.push(run);
+        }
+        at = end;
+        if at >= range.end {
+            break;
+        }
+    }
+    sliced
 }
 
 /// A path alone is not enough: two identical relative paths can appear in a
@@ -1392,6 +1706,12 @@ pub enum ComposerInputEvent {
     PastedPaths(Vec<PathBuf>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedLongText(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteNoticeEvent(pub PasteNotice);
+
 /// Multiline input entity: content + selection + IME marked text + measured
 /// layout (wrapped lines) for mouse mapping and auto-grow.
 pub struct ComposerInput {
@@ -1611,6 +1931,10 @@ impl ComposerInput {
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
+    }
+
+    fn insert_file_mention(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.replace_mention(self.selected_range.clone(), path, false, cx);
     }
 
     /// Replace a completed plain-text token (slash commands) as one
@@ -2246,17 +2570,32 @@ impl ComposerInput {
                 ClipboardEntry::String(_) => {}
             }
         }
-        if !images.is_empty() {
-            cx.emit(ComposerInputEvent::PastedImages(images));
-            return;
-        }
-        if !paths.is_empty() {
-            cx.emit(ComposerInputEvent::PastedPaths(paths));
-            return;
-        }
-        if let Some(text) = item.text() {
-            // Multiline input: newlines are welcome (unlike the single-line example).
-            self.replace_text_in_range(None, &text, window, cx);
+        let text = item.text();
+        let replace_range = self.projection.normalize_range(
+            self.marked_range
+                .clone()
+                .unwrap_or_else(|| self.selected_range.clone()),
+        );
+        let selected_chars = self.content[replace_range].chars().count();
+        match decide_paste(
+            images.len(),
+            paths.len(),
+            text.as_deref(),
+            self.content.chars().count(),
+            selected_chars,
+        ) {
+            PasteDecision::Images => cx.emit(ComposerInputEvent::PastedImages(images)),
+            PasteDecision::Paths => cx.emit(ComposerInputEvent::PastedPaths(paths)),
+            PasteDecision::LongText(text) => cx.emit(PastedLongText(text)),
+            PasteDecision::PlainText { text, notice } => {
+                if !text.is_empty() {
+                    self.replace_text_in_range(None, &text, window, cx);
+                }
+                if let Some(notice) = notice {
+                    cx.emit(PasteNoticeEvent(notice));
+                }
+            }
+            PasteDecision::Ignore => {}
         }
     }
 
@@ -2616,66 +2955,126 @@ impl ComposerInput {
         let font_size = style.font_size.to_pixels(window.rem_size());
         self.line_height = px(INPUT_LINE_HEIGHT);
 
-        // Chips read as inline code: the markdown renderer's recipe (mono font
-        // + `code_text` violet) over the rounded `code_wash` painted beneath.
-        let (chip_font, chip_color) = {
-            let theme = Theme::of(cx);
-            (gpui::font(theme.font_mono.clone()), theme.code_text)
+        let plans = if is_placeholder {
+            vec![ComposerRunPlan {
+                len: display.len(),
+                ..ComposerRunPlan::default()
+            }]
+        } else {
+            composer_run_plan_enabled(
+                &self.content,
+                &self.projection,
+                self.marked_range.as_ref(),
+                self.mentions_enabled,
+            )
         };
-        let run_for = |len: usize, underline: bool, chip: bool| TextRun {
-            len,
-            font: if chip {
-                chip_font.clone()
+        debug_assert_eq!(
+            plans.iter().map(|plan| plan.len).sum::<usize>(),
+            display.len()
+        );
+
+        let theme = Theme::of(cx);
+        let run_for = |plan: &ComposerRunPlan, decorated: bool| {
+            let decor = decorated
+                .then_some(plan.decor)
+                .unwrap_or_else(crate::markdown_decor::DecorStyle::default);
+            let mono = plan.mention || decor.code || decor.code_block;
+            let mut font = if mono {
+                gpui::font(theme.font_mono.clone())
             } else {
                 style.font()
-            },
-            color: if chip { chip_color } else { style.color },
-            // Rounded mention washes are painted explicitly beneath the text;
-            // TextRun backgrounds are square and can disappear in wrapped runs.
-            background_color: None,
-            underline: underline.then_some(UnderlineStyle {
-                color: Some(style.color),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            strikethrough: None,
-        };
-        let runs: Vec<TextRun> = match self.marked_range.as_ref() {
-            Some(marked) if !is_placeholder => {
-                let start = self.projection.raw_to_display(marked.start);
-                let end = self.projection.raw_to_display(marked.end);
-                vec![
-                    run_for(start, false, false),
-                    run_for(end.saturating_sub(start), true, false),
-                    run_for(display.len() - end, false, false),
-                ]
-                .into_iter()
-                .filter(|r| r.len > 0)
-                .collect()
+            };
+            if (decor.bold || decor.heading.is_some()) && font.weight.0 < FontWeight::SEMIBOLD.0 {
+                font.weight = FontWeight::SEMIBOLD;
             }
-            _ if is_placeholder => vec![run_for(display.len(), false, false)],
-            _ => {
-                let mut runs = Vec::new();
-                let mut at = 0;
-                for (_, chip) in &self.projection.mentions {
-                    if at < chip.start {
-                        runs.push(run_for(chip.start - at, false, false));
-                    }
-                    runs.push(run_for(chip.len(), false, true));
-                    at = chip.end;
-                }
-                if at < display.len() {
-                    runs.push(run_for(display.len() - at, false, false));
-                }
-                runs
+            if decor.italic || decor.quote {
+                font.style = FontStyle::Italic;
             }
-        };
 
-        let lines = window
+            let color = if plan.mention {
+                theme.code_text
+            } else if decor.list_marker {
+                theme.accent
+            } else if decor.marker {
+                theme.text_faint
+            } else if decor.code || decor.code_block {
+                theme.code_text
+            } else {
+                style.color
+            };
+            let underline = if plan.marked {
+                Some(UnderlineStyle {
+                    color: Some(style.color),
+                    thickness: px(1.0),
+                    wavy: false,
+                })
+            } else if decor.link {
+                Some(UnderlineStyle {
+                    color: Some(theme.text_muted),
+                    thickness: px(1.0),
+                    wavy: false,
+                })
+            } else {
+                None
+            };
+
+            TextRun {
+                len: plan.len,
+                font,
+                color,
+                // Mention chips keep their explicit rounded quads. Markdown
+                // code uses the theme wash directly in the text run.
+                background_color: (!plan.mention
+                    && !decor.marker
+                    && (decor.code || decor.code_block))
+                    .then_some(theme.code_wash),
+                underline,
+                strikethrough: decor.strike.then_some(StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: Some(theme.text_muted),
+                }),
+            }
+        };
+        let base_runs: Vec<TextRun> = plans.iter().map(|plan| run_for(plan, false)).collect();
+        let runs: Vec<TextRun> = plans.iter().map(|plan| run_for(plan, true)).collect();
+
+        // Shape the undecorated projection separately. These metrics alone
+        // drive compact↔expanded hysteresis, so heading glyph size and bold/
+        // mono widths cannot cause decorate→measure→flip feedback.
+        let base_lines = window
             .text_system()
-            .shape_text(display, font_size, &runs, Some(width), None)
+            .shape_text(display.clone(), font_size, &base_runs, Some(width), None)
             .map(|small| small.into_vec())
             .unwrap_or_default();
+        let has_sized_heading = plans.iter().any(|plan| plan.decor.heading.is_some());
+        let lines = if has_sized_heading {
+            let display_text: &str = display.as_ref();
+            let mut shaped = Vec::new();
+            let mut line_start = 0;
+            for line in display_text.split('\n') {
+                let line_range = line_start..line_start + line.len();
+                let line_runs = text_runs_for_range(&runs, line_range.clone());
+                let line_size =
+                    heading_font_size_for_range(&plans, line_range, f32::from(font_size));
+                if let Ok(line) = window.text_system().shape_text(
+                    SharedString::from(line.to_owned()),
+                    px(line_size),
+                    &line_runs,
+                    Some(width),
+                    None,
+                ) {
+                    shaped.extend(line);
+                }
+                line_start += line.len() + 1;
+            }
+            shaped
+        } else {
+            window
+                .text_system()
+                .shape_text(display.clone(), font_size, &runs, Some(width), None)
+                .map(|small| small.into_vec())
+                .unwrap_or_default()
+        };
 
         // Logical line byte offsets (each shaped line covers one \n-split line).
         let mut line_starts = Vec::with_capacity(lines.len());
@@ -2692,16 +3091,37 @@ impl ComposerInput {
             .iter()
             .map(|l| f32::from(l.size(self.line_height).height))
             .sum();
-        let max_line_width: f32 = lines
+        let decorated_width: f32 = lines
             .iter()
             .map(|l| f32::from(l.unwrapped_layout.width))
             .fold(0.0, f32::max);
+        let base_measurements = TextMeasurements {
+            width: base_lines
+                .iter()
+                .map(|line| f32::from(line.unwrapped_layout.width))
+                .fold(0.0, f32::max),
+            height: base_lines
+                .iter()
+                .map(|line| f32::from(line.size(self.line_height).height))
+                .sum(),
+        };
+        let flip_measurements = stable_flip_measurements(
+            base_measurements,
+            TextMeasurements {
+                width: decorated_width,
+                height: content_height,
+            },
+        );
 
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
         self.content_height = content_height.max(INPUT_LINE_HEIGHT);
-        self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
+        self.max_line_width = if is_placeholder {
+            0.0
+        } else {
+            flip_measurements.width
+        };
         self.last_width = f32::from(width);
         self.layout_epoch += 1;
         self.content_height
@@ -2729,6 +3149,8 @@ impl ComposerInput {
 }
 
 impl EventEmitter<ComposerInputEvent> for ComposerInput {}
+impl EventEmitter<PastedLongText> for ComposerInput {}
+impl EventEmitter<PasteNoticeEvent> for ComposerInput {}
 
 impl Focusable for ComposerInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -3229,6 +3651,19 @@ impl gpui::Element for ComposerTextElement {
         });
 
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            let mut y = bounds.top() - px(scroll);
+            for line in &lines {
+                let height = line.size(line_height).height;
+                let _ = line.paint_background(
+                    point(bounds.left(), y),
+                    line_height,
+                    gpui::TextAlign::Left,
+                    Some(bounds),
+                    window,
+                    cx,
+                );
+                y += height;
+            }
             for quad in prepaint.mention_quads.drain(..) {
                 window.paint_quad(quad);
             }
@@ -3521,6 +3956,8 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Monotonic display name source for pasted text files.
+    next_pasted_text: u64,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -3599,6 +4036,8 @@ pub struct Composer {
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
+    _long_paste_events: Subscription,
+    _paste_notice_events: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -3679,6 +4118,20 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
+        let long_paste_events =
+            cx.subscribe(&input, |this: &mut Self, _, event: &PastedLongText, cx| {
+                this.next_pasted_text += 1;
+                let staged = staged_pasted_text(this.next_pasted_text, event.0.clone());
+                this.add_staged(vec![staged], cx);
+            });
+        let paste_notice_events = cx.subscribe(
+            &input,
+            |this: &mut Self, _, event: &PasteNoticeEvent, cx| {
+                this.failure = Some(event.0.message().into());
+                this.failure_key = Some(this.current_key.clone());
+                cx.notify();
+            },
+        );
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
             state,
@@ -3686,6 +4139,7 @@ impl Composer {
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
+            next_pasted_text: 0,
             preview: None,
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
@@ -3722,6 +4176,8 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
+            _long_paste_events: long_paste_events,
+            _paste_notice_events: paste_notice_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -3742,10 +4198,11 @@ impl Composer {
                 .collect();
             if std::env::var("ZERON_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
+                && let Some(image) = first.image()
             {
                 composer.preview = Some(attachments::PreviewImage {
                     name: first.name.clone().into(),
-                    image: first.image.clone(),
+                    image,
                 });
                 composer.preview_focus_pending = true;
             }
@@ -3792,25 +4249,47 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// Classify every picker/drop/paste path. Images keep the upload path;
+    /// project text files become mentions; everything else stages as a
+    /// source-path chip. No path disappears without a named failure.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let selected_space = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .map(|space| PathBuf::from(&space.path));
         let mut staged = Vec::new();
-        for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
-                Err(message) => {
+        for path in paths {
+            match attachments::classify_dropped_path(&path, selected_space.as_deref()) {
+                attachments::DroppedPathKind::Image => match attachments::stage_file(&path) {
+                    Ok(attachment) => staged.push(attachment),
+                    Err(message) => {
+                        self.failure = Some(message.into());
+                        self.failure_key = Some(self.current_key.clone());
+                    }
+                },
+                attachments::DroppedPathKind::ProjectMention { relative_path } => {
+                    self.input.update(cx, |input, cx| {
+                        input.insert_file_mention(&relative_path, cx);
+                    });
+                }
+                attachments::DroppedPathKind::ExternalFile { path, size } => {
+                    match attachments::stage_path_file(&path, size) {
+                        Ok(attachment) => staged.push(attachment),
+                        Err(message) => {
+                            self.failure = Some(message.into());
+                            self.failure_key = Some(self.current_key.clone());
+                        }
+                    }
+                }
+                attachments::DroppedPathKind::Failure(message) => {
                     self.failure = Some(message.into());
                     self.failure_key = Some(self.current_key.clone());
-                    cx.notify();
                 }
             }
         }
         self.add_staged(staged, cx);
+        cx.notify();
     }
 
     pub(crate) fn set_failure(&mut self, message: String, cx: &mut Context<Self>) {
@@ -3819,12 +4298,7 @@ impl Composer {
     }
 
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(list) = self.attachments.get_mut(&self.current_key) {
-            list.retain(|a| a.id != id);
-            if list.is_empty() {
-                self.attachments.remove(&self.current_key);
-            }
-        }
+        remove_staged_attachment(&mut self.attachments, &self.current_key, id);
         cx.notify();
     }
 
@@ -3870,12 +4344,10 @@ impl Composer {
         )
     }
 
-    /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
-    /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
-    /// revealed on hover, click opens the full-size preview.
+    /// Shared staged rail: square image thumbnails and labeled text chips in
+    /// source order, all with the same hover remove affordance.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let staged = self.staged();
-        if staged.is_empty() {
+        if self.staged().is_empty() {
             return None;
         }
         let mut strip = div()
@@ -3885,14 +4357,40 @@ impl Composer {
             .gap(px(STRIP_GAP))
             .px(px(STRIP_PAD_X))
             .pt(px(STRIP_PAD_TOP));
-        for (ix, att) in staged.iter().enumerate() {
+        for (ix, att) in self.staged().iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let preview = attachments::PreviewImage {
-                name: att.name.clone().into(),
-                image: att.image.clone(),
-            };
             let remove_id = att.id.clone();
-            strip = strip.child(
+            let remove = crate::frost::layered(
+                div()
+                    .id(("composer-att-remove", ix))
+                    .absolute()
+                    .top(px(-6.0))
+                    .right(px(-6.0))
+                    .size(px(18.0))
+                    .rounded_full()
+                    .bg(theme.bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .shadow_sm()
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |style| style.opacity(1.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_attachment(&remove_id, cx);
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    ),
+            );
+            let item = if let Some(image) = att.image() {
+                let preview = attachments::PreviewImage {
+                    name: att.name.clone().into(),
+                    image: image.clone(),
+                };
                 div()
                     .group(group.clone())
                     .relative()
@@ -3911,7 +4409,7 @@ impl Composer {
                                 cx.notify();
                             }))
                             .child(
-                                img(att.image.clone())
+                                img(image)
                                     // EXPLICIT dims, not size_full: img layout
                                     // honors the image's intrinsic aspect
                                     // ratio over a percent height (gpui
@@ -3928,45 +4426,78 @@ impl Composer {
                                     .object_fit(ObjectFit::Cover),
                             ),
                     )
-                    // Own layer: inside the frosted pill everything shares one
-                    // draw order and images render last, so without it the
-                    // thumbnail paints OVER this button (user report).
-                    .child(crate::frost::layered(
+                    // Images paint late inside the frosted pill; keep remove
+                    // on its own layer so the thumbnail cannot cover it.
+                    .child(remove)
+            } else if let Some(copy) = staged_text_chip(att) {
+                let title: SharedString = copy.title.into();
+                let subtitle: SharedString = copy.subtitle.into();
+                div()
+                    .group(group)
+                    .relative()
+                    .w(px(copy.width))
+                    .min_w(px(TEXT_CHIP_MIN_WIDTH))
+                    .max_w(px(TEXT_CHIP_MAX_WIDTH))
+                    .h(px(TEXT_CHIP_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(7.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .bg(crate::theme::ink(0.035))
+                    .child(
                         div()
-                            .id(("composer-att-remove", ix))
-                            .absolute()
-                            .top(px(-6.0))
-                            .right(px(-6.0))
-                            .size(px(18.0))
-                            .rounded_full()
-                            .bg(theme.bg)
+                            .size(px(36.0))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .cursor_pointer()
-                            .shadow_sm()
-                            .opacity(0.0)
-                            .group_hover(group, |s| s.opacity(1.0))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // The button overhangs the thumbnail, whose
-                                // hitbox is right underneath — don't let the
-                                // same click also open the preview.
-                                cx.stop_propagation();
-                                this.remove_attachment(&remove_id, cx);
-                            }))
+                            .rounded(px(7.0))
+                            .bg(crate::theme::ink(0.06))
                             .child(
-                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
-                                    .size(px(14.0))
+                                crate::icons::icon(crate::icons::DOCUMENT)
+                                    .size(px(17.0))
                                     .text_color(theme.text_muted),
                             ),
-                    )),
-            );
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .line_height(px(15.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .line_height(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.72))
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(remove)
+            } else {
+                continue;
+            };
+            strip = strip.child(item);
         }
         Some(strip)
     }
 
-    /// Paperclip: the native image picker (the original's hidden
-    /// `<input type=file accept=image/* multiple>`).
+    /// Paperclip: the native file picker; paths feed the same honest
+    /// image/mention/source-path classification as paste and drop.
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -4845,7 +5376,10 @@ impl Composer {
         let host_is_remote = host_device_id
             .as_deref()
             .is_some_and(|id| local_device_id.as_deref() != Some(id));
-        let queued_flow = !staged.is_empty() && {
+        let has_uploads = staged
+            .iter()
+            .any(|attachment| attachment.source_path().is_none());
+        let queued_flow = has_uploads && {
             let state = self.state.read(cx);
             let local_ok = local_device_id
                 .as_deref()
@@ -4859,9 +5393,14 @@ impl Composer {
         // Upload identities minted NOW: in the queued flow the `pending://`
         // ref IS the persisted transport until the host rewrites it, so the
         // id must exist before any bytes move.
-        let upload_ids: Vec<String> = staged
+        let upload_ids: Vec<Option<String>> = staged
             .iter()
-            .map(|_| uuid::Uuid::new_v4().to_string())
+            .map(|attachment| {
+                attachment
+                    .source_path()
+                    .is_none()
+                    .then(|| uuid::Uuid::new_v4().to_string())
+            })
             .collect();
         // The echo carries attachment refs from the first frame, so photos
         // render while the send is still pending. Queued flow: the refs are
@@ -4874,12 +5413,20 @@ impl Composer {
             staged
                 .iter()
                 .zip(&upload_ids)
-                .map(|(att, id)| format!("pending://{id}/{}", att.name))
+                .map(|(att, id)| match (att.source_path(), id) {
+                    (Some(path), _) => path.display().to_string(),
+                    (None, Some(id)) => format!("pending://{id}/{}", att.name),
+                    (None, None) => unreachable!("upload attachments always have an id"),
+                })
                 .collect()
         } else {
             staged
                 .iter()
-                .map(|att| format!("pending/{}/{}", att.id, att.name))
+                .map(|att| {
+                    att.source_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| format!("pending/{}/{}", att.id, att.name))
+                })
                 .collect()
         };
         let echo_text = attachments::with_attachments(&text, &echo_paths);
@@ -4890,30 +5437,23 @@ impl Composer {
         // rewrite instead of blanking into a reload skeleton.
         if queued_flow {
             for (upload_id, att) in upload_ids.iter().zip(&staged) {
-                attachments::seed_attachment_alias(
-                    &device_id,
-                    upload_id,
-                    &att.name,
-                    att.image.clone(),
-                );
+                let Some(upload_id) = upload_id else { continue };
+                let Some(image) = att.image() else { continue };
+                attachments::seed_attachment_alias(&device_id, upload_id, &att.name, image.clone());
                 if let Some(local) = local_device_id.as_deref()
                     && local != device_id
                 {
-                    attachments::seed_attachment_alias(
-                        local,
-                        upload_id,
-                        &att.name,
-                        att.image.clone(),
-                    );
+                    attachments::seed_attachment_alias(local, upload_id, &att.name, image.clone());
                 }
             }
         }
         for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            let Some(image) = att.image() else { continue };
+            attachments::seed_attachment(&device_id, path, &att.name, image.clone());
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
             {
-                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+                attachments::seed_attachment(local, path, &att.name, image.clone());
             }
         }
 
@@ -4982,8 +5522,12 @@ impl Composer {
                     // Local staging is disk-speed; publish progress anyway so
                     // huge files still narrate.
                     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
-                    {
+                    let total: u64 = staged
+                        .iter()
+                        .filter(|attachment| attachment.source_path().is_none())
+                        .map(StagedAttachment::byte_len)
+                        .sum();
+                    if has_uploads {
                         let progress = progress.clone();
                         this.update(cx, |composer, cx| {
                             composer.state.update(cx, |s, cx| {
@@ -4994,6 +5538,7 @@ impl Composer {
                         .ok();
                     }
                     for (att, upload_id) in staged.iter().zip(&upload_ids) {
+                        let Some(upload_id) = upload_id else { continue };
                         if let Err(err) = attachments::upload_attachment(
                             &engine,
                             cx.background_executor(),
@@ -5017,11 +5562,15 @@ impl Composer {
                     content = echo_text.clone();
                 } else if !staged.is_empty() {
                     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
+                    let total: u64 = staged
+                        .iter()
+                        .filter(|attachment| attachment.source_path().is_none())
+                        .map(StagedAttachment::byte_len)
+                        .sum();
                     const LEGACY_UPLOAD_BUDGET: std::time::Duration =
                         std::time::Duration::from_secs(300);
                     let upload_started = std::time::Instant::now();
-                    {
+                    if has_uploads {
                         let progress = progress.clone();
                         this.update(cx, |composer, cx| {
                             composer.state.update(cx, |s, cx| {
@@ -5032,6 +5581,13 @@ impl Composer {
                         .ok();
                     }
                     for (att, upload_id) in staged.iter().zip(&upload_ids) {
+                        if let Some(path) = att.source_path() {
+                            attachment_paths.push(path.display().to_string());
+                            continue;
+                        }
+                        let Some(upload_id) = upload_id else {
+                            unreachable!("upload attachments always have an id");
+                        };
                         let Some(remaining) =
                             LEGACY_UPLOAD_BUDGET.checked_sub(upload_started.elapsed())
                         else {
@@ -5073,9 +5629,11 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
-                        if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                        if let Some(image) = att.image() {
+                            attachments::seed_attachment(&seed_device, path, &att.name, image.clone());
+                            if seed_device != device_id {
+                                attachments::seed_attachment(&device_id, path, &att.name, image);
+                            }
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -5341,11 +5899,8 @@ impl Composer {
                         let mut merged = staged.clone();
                         for key in [err_chat_id.clone(), restore_key.clone()] {
                             if let Some(slot) = composer.attachments.get_mut(&key) {
-                                let fresh: Vec<_> = slot
-                                    .drain(..)
-                                    .filter(|e| !merged.iter().any(|f| f.id == e.id))
-                                    .collect();
-                                merged.extend(fresh);
+                                let fresh: Vec<_> = slot.drain(..).collect();
+                                merge_restored_attachments(&mut merged, fresh);
                             }
                         }
                         composer.attachments.insert(restore_key, merged);
@@ -6199,9 +6754,17 @@ impl Render for Composer {
         // `morph_t`) animates. Steady state renders exactly the target.
         // Staged attachments add the wrap strip's height to the pill in BOTH
         // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
-        let staged_count = self.staged().len();
+        let staged_sizes: Vec<(f32, f32)> = self
+            .staged()
+            .iter()
+            .map(|attachment| {
+                staged_text_chip(attachment)
+                    .map(|chip| (chip.width, TEXT_CHIP_HEIGHT))
+                    .unwrap_or((STRIP_THUMB, STRIP_THUMB))
+            })
+            .collect();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
-        let strip_h = attachment_strip_height(staged_count, strip_width_hint);
+        let strip_h = attachment_strip_height(&staged_sizes, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if expanded {
             composer_total_height(content_height)
@@ -6436,6 +6999,173 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn planned_run_at(runs: &[ComposerRunPlan], offset: usize) -> &ComposerRunPlan {
+        let mut at = 0;
+        for run in runs {
+            if offset < at + run.len {
+                return run;
+            }
+            at += run.len;
+        }
+        panic!("offset {offset} is covered by the exact run plan");
+    }
+
+    #[test]
+    fn paste_decision_enforces_media_precedence_and_long_text_threshold() {
+        let long = "x".repeat(5_001);
+        assert_eq!(decide_paste(1, 1, Some(&long), 0, 0), PasteDecision::Images);
+        assert_eq!(decide_paste(0, 1, Some(&long), 0, 0), PasteDecision::Paths);
+        assert_eq!(
+            decide_paste(0, 0, Some(&long), 0, 0),
+            PasteDecision::LongText(long)
+        );
+
+        let at_threshold = "y".repeat(5_000);
+        assert_eq!(
+            decide_paste(0, 0, Some(&at_threshold), 0, 0),
+            PasteDecision::PlainText {
+                text: at_threshold,
+                notice: None,
+            }
+        );
+    }
+
+    #[test]
+    fn paste_decision_caps_in_characters_and_reports_truncation_or_full_input() {
+        assert_eq!(
+            decide_paste(0, 0, Some("abcd"), 9_998, 0),
+            PasteDecision::PlainText {
+                text: "ab".into(),
+                notice: Some(PasteNotice::Truncated),
+            }
+        );
+        assert_eq!(
+            decide_paste(0, 0, Some("anything"), 10_000, 0),
+            PasteDecision::PlainText {
+                text: String::new(),
+                notice: Some(PasteNotice::Full),
+            }
+        );
+        assert_eq!(
+            decide_paste(0, 0, Some("éé"), 9_999, 0),
+            PasteDecision::PlainText {
+                text: "é".into(),
+                notice: Some(PasteNotice::Truncated),
+            },
+            "the cap counts characters without splitting UTF-8"
+        );
+        assert_eq!(
+            decide_paste(0, 0, Some("abc"), 10_000, 2),
+            PasteDecision::PlainText {
+                text: "ab".into(),
+                notice: Some(PasteNotice::Truncated),
+            },
+            "replacing a selection first frees its character capacity"
+        );
+    }
+
+    #[test]
+    fn pasted_text_stages_bytes_name_preview_and_survives_restore_merge() {
+        let first_line = format!("{}\nsecond line", "é".repeat(55));
+        let attachment = staged_pasted_text(7, first_line.clone());
+        assert_eq!(attachment.name, "pasted-7.txt");
+        assert_eq!(attachment.bytes(), first_line.as_bytes());
+        match &attachment.kind {
+            attachments::StagedAttachmentKind::TextFile { preview, .. } => {
+                assert_eq!(preview.chars().count(), 50);
+                assert_eq!(preview, &"é".repeat(50));
+            }
+            attachments::StagedAttachmentKind::Image => {
+                panic!("long pasted text must not become an image")
+            }
+        }
+
+        let duplicate = attachment.clone();
+        let fresh = staged_pasted_text(8, "fresh while send was in flight".into());
+        let mut restored = vec![attachment];
+        merge_restored_attachments(&mut restored, vec![duplicate, fresh]);
+        assert_eq!(
+            restored
+                .iter()
+                .map(|attachment| attachment.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pasted-7.txt", "pasted-8.txt"]
+        );
+        assert!(restored.iter().all(|attachment| matches!(
+            &attachment.kind,
+            attachments::StagedAttachmentKind::TextFile { .. }
+        )));
+    }
+
+    #[test]
+    fn staged_text_chip_copy_truncates_unicode_and_formats_source_and_size() {
+        let pasted = attachments::stage_text_file(
+            "pasted-1.txt".into(),
+            vec![b'x'; 464_179],
+            "12345678901234567890extra".into(),
+        );
+        let pasted_copy = staged_text_chip(&pasted).expect("text chip");
+        assert_eq!(pasted_copy.title, "12345678901234567890…");
+        assert_eq!(pasted_copy.subtitle, "Pasted Text · 453.3 KB");
+        assert!((TEXT_CHIP_MIN_WIDTH..=TEXT_CHIP_MAX_WIDTH).contains(&pasted_copy.width));
+
+        let external = tempfile::tempdir().expect("external tempdir");
+        let path = external.path().join("dropped.txt");
+        std::fs::write(&path, "first line\nsecond").expect("fixture");
+        let dropped = attachments::stage_path_file(&path, 17).expect("stage path");
+        let dropped_copy = staged_text_chip(&dropped).expect("text chip");
+        assert_eq!(dropped_copy.title, "first line");
+        assert_eq!(dropped_copy.subtitle, "dropped.txt");
+
+        assert_eq!(format_attachment_size(999), "999 B");
+        assert_eq!(format_attachment_size(1_048_576), "1.0 MB");
+    }
+
+    #[test]
+    fn attachment_strip_height_wraps_real_thumbnail_and_text_chip_sizes() {
+        assert_eq!(attachment_strip_height(&[], 240.0), 0.0);
+        assert_eq!(
+            attachment_strip_height(
+                &[(STRIP_THUMB, STRIP_THUMB), (120.0, TEXT_CHIP_HEIGHT)],
+                240.0
+            ),
+            STRIP_PAD_TOP + STRIP_THUMB,
+            "a thumbnail and minimum-width chip fit the same row"
+        );
+        assert_eq!(
+            attachment_strip_height(
+                &[(120.0, TEXT_CHIP_HEIGHT), (120.0, TEXT_CHIP_HEIGHT)],
+                240.0
+            ),
+            STRIP_PAD_TOP + TEXT_CHIP_HEIGHT * 2.0 + STRIP_GAP,
+            "chip widths, not item count, decide wrapping"
+        );
+        assert_eq!(
+            attachment_strip_height(
+                &[(200.0, TEXT_CHIP_HEIGHT), (STRIP_THUMB, STRIP_THUMB)],
+                240.0
+            ),
+            STRIP_PAD_TOP + TEXT_CHIP_HEIGHT + STRIP_GAP + STRIP_THUMB,
+            "each row contributes its tallest real child"
+        );
+    }
+
+    #[test]
+    fn removing_one_staged_chip_preserves_its_sibling_and_other_chat() {
+        let first = attachments::stage_text_file("first.txt".into(), vec![1], "first".into());
+        let second = attachments::stage_text_file("second.txt".into(), vec![2], "second".into());
+        let other = attachments::stage_text_file("other.txt".into(), vec![3], "other".into());
+        let mut by_chat = HashMap::from([
+            ("chat-a".to_string(), vec![first.clone(), second.clone()]),
+            ("chat-b".to_string(), vec![other.clone()]),
+        ]);
+
+        assert!(remove_staged_attachment(&mut by_chat, "chat-a", &first.id));
+        assert_eq!(by_chat["chat-a"].len(), 1);
+        assert_eq!(by_chat["chat-a"][0].id, second.id);
+        assert_eq!(by_chat["chat-b"][0].id, other.id);
+    }
 
     #[test]
     fn the_slash_popup_spans_the_pill_at_every_column_width() {
@@ -6835,6 +7565,95 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn markdown_run_plan_exactly_covers_display_and_preserves_mentions() {
+        let raw = "## **See** [lib.rs](zeron-file:src/lib.rs)";
+        let projection = TextProjection::new(raw);
+        let runs = composer_run_plan_enabled(raw, &projection, None, true);
+
+        assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            projection.display.len()
+        );
+        let see = projection.display.find("See").unwrap();
+        let see_run = planned_run_at(&runs, see);
+        assert_eq!(see_run.decor.heading, Some(2));
+        assert!(see_run.decor.bold);
+
+        let mention = &projection.mentions[0].1;
+        let mention_run = planned_run_at(&runs, mention.start);
+        assert!(mention_run.mention);
+        assert_eq!(
+            mention_run.decor,
+            crate::markdown_decor::DecorStyle::default()
+        );
+        assert_eq!(raw, "## **See** [lib.rs](zeron-file:src/lib.rs)");
+    }
+
+    #[test]
+    fn markdown_run_plan_skips_marked_text_and_oversized_inputs() {
+        let raw = "**bold** and `code`";
+        let projection = TextProjection::new(raw);
+        let runs = composer_run_plan_enabled(raw, &projection, Some(&(2..6)), true);
+
+        let bold = projection.display.find("bold").unwrap();
+        let bold_run = planned_run_at(&runs, bold);
+        assert!(bold_run.marked);
+        assert_eq!(bold_run.decor, crate::markdown_decor::DecorStyle::default());
+        let code = projection.display.find("code").unwrap();
+        assert!(planned_run_at(&runs, code).decor.code);
+
+        let oversized = format!("**{}**", "x".repeat(crate::markdown_decor::MAX_DECOR_CHARS));
+        let projection = TextProjection::new(&oversized);
+        let runs = composer_run_plan_enabled(&oversized, &projection, None, true);
+        assert!(runs.iter().all(|run| run.decor == Default::default()));
+    }
+
+    #[test]
+    fn markdown_heading_paint_metrics_do_not_feed_back_into_flip() {
+        assert_eq!(heading_font_size(Some(1), INPUT_TEXT_SIZE), 19.0);
+        assert_eq!(heading_font_size(Some(2), INPUT_TEXT_SIZE), 16.0);
+        assert_eq!(heading_font_size(Some(3), INPUT_TEXT_SIZE), 15.0);
+        assert_eq!(heading_font_size(Some(6), INPUT_TEXT_SIZE), INPUT_TEXT_SIZE);
+
+        let base = TextMeasurements {
+            width: 290.0,
+            height: INPUT_LINE_HEIGHT,
+        };
+        let decorated = TextMeasurements {
+            width: 360.0,
+            height: 27.0,
+        };
+        let flip = stable_flip_measurements(base, decorated);
+        assert_eq!(flip, base);
+        assert!(!composer_flip(false, flip.width, 300.0, false, false));
+    }
+
+    #[test]
+    fn markdown_heading_sizing_never_reaches_mentions_or_marked_text() {
+        let raw = "# [lib.rs](zeron-file:src/lib.rs)";
+        let projection = TextProjection::new(raw);
+        let plans = composer_run_plan_enabled(raw, &projection, None, true);
+        assert_eq!(
+            heading_font_size_for_range(&plans, 0..projection.display.len(), INPUT_TEXT_SIZE),
+            INPUT_TEXT_SIZE
+        );
+
+        let raw = "# heading";
+        let projection = TextProjection::new(raw);
+        let plans = composer_run_plan_enabled(raw, &projection, Some(&(2..5)), true);
+        assert_eq!(
+            heading_font_size_for_range(&plans, 0..projection.display.len(), INPUT_TEXT_SIZE),
+            INPUT_TEXT_SIZE
+        );
+
+        let plans = composer_run_plan_enabled(raw, &projection, None, true);
+        assert_eq!(
+            heading_font_size_for_range(&plans, 0..projection.display.len(), INPUT_TEXT_SIZE),
+            19.0
+        );
     }
 
     #[test]

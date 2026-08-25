@@ -31,6 +31,7 @@ pub mod icons;
 pub mod inline_media;
 pub mod loaders;
 pub mod markdown;
+pub mod markdown_decor;
 pub mod motion;
 pub mod notify;
 pub mod pickers;
@@ -46,6 +47,7 @@ pub mod theme;
 pub mod tool_icons;
 pub mod transcript;
 mod turn_steps;
+mod url_chips;
 pub mod workers;
 
 use std::borrow::Cow;

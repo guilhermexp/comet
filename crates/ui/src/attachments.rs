@@ -12,6 +12,7 @@
 //! round-trip).
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -45,8 +46,9 @@ const MAX_READ_CHUNKS: usize = 1_000;
 // Text transport (message-attachments.ts)
 // ---------------------------------------------------------------------------
 
-/// The body used for image-only sends (`use-attachments.ts`).
-pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
+/// The body used for attachment-only sends (`use-attachments.ts`).
+pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached file(s).";
+const LEGACY_ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
 
 /// How attachments ride the prompt (use-attachments.ts `withAttachments`):
 /// plain local paths appended to the text — the files are staged on the device
@@ -63,9 +65,35 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         text
     };
     format!(
-        "{body}\n\nAttached images (local files — open them to view):\n{}",
+        "{body}\n\nAttached files (local files — open them to view):\n{}",
         refs.join("\n")
     )
+}
+
+#[cfg(test)]
+mod neutral_attachment_wording_tests {
+    use super::{parse_user_message_images, with_attachments};
+
+    #[test]
+    fn builder_is_neutral_and_parser_finds_new_and_legacy_trailers() {
+        let paths = vec!["/tmp/pasted-1.txt".to_string()];
+        let neutral = with_attachments("Review this", &paths);
+        assert_eq!(
+            neutral,
+            "Review this\n\nAttached files (local files — open them to view):\n- /tmp/pasted-1.txt"
+        );
+        let parsed = parse_user_message_images(&neutral);
+        assert_eq!(parsed.text, "Review this");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].path, "/tmp/pasted-1.txt");
+
+        let legacy =
+            "Review this\n\nAttached images (local files — open them to view):\n- /tmp/old.png";
+        let parsed = parse_user_message_images(legacy);
+        assert_eq!(parsed.text, "Review this");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].path, "/tmp/old.png");
+    }
 }
 
 /// An attachment ref parsed back out of a user message's text.
@@ -97,12 +125,13 @@ fn name_from_path(path: &str) -> String {
 }
 
 /// Find the refs trailer: a blank line, then a line starting (case-insensitive)
-/// with `Attached images (local files` and ending `):`. Returns
+/// with `Attached files (local files` or the legacy image-only wording and
+/// ending `):`. Returns
 /// `(body_end, refs_start)` byte offsets — the tolerant equivalent of zeron's
 /// `ATTACHED_IMAGES_RE`.
 fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
-    let needle = "\n\nattached images (local files";
+    let needle = "\n\nattached ";
     let mut from = 0usize;
     while let Some(rel) = lower[from..].find(needle) {
         let gap = from + rel;
@@ -112,7 +141,10 @@ fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
             .map(|p| line_start + p)
             .unwrap_or(content.len());
         let line = content[line_start..line_end].trim_end_matches('\r');
-        if line.ends_with("):") {
+        let lower_line = line.to_ascii_lowercase();
+        let supported = lower_line.starts_with("attached files (local files")
+            || lower_line.starts_with("attached images (local files");
+        if supported && line.ends_with("):") {
             let refs_start = (line_end + 1).min(content.len());
             return Some((gap, refs_start));
         }
@@ -151,7 +183,10 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         };
     }
     ParsedUserMessage {
-        text: if body.trim() == ATTACHMENT_ONLY_TEXT {
+        text: if matches!(
+            body.trim(),
+            ATTACHMENT_ONLY_TEXT | LEGACY_ATTACHMENT_ONLY_TEXT
+        ) {
             String::new()
         } else {
             body.to_string()
@@ -169,8 +204,8 @@ pub fn user_message_rail_text(content: &str) -> String {
     }
     match parsed.attachments.len() {
         0 => content.to_string(),
-        1 => "Attached image".to_string(),
-        n => format!("{n} attached images"),
+        1 => "Attached file".to_string(),
+        n => format!("{n} attached files"),
     }
 }
 
@@ -178,22 +213,105 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// An image staged in the composer, before upload. The raw bytes live inside
-/// the [`Image`] (gpui decodes them at paint; the same Arc feeds thumbnails,
-/// the lightbox, the upload, and the post-send cache seed).
+/// Content carried by the single staged-attachment rail.
+#[derive(Clone)]
+pub enum StagedAttachmentKind {
+    /// Raw bytes live in the compatibility `image` field below.
+    Image,
+    /// Plain bytes delivered like any other attachment; `preview` is the
+    /// first line truncated to 50 characters for the later staged chip.
+    TextFile { bytes: Arc<[u8]>, preview: String },
+}
+
+/// A file staged in the composer, before upload.
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
     /// File name with a type-matching extension (use-attachments.ts
     /// `ensureExtension` — agents sniff images by extension).
     pub name: String,
+    pub kind: StagedAttachmentKind,
+    /// Original path for dropped external files. These ride the prompt by
+    /// path and are never copied into the in-memory upload cache at drop time.
+    pub source_path: Option<std::path::PathBuf>,
+    /// Display/progress size without forcing a source-path attachment into
+    /// memory. For pasted text and images this matches `bytes().len()`.
+    pub size: u64,
+    /// Kept for image-only consumers outside the composer. Text files carry
+    /// an unpainted empty sentinel; `kind` is authoritative and composer
+    /// image paths must go through [`Self::image`].
     pub image: Arc<Image>,
 }
 
 impl StagedAttachment {
     pub fn bytes(&self) -> &[u8] {
-        &self.image.bytes
+        match &self.kind {
+            StagedAttachmentKind::Image => &self.image.bytes,
+            StagedAttachmentKind::TextFile { bytes, .. } => bytes,
+        }
     }
+
+    pub fn image(&self) -> Option<Arc<Image>> {
+        match &self.kind {
+            StagedAttachmentKind::Image => Some(self.image.clone()),
+            StagedAttachmentKind::TextFile { .. } => None,
+        }
+    }
+
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    pub fn byte_len(&self) -> u64 {
+        self.size
+    }
+}
+
+pub fn stage_text_file(name: String, bytes: Vec<u8>, preview: String) -> StagedAttachment {
+    let size = bytes.len() as u64;
+    StagedAttachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        kind: StagedAttachmentKind::TextFile {
+            bytes: Arc::from(bytes),
+            preview,
+        },
+        source_path: None,
+        size,
+        image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+    }
+}
+
+pub fn stage_path_file(path: &Path, size: u64) -> Result<StagedAttachment, String> {
+    let display_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut sample = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| format!("{display_name} could not be read."))?
+        .take(256)
+        .read_to_end(&mut sample)
+        .map_err(|_| format!("{display_name} could not be read."))?;
+    let preview = String::from_utf8_lossy(&sample)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(50)
+        .collect();
+    Ok(StagedAttachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: display_name,
+        kind: StagedAttachmentKind::TextFile {
+            bytes: Arc::from(Vec::new()),
+            preview,
+        },
+        source_path: Some(path.to_path_buf()),
+        size,
+        image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+    })
 }
 
 /// Image formats the whole pipeline supports: intersection of gpui's decoders
@@ -208,6 +326,158 @@ pub fn format_by_extension(path: &Path) -> Option<ImageFormat> {
         "bmp" => Some(ImageFormat::Bmp),
         "tif" | "tiff" => Some(ImageFormat::Tiff),
         _ => None,
+    }
+}
+
+/// File types the drop classifier may turn into project mentions. The path
+/// still has to live under the selected space; this list is only a text hint,
+/// never a reason to read or cache the file at drop time.
+pub fn is_text_file_extension(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "txt"
+            | "text"
+            | "md"
+            | "mdx"
+            | "rst"
+            | "adoc"
+            | "asciidoc"
+            | "log"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "jsonc"
+            | "json5"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "sass"
+            | "less"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "tsx"
+            | "mts"
+            | "cts"
+            | "vue"
+            | "svelte"
+            | "astro"
+            | "rs"
+            | "go"
+            | "py"
+            | "pyi"
+            | "rb"
+            | "php"
+            | "java"
+            | "kt"
+            | "kts"
+            | "scala"
+            | "swift"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hh"
+            | "hpp"
+            | "hxx"
+            | "cs"
+            | "fs"
+            | "fsx"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "ps1"
+            | "sql"
+            | "graphql"
+            | "gql"
+            | "proto"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "env"
+            | "properties"
+            | "gradle"
+            | "cmake"
+            | "hcl"
+            | "tf"
+            | "tfvars"
+            | "nix"
+            | "lua"
+            | "pl"
+            | "pm"
+            | "r"
+            | "ex"
+            | "exs"
+            | "erl"
+            | "hrl"
+            | "clj"
+            | "cljs"
+            | "cljc"
+            | "edn"
+            | "hs"
+            | "lhs"
+            | "elm"
+            | "sol"
+            | "zig"
+            | "vim"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DroppedPathKind {
+    Image,
+    ProjectMention { relative_path: String },
+    ExternalFile { path: std::path::PathBuf, size: u64 },
+    Failure(String),
+}
+
+pub(crate) fn classify_dropped_path(path: &Path, selected_space: Option<&Path>) -> DroppedPathKind {
+    let display_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return DroppedPathKind::Failure(format!("{display_name} could not be read."));
+        }
+    };
+    if std::fs::File::open(path).is_err() {
+        return DroppedPathKind::Failure(format!("{display_name} could not be read."));
+    }
+    if format_by_extension(path).is_some() {
+        return DroppedPathKind::Image;
+    }
+    if is_text_file_extension(path)
+        && let Some(space) = selected_space
+        && let (Ok(path), Ok(space)) = (path.canonicalize(), space.canonicalize())
+        && let Ok(relative) = path.strip_prefix(space)
+    {
+        let relative_path = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !relative_path.is_empty() {
+            return DroppedPathKind::ProjectMention { relative_path };
+        }
+    }
+    DroppedPathKind::ExternalFile {
+        path: path.to_path_buf(),
+        size: metadata.len(),
     }
 }
 
@@ -247,6 +517,9 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     Ok(StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension(&display_name, format),
+        kind: StagedAttachmentKind::Image,
+        source_path: None,
+        size: bytes.len() as u64,
         image: Arc::new(Image::from_bytes(format, bytes)),
     })
 }
@@ -257,7 +530,92 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
     StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension("image", format),
+        kind: StagedAttachmentKind::Image,
+        source_path: None,
+        size: image.bytes.len() as u64,
         image: Arc::new(image),
+    }
+}
+
+#[cfg(test)]
+mod dropped_text_extension_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{DroppedPathKind, classify_dropped_path, is_text_file_extension};
+
+    #[test]
+    fn text_extension_hint_covers_reference_formats_without_claiming_images_or_extensionless() {
+        for path in [
+            "src/main.rs",
+            "README.md",
+            "config.toml",
+            "schema.graphql",
+            "workflow.yml",
+            "component.tsx",
+        ] {
+            assert!(is_text_file_extension(Path::new(path)), "{path}");
+        }
+        assert!(is_text_file_extension(Path::new("NOTES.TXT")));
+        assert!(!is_text_file_extension(Path::new("photo.png")));
+        assert!(!is_text_file_extension(Path::new("LICENSE")));
+    }
+
+    #[test]
+    fn dropped_paths_classify_as_image_project_mention_external_or_named_failure() {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let external = tempfile::tempdir().expect("external tempdir");
+        let source = project.path().join("src");
+        std::fs::create_dir(&source).expect("source dir");
+
+        let image = project.path().join("image.png");
+        let project_text = source.join("main.rs");
+        let external_text = external.path().join("notes.txt");
+        let extensionless = project.path().join("LICENSE");
+        for path in [&image, &project_text, &external_text, &extensionless] {
+            std::fs::write(path, b"first line\nsecond line").expect("fixture");
+        }
+
+        assert_eq!(
+            classify_dropped_path(&image, Some(project.path())),
+            DroppedPathKind::Image
+        );
+        assert_eq!(
+            classify_dropped_path(&project_text, Some(project.path())),
+            DroppedPathKind::ProjectMention {
+                relative_path: "src/main.rs".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_dropped_path(&external_text, Some(project.path())),
+            DroppedPathKind::ExternalFile {
+                path: external_text.clone(),
+                size: 22,
+            }
+        );
+        assert_eq!(
+            classify_dropped_path(&extensionless, Some(project.path())),
+            DroppedPathKind::ExternalFile {
+                path: extensionless.clone(),
+                size: 22,
+            },
+            "extensionless paths must stage instead of disappearing"
+        );
+
+        let missing = project.path().join("missing.txt");
+        let DroppedPathKind::Failure(message) =
+            classify_dropped_path(&missing, Some(project.path()))
+        else {
+            panic!("missing path must fail visibly");
+        };
+        assert!(message.contains("missing.txt"), "{message}");
+
+        assert_eq!(
+            classify_dropped_path(&external_text, None),
+            DroppedPathKind::ExternalFile {
+                path: PathBuf::from(&external_text),
+                size: 22,
+            }
+        );
     }
 }
 
@@ -871,11 +1229,11 @@ mod tests {
     }
 
     #[test]
-    fn rail_text_summarizes_image_only_sends() {
+    fn rail_text_summarizes_attachment_only_sends_neutrally() {
         let one = with_attachments("", &["/a/b.png".to_string()]);
-        assert_eq!(user_message_rail_text(&one), "Attached image");
+        assert_eq!(user_message_rail_text(&one), "Attached file");
         let two = with_attachments("", &["/a/b.png".to_string(), "/c/d.png".into()]);
-        assert_eq!(user_message_rail_text(&two), "2 attached images");
+        assert_eq!(user_message_rail_text(&two), "2 attached files");
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");

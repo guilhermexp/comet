@@ -59,10 +59,31 @@ impl Harness for AckHarness {
             "prompt reached the harness with unresolved pending refs: {}",
             request.prompt
         );
+        assert_eq!(
+            request.attachments.len(),
+            1,
+            "the staged text file must reach the run request attachment rail"
+        );
+        assert!(
+            request
+                .prompt
+                .contains("Attached files (local files — open them to view):"),
+            "the run prompt must use the media-neutral attachment trailer: {}",
+            request.prompt
+        );
         for path in &request.attachments {
             assert!(
                 std::path::Path::new(path).is_file(),
                 "attachment path not a real file: {path}"
+            );
+            assert!(
+                request.prompt.contains(path),
+                "the prompt must list the same local path delivered to the harness: {path}"
+            );
+            assert_eq!(
+                std::fs::read(path).expect("read delivered text attachment"),
+                b"plain text attachment bytes",
+                "the run device must receive the original TextFile bytes"
             );
         }
         let events: Vec<Result<AgentEvent, HarnessError>> = vec![
@@ -119,7 +140,7 @@ fn run_payload(message_id: &str, pending_ref: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
             prompt: format!(
-                "look at this\n\nAttached images (local files — open them to view):\n- {pending_ref}"
+                "look at this\n\nAttached files (local files — open them to view):\n- {pending_ref}"
             ),
             harness: None,
             model: None,
@@ -139,7 +160,7 @@ fn run_payload(message_id: &str, pending_ref: &str) -> SessionCommandPayload {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
+async fn text_file_bytes_land_then_execute_with_rewritten_path_in_prompt() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(AckHarness));
@@ -165,8 +186,8 @@ async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
 
     // Queue a Run whose attachment bytes have NOT landed yet: it must sit
     // Pending — deferred, unprocessed, no turn — instead of running without
-    // its image (or worse, handing the harness a dangling ref).
-    let pending_ref = "pending://att-1/photo one.png";
+    // its text file (or worse, handing the harness a dangling ref).
+    let pending_ref = "pending://att-1/pasted-1.txt";
     core.doc_host
         .queue_command(CHAT, run_payload("msg-qa-1", pending_ref))
         .expect("queue run command");
@@ -197,7 +218,7 @@ async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
         .call(
             zeron_rpc::methods::UPLOAD_CHUNK,
             serde_json::json!({
-                "uploadId": "att-1", "seq": 0, "data": BASE64.encode(b"png-bytes"),
+                "uploadId": "att-1", "seq": 0, "data": BASE64.encode(b"plain text attachment bytes"),
             }),
         )
         .await
@@ -205,7 +226,7 @@ async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
     client
         .call(
             zeron_rpc::methods::UPLOAD_COMMIT,
-            serde_json::json!({ "uploadId": "att-1", "fileName": "photo one.png" }),
+            serde_json::json!({ "uploadId": "att-1", "fileName": "pasted-1.txt" }),
         )
         .await
         .expect("upload commit");
@@ -233,7 +254,7 @@ async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
         "persisted text must not leak pending refs: {user_text}"
     );
     assert!(
-        user_text.contains("att-1-photo_one.png"),
+        user_text.contains("att-1-pasted-1.txt"),
         "persisted text names the committed file: {user_text}"
     );
 
