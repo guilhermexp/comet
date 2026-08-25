@@ -30,8 +30,8 @@
 
 **must_haves:** every staged non-image item is visible, labeled, sized, and removable before send.
 
-- [ ] C7 Render TextFile attachments in the staged strip as chips: icon block, first-line title (≤20 chars + …), subtitle `Pasted Text · <size>` (or the file name for dropped files), hover ×, min 120/max 200 px, beside the image thumbnails. files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer` + visual check.
-- [ ] C8 Chip removal and per-chat persistence match image behavior (navigate away and back keeps them; remove deletes only the one chip). files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer`.
+- [x] C7 Render TextFile attachments in the staged strip as chips: icon block, first-line title (≤20 chars + …), subtitle `Pasted Text · <size>` (or the file name for dropped files), hover ×, min 120/max 200 px, beside the image thumbnails. files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer` + visual check.
+- [x] C8 Chip removal and per-chat persistence match image behavior (navigate away and back keeps them; remove deletes only the one chip). files: `crates/ui/src/composer.rs`. verify: `cargo test -p zeron-ui composer`.
 
 ## 4. Markdown decoration (paint-only)
 

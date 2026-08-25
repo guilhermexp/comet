@@ -309,18 +309,37 @@ pub const STRIP_THUMB: f32 = 56.0;
 pub const STRIP_GAP: f32 = 8.0;
 pub const STRIP_PAD_TOP: f32 = 12.0;
 pub const STRIP_PAD_X: f32 = 16.0;
+pub const TEXT_CHIP_MIN_WIDTH: f32 = 120.0;
+pub const TEXT_CHIP_MAX_WIDTH: f32 = 200.0;
+pub const TEXT_CHIP_HEIGHT: f32 = 52.0;
 
-/// Height the wrap strip adds to the pill for `count` staged thumbnails at an
-/// `inner_width` pill content width (0 when empty). Mirrors flex-wrap: as many
-/// 56px thumbs per row as fit with 8px gaps inside the 16px side insets.
-pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
-    if count == 0 {
+/// Height the wrap strip adds to the pill for its actual child sizes. Text
+/// chips are wider and shorter than thumbnails, so a count-only estimate can
+/// disagree with flex-wrap and feed unstable heights into the pill flip.
+pub fn attachment_strip_height(items: &[(f32, f32)], inner_width: f32) -> f32 {
+    if items.is_empty() {
         return 0.0;
     }
-    let usable = (inner_width - 2.0 * STRIP_PAD_X).max(STRIP_THUMB);
-    let per_row = (((usable + STRIP_GAP) / (STRIP_THUMB + STRIP_GAP)).floor() as usize).max(1);
-    let rows = count.div_ceil(per_row);
-    STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
+    let usable = (inner_width - 2.0 * STRIP_PAD_X).max(1.0);
+    let mut height = STRIP_PAD_TOP;
+    let mut row_width = 0.0;
+    let mut row_height: f32 = 0.0;
+    for &(width, item_height) in items {
+        let next_width = if row_width == 0.0 {
+            width
+        } else {
+            row_width + STRIP_GAP + width
+        };
+        if row_width > 0.0 && next_width > usable {
+            height += row_height + STRIP_GAP;
+            row_width = width;
+            row_height = item_height;
+        } else {
+            row_width = next_width;
+            row_height = row_height.max(item_height);
+        }
+    }
+    height + row_height
 }
 
 pub fn comment_strip_height(count: usize) -> f32 {
@@ -588,6 +607,69 @@ fn merge_restored_attachments(
             restored.push(attachment);
         }
     }
+}
+
+fn remove_staged_attachment(
+    attachments: &mut HashMap<String, Vec<StagedAttachment>>,
+    key: &str,
+    id: &str,
+) -> bool {
+    let Some(list) = attachments.get_mut(key) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|attachment| attachment.id != id);
+    let removed = list.len() != before;
+    if list.is_empty() {
+        attachments.remove(key);
+    }
+    removed
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StagedTextChip {
+    title: String,
+    subtitle: String,
+    width: f32,
+}
+
+fn format_attachment_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn staged_text_chip(attachment: &StagedAttachment) -> Option<StagedTextChip> {
+    let attachments::StagedAttachmentKind::TextFile { preview, .. } = &attachment.kind else {
+        return None;
+    };
+    let source = preview.lines().next().unwrap_or_default().trim();
+    let source = if source.is_empty() {
+        attachment.name.as_str()
+    } else {
+        source
+    };
+    let mut chars = source.chars();
+    let mut title: String = chars.by_ref().take(20).collect();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    let subtitle = if attachment.source_path().is_some() {
+        attachment.name.clone()
+    } else {
+        format!("Pasted Text · {}", format_attachment_size(attachment.byte_len()))
+    };
+    let text_chars = title.chars().count().max(subtitle.chars().count()) as f32;
+    let width = (60.0 + text_chars * 6.0).clamp(TEXT_CHIP_MIN_WIDTH, TEXT_CHIP_MAX_WIDTH);
+    Some(StagedTextChip {
+        title,
+        subtitle,
+        width,
+    })
 }
 
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
@@ -4213,12 +4295,7 @@ impl Composer {
     }
 
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(list) = self.attachments.get_mut(&self.current_key) {
-            list.retain(|a| a.id != id);
-            if list.is_empty() {
-                self.attachments.remove(&self.current_key);
-            }
-        }
+        remove_staged_attachment(&mut self.attachments, &self.current_key, id);
         cx.notify();
     }
 
@@ -4264,16 +4341,10 @@ impl Composer {
         )
     }
 
-    /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
-    /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
-    /// revealed on hover, click opens the full-size preview.
+    /// Shared staged rail: square image thumbnails and labeled text chips in
+    /// source order, all with the same hover remove affordance.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let staged: Vec<_> = self
-            .staged()
-            .iter()
-            .filter_map(|attachment| attachment.image().map(|image| (attachment, image)))
-            .collect();
-        if staged.is_empty() {
+        if self.staged().is_empty() {
             return None;
         }
         let mut strip = div()
@@ -4283,14 +4354,40 @@ impl Composer {
             .gap(px(STRIP_GAP))
             .px(px(STRIP_PAD_X))
             .pt(px(STRIP_PAD_TOP));
-        for (ix, (att, image)) in staged.into_iter().enumerate() {
+        for (ix, att) in self.staged().iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let preview = attachments::PreviewImage {
-                name: att.name.clone().into(),
-                image: image.clone(),
-            };
             let remove_id = att.id.clone();
-            strip = strip.child(
+            let remove = crate::frost::layered(
+                div()
+                    .id(("composer-att-remove", ix))
+                    .absolute()
+                    .top(px(-6.0))
+                    .right(px(-6.0))
+                    .size(px(18.0))
+                    .rounded_full()
+                    .bg(theme.bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .shadow_sm()
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |style| style.opacity(1.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_attachment(&remove_id, cx);
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    ),
+            );
+            let item = if let Some(image) = att.image() {
+                let preview = attachments::PreviewImage {
+                    name: att.name.clone().into(),
+                    image: image.clone(),
+                };
                 div()
                     .group(group.clone())
                     .relative()
@@ -4326,45 +4423,78 @@ impl Composer {
                                     .object_fit(ObjectFit::Cover),
                             ),
                     )
-                    // Own layer: inside the frosted pill everything shares one
-                    // draw order and images render last, so without it the
-                    // thumbnail paints OVER this button (user report).
-                    .child(crate::frost::layered(
+                    // Images paint late inside the frosted pill; keep remove
+                    // on its own layer so the thumbnail cannot cover it.
+                    .child(remove)
+            } else if let Some(copy) = staged_text_chip(att) {
+                let title: SharedString = copy.title.into();
+                let subtitle: SharedString = copy.subtitle.into();
+                div()
+                    .group(group)
+                    .relative()
+                    .w(px(copy.width))
+                    .min_w(px(TEXT_CHIP_MIN_WIDTH))
+                    .max_w(px(TEXT_CHIP_MAX_WIDTH))
+                    .h(px(TEXT_CHIP_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(7.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .bg(crate::theme::ink(0.035))
+                    .child(
                         div()
-                            .id(("composer-att-remove", ix))
-                            .absolute()
-                            .top(px(-6.0))
-                            .right(px(-6.0))
-                            .size(px(18.0))
-                            .rounded_full()
-                            .bg(theme.bg)
+                            .size(px(36.0))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .cursor_pointer()
-                            .shadow_sm()
-                            .opacity(0.0)
-                            .group_hover(group, |s| s.opacity(1.0))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // The button overhangs the thumbnail, whose
-                                // hitbox is right underneath — don't let the
-                                // same click also open the preview.
-                                cx.stop_propagation();
-                                this.remove_attachment(&remove_id, cx);
-                            }))
+                            .rounded(px(7.0))
+                            .bg(crate::theme::ink(0.06))
                             .child(
-                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
-                                    .size(px(14.0))
+                                crate::icons::icon(crate::icons::DOCUMENT)
+                                    .size(px(17.0))
                                     .text_color(theme.text_muted),
                             ),
-                    )),
-            );
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .line_height(px(15.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .line_height(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.72))
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(remove)
+            } else {
+                continue;
+            };
+            strip = strip.child(item);
         }
         Some(strip)
     }
 
-    /// Paperclip: the native image picker (the original's hidden
-    /// `<input type=file accept=image/* multiple>`).
+    /// Paperclip: the native file picker; paths feed the same honest
+    /// image/mention/source-path classification as paste and drop.
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -5394,7 +5524,7 @@ impl Composer {
                         .filter(|attachment| attachment.source_path().is_none())
                         .map(StagedAttachment::byte_len)
                         .sum();
-                    {
+                    if has_uploads {
                         let progress = progress.clone();
                         this.update(cx, |composer, cx| {
                             composer.state.update(cx, |s, cx| {
@@ -5437,7 +5567,7 @@ impl Composer {
                     const LEGACY_UPLOAD_BUDGET: std::time::Duration =
                         std::time::Duration::from_secs(300);
                     let upload_started = std::time::Instant::now();
-                    {
+                    if has_uploads {
                         let progress = progress.clone();
                         this.update(cx, |composer, cx| {
                             composer.state.update(cx, |s, cx| {
@@ -6621,13 +6751,17 @@ impl Render for Composer {
         // `morph_t`) animates. Steady state renders exactly the target.
         // Staged attachments add the wrap strip's height to the pill in BOTH
         // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
-        let staged_count = self
+        let staged_sizes: Vec<(f32, f32)> = self
             .staged()
             .iter()
-            .filter(|attachment| attachment.image().is_some())
-            .count();
+            .map(|attachment| {
+                staged_text_chip(attachment)
+                    .map(|chip| (chip.width, TEXT_CHIP_HEIGHT))
+                    .unwrap_or((STRIP_THUMB, STRIP_THUMB))
+            })
+            .collect();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
-        let strip_h = attachment_strip_height(staged_count, strip_width_hint);
+        let strip_h = attachment_strip_height(&staged_sizes, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if expanded {
             composer_total_height(content_height)
@@ -6959,6 +7093,66 @@ mod tests {
             &attachment.kind,
             attachments::StagedAttachmentKind::TextFile { .. }
         )));
+    }
+
+    #[test]
+    fn staged_text_chip_copy_truncates_unicode_and_formats_source_and_size() {
+        let pasted = attachments::stage_text_file(
+            "pasted-1.txt".into(),
+            vec![b'x'; 464_179],
+            "12345678901234567890extra".into(),
+        );
+        let pasted_copy = staged_text_chip(&pasted).expect("text chip");
+        assert_eq!(pasted_copy.title, "12345678901234567890…");
+        assert_eq!(pasted_copy.subtitle, "Pasted Text · 453.3 KB");
+        assert!((TEXT_CHIP_MIN_WIDTH..=TEXT_CHIP_MAX_WIDTH).contains(&pasted_copy.width));
+
+        let external = tempfile::tempdir().expect("external tempdir");
+        let path = external.path().join("dropped.txt");
+        std::fs::write(&path, "first line\nsecond").expect("fixture");
+        let dropped = attachments::stage_path_file(&path, 17).expect("stage path");
+        let dropped_copy = staged_text_chip(&dropped).expect("text chip");
+        assert_eq!(dropped_copy.title, "first line");
+        assert_eq!(dropped_copy.subtitle, "dropped.txt");
+
+        assert_eq!(format_attachment_size(999), "999 B");
+        assert_eq!(format_attachment_size(1_048_576), "1.0 MB");
+    }
+
+    #[test]
+    fn attachment_strip_height_wraps_real_thumbnail_and_text_chip_sizes() {
+        assert_eq!(attachment_strip_height(&[], 240.0), 0.0);
+        assert_eq!(
+            attachment_strip_height(&[(STRIP_THUMB, STRIP_THUMB), (120.0, TEXT_CHIP_HEIGHT)], 240.0),
+            STRIP_PAD_TOP + STRIP_THUMB,
+            "a thumbnail and minimum-width chip fit the same row"
+        );
+        assert_eq!(
+            attachment_strip_height(&[(120.0, TEXT_CHIP_HEIGHT), (120.0, TEXT_CHIP_HEIGHT)], 240.0),
+            STRIP_PAD_TOP + TEXT_CHIP_HEIGHT * 2.0 + STRIP_GAP,
+            "chip widths, not item count, decide wrapping"
+        );
+        assert_eq!(
+            attachment_strip_height(&[(200.0, TEXT_CHIP_HEIGHT), (STRIP_THUMB, STRIP_THUMB)], 240.0),
+            STRIP_PAD_TOP + TEXT_CHIP_HEIGHT + STRIP_GAP + STRIP_THUMB,
+            "each row contributes its tallest real child"
+        );
+    }
+
+    #[test]
+    fn removing_one_staged_chip_preserves_its_sibling_and_other_chat() {
+        let first = attachments::stage_text_file("first.txt".into(), vec![1], "first".into());
+        let second = attachments::stage_text_file("second.txt".into(), vec![2], "second".into());
+        let other = attachments::stage_text_file("other.txt".into(), vec![3], "other".into());
+        let mut by_chat = HashMap::from([
+            ("chat-a".to_string(), vec![first.clone(), second.clone()]),
+            ("chat-b".to_string(), vec![other.clone()]),
+        ]);
+
+        assert!(remove_staged_attachment(&mut by_chat, "chat-a", &first.id));
+        assert_eq!(by_chat["chat-a"].len(), 1);
+        assert_eq!(by_chat["chat-a"][0].id, second.id);
+        assert_eq!(by_chat["chat-b"][0].id, other.id);
     }
 
     #[test]
