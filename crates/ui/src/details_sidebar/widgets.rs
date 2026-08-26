@@ -45,6 +45,7 @@ pub struct ChatWorkersWidgetState {
     context_key: Option<String>,
     selected_tab: Option<ChatWorkersTab>,
     activity_expansion: HashMap<String, bool>,
+    dispatch_counts: Option<[usize; 3]>,
 }
 
 impl ChatWorkersWidgetState {
@@ -55,6 +56,9 @@ impl ChatWorkersWidgetState {
         self.context_key = context_key.map(str::to_owned);
         self.selected_tab = None;
         self.activity_expansion.clear();
+        // Re-baseline: comparing the new chat's rows against the old chat's
+        // counts reads as a dispatch that never happened.
+        self.dispatch_counts = None;
         true
     }
 
@@ -65,6 +69,32 @@ impl ChatWorkersWidgetState {
 
     pub fn select(&mut self, tab: ChatWorkersTab) {
         self.selected_tab = Some(tab);
+    }
+
+    /// A tab whose count just grew is where the work the user just launched
+    /// went, so it takes focus — including over an explicit selection, which
+    /// was the whole complaint: dispatching a worker from a chat parked on
+    /// Subagents left the user watching an unrelated list. The first sync only
+    /// records the baseline, so opening a chat that already has rows does not
+    /// yank the tab out from under the reader.
+    pub fn sync_dispatch(&mut self, workflows: usize, subagents: usize, workers: usize) {
+        let next = [workflows, subagents, workers];
+        let Some(previous) = self.dispatch_counts.replace(next) else {
+            return;
+        };
+        // Coarsest dispatch first: a workflow or a worker launch also mints
+        // the subagent rows beneath it, and the tab the user meant is the one
+        // they dispatched, not its byproduct.
+        for (tab, ix) in [
+            (ChatWorkersTab::Workflows, 0),
+            (ChatWorkersTab::Workers, 2),
+            (ChatWorkersTab::Subagents, 1),
+        ] {
+            if next[ix] > previous[ix] {
+                self.selected_tab = Some(tab);
+                return;
+            }
+        }
     }
 
     pub fn sync_activities<'a>(&mut self, activity_ids: impl IntoIterator<Item = &'a str>) {
@@ -258,6 +288,59 @@ mod tests {
             auto_tab(0, 0, workers_tab_presence(0, true)),
             ChatWorkersTab::Workers
         );
+    }
+
+    #[test]
+    fn a_dispatch_pulls_focus_to_its_own_tab_over_an_explicit_selection() {
+        let mut state = ChatWorkersWidgetState::default();
+        state.sync_dispatch(0, 2, 0);
+        state.select(ChatWorkersTab::Subagents);
+        assert_eq!(state.active_tab(0, 2, 0), ChatWorkersTab::Subagents);
+
+        state.sync_dispatch(0, 2, 1);
+        assert_eq!(
+            state.active_tab(0, 2, 1),
+            ChatWorkersTab::Workers,
+            "a launched worker takes focus off the tab the user was parked on"
+        );
+
+        state.sync_dispatch(0, 3, 1);
+        assert_eq!(state.active_tab(0, 3, 1), ChatWorkersTab::Subagents);
+    }
+
+    #[test]
+    fn the_first_sync_is_a_baseline_and_a_finished_row_never_steals_focus() {
+        let mut state = ChatWorkersWidgetState::default();
+        // Opening a chat that already has workers must not override the
+        // auto order — nothing was dispatched, the rows were already there.
+        state.sync_dispatch(1, 0, 4);
+        assert_eq!(state.active_tab(1, 0, 4), ChatWorkersTab::Workflows);
+
+        // Rows leaving is not a dispatch either.
+        state.select(ChatWorkersTab::Workflows);
+        state.sync_dispatch(1, 0, 2);
+        assert_eq!(state.active_tab(1, 0, 2), ChatWorkersTab::Workflows);
+    }
+
+    #[test]
+    fn a_worker_launch_that_also_mints_subagents_lands_on_the_worker() {
+        let mut state = ChatWorkersWidgetState::default();
+        state.sync_dispatch(0, 1, 0);
+        state.sync_dispatch(0, 2, 1);
+
+        assert_eq!(state.active_tab(0, 2, 1), ChatWorkersTab::Workers);
+    }
+
+    #[test]
+    fn switching_chats_rebaselines_instead_of_reading_a_dispatch() {
+        let mut state = ChatWorkersWidgetState::default();
+        state.sync_context(Some("chat-a"));
+        state.sync_dispatch(0, 0, 0);
+
+        state.sync_context(Some("chat-b"));
+        state.sync_dispatch(2, 0, 5);
+
+        assert_eq!(state.active_tab(2, 0, 5), ChatWorkersTab::Workflows);
     }
 
     #[test]
