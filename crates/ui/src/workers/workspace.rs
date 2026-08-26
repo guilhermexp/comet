@@ -898,7 +898,14 @@ impl WorkersSidebar {
                 div()
                     .min_w_0()
                     .flex_1()
-                    .truncate()
+                    // Elipse no MEIO, não na cauda: o título é o prompt do
+                    // brief, e briefs irmãos compartilham prefixo longo
+                    // ("Leia /tmp/orch-jk-inta…"). Cortando a cauda, dois
+                    // workers diferentes viravam a mesma linha — e uma delas
+                    // ficando ativa parecia a outra reiniciando o contador.
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis_middle()
                     .text_size(px(SIDEBAR_LABEL_SIZE))
                     .text_color(if selected {
                         theme.text
@@ -3016,15 +3023,30 @@ impl WorkersContent {
 
     fn render_session(&self, session: WorkersSession, theme: &Theme) -> AnyElement {
         let live = session.is_live();
+        // O terminal entra viva ou parada. `set_session` ja aponta pra sessao
+        // selecionada nos dois casos e inicia o historical_replay, entao a
+        // saida retida esta pronta pra pintar — trocar por um aviso jogava
+        // fora um scrollback que continua inteiro no disco, e apagava da tela
+        // a sessao que o usuario estava lendo no instante em que ela morre.
         workers_session_surface(theme)
-            .when(live, |el| el.child(self.terminal.clone()))
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().child(self.terminal.clone()))
             .when(!live, |el| {
-                el.flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_faint)
-                    .child("This worker has stopped. Use its context menu to continue.")
+                el.child(
+                    div()
+                        .flex_none()
+                        .h(px(26.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_t_1()
+                        .border_color(theme.border.opacity(0.55))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child("This worker has stopped. Use its context menu to continue."),
+                )
             })
             .into_any_element()
     }
