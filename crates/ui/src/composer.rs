@@ -313,35 +313,6 @@ pub const TEXT_CHIP_MIN_WIDTH: f32 = 120.0;
 pub const TEXT_CHIP_MAX_WIDTH: f32 = 200.0;
 pub const TEXT_CHIP_HEIGHT: f32 = 52.0;
 
-/// Height the wrap strip adds to the pill for its actual child sizes. Text
-/// chips are wider and shorter than thumbnails, so a count-only estimate can
-/// disagree with flex-wrap and feed unstable heights into the pill flip.
-pub fn attachment_strip_height(items: &[(f32, f32)], inner_width: f32) -> f32 {
-    if items.is_empty() {
-        return 0.0;
-    }
-    let usable = (inner_width - 2.0 * STRIP_PAD_X).max(1.0);
-    let mut height = STRIP_PAD_TOP;
-    let mut row_width = 0.0;
-    let mut row_height: f32 = 0.0;
-    for &(width, item_height) in items {
-        let next_width = if row_width == 0.0 {
-            width
-        } else {
-            row_width + STRIP_GAP + width
-        };
-        if row_width > 0.0 && next_width > usable {
-            height += row_height + STRIP_GAP;
-            row_width = width;
-            row_height = item_height;
-        } else {
-            row_width = next_width;
-            row_height = row_height.max(item_height);
-        }
-    }
-    height + row_height
-}
-
 pub fn comment_strip_height(count: usize) -> f32 {
     if count == 0 {
         return 0.0;
@@ -4356,7 +4327,9 @@ impl Composer {
             .flex_wrap()
             .gap(px(STRIP_GAP))
             .px(px(STRIP_PAD_X))
-            .pt(px(STRIP_PAD_TOP));
+            // Acima do pill, o respiro vai EMBAIXO: o strip separa do pill,
+            // nao do topo de uma caixa que ele nao habita mais.
+            .pb(px(STRIP_PAD_TOP));
         for (ix, att) in self.staged().iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
             let remove_id = att.id.clone();
@@ -6752,26 +6725,16 @@ impl Render for Composer {
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
         // `morph_t`) animates. Steady state renders exactly the target.
-        // Staged attachments add the wrap strip's height to the pill in BOTH
-        // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
-        let staged_sizes: Vec<(f32, f32)> = self
-            .staged()
-            .iter()
-            .map(|attachment| {
-                staged_text_chip(attachment)
-                    .map(|chip| (chip.width, TEXT_CHIP_HEIGHT))
-                    .unwrap_or((STRIP_THUMB, STRIP_THUMB))
-            })
-            .collect();
-        let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
-        let strip_h = attachment_strip_height(&staged_sizes, strip_width_hint);
+        // O strip de anexos NAO entra nesta conta: ele mora acima do pill, no
+        // container, igual ao card da mensagem enviada. Dentro do pill ele
+        // inchava a caixa de texto a cada anexo.
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if expanded {
             composer_total_height(content_height)
         } else {
             COMPACT_TOTAL_HEIGHT
         };
-        let target_height = base_height + strip_h + comment_strip_h;
+        let target_height = base_height + comment_strip_h;
         let (pill_height, morph_t, morphing) = match self.flip_morph {
             Some(m) if !m.done(now_ms) => {
                 (m.height(target_height, now_ms), m.progress(now_ms), true)
@@ -6857,7 +6820,6 @@ impl Render for Composer {
                 .flex()
                 .flex_col()
                 .children(comments_chip)
-                .children(strip)
                 .child(
                     div()
                         .h(px(
@@ -6911,7 +6873,6 @@ impl Render for Composer {
                 .flex_col()
                 .justify_end()
                 .children(comments_chip)
-                .children(strip)
                 .child(
                     div()
                         .h(px(COMPACT_TOTAL_HEIGHT - PILL_BORDER_V))
@@ -6954,7 +6915,7 @@ impl Render for Composer {
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(crate::frost::frosted(
+        let container = container.children(strip).child(crate::frost::frosted(
             26.0,
             16.0,
             motion::fade_quick("composer-input", body),
@@ -7120,35 +7081,6 @@ mod tests {
 
         assert_eq!(format_attachment_size(999), "999 B");
         assert_eq!(format_attachment_size(1_048_576), "1.0 MB");
-    }
-
-    #[test]
-    fn attachment_strip_height_wraps_real_thumbnail_and_text_chip_sizes() {
-        assert_eq!(attachment_strip_height(&[], 240.0), 0.0);
-        assert_eq!(
-            attachment_strip_height(
-                &[(STRIP_THUMB, STRIP_THUMB), (120.0, TEXT_CHIP_HEIGHT)],
-                240.0
-            ),
-            STRIP_PAD_TOP + STRIP_THUMB,
-            "a thumbnail and minimum-width chip fit the same row"
-        );
-        assert_eq!(
-            attachment_strip_height(
-                &[(120.0, TEXT_CHIP_HEIGHT), (120.0, TEXT_CHIP_HEIGHT)],
-                240.0
-            ),
-            STRIP_PAD_TOP + TEXT_CHIP_HEIGHT * 2.0 + STRIP_GAP,
-            "chip widths, not item count, decide wrapping"
-        );
-        assert_eq!(
-            attachment_strip_height(
-                &[(200.0, TEXT_CHIP_HEIGHT), (STRIP_THUMB, STRIP_THUMB)],
-                240.0
-            ),
-            STRIP_PAD_TOP + TEXT_CHIP_HEIGHT + STRIP_GAP + STRIP_THUMB,
-            "each row contributes its tallest real child"
-        );
     }
 
     #[test]
