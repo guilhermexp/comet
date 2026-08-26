@@ -18,6 +18,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Animação é camada de **paint**: `with_animation` sobre opacidade nunca altera layout. `prefers-reduced-motion` é honrado.
 - Altura de linha em code block = linhas × line-height, independente do highlight; o highlight roda time-sliced em background e entra como run de texto (paint-only).
 - Transcript é por **bloco**, não por mensagem: id estável `msgId#blockId`, turno vivo não splitado, re-split na persistência. Eco otimista compartilha o id cunhado no cliente pra persistência não piscar.
+- **Chat Transcript Export é uma projeção pura do transcript**: `chat_export.rs` percorre `&[SessionMessageEntry]` uma vez para formar um único `ExportDoc`, e Markdown/Text/JSON derivam somente dele. Nunca lê Run Journal, resolve `output_ref`/`diff_ref` ou importa gpui/I/O; tools usam `zeron_proto::view::tool_chip_content`, e só o `ToolCall` já sanitizado decide quais comando/path aparecem.
 - Chips GitHub/YouTube existem só em mensagens de usuário já enviadas: `url_chips.rs` segmenta e projeta o texto uma vez em `rows_for_entry`, e a row cacheia spans clicáveis. O paint só consome esses spans; input, assistente e outras URLs continuam texto, a pontuação final fica fora do chip e a mensagem persistida nunca muda.
 - Cards do usuário são sticky por turno: um clone paint-only do renderer existente ocupa o inset do runway e é empurrado pelo próximo user row. A geometria é per-chat, não altera altura da lista, não substitui o runway e não duplica o original quando ele já ocupa a posição.
 - O wrapper externo do sticky é transparente; a oclusão/blur e o bloqueio de mouse/hover subjacente ficam limitados ao card interno arredondado, enquanto wheel/touch continuam chegando ao transcript.
@@ -66,6 +67,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/**` (estado, derivações, parse de markdown) | unit | `cargo test -p zeron-ui` |
+| `src/chat_export.rs` (ExportDoc, artifacts, Markdown/Text/JSON e filename) | unit | `cargo test -p zeron-ui --lib chat_export` |
 | `src/url_chips.rs` + projeção da row de usuário | unit | `cargo test -p zeron-ui url_chips` · `cargo test -p zeron-ui transcript` |
 | `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p zeron-ui` |
 | `src/markdown/render.rs` (invalidação do `RenderCache`) | unit — chaves derivadas caem junto com a row | `cargo test -p zeron-ui invalidate_row` |
@@ -76,4 +78,4 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Child DOX Index
 
-Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Os módulos-raiz `composer.rs` e `markdown_decor.rs` também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.
+Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Os módulos-raiz `chat_export.rs`, `composer.rs` e `markdown_decor.rs` também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.

@@ -82,7 +82,7 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 
 | Domínio | Doc | O que mora ali |
 |---|---|---|
-| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 9 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, MCP, updater, UI/composer e decoração markdown |
+| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 9 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, MCP, updater, UI/composer, export de Chat Transcript e decoração markdown |
 | Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/comet` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |

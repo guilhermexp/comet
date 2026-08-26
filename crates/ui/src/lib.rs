@@ -19,6 +19,7 @@ pub mod badges;
 mod capture;
 pub mod change_requests;
 pub mod changes;
+pub(crate) mod chat_export;
 pub mod comments;
 pub mod composer;
 pub mod details_sidebar;
