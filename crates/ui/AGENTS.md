@@ -24,6 +24,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Cards do usuário são sticky por turno: um clone paint-only do renderer existente ocupa o inset do runway e é empurrado pelo próximo user row. A geometria é per-chat, não altera altura da lista, não substitui o runway e não duplica o original quando ele já ocupa a posição.
 - O wrapper externo do sticky é transparente; a oclusão/blur e o bloqueio de mouse/hover subjacente ficam limitados ao card interno arredondado, enquanto wheel/touch continuam chegando ao transcript.
 - `TurnSteps` e a projeção de mudanças de arquivo mantêm ids estáveis; previews de Write/Edit renderizam somente o conteúdo limitado que veio do doc.
+- `TurnSteps` só existe em turno assentado: enquanto `status == Streaming` o turno inteiro fica aberto, e o fold nasce ao assentar reaproveitando os ids das rows vivas.
 - Dentro de `TurnSteps` expandido, grupos de tools mostram os cards individuais por padrão; stdout, invocações e diffs internos continuam fechados, e toggle explícito do usuário prevalece.
 - Cards inline de arquivo mantêm expansão, lazy fetch e `ScrollHandle` interno no `Transcript`, keyed pelo row id estável, para virtualização e TurnSteps não resetarem o card.
 - Input histórico de arquivo é derivado/highlighted fora do render; corpos grandes usam `uniform_list`, e linhas lógicas patológicas são divididas em paint rows completos de até 512 caracteres antes do cache.

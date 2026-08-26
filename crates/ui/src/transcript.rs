@@ -54,7 +54,7 @@ use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
-use crate::turn_steps::{TurnStepsMode, plan_turn_steps};
+use crate::turn_steps::plan_turn_steps;
 use comet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
@@ -1198,17 +1198,8 @@ fn settle_turn_steps_child(row: &mut Row) {
     }
 }
 
-fn turn_steps_version(
-    mode: TurnStepsMode,
-    summary: &str,
-    duration_ms: Option<u64>,
-    rows: &[Row],
-) -> u64 {
+fn turn_steps_version(summary: &str, duration_ms: Option<u64>, rows: &[Row]) -> u64 {
     let mut bytes = Vec::new();
-    bytes.push(match mode {
-        TurnStepsMode::StreamingPrefix => 0,
-        TurnStepsMode::FinalAnswer => 1,
-    });
     bytes.extend_from_slice(&(summary.len() as u64).to_le_bytes());
     bytes.extend_from_slice(summary.as_bytes());
     match duration_ms {
@@ -1774,7 +1765,7 @@ fn rows_for_entry_with_todo_history(
         settle_turn_steps_child(child);
     }
     let turn_start = children.first().is_some_and(|row| row.turn_start);
-    let version = turn_steps_version(plan.mode, &plan.summary, entry.duration_ms, &children);
+    let version = turn_steps_version(&plan.summary, entry.duration_ms, &children);
     let steps = Row {
         id: format!("{}#steps", entry.id).into(),
         version,
@@ -9017,7 +9008,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_turn_streaming_keeps_unresolved_tools_and_latest_text_top_level() {
+    fn assistant_turn_streaming_folds_nothing() {
         let mut unresolved_a = tool_part("exec-a", "cargo test");
         let mut unresolved_b = tool_part("exec-b", "cargo check");
         for part in [&mut unresolved_a, &mut unresolved_b] {
@@ -9038,19 +9029,22 @@ mod tests {
         );
 
         let rows = rows_for_entry(&entry, false, &mut parse);
-        assert_eq!(rows[0].id.as_ref(), "assistant-live-tools#steps");
-        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
-            panic!("completed prefix should be folded while streaming");
-        };
-        assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
-        assert!(matches!(children[1].kind, RowKind::ToolGroup { .. }));
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.kind, RowKind::TurnSteps { .. })),
+            "a live turn keeps every step on screen"
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::LiveMarkdown { .. }));
+        // Without a fold there is no split boundary either: the settled read
+        // and both live tools share one open group.
         assert!(matches!(
             &rows[1].kind,
             RowKind::ToolGroup {
                 tools,
                 auto_open: true,
                 ..
-            } if tools.len() == 2 && tools.iter().all(|tool| !tool.resolved)
+            } if tools.len() == 3 && tools.iter().filter(|tool| !tool.resolved).count() == 2
         ));
 
         let latest_text = assistant(
@@ -9062,12 +9056,12 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&latest_text, false, &mut parse);
-        assert_eq!(rows[0].id.as_ref(), "assistant-live-text#steps");
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[1].kind, RowKind::LiveMarkdown { .. }));
     }
 
     #[test]
-    fn assistant_turn_keeps_active_reasoning_input_and_subagent_outside() {
+    fn assistant_turn_streaming_keeps_the_whole_turn_expanded() {
         let active_reasoning = assistant(
             "assistant-live-reasoning",
             MessageStatus::Streaming,
@@ -9082,7 +9076,7 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&active_reasoning, false, &mut parse);
-        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(
             rows[1].kind,
             RowKind::Reasoning { active: true, .. }
@@ -9102,7 +9096,7 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&unresolved_input, false, &mut parse);
-        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(
             rows[1].kind,
             RowKind::InputChip {
@@ -9120,7 +9114,7 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&running_subagent, false, &mut parse);
-        assert!(matches!(rows[0].kind, RowKind::TurnSteps { .. }));
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
     }
 
@@ -9162,11 +9156,27 @@ mod tests {
         let live_rows = rows_for_entry(&live, false, &mut parse);
         let done_rows = rows_for_entry(&done, false, &mut parse);
 
-        assert_eq!(live_rows[0].id, done_rows[0].id);
-        assert_eq!(live_rows[0].id.as_ref(), "assistant-specialized#steps");
+        assert!(
+            live_rows
+                .iter()
+                .all(|row| !matches!(row.kind, RowKind::TurnSteps { .. }))
+        );
+        assert_eq!(done_rows[0].id.as_ref(), "assistant-specialized#steps");
         let RowKind::TurnSteps { rows: children, .. } = &done_rows[0].kind else {
             panic!("specialized prefix should be preserved inside TurnSteps");
         };
+        // Settling only re-parents the prefix: the children keep the ids the
+        // live rows had, so the render cache does not churn on the fold.
+        assert_eq!(
+            children
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            live_rows[..children.len()]
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        );
         assert!(
             children
                 .iter()
@@ -9511,7 +9521,13 @@ mod tests {
         let mut settled = grown.clone();
         settled.status = Some(MessageStatus::Complete);
         let settled_rows = rows_for_entry(&settled, false, &mut parse);
-        assert_eq!(settled_rows[0].id, grown_rows[0].id);
+        // The fold appears only once the turn settles.
+        assert!(
+            grown_rows
+                .iter()
+                .all(|row| !matches!(row.kind, RowKind::TurnSteps { .. }))
+        );
+        assert_eq!(settled_rows[0].id.as_ref(), "assistant-transition#steps");
         assert!(matches!(grown_rows[1].kind, RowKind::LiveMarkdown { .. }));
         assert!(matches!(settled_rows[1].kind, RowKind::Markdown { .. }));
 
@@ -9530,7 +9546,7 @@ mod tests {
     fn turn_steps_transition_settles_folded_markdown_and_owns_no_timestamp() {
         let entry = assistant(
             "assistant-veil",
-            MessageStatus::Streaming,
+            MessageStatus::Complete,
             vec![
                 text_part("narration", "Inspecting."),
                 tool_part("read", "cat src/lib.rs"),
@@ -9539,12 +9555,11 @@ mod tests {
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
         let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
-            panic!("expected streaming disclosure");
+            panic!("expected the settled disclosure");
         };
         assert!(matches!(children[0].kind, RowKind::Markdown { .. }));
         assert!(children.iter().all(|child| child.timestamp.is_none()));
-        assert!(rows[0].timestamp.is_none());
-        assert!(rows[1].timestamp.is_none());
+        assert!(rows[0].timestamp.is_none(), "the fold owns no timestamp");
     }
 
     #[test]
@@ -10334,7 +10349,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tail_and_turn_steps_tool_groups_show_cards_without_opening_details() {
+    fn active_tail_and_earlier_groups_show_cards_without_opening_details() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
@@ -10365,31 +10380,26 @@ mod tests {
         assert!(!auto_open);
         assert!(!detail_auto_open);
 
-        // Earlier groups in the active streaming turn stay open too.
+        // Earlier groups in the active streaming turn stay open too — and
+        // top-level, since a live turn folds nothing.
         let mid = assistant(
             "m4",
             MessageStatus::Streaming,
             vec![tool_part("a", "ls"), text_part("t0", "hi")],
         );
         let rows = rows_for_entry(&mid, false, &mut parse);
-        let RowKind::TurnSteps { rows: children, .. } = &rows[0].kind else {
-            panic!("completed prefix should be folded");
-        };
         let RowKind::ToolGroup {
             auto_open,
             detail_auto_open,
             ..
-        } = children[0].kind
+        } = rows[0].kind
         else {
-            panic!()
+            panic!("earlier group stays a top-level row while streaming")
         };
-        assert!(
-            auto_open,
-            "completed prefix tool cards remain visible inside TurnSteps"
-        );
+        assert!(auto_open, "earlier tool cards remain visible");
         assert!(
             !detail_auto_open,
-            "completed prefix command output remains collapsed by default"
+            "only the current group opens its command output"
         );
     }
 

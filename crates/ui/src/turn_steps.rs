@@ -3,16 +3,9 @@ use std::collections::HashMap;
 use zeron_doc::{MessagePart, MessageStatus};
 use zeron_proto::ToolCall;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnStepsMode {
-    StreamingPrefix,
-    FinalAnswer,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnStepsPlan {
     pub split_before_part: usize,
-    pub mode: TurnStepsMode,
     pub summary: String,
 }
 
@@ -35,13 +28,12 @@ pub fn plan_turn_steps(
     parts: &[MessagePart],
     status: Option<MessageStatus>,
 ) -> Option<TurnStepsPlan> {
+    // Um turno em voo fica inteiro aberto. Dobrar o prefixo já assentado
+    // enquanto o agente trabalha escondia exatamente a saida que a run esta
+    // produzindo: sobrava so a chamada corrente, uma por vez. Dobrar e a
+    // affordance do turno TERMINADO, logo abaixo.
     if status == Some(MessageStatus::Streaming) {
-        let split_before_part = streaming_split(parts)?;
-        return Some(TurnStepsPlan {
-            split_before_part,
-            mode: TurnStepsMode::StreamingPrefix,
-            summary: turn_summary(&parts[..split_before_part]),
-        });
+        return None;
     }
 
     let last_tool = parts
@@ -60,7 +52,6 @@ pub fn plan_turn_steps(
 
     Some(TurnStepsPlan {
         split_before_part: last_text,
-        mode: TurnStepsMode::FinalAnswer,
         summary: turn_summary(prefix),
     })
 }
@@ -73,29 +64,6 @@ fn turn_summary(parts: &[MessagePart]) -> String {
 
     let steps = parts.iter().filter(|part| is_visible_part(part)).count();
     format!("{steps} {}", if steps == 1 { "step" } else { "steps" })
-}
-
-fn streaming_split(parts: &[MessagePart]) -> Option<usize> {
-    if parts.first().is_some_and(is_unsettled_part) {
-        return None;
-    }
-
-    let split = parts
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(index, part)| {
-            (is_visible_part(part) && is_unsettled_part(part)).then_some(index)
-        })
-        .or_else(|| {
-            parts
-                .iter()
-                .enumerate()
-                .rfind(|(_, part)| is_visible_part(part))
-                .map(|(index, _)| index)
-        })?;
-
-    (split > 0 && has_visible_operational_content(&parts[..split])).then_some(split)
 }
 
 fn is_visible_part(part: &MessagePart) -> bool {
@@ -121,19 +89,6 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
             false
         }
     }
-}
-
-fn has_visible_operational_content(parts: &[MessagePart]) -> bool {
-    parts.iter().any(|part| {
-        is_visible_part(part)
-            && matches!(
-                part,
-                MessagePart::Tool { .. }
-                    | MessagePart::Reasoning { .. }
-                    | MessagePart::Input { .. }
-                    | MessagePart::Error { .. }
-            )
-    })
 }
 
 pub fn activity_breakdown(parts: &[MessagePart]) -> String {
@@ -370,7 +325,6 @@ mod tests {
         ];
 
         let plan = plan_turn_steps(&parts, Some(MessageStatus::Complete)).unwrap();
-        assert_eq!(plan.mode, TurnStepsMode::FinalAnswer);
         assert_eq!(plan.split_before_part, 2);
         assert_eq!(plan.summary, "1 read");
     }
@@ -437,99 +391,43 @@ mod tests {
     }
 
     #[test]
-    fn streaming_turn_keeps_all_concurrent_unresolved_tools_visible() {
-        let parts = vec![
-            tool("old", exec("cargo check"), true),
-            tool("first", exec("cargo test -p zeron-ui"), false),
-            tool("second", read("Cargo.toml"), false),
+    fn streaming_turn_never_folds_anything() {
+        // Toda forma que antes virava StreamingPrefix: tool em voo, texto
+        // corrente, reasoning ativo, input pendente, subagente rodando.
+        let shapes = [
+            vec![
+                tool("old", exec("cargo check"), true),
+                tool("first", exec("cargo test -p zeron-ui"), false),
+                tool("second", read("Cargo.toml"), false),
+            ],
+            vec![
+                tool("read", read("src/lib.rs"), true),
+                text("latest", "Preparing the result"),
+            ],
+            vec![
+                tool("read", read("src/lib.rs"), true),
+                reasoning("thinking", false),
+                tool("later", exec("cargo check"), true),
+            ],
+            vec![
+                tool("read", read("src/lib.rs"), true),
+                input("question", false),
+                tool("later", exec("cargo check"), true),
+            ],
+            vec![
+                tool("read", read("src/lib.rs"), true),
+                running_subagent("agent"),
+                tool("later", exec("cargo check"), true),
+            ],
         ];
 
-        let plan = plan_turn_steps(&parts, Some(MessageStatus::Streaming)).unwrap();
-        assert_eq!(plan.mode, TurnStepsMode::StreamingPrefix);
-        assert_eq!(plan.split_before_part, 1);
-    }
-
-    #[test]
-    fn streaming_turn_without_unresolved_work_keeps_latest_activity_visible() {
-        let parts = vec![
-            tool("read", read("src/lib.rs"), true),
-            text("latest", "Preparing the result"),
-        ];
-
-        let plan = plan_turn_steps(&parts, Some(MessageStatus::Streaming)).unwrap();
-        assert_eq!(plan.mode, TurnStepsMode::StreamingPrefix);
-        assert_eq!(plan.split_before_part, 1);
-    }
-
-    #[test]
-    fn streaming_turn_keeps_active_reasoning_visible() {
-        let parts = vec![
-            tool("read", read("src/lib.rs"), true),
-            reasoning("thinking", false),
-            tool("later", exec("cargo check"), true),
-        ];
-
-        assert_eq!(
-            plan_turn_steps(&parts, Some(MessageStatus::Streaming))
-                .unwrap()
-                .split_before_part,
-            1
-        );
-    }
-
-    #[test]
-    fn streaming_turn_keeps_unresolved_input_visible() {
-        let parts = vec![
-            tool("read", read("src/lib.rs"), true),
-            input("question", false),
-            tool("later", exec("cargo check"), true),
-        ];
-
-        assert_eq!(
-            plan_turn_steps(&parts, Some(MessageStatus::Streaming))
-                .unwrap()
-                .split_before_part,
-            1
-        );
-    }
-
-    #[test]
-    fn streaming_turn_keeps_running_subagent_visible_after_spawn_resolves() {
-        let parts = vec![
-            tool("read", read("src/lib.rs"), true),
-            running_subagent("agent"),
-            tool("later", exec("cargo check"), true),
-        ];
-
-        assert_eq!(
-            plan_turn_steps(&parts, Some(MessageStatus::Streaming))
-                .unwrap()
-                .split_before_part,
-            1
-        );
-    }
-
-    #[test]
-    fn streaming_turn_does_not_wrap_when_the_boundary_is_the_first_part() {
-        let parts = vec![tool("active", exec("cargo check"), false)];
-
-        assert_eq!(
-            plan_turn_steps(&parts, Some(MessageStatus::Streaming)),
-            None
-        );
-    }
-
-    #[test]
-    fn streaming_turn_does_not_wrap_plain_narration_before_active_work() {
-        let parts = vec![
-            text("narration", "Next I will run the checks"),
-            tool("active", exec("cargo check"), false),
-        ];
-
-        assert_eq!(
-            plan_turn_steps(&parts, Some(MessageStatus::Streaming)),
-            None
-        );
+        for parts in shapes {
+            assert_eq!(
+                plan_turn_steps(&parts, Some(MessageStatus::Streaming)),
+                None,
+                "streaming turn must stay fully expanded"
+            );
+        }
     }
 
     #[test]
@@ -639,14 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_turn_falls_back_to_visible_step_count_without_tools() {
-        let parts = vec![reasoning("done", true), reasoning("active", false)];
-
+    fn summary_falls_back_to_visible_step_count_without_tools() {
+        assert_eq!(turn_summary(&[reasoning("done", true)]), "1 step");
         assert_eq!(
-            plan_turn_steps(&parts, Some(MessageStatus::Streaming))
-                .unwrap()
-                .summary,
-            "1 step"
+            turn_summary(&[reasoning("a", true), reasoning("b", true)]),
+            "2 steps"
         );
     }
 
