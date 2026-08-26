@@ -164,11 +164,14 @@ struct HistoricalReplay {
     chunks: u32,
 }
 
-/// Teto do catch-up silencioso. Uma sessao viva e tagarela pode nunca drenar
-/// o backlog, e sem teto a tela ficaria vazia pra sempre. Estourado o limite,
-/// volta a pintar chunk a chunk — o pior caso vira o comportamento antigo,
-/// nunca algo pior.
-const MAX_SILENT_REPLAY_CHUNKS: u32 = 64;
+/// Teto do catch-up silencioso, medido em chunks de `OUTPUT_MAX_BYTES`
+/// (256 KB) do host: 128 MB de backlog escondido. Dimensionado pelos dois
+/// lados — o maior scrollback retido que vimos tem 28 MB (~112 chunks, cabe
+/// folgado), e nenhuma sessao emite 128 MB AO VIVO no intervalo entre abrir e
+/// drenar. O teto existe porque uma sessao que nunca drena deixaria a tela
+/// coberta pra sempre; estourado, volta a pintar chunk a chunk, entao o pior
+/// caso vira o comportamento antigo e nunca algo pior.
+const MAX_SILENT_REPLAY_CHUNKS: u32 = 512;
 
 impl HistoricalReplay {
     fn start(&mut self) {
@@ -1254,6 +1257,14 @@ impl Render for WorkersTerminal {
             .and_then(|state| state.resize_error.clone())
             .or_else(|| self.error.clone());
         let theme = crate::theme::Theme::of(cx).clone();
+        // Suprimir o notify do replay nao basta: qualquer outro repaint da
+        // janela pinta o emulador no meio do backlog, e o usuario ve o
+        // terminal rolando do topo. A grade fica coberta ate o catch-up
+        // drenar — o TerminalElement continua montado porque e ele que mede a
+        // geometria, e o replay so consome output depois que a grade existe.
+        let catching_up = self
+            .active_state()
+            .is_some_and(|state| state.historical_replay.is_catching_up());
         let scrollbar = self.render_scrollbar(&theme, cx);
         let jump_to_bottom = self.render_jump_to_bottom(cx);
         div()
@@ -1273,6 +1284,20 @@ impl Render for WorkersTerminal {
             .child(TerminalElement::new_workers(cx.entity(), focused))
             .children(scrollbar)
             .children(jump_to_bottom)
+            .when(catching_up, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(crate::terminal::view::terminal_panel_bg(&theme))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child("Loading history…"),
+                )
+            })
             .when_some(error, |el, error| {
                 el.child(
                     div()
