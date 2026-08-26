@@ -25,6 +25,7 @@ use gpui::{
 };
 
 use gpui_tokio::Tokio;
+use zeron_doc::{SessionMessageEntry, TranscriptFrame};
 use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
@@ -775,6 +776,153 @@ enum SplashPhase {
 }
 
 /// The chat-row Rename dialog.
+/// One row of the chat menu's EXPORT section. Declared as data so the six
+/// actions cannot drift apart: comet has no submenu primitive (and this change
+/// adds none), so they render flat under a heading.
+struct ExportMenuItem {
+    key: &'static str,
+    label: &'static str,
+    glyph: &'static str,
+    format: crate::chat_export::ExportFormat,
+    delivery: ExportDelivery,
+}
+
+const EXPORT_MENU_ITEMS: &[ExportMenuItem] = &[
+    ExportMenuItem {
+        key: "export-download-md",
+        label: "Download as Markdown",
+        glyph: icons::ARCHIVE_UP_MINIMALISTIC,
+        format: crate::chat_export::ExportFormat::Markdown,
+        delivery: ExportDelivery::Download,
+    },
+    ExportMenuItem {
+        key: "export-download-json",
+        label: "Download as JSON",
+        glyph: icons::ARCHIVE_UP_MINIMALISTIC,
+        format: crate::chat_export::ExportFormat::Json,
+        delivery: ExportDelivery::Download,
+    },
+    ExportMenuItem {
+        key: "export-download-txt",
+        label: "Download as Text",
+        glyph: icons::ARCHIVE_UP_MINIMALISTIC,
+        format: crate::chat_export::ExportFormat::Text,
+        delivery: ExportDelivery::Download,
+    },
+    ExportMenuItem {
+        key: "export-copy-md",
+        label: "Copy as Markdown",
+        glyph: icons::COPY,
+        format: crate::chat_export::ExportFormat::Markdown,
+        delivery: ExportDelivery::Clipboard,
+    },
+    ExportMenuItem {
+        key: "export-copy-json",
+        label: "Copy as JSON",
+        glyph: icons::COPY,
+        format: crate::chat_export::ExportFormat::Json,
+        delivery: ExportDelivery::Clipboard,
+    },
+    ExportMenuItem {
+        key: "export-copy-txt",
+        label: "Copy as Text",
+        glyph: icons::COPY,
+        format: crate::chat_export::ExportFormat::Text,
+        delivery: ExportDelivery::Clipboard,
+    },
+];
+
+/// The sidebar notice strip's payload. `ok` rides with the text so a success
+/// message can never inherit the previous failure's red.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarNotice {
+    text: SharedString,
+    ok: bool,
+}
+
+impl SidebarNotice {
+    fn failure(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            ok: false,
+        }
+    }
+
+    fn success(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            ok: true,
+        }
+    }
+}
+
+/// Where a Chat Transcript Export lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportDelivery {
+    /// Straight into the user's Downloads directory, no save dialog.
+    Download,
+    Clipboard,
+}
+
+/// What an export did, so the notice is a function of the outcome instead of a
+/// string assembled at each of the six call sites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExportOutcome {
+    Downloaded(String),
+    Copied,
+    Failed(String),
+}
+
+fn export_notice(outcome: &ExportOutcome) -> SidebarNotice {
+    match outcome {
+        ExportOutcome::Downloaded(file) => {
+            SidebarNotice::success(format!("Exported to Downloads: {file}"))
+        }
+        ExportOutcome::Copied => SidebarNotice::success("Chat copied to clipboard"),
+        ExportOutcome::Failed(reason) => SidebarNotice::failure(format!("Export failed: {reason}")),
+    }
+}
+
+/// The selected Chat's transcript is already in memory; every other row has to
+/// be fetched. Pure because the failure this guards — exporting the SELECTED
+/// chat when the user right-clicked a different one — is silent and produces a
+/// plausible-looking file.
+fn export_reads_memory(selected: Option<&str>, target: &str) -> bool {
+    selected == Some(target)
+}
+
+/// One-shot Chat Transcript read for a Chat that is not the selected one:
+/// `WatchDocMessages` already resolves a doc wherever it lives, and its first
+/// frame is a full reset, so the subscription is taken for exactly that frame
+/// and dropped. A dedicated RPC would duplicate that resolution for one caller.
+async fn fetch_transcript_once(
+    engine: &crate::state::EngineHandle,
+    chat_id: &str,
+) -> Result<Vec<SessionMessageEntry>, String> {
+    let params = serde_json::json!({ "chatId": chat_id });
+    let mut rx = engine
+        .client()
+        .subscribe(methods::WATCH_DOC_MESSAGES, params)
+        .await
+        .map_err(|err| format!("could not read the chat: {err}"))?;
+    while let Some(value) = rx.recv().await {
+        match serde_json::from_value::<TranscriptFrame>(value) {
+            // Deltas before the reset belong to a doc we hold nothing of; only
+            // the reset is a complete transcript on its own.
+            Ok(TranscriptFrame::Reset { reset }) => return Ok(reset),
+            Ok(TranscriptFrame::Delta { .. }) => continue,
+            Err(err) => return Err(format!("malformed chat frame: {err}")),
+        }
+    }
+    Err("the chat stream closed before sending anything".into())
+}
+
+/// The Downloads directory of the current user, or `None` when `HOME` is unset
+/// (the same resolution `workspace_open_menu` uses for `~/Applications`).
+fn downloads_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads"))
+}
+
 struct RenameChatDialog {
     chat_id: String,
     input: Entity<ComposerInput>,
@@ -1164,8 +1312,10 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
-    /// Inline sidebar error strip (mutation failures); click dismisses.
-    sidebar_notice: Option<SharedString>,
+    /// Inline sidebar notice strip (mutation failures, export outcomes); click
+    /// dismisses. The tone rides WITH the text: two parallel fields would let a
+    /// caller set a success message and leave the previous failure's red on it.
+    sidebar_notice: Option<SidebarNotice>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -1180,6 +1330,9 @@ pub struct Shell {
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
+    /// The in-flight Chat Transcript Export. One at a time: a second pick
+    /// replaces the first rather than racing it onto the notice strip.
+    export_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
     runtime_change_error: Option<SharedString>,
@@ -1578,6 +1731,7 @@ impl Shell {
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
+            export_task: None,
             auth_task: None,
             runtime_change_task: None,
             runtime_change_error: None,
@@ -3033,17 +3187,142 @@ impl Shell {
 
     // ---- sidebar mutations ----
 
+    // ---- chat transcript export ----
+
+    /// Render this Chat's transcript and deliver it. Reads the Chat Transcript
+    /// only: never the Run Journal, never a sidecar blob (ADR 0002).
+    fn export_chat(
+        &mut self,
+        chat_id: String,
+        format: crate::chat_export::ExportFormat,
+        delivery: ExportDelivery,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_chat_menu(cx);
+        let state = self.state.read(cx);
+        let Some(chat) = state.chats.iter().find(|c| c.id == chat_id).cloned() else {
+            self.report_export(ExportOutcome::Failed("chat not found".into()), cx);
+            return;
+        };
+        // Resolve the entries BEFORE spawning: whether this row is the selected
+        // one is a fact about now, not about whenever the task gets scheduled.
+        let in_memory = export_reads_memory(state.selected_chat.as_deref(), &chat_id)
+            .then(|| state.transcript.clone());
+        let engine = state.engine().cloned();
+
+        let metadata = crate::chat_export::ChatMetadata {
+            id: chat.id.clone(),
+            title: chat.title.clone().unwrap_or_default(),
+            branch: chat.branch.clone().unwrap_or_default(),
+            cwd: chat.cwd.clone().unwrap_or_default(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        self.export_task = Some(cx.spawn(async move |this, cx| {
+            let entries = match in_memory {
+                Some(entries) => entries,
+                None => {
+                    let Some(engine) = engine else {
+                        this.update(cx, |shell, cx| {
+                            shell.report_export(
+                                ExportOutcome::Failed("engine not connected".into()),
+                                cx,
+                            );
+                        })
+                        .ok();
+                        return;
+                    };
+                    match fetch_transcript_once(&engine, &chat_id).await {
+                        Ok(entries) => entries,
+                        Err(reason) => {
+                            this.update(cx, |shell, cx| {
+                                shell.report_export(ExportOutcome::Failed(reason), cx);
+                            })
+                            .ok();
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let title = metadata.title.clone();
+            let doc = crate::chat_export::ExportDoc::from_transcript(metadata, &entries);
+            let rendered = match format {
+                crate::chat_export::ExportFormat::Markdown => {
+                    Ok(crate::chat_export::render_markdown(&doc))
+                }
+                crate::chat_export::ExportFormat::Text => Ok(crate::chat_export::render_text(&doc)),
+                crate::chat_export::ExportFormat::Json => crate::chat_export::render_json(&doc)
+                    .map_err(|err| format!("could not serialize the chat: {err}")),
+            };
+            let content = match rendered {
+                Ok(content) => content,
+                Err(reason) => {
+                    this.update(cx, |shell, cx| {
+                        shell.report_export(ExportOutcome::Failed(reason), cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+
+            let outcome = match delivery {
+                ExportDelivery::Clipboard => {
+                    let copied = this.update(cx, |_, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(content));
+                    });
+                    if copied.is_err() {
+                        return;
+                    }
+                    ExportOutcome::Copied
+                }
+                ExportDelivery::Download => {
+                    let file = crate::chat_export::build_filename(&title, &chat_id, format);
+                    let Some(dir) = downloads_dir() else {
+                        this.update(cx, |shell, cx| {
+                            shell.report_export(
+                                ExportOutcome::Failed("no home directory to write into".into()),
+                                cx,
+                            );
+                        })
+                        .ok();
+                        return;
+                    };
+                    let write_file = file.clone();
+                    let written = cx
+                        .background_executor()
+                        .spawn(async move {
+                            std::fs::create_dir_all(&dir)?;
+                            std::fs::write(dir.join(&write_file), content.as_bytes())
+                        })
+                        .await;
+                    match written {
+                        Ok(()) => ExportOutcome::Downloaded(file),
+                        Err(err) => ExportOutcome::Failed(err.to_string()),
+                    }
+                }
+            };
+            this.update(cx, |shell, cx| shell.report_export(outcome, cx))
+                .ok();
+        }));
+    }
+
+    fn report_export(&mut self, outcome: ExportOutcome, cx: &mut Context<Self>) {
+        self.sidebar_notice = Some(export_notice(&outcome));
+        cx.notify();
+    }
+
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(SidebarNotice::failure("Engine not connected"));
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
                     cx.notify();
                 })
                 .ok();
@@ -3227,8 +3506,9 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                        shell.sidebar_notice = Some(SidebarNotice::failure(format!(
+                            "Could not cancel sign-in: {err}"
+                        )));
                     }
                 }
                 cx.notify();
@@ -3550,7 +3830,8 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.sidebar_notice =
+                        Some(SidebarNotice::failure(format!("Sign in failed: {err}")));
                     cx.notify();
                 }
             })
@@ -5415,8 +5696,13 @@ impl Shell {
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
-            // Inline mutation-failure notice.
+            // Inline notice: mutation failures and export outcomes.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
+                let ink = if notice.ok {
+                    theme.text_muted
+                } else {
+                    theme.danger
+                };
                 el.child(
                     div()
                         .id("sidebar-notice")
@@ -5426,15 +5712,15 @@ impl Shell {
                         .py(px(4.0))
                         .rounded(px(Theme::CONTROL_RADIUS))
                         .border_1()
-                        .border_color(theme.danger)
+                        .border_color(ink)
                         .text_size(px(11.0))
-                        .text_color(theme.danger)
+                        .text_color(ink)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_notice = None;
                             cx.notify();
                         }))
-                        .child(notice),
+                        .child(notice.text),
                 )
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
@@ -6182,7 +6468,8 @@ impl Shell {
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
-                .w(px(170.0))
+                // Sized for the longest EXPORT label, not for "Rename…".
+                .w(px(226.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_chat_menu(cx);
                 }))
@@ -6210,6 +6497,18 @@ impl Shell {
                         )
                         .child(SharedString::from("Archive")),
                 )
+                .child(popover::menu_separator())
+                .child(popover::menu_heading(&theme, "Export"))
+                .children(EXPORT_MENU_ITEMS.iter().map(|item| {
+                    let export_id = chat_id.clone();
+                    popover::menu_row(&theme, false, format!("chat-menu-{}-{chat_id}", item.key))
+                        .id(item.key)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.export_chat(export_id.clone(), item.format, item.delivery, cx)
+                        }))
+                        .child(icon(item.glyph).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(item.label))
+                }))
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
@@ -8637,6 +8936,69 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exporting reads memory ONLY for the row that is actually selected. The
+    /// failure this guards is silent: right-click any other row and you would
+    /// get a complete, plausible export OF THE WRONG CHAT.
+    #[test]
+    fn export_reads_memory_only_for_the_selected_chat() {
+        assert!(export_reads_memory(Some("chat-a"), "chat-a"));
+        assert!(!export_reads_memory(Some("chat-a"), "chat-b"));
+        assert!(!export_reads_memory(None, "chat-a"));
+    }
+
+    /// Every outcome is visible and says which one it was — success names the
+    /// file or the clipboard, failure names the reason. Nothing is silent.
+    #[test]
+    fn export_notice_states_the_outcome_and_its_tone() {
+        let downloaded = export_notice(&ExportOutcome::Downloaded(
+            "Fix_the_thing-a1b2c3d4.md".into(),
+        ));
+        assert_eq!(
+            downloaded,
+            SidebarNotice::success("Exported to Downloads: Fix_the_thing-a1b2c3d4.md")
+        );
+        assert!(downloaded.ok);
+
+        assert_eq!(
+            export_notice(&ExportOutcome::Copied),
+            SidebarNotice::success("Chat copied to clipboard")
+        );
+
+        let failed = export_notice(&ExportOutcome::Failed("permission denied".into()));
+        assert_eq!(
+            failed,
+            SidebarNotice::failure("Export failed: permission denied")
+        );
+        assert!(!failed.ok);
+    }
+
+    /// The six actions are declared once, so a format can never lose its copy
+    /// twin or gain a second download row.
+    #[test]
+    fn export_menu_covers_every_format_on_both_deliveries() {
+        use crate::chat_export::ExportFormat::{Json, Markdown, Text};
+        let mut seen: Vec<_> = EXPORT_MENU_ITEMS
+            .iter()
+            .map(|item| (item.delivery, item.format))
+            .collect();
+        assert_eq!(seen.len(), 6, "six actions, no more and no fewer");
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "no duplicated action");
+        for format in [Markdown, Json, Text] {
+            for delivery in [ExportDelivery::Download, ExportDelivery::Clipboard] {
+                assert!(
+                    EXPORT_MENU_ITEMS
+                        .iter()
+                        .any(|item| item.format == format && item.delivery == delivery),
+                    "{delivery:?} {format:?} has no menu row"
+                );
+            }
+        }
+        let keys: std::collections::HashSet<_> =
+            EXPORT_MENU_ITEMS.iter().map(|item| item.key).collect();
+        assert_eq!(keys.len(), 6, "element ids must be unique");
+    }
 
     #[test]
     fn sidebar_mode_switcher_uses_compact_geometry() {
