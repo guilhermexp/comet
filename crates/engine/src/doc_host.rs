@@ -497,6 +497,18 @@ impl ChatDocHandle {
                     .doc
                     .set_message_status(&entry.id, MessageStatus::Aborted)?
             {
+                // The entry's own status is not what the tool cards read: a
+                // part left unresolved by the dead run spins forever under a
+                // transcript that already says the run was interrupted.
+                match self.doc.settle_pending_parts(&entry.id) {
+                    Ok(settled) if settled > 0 => {
+                        tracing::debug!(chat = %self.chat_id, entry = %entry.id, settled, "settled parts left in flight")
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(chat = %self.chat_id, error = %err, "settling in-flight parts failed")
+                    }
+                }
                 let part_id = format!("{}-recovery", entry.id);
                 if let Err(err) = self.doc.append_error_part(&entry.id, &part_id, note) {
                     tracing::warn!(chat = %self.chat_id, error = %err, "recovery note append failed");

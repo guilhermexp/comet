@@ -27,7 +27,7 @@ use zeron_engine::{EngineCore, HarnessRegistry, RunJournal};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    SteeringMode, ToolCall,
 };
 use zeron_sync::DocsStore;
 
@@ -352,10 +352,34 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
         doc.push_message(&SessionMessageEntry {
             id: "msg-assistant-1".into(),
             role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "partial…".into(),
-            }],
+            parts: vec![
+                MessagePart::Text {
+                    id: "t0".into(),
+                    text: "partial…".into(),
+                },
+                // The tool the run was inside when it died: without settling
+                // it, its card keeps spinning under a transcript that already
+                // says the run was interrupted.
+                MessagePart::Tool {
+                    id: "tool-0".into(),
+                    call: ToolCall::Exec {
+                        command: "sleep 600".into(),
+                    },
+                    is_error: false,
+                    resolved: false,
+                    execution: None,
+                    output: None,
+                    diff: None,
+                    output_ref: None,
+                    output_bytes: None,
+                    diff_ref: None,
+                    diff_stats: None,
+                    file_preview: None,
+                    subagent_ref: None,
+                    subagent_status: None,
+                    subagent_tail: None,
+                },
+            ],
             created_at: 2,
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Streaming),
@@ -407,6 +431,20 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
     assert_eq!(entries[1].duration_ms, None);
+    // … and settled the tool it died inside, so nothing keeps spinning.
+    assert!(
+        entries[1].parts.iter().any(|part| matches!(
+            part,
+            MessagePart::Tool {
+                id,
+                resolved: true,
+                is_error: true,
+                ..
+            } if id == "tool-0"
+        )),
+        "the in-flight tool must settle with the entry: {:?}",
+        entries[1].parts
+    );
     // … and closed the stale journal with a synthetic Done.
     let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
     assert!(matches!(

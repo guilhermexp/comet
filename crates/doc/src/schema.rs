@@ -493,6 +493,115 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Recovery companion to [`Self::set_message_status`]: stamping the entry
+    /// `aborted` does not touch the parts the dead run left mid-flight, and an
+    /// unresolved part keeps announcing itself as live forever — the
+    /// transcript said "Run interrupted by engine restart" while the tool card
+    /// right above it still spun on `Creating`. Each kind settles the way its
+    /// own renderer reads as finished: a tool resolves as an error (it never
+    /// returned a result), a running subagent is marked failed for the same
+    /// reason, reasoning completes, an unanswered question resolves. Returns
+    /// how many parts moved, and is idempotent — a crash loop can re-run it.
+    pub fn settle_pending_parts(&self, message_id: &str) -> Result<usize, DocError> {
+        // Decide from the READ entry, never from the raw map: `resolved` is
+        // derived on the way out (a salvaged tool carrying output reads
+        // resolved with no `resolved` key at all), so judging by key presence
+        // flips a tool that finished fine into an error.
+        let Some(entry) = self
+            .read_entries()?
+            .into_iter()
+            .find(|entry| entry.id == message_id)
+        else {
+            return Ok(0);
+        };
+        let pending = entry
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Tool {
+                    id,
+                    resolved,
+                    subagent_status,
+                    ..
+                } if !resolved || *subagent_status == Some(SubagentStatus::Running) => Some((
+                    id.clone(),
+                    PendingPart::Tool {
+                        settle_call: !resolved,
+                    },
+                )),
+                MessagePart::Reasoning { id, completed, .. } if !completed => {
+                    Some((id.clone(), PendingPart::Reasoning))
+                }
+                MessagePart::Input { id, resolved, .. } if !resolved => {
+                    Some((id.clone(), PendingPart::Input))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(raw_entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                raw_entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                raw_entry.get("parts")
+            else {
+                continue;
+            };
+            let mut settled = 0usize;
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let part_id = match part.get("id") {
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => s.to_string(),
+                    _ => continue,
+                };
+                let Some((_, kind)) = pending.iter().find(|(id, _)| *id == part_id) else {
+                    continue;
+                };
+                match kind {
+                    PendingPart::Tool { settle_call } => {
+                        if *settle_call {
+                            part.insert("resolved", true)?;
+                            part.insert("isError", true)?;
+                        }
+                        if matches!(
+                            part.get("subagentStatus"),
+                            Some(loro::ValueOrContainer::Value(LoroValue::String(s)))
+                                if s.as_str() == "running"
+                        ) {
+                            part.insert("subagentStatus", "failed")?;
+                        }
+                    }
+                    PendingPart::Reasoning => part.insert("completed", true).map(|_| ())?,
+                    PendingPart::Input => part.insert("resolved", true).map(|_| ())?,
+                }
+                settled += 1;
+            }
+            if settled > 0 {
+                self.doc.commit();
+            }
+            return Ok(settled);
+        }
+        Ok(0)
+    }
+
     /// Append an error part to an existing entry (crash recovery: the aborted
     /// entry must SAY why it ended — "Run interrupted by engine restart…" —
     /// not just truncate silently). Returns `false` when no entry matches.
@@ -1272,6 +1381,15 @@ pub fn materialize_tail(
     })
 }
 
+/// What a stalled part needs written to read as finished. Kept next to
+/// [`SessionDoc::settle_pending_parts`] — the read decides, the write applies.
+#[derive(Debug, Clone, Copy)]
+enum PendingPart {
+    Tool { settle_call: bool },
+    Reasoning,
+    Input,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,6 +1409,33 @@ mod tests {
             status: Some(MessageStatus::Complete),
             duration_ms: None,
             continuation_of: None,
+        }
+    }
+
+    fn tool_part(id: &str, resolved: bool, subagent_status: Option<&str>) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Exec {
+                command: "ls".into(),
+            },
+            is_error: false,
+            resolved,
+            execution: None,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: subagent_status.map(|_| "sub-1".to_string()),
+            subagent_status: subagent_status.and_then(|s| match s {
+                "running" => Some(SubagentStatus::Running),
+                "done" => Some(SubagentStatus::Done),
+                "failed" => Some(SubagentStatus::Failed),
+                _ => None,
+            }),
+            subagent_tail: None,
         }
     }
 
@@ -1972,6 +2117,78 @@ mod tests {
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries[0].status, Some(MessageStatus::Aborted));
         assert_eq!(entries[0].duration_ms, None);
+    }
+
+    #[test]
+    fn settle_pending_parts_leaves_nothing_announcing_itself_as_live() {
+        let doc = SessionDoc::init("chat-recovery").unwrap();
+        let mut entry = user_entry("m1", "hello");
+        entry.role = MessageRole::Assistant;
+        entry.status = Some(MessageStatus::Streaming);
+        entry.parts = vec![
+            MessagePart::Reasoning {
+                id: "r0".into(),
+                text: "thinking".into(),
+                completed: false,
+                duration_ms: None,
+            },
+            tool_part("t0", false, None),
+            tool_part("t1", false, Some("running")),
+            // Already settled: re-settling would flip a real success to error.
+            tool_part("t2", true, None),
+            MessagePart::Input {
+                id: "i0".into(),
+                request_id: "req".into(),
+                questions: Vec::new(),
+                resolved: false,
+            },
+        ];
+        doc.push_message(&entry).unwrap();
+
+        // r0, t0, t1 (resolve + subagente running), i0 — t2 ja estava pronto.
+        assert_eq!(doc.settle_pending_parts("m1").unwrap(), 4);
+
+        let parts = &doc.read_entries().unwrap()[0].parts;
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Reasoning {
+                completed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Tool {
+                resolved: true,
+                is_error: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[2],
+            MessagePart::Tool {
+                resolved: true,
+                is_error: true,
+                subagent_status: Some(SubagentStatus::Failed),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[3],
+            MessagePart::Tool {
+                resolved: true,
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[4],
+            MessagePart::Input { resolved: true, .. }
+        ));
+
+        // Idempotent: a crash loop re-runs recovery over the same entry.
+        assert_eq!(doc.settle_pending_parts("m1").unwrap(), 0);
+        assert_eq!(doc.settle_pending_parts("nope").unwrap(), 0);
     }
 
     #[test]

@@ -1492,11 +1492,18 @@ fn rows_for_entry_with_todo_history(
                 if matches!(call, ToolCall::Todo { .. }) {
                     todo_history.clear();
                 }
+                // A turn that has stopped cannot still be running a tool.
+                // Recovery settles in-flight parts now, but every entry
+                // written before that fix still carries `resolved: false`, and
+                // the card spins forever under a transcript that already says
+                // the run was interrupted. Forced settling reads as an error
+                // because that is what it is: the tool never returned.
+                let stalled = !streaming && !*resolved;
                 let item = ToolItem {
                     id: tool_id.clone().into(),
                     call: call.clone(),
-                    is_error: *is_error,
-                    resolved: *resolved,
+                    is_error: *is_error || stalled,
+                    resolved: *resolved || stalled,
                     execution: *execution,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
@@ -1506,7 +1513,15 @@ fn rows_for_entry_with_todo_history(
                     diff_ref: diff_ref.clone().map(SharedString::from),
                     file_preview: file_preview.clone().map(Arc::new),
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
-                    subagent_status: *subagent_status,
+                    // Same reasoning one level down: a spawn chip left
+                    // `running` by a dead turn watches a doc nobody is
+                    // writing to.
+                    subagent_status: match subagent_status {
+                        Some(zeron_doc::SubagentStatus::Running) if !streaming => {
+                            Some(zeron_doc::SubagentStatus::Failed)
+                        }
+                        other => *other,
+                    },
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                 };
                 let is_file_change =
@@ -9005,6 +9020,49 @@ mod tests {
         assert!(matches!(children[2].kind, RowKind::Markdown { .. }));
         assert!(matches!(children[3].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+    }
+
+    /// The doc of a chat that crashed before recovery learned to settle parts
+    /// still says `resolved: false`. The turn is over — nothing may spin.
+    #[test]
+    fn a_settled_turn_never_renders_a_live_tool() {
+        let mut unresolved = tool_part("stuck", "sleep 600");
+        let MessagePart::Tool {
+            resolved,
+            subagent_status,
+            ..
+        } = &mut unresolved
+        else {
+            unreachable!();
+        };
+        *resolved = false;
+        *subagent_status = Some(zeron_doc::SubagentStatus::Running);
+
+        let live = assistant("m-live", MessageStatus::Streaming, vec![unresolved.clone()]);
+        let rows = rows_for_entry(&live, false, &mut parse);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("expected a tool group");
+        };
+        assert!(!tools[0].resolved, "a live turn keeps its tool live");
+        assert_eq!(
+            tools[0].subagent_status,
+            Some(zeron_doc::SubagentStatus::Running)
+        );
+
+        for status in [MessageStatus::Aborted, MessageStatus::Complete] {
+            let settled = assistant("m-settled", status, vec![unresolved.clone()]);
+            let rows = rows_for_entry(&settled, false, &mut parse);
+            let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+                panic!("expected a tool group");
+            };
+            assert!(tools[0].resolved, "{status:?} must not spin");
+            assert!(tools[0].is_error, "{status:?}: it never returned");
+            assert_eq!(
+                tools[0].subagent_status,
+                Some(zeron_doc::SubagentStatus::Failed),
+                "{status:?}: the spawn chip watches a dead doc"
+            );
+        }
     }
 
     #[test]
