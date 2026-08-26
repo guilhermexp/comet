@@ -70,6 +70,13 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   (`task` stays inside the caller's session, read-only).
   `tests/controller_mcp.rs` locks both: every action in the enum appears in
   some description, and no field is left without one.
+- **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
+  `project_id` and `validate_launch_target` rejects any id absent from the live
+  project list, so the surface must also be able to *add* a project
+  (`add_project`, idempotent over the canonical path). Without it the caller's
+  only working move for an unregistered repo is an ancestor project, and the
+  worker runs every command against the wrong tree — observed 2026-08-26, two
+  workers briefed on a client repo launched in `$HOME`.
 
 ## Work Guidance
 
@@ -90,7 +97,7 @@ Requires the main checkout (submodule pin not fetchable elsewhere).
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (18) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (8) — settings snapshot/persistence | integration | `--test settings` |

@@ -330,6 +330,108 @@ fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// `launch_worker` only accepts a project_id that is already in the list, so a
+/// checkout nobody registered is unlaunchable. Without this action the caller's
+/// only working move was an ancestor project — which is how two workers ended
+/// up running in $HOME instead of the repo they were briefed about.
+#[test]
+fn add_project_registers_an_unlisted_checkout_and_is_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let home = TempDir::new()?;
+    fs::write(
+        home.path().join("app-state.json"),
+        serde_json::to_vec(&json!({
+            "projects": [{
+                "id": "ancestor",
+                "name": "Home",
+                "path": "/tmp",
+                "sort_order": 0,
+                "is_folder": false
+            }],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))?,
+    )?;
+    let _guard = UnpeelHomeGuard::set(home.path());
+
+    let checkout = TempDir::new()?;
+    let call = |arguments: serde_json::Value| {
+        controller_mcp_handle_request(json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": { "name": "workers", "arguments": arguments }
+        }))
+        .expect("tools/call responds")
+    };
+
+    // Advertised, not just dispatchable: dispatch matches the raw string, so an
+    // action missing from the enum is invisible to the caller that reads the
+    // schema — which is every caller.
+    let tools = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}
+    }))
+    .expect("tools/list responds");
+    assert!(
+        tools["result"]["tools"][0]["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .any(|action| action == "add_project")
+    );
+
+    let listed = call(json!({ "action": "list_projects" }));
+    assert_eq!(
+        listed["result"]["structuredContent"]["projects"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let added = call(json!({
+        "action": "add_project",
+        "path": checkout.path().to_string_lossy()
+    }));
+    assert_eq!(added["result"]["isError"], false);
+    let id = added["result"]["structuredContent"]["project_id"]
+        .as_str()
+        .expect("add_project returns the id launch_worker needs")
+        .to_owned();
+    // The echoed path is the canonical one the worker will run in — on macOS a
+    // temp dir resolves through /private, and that gap is the whole bug class.
+    assert_eq!(
+        added["result"]["structuredContent"]["path"].as_str(),
+        Some(
+            std::fs::canonicalize(checkout.path())?
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+
+    let listed = call(json!({ "action": "list_projects" }));
+    let projects = listed["result"]["structuredContent"]["projects"]
+        .as_array()
+        .expect("projects");
+    assert_eq!(projects.len(), 2);
+    assert!(projects.iter().any(|project| project["id"] == id.as_str()));
+
+    let again = call(json!({
+        "action": "add_project",
+        "path": checkout.path().to_string_lossy()
+    }));
+    assert_eq!(
+        again["result"]["structuredContent"]["project_id"].as_str(),
+        Some(id.as_str()),
+        "re-registering the same checkout must reuse its id, not fork a duplicate"
+    );
+
+    let rejected = call(json!({ "action": "add_project" }));
+    assert_eq!(rejected["result"]["isError"], true);
+    Ok(())
+}
+
 #[test]
 fn controller_mcp_prepares_the_current_binary_as_session_host() {
     let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");

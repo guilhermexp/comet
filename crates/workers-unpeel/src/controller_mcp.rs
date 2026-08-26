@@ -25,6 +25,7 @@ fn controller_client() -> &'static LocalWorkersClient {
 const ACTIONS: &[&str] = &[
     "help",
     "list_projects",
+    "add_project",
     "list_presets",
     "launch_worker",
     "list_workers",
@@ -373,7 +374,7 @@ fn dispatch_action(
     match action.as_str() {
         "help" => Ok(json!({
             "actions": ACTIONS,
-            "workflow": "list_projects -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker",
+            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker",
             "keys": ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "ctrl-c", "text:<literal>"],
             "limits": { "wait_seconds": 120, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
         })),
@@ -388,6 +389,31 @@ fn dispatch_action(
                     "worktree_branch": project.worktree_branch,
                     "git_branch": project.git_branch
                 })).collect::<Vec<_>>()
+            }))
+        }
+        "add_project" => {
+            // Registering the checkout is the only way to launch into it:
+            // `launch_worker` takes a project_id and validate_launch_target
+            // rejects anything absent from this list. Without this action the
+            // caller's only launchable option for an unlisted repo was an
+            // ancestor project — a worker in $HOME running every command
+            // against the wrong tree.
+            let path = required_string(arguments, "path")?;
+            let id = client
+                .add_project(std::path::Path::new(&path))
+                .map_err(|error| error.to_string())?;
+            let registered = client
+                .bootstrap()
+                .map_err(|error| error.to_string())?
+                .projects
+                .into_iter()
+                .find(|project| project.id == id);
+            Ok(json!({
+                "project_id": id,
+                // The canonical path, which is what the worker will actually
+                // run in — it can differ from what was passed (symlink,
+                // trailing slash), and that difference is the whole bug class.
+                "path": registered.map(|project| project.path)
             }))
         }
         "list_presets" => {
@@ -956,7 +982,11 @@ fn tool_definition() -> Value {
         processes that do implementation work inside a target project's own checkout \
         or worktree. Every change to a real project goes through a worker; `task` \
         subagents stay inside the caller's session for read-only research and never \
-        write to a project. Loop: `list_projects` to resolve the project, \
+        write to a project. Loop: `list_projects` to resolve the project — when no \
+        listed project's path IS the target checkout, `add_project` it and launch \
+        into the id that comes back, never into an ancestor project: a worker \
+        started one level up runs every command, gate and relative path against \
+        the wrong tree — then \
         `list_presets` to pick a preset, `launch_worker` with a self-contained \
         briefing in `initial_text`, `wait_for_status` instead of polling, \
         `read_output` to inspect evidence, then `stop_worker` or `archive_worker`. \
@@ -968,7 +998,8 @@ fn tool_definition() -> Value {
             "required": ["action"],
             "properties": {
                 "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
-                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects. list_presets: optional scope filter." },
+                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter." },
+                "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
                 "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
                 "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
                 "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker and archive_worker." },
