@@ -138,6 +138,10 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+/// Non-image attachment chips size to their file name between these bounds
+/// (the composer's staged chip bounds, widened for a full name).
+pub const FILE_CHIP_MIN_WIDTH: f32 = 140.0;
+pub const FILE_CHIP_MAX_WIDTH: f32 = 240.0;
 pub const USER_MESSAGE_CARD_MAX_HEIGHT: f32 = 100.0;
 pub const USER_MESSAGE_CARD_PAD_Y: f32 = 8.0;
 pub const USER_MESSAGE_CARD_RADIUS: f32 = 12.0;
@@ -147,12 +151,107 @@ fn user_message_overflows(content_height: f32) -> bool {
     content_height > USER_MESSAGE_CARD_MAX_HEIGHT - USER_MESSAGE_CARD_PAD_Y * 2.0
 }
 
-fn user_message_attachment_summary(count: usize) -> Option<SharedString> {
-    match count {
-        0 => None,
-        1 => Some("Using image".into()),
-        count => Some(format!("Using {count} images").into()),
+/// An attachment ref is an image only when its extension says so — the same
+/// test the loader uses. Text files ride the identical trailer (long paste,
+/// dropped `.txt`/`.zip`), so nothing about the ref's SHAPE distinguishes
+/// them.
+fn attachment_ref_is_image(path: &str) -> bool {
+    crate::attachments::format_by_extension(std::path::Path::new(path)).is_some()
+}
+
+/// The sent-message chip for a non-image attachment — the transcript twin of
+/// the composer's staged text chip (`composer::staged_text_chip`), so a file
+/// looks the same before and after the send. Sized to the file name and
+/// capped, but always [`ATT_THUMB_H`] tall: the strip's height is fixed so
+/// load-state flips never shift the virtualizer, and a shorter chip would
+/// leave the row visibly ragged next to real thumbnails.
+fn file_attachment_chip(
+    row_id: &SharedString,
+    aix: usize,
+    att: &crate::attachments::UserImageAttachment,
+    theme: &Theme,
+) -> AnyElement {
+    let name: SharedString = att.name.clone().into();
+    let kind = std::path::Path::new(&att.path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!("{} file", ext.to_ascii_uppercase()))
+        .unwrap_or_else(|| "File".to_string());
+    let width = (60.0 + att.name.chars().count() as f32 * 6.0)
+        .clamp(FILE_CHIP_MIN_WIDTH, FILE_CHIP_MAX_WIDTH);
+    div()
+        .id(SharedString::from(format!("{row_id}#att{aix}")))
+        .flex_none()
+        .w(px(width))
+        .h(px(ATT_THUMB_H))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.11))
+        .bg(crate::theme::ink(0.035))
+        .child(
+            div()
+                .size(px(36.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.0))
+                .bg(crate::theme::ink(0.06))
+                .child(
+                    crate::icons::icon(crate::icons::DOCUMENT)
+                        .size(px(17.0))
+                        .text_color(theme.text_muted),
+                ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .line_height(px(15.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.5))
+                        .line_height(px(14.0))
+                        .text_color(theme.text_muted.opacity(0.72))
+                        .child(SharedString::from(kind)),
+                ),
+        )
+        .into_any_element()
+}
+
+fn user_message_attachment_summary(
+    atts: &[crate::attachments::UserImageAttachment],
+) -> Option<SharedString> {
+    let count = atts.len();
+    if count == 0 {
+        return None;
     }
+    let images = atts
+        .iter()
+        .filter(|att| attachment_ref_is_image(&att.path))
+        .count();
+    Some(match (count, images) {
+        (1, 1) => "Using image".into(),
+        (1, _) => "Using file".into(),
+        (n, i) if i == n => format!("Using {n} images").into(),
+        (n, 0) => format!("Using {n} files").into(),
+        (n, _) => format!("Using {n} attachments").into(),
+    })
 }
 
 fn user_message_card_background(theme: &Theme) -> gpui::Hsla {
@@ -4583,7 +4682,12 @@ impl Transcript {
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
         let device_ids = self.attachment_device_ids(cx);
+        // Fixed height (a load-state flip must never shift the virtualizer),
+        // but scrollable across: a send of seven files runs past the bubble
+        // and `overflow_hidden` simply ate the tail — invisibly, so the row
+        // read as "that's all of them".
         let mut strip = div()
+            .id(SharedString::from(format!("{row_id}#atts")))
             .w_full()
             .h(px(ATT_STRIP_H))
             .flex()
@@ -4591,10 +4695,21 @@ impl Transcript {
             .justify_start()
             .items_start()
             .gap(px(8.0))
-            .overflow_hidden()
+            .overflow_x_scroll()
             .px(px(4.0))
             .pt(px(4.0));
+        let theme = Theme::of(cx).clone();
         for (aix, att) in atts.iter().enumerate() {
+            // Not every ref is an image. The composer stages text files too
+            // (a long paste, a dropped .txt/.zip) and they ride this same
+            // trailer, so pushing them through the image path asked the owning
+            // device for a picture that can never decode: the strip rendered a
+            // row of empty dashed frames (2026-08-25 report). Classify first,
+            // and never start a load for something that isn't an image.
+            if !attachment_ref_is_image(&att.path) {
+                strip = strip.child(file_attachment_chip(row_id, aix, att, &theme));
+                continue;
+            }
             let state = self.attachment_state(&device_ids, &att.path, cx);
             // The in-flight send's progress belongs ON the thumbnail
             // (2026-08-18 user request). Two ref shapes mean "still
@@ -5330,7 +5445,7 @@ impl Transcript {
                             );
                     }
                     column = column.child(card);
-                } else if let Some(summary) = user_message_attachment_summary(attachments.len()) {
+                } else if let Some(summary) = user_message_attachment_summary(&attachments) {
                     column = column.child(
                         div()
                             .w_full()
@@ -10340,16 +10455,50 @@ mod tests {
         assert!(user_message_overflows(content_limit + 0.5));
     }
 
+    fn att(path: &str) -> crate::attachments::UserImageAttachment {
+        crate::attachments::UserImageAttachment {
+            id: path.to_string(),
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        }
+    }
+
     #[test]
     fn image_only_user_messages_receive_the_reference_summary() {
-        assert_eq!(user_message_attachment_summary(0), None);
+        assert_eq!(user_message_attachment_summary(&[]), None);
         assert_eq!(
-            user_message_attachment_summary(1).as_deref(),
+            user_message_attachment_summary(&[att("/a/b.png")]).as_deref(),
             Some("Using image")
         );
         assert_eq!(
-            user_message_attachment_summary(3).as_deref(),
+            user_message_attachment_summary(&[att("/a/b.png"), att("/c/d.jpg"), att("/e/f.webp")])
+                .as_deref(),
             Some("Using 3 images"),
+        );
+    }
+
+    /// A text-only or mixed send must not claim images: the refs trailer
+    /// carries staged text files (long paste, dropped .txt/.zip) through the
+    /// exact same shape as an image, so only the extension can tell them
+    /// apart. Calling every ref an image is what made the sent bubble render
+    /// a row of empty dashed thumbnails.
+    #[test]
+    fn file_attachments_are_never_summarised_as_images() {
+        assert!(!attachment_ref_is_image("/a/chat.txt"));
+        assert!(!attachment_ref_is_image("/a/export.zip"));
+        assert!(!attachment_ref_is_image("/a/no-extension"));
+        assert!(attachment_ref_is_image("/a/shot.PNG"));
+        assert_eq!(
+            user_message_attachment_summary(&[att("/a/chat.txt")]).as_deref(),
+            Some("Using file")
+        );
+        assert_eq!(
+            user_message_attachment_summary(&[att("/a/1.txt"), att("/a/2.zip")]).as_deref(),
+            Some("Using 2 files")
+        );
+        assert_eq!(
+            user_message_attachment_summary(&[att("/a/1.txt"), att("/a/2.png")]).as_deref(),
+            Some("Using 2 attachments")
         );
     }
 
