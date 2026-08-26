@@ -13,6 +13,11 @@ withhold. Resolving the sidecar blobs behind large outputs was rejected too: it 
 fetch per tool chip and still cannot recover the stripped inputs, so it buys size and
 latency without buying completeness.
 
-The cost is accepted and permanent: an export can say a command ran without saying what
-the command was. Anyone reaching for the journal to "make the export complete" is
-undoing this decision, not fixing an oversight.
+What the filter actually removes is narrower than "tool inputs": file contents on a
+write, the before/after strings of an edit, a web fetch's prompt, and the free-form
+input of MCP and unrecognized tools. A shell command, a read path, a search pattern and
+a query all survive. So an export can say precisely which command ran and which file was
+edited — it just cannot show what was written into that file.
+
+The cost is accepted and permanent. Anyone reaching for the journal to "make the export
+complete" is undoing this decision, not fixing an oversight.

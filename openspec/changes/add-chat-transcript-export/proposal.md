@@ -23,9 +23,12 @@ wrong source, and saying so is half the point of this change (see
   Recorded in `CONTEXT.md`.
 - **D-02:** The source is the **Chat Transcript** — the same entries the
   transcript view renders. The Run Journal is rejected as a source: it keeps
-  the raw tool inputs that `render_parts` strips before anything is displayed
-  or synced, so exporting it would leak, in a file meant to be pasted
-  elsewhere, exactly what the transcript exists to withhold. Sidecar blobs
+  the tool payloads `sanitize_tool_call` strips before anything is displayed or
+  synced — file contents on a write, an edit's before/after strings, a fetch's
+  prompt, MCP and unknown-tool inputs — so exporting it would leak, in a file
+  meant to be pasted elsewhere, exactly what the transcript exists to withhold.
+  A command, a read path and a search pattern survive the filter and DO appear
+  in an export. Sidecar blobs
   behind `output_ref` are NOT resolved either: a fetch per tool chip buys size
   and latency without buying completeness, since the stripped inputs are gone
   regardless. ADR 0002.

@@ -56,7 +56,13 @@ around it rather than inventing a second vocabulary for the same thing.
 
 ## What an export cannot say
 
-A tool part whose input was stripped by `render_parts` exports as
-`> *Used Bash tool*` with no command. This is ADR 0002 working as intended, not
-a gap to close later. The Artifact index is what keeps such a run legible: it
-still records the files that changed and the subagents that ran.
+`sanitize_tool_call` is narrower than "strips tool inputs": it clears
+`WriteFile.content`, `EditFile.old_string`/`new_string`, `WebFetch.prompt`,
+`Mcp.input` and `Unknown.input`. Everything else — `Exec.command`,
+`ReadFile.path`, `Search.pattern`, `WebSearch.query` — reaches the doc intact.
+
+So the export DOES name the command a Bash ran and the file an Edit touched; it
+does not carry the bytes that went into that file. Renderers must read the
+`ToolCall` variant rather than assume a field is present or absent: an
+`EditFile` always has its path and never has its strings. This is ADR 0002
+working as intended, not a gap to close later.
