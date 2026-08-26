@@ -189,6 +189,10 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    // Link-source marks for the GitHub/YouTube URL chips (official marks,
+    // single-path so gpui's currentColor tint carries the chip's ink).
+    (GITHUB_MARK, "github-mark"),
+    (YOUTUBE_MARK, "youtube-mark"),
     // Unpeel runtime package marks. These are copied from
     // `third_party/unpeel/runtimes/*/assets/icon.svg` so packaged builds do
     // not depend on the source submodule at runtime.

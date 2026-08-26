@@ -75,11 +75,11 @@ pub(crate) fn project_urls(text: &str) -> Option<UrlProjection> {
             UrlSegment::Chip { url, label, kind } => {
                 let source = source_at..source_at + url.len();
                 let display_start = projected.len();
-                if kind == UrlChipKind::GitHub {
-                    // Reserve one icon-width before the label. The transcript
-                    // paints its existing git-branch asset into this space.
-                    projected.push_str("  ");
-                }
+                // Reserve one icon-width before the label; the transcript
+                // paints the kind's brand mark into that space. Both kinds
+                // reserve it — a YouTube chip with no gap painted its icon
+                // over the first glyphs of the label.
+                projected.push_str("  ");
                 projected.push_str(&label);
                 let display = display_start..projected.len();
                 chips.push(UrlChipSpan {

@@ -135,10 +135,16 @@ pub struct CachedCode {
 }
 
 impl RenderCache {
-    /// Drop every cached entry for `row`.
+    /// Drop every cached entry for `row`, INCLUDING the derived keys a row
+    /// renders its secondary trees under (`"{row}-reasoning"`,
+    /// `"{row}#mermaid-code"`). Callers only know the row id, so an exact
+    /// match left those trees cached forever: every thinking block froze at
+    /// the length its first paint saw, mid-word. Prefix matching can also
+    /// drop a sibling whose id is a prefix-extension of this one (`m#r1`
+    /// vs `m#r10`) — a redundant reflatten, never a stale render.
     pub fn invalidate_row(&mut self, row: &str) {
-        self.flats.retain(|(r, _, _), _| r.as_ref() != row);
-        self.code.retain(|(r, _, _), _| r.as_ref() != row);
+        self.flats.retain(|(r, _, _), _| !r.starts_with(row));
+        self.code.retain(|(r, _, _), _| !r.starts_with(row));
     }
 
     pub fn clear(&mut self) {
@@ -1466,6 +1472,32 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+    }
+
+    /// A row renders its reasoning tree under `"{row}-reasoning"` and its
+    /// mermaid source under `"{row}#mermaid-code"`, but invalidation only
+    /// ever gets the row id. Exact-match retain left those entries cached
+    /// for the life of the transcript, so every streamed thinking block
+    /// stayed frozen at its first-paint length — truncated mid-word.
+    #[test]
+    fn invalidate_row_drops_derived_row_keys() {
+        let mut cache = RenderCache::default();
+        let flat = || {
+            Rc::new(FlatText {
+                text: "x".into(),
+                runs: Vec::new(),
+                links: Vec::new(),
+            })
+        };
+        for key in ["m1#r0", "m1#r0-reasoning", "m1#r0#mermaid-code"] {
+            cache.flats.insert((key.into(), 0, 0), flat());
+        }
+        cache.flats.insert(("m2#r0-reasoning".into(), 0, 0), flat());
+
+        cache.invalidate_row("m1#r0");
+
+        assert_eq!(cache.flats.len(), 1, "only the untouched row survives");
+        assert!(cache.flats.contains_key(&("m2#r0-reasoning".into(), 0, 0)));
     }
 
     /// Block ids key the `InteractiveText` element (hence an a11y node), the

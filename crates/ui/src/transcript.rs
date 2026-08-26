@@ -7108,6 +7108,7 @@ fn user_bubble_text(
     let github_wash = theme.code_wash;
     let youtube_wash = theme.danger.opacity(0.10);
     let github_ink = theme.code_text;
+    let youtube_ink = theme.danger_muted;
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
     let painted_url_chips = url_chips.clone();
@@ -7143,9 +7144,15 @@ fn user_bubble_text(
                         BorderStyle::default(),
                     ));
                 }
-                if chip.kind == crate::url_chips::UrlChipKind::GitHub
-                    && let Some(rect) = icon_rect
-                {
+                if let Some(rect) = icon_rect {
+                    let (mark, ink) = match chip.kind {
+                        crate::url_chips::UrlChipKind::GitHub => {
+                            (crate::icons::GITHUB_MARK, github_ink)
+                        }
+                        crate::url_chips::UrlChipKind::YouTube => {
+                            (crate::icons::YOUTUBE_MARK, youtube_ink)
+                        }
+                    };
                     let icon_size = px(11.0);
                     let icon_bounds = Bounds::new(
                         gpui::point(
@@ -7156,10 +7163,10 @@ fn user_bubble_text(
                     );
                     let _ = window.paint_svg(
                         icon_bounds,
-                        SharedString::from(crate::icons::GIT_BRANCH),
+                        SharedString::from(mark),
                         None,
                         Default::default(),
-                        github_ink,
+                        ink,
                         cx,
                     );
                 }
