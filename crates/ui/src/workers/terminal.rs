@@ -161,12 +161,20 @@ impl RemoteGridTracker {
 struct HistoricalReplay {
     active: bool,
     grid_ready: bool,
+    chunks: u32,
 }
+
+/// Teto do catch-up silencioso. Uma sessao viva e tagarela pode nunca drenar
+/// o backlog, e sem teto a tela ficaria vazia pra sempre. Estourado o limite,
+/// volta a pintar chunk a chunk — o pior caso vira o comportamento antigo,
+/// nunca algo pior.
+const MAX_SILENT_REPLAY_CHUNKS: u32 = 64;
 
 impl HistoricalReplay {
     fn start(&mut self) {
         self.active = true;
         self.grid_ready = false;
+        self.chunks = 0;
     }
 
     fn observe_geometry(&mut self) {
@@ -177,11 +185,32 @@ impl HistoricalReplay {
         !self.active || self.grid_ready
     }
 
+    /// Enquanto o backlog nao drena, o terminal alimenta o emulador sem
+    /// pintar: cada chunk pintado era um quadro do terminal rolando do topo,
+    /// e quem abre a sessao quer o fim dela, nao o filme.
+    fn is_catching_up(&self) -> bool {
+        self.active && self.chunks < MAX_SILENT_REPLAY_CHUNKS
+    }
+
     fn observe_output(&mut self, had_data: bool) {
-        if !had_data {
+        if had_data {
+            self.chunks = self.chunks.saturating_add(1);
+        } else {
             self.active = false;
         }
     }
+}
+
+/// Se este refresh deve virar um quadro na tela. Pintar so quando o catch-up
+/// acabou (ou quando ele acabou AGORA, que e o quadro que o usuario pediu:
+/// a ultima interacao).
+fn should_paint(
+    was_catching_up: bool,
+    catching_up: bool,
+    had_data: bool,
+    viewport_dirty: bool,
+) -> bool {
+    !catching_up && (had_data || viewport_dirty || was_catching_up)
 }
 
 #[derive(Default)]
@@ -492,9 +521,16 @@ impl WorkersTerminal {
                         }
                         match result {
                             Ok((output, viewport)) => {
+                                let was_catching_up = state.historical_replay.is_catching_up();
                                 let had_data = state.apply_refresh(output, viewport);
+                                let catching_up = state.historical_replay.is_catching_up();
                                 terminal.error = None;
-                                if had_data || viewport_dirty {
+                                if should_paint(
+                                    was_catching_up,
+                                    catching_up,
+                                    had_data,
+                                    viewport_dirty,
+                                ) {
                                     cx.notify();
                                 }
                             }
@@ -1269,9 +1305,10 @@ mod tests {
     use crate::terminal::view::paste_bytes;
 
     use super::{
-        HistoricalReplay, MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync,
-        RetainedWorkerTerminals, TerminalRefresh, TerminalScrollAction, WorkersTerminalView,
-        mouse_report_bytes, scroll_action, terminal_refresh, viewport_has_tui_jump_hint,
+        HistoricalReplay, MAX_SILENT_REPLAY_CHUNKS, MouseProtocol, MouseReportKind,
+        RemoteGridTracker, ResizeSync, RetainedWorkerTerminals, TerminalRefresh,
+        TerminalScrollAction, WorkersTerminalView, mouse_report_bytes, scroll_action, should_paint,
+        terminal_refresh, viewport_has_tui_jump_hint,
     };
 
     #[test]
@@ -1547,6 +1584,50 @@ mod tests {
 
         replay.start();
         assert!(!replay.can_consume_output());
+    }
+
+    /// Abrir uma sessao longa pintava cada chunk do backlog: o usuario via o
+    /// terminal rolar do topo ate o fim antes de chegar onde ele queria.
+    #[test]
+    fn a_long_backlog_paints_one_frame_at_the_end_not_the_whole_scroll() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+
+        // Chunks do backlog: alimentam o emulador, nenhum vira quadro.
+        for _ in 0..5 {
+            let was = replay.is_catching_up();
+            replay.observe_output(true);
+            assert!(was && replay.is_catching_up());
+            assert!(!should_paint(was, replay.is_catching_up(), true, false));
+        }
+
+        // A leitura vazia drena o backlog: ESTE e o quadro que o usuario pediu.
+        let was = replay.is_catching_up();
+        replay.observe_output(false);
+        assert!(!replay.is_catching_up());
+        assert!(should_paint(was, replay.is_catching_up(), false, false));
+
+        // Dali em diante, output ao vivo pinta normalmente.
+        replay.observe_output(true);
+        assert!(should_paint(false, replay.is_catching_up(), true, false));
+    }
+
+    /// Uma sessao viva e tagarela pode nunca drenar; sem teto a tela ficaria
+    /// vazia pra sempre.
+    #[test]
+    fn a_backlog_that_never_drains_starts_painting_again() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+
+        for _ in 0..MAX_SILENT_REPLAY_CHUNKS {
+            assert!(replay.is_catching_up());
+            replay.observe_output(true);
+        }
+
+        assert!(!replay.is_catching_up(), "o teto solta o paint");
+        assert!(should_paint(false, replay.is_catching_up(), true, false));
     }
 
     #[test]
