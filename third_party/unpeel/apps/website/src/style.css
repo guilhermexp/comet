@@ -1,0 +1,689 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* Distinctive type system: a tight grotesque for body, an editorial serif for
+   accents, and a terminal mono for system/labels — the product is a terminal,
+   so the mono is load-bearing, not decoration. */
+@theme {
+  --font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  /* Session status palette — used sparingly for the "see everything at a
+     glance" dots. Tuned for the near-black background. Done is the desktop
+     app's blue unread/done dot (#60A5FA family), not green — the apps have
+     no green status anywhere. */
+  --color-status-busy: oklch(0.78 0.16 70);
+  --color-status-done: oklch(0.6 0.17 250);
+  --color-status-attention: oklch(0.72 0.19 25);
+
+  /* Agent runtime accents — one palette for the hero shimmer, feature-card
+     tones, and anywhere else a runtime color is needed (bg-agent-claude,
+     text-agent-codex, …). Keep in sync with the demo CLI accents. */
+  --color-agent-claude: #d97757;
+  --color-agent-codex: oklch(0.74 0.13 195);
+  --color-agent-green: oklch(0.72 0.19 145);
+  --color-agent-kimi: #4fa8ff;
+  --color-agent-gemini: oklch(0.62 0.19 265);
+  --color-agent-cursor: oklch(0.62 0.2 300);
+  --color-agent-kiro: #c19aff;
+}
+
+/* Map the shadcn-style design tokens to Tailwind v4 theme colors, so
+   `bg-background`, `text-foreground`, `border-border`, etc. resolve. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+/* Self-contained neutral palette (no external design system). */
+:root {
+  color-scheme: light;
+  --radius: 0.625rem;
+  --background: oklch(0.955 0.002 286);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --border: oklch(0.895 0.002 286);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  /* Header icon top-lit fade: the dark light-mode icon reads as lit from
+     above when the TOP is the faded end. Flipped in dark (see .dark). */
+  --icon-fade-top: 0.8;
+  --icon-fade-bottom: 1;
+}
+
+/* Dark is the marketing surface — deep, slightly warm near-black. */
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.155 0.004 285);
+  --foreground: oklch(0.97 0 0);
+  --card: #1a1a1f;
+  --card-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.985 0 0);
+  --primary-foreground: oklch(0.18 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.705 0.01 285);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  /* bright currentColor: opaque top = lit from above */
+  --icon-fade-top: 1;
+  --icon-fade-bottom: 0.8;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  /* Header icon gradient stops (TopBar DEPTH_STOPS): stop-opacity from the
+     theme-aware --icon-fade-* vars so the lit end stays at the top. */
+  .icon-fade-top {
+    stop-opacity: var(--icon-fade-top);
+  }
+  .icon-fade-bottom {
+    stop-opacity: var(--icon-fade-bottom);
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection {
+    background: var(--foreground);
+    color: var(--background);
+  }
+}
+
+@layer utilities {
+  /* "multiplexer" terminal shimmer: characters rest at the normal text
+     color; a discrete wave of agent-runtime colors (Claude coral, Codex
+     teal, done-green, Kimi blue, Cursor violet) sweeps through them,
+     each character fading from the text color into the agent colors and
+     back — quick wave, calm rest state. */
+  .text-agent-terminal > span {
+    animation: agent-char 2.6s ease-in-out infinite;
+  }
+  @keyframes agent-char {
+    0%,
+    58% {
+      color: var(--foreground);
+    }
+    62% {
+      color: var(--color-agent-claude);
+    }
+    66% {
+      color: var(--color-agent-codex);
+    }
+    70% {
+      color: var(--color-agent-green);
+    }
+    74% {
+      color: var(--color-agent-kimi);
+    }
+    78% {
+      color: var(--color-agent-cursor);
+    }
+    82%,
+    100% {
+      color: var(--foreground);
+    }
+  }
+
+  /* "Copied" confirmation (hero install command): the same per-character
+     agent-color wave as the headline, but played once and fast — the whole
+     sweep lands inside the popover's short life. */
+  .text-agent-copied > span {
+    animation: agent-char 1.2s ease-in-out both;
+  }
+
+  /* Gradient text selection (app/lib/agentSelection.ts): while the live
+     handler is running (html.live-selection), only elements the handler tags
+     get painted — from inline --selection-bg/fg vars sampled off the agent
+     ramp by the element's screen position at selection time, so a drag down
+     the page reads as one continuous gradient. Inputs keep a plain inverted
+     highlight (their text nodes are invisible to the walker). Without JS the
+     class never lands and selection falls back to the base inverted rule. */
+  .live-selection *::selection {
+    background-color: transparent;
+    color: currentColor;
+  }
+  .live-selection .selection-text-owner::selection {
+    background-color: var(--selection-bg, var(--foreground));
+    color: var(--selection-fg, var(--background));
+  }
+  .live-selection input::selection,
+  .live-selection textarea::selection {
+    background-color: var(--foreground);
+    color: var(--background);
+  }
+
+  /* Glass border for the homepage cards: a 1px specular ring whose
+     highlight angle (--glass-angle) is driven from scroll position, so the
+     lighting sweeps across the edge as the card moves through the viewport.
+     Neutral ink only — the per-card accent tint (WhyCard's `tint` prop /
+     --glass-tint) is intentionally not consumed here anymore; the props are
+     inert. Light mode uses dark ink — a white specular is invisible on the
+     light background — with a higher floor so the edge never vanishes
+     mid-sweep. */
+  .glass-border::before {
+    content: "";
+    pointer-events: none;
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      var(--glass-angle, 120deg),
+      oklch(0 0 0 / 0.13),
+      oklch(0 0 0 / 0.07) 28%,
+      oklch(0 0 0 / 0.06) 55%,
+      oklch(0 0 0 / 0.1)
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    mask-composite: exclude;
+  }
+  .dark .glass-border::before {
+    background: linear-gradient(
+      var(--glass-angle, 120deg),
+      oklch(1 0 0 / 0.18),
+      oklch(1 0 0 / 0.05) 28%,
+      oklch(1 0 0 / 0.02) 55%,
+      oklch(1 0 0 / 0.11)
+    );
+  }
+
+  /* Phone review demo (MarkupReviewDemo): one 14s loop. A screenshot the
+     agent took lands on the phone (mkp-shot), a marker ring and arrow draw
+     themselves over it (mkp-ring / mkp-arrow, pathLength=1 dash trick), a
+     note pill pops (mkp-note), and send pulses (mkp-send) with a sent toast
+     (mkp-toast). */
+  .mkp-shot {
+    animation: mkp-shot 14s ease-out infinite;
+  }
+  @keyframes mkp-shot {
+    0%, 2% { opacity: 0; transform: translateY(10px) scale(0.97); }
+    7%, 96% { opacity: 1; transform: none; }
+    99%, 100% { opacity: 0; transform: none; }
+  }
+  .mkp-ring {
+    stroke-dasharray: 1;
+    animation: mkp-ring 14s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+  @keyframes mkp-ring {
+    0%, 12% { stroke-dashoffset: 1; opacity: 0; }
+    13% { opacity: 1; }
+    21%, 95% { stroke-dashoffset: 0; opacity: 1; }
+    98%, 100% { stroke-dashoffset: 0; opacity: 0; }
+  }
+  .mkp-arrow {
+    stroke-dasharray: 1;
+    animation: mkp-arrow 14s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+  @keyframes mkp-arrow {
+    0%, 21% { stroke-dashoffset: 1; opacity: 0; }
+    22% { opacity: 1; }
+    30%, 95% { stroke-dashoffset: 0; opacity: 1; }
+    98%, 100% { stroke-dashoffset: 0; opacity: 0; }
+  }
+  .mkp-arrowhead {
+    animation: mkp-arrowhead 14s ease-out infinite;
+  }
+  @keyframes mkp-arrowhead {
+    0%, 27% { opacity: 0; }
+    30%, 95% { opacity: 1; }
+    98%, 100% { opacity: 0; }
+  }
+  .mkp-note {
+    animation: mkp-note 14s cubic-bezier(0.34, 1.4, 0.64, 1) infinite;
+  }
+  @keyframes mkp-note {
+    0%, 31% { opacity: 0; transform: scale(0.8) translateY(4px); }
+    36%, 95% { opacity: 1; transform: none; }
+    98%, 100% { opacity: 0; }
+  }
+  .mkp-send {
+    animation: mkp-send 14s ease-in-out infinite;
+  }
+  @keyframes mkp-send {
+    0%, 41% { transform: scale(1); }
+    43.5% { transform: scale(1.3); }
+    46%, 100% { transform: scale(1); }
+  }
+  .mkp-toast {
+    animation: mkp-toast 14s ease-out infinite;
+  }
+  @keyframes mkp-toast {
+    0%, 44% { opacity: 0; transform: translateY(6px); }
+    47%, 60% { opacity: 1; transform: none; }
+    64%, 100% { opacity: 0; transform: none; }
+  }
+  /* Computer Use demo: the pointer glides between UI targets with dwell
+     pauses, and the ring pulses a "click" at each stop (timed to the same
+     10s cycle). */
+  @keyframes cua-move {
+    0%, 10% { left: 16%; top: 74%; }
+    24%, 34% { left: 64%; top: 26%; }
+    48%, 58% { left: 40%; top: 60%; }
+    72%, 82% { left: 82%; top: 68%; }
+    96%, 100% { left: 16%; top: 74%; }
+  }
+  .cua-cursor {
+    animation: cua-move 10s ease-in-out infinite;
+  }
+  @keyframes cua-click {
+    0%, 27% { opacity: 0; transform: scale(0.4); }
+    29% { opacity: 0.85; transform: scale(0.6); }
+    37% { opacity: 0; transform: scale(1.7); }
+    51% { opacity: 0; transform: scale(0.4); }
+    53% { opacity: 0.85; transform: scale(0.6); }
+    61% { opacity: 0; transform: scale(1.7); }
+    75% { opacity: 0; transform: scale(0.4); }
+    77% { opacity: 0.85; transform: scale(0.6); }
+    85% { opacity: 0; transform: scale(1.7); }
+    100% { opacity: 0; }
+  }
+  .cua-click {
+    animation: cua-click 10s linear infinite;
+  }
+
+  /* Scroll reveal: collapsed by default, released when JS adds data-reveal=in.
+     Falls open if JS never runs (no-js safety). */
+  [data-reveal] {
+    opacity: 0;
+    transform: translateY(18px);
+    transition:
+      opacity 0.7s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+    transition-delay: var(--reveal-delay, 0ms);
+  }
+  [data-reveal="in"] {
+    opacity: 1;
+    transform: none;
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(20px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .animate-rise {
+    animation: rise 0.8s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  /* Transform-free reveal: use on elements that contain a backdrop-filter
+     (e.g. the hero app window). A `transform` on an ancestor promotes a
+     compositing layer that defeats descendant backdrop-blur, so this fades
+     with opacity only. */
+  @keyframes fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .animate-fade {
+    animation: fade 0.8s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  @keyframes blink {
+    0%, 55% { opacity: 1; }
+    56%, 100% { opacity: 0; }
+  }
+  .animate-caret {
+    animation: blink 1.1s step-end infinite;
+  }
+
+  /* MCP diagram: a single dash (set against pathLength=100) travels the whole
+     connector once per cycle, so commands/reads appear to stream along it. */
+  @keyframes mcp-flow {
+    from { stroke-dashoffset: 0; }
+    to { stroke-dashoffset: -100; }
+  }
+  .mcp-flow {
+    animation: mcp-flow 2.8s linear infinite;
+  }
+
+  /* Hub broadcast ring: scale + fade outward (like radar). */
+  @keyframes mcp-ping {
+    0% { transform: scale(1); opacity: 0.6; }
+    80%, 100% { transform: scale(1.6); opacity: 0; }
+  }
+  .mcp-ping {
+    animation: mcp-ping 2.8s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+  }
+
+  /* Active-session pulse on the status dot. */
+  @keyframes mcp-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  .mcp-dot {
+    animation: mcp-dot 1.6s ease-in-out infinite;
+  }
+
+  /* Shimmering status text (e.g. Codex "Working", Gemini "Thinking", Cursor
+     "Composing") — a bright highlight sweeps across the word, like the real
+     CLIs. Per-CLI colour via --sh (base tint) and --shh (highlight); default
+     is a white sweep. */
+  @keyframes demo-shimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
+  .demo-shimmer {
+    color: transparent;
+    background-image: linear-gradient(
+      100deg,
+      var(--sh, oklch(1 0 0 / 0.5)) 40%,
+      var(--shh, oklch(1 0 0)) 50%,
+      var(--sh, oklch(1 0 0 / 0.5)) 60%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: demo-shimmer 2.4s linear infinite;
+  }
+
+  /* Browser MCP demo: one 11s loop tells the tool-call story. The pointer
+     (show_cursor) glides rest → “Pricing” nav (click at 26%) → hover the Pro
+     card (browser_get reads it) → rest; the page flashes at 77% for
+     browser_screenshot; and each terminal tool line (.browser-demo-step-N in
+     BrowserMcpDemo.tsx) pops in at the moment its action happens. All
+     elements mount together, so same-duration animations stay in lockstep.
+     Waypoints are % of the browser window. */
+  @keyframes browser-cursor-move {
+    0%, 8%    { left: 86%; top: 92%; }
+    22%, 34%  { left: 55%; top: 34%; }
+    48%, 72%  { left: 50%; top: 70%; }
+    88%, 100% { left: 86%; top: 92%; }
+  }
+  .browser-demo-cursor {
+    position: absolute;
+    left: 50%;
+    top: 70%;
+    animation: browser-cursor-move 11s cubic-bezier(0.45, 0.05, 0.25, 1) infinite;
+  }
+  @keyframes browser-cursor-click {
+    0%, 24%   { opacity: 0; transform: scale(0.3); }
+    26%       { opacity: 0.85; transform: scale(0.45); }
+    34%       { opacity: 0; transform: scale(1.7); }
+    35%, 100% { opacity: 0; transform: scale(0.3); }
+  }
+  .browser-demo-cursor::before {
+    content: "";
+    position: absolute;
+    left: -9px;
+    top: -9px;
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    border: 1.5px solid oklch(0.8 0.1 255);
+    opacity: 0;
+    animation: browser-cursor-click 11s linear infinite;
+  }
+  /* browser_screenshot: a quick shutter flash over the page. */
+  @keyframes browser-demo-flash {
+    0%, 75%   { opacity: 0; }
+    77%       { opacity: 0.2; }
+    82%, 100% { opacity: 0; }
+  }
+  .browser-demo-flash {
+    animation: browser-demo-flash 11s linear infinite;
+  }
+  /* Terminal tool lines appear as their action happens in the browser:
+     open/snapshot as the page settles, click right after the ring fires,
+     get once the pointer parks on the Pro card, screenshot after the flash. */
+  @keyframes browser-demo-step-1 { 0%, 2%  { opacity: 0; } 4%, 100%  { opacity: 1; } }
+  @keyframes browser-demo-step-2 { 0%, 12% { opacity: 0; } 14%, 100% { opacity: 1; } }
+  @keyframes browser-demo-step-3 { 0%, 27% { opacity: 0; } 29%, 100% { opacity: 1; } }
+  @keyframes browser-demo-step-4 { 0%, 52% { opacity: 0; } 54%, 100% { opacity: 1; } }
+  @keyframes browser-demo-step-5 { 0%, 79% { opacity: 0; } 81%, 100% { opacity: 1; } }
+  .browser-demo-step-1 { animation: browser-demo-step-1 11s linear infinite; }
+  .browser-demo-step-2 { animation: browser-demo-step-2 11s linear infinite; }
+  .browser-demo-step-3 { animation: browser-demo-step-3 11s linear infinite; }
+  .browser-demo-step-4 { animation: browser-demo-step-4 11s linear infinite; }
+  .browser-demo-step-5 { animation: browser-demo-step-5 11s linear infinite; }
+
+  @keyframes demo-status-line {
+    0%, 100% { transform: translateX(0); opacity: 0.72; }
+    50% { transform: translateX(7px); opacity: 1; }
+  }
+  .demo-status-line {
+    position: relative;
+    display: inline-block;
+    width: 13px;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: oklch(0.6 0.17 250 / 0.24);
+  }
+  .demo-status-line::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: 6px;
+    border-radius: inherit;
+    background: oklch(0.6 0.17 250);
+    animation: demo-status-line 1.15s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  [data-reveal] { opacity: 1; transform: none; transition: none; }
+  /* Page-level / large motion respects the setting. The small in-terminal
+     "liveliness" animations (caret, shimmer, status spinners) intentionally
+     keep running: they ARE the "agent is working" signal in the product demo,
+     so freezing them reads as broken. See CyclingGlyph for the JS equivalent. */
+  .animate-rise, .animate-fade,
+  .mcp-flow, .mcp-ping, .mcp-dot { animation: none; }
+  /* Pointer rests on the Pro card (its static left/top); every tool line
+     stays visible (their default opacity is 1) and the shutter flash is off. */
+  .browser-demo-cursor, .browser-demo-cursor::before,
+  .browser-demo-flash,
+  .browser-demo-step-1, .browser-demo-step-2, .browser-demo-step-3,
+  .browser-demo-step-4, .browser-demo-step-5 { animation: none; }
+}
+
+/* ------------------------------------------------------------ docs prose ---
+   Typography for markdown-rendered documentation (see pages/Docs.tsx). The
+   content is repo-authored markdown, so element selectors are the contract. */
+@layer components {
+  .docs-prose {
+    font-size: 1rem;
+    line-height: 1.75;
+    color: var(--muted-foreground);
+  }
+  .docs-prose h2 {
+    margin-top: 2.75rem;
+    scroll-margin-top: 6rem;
+    font-size: 1.45rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.25;
+    color: var(--foreground);
+    text-wrap: balance;
+  }
+  .docs-prose h3 {
+    margin-top: 2rem;
+    scroll-margin-top: 6rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--foreground);
+  }
+  .docs-prose p { margin-top: 1rem; }
+  .docs-prose .experimental-callout {
+    margin-top: 1.25rem;
+    padding: 1rem 1.125rem;
+    border: 1px solid oklch(0.72 0.13 58 / 0.32);
+    border-radius: 0.75rem;
+    background:
+      linear-gradient(135deg, oklch(0.74 0.14 58 / 0.13), oklch(0.58 0.12 48 / 0.055)),
+      oklch(1 0 0 / 0.018);
+    box-shadow:
+      inset 0 1px 0 oklch(1 0 0 / 0.06),
+      0 18px 36px -28px oklch(0.67 0.15 54 / 0.48);
+    color: color-mix(in oklab, var(--muted-foreground) 90%, transparent);
+  }
+  .docs-prose .experimental-callout p {
+    margin-top: 0;
+  }
+  .docs-prose .experimental-callout__label {
+    margin-bottom: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: oklch(0.8 0.13 62);
+  }
+  .docs-prose strong {
+    font-weight: 600;
+    color: color-mix(in oklab, var(--foreground) 92%, transparent);
+  }
+  .docs-prose em { font-style: italic; }
+  .docs-prose a {
+    color: color-mix(in oklab, var(--foreground) 90%, transparent);
+    text-decoration: underline;
+    text-decoration-color: var(--border);
+    text-underline-offset: 4px;
+    transition: text-decoration-color 0.15s ease;
+  }
+  .docs-prose a:hover { text-decoration-color: var(--foreground); }
+  .docs-prose ul, .docs-prose ol {
+    margin-top: 1rem;
+    padding-left: 1.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .docs-prose ul { list-style: disc; }
+  .docs-prose ol { list-style: decimal; }
+  .docs-prose li::marker { color: color-mix(in oklab, var(--muted-foreground) 55%, transparent); }
+  .docs-prose code {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    color: color-mix(in oklab, var(--foreground) 88%, transparent);
+    background: color-mix(in oklab, var(--foreground) 6%, transparent);
+    border: 1px solid color-mix(in oklab, var(--foreground) 9%, transparent);
+    border-radius: 0.375rem;
+    padding: 0.1em 0.35em;
+    white-space: nowrap;
+  }
+  /* Code blocks are terminals: deliberately dark in both site themes, so the
+     text color is pinned light instead of following --foreground. */
+  .docs-prose pre {
+    margin-top: 1.25rem;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    border-radius: 0.75rem;
+    border: 1px solid oklch(1 0 0 / 0.08);
+    background: oklch(0.16 0.003 285 / 0.97);
+  }
+  .docs-prose pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    white-space: pre;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    color: oklch(0.88 0.002 285);
+  }
+  .docs-prose blockquote {
+    margin-top: 1.25rem;
+    padding-left: 1rem;
+    border-left: 2px solid color-mix(in oklab, var(--foreground) 16%, transparent);
+    color: color-mix(in oklab, var(--muted-foreground) 85%, transparent);
+  }
+  .docs-prose hr {
+    margin-top: 2.5rem;
+    border: none;
+    border-top: 1px solid color-mix(in oklab, var(--foreground) 9%, transparent);
+  }
+  .docs-prose table {
+    margin-top: 1.25rem;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    line-height: 1.55;
+  }
+  .docs-prose th {
+    padding: 0.5rem 1rem 0.5rem 0;
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+    border-bottom: 1px solid color-mix(in oklab, var(--foreground) 14%, transparent);
+  }
+  .docs-prose td {
+    padding: 0.55rem 1rem 0.55rem 0;
+    vertical-align: top;
+    border-bottom: 1px solid color-mix(in oklab, var(--foreground) 7%, transparent);
+  }
+  .docs-prose img {
+    margin-top: 1.5rem;
+    border-radius: 0.75rem;
+    border: 1px solid color-mix(in oklab, var(--foreground) 11%, transparent);
+    box-shadow: 0 20px 40px -16px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* Square site, always: the terminal aesthetic's zero-radius corners apply in
+   BOTH presentations now, so flipping APP ⁄ CLI never reflows the chrome —
+   the switch only swaps preview content. `keep-round` opts out an element AND
+   its whole subtree: it marks the device mockups (Mac app windows, iPhone
+   frames, traffic lights), which preview real products whose chrome is
+   genuinely rounded. (The `tui` class still lands on <html> in CLI mode for
+   anything presentation-specific, but corners no longer depend on it.) */
+*:not(.keep-round):not(.keep-round *) {
+  border-radius: 0 !important;
+}

@@ -1,0 +1,44 @@
+schema_version = 1
+id = "dev.mariozechner.pi"
+slug = "pi"
+legacy_slug = "pi"
+label = "Pi"
+adapter = "builtin:pi"
+legacy_order = 5
+platforms = ["macos", "linux"]
+supports_quick_launch = true
+capabilities = ["resume", "restart_agent", "append_system_context"]
+
+[display]
+tint = "#7C95FF"
+spinner_tint = "#7C95FF"
+icon = "pi"
+icon_asset = "assets/icon.svg"
+icon_source = "internal:legacy-unpeel-tool-icons"
+icon_license = "vendor-brand-asset"
+
+[install]
+official_url = "https://github.com/badlogic/pi-mono"
+command = "npm install -g @mariozechner/pi-coding-agent"
+
+[detection]
+command_aliases = ["pi"]
+process_aliases = ["pi"]
+script_path_signatures = []
+
+[lifecycle]
+source = "output"
+authority = "none"
+fallback = "output"
+completion_reliable = false
+attention_reliable = false
+
+[[usage.stores]]
+root = ".pi/agent/sessions"
+extensions = ["jsonl"]
+
+[[suggested_presets]]
+id = "pi"
+label = "pi"
+command = "pi"
+quick_launch = false

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#1a1a1f" />
+  <!-- Square Unpeel mark — the CLI-mode cut of the logo (see Logo.tsx),
+       centered on the same 512 canvas as favicon.svg, square tile to match. -->
+  <g transform="matrix(1.0667 0 0 1.0667 128 128)">
+    <path d="M240 240H0V110H54V186H186V110H240V240Z" fill="#D9D9D9"/>
+    <path d="M9.61651e-06 9.53611e-06L240 3.05176e-05L240 110L186 110L186 54L54 54L54 110L0 110L9.61651e-06 9.53611e-06Z" fill="#D9D9D9" fill-opacity="0.2"/>
+  </g>
+</svg>

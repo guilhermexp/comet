@@ -1,0 +1,56 @@
+---
+name: verify
+description: Build, launch, and drive the native Unpeel macOS app to verify session/UI changes end-to-end without clicking through the UI by hand.
+---
+
+# Verifying native app changes live
+
+## Build + launch the dev app
+
+```sh
+apps/native/dev-app.sh        # = `bun run dev:native` (bun may not be on PATH in agent shells)
+```
+
+Builds release, signs with the stable dev cert, and `open`s
+`apps/native/dist/Unpeel.app` ("Unpeel Dev", burnt-orange icon).
+
+Gotchas:
+
+- **Same bundle id everywhere**: if ANY instance (old dev build or
+  `/Applications/Unpeel.app`) is already running, the script's final `open`
+  silently refocuses it instead of launching the new binary. Quit the old dev
+  build first (`osascript -e 'quit app "Unpeel Dev"'`), and NEVER quit the
+  installed app without operator approval (AGENTS.md never-quit rule).
+- Confirm which binary is live: `pgrep -fl "Unpeel.app/Contents/MacOS/UnpeelNative"`
+  (path shows dist vs /Applications).
+
+## Drive the store without clicking
+
+The hook server's `/mcp/*` bridge reaches UnpeelStore directly:
+
+- Port: the entry ADDED to `~/.unpeel/app-ports` (newline list of ports, one
+  per instance) when the instance starts — snapshot the file before launch and
+  diff. Auth: header `x-unpeel-auth: $(cat ~/.unpeel/mcp/auth-token)`.
+- `POST /mcp/restart-session {"session_id": "..."}` — same path as the UI
+  Restart verb (resume rewrite, carries, watchers).
+- `POST /mcp/start-session`, `/mcp/close-session`, `/mcp/list-presets` also
+  exist (see MCPBridge.swift for shapes).
+
+Type into a session's PTY without the app (marks `has_been_written_to`, fires
+auto-title — harmless at a shell prompt):
+
+```sh
+printf '{"type":"write","data":"\\r"}\n' | nc -U ~/.unpeel/app-sessions/<id>/session.sock -w 2
+```
+
+Session ground truth is `~/.unpeel/app-sessions/<id>/manifest.json` (state,
+command, `has_been_written_to`) and `output.bin` (raw PTY bytes — grep it for
+expected CLI output). A restarted session keeps its `created_at`, so find the
+replacement id by matching `created_at` across manifests.
+
+## Observing the UI itself
+
+Published-store UI (banners, sidebar state) has no external API — use the
+unpeel computer MCP tool (`see`/`click`/`screenshot`, target app "Unpeel Dev")
+to select the session row and screenshot. The first computer action blocks on
+a one-time approval dialog the operator must answer.

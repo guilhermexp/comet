@@ -1,0 +1,28 @@
+# Suggested-shape manifest (docs/plans/unpeel-apps.md ▸ App manifest).
+# The runtime that reads this is not built yet; this file makes unpeel-todos
+# the reference for the declared contract.
+manifest_version = 1
+id = "com.unpeel.todos"
+name = "Todos"
+command = "unpeel-todos"
+description = "Todo lists"
+
+[views]
+terminal = true
+semantic_protocol = 1
+
+[room]
+schema = "com.unpeel.todos"
+schema_version = 1
+roomstore_protocol = 1
+
+[permissions]
+required = ["room.read", "room.write"]
+
+[[agent.tools]]
+name = "add_todo"
+description = "Add a todo item"
+kind = "roomstore"
+
+[agent]
+skill = "skill.md"

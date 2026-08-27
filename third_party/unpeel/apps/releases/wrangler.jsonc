@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "unpeel-release-updates",
+  "account_id": "abc947fba4af12bd510f8e6e7530c578",
+  "compatibility_date": "2025-08-03",
+  "main": "./src/worker.mjs",
+  "observability": { "enabled": true },
+  // This worker is the SINGLE owner of the release surface, on both apex and
+  // www (Cloudflare routes take precedence over the app worker's Custom
+  // Domains). The former duplicate implementation in apps/website/app/routes/
+  // releases.ts has been removed — keep it that way: one enforcement codebase.
+  "routes": [
+    { "pattern": "unpeel.com/appcast-alpha.xml*", "zone_name": "unpeel.com" },
+    { "pattern": "unpeel.com/appcast-beta.xml*", "zone_name": "unpeel.com" },
+    { "pattern": "unpeel.com/appcast.xml*", "zone_name": "unpeel.com" },
+    { "pattern": "unpeel.com/download/mac*", "zone_name": "unpeel.com" },
+    { "pattern": "unpeel.com/install.sh*", "zone_name": "unpeel.com" },
+    { "pattern": "unpeel.com/releases/*", "zone_name": "unpeel.com" },
+    // v1.unpeel.com is the preview lane (unpeel-app-v1 worker); it gets the
+    // same distribution routes so install/download flows are testable there.
+    // No appcasts on v1: shipped apps only ever poll unpeel.com feeds.
+    { "pattern": "v1.unpeel.com/download/mac*", "zone_name": "unpeel.com" },
+    { "pattern": "v1.unpeel.com/install.sh*", "zone_name": "unpeel.com" },
+    { "pattern": "v1.unpeel.com/releases/*", "zone_name": "unpeel.com" },
+    { "pattern": "www.unpeel.com/appcast-alpha.xml*", "zone_name": "unpeel.com" },
+    { "pattern": "www.unpeel.com/appcast-beta.xml*", "zone_name": "unpeel.com" },
+    { "pattern": "www.unpeel.com/appcast.xml*", "zone_name": "unpeel.com" },
+    { "pattern": "www.unpeel.com/download/mac*", "zone_name": "unpeel.com" },
+    { "pattern": "www.unpeel.com/install.sh*", "zone_name": "unpeel.com" },
+    { "pattern": "www.unpeel.com/releases/*", "zone_name": "unpeel.com" }
+  ],
+  // Lets worker.mjs import install.sh as a string (the CLI installer body).
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "unpeel-licenses",
+      "database_id": "2e9a8032-28a6-4265-a844-763ebff908c2",
+      "migrations_dir": "../app/migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "RELEASES",
+      "bucket_name": "unpeel-releases"
+    }
+  ],
+  "vars": {
+    "RELEASE_DEFAULT_CHANNEL": "beta"
+  }
+}

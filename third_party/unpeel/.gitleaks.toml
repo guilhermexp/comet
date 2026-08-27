@@ -1,0 +1,20 @@
+# Gitleaks config — the allowlist below covers the six known test-fixture
+# hits from the 2026-08-13 pre-publication tree scan, so CI runs are quiet
+# unless something NEW appears. Never allowlist a real credential; fix the
+# code instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known test fixtures (verified non-secrets, 2026-08-13)"
+regexes = [
+  # Fake pairing token used across TUI + Swift protocol tests.
+  '''K7ZP2Q4RSTUVWXYZABCDEFGH23''',
+  # RFC 6455's literal example Sec-WebSocket-Key ("the sample nonce").
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+  # Sequential-hex dummy encryption key in the browser verify script.
+  '''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''',
+  # A Swift type name the generic rule mistakes for a key.
+  '''Curve25519\.KeyAgreement\.PrivateKey''',
+]

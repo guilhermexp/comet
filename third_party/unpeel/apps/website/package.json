@@ -1,0 +1,46 @@
+{
+  "name": "@unpeel/website",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite build && vite preview",
+    "deploy": "vite build && wrangler deploy",
+    "check": "wrangler types --env-interface CloudflareBindings && tsc --noEmit",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "keygen": "bun run ../../../unpeel-account/scripts/generate-keypair.ts",
+    "demos:build": "bun run scripts/build-demo-transcripts.ts",
+    "demos:test": "bun run scripts/test-demo-transcripts.ts",
+    "relay:test": "bun run ../../../unpeel-account/scripts/test-relay-bindings.ts",
+    "db:migrate": "wrangler d1 migrations apply unpeel-licenses",
+    "db:migrate:local": "wrangler d1 migrations apply unpeel-licenses --local",
+    "db:seed:dev-license": "bun run ../../../unpeel-account/scripts/seed-dev-license.ts",
+    "deploy:v1": "UNPEEL_DEPLOY_TARGET=v1 vite build && node -e \"const f='dist/unpeel_app/wrangler.json',j=require('fs');const c=JSON.parse(j.readFileSync(f));c.triggers={crons:[]};j.writeFileSync(f,JSON.stringify(c,null,2))\" && wrangler deploy -c dist/unpeel_app/wrangler.json"
+  },
+  "dependencies": {
+    "@inertiajs/react": "^3.0.3",
+    "@unpeel/account-service": "file:./account-service-stub",
+    "clsx": "^2.1.1",
+    "hono": "^4.13.2",
+    "lucide-react": "^1.14.0",
+    "marked": "^18.0.5",
+    "mimetext": "^3.0.28",
+    "postal-mime": "^2.7.4",
+    "qrcode-generator": "^2.0.4",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.2.4"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.44.0",
+    "@tailwindcss/vite": "^4.2.4",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.4",
+    "vite-ssr-components": "^0.5.2",
+    "wrangler": "^4.110.0"
+  }
+}

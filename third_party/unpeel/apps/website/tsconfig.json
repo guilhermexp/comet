@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./app/*"],
+      // First entry that exists wins: the private sibling checkout when
+      // present (official builds), the in-repo public stub otherwise. Must
+      // mirror the runtime selection in vite.config.ts.
+      "@unpeel/account-service": [
+        "../../../unpeel-account/src/index.ts",
+        "./account-service-stub/src/index.ts"
+      ]
+    }
+  },
+  "include": ["app", "src", "vite-plugins", "vite.config.ts", "worker-configuration.d.ts"]
+}

@@ -1,0 +1,34 @@
+{
+  "cli": "codex",
+  "blocks": [
+    {
+      "kind": "assistant",
+      "text": "I’ve got enough to answer the “why” now. The short version is that Browser MCP is carrying real OS/browser lifecycle state, while our normal app checks are mostly pure build/test checks; stale daemon/profile state can survive across agent sessions and make the …"
+    },
+    {
+      "kind": "tool",
+      "name": "exec",
+      "detail": "nl -ba docs/feature/browser-mcp-deep-check.md | sed -n '25,60p;90,112p;280,315p'"
+    },
+    {
+      "kind": "tool",
+      "name": "exec",
+      "detail": "nl -ba crates/unpeel-core/src/browser_mcp.rs | sed -n '1,35p;43,76p;78,111p;379, …"
+    },
+    {
+      "kind": "tool",
+      "name": "exec",
+      "detail": "nl -ba apps/native/UnpeelNative/Sources/UnpeelNative/UnpeelStore.swift | sed -n …"
+    },
+    {
+      "kind": "tool",
+      "name": "exec",
+      "detail": "nl -ba apps/native/verify-browser.sh | sed -n '1,24p;56,84p'",
+      "result": "Output: 1 #!/usr/bin/env bash 2 # 3 # Headless en …"
+    },
+    {
+      "kind": "assistant",
+      "text": "Because Browser MCP is not just “run a screenshot tool.” It is a live chain: `agent -> provider MCP client -> unpeel-host __browser_mcp__ -> agent-browser CLI -> native daemon -> system Chrome -> target page` Any layer can be fine while the next one is wedged. …"
+    }
+  ]
+}
