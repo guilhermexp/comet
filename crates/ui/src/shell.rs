@@ -49,6 +49,7 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
+use crate::settings::projects::ProjectsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
@@ -200,17 +201,20 @@ pub enum SettingsSection {
     Appearance,
     Notifications,
     Shortcuts,
+    /// O registro durável de projetos — o ledger, não o working set da sidebar.
+    Projects,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
+        SettingsSection::Projects,
         SettingsSection::Archived,
     ];
 
@@ -224,6 +228,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::Projects => "Projects",
             SettingsSection::Archived => "Archived sessions",
         }
     }
@@ -1282,6 +1287,7 @@ pub struct Shell {
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
+    projects_page: Option<Entity<ProjectsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
@@ -1707,6 +1713,7 @@ impl Shell {
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
+            projects_page: None,
             harnesses_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
@@ -3103,6 +3110,15 @@ impl Shell {
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
                 }
                 match &self.accounts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Projects => {
+                if self.projects_page.is_none() {
+                    self.projects_page = Some(cx.new(ProjectsPage::new));
+                }
+                match &self.projects_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -5048,6 +5064,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Projects => icons::FOLDER,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to

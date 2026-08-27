@@ -56,6 +56,44 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
   nao forke a maquina de estados numa copia local; mude no proprio
   `third_party/unpeel` para que as duas pontas nao divirjam.
+- **O ledger sobrevive ao `remove_project`; o working set nao.** `projects[]`
+  em `app-state.json` e o working set: `remove_project` poda o registro E
+  todas as sessoes debaixo dele. O ledger mora na chave irma `comet_projects`,
+  no mesmo arquivo (mesmo flock, mesma recusa de dropar chave nao modelada), e
+  `remove_project_record` enumera as tres chaves que limpa — esta nao esta
+  entre elas. Se o ledger algum dia virar filho de `projects`, o teste
+  `ledger_survives_the_pruning_that_removes_a_project` fica vermelho, e e para
+  ficar. A chave e o PATH, nunca o id: `add_project` cunha um `comet-<uuid>`
+  novo a cada entrada.
+- **`reconcile` e puro e `last_seen_at` so anda com atividade real.** Nunca
+  carimbe `now` num projeto vivo e parado: `dirty` viraria true a cada passada
+  e abrir a tela escreveria num arquivo compartilhado e travado a cada render.
+- **`git --until` ignora data malformada EM SILENCIO.** Medido: `--until=@86400`
+  e `--until=86400 +0000` sao aceitos e devolvem HEAD como se nao houvesse
+  filtro. So `@<segundos> <offset>` e ISO 8601 filtram. Qualquer mexida em
+  `project_git::commit_at` mantem
+  `a_date_before_the_first_commit_has_no_anchor`, que e a rede desse silencio.
+- **Nada de estado de git no ledger.** `is_repo`, remote, branch e commits
+  ancora sao lidos frescos por projeto SELECIONADO. `WorkersProject::git_branch`
+  nao serve de fonte: o campo e desserializado de `gitBranch`, mas o
+  `controller_host.rs` que o comet usa nunca o emite (so o host TUI emite), entao
+  pela rota `comet-local` ele e sempre `None`.
+- **`owner`/`repo` nao sao derivados aqui.** Isso e
+  `zeron_engine::parse_git_remote`, e puxar `engine` (loro, tokio, rusqlite,
+  reqwest) para dentro desta crate por um parser inflaria ate o `cargo test`
+  daqui. `project_git` devolve `remote_url`; quem consome — a UI, que ja
+  depende das duas — faz a derivacao.
+- **A costura entre criar worktree e rodar setup e testada, nao presumida.**
+  `worktree_config` prova que os comandos rodam; `worktree_setup_wiring_tests`
+  prova que `create_worktree` os CHAMA. Sem o segundo, apagar a chamada deixa a
+  suite verde — e um arquivo de setup que ninguem le e exatamente o bug que a
+  feature existe para consertar. `create_worktree_at` existe so para dar essa
+  costura um caminho de estado injetavel; nao use a variante `_at` em producao.
+- **Teste que cria worktree limpa o que criou.** `unpeel_core::worktrees::create`
+  escreve em `~/.unpeel/worktrees/`, que o state path injetado NAO redireciona.
+  O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o ramo deixa o
+  diretorio do repo vazio para tras e a contagem cresce a cada rodada (cresceu,
+  16 vezes, antes do `Drop` do fixture cobrir o pai).
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -103,7 +141,7 @@ Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (10), `src/project_git.rs` (11), `src/worktree_config.rs` (11), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
