@@ -59,8 +59,61 @@ pub(crate) struct Artifact {
 #[derive(Clone, Debug)]
 pub(crate) struct ExportDoc {
     pub(crate) chat: ChatMetadata,
-    pub(crate) messages: Vec<SessionMessageEntry>,
+    messages: Vec<ExportMessage>,
     pub(crate) artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ExportRole {
+    User,
+    Assistant,
+    System,
+}
+
+impl From<MessageRole> for ExportRole {
+    fn from(role: MessageRole) -> Self {
+        match role {
+            MessageRole::User => Self::User,
+            MessageRole::Assistant => Self::Assistant,
+            MessageRole::System => Self::System,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportMessage {
+    id: String,
+    role: ExportRole,
+    parts: Vec<ExportPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ExportPart {
+    Text { text: String },
+    Tool { tool: ExportTool },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ExportTool {
+    Exec { label: String, command: String },
+    Modified { label: String, path: String },
+    Read { label: String, path: String },
+    Generic { label: String },
+}
+
+impl ExportTool {
+    fn label(&self) -> &str {
+        match self {
+            Self::Exec { label, .. }
+            | Self::Modified { label, .. }
+            | Self::Read { label, .. }
+            | Self::Generic { label } => label,
+        }
+    }
 }
 
 impl ExportDoc {
@@ -69,71 +122,86 @@ impl ExportDoc {
         let mut artifacts = Vec::new();
 
         for (message_ix, message) in entries.iter().enumerate() {
+            let mut parts = Vec::new();
             for (part_ix, part) in message.parts.iter().enumerate() {
-                let MessagePart::Tool {
-                    call,
-                    output_bytes,
-                    diff_stats,
-                    file_preview,
-                    subagent_ref,
-                    ..
-                } = part
-                else {
-                    continue;
-                };
-                let (tool, _) = tool_chip_content(call);
+                match part {
+                    MessagePart::Text { text, .. } => {
+                        parts.push(ExportPart::Text { text: text.clone() });
+                    }
+                    MessagePart::Tool {
+                        call,
+                        output_bytes,
+                        diff_stats,
+                        file_preview,
+                        subagent_ref,
+                        ..
+                    } => {
+                        let (tool, _) = tool_chip_content(call);
+                        parts.push(ExportPart::Tool {
+                            tool: export_tool(call),
+                        });
 
-                let mut file_paths = Vec::new();
-                if let Some(stats) = diff_stats {
-                    for stat in stats {
-                        if !file_paths.contains(&stat.path) {
-                            file_paths.push(stat.path.clone());
+                        let mut file_paths = Vec::new();
+                        if let Some(stats) = diff_stats {
+                            for stat in stats {
+                                if !file_paths.contains(&stat.path) {
+                                    file_paths.push(stat.path.clone());
+                                }
+                            }
+                        }
+                        if file_preview.is_some()
+                            && let Some(path) = file_write_path(call)
+                            && !file_paths.iter().any(|candidate| candidate == path)
+                        {
+                            file_paths.push(path.to_owned());
+                        }
+                        for path in file_paths {
+                            artifacts.push(Artifact {
+                                kind: ArtifactKind::FileWrite,
+                                message_ix,
+                                part_ix,
+                                tool: tool.to_owned(),
+                                path: Some(path),
+                                output_bytes: None,
+                                subagent_ref: None,
+                            });
+                        }
+
+                        if let Some(subagent_ref) = subagent_ref {
+                            artifacts.push(Artifact {
+                                kind: ArtifactKind::Subagent,
+                                message_ix,
+                                part_ix,
+                                tool: tool.to_owned(),
+                                path: None,
+                                output_bytes: None,
+                                subagent_ref: Some(subagent_ref.clone()),
+                            });
+                        }
+
+                        if output_bytes.is_some_and(|bytes| bytes > HEAVY_OUTPUT_BYTE_THRESHOLD) {
+                            artifacts.push(Artifact {
+                                kind: ArtifactKind::HeavyOutput,
+                                message_ix,
+                                part_ix,
+                                tool: tool.to_owned(),
+                                path: None,
+                                output_bytes: *output_bytes,
+                                subagent_ref: None,
+                            });
                         }
                     }
-                }
-                if file_preview.is_some()
-                    && let Some(path) = file_write_path(call)
-                    && !file_paths.iter().any(|candidate| candidate == path)
-                {
-                    file_paths.push(path.to_owned());
-                }
-                for path in file_paths {
-                    artifacts.push(Artifact {
-                        kind: ArtifactKind::FileWrite,
-                        message_ix,
-                        part_ix,
-                        tool: tool.to_owned(),
-                        path: Some(path),
-                        output_bytes: None,
-                        subagent_ref: None,
-                    });
-                }
-
-                if let Some(subagent_ref) = subagent_ref {
-                    artifacts.push(Artifact {
-                        kind: ArtifactKind::Subagent,
-                        message_ix,
-                        part_ix,
-                        tool: tool.to_owned(),
-                        path: None,
-                        output_bytes: None,
-                        subagent_ref: Some(subagent_ref.clone()),
-                    });
-                }
-
-                if output_bytes.is_some_and(|bytes| bytes > HEAVY_OUTPUT_BYTE_THRESHOLD) {
-                    artifacts.push(Artifact {
-                        kind: ArtifactKind::HeavyOutput,
-                        message_ix,
-                        part_ix,
-                        tool: tool.to_owned(),
-                        path: None,
-                        output_bytes: *output_bytes,
-                        subagent_ref: None,
-                    });
+                    MessagePart::Reasoning { .. }
+                    | MessagePart::Input { .. }
+                    | MessagePart::Error { .. }
+                    | MessagePart::WorkflowTask { .. } => {}
                 }
             }
-            messages.push(message.clone());
+            messages.push(ExportMessage {
+                id: message.id.clone(),
+                role: message.role.into(),
+                parts,
+            });
         }
 
         Self {
@@ -141,6 +209,33 @@ impl ExportDoc {
             messages,
             artifacts,
         }
+    }
+}
+
+fn export_tool(call: &ToolCall) -> ExportTool {
+    let (label, _) = tool_chip_content(call);
+    match call {
+        ToolCall::Exec { command } => ExportTool::Exec {
+            label: label.to_owned(),
+            command: command.clone(),
+        },
+        ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+            ExportTool::Modified {
+                label: label.to_owned(),
+                path: path.clone(),
+            }
+        }
+        ToolCall::ApplyPatch { path: Some(path) } => ExportTool::Modified {
+            label: label.to_owned(),
+            path: path.clone(),
+        },
+        ToolCall::ReadFile { path } => ExportTool::Read {
+            label: label.to_owned(),
+            path: path.clone(),
+        },
+        _ => ExportTool::Generic {
+            label: label.to_owned(),
+        },
     }
 }
 
@@ -184,24 +279,20 @@ pub(crate) fn render_markdown(doc: &ExportDoc) -> String {
 
     for message in &doc.messages {
         let author = match message.role {
-            MessageRole::User => "You",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::System => "System",
+            ExportRole::User => "You",
+            ExportRole::Assistant => "Assistant",
+            ExportRole::System => "System",
         };
         rendered.push_str(&format!("\n### **{author}**\n\n"));
         for part in &message.parts {
             match part {
-                MessagePart::Text { text, .. } => {
+                ExportPart::Text { text } => {
                     rendered.push_str(text);
                     rendered.push('\n');
                 }
-                MessagePart::Tool { call, .. } => {
-                    rendered.push_str(&render_markdown_tool(call));
+                ExportPart::Tool { tool } => {
+                    rendered.push_str(&render_markdown_tool(tool));
                 }
-                MessagePart::Reasoning { .. }
-                | MessagePart::Input { .. }
-                | MessagePart::Error { .. }
-                | MessagePart::WorkflowTask { .. } => {}
             }
         }
     }
@@ -245,20 +336,17 @@ fn longest_backtick_run(text: &str) -> usize {
     longest
 }
 
-fn render_markdown_tool(call: &ToolCall) -> String {
-    match call {
-        ToolCall::Exec { command } => {
+fn render_markdown_tool(tool: &ExportTool) -> String {
+    match tool {
+        ExportTool::Exec { command, .. } => {
             let fence = "`".repeat(longest_backtick_run(command).max(2) + 1);
             format!("{fence}bash\n{command}\n{fence}\n\n")
         }
-        ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+        ExportTool::Modified { path, .. } => {
             format!("> Modified: `{path}`\n\n")
         }
-        ToolCall::ReadFile { path } => format!("> Read: `{path}`\n\n"),
-        other => {
-            let (label, _) = tool_chip_content(other);
-            format!("> *Used {label} tool*\n\n")
-        }
+        ExportTool::Read { path, .. } => format!("> Read: `{path}`\n\n"),
+        ExportTool::Generic { label } => format!("> *Used {label} tool*\n\n"),
     }
 }
 
@@ -277,25 +365,20 @@ pub(crate) fn render_text(doc: &ExportDoc) -> String {
 
     for message in &doc.messages {
         let author = match message.role {
-            MessageRole::User => "You",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::System => "System",
+            ExportRole::User => "You",
+            ExportRole::Assistant => "Assistant",
+            ExportRole::System => "System",
         };
         rendered.push_str(&format!("\n{author}:\n"));
         for part in &message.parts {
             match part {
-                MessagePart::Text { text, .. } => {
+                ExportPart::Text { text } => {
                     rendered.push_str(text);
                     rendered.push('\n');
                 }
-                MessagePart::Tool { call, .. } => {
-                    let (label, _) = tool_chip_content(call);
-                    rendered.push_str(&format!("[used {label} tool]\n"));
+                ExportPart::Tool { tool } => {
+                    rendered.push_str(&format!("[used {} tool]\n", tool.label()));
                 }
-                MessagePart::Reasoning { .. }
-                | MessagePart::Input { .. }
-                | MessagePart::Error { .. }
-                | MessagePart::WorkflowTask { .. } => {}
             }
         }
     }
@@ -327,7 +410,7 @@ struct JsonExport<'a> {
     exported_at: &'a str,
     chat: JsonChat<'a>,
     artifact_index: &'a [Artifact],
-    messages: &'a [SessionMessageEntry],
+    messages: &'a [ExportMessage],
 }
 
 #[derive(Serialize)]
@@ -753,6 +836,48 @@ mod tests {
         assert!(!markdown.contains("verbose write output"));
     }
 
+    /// Serializar `SessionMessageEntry` direto devolvia ao JSON output inline,
+    /// refs e parts que Markdown/Text omitem. O documento intermediario precisa
+    /// tornar esses campos inexpressaveis para os tres formatos concordarem.
+    #[test]
+    fn json_serializes_only_the_shared_sanitized_projection() {
+        let mut entry = message("m-assistant", MessageRole::Assistant, "Visible answer");
+        entry.parts.push(tool_part(
+            "exec",
+            ToolCall::Exec {
+                command: "cargo test".to_owned(),
+            },
+            Some("FULL_INLINE_OUTPUT"),
+            Some("chat/sidecar-output"),
+            Some(42),
+            None,
+            None,
+            None,
+        ));
+        entry.parts.push(MessagePart::Reasoning {
+            id: "reasoning-secret".to_owned(),
+            text: "PRIVATE_REASONING".to_owned(),
+            completed: true,
+            duration_ms: None,
+        });
+
+        let doc = ExportDoc::from_transcript(metadata("Sanitized"), &[entry]);
+        let json = render_json(&doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(!json.contains("FULL_INLINE_OUTPUT"));
+        assert!(!json.contains("sidecar-output"));
+        assert!(!json.contains("outputRef"));
+        assert!(!json.contains("PRIVATE_REASONING"));
+        let parts = parsed["messages"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["kind"], "text");
+        assert_eq!(parts[0]["text"], "Visible answer");
+        assert_eq!(parts[1]["kind"], "tool");
+        assert_eq!(parts[1]["tool"]["kind"], "exec");
+        assert_eq!(parts[1]["tool"]["command"], "cargo test");
+    }
+
     #[test]
     fn all_formats_cover_the_same_messages_and_artifacts_in_order() {
         let write = tool_part(
@@ -838,11 +963,10 @@ mod tests {
         );
         assert_eq!(parsed["artifactIndex"][1]["messageIx"], 1);
         assert_eq!(parsed["artifactIndex"][1]["partIx"], 1);
-        assert_eq!(parsed["messages"][1]["parts"][1]["call"]["kind"], "unknown");
-        assert_eq!(
-            parsed["messages"][1]["parts"][1]["outputRef"],
-            "chat/subagent-sidecar"
-        );
+        assert_eq!(parsed["messages"][1]["parts"][1]["kind"], "tool");
+        assert_eq!(parsed["messages"][1]["parts"][1]["tool"]["kind"], "generic");
+        assert_eq!(parsed["messages"][1]["parts"][1]["tool"]["label"], "Agent");
+        assert!(parsed["messages"][1]["parts"][1].get("outputRef").is_none());
         assert!(
             json.lines()
                 .any(|line| line.starts_with("  \"exportedAt\""))

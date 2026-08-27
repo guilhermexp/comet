@@ -66,3 +66,13 @@ does not carry the bytes that went into that file. Renderers must read the
 `ToolCall` variant rather than assume a field is present or absent: an
 `EditFile` always has its path and never has its strings. This is ADR 0002
 working as intended, not a gap to close later.
+
+## Correction pass after implementation review
+
+`ExportDoc.messages` stores export-owned `ExportMessage` and `ExportPart`
+values, never raw `SessionMessageEntry`. The one transcript pass projects only
+text plus a bounded tool presentation (`Exec`, modified path, read path or
+generic label) while it builds the artifact index. Reasoning, input, workflow,
+inline output, diff and sidecar references are not representable after this
+boundary. Markdown, Text and JSON consume exactly this projection, so JSON
+cannot silently regain transcript fields the other renderers omit.

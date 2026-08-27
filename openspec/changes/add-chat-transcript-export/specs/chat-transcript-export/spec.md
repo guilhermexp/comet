@@ -74,6 +74,14 @@ Test: unit — renderer over Bash, Write, Edit, Read and an unrecognized tool.
 - **THEN** each renders as a single entry shaped by its tool
 - **AND** no tool's full output appears in any format
 
+#### Scenario: JSON serializes only the shared export projection
+Test: unit — JSON over tool output/refs plus skipped transcript-only parts.
+
+- **WHEN** a Chat Transcript tool part carries inline output, diff or sidecar references
+- **THEN** JSON contains only the same projected text/tool sequence used by Markdown and Text
+- **AND** JSON contains no output, diff, outputRef or diffRef field
+- **AND** reasoning, input and workflow parts are absent from every format
+
 ### Requirement: An export opens with what the Chat produced
 
 An export SHALL begin with an artifact index listing the files the Chat wrote,

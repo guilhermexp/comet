@@ -6,6 +6,7 @@
 |---|---|---|---|---|---|---|---|
 | F1 | C1-C4 | §1 | — | passed | fce64b7d | Pure renderer: three formats + artifact index + filename | none — unit |
 | F2 | C5-C7 | §2 | F1 | human_needed | — | Six actions live in the chat menu, end to end | human-driven |
+| F3 | C8-C9 | correção de review | F2 | pending | — | JSON usa a mesma projeção sanitizada dos outros formatos | human-driven |
 
 ## 1. The renderer (pure, no gpui)
 
@@ -23,3 +24,10 @@
 - [x] C5 Resolve a Chat Transcript by chat id: the selected chat reads `AppState::transcript`; any other opens a transient `WatchDocMessages`, takes the first reset frame and drops the subscription. No new RPC method. files: `crates/ui/src/shell.rs`, `crates/ui/src/state.rs`. verify: `cargo test -p zeron-ui shell` + `cargo test -p zeron-ui state`.
 - [x] C6 Wire download and copy: download writes the rendered bytes into the user's Downloads directory under the C4 filename; copy writes the same string via `cx.write_to_clipboard`. Both report through `Shell::sidebar_notice` — success names the file or says it was copied, failure names the reason. `notify::post` is NOT used (D-07). files: `crates/ui/src/shell.rs`. verify: `cargo test -p zeron-ui shell` over the pure outcome-message decision + visual check.
 - [x] C7 Add the flat `EXPORT` section to `chat_menu` — `menu_separator`, `menu_heading("Export")`, then the six rows — between Archive and Delete, and widen the menu card for the longest label. Then the DOX pass: `crates/ui/AGENTS.md` gains the export invariants, and the root `AGENTS.md` glossary pointer gains the Chat-vs-Session line. files: `crates/ui/src/shell.rs`, `crates/ui/AGENTS.md`, `AGENTS.md`. verify: `cargo test -p zeron-ui` + visual check of the menu.
+
+## 3. Correção da projeção compartilhada
+
+**must_haves:** `ExportDoc` não retém mensagens/parts brutas; JSON não consegue serializar output/diff/refs/reasoning/input/workflow; os três formatos preservam a mesma ordem de mensagens, tools e artifacts.
+
+- [x] C8 Substituir `Vec<SessionMessageEntry>` por `ExportMessage`/`ExportPart`/`ExportTool` sanitizados no passe único e consumir somente esses tipos em Markdown, Text e JSON. files: `crates/ui/src/chat_export.rs`. verify: `cargo test -p zeron-ui chat_export`.
+- [ ] C9 Atualizar DOX, rodar suite UI completa e concluir UAT das seis ações antes do archive. files: `crates/ui/AGENTS.md`. verify: `cargo test -p zeron-ui` + visual.
