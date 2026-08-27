@@ -1,0 +1,38 @@
+# unpeel-attach is the macOS renderer-side client. Its live output follower
+# intentionally uses kqueue, so validate it on the platform that ships it
+# instead of asking the Linux CLI artifact job to compile a macOS-only binary.
+name: Native attach
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/native/unpeel-attach/**'
+      - '.github/workflows/native-attach.yml'
+  pull_request:
+    paths:
+      - 'apps/native/unpeel-attach/**'
+      - '.github/workflows/native-attach.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos-attach:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install declared Rust MSRV
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/native/unpeel-attach
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path apps/native/unpeel-attach/Cargo.toml -- --check
+      - name: Clippy (strict)
+        run: cargo clippy --manifest-path apps/native/unpeel-attach/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path apps/native/unpeel-attach/Cargo.toml --all-targets --locked

@@ -1,3 +1,0 @@
-[submodule "third_party/unpeel"]
-	path = third_party/unpeel
-	url = https://github.com/unpeel-com/unpeel.git

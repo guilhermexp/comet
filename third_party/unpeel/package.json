@@ -1,0 +1,34 @@
+{
+  "name": "unpeel-workspace",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:website": "bun run --cwd apps/website dev",
+    "dev:native": "apps/native/dev-app.sh",
+    "dev:native:blank": "apps/native/dev-blank.sh",
+    "test:native": "apps/native/test-native.sh",
+    "test:ios": "apps/ios/test-ios.sh",
+    "test:release": "node --test scripts/release-*.test.mjs",
+    "generate:runtimes": "bun scripts/generate-runtime-client-catalog.mjs",
+    "check:runtimes": "bun scripts/generate-runtime-client-catalog.mjs --check",
+    "validate:runtimes": "bun run check:runtimes && cargo test --manifest-path crates/Cargo.toml -p unpeel-core runtime_catalog",
+    "build": "bun run build:website",
+    "build:website": "bun run --cwd apps/website build",
+    "check": "bun run check:website",
+    "check:website": "bun run --cwd apps/website check",
+    "logo": "node scripts/update-logo.mjs",
+    "release": "apps/native/release.sh",
+    "release:cli": "node scripts/release-cli.mjs",
+    "release:cli:linux": "scripts/build-cli-linux.sh",
+    "release:cloudflare": "node scripts/publish-cloudflare-release.mjs",
+    "release:updates:deploy": "cd apps/website && command npx wrangler deploy --config ../releases/wrangler.jsonc",
+    "release:updates:dry-run": "cd apps/website && command npx wrangler deploy --config ../releases/wrangler.jsonc --dry-run",
+    "sync:agents": "bun run scripts/sync-agency-agents.mjs"
+  },
+  "devDependencies": {
+    "agent-browser": "0.31.1"
+  }
+}

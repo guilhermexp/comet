@@ -1,0 +1,19 @@
+[package]
+name = "unpeel-host"
+description = "Standalone Unpeel session host and Unpeel Sessions MCP server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "unpeel-host"
+path = "src/main.rs"
+
+[dependencies]
+unpeel-core = { path = "../unpeel-core" }
+
+[dev-dependencies]
+libc = "0.2"
+serde_json = "1"

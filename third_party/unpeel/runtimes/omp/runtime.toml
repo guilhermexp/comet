@@ -1,0 +1,35 @@
+schema_version = 1
+id = "sh.omp.cli"
+slug = "omp"
+legacy_slug = "omp"
+label = "OMP CLI"
+adapter = "builtin:omp"
+legacy_order = 13
+platforms = ["macos", "linux"]
+supports_quick_launch = true
+capabilities = ["lifecycle_hooks", "notify_when_done"]
+
+[display]
+icon = "agent"
+
+[install]
+official_url = "https://omp.sh"
+command = "curl -fsSL https://omp.sh/install | sh"
+
+[detection]
+command_aliases = ["omp"]
+process_aliases = ["omp"]
+script_path_signatures = []
+
+[lifecycle]
+source = "hooks"
+authority = "partial"
+fallback = "none"
+completion_reliable = true
+attention_reliable = false
+
+[[suggested_presets]]
+id = "omp"
+label = "OMP CLI"
+command = "omp"
+quick_launch = false

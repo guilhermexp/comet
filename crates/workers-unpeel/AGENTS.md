@@ -3,7 +3,8 @@
 ## Purpose
 
 Typed Comet adapter ("frontier") over `unpeel-core` from the pinned
-`third_party/unpeel` submodule — the backend of the Workers surface. Exposes
+`third_party/unpeel` (vendorizado, ver Local Contracts) — o backend da
+superficie de Workers. Exposes
 `LocalWorkersClient` / `WorkersRuntime` and typed models for bootstrap,
 projects, worktrees, groups, presets, sessions (launch/actions/viewport/
 output), settings snapshots, artifacts, lifecycle, parent notifications, and
@@ -24,15 +25,20 @@ internal host modes (`__session_host__` et al.).
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
 | `tests/` | Integration tests per surface |
 
-Depends on: `unpeel-core` (workspace-pinned to the submodule) only.
+Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
 Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
-- **Submodule pin is load-bearing.** `third_party/unpeel` is pinned at
-  `f27e61a` and is NOT publicly fetchable — clean clones/worktrees cannot
-  build this crate. Run this crate's builds/tests in the main checkout (root
-  AGENTS.md durable gotcha). Never bump or re-point the pin casually.
+- **`third_party/unpeel` e codigo vendorizado, nao submodulo.** O upstream
+  `unpeel-com/unpeel` deixou de existir publicamente; enquanto foi submodulo,
+  NENHUM clone limpo compilava (`unpeel-core` e dependencia path de
+  `zeron-workers-unpeel`, que e dependencia de `zeron-ui`, entao o workspace
+  inteiro falhava na resolucao) — foi o que fez o gate de push revisar cinco
+  rodadas sem executar um teste. Agora sao arquivos comuns rastreados: clone,
+  worktree e CI compilam sem nenhum passo de setup. Nao reintroduza o
+  submodulo e nao tente `git submodule update`. Mudanca de forma no upstream
+  agora se edita AQUI — nao ha mais para onde mandar upstream.
 - **Session hosts are re-executed zeron binaries.** A Workers session runs as a
   `__session_host__` process (`unpeel_core::session_host::SESSION_HOST_ARG`)
   spawned from the current executable; `run_session_host_mode_if_requested()`
@@ -47,8 +53,9 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   process in their `mcpServers` list (injected by zeron-harness's
   `workers_mcp_servers*`); it is NOT Unpeel's worker-to-worker MCP host.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
-  includes upstream source via `#[path]` — edit discipline: do not fork the
-  state machine locally; upstream-shape changes go through the submodule.
+  includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
+  nao forke a maquina de estados numa copia local; mude no proprio
+  `third_party/unpeel` para que as duas pontas nao divirjam.
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -90,7 +97,7 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 ## Verification
 
 Run all: `cargo test -p zeron-workers-unpeel` (part of the publish gate).
-Requires the main checkout (submodule pin not fetchable elsewhere).
+Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 
 ### Test Coverage Matrix
 

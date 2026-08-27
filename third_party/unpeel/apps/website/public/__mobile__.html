@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Dev-only harness: renders the site in a phone-width iframe so a desktop
+     browser (or an agent's) can screenshot the true mobile layout. Not linked
+     from anywhere; delete freely. Usage: /__mobile__.html?target=%23always-on -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>mobile harness</title>
+    <style>
+      html, body { margin: 0; background: #333; }
+      iframe {
+        display: block;
+        margin: 0 auto;
+        width: 390px;
+        height: 844px;
+        border: 0;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="frame" src="/"></iframe>
+    <script>
+      const params = new URLSearchParams(location.search)
+      const target = params.get('target') || ''
+      const frame = document.getElementById('frame')
+      frame.style.height = (parseInt(params.get('h'), 10) || 844) + 'px'
+      frame.style.width = (parseInt(params.get('w'), 10) || 390) + 'px'
+      frame.src = '/' + target
+    </script>
+  </body>
+</html>

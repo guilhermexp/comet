@@ -1,0 +1,35 @@
+schema_version = 1
+id = "ai.primeintellect.prime-agent"
+slug = "prime-agent"
+legacy_slug = "prime-agent"
+label = "Prime Agent"
+adapter = "builtin:prime-agent"
+legacy_order = 14
+platforms = ["macos", "linux"]
+supports_quick_launch = true
+capabilities = ["lifecycle_hooks", "notify_when_done"]
+
+[display]
+icon = "agent"
+
+[install]
+official_url = "https://github.com/PrimeIntellect-ai/prime-agent"
+command = "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+
+[detection]
+command_aliases = ["prime-agent"]
+process_aliases = ["prime-agent"]
+script_path_signatures = []
+
+[lifecycle]
+source = "hooks"
+authority = "partial"
+fallback = "none"
+completion_reliable = true
+attention_reliable = false
+
+[[suggested_presets]]
+id = "prime-agent"
+label = "prime-agent"
+command = "prime-agent"
+quick_launch = false

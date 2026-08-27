@@ -1,0 +1,16 @@
+[package]
+name = "unpeel-todos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Todo list plugin for Unpeel — a complete standalone TUI in any terminal"
+
+[[bin]]
+name = "unpeel-todos"
+path = "src/main.rs"
+
+[dependencies]
+unpeel-ui = { path = "../../unpeel-ui" }
+serde_json = "1"

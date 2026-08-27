@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+.vite
+apps/*/node_modules
+packages/*/node_modules
+dist
+dist-ssr
+apps/*/dist
+apps/*/.svelte-kit
+packages/*/dist
+packages/*/.svelte-kit
+*.local
+
+# Tauri
+src-tauri/target
+apps/*/src-tauri/target
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust (native attach client)
+apps/native/unpeel-attach/target
+apps/native/tools/ht
+
+# Swift/Xcode build outputs
+apps/*/*/.build
+apps/*/*/.derived
+
+# Python bytecode
+__pycache__
+/apps/ios/UnpeelIOS/.deriveddata
+/apps/ios/UnpeelIOS/build

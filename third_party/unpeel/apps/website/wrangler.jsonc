@@ -1,0 +1,100 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "unpeel-app",
+  "account_id": "abc947fba4af12bd510f8e6e7530c578",
+  "compatibility_date": "2025-08-03",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "./app/server.ts",
+  "observability": { "enabled": true },
+  // Cron triggers (broadcast heartbeat + daily digest) are declared in
+  // vite.config.ts, production target only — the vite plugin's config merge
+  // concatenates arrays, so crons declared here would leak onto the v1
+  // preview worker and double-fire against the shared production D1.
+  // Custom domains are set in vite.config.ts so the Cloudflare Vite plugin
+  // carries them into the generated dist/unpeel_app/wrangler.json used by
+  // `wrangler deploy`.
+
+  // License database. Create it once, then paste the returned id here:
+  //   wrangler d1 create unpeel-licenses
+  //   wrangler d1 migrations apply unpeel-licenses
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "unpeel-licenses",
+      "database_id": "2e9a8032-28a6-4265-a844-763ebff908c2",
+      // The schema is part of the closed account service. The installed
+      // @unpeel/account-service package is the public stub (no migrations);
+      // migration commands need the private sibling checkout, like deploys.
+      "migrations_dir": "../../../unpeel-account/migrations"
+    }
+  ],
+
+  // No release bucket here: the standalone unpeel-release-updates worker
+  // (apps/releases) owns /download/mac, /appcast*.xml, and /releases/* on both
+  // apex and www via Cloudflare routes.
+
+  // Workers Rate Limiting binding (edge-enforced, per-colo, no DB writes). Used
+  // to throttle the public waitlist signup (POST /api/subscribe) per client IP.
+  // `period` must be 10 or 60; this allows 5 attempts per 60s per IP.
+  "unsafe": {
+    "bindings": [
+      {
+        "name": "SUBSCRIBE_RATE_LIMITER",
+        "type": "ratelimit",
+        "namespace_id": "1001",
+        "simple": { "limit": 5, "period": 60 }
+      },
+      {
+        // Throttles the email-sending endpoints (license recovery, contact
+        // form) per client IP so they can't be used to mailbox-bomb a victim
+        // or spam support. 3 attempts per 60s per IP.
+        "name": "EMAIL_RATE_LIMITER",
+        "type": "ratelimit",
+        "namespace_id": "1002",
+        "simple": { "limit": 3, "period": 60 }
+      }
+    ]
+  },
+
+  // Outbound email via Cloudflare Email Routing (no third-party ESP). The
+  // Worker may send only From these addresses; enable Email Routing on the
+  // domain and add SPF/DKIM/DMARC so mail to arbitrary recipients is accepted.
+  // See docs/feature/accounts-and-email.md.
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": [
+        "noreply@unpeel.com",
+        "support@unpeel.com",
+        "hello@unpeel.com",
+        "hi@unpeel.com"
+      ]
+    }
+  ],
+
+  // Public (non-secret) config. Secrets — LICENSE_SIGNING_KEY, STRIPE_SECRET_KEY,
+  // STRIPE_WEBHOOK_SECRET — are set with `wrangler secret put …` (see
+  // .dev.vars.example for local dev). LICENSE_PUBLIC_KEY + STRIPE_PRICE_ID are
+  // safe to commit once you have real values.
+  //
+  // ENVIRONMENT=dev (local only, via .dev.vars) relaxes cookie Secure flags and
+  // logs magic links to the console; deployed environments must NOT set it.
+  "vars": {
+    "SITE_URL": "https://unpeel.com",
+    "APP_NAME": "Unpeel",
+    "ENVIRONMENT": "production",
+    "NOREPLY_FROM": "noreply@unpeel.com",
+    "SUPPORT_EMAIL": "support@unpeel.com",
+    "LICENSE_PUBLIC_KEY": "6RfwwHUhth8Ji7T7p/QbDOQjeN9Zrk1S34Hk85cpg54=",
+    // The live $59/seat/year recurring price. A $99 price
+    // (price_1U3aG9IFbmGXjhT1iUADQ9vj) is minted in Stripe and parked for a
+    // future raise — deferred 2026-08-13; if that ships, swap this id
+    // together with $99 site copy in one deploy.
+    "STRIPE_PRICE_ID": "price_1Trds1IFbmGXjhT1pA5SzKjv",
+    // Unpeel Remote is gated on an active Pro license intrinsically in
+    // /api/remote/entitlement — the old REMOTE_ACCESS_MODE knob is retired
+    // (its "subscription" mode refused everyone, 402-ing real Pro Macs).
+    // TestFlight public link for the iOS beta (/ios redirect).
+    "IOS_TESTFLIGHT_URL": "https://testflight.apple.com/join/t2Fa1yRu"
+  }
+}

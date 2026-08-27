@@ -1,0 +1,10 @@
+{
+  "name": "@unpeel/account-service",
+  "version": "0.0.0-stub",
+  "type": "module",
+  "private": true,
+  "description": "Public stub of Unpeel's closed account/licensing service. Same export surface, no service behavior — lets the open repo build without the private unpeel-account sibling. Official builds alias the real package in (see apps/website/vite.config.ts).",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

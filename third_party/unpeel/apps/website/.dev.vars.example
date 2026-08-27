@@ -1,0 +1,40 @@
+# Local secrets/vars for `wrangler dev`. Copy to `.dev.vars` (gitignored).
+# In production, secrets are set with `wrangler secret put <NAME>` instead.
+
+# Ed25519 private key (pkcs8, base64) from `bun run keygen`. PRIVATE.
+# Also used by `bun run db:seed:dev-license` to create the local dev license.
+LICENSE_SIGNING_KEY=
+
+# Stripe test-mode secret key (sk_test_…)
+STRIPE_SECRET_KEY=
+
+# Stripe webhook signing secret (whsec_…). For local dev use the value printed
+# by `stripe listen --forward-to http://localhost:5173/api/stripe/webhook`.
+STRIPE_WEBHOOK_SECRET=
+
+# Local development conveniences:
+#  - ENVIRONMENT=dev relaxes cookie Secure flags and logs magic links/codes to
+#    the console (so you don't need real email delivery locally).
+#  - ENABLE_DEV_EMAIL_LOGIN=true turns /auth/login into instant sign-in (type
+#    any email, no email round-trip). NEVER set either in production.
+ENVIRONMENT=dev
+ENABLE_DEV_EMAIL_LOGIN=true
+
+# Outbound email (the EMAIL send_email binding) is simulated locally — wrangler
+# writes .eml files instead of sending. No secret needed for local dev.
+
+# Super-admin: tommyvedvik@gmail.com is always an admin. Add more (comma-sep):
+# ADMIN_EMAILS=alice@unpeel.com,bob@unpeel.com
+
+# Inbound replies (the Worker's `email` handler) are routed by Cloudflare Email
+# Routing to support@. Unmatched mail is dropped unless a verified address is
+# set here to forward it to:
+# SUPPORT_FORWARD_TO=you@example.com
+
+# Public vars also live in wrangler.jsonc; override locally if needed:
+# SITE_URL=http://localhost:5173
+# Set this when using a local-only signing key. The local Worker uses it for
+# /api/activate verification; pass the same value to the native app as
+# UNPEEL_LICENSE_PUBLIC_KEY so it can verify seeded dev licenses offline.
+# LICENSE_PUBLIC_KEY=
+# STRIPE_PRICE_ID=
