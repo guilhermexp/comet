@@ -9,6 +9,7 @@ pub mod project_ledger;
 pub mod resources;
 mod session_event_journal;
 pub mod workspace_trust;
+pub mod worktree_config;
 
 pub use controller_mcp::CONTROLLER_MCP_ARG;
 #[doc(hidden)]
@@ -357,6 +358,10 @@ pub struct WorkersWorktreeResult {
     pub project_id: String,
     pub path: String,
     pub branch: String,
+    /// O primeiro comando de setup que falhou, se algum. O worktree existe de
+    /// qualquer forma — quem chamou decide se avisa.
+    pub setup_failed_command: Option<String>,
+    pub setup_commands_run: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1616,10 +1621,22 @@ impl LocalWorkersClient {
             let _ = unpeel_core::worktrees::remove(&worktree.path, true);
             return Err(WorkersError::State(error));
         }
+        // O setup do projeto roda AQUI, depois do registro: um worktree que
+        // existe mas nao foi registrado nao e um worktree, e o setup que
+        // falhasse antes disso deixaria a arvore orfa. Falha de setup NAO
+        // desfaz o worktree — o usuario prefere um checkout criado com um
+        // `bun install` quebrado a nenhum checkout, e o comando que quebrou
+        // vem nomeado no resultado.
+        let setup = worktree_config::run_setup_for_project(
+            Path::new(&worktree.path),
+            Path::new(parent_path),
+        );
         Ok(WorkersWorktreeResult {
             project_id,
             path: worktree.path,
             branch: branch.to_owned(),
+            setup_failed_command: setup.failed,
+            setup_commands_run: setup.commands_run,
         })
     }
 

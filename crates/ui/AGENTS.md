@@ -83,3 +83,16 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 ## Child DOX Index
 
 Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Os módulos-raiz `chat_export.rs`, `composer.rs` e `markdown_decor.rs` também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.
+
+- **Settings → Projects mostra o LEDGER, nao o working set.** A sidebar de
+  Workers lista `projects[]`, que `remove_project` poda junto com as sessoes;
+  esta pagina lista `zeron_workers_unpeel::project_ledger`, que sobrevive a
+  poda. Uma linha so do ledger nao tem `project_id`: renomear, "Fill with AI" e
+  "Run Auto Doc" ficam indisponiveis nela porque nao ha o que lancar. O
+  "Forget" do Danger Zone apaga metadado e NAO toca em sessao — e o verbo
+  oposto do "Remove project" do menu de contexto da sidebar.
+- **Git so roda para o projeto SELECIONADO.** `status` e os dois commits
+  ancora custam processos; a listagem nunca os chama. E `RepositoryState` tem
+  um quarto estado que o reference nao tem — `FolderMissing` — porque o ledger
+  guarda projetos cuja pasta o usuario pode ter movido: sem ele, uma pasta
+  apagada leria como "nao e repo" e ganharia um Initialize Git que falharia.

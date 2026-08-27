@@ -231,6 +231,22 @@ pub fn write_at(path: &Path, entries: &[LedgerProject]) -> Result<(), String> {
     })
 }
 
+/// [`forget_at`] contra o `app-state.json` real.
+pub fn forget(project_path: &str) -> Result<bool, String> {
+    forget_at(&state_path(), project_path)
+}
+
+/// [`set_icon_at`] contra o `app-state.json` real.
+pub fn set_icon(project_path: &str, icon: Option<&str>) -> Result<(), String> {
+    set_icon_at(&state_path(), project_path, icon)
+}
+
+/// O arquivo de estado real. `unpeel_core::app_state` resolve isso internamente
+/// mas nao expoe o caminho, e as variantes `_at` precisam dele.
+fn state_path() -> std::path::PathBuf {
+    unpeel_core::app_paths::app_state_path()
+}
+
 /// Esquece um projeto: tira a linha do ledger. Nao toca em `projects[]` nem em
 /// sessao nenhuma — e o oposto de `remove_project`, que faz exatamente o
 /// contrario.

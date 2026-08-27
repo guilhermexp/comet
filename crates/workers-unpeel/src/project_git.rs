@@ -121,6 +121,102 @@ pub fn commit_at(path: &Path, unix_ms: u64) -> Option<AnchorCommit> {
     })
 }
 
+/// Publico ou privado — o dialogo pergunta as duas como acoes distintas, nunca
+/// com um default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+impl Visibility {
+    fn flag(self) -> &'static str {
+        match self {
+            Visibility::Public => "--public",
+            Visibility::Private => "--private",
+        }
+    }
+}
+
+/// `git init` na pasta. Recusa pasta que ja e repo em vez de rodar por cima.
+pub fn init(path: &Path) -> Result<(), String> {
+    if !path.is_dir() {
+        return Err(format!("{} nao existe", path.display()));
+    }
+    if status(path).is_repo {
+        return Err("ja e um repositorio git".to_owned());
+    }
+    let done = Command::new("git")
+        .arg("init")
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if done.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&done.stderr).trim().to_owned())
+    }
+}
+
+/// Os argumentos do `gh repo create`. Separado da execucao para poder ser
+/// testado sem criar repositorio no GitHub de ninguem.
+///
+/// `--push` so entra quando ja existe commit: `gh` falha ao empurrar um repo
+/// sem HEAD, e o caso "pasta inicializada, nada commitado" e comum.
+pub fn publish_args(path: &Path, visibility: Visibility, has_commits: bool) -> Vec<String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
+    let mut args = vec![
+        "repo".to_owned(),
+        "create".to_owned(),
+        name.to_owned(),
+        visibility.flag().to_owned(),
+        "--source".to_owned(),
+        path.display().to_string(),
+        "--remote".to_owned(),
+        "origin".to_owned(),
+    ];
+    if has_commits {
+        args.push("--push".to_owned());
+    }
+    args
+}
+
+/// Cria o repositorio no GitHub e aponta `origin` para ele.
+///
+/// Recusa antes de chamar `gh` uma pasta que nao e repo ou que ja tem remote —
+/// as duas fariam o `gh` falhar com mensagem pior que a nossa.
+pub fn publish_to_github(path: &Path, visibility: Visibility) -> Result<(), String> {
+    let read = status(path);
+    if !read.is_repo {
+        return Err("nao e um repositorio git".to_owned());
+    }
+    if read.has_remote {
+        return Err("o repositorio ja tem um remote".to_owned());
+    }
+    let has_commits = git(path, &["rev-parse", "HEAD"]).is_some();
+    let done = Command::new("gh")
+        .args(publish_args(path, visibility, has_commits))
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "GitHub CLI (gh) nao encontrado. Instale em https://cli.github.com".to_owned()
+            } else {
+                error.to_string()
+            }
+        })?;
+    if done.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&done.stderr).trim().to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +270,47 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    #[test]
+    fn publish_args_only_push_when_there_is_something_to_push() {
+        let path = Path::new("/tmp/meu-projeto");
+        let with = publish_args(path, Visibility::Private, true);
+        assert_eq!(with[2], "meu-projeto", "o nome vem do basename");
+        assert_eq!(with[3], "--private");
+        assert_eq!(with.last().unwrap(), "--push");
+
+        let without = publish_args(path, Visibility::Public, false);
+        assert_eq!(without[3], "--public");
+        assert!(
+            !without.contains(&"--push".to_owned()),
+            "repo sem commit nao pode receber --push: {without:?}"
+        );
+    }
+
+    #[test]
+    fn init_refuses_a_folder_that_is_already_a_repo() {
+        let repo = Repo::with_commit();
+        assert!(init(repo.path()).is_err());
+    }
+
+    #[test]
+    fn init_creates_a_repo_in_a_plain_folder() {
+        let dir = std::env::temp_dir().join(format!("comet-init-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!status(&dir).is_repo);
+        init(&dir).unwrap();
+        assert!(status(&dir).is_repo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nao chama a rede: para antes do `gh` justamente porque `has_remote`.
+    #[test]
+    fn publishing_a_repo_that_already_has_a_remote_is_refused_locally() {
+        let repo = Repo::with_commit();
+        repo.run(&["remote", "add", "origin", "https://example.com/x.git"]);
+        let error = publish_to_github(repo.path(), Visibility::Private).unwrap_err();
+        assert!(error.contains("ja tem um remote"), "{error}");
     }
 
     #[test]
