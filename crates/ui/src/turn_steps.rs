@@ -84,9 +84,9 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
         // Um tool comum nao-resolvido ou reasoning incompleto, ao contrario,
         // sao residuo de um turno morto e podem dobrar (ver
         // terminated_turn_folds_activity_the_dead_run_left_unresolved).
-        MessagePart::Tool { subagent_status, .. } => {
-            *subagent_status == Some(zeron_doc::SubagentStatus::Running)
-        }
+        MessagePart::Tool {
+            subagent_status, ..
+        } => *subagent_status == Some(zeron_doc::SubagentStatus::Running),
         MessagePart::Reasoning { .. }
         | MessagePart::Text { .. }
         | MessagePart::Error { .. }
