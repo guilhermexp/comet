@@ -158,7 +158,10 @@ use crate::{
     icons,
     state::AppState,
     theme::Theme,
-    workers::{model::WorkersModel, presentation::runtime_icon_path},
+    workers::{
+        model::WorkersModel,
+        presentation::{runtime_icon_path, session_title_truncate},
+    },
 };
 
 const FILE_SCAN_LIMIT: usize = 5_000;
@@ -1326,7 +1329,8 @@ impl DetailsSidebar {
                     .flex_1()
                     .child(
                         div()
-                            .truncate()
+                            .min_w_0()
+                            .map(session_title_truncate)
                             .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)

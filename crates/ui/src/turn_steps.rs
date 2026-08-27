@@ -78,16 +78,12 @@ fn is_visible_part(part: &MessagePart) -> bool {
 
 fn is_unsettled_part(part: &MessagePart) -> bool {
     match part {
-        MessagePart::Tool {
-            resolved,
-            subagent_status,
-            ..
-        } => !resolved || *subagent_status == Some(zeron_doc::SubagentStatus::Running),
-        MessagePart::Reasoning { completed, .. } => !completed,
         MessagePart::Input { resolved, .. } => !resolved,
-        MessagePart::Text { .. } | MessagePart::Error { .. } | MessagePart::WorkflowTask { .. } => {
-            false
-        }
+        MessagePart::Tool { .. }
+        | MessagePart::Reasoning { .. }
+        | MessagePart::Text { .. }
+        | MessagePart::Error { .. }
+        | MessagePart::WorkflowTask { .. } => false,
     }
 }
 
@@ -364,28 +360,44 @@ mod tests {
     }
 
     #[test]
-    fn settled_turn_never_folds_unsettled_prefix_activity() {
+    fn settled_turn_never_folds_a_pending_input() {
         for status in [MessageStatus::Complete, MessageStatus::Aborted] {
-            let unresolved_cases = vec![
-                tool("active-tool", exec("cargo check"), false),
+            let parts = vec![
+                tool("read", read("src/lib.rs"), true),
                 input("active-input", false),
+                text("answer", "Final answer"),
+            ];
+
+            assert_eq!(
+                plan_turn_steps(&parts, Some(status)),
+                None,
+                "settled {status:?} must keep {} visible",
+                parts[1].id()
+            );
+        }
+    }
+
+    #[test]
+    fn terminated_turn_folds_activity_the_dead_run_left_unresolved() {
+        for status in [MessageStatus::Complete, MessageStatus::Aborted] {
+            let stalled_cases = vec![
+                tool("active-tool", exec("cargo check"), false),
                 reasoning("active-reasoning", false),
                 running_subagent("active-subagent"),
             ];
 
-            for unsettled in unresolved_cases {
+            for stalled in stalled_cases {
                 let parts = vec![
                     tool("read", read("src/lib.rs"), true),
-                    unsettled,
+                    stalled,
                     text("answer", "Final answer"),
                 ];
+                let id = parts[1].id().to_owned();
 
-                assert_eq!(
-                    plan_turn_steps(&parts, Some(status)),
-                    None,
-                    "settled {status:?} must keep {} visible",
-                    parts[1].id()
-                );
+                let plan = plan_turn_steps(&parts, Some(status)).unwrap_or_else(|| {
+                    panic!("terminated {status:?} must fold {id} into the steps chip")
+                });
+                assert_eq!(plan.split_before_part, 2);
             }
         }
     }

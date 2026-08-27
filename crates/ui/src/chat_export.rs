@@ -231,9 +231,26 @@ fn render_markdown_artifact(artifact: &Artifact) -> String {
     rendered
 }
 
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
 fn render_markdown_tool(call: &ToolCall) -> String {
     match call {
-        ToolCall::Exec { command } => format!("```bash\n{command}\n```\n\n"),
+        ToolCall::Exec { command } => {
+            let fence = "`".repeat(longest_backtick_run(command).max(2) + 1);
+            format!("{fence}bash\n{command}\n{fence}\n\n")
+        }
         ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
             format!("> Modified: `{path}`\n\n")
         }
@@ -336,11 +353,11 @@ pub(crate) fn render_json(doc: &ExportDoc) -> Result<String, serde_json::Error> 
     })
 }
 
-pub(crate) fn build_filename(title: &str, chat_id: &str, format: ExportFormat) -> String {
+fn sanitize_filename_component(raw: &str) -> String {
     let mut sanitized = String::new();
     let mut previous_was_separator = false;
 
-    for ch in title.chars() {
+    for ch in raw.chars() {
         let invalid = ch.is_control()
             || ch.is_whitespace()
             || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
@@ -355,7 +372,22 @@ pub(crate) fn build_filename(title: &str, chat_id: &str, format: ExportFormat) -
         }
     }
 
-    let id_prefix = chat_id.chars().take(8).collect::<String>();
+    sanitized
+}
+
+pub(crate) fn build_filename(title: &str, chat_id: &str, format: ExportFormat) -> String {
+    let sanitized = sanitize_filename_component(title);
+
+    let id_prefix = sanitize_filename_component(chat_id)
+        .trim_matches('_')
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let id_prefix = if id_prefix.is_empty() {
+        "id".to_owned()
+    } else {
+        id_prefix
+    };
     let suffix = format!("-{id_prefix}.{}", format.extension());
     let max_title_bytes = MAX_FILENAME_BYTES.saturating_sub(suffix.len());
     let mut capped = String::new();
@@ -502,6 +534,53 @@ mod tests {
 
         assert!(filename.len() <= 255);
         assert!(filename.ends_with("-abcdef01.md"));
+    }
+
+    #[test]
+    fn filename_sanitizes_the_chat_id_like_the_title() {
+        assert_eq!(
+            build_filename("notes", "../../etc/pw", ExportFormat::Markdown),
+            "notes-.._.._et.md"
+        );
+        assert_eq!(
+            build_filename("notes", " \t\n", ExportFormat::Markdown),
+            "notes-id.md"
+        );
+    }
+
+    #[test]
+    fn markdown_exec_fence_survives_a_command_carrying_triple_backticks() {
+        let command = "cat <<'EOF'\n```rust\nfn main() {}\n```\nEOF";
+        let mut assistant = message("m-assistant", MessageRole::Assistant, "");
+        assistant.parts = vec![tool_part(
+            "exec",
+            ToolCall::Exec {
+                command: command.to_owned(),
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )];
+        let after = message("m-user", MessageRole::User, "still readable");
+
+        let markdown = render_markdown(&ExportDoc::from_transcript(
+            metadata("Fences"),
+            &[assistant, after],
+        ));
+
+        assert!(
+            markdown.contains(&format!("````bash\n{command}\n````")),
+            "exec fence must outgrow the longest backtick run in the command: {markdown}"
+        );
+        let body = markdown.split("````bash").nth(1).expect("exec block");
+        let closing = body.split_once("\n````").expect("closing fence").1;
+        assert!(
+            closing.contains("### **You**\n\nstill readable"),
+            "content after the exec block must stay outside the fence: {closing}"
+        );
     }
 
     #[test]

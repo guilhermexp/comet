@@ -1,4 +1,15 @@
+use gpui::Styled;
 use zeron_workers_unpeel::WorkersProject;
+
+/// Elipse no MEIO, não na cauda: o título é o prompt do brief, e briefs
+/// irmãos compartilham prefixo longo ("Leia /tmp/orch-jk-inta…"). Cortando a
+/// cauda, dois workers diferentes viravam a mesma linha — e uma delas ficando
+/// ativa parecia a outra reiniciando o contador.
+pub fn session_title_truncate<E: Styled>(el: E) -> E {
+    el.overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis_middle()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersTitlebar {

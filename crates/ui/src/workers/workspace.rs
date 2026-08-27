@@ -28,7 +28,7 @@ use super::presentation::{
     SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
     SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
     SessionIndicator, relative_age, runtime_icon_path, runtime_spinner_tint, session_indicator,
-    spinner_frame,
+    session_title_truncate, spinner_frame,
 };
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
@@ -898,14 +898,7 @@ impl WorkersSidebar {
                 div()
                     .min_w_0()
                     .flex_1()
-                    // Elipse no MEIO, não na cauda: o título é o prompt do
-                    // brief, e briefs irmãos compartilham prefixo longo
-                    // ("Leia /tmp/orch-jk-inta…"). Cortando a cauda, dois
-                    // workers diferentes viravam a mesma linha — e uma delas
-                    // ficando ativa parecia a outra reiniciando o contador.
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis_middle()
+                    .map(session_title_truncate)
                     .text_size(px(SIDEBAR_LABEL_SIZE))
                     .text_color(if selected {
                         theme.text
@@ -3155,7 +3148,7 @@ impl WorkersContent {
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .truncate()
+                                    .map(session_title_truncate)
                                     .text_size(px(13.0))
                                     .text_color(theme.text)
                                     .child(row.title),
@@ -3258,7 +3251,7 @@ impl WorkersContent {
                             div()
                                 .min_w_0()
                                 .flex_1()
-                                .truncate()
+                                .map(session_title_truncate)
                                 .text_size(px(12.0))
                                 .text_color(theme.text)
                                 .child(title),
@@ -3340,7 +3333,8 @@ impl WorkersContent {
                             .flex_col()
                             .child(
                                 div()
-                                    .truncate()
+                                    .min_w_0()
+                                    .map(session_title_truncate)
                                     .text_size(px(12.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(theme.text)
