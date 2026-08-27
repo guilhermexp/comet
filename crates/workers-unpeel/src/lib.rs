@@ -1569,11 +1569,26 @@ impl LocalWorkersClient {
         &self,
         request: WorkersCreateWorktreeRequest,
     ) -> Result<WorkersWorktreeResult, WorkersError> {
+        Self::create_worktree_at(&unpeel_core::app_paths::app_state_path(), request)
+    }
+
+    /// `create_worktree` contra um arquivo de estado explicito.
+    ///
+    /// Existe para que o teste possa provar a coisa que nenhum teste de
+    /// `worktree_config` prova: que a criacao de worktree REALMENTE chama o
+    /// setup. Sem esta costura, apagar a chamada la embaixo deixaria a suite
+    /// inteira verde — e o bug original desta change era exatamente um arquivo
+    /// de setup que ninguem lia.
+    pub fn create_worktree_at(
+        state_path: &Path,
+        request: WorkersCreateWorktreeRequest,
+    ) -> Result<WorkersWorktreeResult, WorkersError> {
         let branch = request.branch.trim();
         if branch.is_empty() {
             return Err(WorkersError::State("worktree branch is required".into()));
         }
-        let state = unpeel_core::app_state::load().map_err(WorkersError::State)?;
+        let state =
+            unpeel_core::app_state::load_for_edit_at(state_path).map_err(WorkersError::State)?;
         let projects = state
             .get("projects")
             .and_then(Value::as_array)
@@ -1600,7 +1615,7 @@ impl LocalWorkersClient {
             .unwrap_or(branch)
             .to_owned();
         let path = worktree.path.clone();
-        let register = unpeel_core::app_state::edit(|state| {
+        let register = unpeel_core::app_state::edit_at(state_path, |state| {
             let projects = state
                 .get_mut("projects")
                 .and_then(Value::as_array_mut)
@@ -3105,5 +3120,191 @@ mod session_gallery_tests {
         }
         assert!(!is_image_artifact_name("transcript.txt"));
         assert!(!is_image_artifact_name("no-extension"));
+    }
+}
+
+/// A costura entre criar worktree e rodar o setup.
+///
+/// `worktree_config` prova que os comandos rodam quando chamados; estes testes
+/// provam que `create_worktree` os chama. Sem eles, apagar a chamada em
+/// `create_worktree` deixa a suite inteira verde — e um arquivo de setup que
+/// ninguem le e o bug que esta change existe para consertar.
+#[cfg(test)]
+mod worktree_setup_wiring_tests {
+    use super::*;
+    use crate::worktree_config::COMET_CONFIG_PATH;
+
+    struct Fixture {
+        dir: PathBuf,
+        /// `unpeel_core::worktrees::create` escreve em `~/.unpeel/worktrees/`,
+        /// que o state path injetado NAO redireciona. Sem guardar o que foi
+        /// criado, rodar a suite suja a maquina do usuario — e sujou, 16 vezes,
+        /// antes disto existir.
+        created: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl Fixture {
+        /// Um repo git com um commit, registrado como projeto num app-state
+        /// privado. `create_worktree_at` precisa dos dois.
+        fn new(setup_json: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("comet-wire-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            for args in [
+                vec!["init", "-q"],
+                vec!["config", "user.email", "t@example.com"],
+                vec!["config", "user.name", "T"],
+            ] {
+                let ok = Command::new("git")
+                    .args(&args)
+                    .current_dir(&repo)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "git {args:?}");
+            }
+            std::fs::write(repo.join("a.txt"), "a").unwrap();
+            for args in [vec!["add", "a.txt"], vec!["commit", "-q", "-m", "primeiro"]] {
+                Command::new("git")
+                    .args(&args)
+                    .current_dir(&repo)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap();
+            }
+            if let Some(body) = setup_json {
+                let config = repo.join(COMET_CONFIG_PATH);
+                std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+                std::fs::write(config, body).unwrap();
+            }
+            unpeel_core::app_state::edit_at(&dir.join("app-state.json"), |state| {
+                state.insert(
+                    "projects".to_owned(),
+                    json!([{ "id": "comet-parent", "name": "repo", "path": repo.to_str().unwrap() }]),
+                );
+                Ok(())
+            })
+            .unwrap();
+            Self {
+                dir,
+                created: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Cria o worktree e registra o caminho para o `Drop` limpar depois —
+        /// inclusive quando o teste falha, porque `Drop` roda no unwind.
+        fn create(&self) -> Result<WorkersWorktreeResult, WorkersError> {
+            let created = LocalWorkersClient::create_worktree_at(&self.state(), request());
+            if let Ok(result) = &created {
+                self.created.borrow_mut().push(PathBuf::from(&result.path));
+            }
+            created
+        }
+
+        fn state(&self) -> PathBuf {
+            self.dir.join("app-state.json")
+        }
+
+        fn repo(&self) -> PathBuf {
+            self.dir.join("repo")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for path in self.created.borrow().iter() {
+                let _ = unpeel_core::worktrees::remove(path.to_str().unwrap_or_default(), true);
+                let _ = std::fs::remove_dir_all(path);
+                // O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o
+                // ramo deixa o diretorio do repo vazio para tras, e a contagem
+                // em `~/.unpeel/worktrees/` cresce a cada rodada da suite.
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn request() -> WorkersCreateWorktreeRequest {
+        WorkersCreateWorktreeRequest {
+            project_id: "comet-parent".to_owned(),
+            branch: "feature/x".to_owned(),
+            name: None,
+            base_ref: None,
+        }
+    }
+
+    /// O teste que faltava: criar o worktree TEM que rodar o setup do projeto.
+    #[test]
+    fn creating_a_worktree_runs_the_project_setup() {
+        let fixture = Fixture::new(Some(
+            r#"{"setup-worktree":["printf ok > provas.txt","printf '%s' \"$ROOT_WORKTREE_PATH\" > raiz.txt"]}"#,
+        ));
+        let created = fixture.create().unwrap();
+
+        let worktree = PathBuf::from(&created.path);
+        assert_eq!(created.setup_commands_run, 2, "{created:?}");
+        assert_eq!(created.setup_failed_command, None);
+        assert!(
+            worktree.join("provas.txt").is_file(),
+            "o comando de setup nao rodou no worktree novo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("raiz.txt")).unwrap(),
+            fixture.repo().to_str().unwrap(),
+            "ROOT_WORKTREE_PATH tem que apontar para o checkout principal"
+        );
+    }
+
+    /// Setup quebrado NAO desfaz o worktree: o usuario prefere um checkout com
+    /// um `bun install` falhado a nenhum checkout.
+    #[test]
+    fn a_failing_setup_still_leaves_the_worktree_and_names_the_command() {
+        let fixture = Fixture::new(Some(r#"{"setup-worktree":["exit 7"]}"#));
+        let created = fixture.create().unwrap();
+
+        assert_eq!(created.setup_failed_command.as_deref(), Some("exit 7"));
+        assert_eq!(created.setup_commands_run, 0);
+        assert!(
+            PathBuf::from(&created.path).is_dir(),
+            "o worktree tem que sobreviver a uma falha de setup"
+        );
+    }
+
+    #[test]
+    fn a_project_without_setup_config_creates_the_worktree_and_runs_nothing() {
+        let fixture = Fixture::new(None);
+        let created = fixture.create().unwrap();
+
+        assert_eq!(created.setup_commands_run, 0);
+        assert_eq!(created.setup_failed_command, None);
+        assert!(PathBuf::from(&created.path).is_dir());
+    }
+
+    /// A costura nao pode encostar no `~/.unpeel/app-state.json` desta maquina.
+    #[test]
+    fn the_worktree_is_registered_in_the_given_state_file() {
+        let fixture = Fixture::new(None);
+        let created = fixture.create().unwrap();
+
+        let state = unpeel_core::app_state::load_for_edit_at(&fixture.state()).unwrap();
+        let projects = state.get("projects").and_then(Value::as_array).unwrap();
+        let registered = projects
+            .iter()
+            .find(|project| project.get("id").and_then(Value::as_str) == Some(&created.project_id))
+            .expect("o worktree tem que estar registrado no arquivo passado");
+        assert_eq!(
+            registered.get("worktree_branch").and_then(Value::as_str),
+            Some("feature/x")
+        );
+        assert_eq!(
+            registered.get("parent_project_id").and_then(Value::as_str),
+            Some("comet-parent")
+        );
     }
 }

@@ -83,6 +83,17 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   reqwest) para dentro desta crate por um parser inflaria ate o `cargo test`
   daqui. `project_git` devolve `remote_url`; quem consome — a UI, que ja
   depende das duas — faz a derivacao.
+- **A costura entre criar worktree e rodar setup e testada, nao presumida.**
+  `worktree_config` prova que os comandos rodam; `worktree_setup_wiring_tests`
+  prova que `create_worktree` os CHAMA. Sem o segundo, apagar a chamada deixa a
+  suite verde — e um arquivo de setup que ninguem le e exatamente o bug que a
+  feature existe para consertar. `create_worktree_at` existe so para dar essa
+  costura um caminho de estado injetavel; nao use a variante `_at` em producao.
+- **Teste que cria worktree limpa o que criou.** `unpeel_core::worktrees::create`
+  escreve em `~/.unpeel/worktrees/`, que o state path injetado NAO redireciona.
+  O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o ramo deixa o
+  diretorio do repo vazio para tras e a contagem cresce a cada rodada (cresceu,
+  16 vezes, antes do `Drop` do fixture cobrir o pai).
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -130,7 +141,7 @@ Requires the main checkout (submodule pin not fetchable elsewhere).
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (10), `src/project_git.rs` (7) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (10), `src/project_git.rs` (11), `src/worktree_config.rs` (11), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
