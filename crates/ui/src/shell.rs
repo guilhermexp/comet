@@ -902,7 +902,7 @@ async fn fetch_transcript_once(
     let params = serde_json::json!({ "chatId": chat_id });
     let mut rx = engine
         .client()
-        .subscribe(methods::WATCH_DOC_MESSAGES, params)
+        .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
         .await
         .map_err(|err| format!("could not read the chat: {err}"))?;
     while let Some(value) = rx.recv().await {
