@@ -98,3 +98,6 @@ Setup execution drains bounded stderr concurrently. On Unix the shell owns a
 fresh process group so timeout can terminate descendants. A setup failure
 keeps the created worktree but is carried as command plus reason through the
 client; automatic launch stops before starting a Worker.
+Process exit signals can interrupt the same process's hook-ingress accept loop;
+`WouldBlock` and `Interrupted` are both transient and retry, while other accept
+errors still retire the listener.

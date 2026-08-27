@@ -230,6 +230,13 @@ Test: unit — bounded stderr plus descendant cleanup.
 - **AND** the failure reports a bounded reason
 - **AND** timeout terminates the command's process group before returning
 
+#### Scenario: Setup child signals do not retire the hook ingress
+Test: unit — retry classification for listener accept errors; full crate suite in parallel.
+
+- **WHEN** setup child processes exit while the session hook listener is accepting connections
+- **THEN** an interrupted accept is retried like a would-block accept
+- **AND** the ingress remains available for the next hook request
+
 #### Scenario: A project with no setup config
 Test: unit — the executor's no-config branch.
 

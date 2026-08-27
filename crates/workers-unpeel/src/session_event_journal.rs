@@ -165,7 +165,7 @@ fn start(session_id: &str, session_dir: &Path) -> Result<SessionHookJournalIngre
                         last_entry = Some(entry);
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if accept_error_is_retryable(error.kind()) => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(_) => break,
@@ -177,6 +177,13 @@ fn start(session_id: &str, session_dir: &Path) -> Result<SessionHookJournalIngre
         shutdown,
         thread: Some(thread),
     })
+}
+
+fn accept_error_is_retryable(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    )
 }
 
 fn repair_torn_tail(path: &Path) -> Result<(), String> {
@@ -472,6 +479,17 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WouldBlock e Interrupted sao estados transitórios do accept loop; tirar
+    /// qualquer um derruba o endpoint sob polling ou sinais de filhos.
+    #[test]
+    fn ingress_retries_transient_accept_errors() {
+        assert!(accept_error_is_retryable(std::io::ErrorKind::WouldBlock));
+        assert!(accept_error_is_retryable(std::io::ErrorKind::Interrupted));
+        assert!(!accept_error_is_retryable(
+            std::io::ErrorKind::ConnectionAborted
+        ));
+    }
 
     #[test]
     fn ingress_appends_every_hook_episode_in_order() {

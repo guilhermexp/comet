@@ -8,7 +8,7 @@
 | F2 | C6-C9 | §3 | F1 | pending | — | Projects section lists every recorded project; General card complete | human-driven |
 | F3 | C10-C11 | §4 | F2 | pending | — | Repository row with its three states and both actions | human-driven |
 | F4 | C12-C16 | §5, §6 | F3 | pending | — | Worktree config written AND executed; Auto Doc Run; forget | human-driven |
-| F5 | C17-C23 | correções de review | F4 | pending | — | Contratos reais de ledger, editor, ícone, setup e navegação | human-driven |
+| F5 | C17-C24 | correções de review | F4 | pending | — | Contratos reais de ledger, editor, ícone, setup e navegação | human-driven |
 
 ## 1. The ledger
 
@@ -67,3 +67,4 @@
 - [x] C21 Drenar stderr concorrentemente com cauda limitada e matar o process group no timeout. files: `crates/workers-unpeel/src/worktree_config.rs`. verify: `cargo test -p zeron-workers-unpeel worktree_config`.
 - [x] C22 Propagar comando+motivo de setup, manter o worktree, mostrar a falha e bloquear `create_worktree_and_launch`. files: `crates/workers-unpeel/src/lib.rs`, `crates/ui/src/workers/model.rs`. verify: `cargo test -p zeron-workers-unpeel worktree_setup_wiring_tests` + `cargo test -p zeron-ui workers`.
 - [ ] C23 Atualizar DOX, rodar suites completas das duas crates e concluir UAT visual de Projects/setup antes do archive. files: `crates/{workers-unpeel,ui}/AGENTS.md`. verify: `cargo test -p zeron-workers-unpeel` + `cargo test -p zeron-ui` + `cargo fmt --all --check`.
+- [x] C24 Tratar `Interrupted` como accept transitório no hook ingress para que sinais de filhos do setup não derrubem o listener. files: `crates/workers-unpeel/src/session_event_journal.rs`. verify: `cargo test -p zeron-workers-unpeel session_event_journal` + suite completa paralela.
