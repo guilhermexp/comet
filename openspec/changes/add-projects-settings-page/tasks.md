@@ -8,6 +8,7 @@
 | F2 | C6-C9 | §3 | F1 | pending | — | Projects section lists every recorded project; General card complete | human-driven |
 | F3 | C10-C11 | §4 | F2 | pending | — | Repository row with its three states and both actions | human-driven |
 | F4 | C12-C16 | §5, §6 | F3 | pending | — | Worktree config written AND executed; Auto Doc Run; forget | human-driven |
+| F5 | C17-C23 | correções de review | F4 | pending | — | Contratos reais de ledger, editor, ícone, setup e navegação | human-driven |
 
 ## 1. The ledger
 
@@ -54,3 +55,15 @@
 
 - [x] C15 "Fill with AI" and Auto Doc "Run" launch a worker in the selected project through `WorkersLaunchRequest` with `initial_text` (D-07); Auto Doc seeds the prompt with the two anchor commits from C5 and is disabled when the folder is not a repository. Both are unavailable for a ledger-only row, which has no project id to launch into. The Auto Doc automation row is NOT built (D-08). files: `crates/ui/src/settings/projects.rs`. verify: visual check — the session appears under that project.
 - [x] C16 Danger Zone: forget the project — delete the ledger entry and the stored icon, leave sessions and the working-set record alone (D-09) — behind a confirmation that names the project, states that files on disk are kept, and does not read like the sidebar's "Remove project". Then the DOX pass: `crates/workers-unpeel/AGENTS.md` gains the ledger-vs-working-set invariant and the worktree-setup contract, `crates/ui/AGENTS.md` gains the Projects section, and both Test Coverage Matrices are updated. files: `crates/ui/src/settings/projects.rs`, `crates/workers-unpeel/src/project_ledger.rs`, `crates/workers-unpeel/AGENTS.md`, `crates/ui/AGENTS.md`. verify: `cargo test -p zeron-workers-unpeel` + `cargo test -p zeron-ui` + visual check.
+
+## 7. Correções do review integral
+
+**must_haves:** grupos não entram no ledger; uma chave de path produz uma row; Config/Worktree são editáveis; ícones aparecem e são limpos; a lista rola; remotes preservam host; setup não deadlocka nem lança Worker depois de falhar.
+
+- [x] C17 Projetar apenas projetos de filesystem para o ledger e deduplicar paths vivos no `reconcile`, preservando worktrees de path próprio. files: `crates/workers-unpeel/src/{lib,project_ledger}.rs`. verify: `cargo test -p zeron-workers-unpeel project_ledger`.
+- [ ] C18 Preservar `GitRemote.host` no `RepositoryState` e tornar a lista de Projects verticalmente rolável. files: `crates/ui/src/settings/projects.rs`. verify: `cargo test -p zeron-ui projects` + visual.
+- [ ] C19 Implementar o editor real de config: target suportado, grupos shared/Unix/Windows, normalização, save fora da UI thread e no-op quando não mudou. files: `crates/ui/src/settings/projects.rs`. verify: `cargo test -p zeron-ui projects` + visual.
+- [ ] C20 Usar nome digest-safe, carregar/renderizar o ícone e remover somente o arquivo app-owned no reset/forget. files: `crates/ui/src/settings/projects.rs`, `crates/workers-unpeel/src/project_ledger.rs`. verify: `cargo test -p zeron-ui projects` + visual.
+- [ ] C21 Drenar stderr concorrentemente com cauda limitada e matar o process group no timeout. files: `crates/workers-unpeel/src/worktree_config.rs`. verify: `cargo test -p zeron-workers-unpeel worktree_config`.
+- [ ] C22 Propagar comando+motivo de setup, manter o worktree, mostrar a falha e bloquear `create_worktree_and_launch`. files: `crates/workers-unpeel/src/lib.rs`, `crates/ui/src/workers/model.rs`. verify: `cargo test -p zeron-workers-unpeel worktree_setup_wiring_tests` + `cargo test -p zeron-ui workers`.
+- [ ] C23 Atualizar DOX, rodar suites completas das duas crates e concluir UAT visual de Projects/setup antes do archive. files: `crates/{workers-unpeel,ui}/AGENTS.md`. verify: `cargo test -p zeron-workers-unpeel` + `cargo test -p zeron-ui` + `cargo fmt --all --check`.

@@ -64,7 +64,9 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   entre elas. Se o ledger algum dia virar filho de `projects`, o teste
   `ledger_survives_the_pruning_that_removes_a_project` fica vermelho, e e para
   ficar. A chave e o PATH, nunca o id: `add_project` cunha um `comet-<uuid>`
-  novo a cada entrada.
+  novo a cada entrada. Grupos organizacionais NAO entram: reutilizam o path do
+  pai e violariam essa chave; worktrees entram porque têm path próprio. A
+  projeção filtra `is_group` e `reconcile` deduplica path defensivamente.
 - **`reconcile` e puro e `last_seen_at` so anda com atividade real.** Nunca
   carimbe `now` num projeto vivo e parado: `dirty` viraria true a cada passada
   e abrir a tela escreveria num arquivo compartilhado e travado a cada render.
@@ -141,7 +143,7 @@ Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (10), `src/project_git.rs` (11), `src/worktree_config.rs` (11), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (17), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (12), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

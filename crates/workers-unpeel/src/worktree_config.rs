@@ -182,6 +182,26 @@ pub fn save(
     Ok(path)
 }
 
+/// Persiste um target singular. Grava o novo antes de remover o anterior para
+/// que uma falha nunca custe a config que ainda funcionava.
+pub fn save_selected(
+    project_path: &Path,
+    config: &WorktreeConfig,
+    target: ConfigTarget,
+    previous_target: ConfigTarget,
+) -> Result<PathBuf, String> {
+    let written = save(project_path, config, target)?;
+    if target != previous_target {
+        let previous = project_path.join(previous_target.relative_path());
+        match std::fs::remove_file(previous) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(written)
+}
+
 /// O que o setup fez, para a tela poder dizer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetupOutcome {
@@ -384,6 +404,30 @@ mod tests {
             "config vazia nao deixa arquivo para tras"
         );
         assert_eq!(detect(dir.path()), None);
+    }
+
+    /// Manter o arquivo anterior faz `detect` escolher Comet de novo mesmo
+    /// depois de o usuario selecionar Cursor. O target e singular.
+    #[test]
+    fn changing_target_moves_the_config_instead_of_leaving_two_authorities() {
+        let dir = Dir::new();
+        let config = WorktreeConfig {
+            shared: vec!["bun install".to_owned()],
+            ..Default::default()
+        };
+        save(dir.path(), &config, ConfigTarget::Comet).unwrap();
+
+        save_selected(
+            dir.path(),
+            &config,
+            ConfigTarget::Cursor,
+            ConfigTarget::Comet,
+        )
+        .unwrap();
+
+        assert!(!dir.path().join(COMET_CONFIG_PATH).exists());
+        assert!(dir.path().join(CURSOR_CONFIG_PATH).is_file());
+        assert_eq!(detect(dir.path()).unwrap().target, ConfigTarget::Cursor);
     }
 
     #[test]

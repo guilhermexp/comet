@@ -78,6 +78,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/transcript.rs` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 | `src/markdown_decor.rs` + mapping em `src/composer.rs` | unit — scanner, exact-cover/projeção, IME/cap e estabilidade do flip | `cargo test -p zeron-ui markdown_decor && cargo test -p zeron-ui composer` |
 | `src/{attachments,composer}.rs` (paste/drop e rail staged) | unit — precedência/cap, classificação de path, persistência e restore | `cargo test -p zeron-ui attachments && cargo test -p zeron-ui composer` |
+| `src/settings/projects.rs` (filtro, git remoto, editor/config e decisões de ícone) | unit; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 
 ## Child DOX Index
@@ -90,9 +91,17 @@ Subárvores sem doc próprio (ainda não têm regra local além da desta pasta):
   poda. Uma linha so do ledger nao tem `project_id`: renomear, "Fill with AI" e
   "Run Auto Doc" ficam indisponiveis nela porque nao ha o que lancar. O
   "Forget" do Danger Zone apaga metadado e NAO toca em sessao — e o verbo
-  oposto do "Remove project" do menu de contexto da sidebar.
+  oposto do "Remove project" do menu de contexto da sidebar. Grupos
+  organizacionais compartilham o path do pai e ficam fora; worktrees de path
+  próprio continuam. A lista rola no próprio pane.
 - **Git so roda para o projeto SELECIONADO.** `status` e os dois commits
   ancora custam processos; a listagem nunca os chama. E `RepositoryState` tem
   um quarto estado que o reference nao tem — `FolderMissing` — porque o ledger
   guarda projetos cuja pasta o usuario pode ter movido: sem ele, uma pasta
   apagada leria como "nao e repo" e ganharia um Initialize Git que falharia.
+  Link de repository preserva `GitRemote.host`; nunca reconstrói tudo em
+  `github.com`.
+- **Config/Worktree são editor, não resumo.** Target suportado + listas shared,
+  Unix e Windows normalizam linhas vazias/comentários e só gravam quando o
+  conteúdo ou target mudou. Ícone usa SHA-256 do path, é carregado fora do
+  render e reset/forget só podem remover filho direto do diretório app-owned.

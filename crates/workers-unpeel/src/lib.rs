@@ -956,6 +956,28 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Projetos de filesystem que pertencem ao ledger. Grupos sao organizacao
+/// visual e reutilizam o path do pai; inclui-los violaria a chave unica por
+/// path. Worktrees permanecem porque apontam para checkouts distintos.
+fn live_projects_for_ledger(bootstrap: &WorkersBootstrap) -> Vec<LiveProject> {
+    let mut activity: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for session in &bootstrap.sessions {
+        let latest = activity.entry(session.project_id.as_str()).or_default();
+        *latest = (*latest).max(session.updated_at_unix_ms);
+    }
+    bootstrap
+        .projects
+        .iter()
+        .filter(|project| !project.is_group)
+        .map(|project| LiveProject {
+            id: project.id.clone(),
+            path: project.path.clone(),
+            name: project.name.clone(),
+            last_activity_unix_ms: activity.get(project.id.as_str()).copied(),
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct LocalWorkersClient {
     next_request_id: Arc<AtomicU64>,
@@ -1090,21 +1112,7 @@ impl LocalWorkersClient {
     /// working set nao tem sessao nenhuma — mostra o valor congelado no ledger.
     pub fn projects_with_ledger(&self) -> Result<Vec<ProjectRow>, WorkersError> {
         let bootstrap = self.bootstrap()?;
-        let mut activity: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-        for session in &bootstrap.sessions {
-            let latest = activity.entry(session.project_id.as_str()).or_default();
-            *latest = (*latest).max(session.updated_at_unix_ms);
-        }
-        let live: Vec<LiveProject> = bootstrap
-            .projects
-            .iter()
-            .map(|project| LiveProject {
-                id: project.id.clone(),
-                path: project.path.clone(),
-                name: project.name.clone(),
-                last_activity_unix_ms: activity.get(project.id.as_str()).copied(),
-            })
-            .collect();
+        let live = live_projects_for_ledger(&bootstrap);
         let ledger = project_ledger::read().map_err(WorkersError::State)?;
         let outcome = project_ledger::reconcile(&ledger, &live, now_unix_ms());
         if outcome.dirty {
@@ -3120,6 +3128,56 @@ mod session_gallery_tests {
         }
         assert!(!is_image_artifact_name("transcript.txt"));
         assert!(!is_image_artifact_name("no-extension"));
+    }
+}
+
+#[cfg(test)]
+mod project_ledger_projection_tests {
+    use super::*;
+
+    fn project(id: &str, path: &str, is_group: bool, worktree: Option<&str>) -> WorkersProject {
+        WorkersProject {
+            id: id.into(),
+            name: id.into(),
+            path: path.into(),
+            folder_id: None,
+            parent_project_id: is_group.then(|| "parent".into()),
+            is_group,
+            worktree_branch: worktree.map(str::to_owned),
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        }
+    }
+
+    /// Remover o filtro de `is_group` volta a produzir duas linhas com o path
+    /// do pai; remover worktrees do filtro apaga um projeto de filesystem real.
+    #[test]
+    fn ledger_projection_keeps_projects_and_worktrees_but_not_groups() {
+        let bootstrap = WorkersBootstrap {
+            mac_name: "Mac".into(),
+            protocol: WorkersProtocol {
+                major_version: 1,
+                minor_version: 0,
+                capabilities: Vec::new(),
+            },
+            projects: vec![
+                project("project", "/tmp/repo", false, None),
+                project("group", "/tmp/repo", true, None),
+                project("worktree", "/tmp/repo-wt", false, Some("change/fix")),
+            ],
+            presets: Vec::new(),
+            sessions: Vec::new(),
+            activity_log: Vec::new(),
+        };
+
+        let live = live_projects_for_ledger(&bootstrap);
+        let ids = live
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["project", "worktree"]);
     }
 }
 

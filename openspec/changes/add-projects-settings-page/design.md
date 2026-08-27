@@ -75,3 +75,26 @@ stores that can disagree about the same project — one pruned by
 `remove_project`, one not, with no lock between them. The shared file already
 solved the locking and the forward-compatibility problem; using it is the
 smaller change.
+
+## Correction pass after implementation review
+
+The working-set projection excludes organizational groups before it reaches
+the ledger. Groups deliberately reuse their parent's filesystem path, while
+the ledger key is the path; admitting both would create duplicate rows and an
+ambiguous selection key. Worktrees remain because their paths are distinct.
+`reconcile` also deduplicates live paths defensively.
+
+The Config and Worktree cards are editors, not read-only summaries. Their
+state consists of one selected supported target plus shared, Unix and Windows
+command groups; normalization removes blank/comment lines, and unchanged
+state does not write. The project list scrolls independently of the detail.
+
+Project icon names use a fixed SHA-256 digest of the canonical project path.
+Only files inside the app-owned icon directory are eligible for cleanup, and
+reset/forget clear metadata and that exact file. Repository browser links
+retain the parsed remote host.
+
+Setup execution drains bounded stderr concurrently. On Unix the shell owns a
+fresh process group so timeout can terminate descendants. A setup failure
+keeps the created worktree but is carried as command plus reason through the
+client; automatic launch stops before starting a Worker.

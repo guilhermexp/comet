@@ -13,9 +13,14 @@
 
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, Image, ObjectFit, SharedString, Subscription, Task,
+    Window, div, img, prelude::*, px,
 };
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zeron_workers_unpeel::project_git::{self, ProjectGitStatus, Visibility};
 use zeron_workers_unpeel::project_ledger;
@@ -41,6 +46,7 @@ pub enum RepositoryState {
     NotARepo,
     LocalOnly,
     Published {
+        host: String,
         owner: String,
         repo: String,
     },
@@ -63,6 +69,7 @@ pub fn repository_state(git: &ProjectGitStatus, folder_exists: bool) -> Reposito
     };
     match zeron_engine::parse_git_remote(url) {
         Some(remote) => RepositoryState::Published {
+            host: remote.host,
             owner: remote.owner,
             repo: remote.repository,
         },
@@ -89,6 +96,64 @@ pub fn resolve_rename(input: &str, current: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_owned())
+}
+
+fn commands_from_editor(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn config_from_editor(shared: &str, unix: &str, windows: &str) -> WorktreeConfig {
+    WorktreeConfig {
+        shared: commands_from_editor(shared),
+        unix: commands_from_editor(unix),
+        windows: commands_from_editor(windows),
+    }
+}
+
+pub fn config_edit_required(
+    saved: &WorktreeConfig,
+    saved_target: ConfigTarget,
+    edited: &WorktreeConfig,
+    edited_target: ConfigTarget,
+) -> bool {
+    saved != edited || saved_target != edited_target
+}
+
+fn config_save_matches_selection(saved_path: &str, selected: Option<&str>) -> bool {
+    selected == Some(saved_path)
+}
+
+fn project_icon_filename(project_path: &str, extension: &str) -> String {
+    let digest = Sha256::digest(project_path.as_bytes());
+    format!(
+        "{:x}.{}",
+        digest,
+        extension.trim_start_matches('.').to_ascii_lowercase()
+    )
+}
+
+fn managed_icon_path(managed_dir: &Path, recorded: &str) -> Option<PathBuf> {
+    let recorded = PathBuf::from(recorded);
+    (recorded.parent() == Some(managed_dir) && recorded.file_name().is_some()).then_some(recorded)
+}
+
+fn load_project_icon(recorded: &str) -> Option<Arc<Image>> {
+    let dir = icons_dir().ok()?;
+    let path = managed_icon_path(&dir, recorded)?;
+    let format = crate::attachments::format_by_extension(&path)?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(crate::attachments::MAX_ATTACHMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > crate::attachments::MAX_ATTACHMENT_BYTES {
+        return None;
+    }
+    Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
 /// `Aug 17, 2026` no fuso local. Pura o suficiente para testar via UTC.
@@ -135,6 +200,12 @@ pub struct ProjectsPage {
     selected: Option<String>,
     search: Entity<ComposerInput>,
     name_input: Entity<ComposerInput>,
+    config_shared_input: Entity<ComposerInput>,
+    config_unix_input: Entity<ComposerInput>,
+    config_windows_input: Entity<ComposerInput>,
+    config_target: ConfigTarget,
+    config_baseline: Option<(WorktreeConfig, ConfigTarget)>,
+    icon_images: HashMap<String, Arc<Image>>,
     detail: Option<Detail>,
     loading: bool,
     error: Option<SharedString>,
@@ -143,6 +214,7 @@ pub struct ProjectsPage {
     load_task: Option<Task<()>>,
     detail_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
+    config_write_task: Option<Task<()>>,
     _events: Vec<Subscription>,
 }
 
@@ -151,6 +223,10 @@ impl ProjectsPage {
         let search =
             cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
         let name_input = cx.new(|cx| ComposerInput::new("Project name", cx));
+        let config_shared_input =
+            cx.new(|cx| ComposerInput::new("One shared command per line", cx));
+        let config_unix_input = cx.new(|cx| ComposerInput::new("macOS / Linux commands", cx));
+        let config_windows_input = cx.new(|cx| ComposerInput::new("Windows commands", cx));
         let events = vec![
             cx.subscribe(&search, |_, _, _: &ComposerInputEvent, cx| cx.notify()),
             // O `ComposerInput` nao emite blur e nao expoe o focus handle, e o
@@ -162,6 +238,30 @@ impl ProjectsPage {
                     this.commit_rename(cx);
                 }
             }),
+            cx.subscribe(
+                &config_shared_input,
+                |this, _, event: &ComposerInputEvent, cx| {
+                    if matches!(event, ComposerInputEvent::Submitted) {
+                        this.save_config(cx);
+                    }
+                },
+            ),
+            cx.subscribe(
+                &config_unix_input,
+                |this, _, event: &ComposerInputEvent, cx| {
+                    if matches!(event, ComposerInputEvent::Submitted) {
+                        this.save_config(cx);
+                    }
+                },
+            ),
+            cx.subscribe(
+                &config_windows_input,
+                |this, _, event: &ComposerInputEvent, cx| {
+                    if matches!(event, ComposerInputEvent::Submitted) {
+                        this.save_config(cx);
+                    }
+                },
+            ),
         ];
         let mut page = Self {
             client: LocalWorkersClient::new(),
@@ -169,6 +269,12 @@ impl ProjectsPage {
             selected: None,
             search,
             name_input,
+            config_shared_input,
+            config_unix_input,
+            config_windows_input,
+            config_target: ConfigTarget::Comet,
+            config_baseline: None,
+            icon_images: HashMap::new(),
             detail: None,
             loading: true,
             error: None,
@@ -177,6 +283,7 @@ impl ProjectsPage {
             load_task: None,
             detail_task: None,
             action_task: None,
+            config_write_task: None,
             _events: events,
         };
         page.reload(cx);
@@ -189,16 +296,27 @@ impl ProjectsPage {
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
-                .spawn(async move { client.projects_with_ledger() })
+                .spawn(async move {
+                    let rows = client.projects_with_ledger()?;
+                    let icons = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let recorded = row.icon_path.as_deref()?;
+                            load_project_icon(recorded).map(|image| (row.path.clone(), image))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    Ok::<_, zeron_workers_unpeel::WorkersError>((rows, icons))
+                })
                 .await;
             this.update(cx, |page, cx| {
                 page.loading = false;
                 match loaded {
-                    Ok(rows) => {
+                    Ok((rows, icons)) => {
                         page.error = None;
                         if page.selected.is_none() {
                             page.selected = rows.first().map(|row| row.path.clone());
                         }
+                        page.icon_images = icons;
                         page.rows = rows;
                         page.load_detail(cx);
                     }
@@ -257,6 +375,17 @@ impl ProjectsPage {
                 })
                 .await;
             this.update(cx, |page, cx| {
+                page.config_target = resolved.config_target;
+                page.config_baseline = Some((resolved.config.clone(), resolved.config_target));
+                let shared = resolved.config.shared.join("\n");
+                let unix = resolved.config.unix.join("\n");
+                let windows = resolved.config.windows.join("\n");
+                page.config_shared_input
+                    .update(cx, |input, cx| input.set_text(shared, cx));
+                page.config_unix_input
+                    .update(cx, |input, cx| input.set_text(unix, cx));
+                page.config_windows_input
+                    .update(cx, |input, cx| input.set_text(windows, cx));
                 page.detail = Some(resolved);
                 cx.notify();
             })
@@ -270,6 +399,7 @@ impl ProjectsPage {
         }
         // Sair da linha e uma das duas saidas do campo de nome.
         self.commit_rename(cx);
+        self.save_config(cx);
         self.selected = Some(path);
         self.detail = None;
         self.load_detail(cx);
@@ -316,6 +446,76 @@ impl ProjectsPage {
             },
             "Project renamed",
         );
+    }
+
+    fn edited_config(&self, cx: &gpui::App) -> WorktreeConfig {
+        config_from_editor(
+            self.config_shared_input.read(cx).text(),
+            self.config_unix_input.read(cx).text(),
+            self.config_windows_input.read(cx).text(),
+        )
+    }
+
+    fn save_config(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        let Some((saved, saved_target)) = self.config_baseline.clone() else {
+            return;
+        };
+        let edited = self.edited_config(cx);
+        let target = self.config_target;
+        if !config_edit_required(&saved, saved_target, &edited, target) {
+            return;
+        }
+        let project_path_string = row.path;
+        let project_path = PathBuf::from(&project_path_string);
+        let write_config = edited.clone();
+        self.notice = None;
+        self.error = None;
+        self.config_write_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    worktree_config::save_selected(
+                        &project_path,
+                        &write_config,
+                        target,
+                        saved_target,
+                    )
+                })
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(_) => {
+                        if config_save_matches_selection(
+                            &project_path_string,
+                            page.selected.as_deref(),
+                        ) {
+                            page.config_baseline = Some((edited.clone(), target));
+                            if let Some(detail) = page.detail.as_mut() {
+                                detail.config = edited;
+                                detail.config_target = target;
+                            }
+                            page.notice = Some(SharedString::from("Worktree config saved"));
+                        }
+                    }
+                    Err(error) => page.error = Some(SharedString::from(error)),
+                }
+                page.config_write_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn select_config_target(&mut self, target: ConfigTarget, cx: &mut Context<Self>) {
+        if self.config_target == target {
+            return;
+        }
+        self.config_target = target;
+        self.save_config(cx);
+        cx.notify();
     }
 
     /// Roda uma ação fora da thread de UI e recarrega. Toda ação desta página
@@ -394,9 +594,10 @@ impl ProjectsPage {
                 return;
             };
             let project_path = row.path.clone();
+            let previous_icon = row.icon_path.clone();
             let stored = cx
                 .background_executor()
-                .spawn(async move { store_icon(&project_path, &source) })
+                .spawn(async move { store_icon(&project_path, previous_icon.as_deref(), &source) })
                 .await;
             this.update(cx, |page, cx| {
                 if let Err(error) = stored {
@@ -413,20 +614,56 @@ impl ProjectsPage {
 /// Copia o arquivo escolhido para o diretório de dados do app e registra o
 /// caminho no ledger. O nome é derivado do path do projeto (não do id, que uma
 /// linha só de ledger não tem).
-fn store_icon(project_path: &str, source: &Path) -> Result<(), String> {
+fn store_icon(
+    project_path: &str,
+    previous_icon: Option<&str>,
+    source: &Path,
+) -> Result<(), String> {
+    if crate::attachments::format_by_extension(source).is_none() {
+        return Err("selecione uma imagem PNG, JPEG, GIF, WebP, SVG, BMP ou TIFF".to_owned());
+    }
     let extension = source
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("png");
     let dir = icons_dir()?;
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let stem: String = project_path
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    let destination = dir.join(format!("{stem}.{extension}"));
+    let destination = dir.join(project_icon_filename(project_path, extension));
+    let destination_text = destination.display().to_string();
     std::fs::copy(source, &destination).map_err(|error| error.to_string())?;
-    project_ledger::set_icon(project_path, Some(&destination.display().to_string()))
+    if let Err(error) = project_ledger::set_icon(project_path, Some(&destination_text)) {
+        let _ = std::fs::remove_file(&destination);
+        return Err(error);
+    }
+    if previous_icon.is_some_and(|previous| previous != destination_text) {
+        remove_managed_icon(previous_icon)?;
+    }
+    Ok(())
+}
+
+fn remove_managed_icon(recorded: Option<&str>) -> Result<(), String> {
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
+    let dir = icons_dir()?;
+    let Some(path) = managed_icon_path(&dir, recorded) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn reset_icon(project_path: &str, recorded: Option<&str>) -> Result<(), String> {
+    project_ledger::set_icon(project_path, None)?;
+    remove_managed_icon(recorded)
+}
+
+fn forget_project(project_path: &str, recorded: Option<&str>) -> Result<(), String> {
+    project_ledger::forget(project_path)?;
+    remove_managed_icon(recorded)
 }
 
 fn icons_dir() -> Result<PathBuf, String> {
@@ -475,6 +712,7 @@ impl ProjectsPage {
             .map(|row| {
                 let selected = self.selected.as_deref() == Some(row.path.as_str());
                 let path = row.path.clone();
+                let project_icon = self.icon_images.get(&row.path).cloned();
                 let subtitle = format!(
                     "Last opened {}",
                     format_last_opened(row.last_opened_at_unix_ms, now_ms)
@@ -492,11 +730,18 @@ impl ProjectsPage {
                     .when(selected, |el| el.bg(crate::theme::glass_selected_bg()))
                     .hover(|s| s.bg(theme.glass_hover()))
                     .on_click(cx.listener(move |page, _, _, cx| page.select(path.clone(), cx)))
-                    .child(
-                        crate::icons::icon(crate::icons::FOLDER)
+                    .child(match project_icon {
+                        Some(image) => img(image)
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .rounded(px(4.0))
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
+                        None => crate::icons::icon(crate::icons::FOLDER)
                             .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    )
+                            .text_color(theme.text_muted)
+                            .into_any_element(),
+                    })
                     .child(
                         div()
                             .flex()
@@ -561,8 +806,9 @@ impl ProjectsPage {
             )
             .child(
                 div()
+                    .id("projects-list-scroll")
                     .flex_1()
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .px(px(8.0))
                     .pt(px(8.0))
                     .flex()
@@ -636,6 +882,7 @@ impl ProjectsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let reveal_path = row.path.clone();
+        let project_icon = self.icon_images.get(&row.path).cloned();
         widgets::section_card(theme)
             .child(
                 widgets::card_row(theme, true)
@@ -665,22 +912,31 @@ impl ProjectsPage {
                             .cursor_pointer()
                             .hover(|s| s.bg(ink(0.06)))
                             .on_click(cx.listener(|page, _, _, cx| page.pick_icon(cx)))
-                            .child(
-                                crate::icons::icon(crate::icons::FOLDER)
+                            .child(match project_icon {
+                                Some(image) => img(image)
+                                    .w(px(34.0))
+                                    .h(px(34.0))
+                                    .rounded(px(9.0))
+                                    .object_fit(ObjectFit::Cover)
+                                    .into_any_element(),
+                                None => crate::icons::icon(crate::icons::FOLDER)
                                     .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            ),
+                                    .text_color(theme.text_muted)
+                                    .into_any_element(),
+                            }),
                     )
                     .when(row.icon_path.is_some(), |el| {
                         let path = row.path.clone();
+                        let recorded = row.icon_path.clone();
                         el.child(action_button(
                             theme,
                             "Reset",
                             cx.listener(move |page, _, _, cx| {
                                 let path = path.clone();
+                                let recorded = recorded.clone();
                                 page.run_action(
                                     cx,
-                                    move |_| project_ledger::set_icon(&path, None),
+                                    move |_| reset_icon(&path, recorded.as_deref()),
                                     "Icon reset",
                                 );
                             }),
@@ -808,8 +1064,8 @@ impl ProjectsPage {
                 ))
                 .into_any_element()
             }
-            RepositoryState::Published { owner, repo } => {
-                let url = format!("https://github.com/{owner}/{repo}");
+            RepositoryState::Published { host, owner, repo } => {
+                let url = format!("https://{host}/{owner}/{repo}");
                 base.child(label_block(theme, "Repository", &format!("{owner}/{repo}")))
                     .child(action_button(
                         theme,
@@ -828,9 +1084,9 @@ impl ProjectsPage {
         &mut self,
         theme: &Theme,
         detail: &Detail,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let current = detail.config_target.relative_path();
+        let current = self.config_target.relative_path();
         let hint = if detail.cursor_available {
             "Where worktree setup is stored — this project also has a Cursor config"
         } else {
@@ -850,7 +1106,28 @@ impl ProjectsPage {
                             .text_size(px(12.0))
                             .text_color(theme.text)
                             .child(SharedString::from(current.to_string())),
-                    ),
+                    )
+                    .child(action_button(
+                        theme,
+                        "Use .comet",
+                        cx.listener(|page, _, _, cx| {
+                            page.select_config_target(ConfigTarget::Comet, cx)
+                        }),
+                    ))
+                    .when(detail.cursor_available, |el| {
+                        el.child(action_button(
+                            theme,
+                            "Use .cursor",
+                            cx.listener(|page, _, _, cx| {
+                                page.select_config_target(ConfigTarget::Cursor, cx)
+                            }),
+                        ))
+                    })
+                    .child(action_button(
+                        theme,
+                        "Save config",
+                        cx.listener(|page, _, _, cx| page.save_config(cx)),
+                    )),
             )
             .into_any_element()
     }
@@ -859,11 +1136,10 @@ impl ProjectsPage {
         &mut self,
         theme: &Theme,
         row: &ProjectRow,
-        detail: &Detail,
+        _detail: &Detail,
         live: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let commands = detail.config.commands_for_this_platform().to_vec();
         let project_id = row.project_id.clone();
         let mut card = widgets::section_card(theme).child(
             widgets::card_row(theme, true)
@@ -881,27 +1157,36 @@ impl ProjectsPage {
                             page.launch_with_prompt(id, WORKTREE_SETUP_PROMPT.to_owned(), cx);
                         }),
                     ))
-                }),
+                })
+                .child(action_button(
+                    theme,
+                    "Copy $ROOT_WORKTREE_PATH",
+                    cx.listener(|_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            "$ROOT_WORKTREE_PATH".to_owned(),
+                        ))
+                    }),
+                )),
         );
-        if commands.is_empty() {
-            card = card.child(widgets::card_row(theme, false).child(quiet(
+        card = card
+            .child(config_editor_row(
                 theme,
-                "No setup commands configured for this project",
-            )));
-        }
-        for command in commands {
-            card = card.child(
-                widgets::card_row(theme, false).child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.5))
-                        .text_color(theme.text)
-                        .child(SharedString::from(command)),
-                ),
-            );
-        }
+                "Shared commands",
+                "One command per line. When present, this list runs on every platform.",
+                self.config_shared_input.clone(),
+            ))
+            .child(config_editor_row(
+                theme,
+                "macOS / Linux",
+                "Used when the shared command list is empty.",
+                self.config_unix_input.clone(),
+            ))
+            .child(config_editor_row(
+                theme,
+                "Windows",
+                "Used when the shared command list is empty.",
+                self.config_windows_input.clone(),
+            ));
         card.into_any_element()
     }
 
@@ -950,6 +1235,7 @@ impl ProjectsPage {
     ) -> AnyElement {
         let path = row.path.clone();
         let name = row.name.clone();
+        let recorded_icon = row.icon_path.clone();
         let confirming = self.confirm_forget;
         widgets::section_card(theme)
             .child(
@@ -987,11 +1273,12 @@ impl ProjectsPage {
                             &format!("Forget \"{name}\""),
                             cx.listener(move |page, _, _, cx| {
                                 let path = path.clone();
+                                let recorded_icon = recorded_icon.clone();
                                 page.selected = None;
                                 page.confirm_forget = false;
                                 page.run_action(
                                     cx,
-                                    move |_| project_ledger::forget(&path).map(|_| ()),
+                                    move |_| forget_project(&path, recorded_icon.as_deref()),
                                     "Project forgotten",
                                 );
                             }),
@@ -1070,6 +1357,17 @@ fn label_block(theme: &Theme, label: &str, description: &str) -> AnyElement {
                 .child(SharedString::from(description.to_string())),
         )
         .into_any_element()
+}
+
+fn config_editor_row(
+    theme: &Theme,
+    label: &str,
+    description: &str,
+    input: Entity<ComposerInput>,
+) -> gpui::Div {
+    widgets::card_row(theme, false)
+        .child(label_block(theme, label, description))
+        .child(div().flex_none().w(px(360.0)).child(input))
 }
 
 /// Valor à direita, com a linha cinza do commit âncora embaixo quando existe.
@@ -1189,6 +1487,7 @@ mod tests {
                 true
             ),
             RepositoryState::Published {
+                host: "github.com".to_owned(),
                 owner: "guilhermexp".to_owned(),
                 repo: "comet".to_owned()
             }
@@ -1197,6 +1496,20 @@ mod tests {
             repository_state(&git(true, Some("/caminho/local/sem/host")), true),
             RepositoryState::RemoteUnparsed {
                 url: "/caminho/local/sem/host".to_owned()
+            }
+        );
+    }
+
+    /// O parser aceita GitHub Enterprise e outros hosts; perder `host` na
+    /// projecao fazia o botao Open reconstruir tudo em github.com.
+    #[test]
+    fn repository_state_preserves_the_remote_host() {
+        assert_eq!(
+            repository_state(&git(true, Some("git@git.example.com:team/repo.git")), true),
+            RepositoryState::Published {
+                host: "git.example.com".to_owned(),
+                owner: "team".to_owned(),
+                repo: "repo".to_owned(),
             }
         );
     }
@@ -1220,6 +1533,75 @@ mod tests {
             resolve_rename(" novo nome ", "comet"),
             Some("novo nome".to_owned())
         );
+    }
+
+    /// Remover a normalizacao volta a gravar linhas vazias/comentarios; remover
+    /// a comparacao volta a escrever o app-state a cada paint/reabertura.
+    #[test]
+    fn editor_normalizes_command_groups_and_only_saves_real_changes() {
+        let config = config_from_editor(
+            " bun install \n\n# shared comment",
+            "brew bundle\n  ",
+            "powershell -File setup.ps1",
+        );
+        assert_eq!(config.shared, vec!["bun install"]);
+        assert_eq!(config.unix, vec!["brew bundle"]);
+        assert_eq!(config.windows, vec!["powershell -File setup.ps1"]);
+        assert!(!config_edit_required(
+            &config,
+            ConfigTarget::Comet,
+            &config,
+            ConfigTarget::Comet,
+        ));
+        assert!(config_edit_required(
+            &WorktreeConfig::default(),
+            ConfigTarget::Comet,
+            &config,
+            ConfigTarget::Comet,
+        ));
+        assert!(config_edit_required(
+            &config,
+            ConfigTarget::Cursor,
+            &config,
+            ConfigTarget::Comet,
+        ));
+    }
+
+    /// Path legivel sanitizado colidia (`/a-b` e `/a/b`) e crescia alem do
+    /// NAME_MAX. O digest tem identidade e tamanho fixos.
+    #[test]
+    fn icon_names_are_digest_based_and_component_safe() {
+        let one = project_icon_filename("/a-b", "PNG");
+        let two = project_icon_filename("/a/b", "png");
+        assert_ne!(one, two);
+        assert!(one.ends_with(".png"));
+        assert!(one.len() < 100);
+        assert_eq!(one, project_icon_filename("/a-b", "png"));
+    }
+
+    /// Cleanup so recebe paths cujo pai e exatamente o diretorio app-owned;
+    /// um valor adulterado no ledger nunca vira delete fora dele.
+    #[test]
+    fn icon_cleanup_accepts_only_direct_children_of_the_managed_directory() {
+        let managed = Path::new("/tmp/comet-project-icons");
+        assert_eq!(
+            managed_icon_path(managed, "/tmp/comet-project-icons/abc.png"),
+            Some(PathBuf::from("/tmp/comet-project-icons/abc.png"))
+        );
+        assert_eq!(
+            managed_icon_path(managed, "/tmp/comet-project-icons/nested/abc.png"),
+            None
+        );
+        assert_eq!(managed_icon_path(managed, "/tmp/user-file.png"), None);
+    }
+
+    /// Um save do projeto A pode terminar depois que B foi selecionado; aplicar
+    /// o baseline de A em B faz o proximo edit de B pular ou escrever errado.
+    #[test]
+    fn config_save_result_applies_only_to_the_project_it_started_for() {
+        assert!(config_save_matches_selection("/tmp/a", Some("/tmp/a")));
+        assert!(!config_save_matches_selection("/tmp/a", Some("/tmp/b")));
+        assert!(!config_save_matches_selection("/tmp/a", None));
     }
 
     #[test]

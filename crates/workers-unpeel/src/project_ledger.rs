@@ -17,7 +17,7 @@
 //! cada entrada, entao remover e readicionar a mesma pasta orfanaria o
 //! historico dela.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -117,9 +117,13 @@ pub fn reconcile(ledger: &[LedgerProject], live: &[LiveProject], now: u64) -> Re
 
     let mut rows = Vec::with_capacity(live.len() + remaining.len());
     let mut next: Vec<LedgerProject> = Vec::with_capacity(remaining.len() + live.len());
+    let mut seen_live_paths = HashSet::with_capacity(live.len());
 
     for project in live {
         let entry_key = key(&project.path);
+        if !seen_live_paths.insert(entry_key.clone()) {
+            continue;
+        }
         let activity = project.last_activity_unix_ms;
         let entry = match remaining.remove(&entry_key) {
             Some(previous) => LedgerProject {
@@ -428,6 +432,25 @@ mod tests {
         );
         assert_eq!(outcome.rows.len(), 1, "seria 2 se a chave fosse literal");
         assert_eq!(outcome.rows[0].added_at_unix_ms, 10);
+    }
+
+    /// Duas entidades do working set podem apontar para a mesma pasta (um
+    /// projeto e um grupo organizacional). A chave do ledger e o path, entao
+    /// a segunda nunca pode cunhar outra row/entrada com a mesma identidade.
+    #[test]
+    fn duplicate_live_paths_produce_one_row_and_one_ledger_entry() {
+        let outcome = reconcile(
+            &[],
+            &[
+                live("comet-project", "/tmp/repo", Some(10)),
+                live("comet-group", "/tmp/repo", Some(20)),
+            ],
+            30,
+        );
+
+        assert_eq!(outcome.rows.len(), 1);
+        assert_eq!(outcome.ledger.len(), 1);
+        assert_eq!(outcome.rows[0].project_id.as_deref(), Some("comet-project"));
     }
 
     #[test]

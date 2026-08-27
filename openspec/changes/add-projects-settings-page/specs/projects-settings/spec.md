@@ -35,6 +35,14 @@ Test: unit — write the ledger into a state document carrying unknown keys.
 - **THEN** every top-level key the app does not model is still present afterwards
 - **AND** the working-set project list is unchanged
 
+#### Scenario: Organizational groups never become ledger rows
+Test: unit — bootstrap projection plus duplicate-path reconciliation.
+
+- **WHEN** the Workers bootstrap contains a filesystem project and an organizational group sharing its path
+- **THEN** Settings lists only the filesystem project
+- **AND** the persisted ledger contains exactly one entry for that canonical path
+- **AND** a worktree with its own path remains eligible for the ledger
+
 ### Requirement: Settings offers a Projects section listing every recorded project
 
 The settings navigation SHALL include a Projects section rendering a searchable
@@ -67,6 +75,13 @@ Test: visual — the two panes.
 - **WHEN** the user selects a row
 - **THEN** the right pane shows that project's General, Config, Worktree, Auto Doc and Danger Zone cards
 
+#### Scenario: A long ledger remains navigable
+Test: visual — list taller than the Projects pane.
+
+- **WHEN** the ledger has more rows than fit vertically in the left pane
+- **THEN** the list scrolls independently
+- **AND** every recorded project remains reachable
+
 ### Requirement: The General card shows a project's identity and lifecycle
 
 The General card SHALL show name, icon, path, added date and last-opened date,
@@ -85,6 +100,14 @@ Test: visual — the icon slot before and after.
 - **WHEN** the user picks an image file for a project
 - **THEN** that image is stored for the project and shown in the icon slot
 - **AND** a reset action is offered that restores the default icon
+
+#### Scenario: Resetting or forgetting cleans up a managed icon
+Test: unit — digest filename and managed-path cleanup; visual — icon fallback.
+
+- **WHEN** a project icon is reset or its ledger row is forgotten
+- **THEN** the metadata stops naming the icon
+- **AND** the exact app-owned icon file is deleted
+- **AND** a path outside the app-owned icon directory is never deleted
 
 #### Scenario: A project with no custom icon
 Test: unit — the icon-source decision.
@@ -118,6 +141,7 @@ Test: unit — remote parsing to owner/repo; visual — the row.
 - **WHEN** the selected project's folder has an origin remote
 - **THEN** the Repository row shows owner and repository
 - **AND** offers to open it in the browser when the remote is a known host
+- **AND** the browser URL preserves that remote's host rather than forcing github.com
 
 #### Scenario: A local repository with no remote
 Test: unit — the three-state decision.
@@ -182,6 +206,14 @@ Test: unit — round-trip of a config carrying platform lists.
 - **THEN** those lists are shown in their own groups
 - **AND** a group left empty is stated to fall back to the shared commands
 
+#### Scenario: The config editor writes the selected supported target
+Test: unit — editor normalization and save decision; visual — target and command controls.
+
+- **WHEN** the user changes shared, Unix or Windows commands or selects an available config target
+- **THEN** non-empty non-comment commands are persisted to that target
+- **AND** unchanged editor state performs no write
+- **AND** the Cursor target is selectable only when its file already exists
+
 #### Scenario: Setup runs after a worktree is created
 Test: unit — the executor over a temporary checkout.
 
@@ -189,6 +221,14 @@ Test: unit — the executor over a temporary checkout.
 - **THEN** each command runs in the new worktree
 - **AND** the main checkout's path is available to those commands through the environment
 - **AND** a command that fails stops the run and reports which command failed
+
+#### Scenario: Verbose and timed-out setup commands terminate cleanly
+Test: unit — bounded stderr plus descendant cleanup.
+
+- **WHEN** a setup command fills stderr or outlives its deadline with descendants
+- **THEN** stderr is drained without deadlocking the child
+- **AND** the failure reports a bounded reason
+- **AND** timeout terminates the command's process group before returning
 
 #### Scenario: A project with no setup config
 Test: unit — the executor's no-config branch.
@@ -215,6 +255,14 @@ Test: visual — the session that appears.
 - **WHEN** the user runs Auto Doc on a project whose folder is a repository
 - **THEN** a worker session starts in that project, seeded with the audit request and the project's two anchor commits
 - **AND** the action is unavailable for a project whose folder is not a repository
+
+#### Scenario: Failed worktree setup blocks automatic worker launch
+Test: unit — setup-result launch guard; visual — error notice.
+
+- **WHEN** worktree creation succeeds but one setup command fails
+- **THEN** the worktree remains registered for inspection
+- **AND** the UI names the failed command and reason
+- **AND** no Worker session is launched automatically in that worktree
 
 ### Requirement: A project can be forgotten
 
