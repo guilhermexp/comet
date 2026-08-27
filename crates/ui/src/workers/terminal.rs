@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -163,6 +163,7 @@ struct HistoricalReplay {
     grid_ready: bool,
     chunks: u32,
     backlog_end: Option<u64>,
+    started_at: Option<Instant>,
 }
 
 /// Teto do catch-up silencioso, em leituras de output (cada uma traz no
@@ -174,12 +175,18 @@ struct HistoricalReplay {
 /// comportamento antigo e nunca algo pior.
 const MAX_SILENT_REPLAY_CHUNKS: u32 = 512;
 
+/// Prazo de parede do catch-up. Os outros backstops so avancam quando um
+/// refresh chega; este expira sozinho, entao um estado que PAROU de receber
+/// chamadas — grade que nunca mede, poll que nunca volta — tambem sai.
+const MAX_SILENT_REPLAY_WINDOW: Duration = Duration::from_secs(5);
+
 impl HistoricalReplay {
     fn start(&mut self) {
         self.active = true;
         self.grid_ready = false;
         self.chunks = 0;
         self.backlog_end = None;
+        self.started_at = Some(Instant::now());
     }
 
     fn observe_geometry(&mut self) {
@@ -193,8 +200,28 @@ impl HistoricalReplay {
     /// Enquanto o backlog nao drena, o terminal alimenta o emulador sem
     /// pintar: cada chunk pintado era um quadro do terminal rolando do topo,
     /// e quem abre a sessao quer o fim dela, nao o filme.
+    ///
+    /// A saida e TOTAL: alcancar o offset de abertura, uma leitura vazia, uma
+    /// falha de leitura, o teto de chunks ou o prazo de parede. Inferir "ainda
+    /// drenando" so do caminho feliz deixava o overlay pendurado em cima de
+    /// uma grade viva sempre que um refresh nao chegava.
     fn is_catching_up(&self) -> bool {
-        self.active && self.chunks < MAX_SILENT_REPLAY_CHUNKS
+        self.is_catching_up_at(Instant::now())
+    }
+
+    fn is_catching_up_at(&self, now: Instant) -> bool {
+        self.active
+            && self.chunks < MAX_SILENT_REPLAY_CHUNKS
+            && self.started_at.is_some_and(|start| {
+                now.saturating_duration_since(start) < MAX_SILENT_REPLAY_WINDOW
+            })
+    }
+
+    /// Ler falhou. "Nao consegui ler" nao e "ainda estou drenando backlog": a
+    /// faixa de erro e o sinal, e esconder a grade atras de um estado de
+    /// carregamento falso so tira do usuario o scrollback que ele veio ver.
+    fn observe_failure(&mut self) {
+        self.active = false;
     }
 
     /// Fim do catch-up: o backlog que existia QUANDO O TERMINAL ABRIU. O
@@ -557,6 +584,7 @@ impl WorkersTerminal {
                                 }
                             }
                             Err(error) => {
+                                state.historical_replay.observe_failure();
                                 terminal.error = Some(error.to_string());
                                 cx.notify();
                             }
@@ -1349,10 +1377,10 @@ mod tests {
     use crate::terminal::view::paste_bytes;
 
     use super::{
-        HistoricalReplay, MAX_SILENT_REPLAY_CHUNKS, MouseProtocol, MouseReportKind,
-        RemoteGridTracker, ResizeSync, RetainedWorkerTerminals, TerminalRefresh,
-        TerminalScrollAction, WorkersTerminalView, mouse_report_bytes, scroll_action, should_paint,
-        terminal_refresh, viewport_has_tui_jump_hint,
+        HistoricalReplay, Instant, MAX_SILENT_REPLAY_CHUNKS, MAX_SILENT_REPLAY_WINDOW,
+        MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync, RetainedWorkerTerminals,
+        TerminalRefresh, TerminalScrollAction, WorkersTerminalView, mouse_report_bytes,
+        scroll_action, should_paint, terminal_refresh, viewport_has_tui_jump_hint,
     };
 
     #[test]
@@ -1694,6 +1722,40 @@ mod tests {
 
         replay.observe_output(true, 5_000, None);
         assert!(!replay.is_catching_up());
+    }
+
+    /// O braco de erro do poll nunca chama `apply_refresh`, entao um erro
+    /// persistente de `read_output`/`read_viewport` deixava o overlay
+    /// "Loading history…" cobrindo a grade pra sempre — nem o teto de chunks
+    /// salvava, porque ele so avanca no caminho feliz.
+    #[test]
+    fn a_read_that_keeps_failing_stops_reading_as_catch_up() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+        replay.observe_output(true, CHUNK, Some(10 * CHUNK));
+        assert!(replay.is_catching_up());
+
+        for _ in 0..3 {
+            replay.observe_failure();
+            assert!(!replay.is_catching_up());
+        }
+
+        assert!(should_paint(true, replay.is_catching_up(), false, false));
+    }
+
+    /// E se `apply_refresh` nunca for chamado — a grade nunca mede, entao
+    /// `can_consume_output` barra toda leitura — o prazo de parede e a unica
+    /// coisa que sobra pra soltar a tela.
+    #[test]
+    fn a_catch_up_that_never_receives_a_refresh_expires_on_the_clock() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        let opened = Instant::now();
+
+        assert!(!replay.can_consume_output());
+        assert!(replay.is_catching_up_at(opened));
+        assert!(!replay.is_catching_up_at(opened + MAX_SILENT_REPLAY_WINDOW));
     }
 
     /// Uma sessao viva e tagarela pode nunca drenar; sem teto a tela ficaria
