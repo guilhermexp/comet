@@ -175,9 +175,13 @@ struct HistoricalReplay {
 /// comportamento antigo e nunca algo pior.
 const MAX_SILENT_REPLAY_CHUNKS: u32 = 512;
 
-/// Prazo de parede do catch-up. Os outros backstops so avancam quando um
-/// refresh chega; este expira sozinho, entao um estado que PAROU de receber
-/// chamadas — grade que nunca mede, poll que nunca volta — tambem sai.
+/// Prazo de parede do catch-up, contado a partir do momento em que ele PODE
+/// drenar — a primeira medida da grade —, nunca da selecao da sessao. Uma
+/// sessao selecionada com o terminal fora da tela nao consome leitura nenhuma
+/// (`can_consume_output`), e queimar a janela ali devolvia o filme do
+/// scrollback ao usuario que abrisse o painel depois. Ultimo recurso, atras do
+/// offset de abertura e da falha de leitura: mede um poll que parou de voltar,
+/// e so solta a tela no proximo repaint de outra fonte.
 const MAX_SILENT_REPLAY_WINDOW: Duration = Duration::from_secs(5);
 
 impl HistoricalReplay {
@@ -186,10 +190,13 @@ impl HistoricalReplay {
         self.grid_ready = false;
         self.chunks = 0;
         self.backlog_end = None;
-        self.started_at = Some(Instant::now());
+        self.started_at = None;
     }
 
     fn observe_geometry(&mut self) {
+        if !self.grid_ready {
+            self.started_at = Some(Instant::now());
+        }
         self.grid_ready = true;
     }
 
@@ -212,9 +219,9 @@ impl HistoricalReplay {
     fn is_catching_up_at(&self, now: Instant) -> bool {
         self.active
             && self.chunks < MAX_SILENT_REPLAY_CHUNKS
-            && self.started_at.is_some_and(|start| {
-                now.saturating_duration_since(start) < MAX_SILENT_REPLAY_WINDOW
-            })
+            && self
+                .started_at
+                .is_none_or(|start| now.saturating_duration_since(start) < MAX_SILENT_REPLAY_WINDOW)
     }
 
     /// Ler falhou. "Nao consegui ler" nao e "ainda estou drenando backlog": a
@@ -1744,18 +1751,64 @@ mod tests {
         assert!(should_paint(true, replay.is_catching_up(), false, false));
     }
 
-    /// E se `apply_refresh` nunca for chamado — a grade nunca mede, entao
-    /// `can_consume_output` barra toda leitura — o prazo de parede e a unica
-    /// coisa que sobra pra soltar a tela.
+    /// E se `apply_refresh` nunca for chamado — poll que nao volta, com a
+    /// grade ja medida — o prazo de parede e a unica coisa que sobra pra
+    /// soltar a tela.
     #[test]
     fn a_catch_up_that_never_receives_a_refresh_expires_on_the_clock() {
         let mut replay = HistoricalReplay::default();
         replay.start();
-        let opened = Instant::now();
+        replay.observe_geometry();
+        let measured = Instant::now();
+
+        assert!(replay.can_consume_output());
+        assert!(replay.is_catching_up_at(measured));
+        assert!(!replay.is_catching_up_at(measured + MAX_SILENT_REPLAY_WINDOW));
+    }
+
+    /// A janela conta do momento em que o catch-up PODE drenar, nao da
+    /// selecao: `set_session` roda na restauracao do boot e no auto-select
+    /// pos-launch, com o terminal fora da tela. Carimbando em `start()`, a
+    /// sessao queimava os 5 s sem ler nada e quem abrisse o painel depois via
+    /// o backlog inteiro rolar do topo — o bug original.
+    #[test]
+    fn a_session_selected_off_screen_still_catches_up_when_the_grid_appears() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        let selected = Instant::now();
 
         assert!(!replay.can_consume_output());
-        assert!(replay.is_catching_up_at(opened));
-        assert!(!replay.is_catching_up_at(opened + MAX_SILENT_REPLAY_WINDOW));
+        assert!(replay.is_catching_up_at(selected + MAX_SILENT_REPLAY_WINDOW * 4));
+
+        replay.observe_geometry();
+        let measured = Instant::now();
+
+        assert!(replay.can_consume_output());
+        assert!(
+            replay.is_catching_up_at(measured),
+            "a janela so comeca quando a grade mede"
+        );
+        assert!(!replay.is_catching_up_at(measured + MAX_SILENT_REPLAY_WINDOW));
+    }
+
+    /// O relogio e o ultimo recurso: numa abertura normal quem encerra o
+    /// catch-up e o offset de abertura, muito antes do prazo.
+    #[test]
+    fn a_normal_open_leaves_on_the_backlog_mark_not_on_the_deadline() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+        let measured = Instant::now();
+
+        for chunk in 1..=3_u64 {
+            assert!(replay.is_catching_up_at(measured));
+            replay.observe_output(true, chunk * CHUNK, (chunk == 1).then_some(3 * CHUNK));
+        }
+
+        assert!(
+            !replay.is_catching_up_at(measured),
+            "saiu pelo offset de abertura, com a janela inteira ainda de pe"
+        );
     }
 
     /// Uma sessao viva e tagarela pode nunca drenar; sem teto a tela ficaria
