@@ -105,3 +105,6 @@ Subárvores sem doc próprio (ainda não têm regra local além da desta pasta):
   Unix e Windows normalizam linhas vazias/comentários e só gravam quando o
   conteúdo ou target mudou. Ícone usa SHA-256 do path, é carregado fora do
   render e reset/forget só podem remover filho direto do diretório app-owned.
+- **Falha de setup e sucesso parcial visível.** O worktree criado continua
+  selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
+  ao refresh seguinte e nenhum Worker é lançado automaticamente nele.

@@ -361,7 +361,21 @@ pub struct WorkersWorktreeResult {
     /// O primeiro comando de setup que falhou, se algum. O worktree existe de
     /// qualquer forma — quem chamou decide se avisa.
     pub setup_failed_command: Option<String>,
+    pub setup_failed_reason: Option<String>,
     pub setup_commands_run: usize,
+}
+
+fn ensure_setup_succeeded(worktree: &WorkersWorktreeResult) -> Result<(), WorkersError> {
+    let Some(command) = worktree.setup_failed_command.as_deref() else {
+        return Ok(());
+    };
+    let reason = worktree
+        .setup_failed_reason
+        .as_deref()
+        .unwrap_or("motivo não informado");
+    Err(WorkersError::State(format!(
+        "worktree criado, mas o setup falhou em `{command}`: {reason}"
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1659,6 +1673,7 @@ impl LocalWorkersClient {
             path: worktree.path,
             branch: branch.to_owned(),
             setup_failed_command: setup.failed,
+            setup_failed_reason: setup.failed_reason,
             setup_commands_run: setup.commands_run,
         })
     }
@@ -1669,6 +1684,7 @@ impl LocalWorkersClient {
         mut launch: WorkersLaunchRequest,
     ) -> Result<WorkersWorktreeLaunchResult, WorkersError> {
         let worktree = self.create_worktree(request)?;
+        ensure_setup_succeeded(&worktree)?;
         launch.project_id = worktree.project_id.clone();
         launch.worktree_path = Some(worktree.path.clone());
         launch.worktree_branch = Some(worktree.branch.clone());
@@ -3327,11 +3343,20 @@ mod worktree_setup_wiring_tests {
         let created = fixture.create().unwrap();
 
         assert_eq!(created.setup_failed_command.as_deref(), Some("exit 7"));
+        assert!(
+            created
+                .setup_failed_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains('7'))
+        );
         assert_eq!(created.setup_commands_run, 0);
         assert!(
             PathBuf::from(&created.path).is_dir(),
             "o worktree tem que sobreviver a uma falha de setup"
         );
+        let error = ensure_setup_succeeded(&created).unwrap_err();
+        assert!(error.to_string().contains("exit 7"));
+        assert!(PathBuf::from(&created.path).is_dir());
     }
 
     #[test]

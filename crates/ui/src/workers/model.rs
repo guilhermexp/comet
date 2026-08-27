@@ -11,7 +11,7 @@ use zeron_workers_unpeel::{
     WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
     WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
     WorkersResourceSettings, WorkersSession, WorkersSessionSort, WorkersSettingsSnapshot,
-    WorkersTranscriptSettings, ack_worker_parent_notification,
+    WorkersTranscriptSettings, WorkersWorktreeResult, ack_worker_parent_notification,
     build_worker_parent_notification_prompt, pending_worker_parent_notifications,
     worker_parent_links,
 };
@@ -132,6 +132,17 @@ pub fn selection_after_remove(
                 .find(|session| session.project_id == *project_id && !session.archived)
         })
         .map(|session| session.id.clone())
+}
+
+pub fn worktree_setup_failure_message(result: &WorkersWorktreeResult) -> Option<String> {
+    let command = result.setup_failed_command.as_deref()?;
+    let reason = result
+        .setup_failed_reason
+        .as_deref()
+        .unwrap_or("motivo não informado");
+    Some(format!(
+        "Worktree criado, mas o setup falhou em `{command}`: {reason}"
+    ))
 }
 
 pub fn sessions_for_project<'a>(
@@ -336,6 +347,7 @@ pub struct WorkersModel {
     pub expanded_project_ids: HashSet<String>,
     pub loading: bool,
     pub error: Option<String>,
+    post_refresh_error: Option<String>,
     pub archive_project_id: Option<String>,
     pub archived_sessions: Vec<WorkersSession>,
     pub archive_loading: bool,
@@ -408,6 +420,7 @@ impl WorkersModel {
             expanded_project_ids: HashSet::new(),
             loading: true,
             error: None,
+            post_refresh_error: None,
             archive_project_id: None,
             archived_sessions: Vec::new(),
             archive_loading: false,
@@ -968,9 +981,13 @@ impl WorkersModel {
             },
             move |model, worktree| {
                 model.expanded_project_ids.insert(parent_id);
-                model.selected_project_id = Some(worktree.project_id);
+                model.selected_project_id = Some(worktree.project_id.clone());
                 model.selected_session_id = None;
                 model.launcher_project_id = None;
+                if let Some(error) = worktree_setup_failure_message(&worktree) {
+                    model.error = Some(error.clone());
+                    model.post_refresh_error = Some(error);
+                }
             },
             cx,
         );
@@ -1729,7 +1746,7 @@ impl WorkersModel {
             self.expanded_project_ids
                 .retain(|id| snapshot.projects.iter().any(|project| &project.id == id));
         }
-        self.error = None;
+        self.error = self.post_refresh_error.take();
         self.snapshot = Some(snapshot);
     }
 
@@ -1768,7 +1785,9 @@ impl WorkersModel {
                     }
                     Err(error) => {
                         model.pending_replacement = None;
-                        model.error = Some(error.to_string());
+                        let error = error.to_string();
+                        model.error = Some(error.clone());
+                        model.post_refresh_error = Some(error);
                     }
                 }
                 if !model.start_pending_remove(cx) {
@@ -1820,7 +1839,7 @@ mod tests {
     use zeron_workers_unpeel::{
         WorkerParentLink, WorkerParentNotification, WorkerParentNotificationKind,
         WorkersNotificationSettings, WorkersSession, WorkersSessionCapabilities,
-        WorkersSettingsSnapshot,
+        WorkersSettingsSnapshot, WorkersWorktreeResult,
     };
 
     use super::{
@@ -1830,7 +1849,7 @@ mod tests {
         parent_notification_retry_allowed, parent_notification_rpc_params, reconcile_selection,
         reconcile_selection_with_pending, replacement_selection, resolve_session_target,
         selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
-        toggle_expanded,
+        toggle_expanded, worktree_setup_failure_message,
     };
 
     fn parent_notification() -> WorkerParentNotification {
@@ -2119,6 +2138,25 @@ mod tests {
             .map(|session| session.id.as_str())
             .collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    /// A criação continua sucesso porque o worktree existe, mas o model precisa
+    /// transformar o resultado parcial em erro visível com comando e motivo.
+    #[test]
+    fn worktree_setup_failure_message_names_command_and_reason() {
+        let result = WorkersWorktreeResult {
+            project_id: "worktree-1".into(),
+            path: "/tmp/worktree-1".into(),
+            branch: "change/fix".into(),
+            setup_failed_command: Some("bun install".into()),
+            setup_failed_reason: Some("exit status: 1".into()),
+            setup_commands_run: 0,
+        };
+
+        assert_eq!(
+            worktree_setup_failure_message(&result).as_deref(),
+            Some("Worktree criado, mas o setup falhou em `bun install`: exit status: 1")
+        );
     }
 
     #[test]

@@ -91,6 +91,11 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   suite verde — e um arquivo de setup que ninguem le e exatamente o bug que a
   feature existe para consertar. `create_worktree_at` existe so para dar essa
   costura um caminho de estado injetavel; nao use a variante `_at` em producao.
+- **Setup e uma arvore de processo com resultado parcial explicito.** Stderr e
+  drenado concorrentemente com cauda de 64 KiB; timeout encerra o process group
+  inteiro. Falha mantém o worktree registrado, carrega comando + motivo em
+  `WorkersWorktreeResult` e barra `create_worktree_and_launch` antes de iniciar
+  a Session.
 - **Teste que cria worktree limpa o que criou.** `unpeel_core::worktrees::create`
   escreve em `~/.unpeel/worktrees/`, que o state path injetado NAO redireciona.
   O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o ramo deixa o
@@ -143,7 +148,7 @@ Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (17), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (12), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (17), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

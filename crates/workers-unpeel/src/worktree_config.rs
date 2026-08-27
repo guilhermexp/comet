@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ pub const CURSOR_CONFIG_PATH: &str = ".cursor/worktrees.json";
 /// Teto por comando. Setup que trava seguraria a criacao do worktree para
 /// sempre; 5 min e o mesmo teto do reference.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
 /// De onde a config foi lida — a linha "Config file" mostra isso.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +209,9 @@ pub struct SetupOutcome {
     pub commands_run: usize,
     /// `Some` no primeiro comando que falhou — a execucao para ali.
     pub failed: Option<String>,
+    /// Motivo limitado da falha, separado do comando para a UI poder nomear os
+    /// dois sem confundir payload executado com diagnostico.
+    pub failed_reason: Option<String>,
     pub output: Vec<String>,
 }
 
@@ -229,27 +233,54 @@ fn run_one(
     command: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    let mut child = Command::new("sh")
+    let mut process = Command::new("sh");
+    process
         .arg("-c")
         .arg(command)
         .current_dir(worktree_path)
         .env("ROOT_WORKTREE_PATH", main_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    let mut child = process.spawn().map_err(|error| error.to_string())?;
+    let mut stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut tail = Vec::new();
+            let mut chunk = [0_u8; 8 * 1024];
+            loop {
+                let read = match std::io::Read::read(&mut stderr, &mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let overflow = tail
+                    .len()
+                    .saturating_add(read)
+                    .saturating_sub(STDERR_TAIL_BYTES);
+                if overflow > 0 {
+                    tail.drain(..overflow);
+                }
+                tail.extend_from_slice(&chunk[..read]);
+            }
+            String::from_utf8_lossy(&tail).trim().to_owned()
+        })
+    });
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success() => {
+                terminate_remaining_process_group(child.id());
+                let _ = join_stderr(stderr_reader.take());
+                return Ok(());
+            }
             Ok(Some(status)) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    use std::io::Read as _;
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
+                terminate_remaining_process_group(child.id());
+                let stderr = join_stderr(stderr_reader.take());
                 let stderr = stderr.trim();
                 return Err(if stderr.is_empty() {
                     format!("exit {status}")
@@ -258,14 +289,71 @@ fn run_one(
                 });
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_tree(&mut child);
+                let _ = join_stderr(stderr_reader.take());
                 return Err(format!("timed out after {:?}", timeout));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                terminate_child_tree(&mut child);
+                let _ = join_stderr(stderr_reader.take());
+                return Err(error.to_string());
+            }
         }
     }
+}
+
+fn join_stderr(reader: Option<std::thread::JoinHandle<String>>) -> String {
+    reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn terminate_remaining_process_group(group_leader: u32) {
+    let process_group = -(group_leader as i32);
+    // SAFETY: the command was spawned with `process_group(0)`. ESRCH means the
+    // shell had no remaining descendants and needs no grace period.
+    let signaled = unsafe { libc::kill(process_group, libc::SIGTERM) } == 0;
+    if !signaled {
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_remaining_process_group(_group_leader: u32) {}
+
+#[cfg(unix)]
+fn terminate_child_tree(child: &mut Child) {
+    let process_group = -(child.id() as i32);
+    // SAFETY: `process_group(0)` made the child pid the leader of a fresh
+    // process group owned by this command.
+    unsafe {
+        libc::kill(process_group, libc::SIGTERM);
+    }
+    let grace = std::time::Instant::now() + Duration::from_millis(150);
+    while std::time::Instant::now() < grace {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Always target the group after the grace: the shell may have exited while
+    // one of its descendants remains alive.
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_child_tree(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Roda o setup no worktree recem-criado.
@@ -299,8 +387,9 @@ fn run_setup_with_timeout(
         match run_one(worktree_path, main_path, command, timeout) {
             Ok(()) => outcome.commands_run += 1,
             Err(reason) => {
-                outcome.output.push(reason);
+                outcome.output.push(reason.clone());
                 outcome.failed = Some(command.clone());
+                outcome.failed_reason = Some(reason);
                 return outcome;
             }
         }
@@ -487,10 +576,136 @@ mod tests {
         let outcome = run_setup(worktree.path(), main.path(), &config);
         assert!(!outcome.succeeded());
         assert_eq!(outcome.failed.as_deref(), Some("exit 3"));
+        assert!(
+            outcome
+                .failed_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.contains("exit") && reason.contains('3') })
+        );
         assert_eq!(outcome.commands_run, 0);
         assert!(
             !worktree.path().join("tarde.txt").exists(),
             "parou no primeiro que falhou"
+        );
+    }
+
+    /// Sem drain concorrente, 1 MiB de stderr enche o pipe e o child nunca
+    /// chega ao exit 7; o runner só acorda no timeout.
+    #[test]
+    fn verbose_stderr_cannot_deadlock_the_runner() {
+        let main = Dir::new();
+        let worktree = Dir::new();
+        let command = "head -c 1048576 /dev/zero >&2; exit 7";
+        let config = WorktreeConfig {
+            shared: vec![command.to_owned()],
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+
+        let outcome = run_setup_with_timeout(
+            worktree.path(),
+            main.path(),
+            &config,
+            Duration::from_secs(3),
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.failed.as_deref(), Some(command));
+        let reason = outcome
+            .failed_reason
+            .as_deref()
+            .expect("bounded stderr reason");
+        assert!(reason.len() <= 64 * 1024);
+    }
+
+    #[cfg(unix)]
+    struct PidCleanup(i32);
+
+    #[cfg(unix)]
+    impl Drop for PidCleanup {
+        fn drop(&mut self) {
+            // SAFETY: test-owned pid read from the child it just spawned.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// Matar só `sh -c` deixa descendentes vivos. O deadline cobre o process
+    /// group inteiro antes de `run_setup_with_timeout` devolver.
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_setup_descendants() {
+        let main = Dir::new();
+        let worktree = Dir::new();
+        let config = WorktreeConfig {
+            shared: vec![
+                "sleep 30 & child=$!; printf '%s' \"$child\" > child.pid; wait \"$child\""
+                    .to_owned(),
+            ],
+            ..Default::default()
+        };
+
+        let outcome = run_setup_with_timeout(
+            worktree.path(),
+            main.path(),
+            &config,
+            Duration::from_millis(300),
+        );
+        assert!(
+            outcome
+                .failed_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("timed out"))
+        );
+
+        let pid: i32 = std::fs::read_to_string(worktree.path().join("child.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let _cleanup = PidCleanup(pid);
+        // SAFETY: signal 0 probes existence without changing process state.
+        let result = unsafe { libc::kill(pid, 0) };
+        assert_eq!(result, -1, "setup descendant {pid} survived timeout");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    /// Um shell pode retornar zero e deixar background herdando o pipe. O
+    /// runner continua dono da arvore: nao bloqueia no join nem deixa processo.
+    #[cfg(unix)]
+    #[test]
+    fn successful_shell_cannot_leave_background_descendants() {
+        let main = Dir::new();
+        let worktree = Dir::new();
+        let config = WorktreeConfig {
+            shared: vec!["sleep 2 & printf '%s' \"$!\" > child.pid".to_owned()],
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+
+        let outcome = run_setup_with_timeout(
+            worktree.path(),
+            main.path(),
+            &config,
+            Duration::from_millis(300),
+        );
+
+        let pid: i32 = std::fs::read_to_string(worktree.path().join("child.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let _cleanup = PidCleanup(pid);
+        assert!(outcome.succeeded());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // SAFETY: signal 0 probes existence without changing process state.
+        let result = unsafe { libc::kill(pid, 0) };
+        assert_eq!(result, -1, "successful command leaked descendant {pid}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
         );
     }
 
