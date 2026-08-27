@@ -77,7 +77,22 @@ impl ChatWorkersWidgetState {
     /// Subagents left the user watching an unrelated list. The first sync only
     /// records the baseline, so opening a chat that already has rows does not
     /// yank the tab out from under the reader.
-    pub fn sync_dispatch(&mut self, workflows: usize, subagents: usize, workers: usize) {
+    ///
+    /// `None` is a list the caller could not read, NOT an empty one: a source
+    /// that errored says nothing about what is running, and folding it to `0`
+    /// made its recovery read as a launch. An unavailable list leaves both the
+    /// baseline and the selection untouched, so healing back to the same rows
+    /// compares equal and a launch that happened during the outage still wins.
+    pub fn sync_dispatch(
+        &mut self,
+        workflows: Option<usize>,
+        subagents: Option<usize>,
+        workers: Option<usize>,
+    ) {
+        let (Some(workflows), Some(subagents), Some(workers)) = (workflows, subagents, workers)
+        else {
+            return;
+        };
         let next = [workflows, subagents, workers];
         let Some(previous) = self.dispatch_counts.replace(next) else {
             return;
@@ -290,21 +305,57 @@ mod tests {
         );
     }
 
+    fn dispatch(
+        state: &mut ChatWorkersWidgetState,
+        workflows: usize,
+        subagents: usize,
+        workers: usize,
+    ) {
+        state.sync_dispatch(Some(workflows), Some(subagents), Some(workers));
+    }
+
+    /// Um erro do cliente de workers zerava a contagem, e a volta dela virava
+    /// "0 → N": o usuario parado em Subagents era jogado pra Workers por um
+    /// soluço do daemon que ninguem disparou.
+    #[test]
+    fn an_unavailable_workers_list_and_its_recovery_are_not_a_dispatch() {
+        let mut state = ChatWorkersWidgetState::default();
+        dispatch(&mut state, 0, 2, 3);
+        state.select(ChatWorkersTab::Subagents);
+
+        state.sync_dispatch(Some(0), Some(2), None);
+        assert_eq!(state.active_tab(0, 2, 0), ChatWorkersTab::Subagents);
+
+        dispatch(&mut state, 0, 2, 3);
+        assert_eq!(
+            state.active_tab(0, 2, 3),
+            ChatWorkersTab::Subagents,
+            "a lista voltando com as mesmas linhas nao e um launch"
+        );
+
+        dispatch(&mut state, 0, 2, 4);
+        assert_eq!(
+            state.active_tab(0, 2, 4),
+            ChatWorkersTab::Workers,
+            "um worker novo depois da queda continua puxando o foco"
+        );
+    }
+
     #[test]
     fn a_dispatch_pulls_focus_to_its_own_tab_over_an_explicit_selection() {
         let mut state = ChatWorkersWidgetState::default();
-        state.sync_dispatch(0, 2, 0);
+        dispatch(&mut state, 0, 2, 0);
         state.select(ChatWorkersTab::Subagents);
         assert_eq!(state.active_tab(0, 2, 0), ChatWorkersTab::Subagents);
 
-        state.sync_dispatch(0, 2, 1);
+        dispatch(&mut state, 0, 2, 1);
         assert_eq!(
             state.active_tab(0, 2, 1),
             ChatWorkersTab::Workers,
             "a launched worker takes focus off the tab the user was parked on"
         );
 
-        state.sync_dispatch(0, 3, 1);
+        dispatch(&mut state, 0, 3, 1);
         assert_eq!(state.active_tab(0, 3, 1), ChatWorkersTab::Subagents);
     }
 
@@ -313,20 +364,20 @@ mod tests {
         let mut state = ChatWorkersWidgetState::default();
         // Opening a chat that already has workers must not override the
         // auto order — nothing was dispatched, the rows were already there.
-        state.sync_dispatch(1, 0, 4);
+        dispatch(&mut state, 1, 0, 4);
         assert_eq!(state.active_tab(1, 0, 4), ChatWorkersTab::Workflows);
 
         // Rows leaving is not a dispatch either.
         state.select(ChatWorkersTab::Workflows);
-        state.sync_dispatch(1, 0, 2);
+        dispatch(&mut state, 1, 0, 2);
         assert_eq!(state.active_tab(1, 0, 2), ChatWorkersTab::Workflows);
     }
 
     #[test]
     fn a_worker_launch_that_also_mints_subagents_lands_on_the_worker() {
         let mut state = ChatWorkersWidgetState::default();
-        state.sync_dispatch(0, 1, 0);
-        state.sync_dispatch(0, 2, 1);
+        dispatch(&mut state, 0, 1, 0);
+        dispatch(&mut state, 0, 2, 1);
 
         assert_eq!(state.active_tab(0, 2, 1), ChatWorkersTab::Workers);
     }
@@ -335,10 +386,10 @@ mod tests {
     fn switching_chats_rebaselines_instead_of_reading_a_dispatch() {
         let mut state = ChatWorkersWidgetState::default();
         state.sync_context(Some("chat-a"));
-        state.sync_dispatch(0, 0, 0);
+        dispatch(&mut state, 0, 0, 0);
 
         state.sync_context(Some("chat-b"));
-        state.sync_dispatch(2, 0, 5);
+        dispatch(&mut state, 2, 0, 5);
 
         assert_eq!(state.active_tab(2, 0, 5), ChatWorkersTab::Workflows);
     }

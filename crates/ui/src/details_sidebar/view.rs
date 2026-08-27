@@ -1368,9 +1368,14 @@ impl DetailsSidebar {
         );
         // Raw counts, not `workers_tab_presence`: a binding failure lifting the
         // Workers tab from 0 to 1 is an error to surface, not a dispatch to
-        // follow.
-        self.chat_workers
-            .sync_dispatch(workflows, subagents, workers);
+        // follow. And an errored snapshot goes in as absence, never as zero —
+        // `current_chat_workers` empties the list on any client failure, so a
+        // count would make the recovery look like a launch.
+        self.chat_workers.sync_dispatch(
+            Some(workflows),
+            Some(subagents),
+            workers_error.is_none().then_some(workers),
+        );
         let active = self.chat_workers.active_tab(
             workflows,
             subagents,
