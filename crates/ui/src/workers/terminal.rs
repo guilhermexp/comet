@@ -162,15 +162,16 @@ struct HistoricalReplay {
     active: bool,
     grid_ready: bool,
     chunks: u32,
+    backlog_end: Option<u64>,
 }
 
-/// Teto do catch-up silencioso, medido em chunks de `OUTPUT_MAX_BYTES`
-/// (256 KB) do host: 128 MB de backlog escondido. Dimensionado pelos dois
-/// lados — o maior scrollback retido que vimos tem 28 MB (~112 chunks, cabe
-/// folgado), e nenhuma sessao emite 128 MB AO VIVO no intervalo entre abrir e
-/// drenar. O teto existe porque uma sessao que nunca drena deixaria a tela
-/// coberta pra sempre; estourado, volta a pintar chunk a chunk, entao o pior
-/// caso vira o comportamento antigo e nunca algo pior.
+/// Teto do catch-up silencioso, em leituras de output (cada uma traz no
+/// maximo um chunk de `OUTPUT_MAX_BYTES`, 256 KB do host). Backstop de
+/// runaway, nao a saida normal: quem termina o catch-up e o offset de
+/// abertura em [`HistoricalReplay::backlog_end`]. Existe porque uma sessao
+/// cujo `output_offset` nunca chega deixaria a tela coberta pra sempre;
+/// estourado, volta a pintar chunk a chunk, entao o pior caso vira o
+/// comportamento antigo e nunca algo pior.
 const MAX_SILENT_REPLAY_CHUNKS: u32 = 512;
 
 impl HistoricalReplay {
@@ -178,6 +179,7 @@ impl HistoricalReplay {
         self.active = true;
         self.grid_ready = false;
         self.chunks = 0;
+        self.backlog_end = None;
     }
 
     fn observe_geometry(&mut self) {
@@ -195,10 +197,25 @@ impl HistoricalReplay {
         self.active && self.chunks < MAX_SILENT_REPLAY_CHUNKS
     }
 
-    fn observe_output(&mut self, had_data: bool) {
-        if had_data {
-            self.chunks = self.chunks.saturating_add(1);
-        } else {
+    /// Fim do catch-up: o backlog que existia QUANDO O TERMINAL ABRIU. O
+    /// primeiro snapshot traz o `output_offset` da sessao naquele instante;
+    /// tudo depois dele e output ao vivo por definicao. "Ficou quieto" nao
+    /// serve de saida sozinho — `read_output` faz long-poll de 180 ms, entao
+    /// uma sessao viva que imprime qualquer coisa nesse intervalo nunca
+    /// devolve leitura vazia e ficaria coberta pelo overlay.
+    fn observe_output(&mut self, had_data: bool, next_offset: u64, backlog_end: Option<u64>) {
+        if !self.active {
+            return;
+        }
+        if let Some(end) = backlog_end {
+            self.backlog_end.get_or_insert(end);
+        }
+        if !had_data {
+            self.active = false;
+            return;
+        }
+        self.chunks = self.chunks.saturating_add(1);
+        if self.backlog_end.is_some_and(|end| next_offset >= end) {
             self.active = false;
         }
     }
@@ -321,6 +338,7 @@ impl WorkersTerminalState {
     fn apply_refresh(&mut self, output: WorkersOutput, viewport: Option<WorkersViewport>) -> bool {
         let had_data = !output.data.is_empty();
         let truncated = output.truncated;
+        let backlog_end = viewport.as_ref().map(|viewport| viewport.output_offset);
         if truncated {
             let (cols, rows) = viewport
                 .as_ref()
@@ -353,7 +371,8 @@ impl WorkersTerminalState {
             };
         }
         self.viewport_dirty = had_data && self.modes_from_snapshot;
-        self.historical_replay.observe_output(had_data);
+        self.historical_replay
+            .observe_output(had_data, self.offset, backlog_end);
         if !self.has_tui_jump_hint() {
             self.tui_jump_suppressed = false;
         }
@@ -1611,6 +1630,9 @@ mod tests {
         assert!(!replay.can_consume_output());
     }
 
+    /// Uma leitura de output traz no maximo `OUTPUT_MAX_BYTES` do host.
+    const CHUNK: u64 = 256 * 1024;
+
     /// Abrir uma sessao longa pintava cada chunk do backlog: o usuario via o
     /// terminal rolar do topo ate o fim antes de chegar onde ele queria.
     #[test]
@@ -1620,22 +1642,58 @@ mod tests {
         replay.observe_geometry();
 
         // Chunks do backlog: alimentam o emulador, nenhum vira quadro.
-        for _ in 0..5 {
+        for chunk in 1..=5_u64 {
             let was = replay.is_catching_up();
-            replay.observe_output(true);
+            replay.observe_output(true, chunk * CHUNK, (chunk == 1).then_some(6 * CHUNK));
             assert!(was && replay.is_catching_up());
             assert!(!should_paint(was, replay.is_catching_up(), true, false));
         }
 
-        // A leitura vazia drena o backlog: ESTE e o quadro que o usuario pediu.
+        // O offset de abertura chega: ESTE e o quadro que o usuario pediu.
         let was = replay.is_catching_up();
-        replay.observe_output(false);
+        replay.observe_output(true, 6 * CHUNK, None);
         assert!(!replay.is_catching_up());
-        assert!(should_paint(was, replay.is_catching_up(), false, false));
+        assert!(should_paint(was, replay.is_catching_up(), true, false));
 
         // Dali em diante, output ao vivo pinta normalmente.
-        replay.observe_output(true);
+        replay.observe_output(true, 7 * CHUNK, None);
         assert!(should_paint(false, replay.is_catching_up(), true, false));
+    }
+
+    /// A regressao: `read_output` faz long-poll de 180 ms, entao uma sessao
+    /// viva que imprime a cada <180 ms nunca devolve leitura vazia. Sem o
+    /// offset de abertura, o overlay "Loading history…" cobria a grade
+    /// inteira de um worker recem-lancado que so tinha output ao vivo.
+    #[test]
+    fn a_live_session_that_never_goes_quiet_leaves_catch_up_on_its_first_read() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+
+        replay.observe_output(true, 4_096, Some(4_096));
+
+        assert!(!replay.is_catching_up());
+        assert!(should_paint(true, replay.is_catching_up(), true, false));
+
+        for offset in 1..10_u64 {
+            replay.observe_output(true, 4_096 + offset * 512, None);
+            assert!(!replay.is_catching_up());
+        }
+    }
+
+    /// Um snapshot tirado depois da leitura enxerga o que a sessao imprimiu
+    /// no meio do caminho; o catch-up so precisa de mais uma leitura.
+    #[test]
+    fn a_live_session_whose_snapshot_ran_ahead_catches_up_on_the_next_read() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+
+        replay.observe_output(true, 4_096, Some(4_600));
+        assert!(replay.is_catching_up());
+
+        replay.observe_output(true, 5_000, None);
+        assert!(!replay.is_catching_up());
     }
 
     /// Uma sessao viva e tagarela pode nunca drenar; sem teto a tela ficaria
@@ -1646,9 +1704,9 @@ mod tests {
         replay.start();
         replay.observe_geometry();
 
-        for _ in 0..MAX_SILENT_REPLAY_CHUNKS {
+        for chunk in 1..=u64::from(MAX_SILENT_REPLAY_CHUNKS) {
             assert!(replay.is_catching_up());
-            replay.observe_output(true);
+            replay.observe_output(true, chunk * CHUNK, None);
         }
 
         assert!(!replay.is_catching_up(), "o teto solta o paint");
