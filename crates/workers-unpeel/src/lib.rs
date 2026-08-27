@@ -4,6 +4,8 @@ mod activity_bridge;
 mod controller_mcp;
 mod hook_migration;
 mod parent_notifications;
+pub mod project_git;
+pub mod project_ledger;
 pub mod resources;
 mod session_event_journal;
 pub mod workspace_trust;
@@ -23,6 +25,8 @@ pub use parent_notifications::{
     prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
     worker_parent_links, worker_parent_links_at,
 };
+pub use project_git::{AnchorCommit, ProjectGitStatus};
+pub use project_ledger::{LedgerProject, LiveProject, ProjectRow};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -938,6 +942,15 @@ pub enum WorkersError {
     InvalidProject { path: String, message: String },
 }
 
+/// Agora, em milissegundos desde a epoca. Relogio recuado devolve 0 em vez de
+/// entrar em panico — carimbo de data nunca vale derrubar o app.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct LocalWorkersClient {
     next_request_id: Arc<AtomicU64>,
@@ -1061,6 +1074,38 @@ impl LocalWorkersClient {
         apply_notify_when_done_overlay(&mut bootstrap.sessions);
         self.activity.enrich(&mut bootstrap.sessions);
         Ok(bootstrap)
+    }
+
+    /// As linhas de Settings > Projects: o ledger — tudo que o app ja viu —
+    /// reconciliado com o working set desta passada.
+    ///
+    /// Uma chamada so: `bootstrap` ja traz projetos E sessoes, e e das sessoes
+    /// que sai o "Last opened" de um projeto vivo, pela mesma derivacao que o
+    /// reference faz sobre a tabela de chats dele. Um projeto que ja saiu do
+    /// working set nao tem sessao nenhuma — mostra o valor congelado no ledger.
+    pub fn projects_with_ledger(&self) -> Result<Vec<ProjectRow>, WorkersError> {
+        let bootstrap = self.bootstrap()?;
+        let mut activity: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for session in &bootstrap.sessions {
+            let latest = activity.entry(session.project_id.as_str()).or_default();
+            *latest = (*latest).max(session.updated_at_unix_ms);
+        }
+        let live: Vec<LiveProject> = bootstrap
+            .projects
+            .iter()
+            .map(|project| LiveProject {
+                id: project.id.clone(),
+                path: project.path.clone(),
+                name: project.name.clone(),
+                last_activity_unix_ms: activity.get(project.id.as_str()).copied(),
+            })
+            .collect();
+        let ledger = project_ledger::read().map_err(WorkersError::State)?;
+        let outcome = project_ledger::reconcile(&ledger, &live, now_unix_ms());
+        if outcome.dirty {
+            project_ledger::write(&outcome.ledger).map_err(WorkersError::State)?;
+        }
+        Ok(outcome.rows)
     }
 
     pub fn read_output(

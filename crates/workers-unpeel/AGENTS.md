@@ -20,6 +20,8 @@ internal host modes (`__session_host__` et al.).
 | `session_event_journal.rs` | Session output/event journaling |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
+| `project_ledger.rs` | O ledger `comet_projects` — todo projeto que o app ja viu, por path canonico — e a reconciliacao pura com o working set (`reconcile`) |
+| `project_git.rs` | Estado de git de uma pasta de projeto e o commit-ancora de uma data, lidos na hora (`status`, `commit_at`) |
 | `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()`, then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
 | `tests/` | Integration tests per surface |
@@ -31,8 +33,13 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 - **Submodule pin is load-bearing.** `third_party/unpeel` is pinned at
   `f27e61a` and is NOT publicly fetchable — clean clones/worktrees cannot
-  build this crate. Run this crate's builds/tests in the main checkout (root
-  AGENTS.md durable gotcha). Never bump or re-point the pin casually.
+  build this crate: `git submodule update --init` falha porque o upstream
+  `unpeel-com/unpeel` nao existe publicamente. Rode builds/testes desta crate
+  no checkout principal (root AGENTS.md durable gotcha); se precisar mesmo de
+  um worktree, clone o submodulo do checkout principal
+  (`git clone <main>/third_party/unpeel <worktree>/third_party/unpeel` +
+  `checkout f27e61a`) em vez de tentar a rede. Never bump or re-point the pin
+  casually.
 - **Session hosts are re-executed zeron binaries.** A Workers session runs as a
   `__session_host__` process (`unpeel_core::session_host::SESSION_HOST_ARG`)
   spawned from the current executable; `run_session_host_mode_if_requested()`
@@ -49,6 +56,33 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes upstream source via `#[path]` — edit discipline: do not fork the
   state machine locally; upstream-shape changes go through the submodule.
+- **O ledger sobrevive ao `remove_project`; o working set nao.** `projects[]`
+  em `app-state.json` e o working set: `remove_project` poda o registro E
+  todas as sessoes debaixo dele. O ledger mora na chave irma `comet_projects`,
+  no mesmo arquivo (mesmo flock, mesma recusa de dropar chave nao modelada), e
+  `remove_project_record` enumera as tres chaves que limpa — esta nao esta
+  entre elas. Se o ledger algum dia virar filho de `projects`, o teste
+  `ledger_survives_the_pruning_that_removes_a_project` fica vermelho, e e para
+  ficar. A chave e o PATH, nunca o id: `add_project` cunha um `comet-<uuid>`
+  novo a cada entrada.
+- **`reconcile` e puro e `last_seen_at` so anda com atividade real.** Nunca
+  carimbe `now` num projeto vivo e parado: `dirty` viraria true a cada passada
+  e abrir a tela escreveria num arquivo compartilhado e travado a cada render.
+- **`git --until` ignora data malformada EM SILENCIO.** Medido: `--until=@86400`
+  e `--until=86400 +0000` sao aceitos e devolvem HEAD como se nao houvesse
+  filtro. So `@<segundos> <offset>` e ISO 8601 filtram. Qualquer mexida em
+  `project_git::commit_at` mantem
+  `a_date_before_the_first_commit_has_no_anchor`, que e a rede desse silencio.
+- **Nada de estado de git no ledger.** `is_repo`, remote, branch e commits
+  ancora sao lidos frescos por projeto SELECIONADO. `WorkersProject::git_branch`
+  nao serve de fonte: o campo e desserializado de `gitBranch`, mas o
+  `controller_host.rs` que o comet usa nunca o emite (so o host TUI emite), entao
+  pela rota `comet-local` ele e sempre `None`.
+- **`owner`/`repo` nao sao derivados aqui.** Isso e
+  `zeron_engine::parse_git_remote`, e puxar `engine` (loro, tokio, rusqlite,
+  reqwest) para dentro desta crate por um parser inflaria ate o `cargo test`
+  daqui. `project_git` devolve `remote_url`; quem consome — a UI, que ja
+  depende das duas — faz a derivacao.
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -96,7 +130,7 @@ Requires the main checkout (submodule pin not fetchable elsewhere).
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (12), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (6), `src/project_ledger.rs` (10), `src/project_git.rs` (7) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
