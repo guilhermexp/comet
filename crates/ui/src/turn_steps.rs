@@ -79,8 +79,15 @@ fn is_visible_part(part: &MessagePart) -> bool {
 fn is_unsettled_part(part: &MessagePart) -> bool {
     match part {
         MessagePart::Input { resolved, .. } => !resolved,
-        MessagePart::Tool { .. }
-        | MessagePart::Reasoning { .. }
+        // Um subagente `Running` segue avancando por conta propria depois
+        // que o turno-pai termina; dobrar esconderia trabalho ainda vivo.
+        // Um tool comum nao-resolvido ou reasoning incompleto, ao contrario,
+        // sao residuo de um turno morto e podem dobrar (ver
+        // terminated_turn_folds_activity_the_dead_run_left_unresolved).
+        MessagePart::Tool { subagent_status, .. } => {
+            *subagent_status == Some(zeron_doc::SubagentStatus::Running)
+        }
+        MessagePart::Reasoning { .. }
         | MessagePart::Text { .. }
         | MessagePart::Error { .. }
         | MessagePart::WorkflowTask { .. } => false,
@@ -380,10 +387,14 @@ mod tests {
     #[test]
     fn terminated_turn_folds_activity_the_dead_run_left_unresolved() {
         for status in [MessageStatus::Complete, MessageStatus::Aborted] {
+            // running_subagent is deliberately excluded: a subagent keeps
+            // making progress on its own after the parent turn ends, so it
+            // is not "dead run residue" the way a stalled tool call or an
+            // interrupted reasoning span is. See
+            // terminated_turn_never_folds_a_running_subagent below.
             let stalled_cases = vec![
                 tool("active-tool", exec("cargo check"), false),
                 reasoning("active-reasoning", false),
-                running_subagent("active-subagent"),
             ];
 
             for stalled in stalled_cases {
@@ -399,6 +410,23 @@ mod tests {
                 });
                 assert_eq!(plan.split_before_part, 2);
             }
+        }
+    }
+
+    #[test]
+    fn terminated_turn_never_folds_a_running_subagent() {
+        for status in [MessageStatus::Complete, MessageStatus::Aborted] {
+            let parts = vec![
+                tool("read", read("src/lib.rs"), true),
+                running_subagent("active-subagent"),
+                text("answer", "Final answer"),
+            ];
+
+            assert_eq!(
+                plan_turn_steps(&parts, Some(status)),
+                None,
+                "terminated {status:?} must keep a running subagent visible"
+            );
         }
     }
 
