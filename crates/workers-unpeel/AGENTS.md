@@ -39,6 +39,9 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   worktree e CI compilam sem nenhum passo de setup. Nao reintroduza o
   submodulo e nao tente `git submodule update`. Mudanca de forma no upstream
   agora se edita AQUI — nao ha mais para onde mandar upstream.
+  Proveniência e tree id do snapshot vivem em
+  `third_party/unpeel-upstream.toml`; alteração no vendorizado atualiza essa
+  metadata no mesmo commit.
 - **Session hosts are re-executed zeron binaries.** A Workers session runs as a
   `__session_host__` process (`unpeel_core::session_host::SESSION_HOST_ARG`)
   spawned from the current executable; `run_session_host_mode_if_requested()`

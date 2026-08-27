@@ -86,3 +86,4 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 | Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/comet` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |
+| Código externo | [`third_party/AGENTS.md`](third_party/AGENTS.md) | Unpeel vendorizado, proveniência e referências locais |
