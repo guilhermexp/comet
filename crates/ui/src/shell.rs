@@ -232,6 +232,20 @@ impl SettingsSection {
             SettingsSection::Archived => "Archived sessions",
         }
     }
+
+    fn from_capture_route(route: &str) -> Option<Self> {
+        match route {
+            "settings" | "settings/devices" => Some(Self::Devices),
+            "settings/agents" => Some(Self::Agents),
+            "settings/harnesses" => Some(Self::Harnesses),
+            "settings/appearance" => Some(Self::Appearance),
+            "settings/notifications" => Some(Self::Notifications),
+            "settings/shortcuts" => Some(Self::Shortcuts),
+            "settings/projects" => Some(Self::Projects),
+            "settings/archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
 }
 
 /// What the main outlet shows.
@@ -1626,22 +1640,21 @@ impl Shell {
         // synthetic input can't reach them on headless compositors. Gated on
         // `ZERON_UI_CAPTURE`: a normal run always boots into the chat, however
         // stale the shell's exports are.
-        let route = match crate::capture::knob("ZERON_OPEN_ROUTE").as_deref() {
-            Some("settings") | Some("settings/devices") => {
-                Route::Settings(SettingsSection::Devices)
+        let capture_route = crate::capture::knob("ZERON_OPEN_ROUTE");
+        let route = if let Some(section) = capture_route
+            .as_deref()
+            .and_then(SettingsSection::from_capture_route)
+        {
+            Route::Settings(section)
+        } else {
+            match capture_route.as_deref() {
+                // `new` pins the new-chat canvas (suppresses boot auto-select).
+                Some("new") => {
+                    state.update(cx, |s, _| s.auto_selected = true);
+                    Route::Chat
+                }
+                _ => Route::Chat,
             }
-            Some("settings/agents") => Route::Settings(SettingsSection::Agents),
-            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
-            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
-            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
-            // `new` pins the new-chat canvas (suppresses boot auto-select).
-            Some("new") => {
-                state.update(cx, |s, _| s.auto_selected = true);
-                Route::Chat
-            }
-            _ => Route::Chat,
         };
         // More capture knobs of the same kind: `ZERON_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
@@ -9853,5 +9866,13 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn projects_settings_has_a_capture_route() {
+        assert_eq!(
+            SettingsSection::from_capture_route("settings/projects"),
+            Some(SettingsSection::Projects)
+        );
     }
 }
