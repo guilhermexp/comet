@@ -5,14 +5,14 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
     WorkersSession, WorkersSessionCapabilities, controller_mcp_archive_guard,
-    controller_mcp_choose_semantic_output, controller_mcp_clean_output,
-    controller_mcp_consume_authority_marker, controller_mcp_encode_keys,
-    controller_mcp_handle_request, controller_mcp_is_briefing_screen_ready,
-    controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
-    controller_mcp_sanitize_text, controller_mcp_startup_prompt_response,
-    controller_mcp_take_parent_chat_id, controller_mcp_tracks_task_episode,
-    ensure_controller_mcp_host_launcher, is_session_host_mode, register_worker_parent_at,
-    worker_parent_links_at,
+    controller_mcp_briefing_stability_key, controller_mcp_choose_semantic_output,
+    controller_mcp_clean_output, controller_mcp_consume_authority_marker,
+    controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_is_booting_screen,
+    controller_mcp_is_briefing_screen_ready, controller_mcp_parse_launch,
+    controller_mcp_parse_launch_briefing, controller_mcp_sanitize_text,
+    controller_mcp_startup_prompt_response, controller_mcp_take_parent_chat_id,
+    controller_mcp_tracks_task_episode, ensure_controller_mcp_host_launcher, is_session_host_mode,
+    register_worker_parent_at, worker_parent_links_at,
 };
 
 #[test]
@@ -263,6 +263,55 @@ fn briefing_waits_for_a_stable_agent_prompt_and_rejects_unknown_menus() {
         "Choose setup:\n1. Continue\n2. Exit\nPress enter",
         1_000
     ));
+}
+
+#[test]
+fn a_selection_glyph_does_not_hide_a_numbered_menu() {
+    // Codex prints its update menu with the cursor glyph on the selected row.
+    // Anchoring `1.` at the start of the line missed it, and the same glyph is
+    // what the codex prompt check reads as a ready composer.
+    let menu = "Update available! 0.147.0 -> 0.150.1\n\
+                › 1. Update now\n  2. Skip\n  3. Skip until next version\n\
+                Press enter to continue";
+    assert!(!controller_mcp_is_briefing_screen_ready(
+        "codex", menu, 5_000
+    ));
+}
+
+#[test]
+fn a_booting_runtime_is_not_ready_even_with_its_prompt_painted() {
+    let booting =
+        "Starting MCP servers (2/6): codex_apps, context7, ...\n› Ask Codex to do anything";
+    assert!(controller_mcp_is_booting_screen(booting));
+    assert!(!controller_mcp_is_briefing_screen_ready(
+        "codex", booting, 5_000
+    ));
+    let booted = "codex-cli 0.150.1\n› Ask Codex to do anything";
+    assert!(!controller_mcp_is_booting_screen(booted));
+    assert!(controller_mcp_is_briefing_screen_ready(
+        "codex", booted, 400
+    ));
+}
+
+#[test]
+fn self_repainting_status_lines_do_not_restart_the_stability_window() {
+    // Each frame of the boot counter and of the `esc to interrupt` status line
+    // used to read as a screen change, so stability never reached 300ms and
+    // the entire readiness budget burned without a single ready check.
+    let first = "codex-cli 0.150.1\nStarting MCP servers (1/6): codex_apps, ...\n› Ask Codex to do anything\nWorking (1s • esc to interrupt)";
+    let later = "codex-cli 0.150.1\nStarting MCP servers (5/6): codex_apps, context7, node_repl, ...\n› Ask Codex to do anything\nWorking (7s • esc to interrupt)";
+    assert_eq!(
+        controller_mcp_briefing_stability_key(first),
+        controller_mcp_briefing_stability_key(later)
+    );
+    // Durable rows still count: filtering the status lines must not blind the
+    // window to a menu appearing.
+    assert_ne!(
+        controller_mcp_briefing_stability_key(later),
+        controller_mcp_briefing_stability_key(
+            "codex-cli 0.150.1\n› 1. Update now\nWorking (7s • esc to interrupt)"
+        )
+    );
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

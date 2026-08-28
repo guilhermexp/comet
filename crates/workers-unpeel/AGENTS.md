@@ -136,6 +136,41 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   only working move for an unregistered repo is an ancestor project, and the
   worker runs every command against the wrong tree — observed 2026-08-26, two
   workers briefed on a client repo launched in `$HOME`.
+- **A brief is delivered against a stable screen, and booting is not silence.**
+  `submit_initial_briefing` measures stability over `briefing_stability_key`,
+  never over the raw viewport: the boot counter and the `esc to interrupt`
+  status line repaint on their own clock, so raw frames restarted the 300 ms
+  window on every tick and the whole budget expired without a single ready
+  check — observed 2026-08-27, codex with six MCP servers, brief never
+  delivered. `is_booting_screen` blocks readiness because Codex paints its
+  composer glyph *while* servers boot, and every boot frame pushes the deadline
+  forward: `BRIEFING_READY_WAIT` (45 s) is an idle budget, not a total, and
+  `BRIEFING_BOOT_CEILING` (180 s) is the absolute cap.
+- **The selection glyph is stripped before a numbered menu is matched.** Codex
+  prints `› 1. Update now`, and its `Press enter to continue` footer names
+  neither a nav hint nor a cancel key, so `viewport_has_menu_prompt` does NOT
+  fire on it. Anchoring `1.` at the start of the line is therefore the only
+  thing standing between that menu and the `screen.contains('›')` prompt check
+  reading it as a ready composer.
+- **A launch that could not deliver its brief still returns Ok.** Returning
+  `Err` would orphan a live session whose id the caller never learns, so the
+  payload carries `briefing_submitted: false`, `briefing_error` and a
+  `next_action` naming the remediation. The caller owns the worker from
+  `launch_session` onward: a caller that reads only `launched` leaves it idle
+  and its next `send_text` lands in whatever the runtime happens to show — that
+  is how a brief ended up typed at a login shell on 2026-08-27. Do not "fix"
+  this by killing the session behind the caller's back.
+- **A Comet-managed hook never resolves its interpreter through `PATH`.** Codex
+  runs hooks with an environment of its own choosing and reports a hook that
+  cannot exec as `hook exited with code 127`, naming only the event — no
+  command, no trace line, nothing to attribute it to. Measured 2026-08-27: with
+  the payload on argv and a `PATH` missing `/bin`, `exec bash` in the codex
+  notify normalizer produced exactly that, three times per worker. Both codex
+  assets (`notify-normalizer.sh` and the `notify=[…]` config in
+  `command-wrapper.sh`) now name `${BASH:-/bin/bash}`, and the normalizer leaves
+  a trace breadcrumb instead of failing the turn when no interpreter exists.
+  Codex hooks deliver their payload on **stdin** (`argc=0`, measured), so any
+  new hook asset that reads `$1` must keep the `cat` fallback.
 
 ## Work Guidance
 
@@ -156,7 +191,7 @@ Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/lib.rs` (17), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (19) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/controller_mcp.rs` (24) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (8) — settings snapshot/persistence | integration | `--test settings` |

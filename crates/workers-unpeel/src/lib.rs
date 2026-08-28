@@ -216,6 +216,16 @@ pub fn controller_mcp_is_briefing_screen_ready(
 }
 
 #[doc(hidden)]
+pub fn controller_mcp_briefing_stability_key(screen: &str) -> String {
+    controller_mcp::briefing_stability_key(screen)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_is_booting_screen(screen: &str) -> bool {
+    controller_mcp::is_booting_screen(screen)
+}
+
+#[doc(hidden)]
 pub fn controller_mcp_sanitize_text(text: &str) -> String {
     controller_mcp::sanitize_text(text)
 }

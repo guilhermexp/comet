@@ -467,12 +467,19 @@ fn dispatch_action(
                 }
             }
             let mut response = json!({
-                "session_id": session_id,
+                "session_id": &session_id,
                 "launched": true,
                 "briefing_submitted": briefing.is_some() && briefing_error.is_none()
             });
             if let Some(error) = briefing_error {
                 response["briefing_error"] = error.into();
+                // A live worker with no instruction is worse than a failed
+                // launch: a caller that reads only `launched` leaves it idle,
+                // and its next send_text lands in whatever the runtime happens
+                // to be showing (observed 2026-08-27: the login shell).
+                response["next_action"] = json!(format!(
+                    "Worker {session_id} is live WITHOUT its brief. Deliver it with send_text_to_worker or call stop_worker; do not treat this launch as done."
+                ));
             }
             Ok(response)
         }
@@ -643,8 +650,11 @@ fn capture_process_baseline(session_id: &str) -> Result<Vec<(u32, u64)>, String>
 
 /// How long a just-created worker gets to publish its manifest.
 const MANIFEST_WAIT: Duration = Duration::from_secs(5);
-/// How long the agent prompt gets to become ready once the manifest exists.
-const BRIEFING_READY_WAIT: Duration = Duration::from_secs(8);
+/// How long the agent prompt gets to become ready, measured from the manifest
+/// or from the last observed boot progress, whichever is later.
+const BRIEFING_READY_WAIT: Duration = Duration::from_secs(45);
+/// Absolute ceiling on that wait, however long the runtime keeps booting.
+const BRIEFING_BOOT_CEILING: Duration = Duration::from_secs(180);
 
 /// Poll until the session host has published this worker's manifest, and
 /// return the runtime that owns its prompt.
@@ -674,23 +684,37 @@ fn submit_initial_briefing(
     // start the readiness deadline: otherwise the whole budget can burn before
     // the runtime even exists and the brief is silently never delivered.
     let runtime = wait_for_session_runtime(session_id, MANIFEST_WAIT)?;
-    let deadline = Instant::now() + BRIEFING_READY_WAIT;
-    let mut last_screen = String::new();
+    let started = Instant::now();
+    let mut deadline = started + BRIEFING_READY_WAIT;
+    let mut last_key = String::new();
     let mut stable_since = Instant::now();
     loop {
         if let Some(screen) = current_screen_text(session_id) {
-            if screen != last_screen {
-                last_screen = screen.clone();
+            // Boot progress and the animated status line repaint on their own
+            // clock. Comparing raw frames restarts the stability window on
+            // every tick, so an agent that renders a spinner never looks
+            // stable and the whole budget burns without one ready check.
+            let key = briefing_stability_key(&screen);
+            if key != last_key {
+                last_key = key;
                 stable_since = Instant::now();
             }
             if let Some(response) = startup_prompt_response(&screen) {
                 client
                     .write(session_id, &response)
                     .map_err(|error| error.to_string())?;
-                last_screen.clear();
+                last_key.clear();
                 stable_since = Instant::now();
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
+            }
+            // Booting is progress, not silence: a runtime with several MCP
+            // servers legitimately needs longer than the idle budget, and
+            // timing out here hands the caller a live worker with no brief.
+            if is_booting_screen(&screen) {
+                deadline = deadline
+                    .max(Instant::now() + BRIEFING_READY_WAIT)
+                    .min(started + BRIEFING_BOOT_CEILING);
             }
             if !is_briefing_screen_ready(
                 &runtime,
@@ -767,15 +791,53 @@ pub fn tracks_task_episode(parent_chat_id: Option<&str>, submit: bool) -> bool {
     submit && parent_chat_id.is_some_and(|parent| !parent.trim().is_empty())
 }
 
+/// Screen lines that repaint on their own clock. They carry no readiness
+/// signal, and counting them as screen changes restarts the stability window
+/// on every frame.
+fn is_volatile_status_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.contains("esc to interrupt")
+        || lower.contains("tab to queue")
+        || lower.contains("mcp server")
+}
+
+/// The comparable part of a frame: everything a repaint cannot change on its
+/// own. Prompt stability is measured over this, never over the raw viewport.
+pub fn briefing_stability_key(screen: &str) -> String {
+    screen
+        .lines()
+        .filter(|line| !is_volatile_status_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The runtime is still wiring itself up. Codex paints its composer — prompt
+/// glyph included — while MCP servers are still booting, so this has to block
+/// readiness, not merely extend the deadline.
+pub fn is_booting_screen(screen: &str) -> bool {
+    let lower = screen.to_ascii_lowercase();
+    [
+        "starting mcp server",
+        "booting mcp server",
+        "connecting to mcp server",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 pub fn is_briefing_screen_ready(runtime: &str, screen: &str, stable_for_ms: u64) -> bool {
     let lower = screen.to_ascii_lowercase();
-    let numbered_menu = lower.contains("press enter")
-        && lower
-            .lines()
-            .any(|line| line.trim_start().starts_with("1."))
-        && lower
-            .lines()
-            .any(|line| line.trim_start().starts_with("2."));
+    // The selected row of a Codex menu carries its cursor glyph, so anchoring
+    // `1.` at the start of the line misses the exact menu whose glyph the
+    // prompt check would otherwise read as a ready composer.
+    let menu_option = |option: &str| {
+        lower.lines().any(|line| {
+            line.trim_start()
+                .trim_start_matches(|c: char| matches!(c, '›' | '❯' | '>' | '*' | '•' | '-' | ' '))
+                .starts_with(option)
+        })
+    };
+    let numbered_menu = lower.contains("press enter") && menu_option("1.") && menu_option("2.");
     let prompt_glyph = screen.contains('❯')
         || screen.contains('›')
         || screen.lines().any(|line| matches!(line.trim(), ">" | "> "));
@@ -802,6 +864,7 @@ pub fn is_briefing_screen_ready(runtime: &str, screen: &str, stable_for_ms: u64)
     stable_for_ms >= 300
         && !screen.trim().is_empty()
         && !numbered_menu
+        && !is_booting_screen(screen)
         && !unpeel_core::menu_prompt::viewport_has_menu_prompt(screen)
         && prompt_visible
 }

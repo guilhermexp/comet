@@ -28,4 +28,17 @@ fi
 if ! printf '%s' "$INPUT" | grep -q '"hook_event_name"[[:space:]]*:'; then
   INPUT=$(printf '%s' "$INPUT" | sed "1s/^[[:space:]]*{/&\"hook_event_name\":\"$EVENT_TYPE\",/")
 fi
-exec bash "{{NOTIFY_PATH}}" "$INPUT"
+# Codex spawns hooks with an environment of its own choosing, and a PATH lookup
+# for the interpreter here surfaces as a bare `hook exited with code 127` with
+# nothing in the trace to name the hook that died. `$BASH` is this script's own
+# interpreter (the shebang is absolute), so the transport is always reached the
+# same way; a hook that still cannot run leaves evidence instead of failing the
+# agent's turn.
+NOTIFY_BASH="${BASH:-/bin/bash}"
+if [ ! -x "$NOTIFY_BASH" ]; then
+  printf 'codex-notify-hook: no usable bash interpreter (BASH=%s PATH=%s)\n' \
+    "${BASH:-}" "$PATH" \
+    >> "${UNPEEL_HOOK_TRACE_FILE:-$HOME/.zeron/workers/hooks/trace.log}" 2>/dev/null || true
+  exit 0
+fi
+exec "$NOTIFY_BASH" "{{NOTIFY_PATH}}" "$INPUT"

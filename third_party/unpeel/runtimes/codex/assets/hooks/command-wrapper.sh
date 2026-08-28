@@ -57,4 +57,9 @@ if [ "${UNPEEL_WAIT_FOR_ATTACH:-}" = "1" ] && [ -n "${UNPEEL_SESSION_DIR:-}" ]; 
   done
 fi
 
-exec "$REAL_BIN" "${UNPEEL_MCP_ARGS[@]}" -c "notify=[\"bash\",\"$UNPEEL_CODEX_NOTIFY_PATH\"]" "$@"
+# Codex spawns the notify callback itself, with its own environment, so name the
+# interpreter absolutely: a PATH lookup there dies as an unattributable 127,
+# exactly like the hook path in notify-normalizer.sh.
+UNPEEL_NOTIFY_BASH="${BASH:-/bin/bash}"
+exec "$REAL_BIN" "${UNPEEL_MCP_ARGS[@]}" \
+  -c "notify=[\"$UNPEEL_NOTIFY_BASH\",\"$UNPEEL_CODEX_NOTIFY_PATH\"]" "$@"
