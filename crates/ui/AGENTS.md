@@ -106,8 +106,10 @@ Subárvores sem doc próprio (ainda não têm regra local além da desta pasta):
   `github.com`.
 - **Config/Worktree são editor, não resumo.** Target suportado + listas shared,
   Unix e Windows normalizam linhas vazias/comentários e só gravam quando o
-  conteúdo ou target mudou. Ícone usa SHA-256 do path, é carregado fora do
-  render e reset/forget só podem remover filho direto do diretório app-owned.
+  conteúdo ou target mudou. Saves são serializados; enquanto um está em voo,
+  a fila preserva o draft mais novo por projeto e só avança o baseline depois
+  da persistência correspondente. Ícone usa SHA-256 do path, é carregado fora
+  do render e reset/forget só podem remover filho direto do diretório app-owned.
 - **Falha de setup e sucesso parcial visível.** O worktree criado continua
   selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
   ao refresh seguinte e nenhum Worker é lançado automaticamente nele.

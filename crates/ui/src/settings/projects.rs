@@ -17,7 +17,7 @@ use gpui::{
     Window, div, img, prelude::*, px,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -127,6 +127,156 @@ fn config_save_matches_selection(saved_path: &str, selected: Option<&str>) -> bo
     selected == Some(saved_path)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigWriteRequest {
+    project_path: String,
+    config: WorktreeConfig,
+    target: ConfigTarget,
+    previous_target: ConfigTarget,
+}
+
+#[derive(Debug, Default)]
+struct ConfigWriteScheduler {
+    active: Option<ConfigWriteRequest>,
+    pending: VecDeque<ConfigWriteRequest>,
+    drafts: HashMap<String, ConfigWriteRequest>,
+    failed: HashMap<String, String>,
+}
+
+impl ConfigWriteScheduler {
+    fn schedule(&mut self, mut request: ConfigWriteRequest) {
+        let project_path = request.project_path.clone();
+        let mut replaced = false;
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.project_path == request.project_path)
+        {
+            request.previous_target = pending.previous_target;
+            *pending = request.clone();
+            replaced = true;
+        }
+        if !replaced {
+            if let Some(active) = self
+                .active
+                .as_ref()
+                .filter(|active| active.project_path == request.project_path)
+            {
+                request.previous_target = active.target;
+            }
+            self.pending.push_back(request.clone());
+        }
+        self.failed.remove(&project_path);
+        self.drafts.insert(project_path, request);
+    }
+
+    fn latest_in_flight_for(&self, project_path: &str) -> Option<&ConfigWriteRequest> {
+        self.pending
+            .iter()
+            .rev()
+            .find(|pending| pending.project_path == project_path)
+            .or_else(|| {
+                self.active
+                    .as_ref()
+                    .filter(|active| active.project_path == project_path)
+            })
+    }
+
+    fn draft_for(&self, project_path: &str) -> Option<&ConfigWriteRequest> {
+        self.drafts.get(project_path)
+    }
+
+    fn error_for(&self, project_path: &str) -> Option<&str> {
+        self.failed.get(project_path).map(String::as_str)
+    }
+
+    fn start_next(&mut self) -> Option<ConfigWriteRequest> {
+        if self.active.is_some() {
+            return None;
+        }
+        let request = self.pending.pop_front()?;
+        self.active = Some(request.clone());
+        Some(request)
+    }
+
+    fn finish_success(&mut self, completed: &ConfigWriteRequest) {
+        if self.active.as_ref() == Some(completed) {
+            self.active = None;
+        }
+        if self.drafts.get(&completed.project_path) == Some(completed) {
+            self.failed.remove(&completed.project_path);
+        }
+    }
+
+    fn finish_failure(&mut self, completed: &ConfigWriteRequest, error: String) {
+        if self.active.as_ref() == Some(completed) {
+            self.active = None;
+        }
+        if self.drafts.get(&completed.project_path) == Some(completed) {
+            self.failed.insert(completed.project_path.clone(), error);
+        }
+    }
+
+    fn has_pending_for(&self, project_path: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.project_path == project_path)
+    }
+
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.active.is_none() && self.pending.is_empty()
+    }
+}
+
+fn persist_config_write(request: &ConfigWriteRequest) -> Result<PathBuf, String> {
+    let project_path = PathBuf::from(&request.project_path);
+    let previous_target = worktree_config::detect(&project_path)
+        .map(|detected| detected.target)
+        .unwrap_or(request.previous_target);
+    worktree_config::save_selected(
+        &project_path,
+        &request.config,
+        request.target,
+        previous_target,
+    )
+}
+
+fn config_baseline_after_write(
+    request: &ConfigWriteRequest,
+    selected: Option<&str>,
+) -> Option<(WorktreeConfig, ConfigTarget)> {
+    config_save_matches_selection(&request.project_path, selected)
+        .then(|| (request.config.clone(), request.target))
+}
+
+fn config_state_for_detail(
+    disk_config: WorktreeConfig,
+    disk_target: ConfigTarget,
+    draft: Option<&ConfigWriteRequest>,
+) -> (WorktreeConfig, ConfigTarget) {
+    draft
+        .map(|draft| (draft.config.clone(), draft.target))
+        .unwrap_or((disk_config, disk_target))
+}
+
+fn config_write_previous_target_if_required(
+    scheduler: &ConfigWriteScheduler,
+    project_path: &str,
+    saved: &WorktreeConfig,
+    saved_target: ConfigTarget,
+    edited: &WorktreeConfig,
+    edited_target: ConfigTarget,
+) -> Option<ConfigTarget> {
+    let (effective_config, effective_target) = scheduler
+        .latest_in_flight_for(project_path)
+        .map(|request| (&request.config, request.target))
+        .unwrap_or((saved, saved_target));
+    (scheduler.error_for(project_path).is_some()
+        || config_edit_required(effective_config, effective_target, edited, edited_target))
+    .then_some(effective_target)
+}
+
 fn project_icon_filename(project_path: &str, extension: &str) -> String {
     let digest = Sha256::digest(project_path.as_bytes());
     format!(
@@ -215,6 +365,7 @@ pub struct ProjectsPage {
     detail_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     config_write_task: Option<Task<()>>,
+    config_writes: ConfigWriteScheduler,
     _events: Vec<Subscription>,
 }
 
@@ -284,6 +435,7 @@ impl ProjectsPage {
             detail_task: None,
             action_task: None,
             config_write_task: None,
+            config_writes: ConfigWriteScheduler::default(),
             _events: events,
         };
         page.reload(cx);
@@ -344,12 +496,13 @@ impl ProjectsPage {
         self.confirm_forget = false;
         let added = row.added_at_unix_ms;
         let opened = row.last_opened_at_unix_ms;
-        let path = row.path.clone();
+        let selected_path = row.path.clone();
+        let detail_path = selected_path.clone();
         self.detail_task = Some(cx.spawn(async move |this, cx| {
             let resolved = cx
                 .background_executor()
                 .spawn(async move {
-                    let folder = PathBuf::from(&path);
+                    let folder = PathBuf::from(&detail_path);
                     let exists = folder.is_dir();
                     let git = project_git::status(&folder);
                     let detected = worktree_config::detect(&folder);
@@ -375,6 +528,17 @@ impl ProjectsPage {
                 })
                 .await;
             this.update(cx, |page, cx| {
+                if page.selected.as_deref() != Some(selected_path.as_str()) {
+                    return;
+                }
+                let mut resolved = resolved;
+                let (config, target) = config_state_for_detail(
+                    resolved.config,
+                    resolved.config_target,
+                    page.config_writes.draft_for(&selected_path),
+                );
+                resolved.config = config;
+                resolved.config_target = target;
                 page.config_target = resolved.config_target;
                 page.config_baseline = Some((resolved.config.clone(), resolved.config_target));
                 let shared = resolved.config.shared.join("\n");
@@ -465,44 +629,59 @@ impl ProjectsPage {
         };
         let edited = self.edited_config(cx);
         let target = self.config_target;
-        if !config_edit_required(&saved, saved_target, &edited, target) {
+        let Some(previous_target) = config_write_previous_target_if_required(
+            &self.config_writes,
+            &row.path,
+            &saved,
+            saved_target,
+            &edited,
+            target,
+        ) else {
             return;
-        }
-        let project_path_string = row.path;
-        let project_path = PathBuf::from(&project_path_string);
-        let write_config = edited.clone();
+        };
         self.notice = None;
         self.error = None;
+        self.config_writes.schedule(ConfigWriteRequest {
+            project_path: row.path,
+            config: edited,
+            target,
+            previous_target,
+        });
+        self.start_next_config_write(cx);
+    }
+
+    fn start_next_config_write(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.config_writes.start_next() else {
+            return;
+        };
+        let write_request = request.clone();
         self.config_write_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    worktree_config::save_selected(
-                        &project_path,
-                        &write_config,
-                        target,
-                        saved_target,
-                    )
-                })
+                .spawn(async move { persist_config_write(&write_request) })
                 .await;
             this.update(cx, |page, cx| {
                 match result {
                     Ok(_) => {
-                        if config_save_matches_selection(
-                            &project_path_string,
-                            page.selected.as_deref(),
-                        ) {
-                            page.config_baseline = Some((edited.clone(), target));
+                        page.config_writes.finish_success(&request);
+                        if let Some(baseline) =
+                            config_baseline_after_write(&request, page.selected.as_deref())
+                        {
+                            page.config_baseline = Some(baseline);
                             if let Some(detail) = page.detail.as_mut() {
-                                detail.config = edited;
-                                detail.config_target = target;
+                                detail.config = request.config.clone();
+                                detail.config_target = request.target;
                             }
-                            page.notice = Some(SharedString::from("Worktree config saved"));
+                            page.error = None;
+                            if !page.config_writes.has_pending_for(&request.project_path) {
+                                page.notice = Some(SharedString::from("Worktree config saved"));
+                            }
                         }
                     }
-                    Err(error) => page.error = Some(SharedString::from(error)),
+                    Err(error) => page.config_writes.finish_failure(&request, error),
                 }
                 page.config_write_task = None;
+                page.start_next_config_write(cx);
                 cx.notify();
             })
             .ok();
@@ -844,6 +1023,10 @@ impl ProjectsPage {
         };
         let detail = self.detail.clone().unwrap_or_default();
         let live = row.is_live();
+        let config_error = self
+            .config_writes
+            .error_for(&row.path)
+            .map(|error| SharedString::from(error.to_owned()));
 
         div()
             .flex_1()
@@ -853,7 +1036,7 @@ impl ProjectsPage {
             .child(
                 widgets::page_column()
                     .child(widgets::page_header(theme, "General", None))
-                    .when_some(self.error.clone(), |el, message| {
+                    .when_some(self.error.clone().or(config_error), |el, message| {
                         el.child(widgets::error_strip(theme, message))
                     })
                     .when_some(self.notice.clone(), |el, message| {
@@ -1602,6 +1785,136 @@ mod tests {
         assert!(config_save_matches_selection("/tmp/a", Some("/tmp/a")));
         assert!(!config_save_matches_selection("/tmp/a", Some("/tmp/b")));
         assert!(!config_save_matches_selection("/tmp/a", None));
+    }
+
+    /// Um save A em voo nao pode ser cancelado nem ganhar de B/C. A fila roda
+    /// um por vez e preserva apenas o draft mais novo de cada projeto.
+    #[test]
+    fn concurrent_config_saves_finish_with_latest_disk_and_baseline_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().display().to_string();
+        let request = |command: &str, target| ConfigWriteRequest {
+            project_path: path.clone(),
+            config: WorktreeConfig {
+                shared: vec![command.to_owned()],
+                ..WorktreeConfig::default()
+            },
+            target,
+            previous_target: ConfigTarget::Comet,
+        };
+        let first = request("first", ConfigTarget::Comet);
+        let superseded = request("superseded", ConfigTarget::Comet);
+        let latest = request("latest", ConfigTarget::Cursor);
+        let mut scheduler = ConfigWriteScheduler::default();
+
+        scheduler.schedule(first.clone());
+        assert_eq!(scheduler.start_next(), Some(first.clone()));
+        scheduler.schedule(superseded);
+        scheduler.schedule(latest.clone());
+        assert_eq!(scheduler.start_next(), None, "first continua em voo");
+
+        persist_config_write(&first).unwrap();
+        scheduler.finish_success(&first);
+        assert_eq!(scheduler.start_next(), Some(latest.clone()));
+        persist_config_write(&latest).unwrap();
+        scheduler.finish_success(&latest);
+
+        let detected = worktree_config::detect(dir.path()).unwrap();
+        assert_eq!(detected.target, ConfigTarget::Cursor);
+        assert_eq!(detected.config, latest.config);
+        assert_eq!(
+            config_baseline_after_write(&latest, Some(&path)),
+            Some((latest.config.clone(), ConfigTarget::Cursor))
+        );
+        assert!(scheduler.is_idle());
+    }
+
+    #[test]
+    fn detail_load_prefers_the_project_draft_across_navigation() {
+        let path = "/tmp/project-a".to_owned();
+        let draft = ConfigWriteRequest {
+            project_path: path.clone(),
+            config: WorktreeConfig {
+                shared: vec!["latest".to_owned()],
+                ..WorktreeConfig::default()
+            },
+            target: ConfigTarget::Cursor,
+            previous_target: ConfigTarget::Comet,
+        };
+        let old_disk = WorktreeConfig {
+            shared: vec!["old".to_owned()],
+            ..WorktreeConfig::default()
+        };
+        let mut scheduler = ConfigWriteScheduler::default();
+        scheduler.schedule(draft.clone());
+        assert_eq!(scheduler.start_next(), Some(draft.clone()));
+
+        assert_eq!(
+            config_state_for_detail(
+                old_disk.clone(),
+                ConfigTarget::Comet,
+                scheduler.draft_for(&path),
+            ),
+            (draft.config.clone(), ConfigTarget::Cursor),
+            "voltar durante o save nao reaplica o snapshot antigo"
+        );
+        scheduler.finish_success(&draft);
+        assert_eq!(
+            config_state_for_detail(
+                old_disk.clone(),
+                ConfigTarget::Comet,
+                scheduler.draft_for(&path),
+            ),
+            (draft.config, ConfigTarget::Cursor),
+            "um load que terminou tarde ainda prefere o draft confirmado"
+        );
+        assert_eq!(
+            config_state_for_detail(old_disk.clone(), ConfigTarget::Comet, None),
+            (old_disk, ConfigTarget::Comet),
+            "outro projeto continua lendo o proprio disco"
+        );
+    }
+
+    #[test]
+    fn failed_config_draft_is_scoped_and_can_retry_unchanged() {
+        let path = "/tmp/project-a".to_owned();
+        let failed = ConfigWriteRequest {
+            project_path: path.clone(),
+            config: WorktreeConfig {
+                shared: vec!["retry me".to_owned()],
+                ..WorktreeConfig::default()
+            },
+            target: ConfigTarget::Comet,
+            previous_target: ConfigTarget::Comet,
+        };
+        let mut scheduler = ConfigWriteScheduler::default();
+        scheduler.schedule(failed.clone());
+        assert_eq!(scheduler.start_next(), Some(failed.clone()));
+        scheduler.finish_failure(&failed, "permission denied".to_owned());
+
+        assert_eq!(scheduler.error_for(&path), Some("permission denied"));
+        assert_eq!(scheduler.error_for("/tmp/project-b"), None);
+        assert_eq!(scheduler.draft_for(&path), Some(&failed));
+        assert_eq!(
+            config_write_previous_target_if_required(
+                &scheduler,
+                &path,
+                &failed.config,
+                failed.target,
+                &failed.config,
+                failed.target,
+            ),
+            Some(ConfigTarget::Comet),
+            "Save deve reenfileirar o mesmo draft depois de falhar",
+        );
+
+        scheduler.schedule(failed.clone());
+        assert_eq!(
+            scheduler.error_for(&path),
+            None,
+            "retry limpa o erro em tela"
+        );
+        assert_eq!(scheduler.start_next(), Some(failed));
     }
 
     #[test]

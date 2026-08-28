@@ -8,7 +8,7 @@
 | F2 | C6-C9 | §3 | F1 | pending | — | Projects section lists every recorded project; General card complete | human-driven |
 | F3 | C10-C11 | §4 | F2 | pending | — | Repository row with its three states and both actions | human-driven |
 | F4 | C12-C16 | §5, §6 | F3 | pending | — | Worktree config written AND executed; Auto Doc Run; forget | human-driven |
-| F5 | C17-C24 | correções de review | F4 | pending | — | Contratos reais de ledger, editor, ícone, setup e navegação | human-driven |
+| F5 | C17-C26 | correções de review | F4 | pending | — | Contratos reais de ledger, editor, ícone, setup e navegação | human-driven |
 
 ## 1. The ledger
 
@@ -69,3 +69,4 @@
 - [ ] C23 Atualizar DOX, rodar suites completas das duas crates e concluir UAT visual de Projects/setup antes do archive. files: `crates/{workers-unpeel,ui}/AGENTS.md`. verify: `cargo test -p zeron-workers-unpeel` + `cargo test -p zeron-ui` + `cargo fmt --all --check`.
 - [x] C24 Tratar `Interrupted` como accept transitório no hook ingress para que sinais de filhos do setup não derrubem o listener. files: `crates/workers-unpeel/src/session_event_journal.rs`. verify: `cargo test -p zeron-workers-unpeel session_event_journal` + suite completa paralela.
 - [x] C25 Expor `settings/projects` no parser de `ZERON_OPEN_ROUTE`, com regressão unitária, para que a nova seção continue alcançável pelo QA nativo isolado. files: `crates/ui/src/shell.rs`, `crates/ui/AGENTS.md`. verify: `cargo test -p zeron-ui projects_settings_has_a_capture_route --lib` + captura visual assinada.
+- [x] C26 Serializar saves de Config e coalescer o draft mais novo por projeto, sem substituir o handle em voo nem avançar baseline antes do write correspondente. files: `crates/ui/src/settings/projects.rs`, `crates/ui/AGENTS.md`. verify: `cargo test -p zeron-ui concurrent_config_saves_finish_with_latest_disk_and_baseline_state --lib`.
