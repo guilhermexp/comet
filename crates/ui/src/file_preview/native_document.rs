@@ -124,12 +124,17 @@ fn navigation_delegate() -> *mut Object {
     }
 }
 
-unsafe fn isolated_view(allow_file: bool) -> Option<NativeDocumentView> {
+/// `media_controls` flips the legacy `javaScriptEnabled` switch, which is what
+/// WebKit's built-in media controls run on — measured 2026-08-27: with it off, a
+/// video document paints a dead control bar (spinner, `--:--`, no play button)
+/// and the frame collapses into a corner. Page-level scripting stays off either
+/// way, so a previewed document still cannot run its own code.
+unsafe fn isolated_view(allow_file: bool, media_controls: bool) -> Option<NativeDocumentView> {
     let configuration: *mut Object = msg_send![class!(WKWebViewConfiguration), new];
     let data_store: *mut Object = msg_send![class!(WKWebsiteDataStore), nonPersistentDataStore];
     let _: () = msg_send![configuration, setWebsiteDataStore: data_store];
     let preferences: *mut Object = msg_send![configuration, preferences];
-    let _: () = msg_send![preferences, setJavaScriptEnabled: NO];
+    let _: () = msg_send![preferences, setJavaScriptEnabled: if media_controls { YES } else { NO }];
     let page_preferences: *mut Object = msg_send![configuration, defaultWebpagePreferences];
     if !page_preferences.is_null() {
         let _: () = msg_send![page_preferences, setAllowsContentJavaScript: NO];
@@ -161,7 +166,7 @@ unsafe fn isolated_view(allow_file: bool) -> Option<NativeDocumentView> {
 impl NativeDocumentView {
     pub fn open_html(document: &str) -> Option<Self> {
         unsafe {
-            let view = isolated_view(false)?;
+            let view = isolated_view(false, false)?;
             let document = ns_string(document);
             let base_url: *mut Object = std::ptr::null_mut();
             let _: *mut Object = msg_send![view.view, loadHTMLString: document baseURL: base_url];
@@ -170,8 +175,16 @@ impl NativeDocumentView {
     }
 
     pub fn open_pdf(path: &Path) -> Option<Self> {
+        Self::open_file(path, false)
+    }
+
+    pub fn open_video(path: &Path) -> Option<Self> {
+        Self::open_file(path, true)
+    }
+
+    fn open_file(path: &Path, media_controls: bool) -> Option<Self> {
         unsafe {
-            let view = isolated_view(true)?;
+            let view = isolated_view(true, media_controls)?;
             let path_string = ns_string(path.to_string_lossy().as_ref());
             let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: path_string];
             let _: *mut Object =

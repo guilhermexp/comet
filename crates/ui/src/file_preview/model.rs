@@ -7,6 +7,7 @@ pub enum PreviewKind {
     Html,
     Image,
     Pdf,
+    Video,
     Data,
     Unsupported,
 }
@@ -37,6 +38,9 @@ pub fn classify_preview_kind(path: &str) -> PreviewKind {
         "html" | "htm" => PreviewKind::Html,
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => PreviewKind::Image,
         "pdf" => PreviewKind::Pdf,
+        // WebKit renders these as a media document with its own player; see
+        // the Video arm in `load_preview` for why they skip the byte cap.
+        "mp4" | "mov" | "m4v" | "webm" => PreviewKind::Video,
         "csv" | "tsv" | "xls" | "xlsx" => PreviewKind::Data,
         "rs" | "js" | "jsx" | "ts" | "tsx" | "py" | "go" | "json" | "jsonc" | "sh" | "bash"
         | "zsh" | "toml" | "css" | "scss" | "yaml" | "yml" | "c" | "h" | "cpp" | "cc" | "cxx"
@@ -121,6 +125,12 @@ mod tests {
         assert_eq!(classify_preview_kind("report.html"), PreviewKind::Html);
         assert_eq!(classify_preview_kind("photo.png"), PreviewKind::Image);
         assert_eq!(classify_preview_kind("manual.pdf"), PreviewKind::Pdf);
+        assert_eq!(classify_preview_kind("demo.mp4"), PreviewKind::Video);
+        assert_eq!(
+            classify_preview_kind("Screen Recording.mov"),
+            PreviewKind::Video
+        );
+        assert_eq!(classify_preview_kind("clip.webm"), PreviewKind::Video);
         assert_eq!(classify_preview_kind("data.csv"), PreviewKind::Data);
         assert_eq!(classify_preview_kind("book.xlsx"), PreviewKind::Data);
         assert_eq!(

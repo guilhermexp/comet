@@ -24,6 +24,7 @@ pub enum LoadedPreview {
     Html(Arc<str>),
     Image(Arc<Image>),
     Pdf,
+    Video,
     Table(Arc<[Vec<SharedString>]>),
     Unsupported,
 }
@@ -94,6 +95,12 @@ pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, 
     let kind = classify_preview_kind(path.to_string_lossy().as_ref());
     if kind == PreviewKind::Unsupported {
         return Ok(LoadedPreview::Unsupported);
+    }
+    // A video is never read into memory: WebKit streams it off disk, so the
+    // binary byte cap below does not apply. Capping it would reject the
+    // ordinary case — a screen recording is routinely hundreds of megabytes.
+    if kind == PreviewKind::Video {
+        return Ok(LoadedPreview::Video);
     }
     let metadata = fs::metadata(&path).map_err(|error| PreviewLoadError::Io(error.to_string()))?;
     let binary = matches!(kind, PreviewKind::Image | PreviewKind::Pdf)
@@ -171,7 +178,7 @@ pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, 
                     .into(),
             ))
         }
-        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Unsupported => {
+        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video | PreviewKind::Unsupported => {
             Ok(LoadedPreview::Unsupported)
         }
     }
@@ -235,6 +242,22 @@ mod tests {
         assert!(matches!(
             load_preview(temp.path(), Path::new("large.txt")),
             Err(PreviewLoadError::TooLarge)
+        ));
+    }
+
+    /// A screen recording is routinely larger than the binary cap, and nothing
+    /// reads it: the cap must not reach the video arm, or the ordinary case is
+    /// the rejected one.
+    #[test]
+    fn a_video_past_the_binary_cap_is_still_previewable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recording.mov");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        drop(file);
+        assert!(matches!(
+            load_preview(temp.path(), Path::new("recording.mov")).unwrap(),
+            LoadedPreview::Video
         ));
     }
 

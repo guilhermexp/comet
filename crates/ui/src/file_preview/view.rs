@@ -25,6 +25,15 @@ enum PreviewLoadState {
     Error(SharedString),
 }
 
+/// What the native host is being asked to paint. HTML arrives as a sanitized
+/// string; PDF and video are loaded straight off disk by WebKit.
+#[derive(Clone, Copy)]
+enum NativeSource<'a> {
+    Html(&'a str),
+    Pdf,
+    Video,
+}
+
 #[derive(Debug, Clone)]
 pub enum FilePreviewEvent {
     ActiveChanged {
@@ -373,11 +382,14 @@ impl FilePreview {
                 render_code(&path, lines, highlights, theme)
             }
             PreviewLoadState::Ready(LoadedPreview::Html(document)) => {
-                self.render_native_document(window, theme, Some(document.as_ref()))
+                self.render_native_document(window, theme, NativeSource::Html(document.as_ref()))
             }
             PreviewLoadState::Ready(LoadedPreview::Image(image)) => render_image(image, theme),
             PreviewLoadState::Ready(LoadedPreview::Pdf) => {
-                self.render_native_document(window, theme, None)
+                self.render_native_document(window, theme, NativeSource::Pdf)
+            }
+            PreviewLoadState::Ready(LoadedPreview::Video) => {
+                self.render_native_document(window, theme, NativeSource::Video)
             }
             PreviewLoadState::Ready(LoadedPreview::Table(rows)) => render_data(&path, rows, theme),
         }
@@ -394,7 +406,7 @@ impl FilePreview {
         &mut self,
         window: &Window,
         theme: &Theme,
-        html: Option<&str>,
+        source: NativeSource<'_>,
     ) -> AnyElement {
         #[cfg(target_os = "macos")]
         {
@@ -414,11 +426,16 @@ impl FilePreview {
                 .is_none_or(|(path, _)| path != &absolute);
             if needs_new {
                 self.clear_native_document();
-                let view = match html {
-                    Some(document) => {
+                let view = match source {
+                    NativeSource::Html(document) => {
                         super::native_document::NativeDocumentView::open_html(document)
                     }
-                    None => super::native_document::NativeDocumentView::open_pdf(&absolute),
+                    NativeSource::Pdf => {
+                        super::native_document::NativeDocumentView::open_pdf(&absolute)
+                    }
+                    NativeSource::Video => {
+                        super::native_document::NativeDocumentView::open_video(&absolute)
+                    }
                 };
                 let Some(view) = view else {
                     return centered_message("The native preview could not be opened.", theme);
