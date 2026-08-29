@@ -2769,6 +2769,13 @@ pub struct Transcript {
     user_message_preview: Option<UserMessagePreview>,
     /// Focused while the full-message overlay is open so Escape reaches it.
     user_message_preview_focus: gpui::FocusHandle,
+    mermaid_preview: Option<crate::mermaid_preview::MermaidPreview>,
+    mermaid_preview_focus: gpui::FocusHandle,
+    mermaid_preview_zoom: f32,
+    mermaid_preview_pan: gpui::Point<gpui::Pixels>,
+    mermaid_scroll_handles: HashMap<SharedString, gpui::ScrollHandle>,
+    mermaid_copied_svg: Option<Instant>,
+    mermaid_copied_code: Option<Instant>,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
     /// source; results land in the global attachment cache.
     attachment_loads: HashMap<(String, String), Task<()>>,
@@ -2862,6 +2869,7 @@ enum MermaidLoad {
         width: f32,
         height: f32,
         bytes: usize,
+        svg: String,
         used_at: u64,
     },
 }
@@ -2874,6 +2882,7 @@ enum MermaidSnapshot {
         image: Arc<gpui::Image>,
         width: f32,
         height: f32,
+        svg: String,
     },
 }
 
@@ -3032,6 +3041,13 @@ impl Transcript {
             user_message_overflow: HashMap::new(),
             user_message_preview: None,
             user_message_preview_focus: cx.focus_handle(),
+            mermaid_preview: None,
+            mermaid_preview_focus: cx.focus_handle(),
+            mermaid_preview_zoom: 1.0,
+            mermaid_preview_pan: gpui::point(px(0.0), px(0.0)),
+            mermaid_scroll_handles: HashMap::new(),
+            mermaid_copied_svg: None,
+            mermaid_copied_code: None,
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -6407,10 +6423,18 @@ impl Transcript {
     fn mermaid_snapshot(
         &mut self,
         source: &str,
-        dark: bool,
+        theme: &Theme,
         cx: &mut Context<Self>,
     ) -> MermaidSnapshot {
-        let key = format!("{}\0{source}", if dark { "dark" } else { "light" });
+        let colors = crate::inline_media::MermaidColors::from_theme(theme);
+        let key = format!(
+            "{}\0{source}",
+            if theme.appearance.is_dark() {
+                "dark"
+            } else {
+                "light"
+            }
+        );
         let used_at = self.next_media_use();
         match self.mermaid.get_mut(&key) {
             Some(MermaidLoad::Loading(_)) => return MermaidSnapshot::Loading,
@@ -6422,6 +6446,7 @@ impl Transcript {
                 image,
                 width,
                 height,
+                svg,
                 used_at: stamp,
                 ..
             }) => {
@@ -6430,6 +6455,7 @@ impl Transcript {
                     image: image.clone(),
                     width: *width,
                     height: *height,
+                    svg: svg.clone(),
                 };
             }
             None => {}
@@ -6469,7 +6495,7 @@ impl Transcript {
                 .background_executor()
                 .spawn(async move {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::inline_media::render_mermaid_svg(&render_source, dark)
+                        crate::inline_media::render_mermaid_svg(&render_source, &colors)
                     }))
                     .unwrap_or_else(|_| Err("diagram renderer failed".into()))
                 })
@@ -6494,6 +6520,7 @@ impl Transcript {
                             width: rendered.width,
                             height: rendered.height,
                             bytes: rendered.bytes,
+                            svg: rendered.svg,
                             used_at,
                         },
                         Err(_) => MermaidLoad::Failed { used_at },
@@ -6528,26 +6555,20 @@ impl Transcript {
         let Some(source) = crate::inline_media::mermaid_source(&top.block) else {
             return gpui::Empty.into_any_element();
         };
-        let state = self.mermaid_snapshot(source, theme.appearance.is_dark(), cx);
-        let source_key: SharedString = format!("{row_id}#mermaid-source").into();
-        let source_open = self
-            .folds
-            .get(&source_key)
-            .and_then(|fold| fold.open)
-            .unwrap_or(false);
-        let show_source =
-            source_open || matches!(&state, MermaidSnapshot::Loading | MermaidSnapshot::Failed);
-        let opts = RenderOptions {
-            row_key: SharedString::from(format!("{row_id}#mermaid-code")),
-            veil: None,
-            cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
-            now: Instant::now(),
-            copy: Some(self.copy_ui_for(row_id, cx)),
-            open_file: None,
-        };
-        let source_block = show_source.then(|| {
+        let state = self.mermaid_snapshot(source, theme, cx);
+
+        // Fallback on failure: clean syntax-highlighted code block (like Craft)
+        if matches!(&state, MermaidSnapshot::Failed) {
+            let opts = RenderOptions {
+                row_key: SharedString::from(format!("{row_id}#mermaid-code")),
+                veil: None,
+                cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                now: Instant::now(),
+                copy: Some(self.copy_ui_for(row_id, cx)),
+                open_file: None,
+            };
             let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
-            render::render_block(
+            return render::render_block(
                 &top.block,
                 block_ix,
                 block_ix,
@@ -6558,153 +6579,133 @@ impl Transcript {
                     .get(&block_ix)
                     .and_then(|value| value.as_deref())
                     .map(|document| document.lines.as_slice()),
-            )
-        });
-
-        let mut header = div()
-            .h(px(32.0))
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(10.0))
-            .text_size(px(11.5))
-            .text_color(theme.text_muted)
-            .child(
-                crate::icons::icon(crate::icons::WIDGET)
-                    .size(px(13.0))
-                    .text_color(theme.text_muted),
             );
-        header = match &state {
-            MermaidSnapshot::Loading | MermaidSnapshot::Reloading => header
-                .child("Rendering diagram…")
-                .child(div().flex_1())
+        }
+
+        // Loading or reloading placeholder
+        if matches!(
+            &state,
+            MermaidSnapshot::Loading | MermaidSnapshot::Reloading
+        ) {
+            return div()
+                .w_full()
+                .h(px(80.0))
+                .flex()
+                .items_center()
+                .justify_center()
                 .child(crate::loaders::mini_mono_spinner(
                     format!("mermaid-{row_id}"),
-                    1.8,
+                    2.0,
                     theme.text_muted,
                     cx.entity_id(),
                     cx,
-                )),
-            MermaidSnapshot::Failed => header
-                .child("Could not render diagram")
-                .text_color(theme.danger_muted),
-            MermaidSnapshot::Ready { .. } => {
-                let toggle_key = source_key.clone();
-                header.child("Diagram").child(div().flex_1()).child(
-                    div()
-                        .id(SharedString::from(format!("{row_id}#mermaid-toggle")))
-                        .h(px(22.0))
-                        .px(px(7.0))
-                        .rounded(px(6.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(crate::theme::ink(0.06)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.folds.entry(toggle_key.clone()).or_default().open =
-                                Some(!source_open);
-                            cx.notify();
-                        }))
-                        .child("Source")
-                        .child(
-                            crate::icons::icon(if source_open {
-                                crate::icons::ALT_ARROW_DOWN
-                            } else {
-                                crate::icons::ALT_ARROW_RIGHT
-                            })
-                            .size(px(10.0))
-                            .text_color(theme.text_faint),
-                        ),
-                )
-            }
+                ))
+                .into_any_element();
+        }
+
+        let MermaidSnapshot::Ready {
+            image,
+            width,
+            height,
+            svg,
+        } = state
+        else {
+            return gpui::Empty.into_any_element();
         };
 
-        let mut card = div()
+        let preview = crate::mermaid_preview::MermaidPreview {
+            image: image.clone(),
+            width,
+            height,
+            source: source.to_string(),
+            svg,
+        };
+
+        let scroll_handle = self
+            .mermaid_scroll_handles
+            .entry(row_id.clone())
+            .or_default()
+            .clone();
+
+        let group: SharedString = format!("mermaid-group-{row_id}").into();
+
+        let maximize_btn = {
+            let preview = preview.clone();
+            div()
+                .id(SharedString::from(format!("{row_id}#mermaid-expand")))
+                .absolute()
+                .top(px(8.0))
+                .right(px(8.0))
+                .p(px(5.0))
+                .rounded(px(6.0))
+                .bg(theme.bg)
+                .border_1()
+                .border_color(crate::theme::hairline(0.12))
+                .shadow_sm()
+                .text_color(theme.text_muted)
+                .hover(|s| s.text_color(theme.text).bg(crate::theme::ink(0.1)))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.user_message_preview = None;
+                    this.attachment_preview = None;
+                    this.mermaid_preview = Some(preview.clone());
+                    this.mermaid_preview_zoom = 1.0;
+                    this.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
+                    window.focus(&this.mermaid_preview_focus, cx);
+                    cx.notify();
+                }))
+                .child(crate::icons::icon(crate::icons::EXPAND_ARROWS).size(px(13.0)))
+        };
+
+        let preview_for_click = preview.clone();
+        let scroll_content = div()
+            .id(SharedString::from(format!("{row_id}#mermaid-scroll")))
+            .track_scroll(&scroll_handle)
             .w_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(crate::theme::hairline(0.08))
-            .bg(crate::theme::ink(0.028))
-            .child(header);
-        match state {
-            MermaidSnapshot::Ready {
-                image,
-                width,
-                height,
-            } => {
-                let preview = crate::attachments::PreviewImage {
-                    name: "Mermaid diagram".into(),
-                    image: image.clone(),
-                };
-                card = card.child(
-                    div()
-                        .id(SharedString::from(format!("{row_id}#mermaid-preview")))
-                        .w_full()
-                        .max_h(px(560.0))
-                        .overflow_x_scroll()
-                        .overflow_y_scroll()
-                        .border_t_1()
-                        .border_color(crate::theme::hairline(0.06))
-                        .p(px(12.0))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.user_message_preview = None;
-                            this.attachment_preview = Some(preview.clone());
-                            window.focus(&this.attachment_preview_focus, cx);
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .min_w_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    img(image)
-                                        .w(px(width))
-                                        .h(px(height))
-                                        .rounded(px(6.0))
-                                        .flex_none(),
-                                ),
-                        ),
-                );
-            }
-            MermaidSnapshot::Reloading => {
-                card = card.child(
-                    div()
-                        .w_full()
-                        .h(px(120.0))
-                        .border_t_1()
-                        .border_color(crate::theme::hairline(0.06))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(crate::loaders::mini_mono_spinner(
-                            format!("mermaid-reload-{row_id}"),
-                            2.0,
-                            theme.text_muted,
-                            cx.entity_id(),
-                            cx,
-                        )),
-                );
-            }
-            MermaidSnapshot::Loading | MermaidSnapshot::Failed => {}
-        }
-        if let Some(source_block) = source_block {
-            card = card.child(
+            .overflow_x_scroll()
+            .py(px(6.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.user_message_preview = None;
+                this.attachment_preview = None;
+                this.mermaid_preview = Some(preview_for_click.clone());
+                this.mermaid_preview_zoom = 1.0;
+                this.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
+                window.focus(&this.mermaid_preview_focus, cx);
+                cx.notify();
+            }))
+            .child(
                 div()
-                    .border_t_1()
-                    .border_color(crate::theme::hairline(0.06))
-                    .child(source_block),
+                    .min_w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(image)
+                            .w(px(width))
+                            .h(px(height))
+                            .object_fit(ObjectFit::Contain)
+                            .flex_none(),
+                    ),
             );
-        }
-        card.into_any_element()
+
+        let faded_scroll = crate::edge_fade::edge_faded(32.0, false, false, scroll_content)
+            .fade_overflow_x(&scroll_handle);
+
+        div()
+            .id(SharedString::from(format!("{row_id}#mermaid-block")))
+            .group(group.clone())
+            .relative()
+            .w_full()
+            .my(px(8.0))
+            .child(faded_scroll)
+            .child(
+                div()
+                    .opacity(0.0)
+                    .group_hover(group, |s| s.opacity(1.0))
+                    .child(maximize_btn),
+            )
+            .into_any_element()
     }
 
     fn ensure_reasoning_tick(&mut self, cx: &mut Context<Self>) {
@@ -8527,6 +8528,99 @@ impl Render for Transcript {
                         cx.notify();
                     })
                     .ok();
+                },
+            ));
+        }
+        if let Some(preview) = self.mermaid_preview.clone() {
+            let weak = cx.weak_entity();
+            let theme = Theme::of(cx).clone();
+            let zoom = self.mermaid_preview_zoom;
+            let pan = self.mermaid_preview_pan;
+            let copied_svg = self
+                .mermaid_copied_svg
+                .is_some_and(|t| t.elapsed().as_secs() < 2);
+            let copied_code = self
+                .mermaid_copied_code
+                .is_some_and(|t| t.elapsed().as_secs() < 2);
+
+            let weak_in = weak.clone();
+            let weak_out = weak.clone();
+            let weak_fit = weak.clone();
+            let weak_100 = weak.clone();
+            let weak_svg = weak.clone();
+            let weak_code = weak.clone();
+            let weak_close = weak.clone();
+
+            let svg_source = preview.svg.clone();
+            let code_source = preview.source.clone();
+
+            return root.child(crate::mermaid_preview::mermaid_lightbox(
+                window.viewport_size(),
+                &preview,
+                &self.mermaid_preview_focus,
+                zoom,
+                pan,
+                copied_svg,
+                copied_code,
+                &theme,
+                move |_, cx| {
+                    weak_in
+                        .update(cx, |this, cx| {
+                            this.mermaid_preview_zoom = (this.mermaid_preview_zoom * 1.25).min(5.0);
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |_, cx| {
+                    weak_out
+                        .update(cx, |this, cx| {
+                            this.mermaid_preview_zoom = (this.mermaid_preview_zoom / 1.25).max(0.2);
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |_, cx| {
+                    weak_fit
+                        .update(cx, |this, cx| {
+                            this.mermaid_preview_zoom = 1.0;
+                            this.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |_, cx| {
+                    weak_100
+                        .update(cx, |this, cx| {
+                            this.mermaid_preview_zoom = 1.0;
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |_, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(svg_source.clone()));
+                    weak_svg
+                        .update(cx, |this, cx| {
+                            this.mermaid_copied_svg = Some(Instant::now());
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |_, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(code_source.clone()));
+                    weak_code
+                        .update(cx, |this, cx| {
+                            this.mermaid_copied_code = Some(Instant::now());
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |_, cx| {
+                    weak_close
+                        .update(cx, |this, cx| {
+                            this.mermaid_preview = None;
+                            cx.notify();
+                        })
+                        .ok();
                 },
             ));
         }
