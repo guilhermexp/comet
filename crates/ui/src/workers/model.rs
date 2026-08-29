@@ -330,6 +330,12 @@ fn parent_notification_rpc_params(
             .expect("SessionCommandPayload::Steer is JSON serializable")
     })
 }
+fn is_permanent_parent_notification_failure(error: &zeron_rpc::RpcError) -> bool {
+    match error {
+        zeron_rpc::RpcError::Failed(message) => message.contains("parent chat does not exist"),
+        _ => false,
+    }
+}
 
 fn notification_settings_for_snapshot(
     settings: Option<&WorkersSettingsSnapshot>,
@@ -841,12 +847,17 @@ impl WorkersModel {
                     .client()
                     .call(methods::QUEUE_WORKER_NOTIFICATION, params)
                     .await;
-                let acknowledged = if result.is_ok() {
+                let permanent_failure = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(is_permanent_parent_notification_failure);
+                let acknowledged = if result.is_ok() || permanent_failure {
                     ack_worker_parent_notification(&notification)
                 } else {
                     Ok(())
                 };
-                let delivery_succeeded = result.is_ok() && acknowledged.is_ok();
+                let delivery_succeeded =
+                    (result.is_ok() || permanent_failure) && acknowledged.is_ok();
                 this.update(cx, |model, _| {
                     model
                         .parent_notification_in_flight
@@ -862,7 +873,12 @@ impl WorkersModel {
                     }
                 })
                 .ok();
-                if let Err(error) = result {
+                if permanent_failure {
+                    tracing::info!(
+                        notification = %notification_id,
+                        "dropped orphaned worker parent notification (parent chat no longer exists)"
+                    );
+                } else if let Err(error) = result {
                     tracing::warn!(
                         notification = %notification_id,
                         %error,
@@ -1915,6 +1931,19 @@ mod tests {
             &failures,
             "worker-notify:worker-1",
             start + std::time::Duration::from_secs(8 * 64),
+        ));
+    }
+    #[test]
+    fn missing_parent_chat_is_recognized_as_permanent_failure() {
+        let permanent = zeron_rpc::RpcError::Failed("parent chat does not exist: chat-1".into());
+        assert!(super::is_permanent_parent_notification_failure(&permanent));
+
+        let transient = zeron_rpc::RpcError::Transport("connection reset".into());
+        assert!(!super::is_permanent_parent_notification_failure(&transient));
+
+        let other_failure = zeron_rpc::RpcError::Failed("busy".into());
+        assert!(!super::is_permanent_parent_notification_failure(
+            &other_failure
         ));
     }
 

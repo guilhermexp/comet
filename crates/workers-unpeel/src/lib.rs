@@ -1010,6 +1010,24 @@ pub struct LocalWorkersClient {
     resource_sampler: Arc<Mutex<resources::ResourceSampler>>,
 }
 
+/// Contador de request id do processo inteiro.
+///
+/// O `REPLAY_CACHE` do host e global e chaveado por `(principal, request_id)`,
+/// e toda instancia desta struct fala pelo mesmo principal (`comet-local`).
+/// Um contador POR INSTANCIA fazia cada `LocalWorkersClient::new()` recomecar
+/// em 1 — e a UI cria cinco (terminal, model, resource monitor, workspace,
+/// settings/projects). Colidir com payload diferente devolve 409 barulhento;
+/// colidir com payload IGUAL e pior, porque o segundo cliente recebe a
+/// resposta do primeiro sem erro nenhum.
+///
+/// Os outros tres campos compartilhados ja eram singletons; este ficou de fora.
+fn shared_next_request_id() -> Arc<AtomicU64> {
+    static REQUEST_ID: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
+    REQUEST_ID
+        .get_or_init(|| Arc::new(AtomicU64::new(1)))
+        .clone()
+}
+
 fn shared_displayed_grid() -> Arc<AtomicU64> {
     static GRID: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
     GRID.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
@@ -1049,7 +1067,7 @@ impl LocalWorkersClient {
             ));
         }
         Self {
-            next_request_id: Arc::new(AtomicU64::new(1)),
+            next_request_id: shared_next_request_id(),
             activity: activity_bridge::shared_activity_bridge(),
             last_displayed_grid: shared_displayed_grid(),
             resource_sampler: shared_resource_sampler(),
@@ -2770,7 +2788,10 @@ fn migrate_comet_workers_presets() -> Result<Value, WorkersError> {
     unpeel_core::app_state::load().map_err(WorkersError::State)
 }
 
-fn runtime_catalog_snapshot() -> Vec<WorkersRuntime> {
+/// O catalogo pinado do Unpeel, um `WorkersRuntime` por runtime desta
+/// plataforma. Sonda o PATH para preencher `installed`/`installed_path`, entao
+/// nao e barato: e leitura de tela ou de teste, nao de loop.
+pub fn runtime_catalog_snapshot() -> Vec<WorkersRuntime> {
     let search_dirs = unpeel_core::setup::search_dirs();
     unpeel_core::runtime_catalog::builtin_runtime_catalog()
         .current_platform_descriptors()
@@ -2886,6 +2907,37 @@ fn command_is_risky(command: &str) -> bool {
             || argument == "-f"
             || argument.starts_with("--dangerously")
     })
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::LocalWorkersClient;
+
+    /// O sintoma era `409: request id reused with different request` no log do
+    /// app. A UI cria cinco clientes; com um contador por instancia todos
+    /// recomecavam em 1 e disputavam as mesmas chaves do `REPLAY_CACHE` global
+    /// do host, que so distingue por `(principal, request_id)`.
+    #[test]
+    fn every_client_shares_one_request_id_sequence() {
+        let first = LocalWorkersClient::new();
+        let second = LocalWorkersClient::new();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first.next_request_id, &second.next_request_id),
+            "clientes distintos tem que numerar requests pelo mesmo contador"
+        );
+
+        let before = first
+            .next_request_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let taken = second
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            taken, before,
+            "o id que um cliente consome tem que sair da sequencia que o outro ve"
+        );
+    }
 }
 
 #[cfg(test)]

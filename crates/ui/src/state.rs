@@ -634,8 +634,6 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -683,7 +681,6 @@ impl AppState {
             transfers: HashMap::new(),
             diff_comments: HashMap::new(),
             local_device_id: None,
-            update: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -875,10 +872,6 @@ impl AppState {
             .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
             .or_else(|| sorted.first().copied())
             .map(|s| s.id.clone())
-    }
-
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
-        self.update = Some(status);
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -1341,7 +1334,6 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
-        self.update = None;
         cx.notify();
     }
 
@@ -1430,12 +1422,6 @@ impl AppState {
                 handle.clone(),
                 methods::AUTH_STATUS,
                 AppState::apply_auth_value,
-            ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                AppState::apply_update,
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);

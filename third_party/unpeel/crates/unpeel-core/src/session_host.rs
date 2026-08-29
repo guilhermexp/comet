@@ -75,7 +75,13 @@ const SESSION_SOCKET_ACCEPT_POLL_MS: u64 = 4;
 const MANIFEST_HEALTH_CACHE_TTL_MS: u64 = 500;
 const MANIFEST_HEALTH_CACHE_PRUNE_LEN: usize = 256;
 const MANIFEST_HEALTH_CACHE_STALE_MS: u64 = 60_000;
-const SESSION_OUTPUT_BATCH_FLUSH_MS: u64 = 32;
+/// Quanto o writer segura bytes do PTY antes de encostar no journal.
+///
+/// Uma TUI animando nunca esvazia o buffer, entao ela flusha SEMPRE no timeout:
+/// o valor e latencia de piso por quadro, nao um teto raro. Ver
+/// `OUTPUT_WAIT_POLL_MS` no controller_host para o batimento que os dois
+/// relogios formavam em 32/20 ms.
+const SESSION_OUTPUT_BATCH_FLUSH_MS: u64 = 8;
 const SESSION_OUTPUT_BATCH_MAX_BYTES: usize = 128 * 1024;
 const SESSION_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 const SESSION_OUTPUT_READ_BUFFER_BYTES: usize = 64 * 1024;

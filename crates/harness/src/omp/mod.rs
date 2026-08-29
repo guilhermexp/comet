@@ -126,6 +126,32 @@ pub struct OmpHarness {
     request_timeout: Duration,
 }
 
+/// Quanto esperar o `{"type":"ready"}` do `omp` antes de desistir.
+///
+/// Medido em maquina tranquila, o binario (126 MB) responde `ready` em ~0,9 s
+/// com a linha de comando exata da producao. Os 5 s antigos pareciam folgados
+/// por isso — mas eram o unico prazo, e um boot atravessado por pressao de
+/// memoria ou disco estourava. `handshake_timeout` e prazo, nao espera: subir
+/// nao custa nada enquanto tudo esta saudavel.
+///
+/// `ZERON_OMP_HANDSHAKE_MS` sobrepoe; producao construia `OmpHarness::new()`
+/// puro (`registry.rs`), entao ate aqui nao existia escape nenhum.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Parse puro do knob. `0` e lixo caem no default de proposito: um prazo de
+/// zero abortaria todo handshake, e o knob existe para AFROUXAR quando a
+/// maquina esta apertada, nunca para desligar o `omp` por engano de digitacao.
+fn parse_handshake_ms(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
+}
+
+fn handshake_timeout_from_env() -> Duration {
+    parse_handshake_ms(std::env::var("ZERON_OMP_HANDSHAKE_MS").ok().as_deref())
+}
+
 impl Default for OmpHarness {
     fn default() -> Self {
         Self {
@@ -135,7 +161,7 @@ impl Default for OmpHarness {
                 .map(PathBuf::from)
                 .map(|home| home.join(".orchestrator")),
             env: None,
-            handshake_timeout: Duration::from_secs(5),
+            handshake_timeout: handshake_timeout_from_env(),
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -1221,6 +1247,36 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Producao constroi `OmpHarness::new()` puro (`engine/src/registry.rs`),
+    /// entao o default E o valor de producao: `with_timeouts` so os testes
+    /// chamam. O knob existe porque ate aqui nao havia escape nenhum quando o
+    /// prazo estourava numa maquina apertada.
+    #[test]
+    fn the_handshake_knob_can_only_loosen_the_deadline() {
+        assert_eq!(parse_handshake_ms(None), DEFAULT_HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            parse_handshake_ms(Some("30000")),
+            Duration::from_secs(30),
+            "o knob afrouxa"
+        );
+        assert_eq!(
+            parse_handshake_ms(Some("  30000  ")),
+            Duration::from_secs(30),
+            "espaco em volta nao invalida o valor"
+        );
+        for garbage in ["0", "", "abc", "-1"] {
+            assert_eq!(
+                parse_handshake_ms(Some(garbage)),
+                DEFAULT_HANDSHAKE_TIMEOUT,
+                "{garbage:?} nao pode abortar todo handshake"
+            );
+        }
+        assert!(
+            DEFAULT_HANDSHAKE_TIMEOUT >= Duration::from_secs(10),
+            "o binario responde ready em ~0,9s tranquilo; a folga e para boot sob pressao"
+        );
+    }
 
     #[test]
     fn the_delegation_block_is_appended_only_when_the_workers_tool_is_registered() {

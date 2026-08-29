@@ -79,6 +79,21 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Onde um link que aponta para ARQUIVO deve abrir. `None` manda tudo para
+    /// o app do sistema (`cx.open_url`) — o que o preview interno nao sabe
+    /// abrir continua indo por la de qualquer jeito.
+    pub open_file: Option<Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>>,
+}
+
+/// Um destino de link que o preview interno sabe abrir: caminho local, sem
+/// esquema (`https://`, `mailto:`) e de um tipo que `load_preview` renderiza.
+fn is_previewable_file_link(url: &str) -> bool {
+    !url.contains("://")
+        && !url.starts_with('#')
+        && !url.starts_with("mailto:")
+        && !url.starts_with("tel:")
+        && crate::file_preview::model::classify_preview_kind(url)
+            != crate::file_preview::model::PreviewKind::Unsupported
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -99,6 +114,7 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+            open_file: None,
         }
     }
 }
@@ -676,10 +692,14 @@ fn flat_text_element(
     } else {
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
+        let open_file = opts.open_file.clone();
         InteractiveText::new(id, styled)
-            .on_click(ranges, move |clicked_ix, _window, cx| {
+            .on_click(ranges, move |clicked_ix, window, cx| {
                 if let Some(url) = urls.get(clicked_ix) {
-                    cx.open_url(url);
+                    match open_file.as_ref().filter(|_| is_previewable_file_link(url)) {
+                        Some(open) => open(url, window, cx),
+                        None => cx.open_url(url),
+                    }
                 }
             })
             .into_any_element()
@@ -1526,5 +1546,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn only_local_previewable_targets_leave_the_system_opener() {
+        assert!(is_previewable_file_link("/tmp/worker/report.md"));
+        assert!(is_previewable_file_link("docs/plan.md"));
+        assert!(is_previewable_file_link("shot.png"));
+
+        assert!(!is_previewable_file_link("https://example.com/a.md"));
+        assert!(!is_previewable_file_link("mailto:a@b.com"));
+        assert!(!is_previewable_file_link("#secao"));
+        // Sem tipo que o preview saiba renderizar, o clique segue para o SO.
+        assert!(!is_previewable_file_link("/usr/bin/ls"));
     }
 }

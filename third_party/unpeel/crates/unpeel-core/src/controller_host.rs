@@ -23,7 +23,22 @@ use crate::relay_crypto::TunnelRequest;
 use crate::session_host::{self, HostedSessionManifest, HostedSessionState, SessionHostCommand};
 
 const OUTPUT_WAIT_MAX_MS: u64 = 25_000;
-const OUTPUT_WAIT_POLL_MS: u64 = 20;
+/// Granularidade do long-poll de `/mobile/output`: de quanto em quanto tempo o
+/// tamanho do journal e reconferido enquanto ninguem escreveu nada.
+///
+/// Este relogio e o do batcher de escrita (`SESSION_OUTPUT_BATCH_FLUSH_MS`) sao
+/// independentes, entao a diferenca entre eles vira BATIMENTO: em 32/20 ms um
+/// quadro de TUI chegava ao Controller em intervalos de 20/40/52/60 ms em vez de
+/// uma cadencia estavel, e o olho le isso como animacao travada mesmo com a
+/// vazao media inteira. Alinhados perto dos 12 ms do caminho de terminal da
+/// engine, a jitter cabe dentro de um quadro de 60 Hz.
+///
+/// Custo: um `stat` a cada 4 ms por sessao ATRASADA, e so enquanto ela nao tem
+/// byte novo. `SESSION_SOCKET_ACCEPT_POLL_MS` ja sonda nesse mesmo passo.
+///
+/// ponytail: sondagem em vez de watch de fs. Trocar por kqueue/inotify se
+/// aparecer sessao suficiente para o `stat` pesar num profile.
+const OUTPUT_WAIT_POLL_MS: u64 = 4;
 /// Base64 and the JSON envelope must still fit the common Relay/SSH response
 /// budget. Controllers can keep paging with `nextOffset`.
 // Output bytes are base64 inside the route JSON, then that JSON is base64

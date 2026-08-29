@@ -907,16 +907,23 @@ fn file_open_target(
 ) -> Option<(String, std::path::PathBuf, String)> {
     let root = std::path::PathBuf::from(cwd);
     let candidate = std::path::Path::new(path);
-    let relative = if candidate.is_absolute() {
-        candidate
-            .strip_prefix(&root)
-            .ok()?
-            .to_string_lossy()
-            .to_string()
-    } else {
-        path.to_string()
-    };
-    Some((context_key.to_string(), root, relative))
+    if !candidate.is_absolute() {
+        return Some((context_key.to_string(), root, path.to_string()));
+    }
+    if let Ok(relative) = candidate.strip_prefix(&root) {
+        return Some((
+            context_key.to_string(),
+            root,
+            relative.to_string_lossy().to_string(),
+        ));
+    }
+    // Fora do cwd do chat — o orquestrador escreve no workspace do worker, e o
+    // arquivo que ele cita tem que abrir do mesmo jeito. O caminho absoluto vai
+    // inteiro como chave da aba (`load_preview` resolve absoluto sem raiz): a
+    // raiz do contexto continua sendo o cwd, entao as abas ja abertas contra
+    // ele nao se perdem, e dois `report.md` de diretorios diferentes seguem
+    // sendo duas abas.
+    Some((context_key.to_string(), root, path.to_string()))
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -1248,14 +1255,45 @@ fn visible_turn_step_children(open: bool, rows: &[Row]) -> &[Row] {
     if open { rows } else { &[] }
 }
 
+fn collect_json_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => out.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_json_strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for tool in tools {
-        let mut sources = Vec::new();
-        if let Ok(call) = serde_json::to_string(&tool.call) {
-            sources.push(call);
+        // Os argumentos da call entram valor a valor, nunca como um dump
+        // tokenizado por espaco: o nome default de screenshot no macOS tem
+        // espacos e quebrava em pedacos que nao existem no disco.
+        let mut args = Vec::new();
+        if let Ok(value) = serde_json::to_value(&tool.call) {
+            collect_json_strings(&value, &mut args);
         }
+        for raw in args {
+            if let Some(path) = crate::inline_media::image_path_candidate(&raw)
+                && seen.insert(path.clone())
+            {
+                out.push(path);
+                if out.len() == 6 {
+                    return out;
+                }
+            }
+        }
+        let mut sources = Vec::new();
         for detail in [tool.invocation.as_deref(), tool.detail.as_deref()]
             .into_iter()
             .flatten()
@@ -1272,6 +1310,12 @@ fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
         }
         for source in sources {
             for path in crate::inline_media::extract_image_paths(&source) {
+                // Texto livre so quebra em espaco, entao um caminho com espaco
+                // ja aceito pela call reaparece aqui como cauda solta
+                // ("2026-08-28.png"): e o mesmo arquivo, nao um segundo.
+                if out.iter().any(|kept| kept.ends_with(&format!(" {path}"))) {
+                    continue;
+                }
                 if seen.insert(path.clone()) {
                     out.push(path);
                     if out.len() == 6 {
@@ -2412,8 +2456,6 @@ struct OwnTurnAnchor {
 struct UserMessagePreview {
     row_id: SharedString,
     text: SharedString,
-    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
-    url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2580,20 +2622,6 @@ impl StickyTurnState {
         self.heights.retain(|id, _| live.contains(id));
         self.geometries.retain(|id, _| live.contains(id));
         self.suppress_once.retain(|id| live.contains(id));
-    }
-}
-
-fn user_message_preview(
-    row_id: SharedString,
-    text: SharedString,
-    mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
-    url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
-) -> UserMessagePreview {
-    UserMessagePreview {
-        row_id,
-        text,
-        mentions,
-        url_chips,
     }
 }
 
@@ -2831,6 +2859,8 @@ enum MermaidLoad {
     },
     Ready {
         image: Arc<gpui::Image>,
+        width: f32,
+        height: f32,
         bytes: usize,
         used_at: u64,
     },
@@ -2840,7 +2870,11 @@ enum MermaidSnapshot {
     Loading,
     Reloading,
     Failed,
-    Ready(Arc<gpui::Image>),
+    Ready {
+        image: Arc<gpui::Image>,
+        width: f32,
+        height: f32,
+    },
 }
 
 /// Shell-facing events (the transcript itself hosts no surfaces).
@@ -5378,12 +5412,10 @@ impl Transcript {
                         .unwrap_or(false);
                     let overflow_key = row.id.clone();
                     let weak = cx.weak_entity();
-                    let preview = user_message_preview(
-                        row.id.clone(),
-                        text.clone(),
-                        mentions.clone(),
-                        url_chips.clone(),
-                    );
+                    let preview = UserMessagePreview {
+                        row_id: row.id.clone(),
+                        text: text.clone(),
+                    };
                     let mut card = div()
                         .relative()
                         .min_w_0()
@@ -5516,6 +5548,7 @@ impl Transcript {
                         cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                         now: Instant::now(),
                         copy: Some(self.copy_ui_for(&row.id, cx)),
+                        open_file: self.open_file_link(cx),
                     };
                     let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                     render::render_block(
@@ -5556,6 +5589,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    open_file: self.open_file_link(cx),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -6122,6 +6156,36 @@ impl Transcript {
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
     /// click writes the block's code to the clipboard and shows a transient
     /// "Copied" check on that block for ~1.2s (overlay — no layout shift).
+    /// Link de arquivo no markdown do agente abre no preview interno, nao no
+    /// app do sistema. `None` sem chat selecionado ou sem cwd — sem raiz nao da
+    /// para resolver um caminho relativo, e o clique volta a ser `open_url`.
+    fn open_file_link(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>> {
+        let (context_key, cwd) = {
+            let state = self.state.read(cx);
+            let chat = state.selected_chat_row()?;
+            (chat.id.clone(), chat.cwd.clone()?)
+        };
+        let weak = cx.weak_entity();
+        Some(Rc::new(move |path, _window, cx| {
+            let Some((context_key, root, relative_path)) =
+                file_open_target(&context_key, &cwd, path)
+            else {
+                return;
+            };
+            weak.update(cx, |_, cx| {
+                cx.emit(TranscriptEvent::OpenFile {
+                    context_key,
+                    root,
+                    relative_path,
+                })
+            })
+            .ok();
+        }))
+    }
+
     fn copy_ui_for(&self, row_id: &SharedString, cx: &mut Context<Self>) -> render::CopyUi {
         let copied_ix = self
             .copied_code
@@ -6316,6 +6380,7 @@ impl Transcript {
                 cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                 now: Instant::now(),
                 copy: None,
+                open_file: self.open_file_link(cx),
             };
             let highlights = self.code_highlight_for(row_id, tree, None, cx);
             let mut trace_theme = theme.clone();
@@ -6355,11 +6420,17 @@ impl Transcript {
             }
             Some(MermaidLoad::Ready {
                 image,
+                width,
+                height,
                 used_at: stamp,
                 ..
             }) => {
                 *stamp = used_at;
-                return MermaidSnapshot::Ready(image.clone());
+                return MermaidSnapshot::Ready {
+                    image: image.clone(),
+                    width: *width,
+                    height: *height,
+                };
             }
             None => {}
         }
@@ -6420,6 +6491,8 @@ impl Transcript {
                     match result {
                         Ok(rendered) => MermaidLoad::Ready {
                             image: rendered.image,
+                            width: rendered.width,
+                            height: rendered.height,
                             bytes: rendered.bytes,
                             used_at,
                         },
@@ -6470,6 +6543,7 @@ impl Transcript {
             cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
             now: Instant::now(),
             copy: Some(self.copy_ui_for(row_id, cx)),
+            open_file: None,
         };
         let source_block = show_source.then(|| {
             let highlight = self.code_highlight_for(row_id, tree, Some(block_ix), cx);
@@ -6516,7 +6590,7 @@ impl Transcript {
             MermaidSnapshot::Failed => header
                 .child("Could not render diagram")
                 .text_color(theme.danger_muted),
-            MermaidSnapshot::Ready(_) => {
+            MermaidSnapshot::Ready { .. } => {
                 let toggle_key = source_key.clone();
                 header.child("Diagram").child(div().flex_1()).child(
                     div()
@@ -6559,7 +6633,11 @@ impl Transcript {
             .bg(crate::theme::ink(0.028))
             .child(header);
         match state {
-            MermaidSnapshot::Ready(image) => {
+            MermaidSnapshot::Ready {
+                image,
+                width,
+                height,
+            } => {
                 let preview = crate::attachments::PreviewImage {
                     name: "Mermaid diagram".into(),
                     image: image.clone(),
@@ -6568,10 +6646,12 @@ impl Transcript {
                     div()
                         .id(SharedString::from(format!("{row_id}#mermaid-preview")))
                         .w_full()
-                        .h(px(320.0))
+                        .max_h(px(560.0))
+                        .overflow_x_scroll()
+                        .overflow_y_scroll()
                         .border_t_1()
                         .border_color(crate::theme::hairline(0.06))
-                        .p(px(14.0))
+                        .p(px(12.0))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.user_message_preview = None;
@@ -6579,14 +6659,27 @@ impl Transcript {
                             window.focus(&this.attachment_preview_focus, cx);
                             cx.notify();
                         }))
-                        .child(img(image).w_full().h_full().object_fit(ObjectFit::Contain)),
+                        .child(
+                            div()
+                                .min_w_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    img(image)
+                                        .w(px(width))
+                                        .h(px(height))
+                                        .rounded(px(6.0))
+                                        .flex_none(),
+                                ),
+                        ),
                 );
             }
             MermaidSnapshot::Reloading => {
                 card = card.child(
                     div()
                         .w_full()
-                        .h(px(320.0))
+                        .h(px(120.0))
                         .border_t_1()
                         .border_color(crate::theme::hairline(0.06))
                         .flex()
@@ -7316,18 +7409,25 @@ fn user_message_dialog(
     preview: &UserMessagePreview,
     focus: &gpui::FocusHandle,
     theme: &Theme,
+    window: &Window,
     on_close: impl Fn(&mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let (max_w, max_h) = full_message_dialog_limits(viewport);
     let on_close = Rc::new(on_close);
     let close_on_key = on_close.clone();
     let close_on_scrim = on_close.clone();
-    let message = user_bubble_text(
-        &SharedString::from(format!("{}#full", preview.row_id)),
-        preview.text.clone(),
-        preview.mentions.clone(),
-        preview.url_chips.clone(),
+    // O card inline continua plano (mention wash + url chips pintados sobre uma
+    // linha de texto); o overlay tem espaco e mostra a mensagem como ela foi
+    // escrita — mesma pipeline markdown do file preview.
+    // ponytail: sem highlight de codigo aqui, ligar o `code_highlight_for` se
+    // alguem reclamar de fence sem cor.
+    let tree = parse_full(&preview.text);
+    let message = render::render_tree(
+        &tree,
+        &RenderOptions::settled(SharedString::from(format!("{}#full", preview.row_id))),
         theme,
+        window,
+        &|_| None,
     );
 
     gpui::deferred(
@@ -7976,13 +8076,16 @@ fn task_snapshot_card(
 ) -> AnyElement {
     let title = task_snapshot_title(items, created, resolved, is_error);
 
+    // Mesma plate do card de tool group (ink/hairline sobre o fundo), nao um
+    // `surface_card` solido: a cor fixa ignorava o frost e o card de todo
+    // aparecia como uma placa opaca no meio do transcript.
     div()
         .w_full()
         .overflow_hidden()
-        .rounded(px(10.0))
+        .rounded(px(9.0))
         .border_1()
-        .border_color(theme.border)
-        .bg(theme.surface_card)
+        .border_color(crate::theme::hairline(0.09))
+        .bg(crate::theme::ink(0.025))
         .child(
             div()
                 .h(px(36.0))
@@ -8025,7 +8128,7 @@ fn task_snapshot_card(
                 .h(px(36.0))
                 .px(px(12.0))
                 .border_t_1()
-                .border_color(theme.border.opacity(0.55))
+                .border_color(crate::theme::hairline(0.06))
                 .flex()
                 .items_center()
                 .gap(px(9.0))
@@ -8435,6 +8538,7 @@ impl Render for Transcript {
                 &preview,
                 &self.user_message_preview_focus,
                 &theme,
+                window,
                 move |_, cx| {
                     weak.update(cx, |this, cx| {
                         this.user_message_preview = None;
@@ -9438,12 +9542,21 @@ mod tests {
     }
 
     #[test]
-    fn filename_open_target_is_workspace_jailed_and_separate_from_fold_state() {
+    fn filename_open_target_reaches_outside_the_workspace() {
         let target = file_open_target("chat", "/repo", "src/main.rs").unwrap();
         assert_eq!(target.0, "chat");
         assert_eq!(target.1, std::path::PathBuf::from("/repo"));
         assert_eq!(target.2, "src/main.rs");
-        assert!(file_open_target("chat", "/repo", "/outside/secret.txt").is_none());
+
+        // Absoluto dentro do cwd continua relativo a ele.
+        let inside = file_open_target("chat", "/repo", "/repo/src/main.rs").unwrap();
+        assert_eq!(inside.1, std::path::PathBuf::from("/repo"));
+        assert_eq!(inside.2, "src/main.rs");
+
+        // Fora dele: a raiz do contexto nao muda e o caminho absoluto e a chave.
+        let outside = file_open_target("chat", "/repo", "/tmp/worker/report.md").unwrap();
+        assert_eq!(outside.1, std::path::PathBuf::from("/repo"));
+        assert_eq!(outside.2, "/tmp/worker/report.md");
     }
 
     #[test]
@@ -10133,11 +10246,9 @@ mod tests {
 
     #[test]
     fn assistant_image_read_tool_adds_a_gallery_without_output_text() {
-        let tool = MessagePart::Tool {
-            id: "read-image".into(),
-            call: ToolCall::ReadFile {
-                path: "artifacts/screenshot.png".into(),
-            },
+        let read = |id: &str, path: &str| MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::ReadFile { path: path.into() },
             is_error: false,
             resolved: true,
             execution: None,
@@ -10152,13 +10263,22 @@ mod tests {
             subagent_status: None,
             subagent_tail: None,
         };
-        let entry = assistant("read-media", MessageStatus::Complete, vec![tool]);
+        let entry = assistant(
+            "read-media",
+            MessageStatus::Complete,
+            vec![
+                read("read-image", "artifacts/screenshot.png"),
+                // Nome default de screenshot no macOS: espacos no caminho.
+                read("read-shot", "/tmp/Screen Shot 2026-08-28.png"),
+            ],
+        );
         let rows = rows_for_entry(&entry, false, &mut parse);
 
         assert!(matches!(
             &rows[1].kind,
             RowKind::InlineImages { paths }
-                if paths.as_slice() == ["artifacts/screenshot.png"]
+                if paths.as_slice()
+                    == ["artifacts/screenshot.png", "/tmp/Screen Shot 2026-08-28.png"]
         ));
     }
 
@@ -10568,26 +10688,6 @@ mod tests {
             user_message_attachment_summary(&[att("/a/1.txt"), att("/a/2.png")]).as_deref(),
             Some("Using 2 attachments")
         );
-    }
-
-    #[test]
-    fn user_message_preview_preserves_text_and_mentions() {
-        let mentions = Arc::new(vec![crate::composer::SentMentionSpan {
-            range: 0..7,
-            path: "src/lib.rs".into(),
-            is_dir: false,
-        }]);
-        let url_chips = Arc::new(Vec::new());
-        let preview = user_message_preview(
-            "row-1".into(),
-            "src/lib".into(),
-            mentions.clone(),
-            url_chips.clone(),
-        );
-        assert_eq!(preview.row_id, "row-1");
-        assert_eq!(preview.text, "src/lib");
-        assert_eq!(preview.mentions, mentions);
-        assert_eq!(preview.url_chips, url_chips);
     }
 
     #[test]

@@ -15,7 +15,7 @@ internal host modes (`__session_host__` et al.).
 
 | Path | Owns |
 |---|---|
-| `lib.rs` | All typed `Workers*` models, `LocalWorkersClient`, `WorkersRuntime`, session-host mode detection/dispatch (`is_session_host_mode`, `session_host_launch_args`, `session_host_launcher_path`, `run_session_host_mode_if_requested`) |
+| `lib.rs` | All typed `Workers*` models, `LocalWorkersClient`, `WorkersRuntime`, `runtime_catalog_snapshot` (o catálogo pinado, público para a UI provar seus espelhos de ícone/tint contra a fonte em vez de copiá-la à mão), session-host mode detection/dispatch (`is_session_host_mode`, `session_host_launch_args`, `session_host_launcher_path`, `run_session_host_mode_if_requested`) |
 | `controller_mcp.rs` | Comet-owned MCP surface for the primary Orchestrator (`CONTROLLER_MCP_ARG`) — intentionally separate from Unpeel's worker-to-worker MCP host |
 | `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend |
 | `session_event_journal.rs` | Session output/event journaling |
@@ -29,6 +29,8 @@ Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
 Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
+
+- **Request id é sequência única do processo.** O `REPLAY_CACHE` do host é global e chaveado por `(principal, request_id)`, e todo `LocalWorkersClient` fala pelo mesmo principal (`comet-local`). Um contador por instância fazia cada `new()` recomeçar em 1 — e a UI cria cinco (terminal, model, resource monitor, workspace, settings/projects). Colidir com payload diferente devolve `409: request id reused with different request`; colidir com payload **igual** é pior, porque o segundo cliente recebe a resposta do primeiro sem erro nenhum. `next_request_id` é `shared_next_request_id()`, no mesmo padrão `OnceLock` dos outros campos compartilhados.
 
 - **`third_party/unpeel` e codigo vendorizado, nao submodulo.** O upstream
   `unpeel-com/unpeel` deixou de existir publicamente; enquanto foi submodulo,
@@ -111,6 +113,31 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
+- **O andaime do prompt de notificação não pode ser indentado.** Markdown conta
+  espaço: cerca de código aceita no máximo 3 de indentação, e com 4+ ela deixa de
+  ser cerca — as crases viram texto literal, a cauda vaza como prosa e a
+  instrução final aparece dentro de uma caixa de código. O format string
+  carregava 9 espaços herdados da indentação do fonte. Teste checa indentação
+  linha a linha, porque `contains("```\n…")` casa a cerca sem enxergar o que vem
+  antes dela — foi assim que o teste antigo passou com o markdown quebrado.
+- **`\r` no output tail é retorno de carro, não "mais um controle".** Um TUI
+  repinta a status line dezenas de vezes e o journal guarda cada repaint;
+  `clean_output` tira o ANSI mas mantém o `\r`, então mapeá-lo para espaço junto
+  com os outros concatenava todas as versões numa linha só. Fica o último paint,
+  que é o que um terminal mostraria. Simplificação conhecida: o último segmento
+  vence inteiro, e um repaint mais curto que o anterior deixaria cauda visível
+  num terminal de verdade — status line redesenha do mesmo tamanho, então não
+  paga um emulador aqui.
+- **O prompt de notificação é markdown, e a quebra de linha do output tail é
+  conteúdo.** `build_worker_parent_notification_prompt` monta título + bullets +
+  bloco de código cercado; `safe_prompt_field` continua achatando os campos de
+  uma linha (e troca crase por apóstrofo, pois eles entram em `code` inline),
+  mas o tail passa por `safe_output_block`, que **preserva `\n`**. Achatar o
+  tail junto com os campos era o que entregava uma parede de texto de milhares
+  de caracteres numa linha só — ilegível no overlay do chat e sem estrutura
+  para o agente. A cerca vem de `code_fence_for`: crases dentro do tail
+  fechariam o bloco cedo e derramariam o resto como markdown. Todo o resto dos
+  caracteres de controle (e ANSI, via `clean_output`) continua saindo.
 - **One lifecycle fact carries one event id.** `parent_notifications.rs` derives
   a notification id per event; acknowledging in production compacts the journal,
   which CLEARS `acknowledged_notification_ids` (journal sequences stop meaning
@@ -185,6 +212,17 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 Run all: `cargo test -p zeron-workers-unpeel` (part of the publish gate).
 Roda em qualquer checkout desde que `third_party/unpeel` foi vendorizado.
+
+**O socket aceito do ingress de hook precisa voltar a bloquear.** O listener é
+não-bloqueante de propósito (o loop de accept checa o shutdown), e macOS/BSD
+propaga esse `O_NONBLOCK` para o socket **aceito**; `set_read_timeout` não
+desfaz, porque `SO_RCVTIMEO` nem é consultado enquanto `O_NONBLOCK` valer. Sem
+o `set_nonblocking(false)` em `handle_connection`, todo POST cujos bytes cheguem
+depois do accept devolve `WouldBlock` na primeira leitura, `read_request` sai
+por `?` **sem escrever resposta**, e o hook é descartado em silêncio — evento de
+lifecycle perdido em produção, flake sob paralelismo na suíte (falhava 5/5
+rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
+`read`: exatamente um `WouldBlock` por falha.
 
 ### Test Coverage Matrix
 

@@ -259,6 +259,32 @@ mod tests {
         assert_eq!(runtime_icon_path(None, None), crate::icons::TERMINAL);
     }
 
+    /// O mapa de tints e copia manual do catalogo vendorizado, e o teste ao
+    /// lado e uma TERCEIRA copia da mesma tabela: ele fixa a funcao contra ela
+    /// mesma, nunca contra a fonte. Como o unpeel sincroniza varias versoes por
+    /// semana, um tint que muda (ou um runtime novo) passava em silencio.
+    ///
+    /// Ausencia tambem e contrato: `omp`, `prime-agent` e `copilot` nao
+    /// declaram `spinner_tint` no catalogo, entao `None` e a resposta certa —
+    /// inventar cor aqui e que seria a divergencia.
+    #[test]
+    fn spinner_tints_mirror_the_pinned_catalog_exactly() {
+        let catalog = zeron_workers_unpeel::runtime_catalog_snapshot();
+        assert!(!catalog.is_empty(), "catalogo vendorizado veio vazio");
+        for runtime in catalog {
+            let expected = runtime.spinner_tint_color_hex.as_deref().map(|hex| {
+                u32::from_str_radix(hex.trim_start_matches('#'), 16)
+                    .expect("spinner_tint do catalogo e hex")
+            });
+            assert_eq!(
+                runtime_spinner_tint(Some(&runtime.cli_id), None),
+                expected,
+                "{} saiu do catalogo",
+                runtime.cli_id
+            );
+        }
+    }
+
     #[test]
     fn spinner_matches_unpeel_frames_timing_and_runtime_tints() {
         assert_eq!(spinner_frame(0), "⠋");

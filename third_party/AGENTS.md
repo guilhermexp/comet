@@ -48,6 +48,14 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   sejam dependências binárias intencionais já documentadas.
 - Mudanças em `third_party/unpeel` precisam provar o consumidor real com
   `cargo test -p zeron-workers-unpeel`.
+- **Os dois relógios do caminho de output andam juntos.**
+  `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
+  `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são
+  independentes, então a diferença entre eles vira batimento: em 32/20 ms um
+  quadro de TUI chegava ao Controller em intervalos de 20/40/52/60 ms e o
+  terminal do app parecia travado com a vazão média inteira. Hoje são 8/4 ms,
+  na faixa dos 12 ms do batcher da engine. Mexer num sem o outro reintroduz a
+  jitter — o sintoma não é lentidão, é irregularidade.
 
 ## Verification
 

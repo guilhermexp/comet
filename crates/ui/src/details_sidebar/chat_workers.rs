@@ -60,6 +60,20 @@ pub struct ChatWorkersSnapshot {
     pub workers: Vec<ChatWorkerRow>,
 }
 
+/// Ha trabalho em voo no widget: worker rodando, ou workflow/subagente ainda
+/// em `Running`. E o gatilho do shimmer da strip de abas.
+pub fn snapshot_is_active(snapshot: &ChatWorkersSnapshot) -> bool {
+    snapshot
+        .workers
+        .iter()
+        .any(|worker| worker.semantic.is_active())
+        || snapshot
+            .workflows
+            .iter()
+            .chain(snapshot.subagents.iter())
+            .any(|row| row.status == WorkflowTaskStatus::Running)
+}
+
 pub fn worker_semantic(state: &str, activity: &str) -> WorkerSemantic {
     match (state, activity) {
         ("running", "starting") => WorkerSemantic::Starting,
@@ -300,8 +314,9 @@ mod tests {
     use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
 
     use super::{
-        WorkerSemantic, activity_tasks_from_entries, compact_activity_label, format_usage,
-        project_chat_workers, worker_semantic,
+        ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
+        activity_tasks_from_entries, compact_activity_label, format_usage, project_chat_workers,
+        snapshot_is_active, worker_semantic,
     };
 
     fn workflow_task(id: &str) -> WorkflowTaskUpdate {
@@ -774,5 +789,52 @@ mod tests {
             Some("1.2k tokens · 4 tools · 2.5s")
         );
         assert_eq!(format_usage(None, None), None);
+    }
+
+    #[test]
+    fn the_shimmer_follows_work_in_flight_not_the_row_count() {
+        let worker = |semantic| ChatWorkerRow {
+            session_id: "s".into(),
+            project_id: "p".into(),
+            title: "w".into(),
+            command: "codex".into(),
+            provider_id: None,
+            semantic,
+            state: "running".into(),
+            activity: "working".into(),
+            updated_at_unix_ms: 0,
+        };
+        let activity = |status| ChatActivityRow {
+            id: "a".into(),
+            title: "t".into(),
+            description: None,
+            status,
+            usage: None,
+            progress: Vec::new(),
+            subagent_type: None,
+        };
+
+        assert!(!snapshot_is_active(&ChatWorkersSnapshot::default()));
+        // Linhas presentes, nada rodando: sem shimmer.
+        assert!(!snapshot_is_active(&ChatWorkersSnapshot {
+            workers: vec![worker(WorkerSemantic::Idle)],
+            subagents: vec![activity(WorkflowTaskStatus::Completed)],
+            workflows: vec![activity(WorkflowTaskStatus::Cancelled)],
+        }));
+        assert!(snapshot_is_active(&ChatWorkersSnapshot {
+            workers: vec![
+                worker(WorkerSemantic::Idle),
+                worker(WorkerSemantic::Working)
+            ],
+            ..Default::default()
+        }));
+        assert!(snapshot_is_active(&ChatWorkersSnapshot {
+            subagents: vec![activity(WorkflowTaskStatus::Running)],
+            ..Default::default()
+        }));
+        assert!(snapshot_is_active(&ChatWorkersSnapshot {
+            workflows: vec![activity(WorkflowTaskStatus::Running)],
+            ..Default::default()
+        }));
     }
 }

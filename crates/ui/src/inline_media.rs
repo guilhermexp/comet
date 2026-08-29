@@ -25,6 +25,8 @@ pub struct LoadedInlineImage {
 
 pub struct RenderedMermaid {
     pub image: Arc<Image>,
+    pub width: f32,
+    pub height: f32,
     pub bytes: usize,
 }
 
@@ -71,6 +73,13 @@ fn push_candidate(raw: &str, seen: &mut HashSet<String>, paths: &mut Vec<String>
     }
 }
 
+/// Normaliza UM candidato ja delimitado (um valor de string do JSON da tool
+/// call, por exemplo). `extract_image_paths` quebra em espaco e nao serve para
+/// isso: o nome default de screenshot no macOS tem espacos.
+pub fn image_path_candidate(raw: &str) -> Option<String> {
+    normalize_candidate(raw)
+}
+
 pub fn extract_image_paths(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
@@ -102,17 +111,24 @@ fn canonical_candidate(
     root: &Path,
     candidate: &str,
 ) -> Result<(PathBuf, PathBuf), InlineImageError> {
+    let raw = candidate.strip_prefix("file://").unwrap_or(candidate);
+    let candidate = Path::new(raw);
+    // Absoluto renderiza de onde estiver (`load_preview` o resolve sem raiz): o
+    // screenshot que o agente acabou de tirar mora em /tmp ou ~/Desktop, nunca
+    // no checkout, e o preview so mostra arquivo que a propria sessao ja abriu.
+    // Relativo continua ancorado no checkout (inclusive symlink que escapa
+    // dele) — sem raiz, "artifacts/x.png" nao quer dizer nada.
+    if candidate.is_absolute() {
+        let absolute = candidate
+            .canonicalize()
+            .map_err(|_| InlineImageError::OutsideCheckout)?;
+        return Ok((root.to_path_buf(), absolute));
+    }
     let root = root
         .canonicalize()
         .map_err(|_| InlineImageError::OutsideCheckout)?;
-    let raw = candidate.strip_prefix("file://").unwrap_or(candidate);
-    let candidate = Path::new(raw);
-    let absolute = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        root.join(candidate)
-    };
-    let absolute = absolute
+    let absolute = root
+        .join(candidate)
         .canonicalize()
         .map_err(|_| InlineImageError::OutsideCheckout)?;
     let relative = absolute
@@ -225,8 +241,12 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<RenderedMermaid, S
         return Err("rendered diagram is too large".into());
     }
     let bytes = svg.len();
+    let width = (layout.width as f32).max(1.0);
+    let height = (layout.height as f32).max(1.0);
     Ok(RenderedMermaid {
         image: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
+        width,
+        height,
         bytes,
     })
 }
@@ -265,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn checkout_image_loader_confines_candidates_to_the_root() {
+    fn image_loader_takes_absolute_paths_and_confines_relative_ones() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("artifacts")).unwrap();
@@ -277,13 +297,15 @@ mod tests {
         assert_eq!(loaded.name.as_ref(), "plot.png");
 
         assert!(load_checkout_image(root.path(), "../secret.png").is_err());
-        assert!(
-            load_checkout_image(
-                root.path(),
-                outside.path().join("secret.png").to_str().unwrap()
-            )
-            .is_err()
-        );
+
+        // Fora do checkout, mas absoluto: o agente leu, a UI mostra.
+        fs::write(outside.path().join("Screen Shot.png"), b"png").unwrap();
+        let shot = load_checkout_image(
+            root.path(),
+            outside.path().join("Screen Shot.png").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shot.name.as_ref(), "Screen Shot.png");
 
         #[cfg(unix)]
         {
@@ -336,5 +358,19 @@ mod tests {
         assert!(render_mermaid_svg("   ", true).is_err());
         let oversized = format!("flowchart LR\n{}", "A --> B\n".repeat(10_000));
         assert!(render_mermaid_svg(&oversized, true).is_err());
+    }
+    #[test]
+    fn mermaid_renderer_computes_diagram_dimensions() {
+        let simple = render_mermaid_svg("flowchart LR\nA --> B", true).unwrap();
+        assert!(simple.width > 0.0);
+        assert!(simple.height > 0.0);
+
+        let wide = render_mermaid_svg(
+            "flowchart LR\ncreate --> prepare --> attempt --> bind --> session --> submit --> verify --> close\nverify --> reject",
+            true,
+        )
+        .unwrap();
+        assert!(wide.width > simple.width);
+        assert!(wide.height > 0.0);
     }
 }

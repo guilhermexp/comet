@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::{
-    MAX_INBOUND_BYTES, MAX_PENDING_REQUESTS, parse_frame, sanitize_diagnostic, serialize_frame,
+    ChunkAssembler, MAX_INBOUND_BYTES, MAX_PENDING_REQUESTS, parse_frame, sanitize_diagnostic,
+    serialize_frame,
 };
 use crate::HarnessError;
 
@@ -71,6 +72,11 @@ fn skill_scope_overlay() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Teto de frames guardados antes do `ready`. Generoso porque o caso normal e
+/// zero (o `ready` e a primeira linha); existe so para um produtor patologico
+/// nao virar consumo de memoria sem limite.
+const PRE_READY_EVENT_BUFFER: usize = 1024;
+
 struct Pending {
     command: String,
     resolve: oneshot::Sender<Result<Value, String>>,
@@ -85,6 +91,9 @@ struct Inner {
     closed: AtomicBool,
     /// Most recent child stderr lines, oldest first (see [`STDERR_TAIL_LINES`]).
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Frames de stdout vistos antes do `ready`. Zero num timeout significa
+    /// que o processo nunca falou — outra investigacao que "falou e demorou".
+    frames_before_ready: AtomicU64,
 }
 
 pub struct OmpProcess {
@@ -229,9 +238,10 @@ impl OmpProcess {
             fatal: Mutex::new(None),
             closed: AtomicBool::new(false),
             stderr_tail,
+            frames_before_ready: AtomicU64::new(0),
         });
         let (event_tx, event_rx) = mpsc::channel(256);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<bool, String>>();
         let reader_inner = Arc::clone(&inner);
         tokio::spawn(read_stdout(stdout, reader_inner, event_tx, ready_tx));
 
@@ -241,7 +251,12 @@ impl OmpProcess {
             events: Arc::new(Mutex::new(Some(event_rx))),
         };
         match tokio::time::timeout(launch.handshake_timeout, ready_rx).await {
-            Ok(Ok(Ok(()))) => Ok(process),
+            Ok(Ok(Ok(chunked_frames))) => {
+                if chunked_frames {
+                    process.negotiate_chunked_frames().await;
+                }
+                Ok(process)
+            }
             Ok(Ok(Err(message))) => {
                 let _ = process.shutdown().await;
                 Err(HarnessError::Protocol(message))
@@ -254,12 +269,46 @@ impl OmpProcess {
                 )))
             }
             Err(_) => {
+                // O `omp` nao escreve nada em stderr no caminho feliz, entao
+                // `fatal_message` costuma devolver a string nua e a ocorrencia
+                // seguinte fica tao cega quanto a primeira. Registrar o prazo
+                // real, se o filho ainda estava vivo e quantos frames ja
+                // tinham saido separa "boot lento" de "processo travado" de
+                // "protocolo mudo" — que exigem correcoes diferentes.
+                let alive = process.child_state().await;
+                tracing::warn!(
+                    target: "zeron_harness::omp",
+                    waited_ms = launch.handshake_timeout.as_millis() as u64,
+                    child = %alive,
+                    stdout_frames_before_deadline =
+                        process.inner.frames_before_ready.load(Ordering::SeqCst),
+                    knob = "ZERON_OMP_HANDSHAKE_MS",
+                    "OMP RPC handshake timed out"
+                );
                 let _ = process.shutdown().await;
                 Err(HarnessError::Protocol(fatal_message(
                     &process.inner,
                     "OMP RPC handshake timed out",
                 )))
             }
+        }
+    }
+
+    /// Pede a v2 do protocolo, a que parte um frame acima de 1 MiB em
+    /// `rpc_chunk` em vez de degradar a resposta para "RPC response exceeded
+    /// the transport limit" (ver [`ChunkAssembler`]). Uma recusa nao custa a
+    /// sessao: o resto do protocolo e identico, e so os frames grandes voltam a
+    /// ser perdidos — por isso um aviso, nao um erro.
+    async fn negotiate_chunked_frames(&self) {
+        if let Err(error) = self
+            .request(json!({ "type": "negotiate_protocol", "protocolVersion": 2 }))
+            .await
+        {
+            tracing::warn!(
+                target: "zeron_harness::omp",
+                %error,
+                "OMP RPC chunked-frame negotiation refused; responses over 1 MiB stay dropped"
+            );
         }
     }
 
@@ -340,6 +389,16 @@ impl OmpProcess {
             .ok_or_else(|| HarnessError::Protocol("OMP RPC events already taken".into()))
     }
 
+    /// Estado do filho para o log de timeout: "vivo" separa um boot lento de
+    /// um processo que morreu calado.
+    async fn child_state(&self) -> String {
+        match self.child.lock().await.try_wait() {
+            Ok(None) => "alive".to_owned(),
+            Ok(Some(status)) => format!("exited({status})"),
+            Err(error) => format!("unknown({error})"),
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -365,9 +424,17 @@ async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     inner: Arc<Inner>,
     event_tx: mpsc::Sender<Value>,
-    ready_tx: oneshot::Sender<Result<(), String>>,
+    ready_tx: oneshot::Sender<Result<bool, String>>,
 ) {
     let mut ready_tx = Some(ready_tx);
+    // `event_rx` so e retirado do processo DEPOIS que `start` retorna, entao
+    // durante a janela do handshake ninguem drena o canal. Mandar frames para
+    // ele antes do `ready` podia encher os 256 slots e travar este reader no
+    // `send().await` — e o `ready` que viesse depois nunca seria lido, dando um
+    // "handshake timed out" que nao tem nada a ver com lentidao. Hoje o `ready`
+    // vem primeiro e o alcapao nao morde; fica fechado de qualquer forma.
+    let mut pending_events: Vec<Value> = Vec::new();
+    let mut chunks = ChunkAssembler::default();
     let mut reader = BufReader::new(stdout);
     loop {
         let line = match read_bounded_line(&mut reader, MAX_INBOUND_BYTES).await {
@@ -403,15 +470,39 @@ async fn read_stdout(
                 return;
             }
         };
+        let frame = match chunks.push(frame) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
+            Err(error) => {
+                fail(&inner, error.to_string());
+                if let Some(ready) = ready_tx.take() {
+                    let _ = ready.send(Err(error.to_string()));
+                }
+                return;
+            }
+        };
         match frame.get("type").and_then(Value::as_str) {
             Some("ready") => {
                 if let Some(ready) = ready_tx.take() {
-                    let _ = ready.send(Ok(()));
+                    let _ = ready.send(Ok(supports_chunked_frames(&frame)));
+                }
+                // O receptor so comeca a ser drenado depois do handshake:
+                // segurar os frames aqui e o que impede o bloqueio descrito em
+                // `pending_events`.
+                for frame in pending_events.drain(..) {
+                    if event_tx.send(frame).await.is_err() {
+                        return;
+                    }
                 }
             }
             Some("response") => route_response(&inner, frame),
             _ => {
-                if event_tx.send(frame).await.is_err() {
+                if ready_tx.is_some() {
+                    inner.frames_before_ready.fetch_add(1, Ordering::SeqCst);
+                    if pending_events.len() < PRE_READY_EVENT_BUFFER {
+                        pending_events.push(frame);
+                    }
+                } else if event_tx.send(frame).await.is_err() {
                     return;
                 }
             }
@@ -468,6 +559,16 @@ where
             return Ok(Some(line));
         }
     }
+}
+
+/// O `ready` anuncia as versoes de protocolo que o filho aceita; a v2 e a que
+/// parte frames grandes em `rpc_chunk`. Um `omp` que nao anuncia nada fica em
+/// v1 e nunca recebe um `negotiate_protocol` que ele nao entenderia.
+fn supports_chunked_frames(ready: &Value) -> bool {
+    ready
+        .get("supportedProtocolVersions")
+        .and_then(Value::as_array)
+        .is_some_and(|versions| versions.iter().any(|version| version.as_u64() == Some(2)))
 }
 
 fn route_response(inner: &Inner, frame: Value) {

@@ -121,6 +121,10 @@ strip = "symbols"
 [profile.dev]
 # gpui is slow unoptimized; match zed's approach for deps
 opt-level = 0
+# Full DWARF em debug custa a maior fatia do codegen+link do workspace (gpui é
+# enorme). line-tables mantém backtrace com arquivo:linha; só perde inspeção de
+# variáveis no lldb — volte a `debug = true` quando precisar de um breakpoint.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2

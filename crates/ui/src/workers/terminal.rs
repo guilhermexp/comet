@@ -57,23 +57,32 @@ fn terminal_refresh(viewport_dirty: bool, truncated: bool, has_data: bool) -> Te
     }
 }
 
+/// Quantas linhas do fim da grade a dica de jump pode ocupar. As duas pontas
+/// (o scan e a montagem do texto) leem daqui: divergir custaria um falso
+/// negativo silencioso na pilula de "jump to bottom".
+const TUI_JUMP_HINT_TAIL_ROWS: usize = 15;
+
 fn viewport_has_tui_jump_hint(text: &str) -> bool {
     let lines = text.lines().collect::<Vec<_>>();
-    lines.iter().rev().take(15).any(|line| {
-        if line.contains("Jump to bottom (ctrl+End)") {
-            return true;
-        }
-        [" new message (ctrl+End)", " new messages (ctrl+End)"]
-            .into_iter()
-            .any(|marker| {
-                line.find(marker).is_some_and(|index| {
-                    line[..index]
-                        .split_whitespace()
-                        .next_back()
-                        .is_some_and(|count| count.parse::<u64>().is_ok())
+    lines
+        .iter()
+        .rev()
+        .take(TUI_JUMP_HINT_TAIL_ROWS)
+        .any(|line| {
+            if line.contains("Jump to bottom (ctrl+End)") {
+                return true;
+            }
+            [" new message (ctrl+End)", " new messages (ctrl+End)"]
+                .into_iter()
+                .any(|marker| {
+                    line.find(marker).is_some_and(|index| {
+                        line[..index]
+                            .split_whitespace()
+                            .next_back()
+                            .is_some_and(|count| count.parse::<u64>().is_ok())
+                    })
                 })
-            })
-    })
+        })
 }
 
 fn emulator_mouse_protocol(emulator: &Emulator) -> MouseProtocol {
@@ -183,6 +192,79 @@ const MAX_SILENT_REPLAY_CHUNKS: u32 = 512;
 /// offset de abertura e da falha de leitura: mede um poll que parou de voltar,
 /// e so solta a tela no proximo repaint de outra fonte.
 const MAX_SILENT_REPLAY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Cadencia do re-sync de `input_modes` com o host depois de um truncamento.
+///
+/// O latch `modes_from_snapshot` e de mao unica de proposito: um emulador
+/// semeado com a CAUDA do journal nunca viu o `?1049h`/`?1000h` que abriu o
+/// modo, entao derivar modo dele fica errado para sempre. O que estava errado
+/// era a CADENCIA — `viewport_dirty = had_data && modes_from_snapshot` pedia um
+/// snapshot a cada refresh COM DADO, e snapshot e round-trip IPC ao processo do
+/// session host. Uma TUI animando (o shimmer do codex) tem dado em todo poll,
+/// entao todo quadro pagava esse round-trip e o painel parava em ~15fps
+/// irregular.
+///
+/// E `input_modes` so alimenta os handlers de mouse (down/move/up/scroll):
+/// nada de pintura le esse valor. Meio segundo de defasagem e invisivel ate o
+/// proximo gesto; o snapshot por quadro nao comprava nada alem dos 6 booleanos.
+///
+/// ponytail: throttle no lugar de invalidacao por evento. Se algum dia um modo
+/// precisar valer no MESMO quadro em que muda, o passo seguinte e o host
+/// empurrar a troca de modo no proprio stream de output, nao encurtar isto.
+const MODE_RESYNC_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Quanto tempo depois do ultimo prepaint um terminal ainda conta como visivel.
+///
+/// gpui so pinta quando alguem notifica, entao "pintou agora" nao existe: um
+/// terminal visivel e ocioso para de repintar e o carimbo envelhece sozinho.
+/// Por isso a janela e generosa e o estado fora dela e LENTO, nunca parado —
+/// parar um terminal visivel e ocioso seria deadlock, ele nunca mais acordaria.
+const VISIBLE_PREPAINT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Long-poll de um terminal visivel: o host segura a resposta ate aparecer byte.
+const FOREGROUND_OUTPUT_WAIT_MS: u64 = 180;
+
+/// Fora de vista, le sem esperar e dorme entre as leituras.
+///
+/// O que se economiza aqui nao e o feed do emulador, e o long-poll: o host
+/// confere o tamanho do journal a cada `OUTPUT_WAIT_POLL_MS` (4 ms) enquanto
+/// segura a resposta, entao cada loop parado la dentro custa ~250 `stat`/s.
+/// `WorkersContent` vive o app inteiro e segue `selected_session_id` mesmo com
+/// o usuario no chat, e cada aba de worker do pane direito tem seu proprio
+/// loop — sem este gate, N superficies cobravam o preco de N visiveis.
+///
+/// Continua acompanhando, entao nao ha backlog para drenar ao voltar: o filme
+/// do scrollback que `HistoricalReplay` existe para esconder nao reaparece.
+///
+/// ponytail: cadencia fixa. Se 250 ms de latencia no primeiro byte depois de
+/// ocioso aparecer em uso real, o passo seguinte e o host empurrar o evento,
+/// nao encurtar isto.
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Falhas consecutivas de resize PARA O MESMO TAMANHO antes de desistir.
+///
+/// O retry era eterno: falhou -> `resize_retry_blocked` -> timer de 500 ms ->
+/// desbloqueia + `notify` -> repaint -> prepaint -> `on_grid_metrics` -> falha
+/// de novo. Contra uma sessao morta (`409: session has exited`) isso nunca
+/// converge, e o log do app enchia a ~520 ms por volta enquanto a aba
+/// estivesse visivel.
+///
+/// O teto vale por TAMANHO, nao pela vida do terminal: uma geometria nova zera
+/// a contagem em [`WorkersTerminal::on_grid_metrics`], senao uma sessao que
+/// morreu deixaria o terminal incapaz de sincronizar para sempre.
+const MAX_RESIZE_RETRIES: u32 = 3;
+
+/// O terminal esta na tela? `last_prepaint` e `None` ate o elemento de grade
+/// pintar a primeira vez. Ver [`VISIBLE_PREPAINT_WINDOW`] para o porque de ser
+/// uma janela e nao um booleano.
+/// Parar de re-armar o retry de resize? Ver [`MAX_RESIZE_RETRIES`].
+fn give_up_on_resize(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_RESIZE_RETRIES
+}
+
+fn is_visible(last_prepaint: Option<Instant>, now: Instant) -> bool {
+    last_prepaint.is_some_and(|at| now.saturating_duration_since(at) < VISIBLE_PREPAINT_WINDOW)
+}
 
 impl HistoricalReplay {
     fn start(&mut self) {
@@ -331,6 +413,8 @@ struct WorkersTerminalState {
     offset: u64,
     viewport_dirty: bool,
     modes_from_snapshot: bool,
+    /// Quando o host respondeu o ultimo snapshot de modos. `None` = nunca.
+    modes_synced_at: Option<Instant>,
     historical_replay: HistoricalReplay,
     resize_sync: ResizeSync,
     input_modes: WorkersViewportInputModes,
@@ -338,6 +422,8 @@ struct WorkersTerminalState {
     scroll_gesture: TerminalScrollGesture,
     resize_error: Option<String>,
     resize_retry_blocked: bool,
+    /// Falhas seguidas de resize no tamanho corrente. Ver [`MAX_RESIZE_RETRIES`].
+    resize_failures: u32,
     tui_jump_suppressed: bool,
     mouse_protocol: MouseProtocol,
 }
@@ -349,6 +435,7 @@ impl WorkersTerminalState {
             offset: 0,
             viewport_dirty: true,
             modes_from_snapshot: false,
+            modes_synced_at: None,
             historical_replay: HistoricalReplay::default(),
             resize_sync: ResizeSync::default(),
             input_modes: WorkersViewportInputModes::default(),
@@ -356,13 +443,30 @@ impl WorkersTerminalState {
             scroll_gesture: TerminalScrollGesture::default(),
             resize_error: None,
             resize_retry_blocked: false,
+            resize_failures: 0,
             tui_jump_suppressed: false,
             mouse_protocol: MouseProtocol::Sgr,
         }
     }
 
+    /// Este refresh precisa de um snapshot do host?
+    ///
+    /// `viewport_dirty` sao os one-shots que TEM que pintar agora (troca de
+    /// sessao, resize). O re-sync de modo pos-truncamento anda no relogio de
+    /// [`MODE_RESYNC_INTERVAL`] — ver o porque la.
+    fn needs_viewport(&self, now: Instant) -> bool {
+        self.viewport_dirty
+            || (self.modes_from_snapshot
+                && self
+                    .modes_synced_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= MODE_RESYNC_INTERVAL))
+    }
+
+    /// Roda por refresh E por render, entao so monta a cauda que o scan olha:
+    /// a grade inteira era ~10 KB de String descartada duas vezes por quadro.
     fn has_tui_jump_hint(&self) -> bool {
-        let text = (0..self.emulator.rows())
+        let rows = self.emulator.rows();
+        let text = (rows.saturating_sub(TUI_JUMP_HINT_TAIL_ROWS)..rows)
             .map(|row| self.emulator.row_text(row))
             .collect::<Vec<_>>()
             .join("\n");
@@ -390,6 +494,11 @@ impl WorkersTerminalState {
         self.offset = output.next_offset;
         if let Some(viewport) = viewport {
             self.input_modes = viewport.input_modes;
+            self.modes_synced_at = Some(Instant::now());
+            // Consumir o one-shot so aqui: sem snapshot na mao, um
+            // `viewport_dirty` levantado enquanto a leitura estava em voo
+            // (resize, troca de sessao) tem que sobreviver para o proximo poll.
+            self.viewport_dirty = false;
             if output.truncated && !had_data {
                 let _ = self.emulator.feed(&viewport.ansi);
             }
@@ -404,7 +513,6 @@ impl WorkersTerminalState {
                 application_cursor: self.emulator.app_cursor_mode(),
             };
         }
-        self.viewport_dirty = had_data && self.modes_from_snapshot;
         self.historical_replay
             .observe_output(had_data, self.offset, backlog_end);
         if !self.has_tui_jump_hint() {
@@ -490,6 +598,9 @@ pub struct WorkersTerminal {
     scrollbar_drag: Option<ScrollbarDrag>,
     terminal_hovered: bool,
     scrollbar_hovered: bool,
+    /// Ultimo prepaint do elemento de grade. `None` = nunca pintou.
+    /// Ver [`VISIBLE_PREPAINT_WINDOW`].
+    last_prepaint: Option<Instant>,
     _poll_task: Task<()>,
 }
 
@@ -507,6 +618,7 @@ impl WorkersTerminal {
                     geometry,
                     viewport_dirty,
                     resize_epoch,
+                    visible,
                 )) = this.update(cx, |terminal, _| {
                     let state = terminal.active_state();
                     (
@@ -519,8 +631,9 @@ impl WorkersTerminal {
                                 && !state.resize_sync.pending()
                         }),
                         terminal.geometry,
-                        state.is_some_and(|state| state.viewport_dirty),
+                        state.is_some_and(|state| state.needs_viewport(Instant::now())),
                         state.map_or(0, |state| state.resize_sync.epoch()),
+                        is_visible(terminal.last_prepaint, Instant::now()),
                     )
                 })
                 else {
@@ -542,7 +655,13 @@ impl WorkersTerminal {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let output = client.read_output(&request_session_id, Some(offset), 180)?;
+                        let wait_ms = if visible {
+                            FOREGROUND_OUTPUT_WAIT_MS
+                        } else {
+                            0
+                        };
+                        let output =
+                            client.read_output(&request_session_id, Some(offset), wait_ms)?;
                         let refresh = terminal_refresh(
                             viewport_dirty,
                             output.truncated,
@@ -612,6 +731,13 @@ impl WorkersTerminal {
                         .await;
                 } else {
                     error_backoff_ms = 0;
+                    if !visible {
+                        // Sem long-poll segurando a resposta, a cadencia tem
+                        // que vir daqui — senao isto vira busy loop.
+                        cx.background_executor()
+                            .timer(BACKGROUND_POLL_INTERVAL)
+                            .await;
+                    }
                 }
             }
         });
@@ -630,6 +756,7 @@ impl WorkersTerminal {
             scrollbar_drag: None,
             terminal_hovered: false,
             scrollbar_hovered: false,
+            last_prepaint: None,
             _poll_task: poll_task,
         }
     }
@@ -670,6 +797,7 @@ impl WorkersTerminal {
     }
 
     pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
+        self.last_prepaint = Some(Instant::now());
         self.client.remember_grid(geometry.cols, geometry.rows);
         let dimensions_changed = self.geometry.is_none_or(|previous| {
             previous.cols != geometry.cols || previous.rows != geometry.rows
@@ -686,6 +814,13 @@ impl WorkersTerminal {
         let Some(session_id) = self.session_id.clone() else {
             return;
         };
+        // Alvo novo, tentativa nova: o teto de [`MAX_RESIZE_RETRIES`] conta
+        // falhas no MESMO tamanho. Sem isto, desistir uma vez calaria o resize
+        // desta sessao para sempre.
+        if dimensions_changed && let Some(state) = self.active_state_mut() {
+            state.resize_failures = 0;
+            state.resize_retry_blocked = false;
+        }
         if self
             .active_state()
             .is_some_and(|state| state.resize_retry_blocked)
@@ -733,6 +868,7 @@ impl WorkersTerminal {
                         if let Some(state) = terminal.terminals.states.get_mut(&session_id) {
                             state.resize_error = None;
                             state.resize_retry_blocked = false;
+                            state.resize_failures = 0;
                         }
                         if terminal.session_id.as_deref() == Some(session_id.as_str()) {
                             terminal.error = None;
@@ -744,6 +880,7 @@ impl WorkersTerminal {
                         if let Some(state) = terminal.terminals.states.get_mut(&session_id) {
                             state.resize_error = Some(error.to_string());
                             state.resize_retry_blocked = true;
+                            state.resize_failures = state.resize_failures.saturating_add(1);
                         }
                     }
                 }
@@ -754,7 +891,9 @@ impl WorkersTerminal {
                     .timer(Duration::from_millis(500))
                     .await;
                 let _ = this.update(cx, |terminal, cx| {
-                    if let Some(state) = terminal.terminals.states.get_mut(&session_id) {
+                    if let Some(state) = terminal.terminals.states.get_mut(&session_id)
+                        && !give_up_on_resize(state.resize_failures)
+                    {
                         state.resize_retry_blocked = false;
                         cx.notify();
                     }
@@ -1483,6 +1622,144 @@ mod tests {
         assert!(state.emulator.history_lines() >= 3);
         assert_eq!(state.offset, 24);
         assert!(state.input_modes.known);
+    }
+
+    /// A regressao que deixava o terminal do worker a ~15fps irregular: depois
+    /// de UM truncamento, `viewport_dirty = had_data && modes_from_snapshot`
+    /// pedia snapshot em todo refresh com dado — e snapshot e round-trip IPC ao
+    /// session host. Uma TUI animando tem dado em todo poll, entao era um
+    /// round-trip por quadro, para sempre. Sessao retomada trunca na primeira
+    /// leitura (`journal_start_offset = prior_high_water + 1`), entao o modo
+    /// degradado era o caso NORMAL, nao a excecao.
+    /// `WorkersContent` e criado uma vez em `Shell::new` e segue
+    /// `selected_session_id` para sempre — nada limpa a selecao ao sair da rota
+    /// Workers, e o `workers_sidebar` so entra na arvore em `SidebarMode::
+    /// Workers`. Entao a mesma sessao aberta tambem como aba do pane direito
+    /// tinha DOIS loops de poll, cada um segurando um long-poll onde o host
+    /// confere o journal a cada 4 ms.
+    ///
+    /// O que este teste trava e o terceiro estado: fora de vista NAO e parado.
+    /// gpui so repinta quando alguem notifica, entao um terminal visivel e
+    /// ocioso envelhece o carimbo sozinho — parar ali seria deadlock, ele nunca
+    /// mais receberia output para se notificar de volta.
+    /// O log do app enchia a ~520 ms por volta com
+    /// `409: session has exited` — resize contra uma sessao morta, que nunca
+    /// converge, re-armado eternamente pelo timer de 500 ms.
+    #[test]
+    fn resize_stops_retrying_the_same_size_but_a_new_size_tries_again() {
+        assert!(!super::give_up_on_resize(0));
+        assert!(!super::give_up_on_resize(super::MAX_RESIZE_RETRIES - 1));
+        assert!(super::give_up_on_resize(super::MAX_RESIZE_RETRIES));
+
+        // O teto conta falhas do MESMO alvo. `on_grid_metrics` zera em
+        // `dimensions_changed`, entao uma geometria nova volta a tentar — e e
+        // isso que impede a desistencia de calar a sessao para sempre.
+        let mut state = super::WorkersTerminalState::new(8, 2);
+        state.resize_failures = super::MAX_RESIZE_RETRIES;
+        state.resize_retry_blocked = true;
+        assert!(super::give_up_on_resize(state.resize_failures));
+
+        state.resize_failures = 0;
+        state.resize_retry_blocked = false;
+        assert!(!super::give_up_on_resize(state.resize_failures));
+    }
+
+    #[test]
+    fn visibility_has_three_states_and_none_of_them_is_stopped() {
+        let now = std::time::Instant::now();
+
+        assert!(!super::is_visible(None, now), "nunca pintou");
+        assert!(super::is_visible(Some(now), now), "pintou agora");
+        assert!(
+            super::is_visible(
+                Some(now),
+                now + super::VISIBLE_PREPAINT_WINDOW - std::time::Duration::from_millis(1)
+            ),
+            "dentro da janela ainda conta como visivel"
+        );
+        assert!(
+            !super::is_visible(Some(now), now + super::VISIBLE_PREPAINT_WINDOW),
+            "passada a janela cai para o caminho lento"
+        );
+
+        // O caminho lento tem que ter cadencia propria: sem long-poll segurando
+        // a resposta, um intervalo zero viraria busy loop contra o host.
+        assert!(
+            super::BACKGROUND_POLL_INTERVAL > std::time::Duration::ZERO,
+            "o caminho lento continua andando, so que devagar"
+        );
+    }
+
+    #[test]
+    fn truncation_does_not_ask_the_host_for_a_snapshot_every_frame() {
+        let mut state = super::WorkersTerminalState::new(8, 2);
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 40,
+                next_offset: 41,
+                data: b"x".to_vec(),
+                truncated: true,
+            },
+            Some(zeron_workers_unpeel::WorkersViewport {
+                output_offset: 41,
+                cols: 8,
+                rows: 2,
+                ansi: Vec::new(),
+                input_modes: WorkersViewportInputModes {
+                    known: true,
+                    ..WorkersViewportInputModes::default()
+                },
+            }),
+        );
+        assert!(
+            state.modes_from_snapshot,
+            "o latch continua de mao unica: emulador semeado na cauda nao pode \
+             derivar modo sozinho"
+        );
+        // O relogio do re-sync e o carimbo do snapshot, nao a hora do teste.
+        let synced_at = state.modes_synced_at.expect("o snapshot carimba o sync");
+
+        // Quadros seguintes de uma TUI viva: dado em todos, snapshot em nenhum.
+        for frame in 0..30 {
+            assert!(
+                !state.needs_viewport(synced_at),
+                "quadro {frame} pediu snapshot dentro da janela de re-sync"
+            );
+            state.apply_refresh(
+                zeron_workers_unpeel::WorkersOutput {
+                    offset: 41 + frame,
+                    next_offset: 42 + frame,
+                    data: b".".to_vec(),
+                    truncated: false,
+                },
+                None,
+            );
+        }
+
+        // E o re-sync ainda acontece — os modos nao congelam.
+        assert!(
+            state.needs_viewport(synced_at + super::MODE_RESYNC_INTERVAL),
+            "passada a janela, os modos tem que voltar a sincronizar com o host"
+        );
+    }
+
+    /// Um one-shot levantado enquanto a leitura estava em voo nao pode ser
+    /// comido por um refresh que nao trouxe snapshot nenhum: resize e troca de
+    /// sessao dependem dele para repintar.
+    #[test]
+    fn a_refresh_without_a_snapshot_keeps_a_pending_one_shot() {
+        let mut state = super::WorkersTerminalState::new(8, 2);
+        state.viewport_dirty = true;
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 0,
+                next_offset: 1,
+                data: b"x".to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+        assert!(state.needs_viewport(std::time::Instant::now()));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
-    MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, parse_frame, sanitize_diagnostic,
+    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, parse_frame, sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
@@ -254,6 +254,91 @@ async fn catalog_preserves_provider_identity_and_current_model() {
             "openai-codex/shared",
         ]
     );
+}
+
+#[test]
+fn a_broken_chunk_sequence_fails_instead_of_reassembling_garbage() {
+    let chunk = |index: u64, data: &str| {
+        json!({
+            "type": "rpc_chunk",
+            "chunkId": "rpc-1",
+            "index": index,
+            "count": 2,
+            "byteLength": 4,
+            "data": base64_of(data),
+        })
+    };
+
+    let mut assembler = ChunkAssembler::default();
+    assert!(assembler.push(chunk(0, "ab")).unwrap().is_none());
+    // Um frame comum no meio da sequencia = pedaco perdido.
+    let error = assembler
+        .push(json!({ "type": "notice" }))
+        .expect_err("a lost chunk must not pass as a whole frame");
+    assert!(error.to_string().contains("interrupted"), "{error}");
+
+    let mut assembler = ChunkAssembler::default();
+    assert!(assembler.push(chunk(0, "ab")).unwrap().is_none());
+    let error = assembler
+        .push(chunk(0, "ab"))
+        .expect_err("a repeated index must not pass");
+    assert!(error.to_string().contains("mismatch"), "{error}");
+
+    // Uma sequencia que nao comeca no zero nao tem inicio para remontar.
+    let mut assembler = ChunkAssembler::default();
+    let error = assembler.push(chunk(1, "cd")).expect_err("index 1 first");
+    assert!(error.to_string().contains("index 0"), "{error}");
+
+    // O caminho feliz continua fechando: dois pedacos, um frame.
+    let mut assembler = ChunkAssembler::default();
+    let frame = json!({ "type": "notice", "message": "hi" }).to_string();
+    let (head, tail) = frame.split_at(frame.len() / 2);
+    let split = |index: u64, part: &str| {
+        json!({
+            "type": "rpc_chunk",
+            "chunkId": "rpc-2",
+            "index": index,
+            "count": 2,
+            "byteLength": frame.len(),
+            "data": base64_of(part),
+        })
+    };
+    assert!(assembler.push(split(0, head)).unwrap().is_none());
+    assert_eq!(
+        assembler.push(split(1, tail)).unwrap().unwrap()["type"],
+        "notice"
+    );
+}
+
+fn base64_of(value: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(value)
+}
+
+#[tokio::test]
+async fn a_catalog_split_across_chunks_is_reassembled() {
+    // O catalogo real do OMP mede ~1,2 MiB em 550 linhas — acima do 1 MiB por
+    // linha do filho. Sem remontar `rpc_chunk` a resposta chega degradada
+    // ("RPC response exceeded the transport limit") e o picker fica sem lista.
+    let models = discover_models_with_launch(fake_launch("chunked-models"))
+        .await
+        .unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["openai-codex/gpt-5.6-sol", "anthropic/shared"],
+    );
+}
+
+#[tokio::test]
+async fn a_child_that_refuses_the_chunked_protocol_still_starts() {
+    // Uma negociacao recusada custa os frames grandes, nao a sessao.
+    let models = discover_models_with_launch(fake_launch("refuses-chunked-frames"))
+        .await
+        .unwrap();
+    assert!(models.iter().any(|model| model.id == "anthropic/shared"));
 }
 
 #[tokio::test]
@@ -913,6 +998,20 @@ async fn dropping_the_event_stream_terminates_the_omp_process() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("OMP process {pid} survived after its event stream was dropped");
+}
+
+#[tokio::test]
+#[ignore = "uses the installed OMP CLI: proves the real catalog survives the 1 MiB frame limit"]
+async fn real_omp_catalog_arrives_whole() {
+    // Medido em 2026-08-28: 550 linhas, 1,2 MiB — o frame nao cabe, entao esta
+    // e a unica prova de que a v2 do protocolo esta mesmo negociada. Com v1 o
+    // filho devolve "RPC response exceeded the transport limit" e a lista some.
+    let models = OmpHarness::new().models().await.unwrap();
+    assert!(
+        models.len() > 100,
+        "a truncated catalog means the chunked protocol is off: {} rows",
+        models.len()
+    );
 }
 
 #[tokio::test]

@@ -76,20 +76,35 @@ fn shared_rows(rows: Vec<Vec<String>>) -> Arc<[Vec<SharedString>]> {
 }
 
 pub fn load_preview(root: &Path, relative_path: &Path) -> Result<LoadedPreview, PreviewLoadError> {
-    if relative_path.as_os_str().is_empty()
-        || relative_path.is_absolute()
-        || !relative_path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    {
+    if relative_path.as_os_str().is_empty() {
         return Err(PreviewLoadError::OutsideCheckout);
     }
-    let root = root.canonicalize().map_err(|_| PreviewLoadError::Missing)?;
-    let path = root
-        .join(relative_path)
-        .canonicalize()
-        .map_err(|_| PreviewLoadError::Missing)?;
-    if !path.starts_with(&root) || !path.is_file() {
+    // Um caminho ABSOLUTO abre de onde estiver: e o arquivo que o agente citou,
+    // e ele escreve fora do checkout o tempo todo (workspace de worker, /tmp).
+    // Relativo continua ancorado na raiz — sem ela nao quer dizer nada, e `..`
+    // ou symlink que escapa dela seguem barrados.
+    let path = if relative_path.is_absolute() {
+        relative_path
+            .canonicalize()
+            .map_err(|_| PreviewLoadError::Missing)?
+    } else {
+        if !relative_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(PreviewLoadError::OutsideCheckout);
+        }
+        let root = root.canonicalize().map_err(|_| PreviewLoadError::Missing)?;
+        let path = root
+            .join(relative_path)
+            .canonicalize()
+            .map_err(|_| PreviewLoadError::Missing)?;
+        if !path.starts_with(&root) {
+            return Err(PreviewLoadError::OutsideCheckout);
+        }
+        path
+    };
+    if !path.is_file() {
         return Err(PreviewLoadError::OutsideCheckout);
     }
     let kind = classify_preview_kind(path.to_string_lossy().as_ref());
@@ -229,6 +244,29 @@ mod tests {
                 Err(PreviewLoadError::OutsideCheckout)
             ));
         }
+    }
+
+    #[test]
+    fn loads_an_absolute_path_from_outside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let report = outside.path().join("report.md");
+        fs::write(&report, "# worker\n").unwrap();
+
+        // A raiz e' de outro lugar: o caminho absoluto manda.
+        assert!(matches!(
+            load_preview(root.path(), &report),
+            Ok(LoadedPreview::Markdown(_))
+        ));
+        assert!(matches!(
+            load_preview(root.path(), &outside.path().join("missing.md")),
+            Err(PreviewLoadError::Missing)
+        ));
+        // Diretorio nao e' preview.
+        assert!(matches!(
+            load_preview(root.path(), outside.path()),
+            Err(PreviewLoadError::OutsideCheckout)
+        ));
     }
 
     #[test]

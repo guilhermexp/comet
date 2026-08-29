@@ -148,6 +148,7 @@ mod platform {
         WorkersActivityRow, WorkersActivityRowKind, WorkersMenuBarMode, menu_popover_size,
     };
     use super::{ALL_RECENT_TAG, MenuBarBindings, MenuBarIntent, STATUS_ITEM_TAG};
+    use crate::workers::activity_menu::spinner_parts;
     use crate::workers::model::WorkersSessionTarget;
     use crate::workers::presentation::SPINNER_FRAMES;
 
@@ -359,14 +360,14 @@ mod platform {
                 msg_send![button, setImagePosition: if working { 0_u64 } else if matches!(self.mode, WorkersMenuBarMode::Idle) { 1_u64 } else { 2_u64 }]
             };
             match self.mode {
-                WorkersMenuBarMode::Working { blocked: true } => unsafe {
-                    set_colored_title(button, SPINNER_FRAMES[self.frame], 0xF59E0B)
-                },
-                WorkersMenuBarMode::Working { blocked: false } => {
-                    let _: () = unsafe {
-                        msg_send![button, setTitle: ns_string(SPINNER_FRAMES[self.frame])]
-                    };
-                }
+                WorkersMenuBarMode::Working {
+                    blocked: true,
+                    running,
+                } => unsafe { set_spinner_title(button, self.frame, running, Some(0xF59E0B)) },
+                WorkersMenuBarMode::Working {
+                    blocked: false,
+                    running,
+                } => unsafe { set_spinner_title(button, self.frame, running, None) },
                 WorkersMenuBarMode::Blocked => unsafe {
                     set_colored_title(button, "●", 0xF59E0B)
                 },
@@ -532,6 +533,69 @@ mod platform {
         unsafe {
             msg_send![class!(NSColor), colorWithSRGBRed: red green: green blue: blue alpha: 1.0_f64]
         }
+    }
+
+    /// Tamanho do glifo do spinner. O mesmo que o botao sempre usou.
+    const SPINNER_POINTS: f64 = 15.0;
+    /// Tamanho da contagem. Anotacao ao lado do spinner, nao segundo simbolo:
+    /// no mesmo corpo de 15pt ela competia com ele por atencao. E o tamanho e
+    /// a UNICA coisa que a torna discreta — a cor e a mesma do spinner, entao
+    /// nao pode ser tao pequena a ponto de sumir.
+    const COUNT_POINTS: f64 = 11.0;
+
+    /// Spinner grande + contagem pequena, num titulo so, na mesma cor.
+    ///
+    /// `tint` pinta o conjunto inteiro (o ambar de `Working { blocked: true }`);
+    /// sem ele nenhum atributo de cor e aplicado, entao os dois herdam a cor
+    /// default adaptativa do botao — inclusive a inversao no realce.
+    unsafe fn set_spinner_title(
+        button: *mut Object,
+        frame: usize,
+        running: usize,
+        tint: Option<u32>,
+    ) {
+        let (glyph, count) = spinner_parts(frame, running);
+        let title = format!("{glyph}{count}");
+        let attributed: *mut Object =
+            unsafe { msg_send![class!(NSMutableAttributedString), alloc] };
+        let attributed: *mut Object =
+            unsafe { msg_send![attributed, initWithString: ns_string(&title)] };
+        let glyph_len = glyph.encode_utf16().count();
+        let whole = NSRange {
+            location: 0,
+            length: title.encode_utf16().count(),
+        };
+        let count_range = NSRange {
+            location: glyph_len,
+            length: count.encode_utf16().count(),
+        };
+
+        let spinner_font: *mut Object = unsafe {
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: SPINNER_POINTS weight: 0.4_f64]
+        };
+        let _: () = unsafe {
+            msg_send![attributed, addAttribute: ns_string("NSFont") value: spinner_font range: whole]
+        };
+        let count_font: *mut Object = unsafe {
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: COUNT_POINTS weight: 0.4_f64]
+        };
+        let _: () = unsafe {
+            msg_send![attributed, addAttribute: ns_string("NSFont") value: count_font range: count_range]
+        };
+
+        // Sem tint nao entra atributo de cor NENHUM: spinner e contagem ficam
+        // na cor default do botao, e a diferenca de tamanho ja basta para a
+        // contagem ler como anotacao. Um `secondaryLabelColor` na contagem
+        // ficava cinza demais para ler na menu bar, e cor cravada tambem
+        // desliga a inversao nativa quando o popover abre e o item e realcado.
+        if let Some(hex) = tint {
+            let _: () = unsafe {
+                msg_send![attributed, addAttribute: ns_string("NSColor") value: ns_color(hex) range: whole]
+            };
+        }
+
+        let _: () = unsafe { msg_send![button, setAttributedTitle: attributed] };
+        let _: () = unsafe { msg_send![attributed, release] };
     }
 
     unsafe fn set_colored_title(button: *mut Object, title: &str, hex: u32) {

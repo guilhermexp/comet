@@ -124,20 +124,59 @@ fn navigation_delegate() -> *mut Object {
     }
 }
 
-/// `media_controls` flips the legacy `javaScriptEnabled` switch, which is what
-/// WebKit's built-in media controls run on — measured 2026-08-27: with it off, a
-/// video document paints a dead control bar (spinner, `--:--`, no play button)
-/// and the frame collapses into a corner. Page-level scripting stays off either
-/// way, so a previewed document still cannot run its own code.
-unsafe fn isolated_view(allow_file: bool, media_controls: bool) -> Option<NativeDocumentView> {
+/// O que o host nativo vai pintar. Cada variante carrega uma combinacao de
+/// switches do WebKit **medida**, nao deduzida — as duas chaves de JavaScript
+/// governam coisas diferentes e nenhuma delas e "deixar a pagina rodar script".
+///
+/// - `Html`: precisa de `allowsContentJavaScript`. O documento e um iframe
+///   `srcdoc` sandboxed, e com essa chave desligada o WebKit **nao popula o
+///   frame**: a pagina fica em branco. Medido em 2026-08-28 num `WKWebView`
+///   com a config deste arquivo — 0 pixels pintados desligado, 519 ligado, e a
+///   chave legada nao muda nada nos dois casos.
+/// - `Video`: precisa da chave **legada** `javaScriptEnabled`, que e onde
+///   rodam os controles de midia embutidos (medido 2026-08-27: desligada, o
+///   player pinta uma barra morta e o frame colapsa num canto).
+/// - `Pdf`: nao precisa de nenhuma das duas.
+///
+/// Ligar `allowsContentJavaScript` no HTML **nao** deixa o documento rodar
+/// codigo proprio: quem barra e o `sandbox` sem `allow-scripts` mais a CSP
+/// interna sem `script-src`. Medido com controle positivo — um `<script>` que
+/// pinta o fundo de vermelho da 79962 pixels vermelhos sem as duas defesas e
+/// **zero** dentro do embrulho.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocumentKind {
+    Html,
+    Pdf,
+    Video,
+}
+
+impl DocumentKind {
+    /// Ler arquivo local do disco (`loadFileURL`).
+    fn allows_file(self) -> bool {
+        matches!(self, Self::Pdf | Self::Video)
+    }
+
+    /// A chave legada — so os controles de midia dependem dela.
+    fn legacy_javascript(self) -> bool {
+        matches!(self, Self::Video)
+    }
+
+    /// A chave moderna — so o iframe `srcdoc` do HTML depende dela.
+    fn content_javascript(self) -> bool {
+        matches!(self, Self::Html)
+    }
+}
+
+unsafe fn isolated_view(kind: DocumentKind) -> Option<NativeDocumentView> {
+    let allow_file = kind.allows_file();
     let configuration: *mut Object = msg_send![class!(WKWebViewConfiguration), new];
     let data_store: *mut Object = msg_send![class!(WKWebsiteDataStore), nonPersistentDataStore];
     let _: () = msg_send![configuration, setWebsiteDataStore: data_store];
     let preferences: *mut Object = msg_send![configuration, preferences];
-    let _: () = msg_send![preferences, setJavaScriptEnabled: if media_controls { YES } else { NO }];
+    let _: () = msg_send![preferences, setJavaScriptEnabled: if kind.legacy_javascript() { YES } else { NO }];
     let page_preferences: *mut Object = msg_send![configuration, defaultWebpagePreferences];
     if !page_preferences.is_null() {
-        let _: () = msg_send![page_preferences, setAllowsContentJavaScript: NO];
+        let _: () = msg_send![page_preferences, setAllowsContentJavaScript: if kind.content_javascript() { YES } else { NO }];
     }
     let view: *mut Object = msg_send![class!(WKWebView), alloc];
     let zero = NSRect {
@@ -166,7 +205,7 @@ unsafe fn isolated_view(allow_file: bool, media_controls: bool) -> Option<Native
 impl NativeDocumentView {
     pub fn open_html(document: &str) -> Option<Self> {
         unsafe {
-            let view = isolated_view(false, false)?;
+            let view = isolated_view(DocumentKind::Html)?;
             let document = ns_string(document);
             let base_url: *mut Object = std::ptr::null_mut();
             let _: *mut Object = msg_send![view.view, loadHTMLString: document baseURL: base_url];
@@ -175,16 +214,16 @@ impl NativeDocumentView {
     }
 
     pub fn open_pdf(path: &Path) -> Option<Self> {
-        Self::open_file(path, false)
+        Self::open_file(path, DocumentKind::Pdf)
     }
 
     pub fn open_video(path: &Path) -> Option<Self> {
-        Self::open_file(path, true)
+        Self::open_file(path, DocumentKind::Video)
     }
 
-    fn open_file(path: &Path, media_controls: bool) -> Option<Self> {
+    fn open_file(path: &Path, kind: DocumentKind) -> Option<Self> {
         unsafe {
-            let view = isolated_view(true, media_controls)?;
+            let view = isolated_view(kind)?;
             let path_string = ns_string(path.to_string_lossy().as_ref());
             let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: path_string];
             let _: *mut Object =
@@ -250,7 +289,34 @@ impl Drop for NativeDocumentView {
 
 #[cfg(test)]
 mod tests {
-    use super::{appkit_frame, navigation_policy};
+    use super::{DocumentKind, appkit_frame, navigation_policy};
+
+    /// As duas chaves de JavaScript do WebKit governam coisas diferentes, e
+    /// trocar uma pela outra da um bug silencioso: preview em branco de um
+    /// lado, player de video morto do outro. Nenhum harness pega isso — a
+    /// tabela abaixo E a medicao, e existe para uma troca acidental quebrar
+    /// aqui em vez de na tela do usuario.
+    #[test]
+    fn each_document_kind_keeps_the_webkit_switches_it_was_measured_to_need() {
+        // O iframe `srcdoc` do HTML nao e populado sem a chave moderna.
+        assert!(DocumentKind::Html.content_javascript());
+        // ...e nao precisa da legada: medido, ela nao muda nada no HTML.
+        assert!(!DocumentKind::Html.legacy_javascript());
+        // HTML e string, nao arquivo: nada de ler disco.
+        assert!(!DocumentKind::Html.allows_file());
+
+        // Os controles de midia embutidos rodam na legada, so nela.
+        assert!(DocumentKind::Video.legacy_javascript());
+        assert!(!DocumentKind::Video.content_javascript());
+
+        // PDF nao precisa de nenhuma das duas.
+        assert!(!DocumentKind::Pdf.legacy_javascript());
+        assert!(!DocumentKind::Pdf.content_javascript());
+
+        // So o que vem de arquivo local recebe permissao de leitura.
+        assert!(DocumentKind::Pdf.allows_file());
+        assert!(DocumentKind::Video.allows_file());
+    }
 
     #[test]
     fn converts_gpui_top_left_bounds_to_appkit_bottom_left_frame() {

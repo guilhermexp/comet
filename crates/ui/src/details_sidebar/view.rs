@@ -142,6 +142,7 @@ use crate::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
             activity_tasks_from_entries, compact_activity_label, project_chat_workers,
+            snapshot_is_active,
         },
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, is_denied_relative, scan_checkout},
@@ -1381,7 +1382,14 @@ impl DetailsSidebar {
             subagents,
             workers_tab_presence(workers, workers_error.is_some()),
         );
+        // Shimmer de atividade: a strip inteira brilha enquanto ha worker
+        // rodando ou workflow/subagente em voo — um sinal por widget, em vez de
+        // um spinner por linha.
+        let shimmer = snapshot_is_active(&snapshot)
+            .then(|| crate::loaders::activity_shimmer(crate::theme::ink(0.07), cx.entity_id(), cx));
         let tabs = div()
+            .relative()
+            .overflow_hidden()
             .h(px(34.0))
             .px(px(7.0))
             .flex()
@@ -1389,6 +1397,7 @@ impl DetailsSidebar {
             .gap(px(3.0))
             .border_b_1()
             .border_color(theme.border.opacity(0.55))
+            .children(shimmer)
             .child(self.render_workers_tab(
                 ChatWorkersTab::Workflows,
                 "Workflows",

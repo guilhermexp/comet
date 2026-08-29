@@ -3,8 +3,30 @@ use std::collections::{HashMap, HashSet};
 use zeron_workers_unpeel::{WorkersBootstrap, WorkersSession};
 
 use super::presentation::{
-    SessionIndicator, runtime_icon_path, runtime_spinner_tint, session_indicator,
+    SPINNER_FRAMES, SessionIndicator, runtime_icon_path, runtime_spinner_tint, session_indicator,
 };
+
+/// O glifo do spinner e a contagem de agentes, **separados**.
+///
+/// Devolver as duas partes em vez de uma string pronta e o que deixa a menu bar
+/// pintar a contagem menor e mais apagada que o spinner: ela precisa do limite
+/// entre os dois em unidades UTF-16, e recalcular isso fatiando uma string ja
+/// concatenada seria adivinhar. `(2)` no mesmo corpo monoespaçado de 15pt do
+/// spinner lia como um bloco ao lado dele, nao como anotacao.
+///
+/// A contagem ja vem com o espaco fino que a separa: ele pertence ao trecho
+/// pequeno, senao o vao fica largo demais para o tamanho reduzido.
+///
+/// So `Working` recebe contagem — `Blocked` e `Unread` pintam marcador fixo, e
+/// contar ali seria contar outra coisa (bloqueio e nao-lido nao sao "rodando").
+/// Total de proposito: o `frame` vem de um contador que o chamador incrementa,
+/// e um modulo aqui e mais barato que um invariante espalhado.
+pub fn spinner_parts(frame: usize, running: usize) -> (&'static str, String) {
+    (
+        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+        format!("\u{2009}{running}"),
+    )
+}
 
 pub const POPOVER_WIDTH: f64 = 332.0;
 pub const CONTENT_WIDTH: f64 = 320.0;
@@ -18,6 +40,11 @@ pub const FOOTER_HEIGHT: f64 = 28.0;
 pub enum WorkersMenuBarMode {
     Working {
         blocked: bool,
+        /// Quantos agentes estao rodando agora — `jobs.len()`. Viaja DENTRO da
+        /// variante porque so faz sentido enquanto ha spinner: um contador
+        /// paralelo poderia sobreviver ao estado que o justifica e pintar
+        /// "(2)" numa menu bar parada.
+        running: usize,
     },
     Blocked,
     Unread,
@@ -131,6 +158,7 @@ pub fn project_activity_menu(snapshot: &WorkersBootstrap) -> WorkersActivityMenu
     let mode = if !jobs.is_empty() {
         WorkersMenuBarMode::Working {
             blocked: !blockers.is_empty(),
+            running: jobs.len(),
         }
     } else if !blockers.is_empty() {
         WorkersMenuBarMode::Blocked
@@ -289,8 +317,43 @@ mod tests {
                 session("blocked", "blocked", false),
             ])
             .mode,
-            WorkersMenuBarMode::Working { blocked: true }
+            WorkersMenuBarMode::Working {
+                blocked: true,
+                running: 1
+            }
         );
+    }
+
+    /// A contagem tem que ser `jobs.len()`, nao o total de sessoes: bloqueado e
+    /// nao-lido aparecem no popover mas nao estao rodando, e contar tudo daria
+    /// um numero que nao bate com o que o usuario ve girando.
+    #[test]
+    fn the_menu_bar_counts_running_agents_not_every_session() {
+        assert_eq!(
+            menu(vec![
+                session("working-a", "working", false),
+                session("working-b", "working", false),
+                session("blocked", "blocked", false),
+                session("done", "done", true),
+            ])
+            .mode,
+            WorkersMenuBarMode::Working {
+                blocked: true,
+                running: 2
+            }
+        );
+
+        // Partes separadas: a menu bar pinta a segunda menor e apagada.
+        assert_eq!(super::spinner_parts(0, 2), ("\u{280b}", "\u{2009}2".into()));
+        // O contador de frame do chamador da a volta sozinho; a funcao aguenta
+        // um indice fora da faixa sem entrar em panico.
+        assert_eq!(
+            super::spinner_parts(super::SPINNER_FRAMES.len(), 1),
+            ("\u{280b}", "\u{2009}1".into())
+        );
+        // O glifo do spinner e sempre uma unidade UTF-16 — e disso que sai o
+        // `location` do range da contagem, sem fatiar string.
+        assert_eq!(super::spinner_parts(0, 12).0.encode_utf16().count(), 1);
     }
 
     #[test]

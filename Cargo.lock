@@ -9457,7 +9457,6 @@ dependencies = [
  "zeron-harness",
  "zeron-proto",
  "zeron-rpc",
- "zeron-update",
  "zeron-workers-unpeel",
 ]
 

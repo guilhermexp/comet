@@ -950,15 +950,6 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
-enum UpdateFlow {
-    Idle,
-    Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
-    Ready(PathBuf),
-    Failed(SharedString),
-}
-
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
 /// `RestartPending` survives only as the fallback when the in-place swap
@@ -1336,17 +1327,6 @@ pub struct Shell {
     /// dismisses. The tone rides WITH the text: two parallel fields would let a
     /// caller set a success message and leave the previous failure's red on it.
     sidebar_notice: Option<SidebarNotice>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
-    /// download/stage of it has come in this process.
-    update_flow: UpdateFlow,
-    update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
-    /// How this binary was installed — decides the strip's click behavior.
-    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -1744,10 +1724,6 @@ impl Shell {
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
-            update_flow: UpdateFlow::Idle,
-            update_task: None,
-            update_dismissed: None,
-            install: zeron_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -5722,10 +5698,6 @@ impl Shell {
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
             })
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
-            })
             // Inline notice: mutation failures and export outcomes.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 let ink = if notice.ok {
@@ -5755,152 +5727,6 @@ impl Shell {
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
-    }
-
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
-
-        let (label, clickable): (SharedString, bool) = if mac_app {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // Dark-purple GLASS tint (user request), not the 400-level accent as
-        // a fill: deep pigment at partial alpha tints the blur showing
-        // through instead of compositing into the slab that a bright indigo
-        // fill produced (earlier user report). Light chrome gets a lavender
-        // accent wash instead — dark purple under indigo-600 text goes muddy.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            match theme.appearance {
-                crate::theme::Appearance::Dark => {
-                    let purple = crate::theme::oklch(0.35, 0.12, 277.0);
-                    (purple.opacity(0.45), purple.opacity(0.60))
-                }
-                crate::theme::Appearance::Light => {
-                    (theme.accent.opacity(0.10), theme.accent.opacity(0.16))
-                }
-            }
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
-    }
-
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
-            cx.notify();
-            return;
-        }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
-    }
-
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
-    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
-        self.update_flow = UpdateFlow::Downloading;
-        let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
-        });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = match download.await {
-                Ok(Ok(staged)) => Ok(staged),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
-            };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
-                    }
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
-    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
-            return;
-        };
-        match zeron_update::apply_mac_app(&staged, &bundle) {
-            Ok(()) => {
-                zeron_update::relaunch_app_after_exit(&bundle);
-                cx.quit();
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
-            }
-        }
     }
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise

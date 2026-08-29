@@ -119,6 +119,10 @@ if [ "$scenario" = "malformed" ]; then
 fi
 
 if [ "$scenario" = "out-of-order" ]; then
+  # A v2 do protocolo e negociada antes de qualquer comando (ver
+  # `negotiate_chunked_frames`), entao ela chega antes do par fora de ordem.
+  read -r negotiate
+  respond "$negotiate" '{"protocolVersion":2}'
   read -r first
   read -r second
   respond "$second" '{"models":[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}]}'
@@ -126,8 +130,27 @@ if [ "$scenario" = "out-of-order" ]; then
   respond "$first" '{"sessionId":"s-1","thinkingLevel":"high"}'
 fi
 
+# Um chunk de `count` pedacos: cada fatia de BYTES vai em base64 propria, que e
+# como o `omp` parte um frame acima de 1 MiB.
+emit_chunked() {
+  frame=$1
+  total=$(printf '%s' "$frame" | wc -c | tr -d ' ')
+  half=$((total / 2))
+  first_half=$(printf '%s' "$frame" | dd bs=1 count="$half" 2>/dev/null | base64 | tr -d '\n')
+  second_half=$(printf '%s' "$frame" | dd bs=1 skip="$half" 2>/dev/null | base64 | tr -d '\n')
+  emit "{\"type\":\"rpc_chunk\",\"chunkId\":\"rpc-1\",\"index\":0,\"count\":2,\"byteLength\":$total,\"data\":\"$first_half\"}"
+  emit "{\"type\":\"rpc_chunk\",\"chunkId\":\"rpc-1\",\"index\":1,\"count\":2,\"byteLength\":$total,\"data\":\"$second_half\"}"
+}
+
 while IFS= read -r line; do
   case "$(field type "$line")" in
+    negotiate_protocol)
+      if [ "$scenario" = "refuses-chunked-frames" ]; then
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"negotiate_protocol\",\"success\":false,\"error\":\"Unsupported RPC protocol version: 2\"}"
+      else
+        respond "$line" '{"protocolVersion":2}'
+      fi
+      ;;
     get_state)
       if [ "$scenario" = "missing-session" ]; then
         respond "$line" '{"thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
@@ -136,6 +159,10 @@ while IFS= read -r line; do
       fi
       ;;
     get_available_models)
+      if [ "$scenario" = "chunked-models" ]; then
+        emit_chunked "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"get_available_models\",\"success\":true,\"data\":{\"models\":[{\"provider\":\"anthropic\",\"id\":\"shared\",\"name\":\"Claude Shared\",\"reasoning\":false},{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\",\"name\":\"GPT-5.6 Sol\",\"reasoning\":true}]}}"
+        continue
+      fi
       respond "$line" '{"models":[{"provider":"anthropic","id":"shared","name":"Claude Shared","reasoning":false},{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"contextWindow":400000},{"provider":"openai-codex","id":"shared","name":"Codex Shared","reasoning":true}]}'
       ;;
     get_available_commands)

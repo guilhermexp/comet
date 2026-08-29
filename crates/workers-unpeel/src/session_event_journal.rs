@@ -217,6 +217,15 @@ fn handle_connection(
     sequence: u64,
     last_entry: Option<&SessionHookJournalEntry>,
 ) -> Result<Option<SessionHookJournalEntry>, String> {
+    // O listener e nao-bloqueante para o loop de accept poder checar o
+    // shutdown, e em macOS/BSD o socket ACEITO herda esse `O_NONBLOCK` —
+    // `set_read_timeout` nao o limpa, `SO_RCVTIMEO` e ignorado enquanto ele
+    // valer. Sem isto, um POST cujos bytes ainda nao chegaram no instante do
+    // accept devolve `WouldBlock` na primeira leitura, `read_request` sai por
+    // `?` sem responder nada, e o hook e descartado em silencio: o cliente le
+    // resposta vazia. Media, nao teoria — a sonda mostrou um `WouldBlock` por
+    // falha, com correlacao exata.
+    stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
     let (path, body) = read_request(&mut stream)?;
@@ -489,6 +498,46 @@ mod tests {
         assert!(!accept_error_is_retryable(
             std::io::ErrorKind::ConnectionAborted
         ));
+    }
+
+    /// O socket ACEITO nao pode ficar nao-bloqueante.
+    ///
+    /// O listener e nao-bloqueante de proposito (o loop de accept precisa
+    /// checar o shutdown), e macOS/BSD propaga esse `O_NONBLOCK` para o socket
+    /// aceito. `set_read_timeout` nao desfaz — `SO_RCVTIMEO` nem e consultado
+    /// enquanto `O_NONBLOCK` valer. O sintoma era um hook descartado em
+    /// silencio sempre que os bytes do POST chegassem depois do accept: a
+    /// primeira leitura devolvia `WouldBlock`, `read_request` saia por `?` sem
+    /// escrever resposta, e o cliente lia string vazia. Na suite isso aparecia
+    /// como flake sob paralelismo (falhava 5/5 rodadas, passava com
+    /// `--test-threads=1`); em producao e evento de lifecycle perdido.
+    #[test]
+    fn an_accepted_hook_connection_blocks_for_a_body_that_lags_the_accept() {
+        let directory = tempfile::tempdir().unwrap();
+        let ingress = start("worker-lag", directory.path()).unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", ingress.port)).unwrap();
+        // O accept acontece agora; os bytes so vem depois. E essa janela que o
+        // `O_NONBLOCK` herdado transformava em descarte silencioso.
+        std::thread::sleep(Duration::from_millis(120));
+
+        let body = r#"{"hook_event_name":"Start","unpeel_runtime_generation":1}"#;
+        write!(
+            stream,
+            "POST /hook/worker-lag HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(
+            response.contains("200 OK"),
+            "hook que chega depois do accept tem que ser aceito, nao descartado: {response:?}"
+        );
+        drop(ingress);
+        assert_eq!(read_entries(directory.path()).unwrap().unwrap().len(), 1);
     }
 
     #[test]

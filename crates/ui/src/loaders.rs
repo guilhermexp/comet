@@ -390,6 +390,49 @@ fn hero_ascii(theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// Banda de brilho varrendo a horizontal do pai — "tem trabalho rodando aqui",
+/// sem roubar espaco de layout nem pedir um spinner por linha. O pai precisa
+/// ser `relative()` e `overflow_hidden()`; a banda pinta como fundo, entao ela
+/// entra como PRIMEIRO filho e nunca por cima do texto.
+///
+/// Reduced motion devolve fase 0, que estaciona a banda inteira fora da vista:
+/// sem movimento nao ha shimmer, e nada e' agendado.
+pub fn activity_shimmer(tint: gpui::Hsla, view: EntityId, cx: &mut App) -> impl IntoElement {
+    /// Largura da banda como fracao do pai.
+    const BAND: f32 = 0.34;
+    let phase = motion::pulse_delta(&motion::ACTIVITY_SHIMMER, view, cx);
+    // Entra inteira pela esquerda, sai inteira pela direita.
+    let left = phase * (1.0 + BAND) - BAND;
+    let clear = tint.opacity(0.0);
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(gpui::relative(left))
+        .w(gpui::relative(BAND))
+        .flex()
+        .child(
+            div()
+                .h_full()
+                .w(gpui::relative(0.5))
+                .bg(gpui::linear_gradient(
+                    90.0,
+                    gpui::linear_color_stop(clear, 0.0),
+                    gpui::linear_color_stop(tint, 1.0),
+                )),
+        )
+        .child(
+            div()
+                .h_full()
+                .w(gpui::relative(0.5))
+                .bg(gpui::linear_gradient(
+                    90.0,
+                    gpui::linear_color_stop(tint, 0.0),
+                    gpui::linear_color_stop(clear, 1.0),
+                )),
+        )
+}
+
 /// The landing page's hero comet (apps/landing/public/index.html
 /// `.hero-ascii`), kept as an asset so both surfaces render the same art.
 const HERO_ASCII: &str = include_str!("../assets/hero.txt");
