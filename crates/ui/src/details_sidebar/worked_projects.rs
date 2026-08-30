@@ -58,9 +58,9 @@ pub fn worked_projects(
     let roots: Vec<&CandidateRoot> = candidate_roots
         .iter()
         .filter(|cand| {
-            !candidate_roots.iter().any(|other| {
-                other.root != cand.root && other.root.starts_with(&format!("{}/", cand.root))
-            })
+            !candidate_roots
+                .iter()
+                .any(|other| is_strictly_within(&other.root, &cand.root))
         })
         .collect();
 
@@ -197,10 +197,19 @@ fn consider_path(
         if first_order_by_project_id.contains_key(&cand.project.id) {
             continue;
         }
-        if path == cand.root || path.starts_with(&format!("{}/", cand.root)) {
+        if path == cand.root || is_strictly_within(&path, &cand.root) {
             first_order_by_project_id.insert(cand.project.id.clone(), *order);
         }
     }
+}
+
+/// `true` when `path` sits strictly below `root`, on a component boundary.
+///
+/// Boundary-checked so `/a/kanna` never matches the root `/a/kanwas`, and
+/// allocation-free because this runs per (path token × root) on the render path.
+fn is_strictly_within(path: &str, root: &str) -> bool {
+    path.strip_prefix(root)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Scans path tokens starting with `/` or `~/` in free text without regex.
