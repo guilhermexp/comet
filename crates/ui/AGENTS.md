@@ -22,10 +22,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Altura de linha em code block = linhas × line-height, independente do highlight; o highlight roda time-sliced em background e entra como run de texto (paint-only).
 - Transcript é por **bloco**, não por mensagem: id estável `msgId#blockId`, turno vivo não splitado, re-split na persistência. Eco otimista compartilha o id cunhado no cliente pra persistência não piscar.
 - **A entrega do export mora no shell, a formatação não**: as seis ações do menu resolvem as entries e escolhem destino; `chat_export.rs` continua puro. O transcript vem da memória SÓ quando a linha clicada é a selecionada (`export_reads_memory`) — qualquer outra abre um `WatchDocMessages` transitório e consome apenas o frame `Reset`, porque exportar o chat errado é uma falha silenciosa que produz arquivo plausível. Resultado (sucesso e falha) sai pelo `sidebar_notice`, nunca por `notify::post`: banner de desktop é canal de background e é suprimido justamente com o app em foco. `SidebarNotice` carrega o tom junto do texto para que sucesso não herde o vermelho da falha anterior.
-- **Chat Transcript Export é uma projeção pura do transcript**: `chat_export.rs` percorre `&[SessionMessageEntry]` uma vez para formar um único `ExportDoc`, e Markdown/Text/JSON derivam somente dele. Nunca lê Run Journal, resolve `output_ref`/`diff_ref` ou importa gpui/I/O; tools usam `zeron_proto::view::tool_chip_content`, e só o `ToolCall` já sanitizado decide quais comando/path aparecem.
-  `ExportDoc.messages` usa tipos próprios (`ExportMessage`/`ExportPart`/`ExportTool`),
-  nunca `SessionMessageEntry` bruto: output, diff, refs, reasoning, input e
-  workflow deixam de ser representáveis antes dos três renderers.
+- **Chat Transcript Export usa duas fontes explícitas**: `ExportDoc.messages` é uma projeção pura de `&[SessionMessageEntry]`, enquanto o índice de artifacts recebe também os CLI Workers já projetados pelo `WorkersModel`. O shell captura ambos antes de `cx.spawn`; falha no join de workers degrada para lista vazia. Nunca lê Run Journal, resolve `output_ref`/`diff_ref` ou importa gpui/I/O; tools usam `zeron_proto::view::tool_chip_content`, e só o `ToolCall` já sanitizado decide quais comando/path aparecem.
+  `ExportDoc.messages` usa tipos próprios (`ExportMessage`/`ExportPart`/`ExportTool`), nunca `SessionMessageEntry` bruto: output, diff, refs, reasoning, input e workflow deixam de ser representáveis antes dos três renderers. Workers carregam título + session id e preservam a ordem determinística de `project_chat_workers`; sem worker, os três formatos permanecem byte-idênticos ao export anterior.
 - Chips GitHub/YouTube existem só em mensagens de usuário já enviadas: `url_chips.rs` segmenta e projeta o texto uma vez em `rows_for_entry`, e a row cacheia spans clicáveis. O paint só consome esses spans; input, assistente e outras URLs continuam texto, a pontuação final fica fora do chip e a mensagem persistida nunca muda.
 - Cards do usuário são sticky por turno: um clone paint-only do renderer existente ocupa o inset do runway e é empurrado pelo próximo user row. A geometria é per-chat, não altera altura da lista, não substitui o runway e não duplica o original quando ele já ocupa a posição.
 - O wrapper externo do sticky é transparente; a oclusão/blur e o bloqueio de mouse/hover subjacente ficam limitados ao card interno arredondado, enquanto wheel/touch continuam chegando ao transcript.
@@ -112,6 +110,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/{popover,pickers,composer}.rs` (completion/model popups) | unit + compile | `cargo test -p zeron-ui scrollbar_metrics && cargo test -p zeron-ui composer` |
 | `src/shell/{spaces,tabs}.rs` (ordem visual e atalhos de Chat) | unit | `cargo test -p zeron-ui shell::spaces::tests && cargo test -p zeron-ui shell::tabs::cycle_tests` |
 | `src/mermaid_preview.rs` (fit, slack de pan, fatores de gesto) | unit — matemática pura; a lightbox em si é visual | `cargo test -p zeron-ui --lib mermaid_preview` · `ZERON_MOCK_MEDIA=1 scripts/dev-demo.sh` |
+| `src/settings/accounts.rs` (ordem de provedores, ausência de add em managed, thresholds e format_reset) | unit | `cargo test -p zeron-ui accounts` |
 | `src/settings/projects.rs` (filtro, git remoto, editor/config e decisões de ícone) | unit; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
 | `src/details_sidebar/worked_projects.rs` (Worked Projects, Leaf Root, expansão de home, primeiro contato) | unit | `cargo test -p zeron-ui worked_projects` |
@@ -148,3 +147,8 @@ Subárvores sem doc próprio (ainda não têm regra local além da desta pasta):
 - **Falha de setup e sucesso parcial visível.** O worktree criado continua
   selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
   ao refresh seguinte e nenhum Worker é lançado automaticamente nele.
+- **Settings → Accounts renderiza provedores na ordem fixa Claude, Codex, Kimi,
+  Antigravity, Cursor.** Contas gerenciadas (Kimi Code, Antigravity) chegam da
+  engine `active: true, switchable: false`; a linha não expõe Add account,
+  Switch nem Forget, e a autenticação permanece nos CLIs. O empty state das
+  duas compartilha a cópia de assinatura gerenciada não detectada.

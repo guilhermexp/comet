@@ -90,3 +90,28 @@ Test: UI usage unit test asserting 4th row, label "Antigravity", weekly summary 
 - **WHEN** the snapshot contains Antigravity usage windows
 - **THEN** Antigravity renders fourth in the list with `Weekly <remaining>%` summary
 - **AND** expanding Antigravity lists all 4 windows with distinguishable labels (`Weekly`, `5h`, `Weekly (Claude/GPT)`, `5h (Claude/GPT)`)
+
+### Requirement: Render managed Antigravity account in Settings Accounts
+
+The Settings Accounts page SHALL render Antigravity as a managed provider section positioned between Kimi Code and Cursor, displaying active managed account usage meters without offering Add account, Switch, or Forget actions.
+
+#### Scenario: Managed Antigravity account is present with usage windows
+Test: headed GPUI smoke in Settings → Accounts verifying provider ordering and 4 usage meter bars.
+
+- **WHEN** the account snapshot contains an active managed Antigravity account with usage windows
+- **THEN** Antigravity renders in `Settings → Accounts` between Kimi Code and Cursor
+- **AND** displays the 4 usage meter bars with `N% used` and `resets <when>` information
+
+#### Scenario: No Antigravity credential exists
+Test: headed GPUI smoke in Settings → Accounts verifying the managed Antigravity empty-state copy.
+
+- **WHEN** the account snapshot contains no Antigravity accounts
+- **THEN** the Antigravity section renders the empty-state copy "No Antigravity managed subscription detected on this device."
+- **AND** does not display an Add account action
+
+#### Scenario: Managed account actions are disabled
+Test: UI accounts unit test asserting `provider_can_add(HarnessId::Antigravity)` is false plus engine unit coverage that the managed account is active and non-switchable.
+
+- **WHEN** the Antigravity account section is rendered
+- **THEN** the section header does not render an "Add account" button
+- **AND** the account row does not offer "Switch" or "Forget" actions
