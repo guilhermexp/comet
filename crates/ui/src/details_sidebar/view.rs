@@ -26,6 +26,14 @@ impl Default for DetailsSidebarPreferences {
 pub struct WorkedProjectsCacheKey {
     pub context_key: String,
     pub transcript_len: usize,
+    /// Total tool/text parts across the transcript.
+    ///
+    /// Entry count alone is NOT enough: a streaming turn grows the SAME entry,
+    /// and `TranscriptFrame::Delta` upserts it by removing and reinserting at
+    /// the same id (`zeron_doc::apply_transcript_frame`), so `len()` is
+    /// unchanged while a new `ReadFile`/`Exec` part lands. Without this the
+    /// card freezes for the whole turn — exactly when it is being watched.
+    pub parts_total: usize,
     pub projects_revision: u64,
 }
 
@@ -192,6 +200,7 @@ impl DetailsSidebarState {
         let key = WorkedProjectsCacheKey {
             context_key: context.key.clone(),
             transcript_len: transcript.len(),
+            parts_total: transcript.iter().map(|entry| entry.parts.len()).sum(),
             projects_revision: projects_snapshot_fingerprint(projects),
         };
         if self.worked_projects_cache.as_ref().map(|c| &c.key) != Some(&key) {
@@ -2621,6 +2630,41 @@ mod tests {
         let key4 = state.worked_projects_cache_key().unwrap().clone();
         assert_ne!(key3, key4);
         assert_eq!(key4.context_key, "two");
+
+        // 6. A STREAMING turn grows the same entry: entry count is unchanged
+        //    (`TranscriptFrame::Delta` upserts by id), so only `parts_total`
+        //    can catch it. Without it the card freezes for the whole turn.
+        let mut streaming = vec![entry1.clone()];
+        let MessagePart::Tool { .. } = &streaming[0].parts[0] else {
+            panic!("fixture must start with a tool part");
+        };
+        streaming[0].parts.push(MessagePart::Tool {
+            id: "t2".to_string(),
+            call: ToolCall::ReadFile {
+                path: "/tmp/proj2/other.rs".to_string(),
+            },
+            diff: None,
+            output: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            execution: None,
+            resolved: true,
+            is_error: false,
+        });
+        let before = state.worked_projects(&ctx_one, &[entry1.clone()], &projects_modified, None);
+        let key_before = state.worked_projects_cache_key().unwrap().clone();
+        let after = state.worked_projects(&ctx_one, &streaming, &projects_modified, None);
+        let key_after = state.worked_projects_cache_key().unwrap().clone();
+        assert_eq!(key_before.transcript_len, key_after.transcript_len);
+        assert_ne!(key_before, key_after);
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 2, "the new part's project must appear");
     }
 
     #[test]

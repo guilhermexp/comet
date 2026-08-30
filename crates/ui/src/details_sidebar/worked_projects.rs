@@ -114,26 +114,26 @@ pub fn worked_projects(
                 ToolCall::Search {
                     path: Some(path), ..
                 } => {
-                    scan_path_tokens(path, |token| {
+                    for_each_structured_path(path, |segment| {
                         consider_path(
-                            token,
+                            segment,
                             home_str.as_deref(),
                             &roots,
                             &mut first_order_by_project_id,
                             &mut order,
-                            true,
+                            false,
                         );
                     });
                 }
                 ToolCall::Glob { pattern } => {
-                    scan_path_tokens(pattern, |token| {
+                    for_each_structured_path(pattern, |segment| {
                         consider_path(
-                            token,
+                            segment,
                             home_str.as_deref(),
                             &roots,
                             &mut first_order_by_project_id,
                             &mut order,
-                            true,
+                            false,
                         );
                     });
                 }
@@ -226,6 +226,23 @@ fn consider_path(
 fn is_strictly_within(path: &str, root: &str) -> bool {
     path.strip_prefix(root)
         .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Splits a STRUCTURED path field on the documented `;` multi-root separator.
+///
+/// `Search { path }` and `Glob { pattern }` carry either one exact path or a
+/// `;`-delimited list of roots ("src; tests"), never free prose — so they must
+/// NOT go through [`scan_path_tokens`], which breaks on whitespace and would
+/// truncate a registered project whose folder name contains a space
+/// ("JK Checklist App" -> ".../JK"). Trailing punctuation is likewise kept:
+/// a directory may legitimately end in `)`, as in "Backup (2)".
+fn for_each_structured_path(field: &str, mut on_path: impl FnMut(&str)) {
+    for segment in field.split(';') {
+        let segment = segment.trim();
+        if !segment.is_empty() {
+            on_path(segment);
+        }
+    }
 }
 
 /// Scans path tokens starting with `/` or `~/` in free text without regex.
@@ -927,5 +944,49 @@ mod tests {
         // Toggle back to expanded
         state.toggle_projects_worked_collapsed();
         assert!(!state.projects_worked_collapsed());
+    }
+
+    /// A registered project folder may contain spaces ("JK Checklist App").
+    /// `Search`/`Glob` carry a structured path, so they must be split on the
+    /// documented `;` separator only — routing them through the free-text
+    /// scanner truncates at the first space and silently loses the project.
+    #[test]
+    fn structured_search_and_glob_paths_survive_spaces_and_punctuation() {
+        let own = Path::new("/Users/gui/.orchestrator");
+        let home = Path::new("/Users/gui");
+
+        let spaced = make_project(
+            "jk",
+            "JK Checklist App",
+            "/Users/gui/JK CLIENT/JK Checklist App",
+        );
+        let parens = make_project("bk", "Backup (2)", "/Users/gui/Docs/Backup (2)");
+
+        let entry = assistant_entry(vec![
+            ToolCall::Search {
+                pattern: "fn main".to_string(),
+                path: Some("/Users/gui/JK CLIENT/JK Checklist App".to_string()),
+            },
+            ToolCall::Glob {
+                pattern: "/Users/gui/Docs/Backup (2)/**/*.md".to_string(),
+            },
+        ]);
+
+        let result = worked_projects(&[entry], &[spaced, parens], own, Some(home));
+        assert_eq!(
+            result,
+            vec![
+                WorkedProject {
+                    id: "jk".to_string(),
+                    name: "JK Checklist App".to_string(),
+                    path: "/Users/gui/JK CLIENT/JK Checklist App".to_string(),
+                },
+                WorkedProject {
+                    id: "bk".to_string(),
+                    name: "Backup (2)".to_string(),
+                    path: "/Users/gui/Docs/Backup (2)".to_string(),
+                },
+            ]
+        );
     }
 }

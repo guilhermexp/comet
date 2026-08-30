@@ -19,6 +19,14 @@ Test: unit — derivation across all supported tool call variants.
 - **THEN** candidate paths are extracted from each supported variant
 - **AND** matching registered projects appear in the worked projects list
 
+#### Scenario: Structured path fields are split only on the multi-root separator
+Test: unit — derivation with spaced and parenthesised project folders.
+
+- **WHEN** an assistant invokes `Search` or `Glob`, whose path field carries either one exact path or a `;`-delimited list of roots
+- **THEN** the field is split on `;` alone, never scanned as free text
+- **AND** a registered project whose folder name contains a space or ends in punctuation still matches
+- **AND** only `Exec` commands, which are free prose, are scanned for path tokens
+
 #### Scenario: The universe of worked projects is restricted to Registered Projects
 Test: unit — derivation against registered projects list.
 
