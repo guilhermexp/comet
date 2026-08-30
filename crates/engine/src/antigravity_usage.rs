@@ -29,6 +29,8 @@ pub(crate) enum AntigravityUsageError {
     UnreadableDirectory,
     #[error("Antigravity token refresh request failed")]
     RefreshRequest,
+    #[error("Antigravity OAuth client is not configured")]
+    RefreshConfiguration,
     #[error("Antigravity token refresh returned an invalid payload")]
     RefreshPayload,
     #[error("Antigravity token refresh failed: {0}")]
@@ -41,6 +43,25 @@ pub(crate) enum AntigravityUsageError {
     UsageRequest,
     #[error("Antigravity Usage returned an invalid payload")]
     UsagePayload,
+}
+
+struct OAuthClientConfig {
+    client_id: String,
+    client_secret: String,
+}
+
+fn oauth_client_config(
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> Option<OAuthClientConfig> {
+    let client_id = client_id.map(str::trim).filter(|value| !value.is_empty())?;
+    let client_secret = client_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(OAuthClientConfig {
+        client_id: client_id.to_string(),
+        client_secret: client_secret.to_string(),
+    })
 }
 
 /// Intentionally has no `Debug` or `Display`: those representations could
@@ -115,6 +136,7 @@ pub(crate) struct AntigravityUsage {
     credential_dir: PathBuf,
     usage_url: String,
     token_url: String,
+    oauth_client: Option<OAuthClientConfig>,
     http: reqwest::Client,
     include_keychain: bool,
     source_fingerprint: Mutex<Option<CredentialFingerprint>>,
@@ -130,10 +152,13 @@ impl AntigravityUsage {
             std::env::var_os("ANTIGRAVITY_CONFIG_DIR").as_deref(),
             &home_dir(),
         );
+        let client_id = std::env::var("COMET_ANTIGRAVITY_CLIENT_ID").ok();
+        let client_secret = std::env::var("COMET_ANTIGRAVITY_CLIENT_SECRET").ok();
         Self::new_inner(
             credential_dir,
             CANONICAL_USAGE_URL.to_string(),
             CANONICAL_TOKEN_URL.to_string(),
+            oauth_client_config(client_id.as_deref(), client_secret.as_deref()),
             HTTP_TIMEOUT,
             USAGE_TTL,
             true,
@@ -152,6 +177,7 @@ impl AntigravityUsage {
             credential_dir,
             usage_url,
             token_url,
+            oauth_client_config(Some("test-client-id"), Some("test-client-secret")),
             timeout,
             usage_ttl,
             false,
@@ -162,6 +188,7 @@ impl AntigravityUsage {
         credential_dir: PathBuf,
         usage_url: String,
         token_url: String,
+        oauth_client: Option<OAuthClientConfig>,
         timeout: Duration,
         usage_ttl: Duration,
         include_keychain: bool,
@@ -175,6 +202,7 @@ impl AntigravityUsage {
             credential_dir,
             usage_url,
             token_url,
+            oauth_client,
             http,
             include_keychain,
             source_fingerprint: Mutex::new(None),
@@ -201,6 +229,7 @@ impl AntigravityUsage {
             credential_dir,
             usage_url,
             token_url,
+            oauth_client: oauth_client_config(Some("test-client-id"), Some("test-client-secret")),
             http,
             include_keychain: false,
             source_fingerprint: Mutex::new(None),
@@ -244,7 +273,21 @@ impl AntigravityUsage {
                 .clone()
                 .unwrap_or(cred.clone());
             if current.needs_refresh(now) {
-                match refresh_token(&self.http, &self.token_url, &current.refresh_token, now).await
+                let Some(oauth_client) = self.oauth_client.as_ref() else {
+                    return AntigravityUsageSnapshot::unavailable(
+                        true,
+                        AntigravityUsageError::RefreshConfiguration,
+                        current.email.clone(),
+                    );
+                };
+                match refresh_token(
+                    &self.http,
+                    &self.token_url,
+                    oauth_client,
+                    &current.refresh_token,
+                    now,
+                )
+                .await
                 {
                     Ok((access_token, expires_at, email)) => {
                         let updated = AntigravityCredential {
@@ -482,12 +525,13 @@ pub(crate) fn select_best_credential(
 async fn refresh_token(
     http: &reqwest::Client,
     token_url: &str,
+    oauth_client: &OAuthClientConfig,
     refresh_token: &str,
     now: i64,
 ) -> Result<(String, i64, Option<String>), AntigravityUsageError> {
     let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+        ("client_id", oauth_client.client_id.as_str()),
+        ("client_secret", oauth_client.client_secret.as_str()),
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
     ];
@@ -796,6 +840,19 @@ mod tests {
   ],
   "description": "Within each group, models share a weekly limit and a 5-hour limit."
 }"#;
+
+    #[test]
+    fn oauth_client_config_requires_a_complete_non_empty_pair() {
+        assert!(oauth_client_config(None, None).is_none());
+        assert!(oauth_client_config(Some("client-id"), None).is_none());
+        assert!(oauth_client_config(None, Some("client-secret")).is_none());
+        assert!(oauth_client_config(Some("  "), Some("client-secret")).is_none());
+        assert!(oauth_client_config(Some("client-id"), Some("  ")).is_none());
+
+        let configured = oauth_client_config(Some(" client-id "), Some(" client-secret ")).unwrap();
+        assert_eq!(configured.client_id, "client-id");
+        assert_eq!(configured.client_secret, "client-secret");
+    }
 
     async fn antigravity_auth_server()
     -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
@@ -1154,5 +1211,38 @@ mod tests {
         assert_eq!(recovered.usage_windows.len(), 4);
         server.await.unwrap();
         assert_eq!(*requests.lock().unwrap(), ["/usage", "/token", "/usage"]);
+    }
+
+    #[tokio::test]
+    async fn expired_token_without_oauth_client_reports_redacted_configuration_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("antigravity-user@example.com.json"),
+            json!({
+                "access_token": "expired-access",
+                "refresh_token": "private-refresh",
+                "expired": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let usage = AntigravityUsage::new_inner(
+            dir.path().to_path_buf(),
+            "http://127.0.0.1:1/usage".into(),
+            "http://127.0.0.1:1/token".into(),
+            None,
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+            false,
+        )
+        .unwrap();
+
+        let snapshot = usage.snapshot(true, 2_000_000_000).await;
+
+        assert!(snapshot.present);
+        let warning = snapshot.warning.unwrap();
+        assert_eq!(warning, "Antigravity OAuth client is not configured");
+        assert!(!warning.contains("expired-access"));
+        assert!(!warning.contains("private-refresh"));
     }
 }

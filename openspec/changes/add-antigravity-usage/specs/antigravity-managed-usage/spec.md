@@ -30,6 +30,8 @@ Test: engine unit test covering missing, disabled (`disabled: true`), and malfor
 
 The system SHALL refresh expiring Antigravity access tokens through the official Google OAuth token endpoint and hold the refreshed access token and expiry in memory without writing back to disk or Keychain.
 
+The OAuth client configuration SHALL be supplied at runtime through `COMET_ANTIGRAVITY_CLIENT_ID` and `COMET_ANTIGRAVITY_CLIENT_SECRET`; it SHALL NOT be embedded in source code or release artifacts.
+
 #### Scenario: Refresh succeeds near expiry
 Test: engine unit test for in-memory token refresh using mock HTTP OAuth endpoint.
 
@@ -44,6 +46,14 @@ Test: engine unit test asserting error handling and redacted diagnostics on refr
 - **WHEN** token refresh fails with an authentication, network, or server error
 - **THEN** Comet reports a redacted provider warning
 - **AND** does not corrupt existing credentials
+
+#### Scenario: OAuth client configuration is unavailable
+Test: engine unit test asserting an expired token produces a redacted configuration warning without making a network request.
+
+- **WHEN** an access token requires refresh and either OAuth client environment variable is missing or empty
+- **THEN** Comet reports that the Antigravity OAuth client is not configured
+- **AND** does not expose the access token, refresh token, client ID, or client secret
+- **AND** a still-valid access token remains eligible for quota requests without that configuration
 
 ### Requirement: Fetch managed Antigravity quota summary
 

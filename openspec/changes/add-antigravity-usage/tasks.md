@@ -4,7 +4,7 @@
 
 | Fase | U-IDs | Seções | Depends on | Audit state | Audited commit | Entrega | UAT mode |
 |---|---|---|---|---|---|---|---|
-| F1 | A1-A5 | §1-§5 | — | implemented | — | Antigravity managed quota end-to-end | human-driven |
+| F1 | A1-A6 | §1-§5 | — | implemented | — | Antigravity managed quota end-to-end | human-driven |
 
 ## 1. Wire Types and Identity
 
@@ -30,3 +30,4 @@
 **must_haves:** All unit tests pass, binary builds, code is formatted, DOX pass updated in engine and UI.
 
 - [x] A5 Run full verification suite and update DOX contracts in `crates/engine/AGENTS.md` and `crates/ui/AGENTS.md`. files: `crates/engine/AGENTS.md`, `crates/ui/AGENTS.md`. verify: `cargo test -p zeron-engine antigravity && cargo test -p zeron-ui usage && cargo build -p zeron && cargo fmt --all`.
+- [x] A6 Remove embedded OAuth client material, accept a complete runtime pair through `COMET_ANTIGRAVITY_CLIENT_ID` and `COMET_ANTIGRAVITY_CLIENT_SECRET`, and keep missing-configuration diagnostics redacted. files: `crates/engine/src/antigravity_usage.rs`, `crates/engine/AGENTS.md`. verify: `cargo test -p zeron-engine antigravity`.
