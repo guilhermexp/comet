@@ -107,16 +107,14 @@ impl DiffMode {
     }
 }
 
-/// Read-modify-write `ui-settings.json` for just the split-diff key — a fresh
-/// load, for the reason [`crate::appearance`] documents: the shell holds its
-/// own `UiSettings` and saves it debounced, so writing a cached snapshot from
-/// here would roll back a pane resize made seconds earlier.
-fn persist_split(split: bool, data_dir: &std::path::Path) {
-    let mut settings = crate::settings::UiSettings::load(data_dir);
+fn persist_split(split: bool, cx: &mut App) -> bool {
+    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+        apply_diff_split_preference(settings, split);
+    })
+}
+
+fn apply_diff_split_preference(settings: &mut crate::settings::UiSettings, split: bool) {
     settings.diff_split = split;
-    if let Err(err) = settings.save(data_dir) {
-        tracing::warn!(error = %err, "could not persist diff layout");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,13 +1470,7 @@ impl gpui::EventEmitter<ChangesEvent> for Changes {}
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
-        let mode = DiffMode::from_split(
-            state
-                .read(cx)
-                .data_dir
-                .as_deref()
-                .is_some_and(|dir| crate::settings::UiSettings::load(dir).diff_split),
-        );
+        let mode = DiffMode::from_split(crate::settings::current(cx).diff_split);
         Self {
             state,
             explicit_cwd: None,
@@ -2276,12 +2268,7 @@ impl Changes {
     /// indices do not survive the re-pairing).
     fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         self.mode = self.mode.toggled();
-        if let Some(dir) = self.state.read(cx).data_dir.clone() {
-            let split = self.mode.is_split();
-            cx.background_executor()
-                .spawn(async move { persist_split(split, &dir) })
-                .detach();
-        }
+        persist_split(self.mode.is_split(), cx);
         // A draft's `+` sits in a column that may not exist after the swap.
         self.hover = None;
         self.reflatten(cx);
@@ -4644,6 +4631,19 @@ similarity index 90%
 rename from old_name.rs
 rename to new_name.rs
 ";
+
+    #[test]
+    fn review_regression_diff_split_preserves_current_settings_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = crate::settings::UiSettings::default();
+        current.sidebar_width = 320.0;
+        apply_diff_split_preference(&mut current, true);
+        current.save(dir.path()).unwrap();
+
+        let persisted = crate::settings::UiSettings::load(dir.path());
+        assert!(persisted.diff_split);
+        assert_eq!(persisted.sidebar_width, 320.0);
+    }
 
     #[test]
     fn parses_files_hunks_and_lines() {
