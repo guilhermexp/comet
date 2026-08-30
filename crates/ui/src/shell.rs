@@ -3464,11 +3464,24 @@ impl Shell {
             self.report_export(ExportOutcome::Failed("chat not found".into()), cx);
             return;
         };
-        // Resolve the entries BEFORE spawning: whether this row is the selected
-        // one is a fact about now, not about whenever the task gets scheduled.
+        // Resolve the entries and workers BEFORE spawning: whether this row is the selected
+        // one and what workers belong to it are facts about now, not about whenever the
+        // task gets scheduled.
         let in_memory = export_reads_memory(state.selected_chat.as_deref(), &chat_id)
             .then(|| state.transcript.clone());
         let engine = state.engine().cloned();
+        let workers = self
+            .workers_model
+            .read(cx)
+            .sessions_for_parent_chat(&chat_id)
+            .map(|sessions| {
+                crate::details_sidebar::chat_workers::project_chat_workers(
+                    Vec::new(),
+                    sessions.into_iter().cloned().collect(),
+                )
+                .workers
+            })
+            .unwrap_or_default();
 
         let metadata = crate::chat_export::ChatMetadata {
             id: chat.id.clone(),
@@ -3506,7 +3519,7 @@ impl Shell {
             };
 
             let title = metadata.title.clone();
-            let doc = crate::chat_export::ExportDoc::from_transcript(metadata, &entries);
+            let doc = crate::chat_export::ExportDoc::from_transcript(metadata, &entries, &workers);
             let rendered = match format {
                 crate::chat_export::ExportFormat::Markdown => {
                     Ok(crate::chat_export::render_markdown(&doc))
