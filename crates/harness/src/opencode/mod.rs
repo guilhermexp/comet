@@ -842,6 +842,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        chat_id: _,
     } = controls;
     let request_input = Arc::new(request_input);
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
@@ -1677,6 +1678,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         *pending_usage = Some(AgentEvent::Usage {
                             input_tokens: input,
                             output_tokens: output,
+                            context_usage: None,
                         });
                     }
                 }
@@ -2178,6 +2180,7 @@ fn part_snapshot_events(
                     is_error: status == "error",
                     output,
                     diff: None,
+                    execution: None,
                 });
             }
             events

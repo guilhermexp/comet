@@ -456,30 +456,30 @@ impl Normalizer {
                 // Surface it as the subagent's tagged Done so the chip flips
                 // done/failed and the transcript freezes.
                 if f.subtype == "task_notification" {
-                    let done = f
-                        .tool_use_id
-                        .as_deref()
-                        .filter(|parent| self.agent_spawn_tools.contains(*parent))
-                        .and_then(|parent| {
-                            let status = match f.status.as_deref().unwrap_or("") {
-                                "completed" | "complete" | "succeeded" | "success" => {
-                                    DoneStatus::Completed
-                                }
-                                "failed" | "errored" | "error" => DoneStatus::Errored,
-                                "killed" | "cancelled" | "canceled" | "stopped"
-                                | "interrupted" => DoneStatus::Interrupted,
-                                _ => return None,
-                            };
-                            Some(tag(
-                                parent,
-                                AgentEvent::Done {
-                                    status,
-                                    result: None,
-                                    error: None,
-                                    session_id: None,
-                                },
-                            ))
-                        });
+                    let done =
+                        f.tool_use_id
+                            .as_deref()
+                            .filter(|parent| self.agent_spawn_tools.contains(*parent))
+                            .and_then(|parent| {
+                                let status = match f.status.as_deref().unwrap_or("") {
+                                    "completed" | "complete" | "succeeded" | "success" => {
+                                        DoneStatus::Completed
+                                    }
+                                    "failed" | "errored" | "error" => DoneStatus::Errored,
+                                    "killed" | "cancelled" | "canceled" | "stopped"
+                                    | "interrupted" => DoneStatus::Interrupted,
+                                    _ => return None,
+                                };
+                                Some(tag(
+                                    parent,
+                                    AgentEvent::Done {
+                                        status,
+                                        result: None,
+                                        error: None,
+                                        session_id: None,
+                                    },
+                                ))
+                            });
                     return workflow.into_iter().chain(done).collect();
                 }
                 // An AGENT task starting (subagent_type present — subagent-
