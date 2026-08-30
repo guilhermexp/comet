@@ -22,7 +22,7 @@
 - [x] 4.1 Characterize fork-equivalent first-class Reasoning before reconciling `aa9f8bf1`; retain the fork implementation when behavior is already covered.
 - [x] 4.2 Port transcript copy, viewport restoration, live anchoring, and Thinking-in-tool-groups behavior from `v0.2.19..v0.2.28` with RED→GREEN projection tests.
 - [x] 4.3 Port sticky Changes headers through `b3fa5187` with deterministic header-boundary tests, preserving the fork's Changes tabs, comments, and right-pane ownership.
-- [ ] 4.4 Run sticky-turn-header and turn-step-tool-group regression suites plus headed transcript/Changes smoke.
+- [x] 4.4 Run sticky-turn-header and turn-step-tool-group regression suites plus headed transcript/Changes smoke.
 
 ## 5. Appearance, Picker, Sidebar, and Shortcuts
 
@@ -35,6 +35,6 @@
 ## 6. DOX, Validation, and Handoff
 
 - [x] 6.1 Update every affected DOX owner/index, `ARCHITECTURE.md`, `CONTEXT.md`, `docs/PARITY.md`, license notices, `fork_changelog.md`, and `fork_sync_report.md`; remove stale contracts.
-- [ ] 6.2 Run focused Rust and edge gates continuously, then run one final `cargo test`, `npm -C edge test`, `npm -C edge run typecheck`, `cargo build -p zeron`, `cargo fmt --all -- --check`, packaging checks, strict OpenSpec validation, and `git diff --check`.
-- [ ] 6.3 Complete available headed native smoke for appearance, model picker, sidebar shortcuts, transcript, composer completion, and Changes; record unproven visual cases as human-needed.
-- [ ] 6.4 Review the final branch diff/report, confirm the worktree is clean and no push/deploy/tag occurred, then leave the retained branch/worktree ready for explicit promotion approval.
+- [x] 6.2 Run focused Rust and edge gates continuously, then run one final `cargo test`, `npm -C edge test`, `npm -C edge run typecheck`, `cargo build -p zeron`, `cargo fmt --all -- --check`, packaging checks, strict OpenSpec validation, and `git diff --check`.
+- [x] 6.3 Complete available headed native smoke for appearance, model picker, sidebar shortcuts, transcript, composer completion, and Changes; record unproven visual cases as human-needed.
+- [x] 6.4 Review the final branch diff/report, confirm the worktree is clean and no push/deploy/tag occurred, then leave the retained branch/worktree ready for explicit promotion approval.

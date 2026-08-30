@@ -9,6 +9,18 @@
 - Post-port audit corrected the last semantic drift: jump/cycle shortcuts now consume the sidebar's configured visible order rather than raw recency.
 - The generated counts below describe the initial mechanical merge at `25180e1a`; they predate the focused reconciliation commits and final verification.
 
+## Final Verification
+
+- OpenSpec delta specs were synchronized into the seven main capability specs and passed strict validation before archive.
+- `cargo fmt --all -- --check`, `cargo test`, `cargo check -p zeron-ui`, and `cargo build -p zeron`: passed. The complete Rust suite executed 1,593 tests successfully; credential/network-only cases remained ignored by their existing contracts.
+- `npm -C edge run typecheck` and `npm -C edge test`: passed (47 Edge tests). The final typecheck exposed and then verified the missing `reasoning` app-layer union member.
+- `scripts/e2e-smoke.sh`: passed the real two-device Worker/engine synchronization flow.
+- `scripts/package-macos.sh`: produced an ad-hoc-signed app bundle, updater tarball, and DMG for arm64 at fork version `0.2.18`.
+- Headed package smoke: embedded engine booted cleanly; native inspection confirmed the model picker, transcript/turn-step tool group, and Changes/file-preview surfaces render.
+- Human-needed UAT: appearance switching, sidebar shortcut gestures, completion-popup scrolling, and sticky-header motion were not exhaustively exercised by UI automation. Their deterministic/unit coverage passed in the full Rust suite.
+- `cargo report future-incompatibilities --id 1` reported that no report is available; the former `block`/`proc-macro-error2` future-incompatibility warning did not recur.
+- `npm audit` still reports five current advisories in the upstream-identical Edge development toolchain (`wrangler`, `miniflare`, test pool, and transitives). No dependency-only divergence was introduced in this port.
+
 ## Execution
 - Timestamp (UTC): 2026-08-30T03:32:58Z
 - Repository: /Users/guilhermevarela/Documents/Projetos/SelfHosting/comet-upstream-v0.2.29
