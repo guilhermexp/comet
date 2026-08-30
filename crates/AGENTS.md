@@ -24,7 +24,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 ## Verification
 
-- Comandos: `cargo test` · `cargo test -p <crate>` · `cargo fmt --all` · `cargo build -p zeron`
+- Comandos: `cargo test --workspace` · `cargo test -p <crate>` · `cargo fmt --all` · `cargo build -p zeron`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|

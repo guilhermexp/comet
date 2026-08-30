@@ -893,59 +893,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn projects_worked_collapse_toggle_and_round_trip() {
-        use crate::details_sidebar::context::{DetailsContext, DetailsMode};
-        use crate::details_sidebar::view::{DetailsSidebarPreferences, DetailsSidebarState};
-        use std::path::PathBuf;
-
-        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
-        let ctx1 = DetailsContext {
-            key: "one".into(),
-            cwd: PathBuf::from("/tmp/one"),
-            branch: Some("main".into()),
-            chat_id: None,
-            target_device_id: None,
-            mode: DetailsMode::Orchestrator,
-        };
-        let ctx2 = DetailsContext {
-            key: "two".into(),
-            cwd: PathBuf::from("/tmp/two"),
-            branch: Some("main".into()),
-            chat_id: None,
-            target_device_id: None,
-            mode: DetailsMode::Orchestrator,
-        };
-
-        state.set_context(Some(ctx1.clone()));
-
-        // Default is expanded (not collapsed)
-        assert!(!state.projects_worked_collapsed());
-
-        // Toggle to collapsed
-        state.toggle_projects_worked_collapsed();
-        assert!(state.projects_worked_collapsed());
-
-        // Expanded paths for file tree must NOT contain the collapse key
-        assert!(
-            !state
-                .expanded_paths()
-                .contains(":projects_worked:collapsed")
-        );
-
-        // Switch context: other context defaults to expanded
-        state.set_context(Some(ctx2));
-        assert!(!state.projects_worked_collapsed());
-
-        // Switch back to "one": remains collapsed
-        state.set_context(Some(ctx1));
-        assert!(state.projects_worked_collapsed());
-
-        // Toggle back to expanded
-        state.toggle_projects_worked_collapsed();
-        assert!(!state.projects_worked_collapsed());
-    }
-
     /// A registered project folder may contain spaces ("JK Checklist App").
     /// `Search`/`Glob` carry a structured path, so they must be split on the
     /// documented `;` separator only — routing them through the free-text

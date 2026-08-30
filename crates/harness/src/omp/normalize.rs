@@ -726,7 +726,9 @@ fn normalize_tool(name: &str, input: &Value) -> ToolCall {
             path: optional_string(input, "path"),
         },
         "glob" => ToolCall::Glob {
-            pattern: string_value(input, "path"),
+            pattern: optional_string(input, "path")
+                .or_else(|| optional_string(input, "pattern"))
+                .unwrap_or_default(),
         },
         "workers" => ToolCall::Mcp {
             server: "comet-workers".into(),
@@ -1676,6 +1678,21 @@ mod tests {
         );
         assert_eq!(
             glob_call,
+            ToolCall::Glob {
+                pattern: "src/**/*.rs".to_string(),
+            }
+        );
+
+        // A payload without `path` falls back to `pattern`: an empty chip is a
+        // silently wrong render, not an error anyone would notice.
+        let glob_without_path = normalize_tool(
+            "glob",
+            &json!({
+                "pattern": "src/**/*.rs"
+            }),
+        );
+        assert_eq!(
+            glob_without_path,
             ToolCall::Glob {
                 pattern: "src/**/*.rs".to_string(),
             }
