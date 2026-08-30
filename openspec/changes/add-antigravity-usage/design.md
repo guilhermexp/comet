@@ -34,7 +34,7 @@ Credential sources:
 
 Every snapshot re-reads the selected store and compares a privacy-safe credential fingerprint. A changed or removed source replaces/clears the active in-memory credential and invalidates cached Usage. An access token refreshed by Comet remains in memory while the source fingerprint is unchanged, avoiding repeated refresh against the intentionally stale third-party store.
 
-Refresh requests use standard client credentials (`client_id` and `client_secret` from CLIProxyAPI) via `POST https://oauth2.googleapis.com/token`. As Google OAuth refresh tokens do not rotate, Comet holds refreshed `access_token` and expiry in-memory only. No data is written back to files or Keychain.
+Refresh requests use the complete runtime pair `COMET_ANTIGRAVITY_CLIENT_ID` and `COMET_ANTIGRAVITY_CLIENT_SECRET` via `POST https://oauth2.googleapis.com/token`; OAuth client material is never embedded in source or release artifacts. A still-valid access token remains usable without that pair, while a required refresh degrades to a redacted configuration warning without making a token request. As Google OAuth refresh tokens do not rotate, Comet holds refreshed `access_token` and expiry in-memory only. No data is written back to files or Keychain.
 
 ### 3. Quota fetch and mapping
 

@@ -1244,5 +1244,70 @@ mod tests {
         assert_eq!(warning, "Antigravity OAuth client is not configured");
         assert!(!warning.contains("expired-access"));
         assert!(!warning.contains("private-refresh"));
+        eprintln!(
+            "Antigravity usage: refresh blocked without OAuth client; warning={warning}; credential_material=redacted; requests=none"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_access_token_without_oauth_client_still_fetches_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("antigravity-user@example.com.json"),
+            json!({
+                "access_token": "still-valid-access",
+                "refresh_token": "private-refresh",
+                "expired": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&bytes);
+            assert!(request.starts_with("POST /usage HTTP/1.1"));
+            assert!(request.lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer still-valid-access")
+            }));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{REAL_FIXTURE}",
+                REAL_FIXTURE.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let usage = AntigravityUsage::new_inner(
+            dir.path().to_path_buf(),
+            format!("http://{address}/usage"),
+            format!("http://{address}/token"),
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            false,
+        )
+        .unwrap();
+
+        let snapshot = usage.snapshot(true, 1_000).await;
+
+        assert!(snapshot.present);
+        assert!(snapshot.warning.is_none());
+        assert_eq!(snapshot.usage_windows.len(), 4);
+        server.await.unwrap();
+        eprintln!(
+            "Antigravity usage: valid access token accepted without OAuth client; windows=4; warning=none; requests=/usage"
+        );
     }
 }
