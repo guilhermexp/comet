@@ -51,8 +51,8 @@ pub mod theme;
 pub mod theme_library;
 pub mod tool_icons;
 pub mod transcript;
-pub mod typography;
 mod turn_steps;
+pub mod typography;
 mod url_chips;
 pub mod workers;
 

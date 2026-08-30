@@ -34,9 +34,9 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
+use comet_syntax::HighlightKind;
 use gpui::{App, Global, Hsla, SharedString, hsla};
 use serde::{Deserialize, Serialize};
-use comet_syntax::HighlightKind;
 use zeron_theme::{
     AccentPreset, AccentSelection, Color as ModelColor, SurfacePreference, SurfaceTreatment,
     ThemeRegistry, ThemeVariant,
@@ -266,6 +266,11 @@ pub fn current_appearance() -> Appearance {
 /// Monotonic id of the current palette — see [`THEME_GENERATION`].
 pub fn theme_generation() -> u32 {
     THEME_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Invalidate caches that bake resolved palette or typography styles.
+pub(crate) fn bump_style_generation() {
+    THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 fn model_appearance(appearance: zeron_theme::Appearance) -> Appearance {

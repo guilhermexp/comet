@@ -236,6 +236,11 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Interface and conversational-prose family. Device-local by design.
+    pub ui_font_family: crate::typography::UiFontFamily,
+    /// Base size for interface and conversational prose. Code-related surfaces
+    /// retain their fixed metrics.
+    pub ui_font_size: crate::typography::UiFontSize,
     /// Independently selected light and dark theme variants.
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
@@ -274,6 +279,8 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            ui_font_family: crate::typography::UiFontFamily::default(),
+            ui_font_size: crate::typography::UiFontSize::default(),
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
             accent: zeron_theme::AccentSelection::default(),

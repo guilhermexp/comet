@@ -5441,9 +5441,10 @@ impl Shell {
                     .when(
                         status == zeron_proto::ChatIndicator::Working && !queued && !undelivered,
                         |el| {
-                            el.child(loaders::mini_gradient_spinner(
+                            el.child(loaders::mini_glyph_spinner(
                                 format!("chat-working-{id}"),
                                 2.0,
+                                Theme::of(cx).glyph,
                                 cx.entity_id(),
                                 cx,
                             ))
@@ -7398,9 +7399,10 @@ impl Shell {
                                 .justify_center()
                                 .group_hover(group.clone(), |s| s.opacity(0.0))
                                 .child(if subagent_running {
-                                    loaders::mini_gradient_spinner(
+                                    loaders::mini_glyph_spinner(
                                         format!("subagent-tab-{ix}"),
                                         2.0,
+                                        theme.glyph,
                                         cx.entity_id(),
                                         cx,
                                     )

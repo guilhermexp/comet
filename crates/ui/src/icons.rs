@@ -44,8 +44,10 @@ macro_rules! icon_assets {
         impl AssetSource for Assets {
             fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
                 match path {
-                    SVG_SANS_FONT => return Ok(Some(Cow::Borrowed(crate::FONT_GEIST))),
-                    SVG_MONO_FONT => return Ok(Some(Cow::Borrowed(crate::FONT_GEIST_MONO))),
+                    SVG_SANS_FONT => return Ok(Some(Cow::Borrowed(crate::typography::GEIST[0]))),
+                    SVG_MONO_FONT => {
+                        return Ok(Some(Cow::Borrowed(crate::typography::GEIST_MONO[0])));
+                    }
                     _ => {}
                 }
                 if let Some(bytes) = material_file_icon_assets::load(path) {

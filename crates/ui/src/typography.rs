@@ -200,7 +200,7 @@ pub struct TypographyState {
 
 impl Global for TypographyState {}
 
-const GEIST: [&[u8]; 8] = [
+pub(crate) const GEIST: [&[u8]; 8] = [
     include_bytes!("../assets/fonts/Geist.ttf"),
     include_bytes!("../assets/fonts/Geist-Italic.ttf"),
     include_bytes!("../assets/fonts/Geist-Medium.ttf"),
@@ -211,7 +211,7 @@ const GEIST: [&[u8]; 8] = [
     include_bytes!("../assets/fonts/Geist-BoldItalic.ttf"),
 ];
 
-const GEIST_MONO: [&[u8]; 8] = [
+pub(crate) const GEIST_MONO: [&[u8]; 8] = [
     include_bytes!("../assets/fonts/GeistMono.ttf"),
     include_bytes!("../assets/fonts/GeistMono-Italic.ttf"),
     include_bytes!("../assets/fonts/GeistMono-Medium.ttf"),
