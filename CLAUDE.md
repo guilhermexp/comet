@@ -10,7 +10,7 @@ Este arquivo é fino de propósito. O contrato do repo está em [`AGENTS.md`](AG
 
 ## Comandos
 
-`cargo build -p comet` · `cargo test` · `cargo test -p <crate>` · `cargo fmt --all` · `scripts/dev-demo.sh` · `scripts/e2e-smoke.sh` · `npm -C edge run test|typecheck`
+`cargo build` · `cargo test --workspace` · `cargo test -p <crate>` · `cargo fmt --all` · `scripts/dev-demo.sh` · `scripts/e2e-smoke.sh` · `npm -C edge run test|typecheck`
 
 ## Lessons Learned
 
