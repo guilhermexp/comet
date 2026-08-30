@@ -30,6 +30,8 @@ pub mod frost;
 pub mod history;
 pub mod icons;
 pub mod inline_media;
+#[cfg(debug_assertions)]
+pub mod inspector;
 pub mod loaders;
 pub mod markdown;
 pub mod markdown_decor;
@@ -171,6 +173,8 @@ pub fn run_app(config: UiConfig) {
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);
+        #[cfg(debug_assertions)]
+        inspector::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
         let workers_model = cx.new({

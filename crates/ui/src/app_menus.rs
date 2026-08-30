@@ -146,6 +146,11 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
     ]));
+    #[cfg(debug_assertions)]
+    menus.push(Menu::new("Developer").items([MenuItem::action(
+        "Toggle GPUI Inspector",
+        crate::inspector::ToggleInspector,
+    )]));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
         menus.push(Menu::new("Window").items([
@@ -266,5 +271,18 @@ mod tests {
         assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
         assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
         assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
+    }
+    #[test]
+    #[cfg(debug_assertions)]
+    fn developer_menu_offers_toggle_inspector() {
+        let menus = app_menus();
+        let dev = menus
+            .iter()
+            .find(|m| m.name.as_ref() == "Developer")
+            .expect("Developer menu present in debug");
+        assert_eq!(
+            action_names(dev),
+            vec![crate::inspector::ToggleInspector.name()]
+        );
     }
 }

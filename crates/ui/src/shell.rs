@@ -188,6 +188,12 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
     ]);
+    #[cfg(debug_assertions)]
+    cx.bind_keys([KeyBinding::new(
+        &platform_combo("mod-alt-i"),
+        crate::inspector::ToggleInspector,
+        None,
+    )]);
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -9700,5 +9706,13 @@ mod tests {
             SettingsSection::from_capture_route("settings/projects"),
             Some(SettingsSection::Projects)
         );
+    }
+    #[test]
+    fn inspector_shortcut_combo_parses() {
+        let combo = platform_combo("mod-alt-i");
+        assert!(Keystroke::parse(&combo).is_ok());
+        if cfg!(target_os = "macos") {
+            assert_eq!(combo, "cmd-alt-i");
+        }
     }
 }
