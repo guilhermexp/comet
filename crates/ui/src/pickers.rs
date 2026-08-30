@@ -2246,15 +2246,13 @@ impl Pickers {
             )
             .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
             .when(icon_loading, |el| {
-                el.child(
-                    div().flex_none().child(crate::loaders::mini_glyph_spinner(
-                        "picker-chip-loader",
-                        2.0,
-                        theme.glyph,
-                        cx.entity_id(),
-                        cx,
-                    )),
-                )
+                el.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
+                    "picker-chip-loader",
+                    2.0,
+                    theme.glyph,
+                    cx.entity_id(),
+                    cx,
+                )))
             })
             .when_some(
                 (!icon_loading).then_some(chip_icon).flatten(),
