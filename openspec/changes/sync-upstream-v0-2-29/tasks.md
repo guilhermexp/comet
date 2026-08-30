@@ -13,9 +13,9 @@
 
 ## 3. OpenCode and Subagent Runtime
 
-- [ ] 3.1 Port native OpenCode HTTP/SSE startup, timeout, prompt-gating, resume, steering, and error tests from `bf634445` through `a401432f`; observe RED before replacing the ACP launch path.
-- [ ] 3.2 Implement the native OpenCode runtime while preserving the fork's Workers MCP and tagged parent/child event contracts; run the complete OpenCode/ACP harness suites.
-- [ ] 3.3 Port connected-provider model filtering from `4fd35579` and subagent binding fixes from `5019dc19`, `18987da3`, and `569793ed`; run focused model and subagent lifecycle tests.
+- [x] 3.1 Port native OpenCode HTTP/SSE startup, timeout, prompt-gating, resume, steering, and error tests from `bf634445` through `a401432f`; observe RED before replacing the ACP launch path.
+- [x] 3.2 Implement the native OpenCode runtime while preserving the fork's Workers MCP and tagged parent/child event contracts; run the complete OpenCode/ACP harness suites.
+- [x] 3.3 Port connected-provider model filtering from `4fd35579` and subagent binding fixes from `5019dc19`, `18987da3`, and `569793ed`; run focused model and subagent lifecycle tests.
 
 ## 4. Transcript and Changes Navigation
 
