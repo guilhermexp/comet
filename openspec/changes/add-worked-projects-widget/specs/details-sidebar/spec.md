@@ -4,13 +4,27 @@
 
 comet SHALL derive the list of registered projects touched by assistant tool calls in a Chat session, matching against leaf registered project roots and ordering them chronologically by first contact.
 
+#### Scenario: Only the chat's own assistant tool calls are signal
+Test: unit — non-assistant entries and unhandled tool calls are ignored.
+
+- **WHEN** user messages, dispatched worker entries, or child subagent transcripts contain paths
+- **OR** assistant tool calls use unhandled tool kinds such as `Mcp` or `Unknown`
+- **THEN** those entries and tool calls do not contribute to the worked projects list
+- **AND** only assistant tool calls from the current chat are considered
+
+#### Scenario: Assistant tool call variants contribute touched paths
+Test: unit — derivation across all supported tool call variants.
+
+- **WHEN** an assistant invokes `ReadFile`, `WriteFile`, `EditFile`, `ApplyPatch`, `Search`, `Glob`, or `Exec`
+- **THEN** candidate paths are extracted from each supported variant
+- **AND** matching registered projects appear in the worked projects list
+
 #### Scenario: The universe of worked projects is restricted to Registered Projects
 Test: unit — derivation against registered projects list.
 
 - **WHEN** assistant tool calls touch filesystem paths
 - **THEN** only paths that match a registered project root or subfolder are included
 - **AND** paths in unregistered folders never appear in the worked projects list
-
 #### Scenario: Container roots are filtered out by the Leaf Root rule
 Test: unit — candidate root filtering with ancestor containers.
 
@@ -76,3 +90,16 @@ Test: unit — sidebar preferences state round-trip for projects worked collapse
 - **WHEN** the user toggles the collapse state of the "Projects worked" section
 - **THEN** the expanded/collapsed state is persisted in `DetailsSidebarPreferences.expanded` keyed by context key
 - **AND** reloading or switching context restores the chosen collapse state
+
+#### Scenario: Clicking a worked project reveals it in Finder
+Test: none — sem harness de render; validação é visual.
+
+- **WHEN** the user clicks on a worked project row in the Workspace card
+- **THEN** `WorkersModel::reveal_project` is invoked with the project's filesystem path
+
+#### Scenario: Worked projects list is bounded in height with vertical scrolling
+Test: none — sem harness de render; validação é visual.
+
+- **WHEN** the worked projects section contains multiple project rows
+- **THEN** the list container height is bounded to `WORKED_PROJECTS_VISIBLE_ROWS` rows
+- **AND** additional rows are accessible via vertical scrolling without stretching the card

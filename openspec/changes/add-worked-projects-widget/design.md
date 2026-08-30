@@ -20,42 +20,42 @@ Home Directory (dirs_home)              ──┘                               
 ## Pure Derivation Algorithm
 
 1. **Empty inputs**: Return `Vec::new()` if transcript or projects list is empty.
-2. **Candidate roots**:
-   - Filter `projects` with non-empty path.
+2. **Registered project roots**:
+   - Filter `projects` with `is_group == false` and non-empty path.
    - Strip trailing slashes (`/`).
-   - Exclude candidate whose path equals `own_checkout` (comparing normalized paths without trailing slashes).
 3. **Leaf Root filtering**:
-   - For each candidate root $R$, discard $R$ if there is another candidate root $O$ such that $O \neq R$ and $O$ starts with `$R/`.
-   - If no roots remain, return `Vec::new()`.
-4. **Transcript scanning**:
+   - For each registered root $R$, discard $R$ if there is another registered root $O$ such that $O \neq R$ and $O$ starts with `$R/` (is strictly within $R$).
+4. **Chat Checkout exclusion**:
+   - From the surviving leaf roots, exclude the candidate whose path equals `own_checkout` (comparing normalized paths without trailing slashes).
+   - If no candidate leaf roots remain, return `Vec::new()`.
+5. **Transcript scanning**:
    - Iterate through entries in chronological order.
    - Consider only entries with `role == "assistant"`.
    - For each `MessagePart::Tool { call, .. }`, extract path candidates:
-     - `ReadFile { path }`, `WriteFile { path, .. }`, `EditFile { path, .. }` -> single path `path`.
-     - `ApplyPatch { path: Some(p) }` -> single path `p`.
-     - `Search { path: Some(p), .. }` -> single path `p`.
-     - `Glob { pattern }` -> single path `pattern`.
-     - `Exec { command }` -> all absolute or home-relative path tokens scanned from `command`.
+     - `ReadFile { path }`, `WriteFile { path, .. }`, `EditFile { path, .. }` -> single path `path` (structured, trailing punctuation preserved).
+     - `ApplyPatch { path: Some(p) }` -> single path `p` (structured, trailing punctuation preserved).
+     - `Search { path: Some(p), .. }` -> tokens scanned from `p` via `scan_path_tokens` (trailing punctuation stripped).
+     - `Glob { pattern }` -> tokens scanned from `pattern` via `scan_path_tokens` (trailing punctuation stripped).
+     - `Exec { command }` -> all absolute or home-relative path tokens scanned from `command` via `scan_path_tokens` (trailing punctuation stripped).
      - Other variants -> ignored.
-5. **Path Token Scanner (without regex)**:
+6. **Path Token Scanner (without regex)**:
    - Scans tokens starting with `/` or `~/` and ending at the first whitespace (`char::is_whitespace`), single quote (`'`), double quote (`"`), backtick (`` ` ``), or closing parenthesis (`)`).
-6. **Path candidate normalization**:
+7. **Path candidate normalization**:
    - `trim()` whitespace.
-   - Strip repeated trailing punctuation: `)`, `.`, `,`, `;`, `:`.
+   - For tokens from scanner: strip repeated trailing punctuation: `)`, `.`, `,`, `;`, `:`.
    - Strip trailing slashes `/`.
    - Discard if not starting with `/` or `~/`.
    - If starting with `~/`:
      - If `home_dir` is `Some(h)`: replace `~` with `h` path string.
      - If `home_dir` is `None`: discard candidate.
-7. **Matching and first-contact ordering**:
-   - For each candidate path, check each unregistered leaf root:
+8. **Matching and first-contact ordering**:
+   - For each candidate path, check each candidate leaf root:
      - Matches if `candidate == root` or `candidate.starts_with(&format!("{root}/"))` (enforcing component boundaries).
    - Record monotonic order counter on first match.
    - Short-circuit when all candidate leaf roots have matched.
-8. **Output**:
+9. **Output**:
    - Sort matched projects by ascending first-contact order.
    - Map to `WorkedProject { id, name, path }` preserving original `WorkersProject.path`.
-
 ## UI Rendering in Workspace Card
 
 - Rendered in `render_details` below `Path` row inside the Workspace `widget_card`.

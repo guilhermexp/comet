@@ -22,11 +22,37 @@ impl Default for DetailsSidebarPreferences {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkedProjectsCacheKey {
+    pub context_key: String,
+    pub transcript_len: usize,
+    pub projects_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WorkedProjectsCache {
+    key: WorkedProjectsCacheKey,
+    result: Vec<super::worked_projects::WorkedProject>,
+}
+
+pub fn projects_snapshot_fingerprint(projects: &[zeron_workers_unpeel::WorkersProject]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for p in projects {
+        p.id.hash(&mut hasher);
+        p.name.hash(&mut hasher);
+        p.path.hash(&mut hasher);
+        p.is_group.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[derive(Debug, Clone)]
 pub struct DetailsSidebarState {
     context: Option<DetailsContext>,
     preferences: DetailsSidebarPreferences,
     load_generation: u64,
+    worked_projects_cache: Option<WorkedProjectsCache>,
 }
 
 impl DetailsSidebarState {
@@ -35,6 +61,7 @@ impl DetailsSidebarState {
             context: None,
             preferences,
             load_generation: 0,
+            worked_projects_cache: None,
         }
     }
 
@@ -153,6 +180,34 @@ impl DetailsSidebarState {
     pub fn accept_file_load(&self, generation: u64, context_key: &str) -> bool {
         self.load_generation == generation
             && self.context.as_ref().map(|context| context.key.as_str()) == Some(context_key)
+    }
+
+    pub fn worked_projects(
+        &mut self,
+        context: &DetailsContext,
+        transcript: &[zeron_doc::SessionMessageEntry],
+        projects: &[zeron_workers_unpeel::WorkersProject],
+        home_dir: Option<&std::path::Path>,
+    ) -> Vec<super::worked_projects::WorkedProject> {
+        let key = WorkedProjectsCacheKey {
+            context_key: context.key.clone(),
+            transcript_len: transcript.len(),
+            projects_revision: projects_snapshot_fingerprint(projects),
+        };
+        if self.worked_projects_cache.as_ref().map(|c| &c.key) != Some(&key) {
+            let result = super::worked_projects::worked_projects(
+                transcript,
+                projects,
+                &context.cwd,
+                home_dir,
+            );
+            self.worked_projects_cache = Some(WorkedProjectsCache { key, result });
+        }
+        self.worked_projects_cache.as_ref().unwrap().result.clone()
+    }
+
+    pub fn worked_projects_cache_key(&self) -> Option<&WorkedProjectsCacheKey> {
+        self.worked_projects_cache.as_ref().map(|c| &c.key)
     }
 }
 
@@ -1602,10 +1657,10 @@ impl DetailsSidebar {
 
         if context.mode == super::context::DetailsMode::Orchestrator {
             let home = dirs_home();
-            let worked = super::worked_projects::worked_projects(
+            let worked = self.sidebar.worked_projects(
+                &context,
                 &self.app_state.read(cx).transcript,
                 self.workers_model.read(cx).projects(),
-                &context.cwd,
                 home.as_deref(),
             );
             if !worked.is_empty() {
@@ -1663,46 +1718,41 @@ impl DetailsSidebar {
                     .child(header);
 
                 if !collapsed {
-                    let rows =
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(1.0))
-                            .children(worked.into_iter().map(|project| {
-                                let path = project.path.clone();
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "worked-project-{}",
-                                        project.id
-                                    )))
-                                    .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
-                                    .px(px(10.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(7.0))
-                                    .cursor_pointer()
-                                    .rounded_md()
-                                    .hover(|style| style.bg(crate::theme::ink(0.045)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.workers_model.update(cx, |model, cx| {
-                                            model.reveal_project(path.clone(), cx);
-                                        });
-                                    }))
-                                    .child(
-                                        icons::icon(icons::FOLDER)
-                                            .size(px(14.0))
-                                            .text_color(theme.text_muted),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(px(12.0))
-                                            .text_color(theme.text)
-                                            .child(project.name),
-                                    )
-                            }));
+                    let rows = div()
+                        .flex()
+                        .flex_col()
+                        .children(worked.iter().enumerate().map(|(index, project)| {
+                            let path = project.path.clone();
+                            div()
+                                .id(("worked-project", index))
+                                .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .cursor_pointer()
+                                .rounded_md()
+                                .hover(|style| style.bg(crate::theme::ink(0.045)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.workers_model.update(cx, |model, cx| {
+                                        model.reveal_project(path.clone(), cx);
+                                    });
+                                }))
+                                .child(
+                                    icons::icon(icons::FOLDER)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text)
+                                        .child(zeron_proto::view::single_line(&project.name)),
+                                )
+                        }));
 
                     worked_section = worked_section.child(
                         div()
@@ -1714,7 +1764,6 @@ impl DetailsSidebar {
                             .child(rows),
                     );
                 }
-
                 workspace_body = workspace_body.child(worked_section);
             }
         }
@@ -2471,6 +2520,107 @@ mod tests {
         // Toggle back to expanded
         state.toggle_projects_worked_collapsed();
         assert!(!state.projects_worked_collapsed());
+    }
+    #[test]
+    fn worked_projects_cache_key_invalidation() {
+        use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+        use zeron_proto::ToolCall;
+        use zeron_workers_unpeel::{WorkersProject, WorkersSessionSort};
+
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        let ctx_one = context("one");
+        let ctx_two = context("two");
+
+        let p1 = WorkersProject {
+            id: "p1".to_string(),
+            name: "Proj 1".to_string(),
+            path: "/tmp/proj1".to_string(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        };
+
+        let entry1 = SessionMessageEntry {
+            id: "m1".to_string(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "t1".to_string(),
+                call: ToolCall::ReadFile {
+                    path: "/tmp/proj1/file.rs".to_string(),
+                },
+                diff: None,
+                output: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+                execution: None,
+                resolved: true,
+                is_error: false,
+            }],
+            created_at: 0,
+            device_id: "d1".to_string(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        };
+
+        let transcript = vec![entry1.clone()];
+        let projects = vec![p1.clone()];
+
+        // 1. First call computes and caches
+        let res1 = state.worked_projects(&ctx_one, &transcript, &projects, None);
+        assert_eq!(res1.len(), 1);
+        let key1 = state.worked_projects_cache_key().unwrap().clone();
+        assert_eq!(key1.context_key, "one");
+        assert_eq!(key1.transcript_len, 1);
+
+        // 2. Same inputs reuse cache (key identical)
+        let res2 = state.worked_projects(&ctx_one, &transcript, &projects, None);
+        assert_eq!(res2.len(), 1);
+        assert_eq!(state.worked_projects_cache_key(), Some(&key1));
+
+        // 3. Changed transcript length recomputes with new key
+        let mut transcript_longer = transcript.clone();
+        transcript_longer.push(entry1.clone());
+        let _ = state.worked_projects(&ctx_one, &transcript_longer, &projects, None);
+        let key2 = state.worked_projects_cache_key().unwrap().clone();
+        assert_ne!(key1, key2);
+        assert_eq!(key2.transcript_len, 2);
+
+        // 4. Changed projects list recomputes with new key
+        let mut projects_modified = projects.clone();
+        projects_modified.push(WorkersProject {
+            id: "p2".to_string(),
+            name: "Proj 2".to_string(),
+            path: "/tmp/proj2".to_string(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        });
+        let _ = state.worked_projects(&ctx_one, &transcript_longer, &projects_modified, None);
+        let key3 = state.worked_projects_cache_key().unwrap().clone();
+        assert_ne!(key2, key3);
+
+        // 5. Changed context recomputes with new key
+        let _ = state.worked_projects(&ctx_two, &transcript_longer, &projects_modified, None);
+        let key4 = state.worked_projects_cache_key().unwrap().clone();
+        assert_ne!(key3, key4);
+        assert_eq!(key4.context_key, "two");
     }
 
     #[test]

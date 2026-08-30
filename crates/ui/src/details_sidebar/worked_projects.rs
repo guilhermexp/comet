@@ -36,15 +36,18 @@ pub fn worked_projects(
     let own_str = own_checkout.to_string_lossy();
     let own_trimmed = own_str.trim_end_matches('/');
 
-    let candidate_roots: Vec<CandidateRoot> = projects
+    let all_registered_roots: Vec<CandidateRoot> = projects
         .iter()
         .filter_map(|project| {
+            if project.is_group {
+                return None;
+            }
             let p_path = project.path.trim();
             if p_path.is_empty() {
                 return None;
             }
             let trimmed = p_path.trim_end_matches('/');
-            if trimmed.is_empty() || trimmed == own_trimmed {
+            if trimmed.is_empty() {
                 return None;
             }
             Some(CandidateRoot {
@@ -54,14 +57,15 @@ pub fn worked_projects(
         })
         .collect();
 
-    // Leaf Root filter: drop any candidate root that is a strict ancestor of another candidate root
-    let roots: Vec<&CandidateRoot> = candidate_roots
+    // Leaf Root filter: drop any candidate root that is a strict ancestor of another registered project root
+    let roots: Vec<&CandidateRoot> = all_registered_roots
         .iter()
         .filter(|cand| {
-            !candidate_roots
+            !all_registered_roots
                 .iter()
                 .any(|other| is_strictly_within(&other.root, &cand.root))
         })
+        .filter(|cand| cand.root != own_trimmed)
         .collect();
 
     if roots.is_empty() {
@@ -94,6 +98,7 @@ pub fn worked_projects(
                         &roots,
                         &mut first_order_by_project_id,
                         &mut order,
+                        false,
                     );
                 }
                 ToolCall::ApplyPatch { path: Some(path) } => {
@@ -103,27 +108,34 @@ pub fn worked_projects(
                         &roots,
                         &mut first_order_by_project_id,
                         &mut order,
+                        false,
                     );
                 }
                 ToolCall::Search {
                     path: Some(path), ..
                 } => {
-                    consider_path(
-                        path,
-                        home_str.as_deref(),
-                        &roots,
-                        &mut first_order_by_project_id,
-                        &mut order,
-                    );
+                    scan_path_tokens(path, |token| {
+                        consider_path(
+                            token,
+                            home_str.as_deref(),
+                            &roots,
+                            &mut first_order_by_project_id,
+                            &mut order,
+                            true,
+                        );
+                    });
                 }
                 ToolCall::Glob { pattern } => {
-                    consider_path(
-                        pattern,
-                        home_str.as_deref(),
-                        &roots,
-                        &mut first_order_by_project_id,
-                        &mut order,
-                    );
+                    scan_path_tokens(pattern, |token| {
+                        consider_path(
+                            token,
+                            home_str.as_deref(),
+                            &roots,
+                            &mut first_order_by_project_id,
+                            &mut order,
+                            true,
+                        );
+                    });
                 }
                 ToolCall::Exec { command } => {
                     scan_path_tokens(command, |token| {
@@ -133,6 +145,7 @@ pub fn worked_projects(
                             &roots,
                             &mut first_order_by_project_id,
                             &mut order,
+                            true,
                         );
                     });
                 }
@@ -168,17 +181,20 @@ fn consider_path(
     roots: &[&CandidateRoot],
     first_order_by_project_id: &mut HashMap<String, usize>,
     order: &mut usize,
+    strip_trailing_punct: bool,
 ) {
     *order += 1;
-    // Trim whitespace, then strip trailing repeated punctuation ')', '.', ',', ';', ':',
-    // then strip trailing slashes '/'.
     let trimmed = raw_path.trim();
-    let stripped_punct = trimmed.trim_end_matches(|c| matches!(c, ')' | '.' | ',' | ';' | ':'));
-    let cleaned = stripped_punct.trim_end_matches('/');
+    let cleaned = if strip_trailing_punct {
+        trimmed
+            .trim_end_matches(|c| matches!(c, ')' | '.' | ',' | ';' | ':'))
+            .trim_end_matches('/')
+    } else {
+        trimmed.trim_end_matches('/')
+    };
     if cleaned.is_empty() {
         return;
     }
-
     // Relative paths are ignored (S5). Only absolute (starting with '/') or home-relative (starting with '~/') count.
     let path: String = if cleaned.starts_with('/') {
         cleaned.to_string()
@@ -577,18 +593,160 @@ mod tests {
     }
 
     #[test]
+    fn groups_never_produce_a_duplicate_row() {
+        let own = Path::new("/Users/gui/.orchestrator");
+        let home = Path::new("/Users/gui");
+
+        let mut p1 = make_project("p1", "Comet", "/a/comet");
+        p1.is_group = false;
+        let mut g1 = make_project("g1", "Frontend", "/a/comet");
+        g1.is_group = true;
+
+        let entry = assistant_entry(vec![ToolCall::ReadFile {
+            path: "/a/comet/src/x.rs".to_string(),
+        }]);
+
+        let result = worked_projects(&[entry], &[p1, g1], own, Some(home));
+
+        assert_eq!(
+            result,
+            vec![WorkedProject {
+                id: "p1".to_string(),
+                name: "Comet".to_string(),
+                path: "/a/comet".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ancestor_of_own_checkout_is_never_promoted_to_leaf() {
+        let own = Path::new("/a/b/c");
+        let home = Path::new("/Users/gui");
+
+        let p1 = make_project("p1", "Parent", "/a/b");
+        let p2 = make_project("p2", "Child", "/a/b/c");
+
+        let entry = assistant_entry(vec![ToolCall::ReadFile {
+            path: "/a/b/c/main.rs".to_string(),
+        }]);
+
+        let result = worked_projects(&[entry], &[p1, p2], own, Some(home));
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn semicolon_delimited_search_and_glob_paths_are_split() {
+        let own = Path::new("/Users/gui/.orchestrator");
+        let home = Path::new("/Users/gui");
+
+        let proj1 = make_project("p1", "Proj1", "/A/proj1");
+        let proj2 = make_project("p2", "Proj2", "/B/proj2");
+
+        let search_entry = assistant_entry(vec![ToolCall::Search {
+            pattern: "fn main".to_string(),
+            path: Some("/A/proj1; /B/proj2".to_string()),
+        }]);
+
+        let search_result = worked_projects(
+            &[search_entry],
+            &[proj1.clone(), proj2.clone()],
+            own,
+            Some(home),
+        );
+
+        assert_eq!(
+            search_result,
+            vec![
+                WorkedProject {
+                    id: "p1".to_string(),
+                    name: "Proj1".to_string(),
+                    path: "/A/proj1".to_string(),
+                },
+                WorkedProject {
+                    id: "p2".to_string(),
+                    name: "Proj2".to_string(),
+                    path: "/B/proj2".to_string(),
+                },
+            ]
+        );
+
+        let glob_entry = assistant_entry(vec![ToolCall::Glob {
+            pattern: "/A/proj1/**/*.rs; /B/proj2/**/*.rs".to_string(),
+        }]);
+
+        let glob_result = worked_projects(
+            &[glob_entry],
+            &[proj1.clone(), proj2.clone()],
+            own,
+            Some(home),
+        );
+
+        assert_eq!(
+            glob_result,
+            vec![
+                WorkedProject {
+                    id: "p1".to_string(),
+                    name: "Proj1".to_string(),
+                    path: "/A/proj1".to_string(),
+                },
+                WorkedProject {
+                    id: "p2".to_string(),
+                    name: "Proj2".to_string(),
+                    path: "/B/proj2".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_path_fields_keep_trailing_punctuation() {
+        let own = Path::new("/Users/gui/.orchestrator");
+        let home = Path::new("/Users/gui");
+
+        let proj = make_project("app", "App (2)", "/Users/g/Docs/App (2)");
+
+        let entry = assistant_entry(vec![ToolCall::ReadFile {
+            path: "/Users/g/Docs/App (2)".to_string(),
+        }]);
+
+        let result = worked_projects(&[entry], &[proj.clone()], own, Some(home));
+
+        assert_eq!(
+            result,
+            vec![WorkedProject {
+                id: "app".to_string(),
+                name: "App (2)".to_string(),
+                path: "/Users/g/Docs/App (2)".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn trailing_punctuation_cleaned() {
         let own = Path::new("/Users/gui/.orchestrator");
         let home = Path::new("/Users/gui");
 
         let proj_a = make_project("a", "Project A", "/Users/gui/proj-a");
         let proj_b = make_project("b", "Project B", "/Users/gui/proj-b");
+        let proj_c = make_project("c", "Project C", "/Users/gui/proj-c");
+        let proj_d = make_project("d", "Project D", "/Users/gui/proj-d");
 
         let entry = assistant_entry(vec![ToolCall::Exec {
-            command: "check (/Users/gui/proj-a) and /Users/gui/proj-b, then exit.".to_string(),
+            command: "check (/Users/gui/proj-a) and /Users/gui/proj-b, then /Users/gui/proj-c. and /Users/gui/proj-d; exit.".to_string(),
         }]);
 
-        let result = worked_projects(&[entry], &[proj_a.clone(), proj_b.clone()], own, Some(home));
+        let result = worked_projects(
+            &[entry],
+            &[
+                proj_a.clone(),
+                proj_b.clone(),
+                proj_c.clone(),
+                proj_d.clone(),
+            ],
+            own,
+            Some(home),
+        );
 
         assert_eq!(
             result,
@@ -603,7 +761,40 @@ mod tests {
                     name: "Project B".to_string(),
                     path: "/Users/gui/proj-b".to_string(),
                 },
+                WorkedProject {
+                    id: "c".to_string(),
+                    name: "Project C".to_string(),
+                    path: "/Users/gui/proj-c".to_string(),
+                },
+                WorkedProject {
+                    id: "d".to_string(),
+                    name: "Project D".to_string(),
+                    path: "/Users/gui/proj-d".to_string(),
+                },
             ]
+        );
+    }
+
+    #[test]
+    fn apply_patch_path_contributes() {
+        let own = Path::new("/Users/gui/.orchestrator");
+        let home = Path::new("/Users/gui");
+
+        let proj = make_project("p1", "PatchProj", "/Users/gui/patch-proj");
+
+        let entry = assistant_entry(vec![ToolCall::ApplyPatch {
+            path: Some("/Users/gui/patch-proj/src/lib.rs".to_string()),
+        }]);
+
+        let result = worked_projects(&[entry], &[proj.clone()], own, Some(home));
+
+        assert_eq!(
+            result,
+            vec![WorkedProject {
+                id: "p1".to_string(),
+                name: "PatchProj".to_string(),
+                path: "/Users/gui/patch-proj".to_string(),
+            }]
         );
     }
 
@@ -640,11 +831,17 @@ mod tests {
             ToolCall::Mcp {
                 server: "custom".to_string(),
                 tool: "custom".to_string(),
-                input: None,
+                input: Some(serde_json::json!({
+                    "path": "/Users/gui/mcp-proj/file.rs",
+                    "command": "cd /Users/gui/mcp-proj"
+                })),
             },
             ToolCall::Unknown {
                 name: "custom".to_string(),
-                input: None,
+                input: Some(serde_json::json!({
+                    "path": "/Users/gui/mcp-proj/file.rs",
+                    "command": "cd /Users/gui/mcp-proj"
+                })),
             },
             ToolCall::Search {
                 pattern: "fn main".to_string(),
@@ -677,5 +874,58 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn projects_worked_collapse_toggle_and_round_trip() {
+        use crate::details_sidebar::context::{DetailsContext, DetailsMode};
+        use crate::details_sidebar::view::{DetailsSidebarPreferences, DetailsSidebarState};
+        use std::path::PathBuf;
+
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        let ctx1 = DetailsContext {
+            key: "one".into(),
+            cwd: PathBuf::from("/tmp/one"),
+            branch: Some("main".into()),
+            chat_id: None,
+            target_device_id: None,
+            mode: DetailsMode::Orchestrator,
+        };
+        let ctx2 = DetailsContext {
+            key: "two".into(),
+            cwd: PathBuf::from("/tmp/two"),
+            branch: Some("main".into()),
+            chat_id: None,
+            target_device_id: None,
+            mode: DetailsMode::Orchestrator,
+        };
+
+        state.set_context(Some(ctx1.clone()));
+
+        // Default is expanded (not collapsed)
+        assert!(!state.projects_worked_collapsed());
+
+        // Toggle to collapsed
+        state.toggle_projects_worked_collapsed();
+        assert!(state.projects_worked_collapsed());
+
+        // Expanded paths for file tree must NOT contain the collapse key
+        assert!(
+            !state
+                .expanded_paths()
+                .contains(":projects_worked:collapsed")
+        );
+
+        // Switch context: other context defaults to expanded
+        state.set_context(Some(ctx2));
+        assert!(!state.projects_worked_collapsed());
+
+        // Switch back to "one": remains collapsed
+        state.set_context(Some(ctx1));
+        assert!(state.projects_worked_collapsed());
+
+        // Toggle back to expanded
+        state.toggle_projects_worked_collapsed();
+        assert!(!state.projects_worked_collapsed());
     }
 }
