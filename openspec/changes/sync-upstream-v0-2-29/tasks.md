@@ -1,7 +1,7 @@
 ## 1. Isolated Integration Baseline
 
 - [x] 1.1 Commit the validated OpenSpec/implementation plan, run `cargo fmt --all`, and confirm local `main` is clean at the recorded baseline.
-- [ ] 1.2 Create retained worktree branch `chore/upstream-sync-v0.2.29`, seed `fork_changelog.md` with upstream baseline `04b08ea2`, and merge `upstream/main` at `b3fa5187` without push.
+- [x] 1.2 Create retained worktree branch `chore/upstream-sync-v0.2.29`, seed `fork_changelog.md` with upstream baseline `04b08ea2`, and merge `upstream/main` at `b3fa5187` without push.
 - [ ] 1.3 Audit the merge report, all conflicts, new dependencies/licenses, publication workflows, and the 60 overlapping private paths; restore fork-controlled identity, updater, deployment, and release behavior.
 
 ## 2. Registry, Sync, and Wire Safety

@@ -8,3 +8,791 @@ Tracks local/private fork changes against upstream.
 - HEAD before sync: `6519eb68cab2298eda734ede2e72a9e019ca9421`
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
+## 2026-08-30T03:32:58Z
+
+- Branch: chore/upstream-sync-v0.2.29
+- HEAD: 350ed33a
+- Upstream base: upstream/main
+- Previous synced upstream commit (from changelog): `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
+- Target upstream commit for this run: b3fa5187
+- Private commits: 776
+- Commit list:
+  - 350ed33a docs: plan upstream v0.2.29 port
+  - 6519eb68 fix: invalidate antigravity usage on credential changes
+  - 5e0ae806 feat: expand agent integrations and harden runtime
+  - 7d9c84b4 feat(ui): add native GPUI dev inspector with shortcut and picking
+  - 4288f7b5 feat(ui): embed beautiful-mermaid engine via QuickJS with 1:1 Craft UI/UX
+  - 59b44d35 feat(ui): refine worker notifications, video previews, and remove update banner
+  - 6067d9ad fix(workers): harden briefing and Codex hooks
+  - a4fd3cca feat(preview): play local video files
+  - 858a5804 fix(projects): serialize config persistence
+  - b42c069f fix(ui): expose projects settings to native QA
+  - 453ade34 fix(workers): keep hook ingress across child signals
+  - c10577da docs(vendor): align unpeel provenance and DOX
+  - d22f72ce fix(export): sanitize every transcript export format
+  - d0d00f9e fix(workers): make worktree setup failures reliable
+  - 4d5928d4 fix(projects): complete projects settings contracts
+  - d05490a3 docs(plan): design recent change corrections
+  - cc5d53c6 Merge branch 'change/add-projects-settings-page'
+  - 0077b7ad Merge branch 'chore/vendor-unpeel'
+  - 72df91fb no-mistakes(document): fmt: reformat turn_steps.rs match arm; docs already current
+  - 44bbfcef docs(dox): AGENTS.md do workers-unpeel deixa de descrever um submodulo
+  - 216b61e8 chore: vendorar third_party/unpeel em vez de submodulo
+  - 79833f12 no-mistakes(test): fix(ui): keep running subagent from folding into a dead turn's steps chip
+  - 14c5eab8 test(workers): provar que create_worktree realmente roda o setup
+  - e02e4ee8 no-mistakes(review): fix(workers): contar o prazo do catch-up a partir da grade
+  - 5966fdfb no-mistakes(review): fix(workers): saida total do catch-up, inclusive em erro
+  - 2c4d0dcd feat(ui): Settings > Projects, worktree setup que de fato roda
+  - 721bbd8f no-mistakes(review): fix(ui): lista de workers indisponivel nao e dispatch
+  - 8a6e4bd0 feat(workers): ledger de projetos que sobrevive ao remove_project
+  - 9cc46ebe no-mistakes(review): fix(ui): cancelar a inscricao do export ao terminar
+  - ed199616 docs(openspec): change add-projects-settings-page
+  - c7ed9058 no-mistakes(review): fix(workers): encerrar catch-up no offset de abertura, nao no silencio
+  - bae5ffc6 no-mistakes(review): fix(ui): elipse no meio compartilhada, dobra de turno morto, fence e nome de export
+  - eca05afd fix(composer): strip de anexos acima do pill, nao dentro dele
+  - 15b46db1 fix(workers): esconder a grade durante o catch-up, nao so evitar pedir frame
+  - 00574a42 fix(workers): abrir sessao longa cai no fim, nao no comeco do filme
+  - 390a138f fix(workers): linhas distinguiveis na sidebar e scrollback de sessao parada
+  - 5d765b83 fix: parts deixadas em voo por run morta param de girar
+  - 94aed5d8 feat(ui): aba do widget Workers segue o que acabou de ser disparado
+  - 22864f08 feat(workers): add_project na superficie MCP, para o worker nao cair no ancestral
+  - 007c5dd5 fix(ui): turno em voo nao dobra mais o proprio historico
+  - a6843e19 feat(ui): six Chat Transcript Export actions in the chat menu (C5-C7)
+  - 9b857b0d spec(chat-export): F1 audited passed em fce64b7d (C1-C4)
+  - fce64b7d feat(ui): add pure chat transcript export renderer
+  - 9fc9321f spec(chat-export): corrige o que sanitize_tool_call realmente apaga
+  - a1f873ee spec(chat-export): propose add-chat-transcript-export + glossary/ADR for the Chat-vs-Session collision
+  - 3dd593df fix(ui): sent non-image attachments render as file chips, not empty frames
+  - d8c4d4d1 fix(ui): thinking blocks stop truncating mid-word; GitHub/YouTube chips get their real marks
+  - 7a087449 Merge branch 'change/enrich-composer-intake'
+  - 5784a271 style(ui): rustfmt the F3 chip strip (worker paused before its fmt gate)
+  - 190ec434 Merge branch 'change/enrich-composer-intake-f5' into change/enrich-composer-intake
+  - 3312949d feat(ui): show staged text attachments as chips in the composer strip
+  - cc2e6d5e feat(ui): classify dropped composer files
+  - d804142a Merge branch 'main' into change/enrich-composer-intake-f1
+  - 145732de fix(ui): close composer markdown decoration guards
+  - 0110b0f0 fix(orchestrator): o prompt e o schema da tool passam a arbitrar entre task e workers
+  - aaacd227 wip(ui): markdown decoration in the composer input (F4/C9-C11 implementation, verified by orchestrator)
+  - 562388c4 chore: consolida tres frentes em voo — remove a substancia legada de worker-tools, contem o storm de notificacoes de worker e torna Skip primeira classe
+  - 9ec152f9 openspec: Fasing F5 -> human_needed @ f58e6f73 (spec-audit mechanically green; visual/click UAT pending with F1's)
+  - f58e6f73 feat(ui): render URL chips in user messages
+  - 54a84357 openspec: stamp remaining F2/F3 scenarios; Fasing F1 -> human_needed @ f69f5f23 (spec-audit mechanically green, awaiting human UAT)
+  - c3936e9a openspec: stamp remaining F2/F3 scenarios; Fasing F1 -> human_needed @ f69f5f23 (spec-audit mechanically green, awaiting human UAT)
+  - 12e432db openspec: stamp Test: tiers on every scenario of enrich-composer-intake (phase-audit gap: artifacts lacked per-scenario test stamps)
+  - f69f5f23 openspec: stamp Test: tiers on every scenario of enrich-composer-intake (phase-audit gap: artifacts lacked per-scenario test stamps)
+  - 33af3ec5 feat(ui): stage long pasted text as attachments
+  - 86fe5d67 openspec: propose enrich-composer-intake (paste discipline, honest drops, staged chips, input markdown decoration, URL chips) — ported from orchestrator.dev's composer, source recovered from its bundle
+  - 7d5e211f fix(ui): the slash list scrolls instead of hiding its own tail
+  - 95e7c3ce fix(ui): the slash popup spans the composer pill instead of a fixed 520px
+  - 9accabbb fix(ui): the slash popup is a list of commands, not a dense picker
+  - c182091f fix(engine,ui): a crash mid-turn must not leave an eternal spinner or an unanswerable question
+  - d27a9488 fix(ui): capture knobs need an explicit opt-in, so a normal run boots into the chat
+  - 0ab192c0 fix(ui): keep the details header off the settings pages
+  - d28dc57f fix(ui): the titlebar's trailing controls are one content-sized cluster
+  - 4e17300f fix(ui): one capture button, one capture gesture; unstale the folder test
+  - 20497535 refactor(ui): one right pane, one tab strip, one registry
+  - 4f2a81e8 fix(ui): make clicking a file actually open its preview, with room to paint
+  - f9bec564 fix(ui): give every markdown block its own id, every file its own scroll
+  - 45144179 fix(engine): stop the checkout diff from overflowing the worker stack
+  - c9822abd chore(ui): clear the warnings left on main
+  - 89296629 Merge pull request #3 from guilhermexp/fix/titling-model-claude-usage-a11y
+  - 6f3643d1 no-mistakes(document): document Claude credential stores, titling family pick, a11y roles
+  - c80814cf no-mistakes(test): silence unused RunRequest warning in restart_resume test harness
+  - 652cc4ad no-mistakes(review): make Claude credential writes reach every store; drop hyphenated snapshot dates from model rank
+  - 5dc7382f feat(ui): expose focused surfaces to accessibility
+  - c272ec89 fix(engine): read Claude credentials from the store the CLI uses
+  - cbe27491 fix(engine): title chats with the newest model of the small tier
+  - 1dd50934 chore: clear compiler warnings and env-dependent test failures
+  - c8814d82 fix(ui): normalize subagent rows in Workers widget
+  - 0643baf1 refactor(engine): clarify Kimi usage flow
+  - f982502a feat(ui): add Kimi managed usage
+  - 5201de0a docs(spec): constrain Kimi usage credential origin
+  - aa9f75a7 fix(ui): polish workers subagent widget
+  - cee95645 docs(ui): plan workers widget polish
+  - f60d69d3 Merge pull request #2 from guilhermexp/feat/orchestrator-turn-steps
+  - 314b41f4 no-mistakes(lint): fix(tests): repara fixtures quebradas e lint de sync
+  - 1e5b56b5 no-mistakes(document): docs: corrige contrato de context usage e purposes de spec
+  - e5069be7 no-mistakes(review): restore own-turn held guard placement and drop dead layout helpers
+  - 6beb70a1 docs(ui): close context and todo alignment plans
+  - dcf7d915 fix(ui): retain context usage and align todo status
+  - d4a5d669 no-mistakes(document): Atualiza contratos de turnos e formatação
+  - b7d8a5e6 no-mistakes(test): Bloqueado pelo submódulo privado do Unpeel
+  - 054e106f no-mistakes(review): Limita previews ACP e bloqueia cliques sob sticky
+  - 13091409 fix(ui): show turn tool cards by default
+  - 40f18a02 fix(ui): remove sticky header backdrop seam
+  - 2554df73 feat(ui): keep user messages sticky per turn
+  - 4ef25aaf docs(ui): record contained file card scrolling
+  - ff62b69e fix(engine): bound historical file input lookup
+  - e40351e8 fix(streaming): bound progressive file tool updates
+  - d55ea221 docs(ui): record assistant turn steps parity
+  - d280ccef fix(ui): contain file card wheel scrolling
+  - df705295 fix(ui): harden file change card boundaries
+  - 1de8e58a feat(ui): render live file change cards
+  - f9e7d3d1 feat(chat): persist bounded file change previews
+  - cdae0596 fix(ui): preserve turn steps through transcript updates
+  - 6fc59fc7 feat(ui): render per-turn assistant steps
+  - 53411b07 feat(ui): project assistant work into turn steps
+  - a24593f5 test(chat): cover duration at steer boundary
+  - 100a70ba fix(harness): align progressive OMP tool frames
+  - b62a9748 fix(ui): keep unresolved turn activity visible
+  - 178f6c32 test(chat): cover errored and steered turn duration
+  - dcd4c574 feat(ui): define assistant turn collapse policy
+  - 642c5db4 feat(chat): persist assistant turn duration
+  - ee98390b feat(harness): preserve progressive file tool input
+  - b606f0b3 docs(ui): plan live file change cards
+  - 30e33a5e docs(ui): add turn duration to collapse plan
+  - fe1e4a53 docs(spec): expand Kimi provider migration boundary
+  - a766ef89 docs(ui): plan assistant turn steps
+  - 3f6afb1d feat(workers): advertise orchestrator control guidance
+  - 60c9f4b3 feat(ui): render todo lifecycle snapshots
+  - 60d72e79 docs(spec): make Kimi usage change executable
+  - 519b9319 docs(spec): add Kimi managed usage change
+  - bf8c7129 fix(ui): keep local usage details accessible
+  - 7aa5a9d8 fix(ui): remove inline code background wash
+  - 9cf88001 chore: init orchestration flow (OpenSpec + DOX + auto-claude)
+  - 1856ff67 feat(ui): complete provider usage details
+  - 3cbad197 feat(ui): replace subagent avatars with Blobatar
+  - 78e64857 docs(ui): design Blobatar subagent avatars
+  - 8ecb0826 feat(ui): improve terminal scrolling and viewport behavior
+  - 189e43c5 fix(ui): expand command groups while streaming
+  - 6bca0995 fix(ui): remove redundant subagent status check
+  - 3abe7449 fix(ui): render Codex avatars in full color
+  - 00230235 feat(ui): use Codex subagent avatars
+  - c9102e97 fix(ui): keep thought blocks expanded
+  - 751d66bd docs: plan Codex subagent avatars
+  - 98f195cd docs: design Codex subagent avatars
+  - 08c0652e fix(ui): show native OMP subagent details
+  - 1b042f1e docs: plan OMP subagent detail parity
+  - a5f664e2 docs: design OMP subagent detail parity
+  - fb0c6ef9 fix(omp): render todo snapshots through shared component
+  - 74ff902e docs: plan OMP todo rendering parity
+  - c0285895 docs: design OMP todo rendering parity
+  - b717f3c0 docs: plan terminal scrollback parity
+  - 2fa98fe2 docs: design terminal scrollback parity
+  - 6b734c12 fix(omp): route batched subagents independently
+  - 1528d6f0 fix(ui): harden chat workers widget lifecycle
+  - fc5d1103 feat(ui): open workers in chat split
+  - f4df56db feat(ui): add chat workers details widget
+  - ba1b3d85 feat(ui): project chat worker activity
+  - 09cefb65 feat(doc): persist chat workflow activity
+  - 55503545 feat(harness): normalize workflow activity
+  - 9f7b8b1c feat(proto): add workflow activity events
+  - e90f22b1 docs: plan chat workers widget
+  - 861fcfba docs: design chat workers widget
+  - 29673636 fix(ui): reject malformed Mermaid source
+  - 94bbe2bd fix(ui): bound Mermaid graph complexity
+  - f0828262 fix(ui): cap inline media admission
+  - 0255e416 fix(ui): bound inline media lifecycle
+  - d3121ef9 feat(ui): render Mermaid diagrams inline
+  - 994cd30e feat(ui): preview agent images inline
+  - 2614d2e8 feat(ui): add native inline media core
+  - e987f802 docs: plan inline media rendering
+  - aa6ba56d docs: design inline media rendering
+  - 49063b29 fix: harden streaming lifecycle edges
+  - b5f153a7 test: update additive metadata fixtures
+  - 1120e12e feat(ui): render live reasoning traces
+  - 71072211 feat(doc): retain reasoning transcript parts
+  - 457d5d1f feat(harness): retain command result details
+  - f7683ed9 feat: preserve command execution metadata
+  - b4899285 feat(ui): show live command tool states
+  - 59f8c05b feat(proto): describe live tool lifecycle
+  - a575fd49 docs: plan streaming tool block parity
+  - 42ad1230 docs: design streaming tool block parity
+  - 65d3ccf6 feat: show context window usage in composer
+  - fb92d785 docs: design context window indicator
+  - 5bbe5d75 fix(harness): restore Workers MCP in native runtimes
+  - f02c078a docs: design native Workers MCP restoration
+  - 8884d65f fix: match composer to user message radius
+  - 1816f56a refine composer corner radius
+  - 575ca10d docs: design composer corner refinement
+  - 42952a73 fix: match user cards to composer chrome
+  - f6ea84bf feat: add full user message preview
+  - df94241e feat: port Orchestrator user message card
+  - 031b0920 test: define user message presentation contract
+  - dca35d56 docs: plan Orchestrator user message bubble
+  - 47e21e7e docs: design Orchestrator user message bubble
+  - 2c03999a perf: cache contextual tool icons
+  - 45df7aed feat: render contextual tool icons
+  - 100f7bee feat: resolve contextual tool icons
+  - 0f4c40f4 docs: plan contextual tool icons
+  - 26a00347 docs: design contextual tool icons
+  - 6d1a53c6 fix: harden OMP RPC lifecycle
+  - 5af2ffc6 test: harden OMP runtime integration
+  - 37029ba3 feat: register OMP runtime
+  - 6e0d01e0 feat: run OMP through native RPC
+  - 4dfe3430 feat: expose Workers to OMP RPC
+  - 5880575a feat: normalize OMP RPC events
+  - 827f6d36 feat: discover OMP models and commands
+  - 779f8244 feat: add bounded OMP RPC transport
+  - d183987f feat: add OMP harness identity
+  - c37628a4 docs: plan native OMP RPC runtime
+  - 16ba30dd docs: design native OMP RPC runtime
+  - fe9ebdb5 v0.2.18
+  - b276f8ac ios: clean up build warnings
+  - 168c5a00 ui: handle empty agent catalogs safely
+  - dd722aba registry: gate default agent enablement on the installed probe
+  - bcd4217e sync: pull/push hardening — bearer headers everywhere, body caps, bounded rows response
+  - c19e1ba4 harnesses: no unrunnable fallback in the composer offer; uninstalled last harness can be disabled
+  - 8728718a accounts: stop Codex add-account opening two identical auth tabs
+  - 67c8cc86 accounts: correct Codex free-tier quota window to a month
+  - 5957ba4f ui: let installed-only harnesses toggle off; picker requires an installed CLI
+  - ad60081c ios: configure App Store bundle identifier
+  - 4b9c69a4 fix composer idle redraw loop
+  - 688b08ca restore full right pane takeover
+  - 0b7f3002 preserve minimum chat panel width
+  - e800a442 adapt composer traits control to available width
+  - b1a5fa9c fix composer reflow during panel resize
+  - c39e5fb2 fix(ui): make changes pane freely resizable
+  - 28dfcd7f Preserve live MCP OAuth when switching Claude accounts.
+  - 5b021352 Center chip header content inside the bordered card
+  - fb089a70 Keep agent spawn chips visible outside the tool-group collapse
+  - 913ea30a ios/chat2: cursor contiguity + gap repair + retry re-issue (PR #172 port)
+  - f4ba32f0 ios: send truth, queued attachments, and worktree-on-drain (PRs #159/#164/#165/#168/#170 port)
+  - 0436af7d ios/sync: event-driven reconnect + relay link liveness (PR #168 port)
+  - 6ea08615 v0.2.17
+  - 9336d9a8 Thumbnail percent ring tracks the real relay transfer, not just staging
+  - 8c7d1198 v0.2.16
+  - 5f41d240 fix: harden OpenCode model discovery
+  - 5b01da36 Fix selection edge scrolling and terminal scrollbar
+  - 4ebda301 ui: fix decorated ranges at soft wraps
+  - af82b86d Fix terminal rendering after sidebar reopen
+  - b833e3d0 fix(acp): support Grok model switching
+  - 9bacc28e v0.2.15
+  - 08ea6574 Attachment thumbnails: sending indicator back, no post-send blink, corners clip
+  - df0dd4ec v0.2.14
+  - 7ef3b3e7 chat2: cursor contiguity + gap repair — the new-session random-hang root cause
+  - 5c483a87 Expired undelivered sends are re-issuable too
+  - 458399a6 Retry mints a fresh attempt; dead commands terminalize instead of ghosting
+  - d862afe7 fix(ui): round project picker section corners
+  - 51074d6e v0.2.13
+  - 6f38cb1c ui: contain wheel overscroll inside scrollable composer input
+  - 05a252af Atomic new-chat sends: stage first, restore to canvas on failure
+  - 3731ff68 Connection spinner goes grayscale (mini_mono_spinner)
+  - 63bb1919 Connection line: bare spinner, no surface
+  - 1fa812a8 Calm connectivity truth: degrade hysteresis, staging sweep race, quiet pill
+  - 2814b4c7 v0.2.12
+  - 659c11e2 opencode: effort picker rides model variants — the wire had it all along
+  - 0b526be9 opencode: surface provider failures instead of silent forever-Working
+  - 677849a3 gpui: repoint at wingleeio/zed post-merge; frost the change-request card
+  - 524a5d08 ui: real frosted floats on Linux (wgpu backdrop blur)
+  - afe96bed subagent steers: durable across harnesses (claude re-key, engine gates, opencode resume)
+  - 691e644c v0.2.11
+  - e3d158d7 source control: resolve the default branch through gh, never git transport
+  - 00d3140a subagent transcripts open with their prompt; opencode+grok forward user messages
+  - 54dd1d89 codex: child userMessage items are steers, not delta-channel echoes
+  - ce2ea6eb subagent tabs: working trailer + parent steer messages
+  - 56134713 transcript: spawn chips link to the subagent tab, not an accordion
+  - e6b8412b test(engine): isolate login shell gh path fixture
+  - 69626695 fix(engine): evict inactive change request cache entries
+  - 9d5cb392 fix(engine): resolve uncached remote default branch
+  - 30664c97 fix(engine): use origin for untracked branches
+  - f23a2688 fix(ui): retry pull request watch after host upgrade
+  - 9b88cde0 fix(engine): preserve links on unsupported streams
+  - 5921046d fix(engine): resolve gh from login shell path
+  - 479b5677 fix(ui): frost pull request tooltip
+  - 6b53dfce test: cover pull request status across device boundaries
+  - 1ad3589e feat(ios): show host pull requests in session surfaces
+  - 0537a996 feat(ios): support streaming device RPC
+  - 8f76b2fb feat(ui): show pull request badges in sidebar and composer
+  - be806195 feat(ui): track pull requests for local and remote sessions
+  - f0364a5c feat(engine): stream cached checkout change request status
+  - c8e0b661 feat(engine): resolve GitHub pull requests with gh
+  - cbb11fb6 feat(proto): model checkout change request status
+  - 53147e67 doc_host: new-chat join backoff resets on sibling dial success
+  - 2eac227f send: New-worktree never silently degrades; undelivered sends say "Queued"
+  - bc932861 attachments: progress ring on the sending thumbnail instead of label swap
+  - dbb4c400 attachments: 10x chunks, parallel window, overall deadline, live progress
+  - fff9b04a style: rustfmt pass over the durability work
+  - aba12113 delivery: explicit failed state + retry, send-time timestamps (Phase 4)
+  - b87d72ff delivery: peer-relay QueueCommand fallback + deterministic flaky-network suite (Phase 3)
+  - db2bf6f5 ui: connection truth — pill, composer honesty, Queued badges (Phase 1)
+  - f386da10 relay: end-to-end peer-link liveness + registry-dark dial parking
+  - a46dc62e attachments: ride the durable queue — QueueCommand first, bytes chase in drain
+  - 0938a8fb sync: event-driven reconnects — online-bus everywhere, path monitor, tighter caps
+  - 786eed78 harness: opencode probe example builds again post-worktree field
+  - 7e66a215 accounts: keep the list order stable — always
+  - 66a1cff6 spaces: enumerate custom mounts and accept typed paths (PR #144 feedback)
+  - 0f63744b spaces: reach other drives from the add-project palette
+  - f76e6248 landing: point downloads at v0.2.10
+  - c21155ab v0.2.10
+  - e3ea0892 harness: native drivers rediscover slash commands
+  - 0f5bf873 send: worktree creation rides the durable command plane; relay calls get deadlines
+  - 75fe726b opencode: ACP harness with subagent viz off the sidecar event bus
+  - a29d1142 landing: point downloads at v0.2.9
+  - b43ebe4d v0.2.9
+  - f0ed400a cursor: isolate each SDK run's agent store — concurrent runs no longer lock
+  - d0ac2459 landing: point downloads at v0.2.8
+  - 5b303f94 v0.2.8
+  - 23c64053 cursor: live model discovery + typed model options actually applied
+  - afd7d7fd landing: point downloads at v0.2.7
+  - 356adf59 v0.2.7
+  - 94478301 cursor: in-app Connect via the SDK's browser login + accounts integration
+  - 6cfeb289 grok: subagent visualization over ACP — lifecycle wire events + disk-tailed transcripts
+  - 3423f6d5 chat2: claim rooms on HTTP first-contact, not just WS join
+  - 4c4efa2e landing: point downloads at v0.2.6
+  - 8b7e1cda v0.2.6
+  - 1e007b98 landing: point downloads at v0.2.5
+  - bf6ae496 v0.2.5
+  - 438ad6c5 sync: cursor amnesty — a cursor above the checkpoint is re-verified, once
+  - 004b5c04 sync: an encoded-empty frontier is a vacuous claim — fetch, never skip
+  - 52393d1b sync: empty checkpoint frontier is NOT contained — fetch, never skip history
+  - 9b749c41 sync: pull-path failures are loud on both platforms
+  - 5b205cf8 ios: pull's checkpoint fetch must drain the socket's frame buffer
+  - ecf41d4c landing: point downloads at v0.2.4
+  - 35031dbf v0.2.4
+  - 3a88d759 sync: audit fixes — heal waits for known server state, iOS retires pushes only on edge verdicts
+  - b8b6de49 sync: pull-first HTTPS transport — 1-RTT bootstrap, WS demoted to enhancement
+  - a9344341 ios: checkpoint downloads survive redials, registry single-dial, registry-first dial gating
+  - a9faf0f0 net: cap mobile warm dials, overlap checkpoint with backfill, flush sends at state
+  - 1f13d44f landing: add nine new tweets to the marquee
+  - ba695e0c subagent iconography: bot glyph for tabs and spawn chips
+  - 96b12f25 subagent tab: every open lands at the end
+  - 5aaaea68 shell: jump pills go glass
+  - 0d560c98 subagent tab: scroll follow + jump pill; chip quiets down; top fade
+  - 46f9c925 subagent polish: Agent chip label + codex message paragraphing
+  - a3407521 subagent UX: real terminal statuses, bare tab titles, designed chip
+  - 25c45876 subagent tabs: contextual titles + top-aligned streaming runway
+  - a24099a7 subagent viz: three live-rig findings fixed
+  - 2de2f49b subagent visualization: per-subagent docs, spawn chips, right-pane tab (B)
+  - 10fb08ed harness: Grok ACP hardening (A5)
+  - 720fdfaa harness/engine: retire adapter machinery for claude/codex/cursor (A4)
+  - fb5951aa harness: Cursor driver via the pinned @cursor/sdk shim (A3)
+  - 19ad0d1f harness: native Codex driver over app-server JSON-RPC (A2)
+  - 581e0a23 harness: native Claude driver over stream-json (A1)
+  - e1014c41 linux: draw caption controls under client-side decorations
+  - 905ef1e2 github: add FUNDING.yml so the repo shows a Sponsor button
+  - c5789fe6 no-mistakes(document): Atualiza documentação e formatação da integração Workers
+  - 15f60e4d no-mistakes(test): Corrige testes de preview; submódulo privado bloqueia validação
+  - eacec939 no-mistakes(review): Corrige sidebar, previews, notificações e responsividade
+  - 7267ae33 feat(ui): complete details and file preview parity
+  - 8a371b2b feat(workers): complete orchestrator worker integration
+  - 5c4d9e04 docs: record Workers MCP safety validation
+  - 0645d8c3 fix(workers): enforce controller MCP boundaries
+  - 1215ce21 docs: document Orchestrator Workers MCP
+  - 14ac0fa7 fix(workers): preserve MCP controller request sequence
+  - e00cbd3b fix(workers): bootstrap MCP session host launcher
+  - 6c1c18d6 feat(orchestrator): inject Workers MCP
+  - 678b5dff feat(workers): expose orchestration MCP actions
+  - aeae9f4c feat(workers): add controller MCP server
+  - 909bbd2c docs: plan Orchestrator Workers MCP
+  - 17d0dc6b docs: design Orchestrator Workers MCP
+  - 2961735c fix(workers): close resource monitoring review gaps
+  - 6f42f6f9 feat(workers): handle memory pressure safely
+  - 6feb0993 feat(workers): add on-demand resource diagnostics
+  - 8f4cf71e feat(workers): monitor resources in background
+  - b8027b44 feat(workers): add resource diagnostics CLI
+  - 15375a04 feat(workers): persist resource settings
+  - 50f36f30 feat(workers): sample session process resources
+  - 46aef23b feat(workers): add resource snapshot model
+  - 7e32e73a docs: plan Workers resource observability
+  - a75b6816 docs: design Workers resource management
+  - 1f113fb2 feat(workers): add provider icons and multiline input
+  - fc547b11 docs: design Workers provider icons
+  - 2623d453 feat(workers): add session capture gallery
+  - 35367425 feat(workers): complete Unpeel terminal parity
+  - 925c20f5 feat(workers): complete unpeel parity flows
+  - 2fd98f15 chore(workers): pin unpeel compatibility patches
+  - e7abfcbc docs(workers): record unpeel parity acceptance
+  - bf5d1947 test(engine): wait for title and branch convergence
+  - b7d60eb5 fix(workers): align archive recent and menu navigation
+  - b1962179 fix(workers): close terminal viewport and input parity
+  - 3c027fde feat(workers): run trusted provider installs from presets
+  - 51a36930 fix(workers): make activity generation authoritative
+  - 644da506 feat(workers): complete project and worktree organization
+  - de62deab feat(workers): align session lifecycle and Unpeel chrome
+  - cef6e78e feat(workers): project Unpeel menu bar activity
+  - 553c252a docs: plan Unpeel Workers menu bar parity
+  - e5c43dae docs: specify Unpeel Workers menu bar parity
+  - acd42922 docs: close Workers parity verification
+  - d85d2686 feat: port Unpeel Workers experience
+  - 63e964d5 docs: plan Unpeel Workers parity correction
+  - 0977e5da docs: correct Unpeel Workers parity scope
+  - 1aab2c55 feat(workers): add reactive local model
+  - bd53e6b6 feat(workers): complete local Unpeel client
+  - 7fd7beb2 docs: plan complete local Workers experience
+  - 6b164626 feat(workers): add Unpeel local bootstrap adapter
+  - b9f40661 build(workers): pin Unpeel upstream
+  - 19d1517f docs: plan Unpeel Workers foundation
+  - 70eb7aca docs: specify Unpeel Workers integration
+  - 550af6d3 feat(ui): add sidebar mode selector
+  - d3b3c64a docs: plan sidebar modes implementation
+  - e088a2a3 docs: design sidebar modes
+  - 8903b41d review: comment-only steers, renames cite the right side, drafts stay put
+  - d31460c7 review: earliest side marker wins, one radius, less prose
+  - e2eb9faf transcript: a sent prompt shows its folded context as a pill, not bullets
+  - e5a68be2 changes: comment a diff line and stage it on the next prompt
+  - d894e882 ios: reveal cached transcripts on layout-quiet instead of burning the settle budget
+  - 572da6b2 ios: single-flight token refresh, staggered room dials, frame-rate settle
+  - 930f1663 landing: point downloads at v0.2.3
+  - 9ae1cfd4 v0.2.3
+  - 375b4413 sync: remove the legacy s2 room client — chat2 is the only chat transport
+  - e09c6df6 net: happy-eyeballs dials, backoff reset on success, online wake, non-blocking startup auth
+  - 0e59f623 landing: point downloads at v0.2.2
+  - 747c1f26 v0.2.2
+  - c9b1f5d5 harness: managed adapter installs, bounded handshake, legible errors
+  - 33725aec www-redirect: 301 www.zeron.sh to apex via worker route
+  - f108a84b landing: point downloads at v0.2.1
+  - 2f6444c8 v0.2.1
+  - 7af05aff rpc: reject local IPC handshakes that carry an Origin header
+  - 0435c8d3 edge: stamp room-kind header only on worker-authorized forwards
+  - 393d04e0 landing: zeb's tweet fourth in the marquee, devices copy says "pilot"
+  - 42fbb06b v0.2.0
+  - b01033a6 review: a dismissed import failure stays reachable
+  - dbe284e4 landing: move zeb's tweet to the end of the first marquee row
+  - d6283608 Shortcuts: rebindable New session (mod-n)
+  - e17702a1 v0.1.65
+  - c4d865ce uploads: remove the write-only R2 attachment mirror
+  - a8972066 fix(syntax): highlight pinned commit diffs
+  - 1ed50000 style(syntax): align palette with git graph
+  - c9addb42 fix(syntax): address highlighting audit findings
+  - 7e03a333 fix(rpc): bound dispatcher async stack usage
+  - 649cdebe test(ui): harden syntax highlighting quality and performance
+  - 67e7fd70 refactor(ui): remove the legacy syntax tokenizer
+  - 3ad0ae18 feat(syntax): support embedded language injections
+  - 1e7abbdf feat(syntax): add core language grammars
+  - 0284744d feat(ui): map full-file syntax into checkout diffs
+  - 7a0b826b feat(rpc): expose checkout diff source pairs
+  - 2455bf16 feat(ui): highlight tool diffs from complete sources
+  - b06ee766 feat(ui): highlight markdown code with tree-sitter
+  - 9219d691 feat(syntax): add tree-sitter highlighting core
+  - ae27c134 feat(ui): expand the syntax theme palette
+  - e71aef0b refactor(syntax): define shared highlighting contracts
+  - 10a50e24 v0.1.64
+  - 7194b481 v0.1.63
+  - 548f424b loaders: splash ascii disables ligatures too
+  - 4e940360 terminal: disable ligatures so a row never renders short
+  - 5ca096b8 terminal: pin glyphs to the grid instead of letting the shaper place them
+  - d4def0fc shell: right pane opens by default; splash gets the landing hero in glass
+  - 5e26fedf shell: surface picker keeps its heading instead of a logo
+  - 0ed0377b shell: true per-pixel horizontal wash fade (gpui bump) + Capy-style picker
+  - 1bf1932d shell: chip washes fade at the strip edges
+  - 4e4328e8 shell: port the old session-tab strip's solved scroll recipe
+  - ff9c52f7 shell: wheel-scroll the surface strip through occluding chips
+  - 94d6ead9 shell: surface strip actually scrolls, with glass edge fades on overflow
+  - 702ffa12 shell: surface-tab strip scrolls horizontally
+  - 80e1e381 shell: + menu row reads Git, not Git diff
+  - 86e4e043 changes: contextual diff tab titles + per-commit diff tabs from History
+  - f89dfd01 terminal: contextual tab names from the OSC title
+  - 56f03615 shell: surface-tab drag matches the terminal drawer's animated reorder
+  - 39eb2061 shell: surface tabs — hover x, drag reorder, multiple diff panels, takeover alignment
+  - 77dd3cc6 shell: surface-tab x renders, embedded terminal shares the pane surface
+  - eedd762b shell: right pane becomes a tabbed surface host (t3 RightPanelTabs)
+  - 32ed2358 review: fail loudly on partial imports, durable marker, spaces-aware offer, fmt
+  - 6b9145e0 ui: trim wizard copy
+  - 39e887ea engine: camelCase import-event fields on the wire
+  - cfba2da7 ui: seamless local→synced switch with one-time import wizard
+  - 1bf3ded2 engine: one-time local→synced profile import
+  - 8dda8d67 v0.1.62
+  - 6f7dad44 rename: comet -> zeron everywhere (binary, crates, env, data dir, iOS)
+  - 192c20b6 fix(ui): elect one replacement engine across viewports
+  - d6c045b5 fix(engine): own every Edge worker across runtime shutdown
+  - cff4c10c fix(engine): disconnect synced runtime on sign-out
+  - 23b63f45 fix(auth): shut down synced runtime on sign-out
+  - 7ded6239 fix(engine): recover synced transports after offline boot
+  - 8e545e18 fix(ui): remove projectless onboarding action
+  - abc31684 fix(engine): resolve native device names
+  - b68b99e3 fix(ui): clarify local-only device labels
+  - 53fc260a fix(daemon): restore systemd start limits
+  - 34ab060a fix(ui): surface deferred engine startup failures
+  - 3198a4a6 fix(engine): isolate synced account uploads
+  - c2cc540e style(ui): order settings imports
+  - ebd32a01 fix(engine): keep local runtimes offline
+  - 2e5c155e fix(e2e): support macOS and transcript deltas
+  - 6373d4d0 fix(auth): back off offline refresh failures
+  - bba27f16 fix(ui): clear stale sync restart after revocation
+  - e55eb937 fix(auth): avoid unsupported match guard
+  - 0e5bd2ca fix(ui): wait for remote engine shutdown
+  - 0a474cb4 fix(engine): recover truncated device identity
+  - 878ba460 fix(auth): invalidate canceled OAuth exchanges
+  - fbf7fd07 fix(ui): stop remote daemon before runtime changes
+  - 0d7ca6ff fix(engine): publish device identity atomically
+  - 1d63658b fix(ui): share pending sync restart across viewports
+  - 3621edb6 fix(engine): require a bearer for development sync
+  - f1e27746 fix(ui): block all synced viewports after sign-out
+  - d55eb81c docs: document local-first usage and optional sync
+  - 9fe5f78d test(engine): lock down local and synced profile isolation
+  - 2bf3ae2d feat(cli): make local-only the default daemon lifecycle
+  - 6623dd32 feat(ui): replace the auth gate with a local sync opt-in
+  - 30c39fdf feat(engine): boot signed-out installations in local-only mode
+  - 9b0ba77a refactor(engine): model local and synced workspace profiles
+  - e07c0a92 pickers: rail indicator is a left half-capsule pressed on the border
+  - b0e82ccf pickers: single moving highlight in the model picker
+  - 4d6da77e pickers: model picker polish — aligned header band, purple rail indicator, star re-anchor, versioned labels
+  - 101ff8c1 pickers: t3-style model picker, model list hygiene, glassy new-project palette
+  - 5e13b41c ui: real glass tint + reference blur for popovers/dropdowns
+  - bb5b44b2 landing: devices fork section, panel reorder, aligned row edges
+  - 5f051833 landing: drop panel frame and inner hairlines
+  - 460380e3 landing: panel redesign, gallery, harness diagram, reach ascii
+  - f3b1bb38 landing: add tweet marquee section
+  - aa133f1c v0.1.61
+  - f28f3724 Transcript: rail reads from the reading line; chip toggles tween the group body
+  - c14df7d8 v0.1.60
+  - 98e60fb9 macOS icon: bake squircle mask, margins, and shadow so the installer icon isn't a bare square
+  - af1e0537 v0.1.59
+  - 847c38ce Transcript: runway ends at the app bottom, rigid stop, streams in place
+  - cd7720d0 v0.1.58
+  - e75da8d2 Transcript: the runway bottom is a hard stop
+  - 0768152f v0.1.57
+  - 0fdda1c7 gpui: bump fork to 8a8954c — macOS 26 window blur fix
+  - 11bd2db8 Transcript: keep the held layout scrollable; row 0 carries its own inset
+  - 96a15b73 Transcript: provisional runway overshoots — short chats have no bounds
+  - b3c53afa Tool chips expand to the full tool call
+  - ae7c11c4 v0.1.56
+  - 85765065 Transcript: only a chat switch clears the runway
+  - 00960f97 Transcript: a restick during a runway re-arms the hold, never the pin
+  - 46e434cf Sessions: settle self-continued turns — extension turn-end + short quiesce
+  - 46fcfc7c Packaging: ascii-hands dmg with drag-into-Applications layout
+  - 23f75c00 v0.1.55
+  - d2ed18ac Transcript: eased runway entry, absolute hold, and scroll release
+  - dab0ef54 style: simplify history ref badges
+  - 237b2f02 fix: preserve history ref overflow affordance
+  - ec906fa2 perf: batch visible history graph paths
+  - 817bf54a feat: fetch remote history from the history pane
+  - 1690e81b feat: show active branch history context
+  - c9b1c5c5 perf: stabilize history row hover state
+  - 81b3ce15 fix: adapt history refs to available width
+  - 8ba87d57 fix: fit history ref tooltips to content
+  - 48b74982 feat: add tooltips to history refs
+  - 1f9705fa feat: add icons to history refs
+  - 78b099c3 fix: contain history reference badges
+  - bd2f9b41 fix: center active history commit ring
+  - 32d0a40b style: soften history graph palette
+  - ae67741e fix: center history load more button
+  - 67a69b5c feat: add git history graph view
+  - dceb9a09 v0.1.54
+  - efe16dac macOS releases: Developer ID signing + notarization in CI
+  - 0b0bc685 Transcript: every send glides the prompt to the top with reserved space
+  - fbfdf4b4 Sessions: never tombstone the resume id on a startup crash; keep stderr
+  - 0ac062fa docs: evidence media for the sending bridge + ref truncation fixes
+  - bd2ca475 Changes header: truncate the branch and base ref evenly
+  - 342076c4 Working trailer: "Sending…" bridge with no timer until the turn starts
+  - e14aefe6 Changes header: budget the row gaps so the buttons hold still on expand
+  - bdac3c9e v0.1.53
+  - f3a56521 ACP: scale the evidence probes — 10-run A/B series + all-harness survey
+  - 57546331 ACP: real-stack A/B evidence probe for the Claude quiet-settle exemption
+  - a516e708 ACP: exempt Claude from the blanket quiet settle (false mid-thought Done + stuck-Working orphan)
+  - fd4e38ed v0.1.52
+  - dfbea1fc ACP: injection cost frames must not settle steered turns; all-agent sweep
+  - 604f20a6 ACP: Claude busy steers ride native queueing, not cancellation
+  - e3afe2f7 ACP: cancel-before-prompt into self-continuing sessions (starve prevention)
+  - ee620e1f ACP: blanket dropped-reply settle for every adapter
+  - 40f32961 ACP: full-stack starve verification against the real adapter
+  - 26e1d7f5 ACP: settle dropped replies off the turn-end cost frame (~1s, not watchdog)
+  - 353acd7d ACP: starved-turn recovery on noRunningTurn evidence (root-cause fix)
+  - 9d268a97 Sessions: quiesce watchdog + fold self-continued output (stuck-Working fix)
+  - ea6b8049 Use landing screenshot in README
+  - af0c6bf8 Brand desktop app as Zeron
+  - 09f8ebec Brand iOS and landing page as Zeron
+  - a29cce69 v0.1.50
+  - 8d829352 Popovers: clicking an open menu's trigger closes it, never close-and-reopen
+  - 28d9d005 Diff gutters: guarantee 6px clear of the accent bar at every width
+  - 19bf5f33 v0.1.49
+  - 04ace857 Diff gutters: size line-number columns to the file's widest number
+  - 11f7d012 Diff sidebar: virtualize at line granularity, not file granularity
+  - 3b59b55c v0.1.48
+  - 6dfc733a Landing: Cursor icon in the supported-agents row
+  - e0ad8e0c Traits chip: name the effective picks instead of a bare "Traits" label
+  - b8508fe5 Add Cursor agent over ACP (`cursor-agent acp`)
+  - fcead637 First-turn anchor: trust the chat row, clamp the wheel
+  - d0c1b0f6 Fix initial desktop chat message positioning
+  - 27322296 Landing: ascii hands, denser railing, copy pass, Discord link
+  - f733156e notify: dash-leading titles are summaries, not notify-send flags
+  - db2a3c14 Desktop notifications: banners on the session ping edges
+  - cd0224d7 Slash-descend: exact casing wins over a case-colliding sibling
+  - 014d7514 Folder picker: slash-to-descend, tab completion, ctrl-n/p
+  - 506ede66 Landing: hero-anchored edge ascii, mobile pass, deploy on push
+  - 0663f7a6 Landing page: black + purple ASCII redo, deployed as static assets
+  - ec31ce41 User bubble text: selectable like rendered markdown
+  - b35c3e71 Add DeepWiki badge
+  - cc354ff4 v0.1.47
+  - 5d8af928 Collapsed-takeover header: scope dropdown on the cluster's 2px rhythm
+  - 3ac32160 v0.1.46
+  - ba968798 Changes scope menu: the 2px row gap every other menu has
+  - 0e78bbf6 Changes header: truncate long refs, tighten collapsed-takeover inset
+  - 534e2f66 v0.1.45
+  - 4972b0a6 diff-sync: watch the git dir when the worktree blows the watch budget
+  - d27d2720 v0.1.44
+  - a9c47e16 Changes header: searchable refs, menu gaps, skew copy, collapsed-sidebar takeover
+  - c03a872b v0.1.43
+  - a1f6ded1 Changes header polish: family fold glyph, takeover alignment + border
+  - 82d83661 Changes header: controls in the titlebar band, full takeover expand
+  - c9de55b7 Changes panel: flush glass pane, diff scopes, ref selector
+  - 8d07efbf v0.1.42
+  - 7ebd4796 Composer: drop "Don't work in a project", gate sends on a project pick
+  - 9ac33c39 Terminal dock: glass fill, floating resize handle, transcript stops at its top
+  - 4e807f56 Update strip: dark-purple glass fill, icon dropped
+  - 1dac3c05 v0.1.41
+  - d0d6ce12 Engine: boot-time transcript salvage for blanked born-gen2 chats
+  - 354212d3 v0.1.40
+  - cbe7b023 Engine: born-gen2 race — absent registry row means chat2, stuck s2 handles seed and persist
+  - f5245c93 iOS: composer tap-anywhere-to-focus, keyboard-open pin re-arm, home header alignment
+  - 2c97c5e5 v0.1.39
+  - 47ed2ea2 Attachment polish: pending photos, strip × stacking/click-through, Esc-close, Show-more gap
+  - 3449c360 v0.1.38
+  - f91bdd8c Host: reopen chat doc after cutover drop so nudged commands execute
+  - 5127d195 Sidebar edge fade: gate on scroll overflow at paint time
+  - 73783125 v0.1.37
+  - e4eec0b4 Unarchive on send + glass-forward light chrome + shared sidebar tokens
+  - 39b3e6d5 iOS: archived shelf + corner status, measured transcript pinning, skeleton loader
+  - 6e5b7270 gpui pins → 53518c0: edge-fade line merged into comet/line-wrap-closing-punctuation
+  - 04dbcf14 v0.1.36
+  - 4389558e Glass-native transcript + t3 archived shelf + canvas target selectors
+  - 63e8662e Engine test: the project-less flow end to end
+  - a3fc1007 Titlebar + joins the window-control cluster; archive swap is corner-hover only
+  - 332c84dc Sidebar/composer polish round: archive-on-hover, device search, richer status text
+  - 3df83f8d Boot restore respects the no-project opt-out; picker capture knobs for project/device
+  - 7249dc8d Rename spaces→projects in UI copy; onboarding allows project-less start
+  - 2513fb13 Kill the tab strip: titlebar names the session, sidebar goes activity-first
+  - 35db5fe7 Composer footer: device + project selectors; refs locked after creation
+  - 3e72b2a8 Engine: project-less chats (createChat deviceId, cwd ~ expanded at spawn); UI state grows device pick + no-project opt-out
+  - 5ab78dc0 Fix merge fallout: new popover closing param at HEAD-side call sites, open_kind() accessors
+  - 36216a95 Space selectors list alphabetically
+  - a869f886 Space triggers carry the "@ device" tag: sidebar filter + composer chip
+  - 21a5c349 Popovers animate out: Popup closing phase, wall-clock fade, blur ride-down
+  - 17ac085a Wash-only selection across every menu: drop the check glyphs
+  - d5189516 Space-filter dropdown: drop the check glyph
+  - 5c5cb4e9 Space-filter dropdown opens below the trigger
+  - 9fe40473 Space-filter trigger: caret at the right edge, names truncate
+  - 4bc48ab0 Device-local tabs + spaces as a sidebar filter dropdown
+  - 56725227 Recover last night's mobile session+UI refactor (lost worktree, replayed)
+  - d5994793 v0.1.35
+  - 5b872f59 Host posts a bootstrap checkpoint when its chat2 room has none
+  - 57abbe24 iOS chat2 cutover: mobile abandons s2 entirely
+  - 2037d072 v0.1.34
+  - 3ed7dc55 Full chat2 migration: born on chat2, host sweep, first-contact push
+  - 0516b196 v0.1.33
+  - f2978c67 Cutover converges live watchers; smoke driver speaks the framed protocol
+  - 95b838ea Robustness batch: seed races closed, steer ledger, watch resubscribe, plan chip
+  - 816fb355 Session timers are per-message; Steered can never trail Done
+  - 7fedd529 v0.1.32
+  - 3cc52895 chat2: close the B3 drain race (buffer push holds the client lock)
+  - f57556ac chat2 cutover: fix the five review blockers + checkpoint spam guard
+  - d2476bd9 chat2 C3/M2/M3: host wiring, roomGen cutover, reader discard-and-adopt
+  - 506f0e6f chat2 C3 foundation: engine sink + Range-resuming checkpoint fetcher
+  - 629f2a48 v0.1.31
+  - 9d139c42 Transcripts salvage malformed entries; room dials get a deadline
+  - 691a9594 v0.1.30
+  - 5ec28fce Tool chips are one-liners again: outputs stay out of the doc, sidecar parked
+  - 15b5d98f v0.1.29
+  - ed8f1e78 chat2 test harnesses: live E2E, cross-language crosscheck, whale rebuild probe
+  - c3a623a1 chat2 review fixes: push retirement, cold-start backfill, reset signal, '#' part ids
+  - a7d0a616 chat2: M1 epoch rebuild — thin-doc whale healing core (chat2-sync M)
+  - 7ef6e117 chat2: Rust ChatClient + cursor-bearing snapshot store (chat2-sync C1/C2)
+  - 20d07ef4 chat2: ChatRoom DO — dumb authenticated log relay (chat2-sync B)
+  - 68b5ad92 thin docs: strip tool outputs/diffs to summaries + R2 sidecar (chat2-sync A)
+  - f54b54c7 edge tests: split unit/workerd tiers via vitest-pool-workers
+  - 1617b031 docs: chat2 dumb-relay sync plan — thin docs, log-relay DO, whale-healing migration
+  - 26b16b0a v0.1.28
+  - 6e9fcba7 ACP polish: configOptions-first models, codex yolo, completion + transcript fixes
+  - 3402c07d v0.1.27
+  - ac946808 Traits dropdown: restore the 2px row gap between menu rows (#33)
+  - 938778cf v0.1.26
+  - 4b864b7e Refresh composer harness catalog live on Settings → Agents toggles (#32)
+  - ab4294c2 v0.1.25
+  - cb5fbcd7 Harness settings page, model prefetch, picker highlight fix (#31)
+  - 1c04744f v0.1.24
+  - 79ab0119 Add Hermes and Pi agents over ACP (#29)
+  - 255f0db7 v0.1.23
+  - 444d8144 Convert claude/codex to ACP: one harness for every agent (#28)
+  - 7804e200 Tool detail cards: clip fix, open/close tween, queued-steer hint (#27)
+  - f635e033 Send-pending overlay demo media for the PR (A/B recordings + stills)
+  - 13f44ca3 Send-in-flight overlay: no phantom Completed flash / done-chime on remote sends
+  - db4912e5 Transcript: hold the scroll anchor across the live-to-complete resplice
+  - 47a22a5e Fix phantom worktree spaces + missing harness glyph from the claim race (#25)
+  - cf9cfe66 v0.1.22
+  - 0d96060d ACP harness: Grok Build, slash commands, tool output + inline diffs (#24)
+  - ffd20237 Terminal: mouse text selection and copy (#21)
+  - 0546d835 Terminal: resolve the ANSI palette per appearance, not just the app chrome (#20)
+  - c68ec335 v0.1.21
+  - 5aa6a257 Run Codex in yolo mode: force danger-full-access, drop the worktree escalation
+  - a8631ed1 Fade-timestamp demo media for the PR (screenshots + recording)
+  - a757e5fe Clear the bottom scroll fade from the last message's timestamp
+  - a92d4420 Whale-session sync fix: chunked update-log rows + shallow-aware join backfill
+  - cd9dfe97 iOS session polish: interactive keyboard, bottom-edge fade, transcript perf, image attachments
+  - 233b8686 iOS registry sync: port the workspace sidebar from the Loro doc to the row registry
+  - 0540d3c6 v0.1.20
+  - 8d6a0fda Registry demo media for the PR (screenshots + recording)
+  - 3ac21dd5 Registry polish: clippy clean, fmt, mock-server tidy
+  - f85b7663 Registry sidebar sync: row-table workspace state replacing the Loro workspace doc
+  - f27c6859 Revert the aggressive fold triggers; route workspace /append for operator repair
+  - 70342647 foldLog: recycle the isolate when the fold export dies on a pressed heap
+  - 8c5105dd Workspace live-frontier-trim guard: match any ws generation, not the literal ws3/
+  - e6284658 Fold the update log when it dwarfs the folded state, not only at fixed budgets
+  - eddfba47 Salvage importable updates before striking; small-payload penalty probe; attributed /stats
+  - 68bfb67b Recycle DOs: clear stale in-memory import penalties after fleet doc flatten
+  - ebd826c0 Retire ws3 workspace rooms — ws4 allocates virgin DO storage
+  - 5e2742cc Expose GET /workspace/:orgId/snapshot for doc repair reads
+  - 6fe1b6c1 Penalty-box devices whose imports keep failing — stop the doomed-push DOS
+  - 4a5072db Workspace rooms force-trim only at aged checkpoints, never the live frontier
+  - e7e2c609 Never serve a freed doc wrapper; count wasm use-after-free as poison
+  - de6a6483 v0.1.19
+  - 68c7e076 Never latch a rejected session; count rejections honestly in comet sync
+  - 036dbb90 iOS: kick every room on foreground — suspension kills sockets silently
+  - acdf4106 Automated wedge break boots attached sockets, like /reset-log always did
+  - 685c8f51 Force-trim gate counts log bytes, not just the snapshot
+  - 026a771a Gate cutoff trims on lastTrimAt alone — isShallow re-fired them forever
+  - 117e1ec1 Relay accepted updates via per-socket fragmentation, not one raw frame
+  - f06a9770 Reset the wasm-poison strike counter on a clean join answer
+  - 9de5eef9 Force-trim oversized rooms that have no aged checkpoint
+  - 197d0600 Free idle docs — wasm memory outlives DO instances and never shrinks
+  - 08f43e52 Make history trims durable before the join continues
+  - 3180016f Free loro-wasm objects explicitly — GC finalizers never fire under wasm pressure
+  - 14f8cf22 Trim history on cold materialization too — idle rooms never trimmed
+  - cc4a4a64 Trim history on log fold, not just the daily alarm
+  - d0fed179 Edge join-wedge root cause: wasm-heap poisoning made joins die in silence
+  - 2a602a62 Add native Windows caption controls (#16)
+  - 04ce9780 v0.1.18
+  - b5f02afc Durable deaf-socket detection + sync telemetry: presence tripwire, comet sync, device-attributed edge logs
+  - 76ea167c Deaf-socket healing: probe-on-focus, acks don't feed the probe, edge closes on send failure
+  - 553110ed fix(composer): let the new-chat pill be as small as the session one
+  - 8b4513d5 feat(spaces): let the folder browser show hidden folders
+  - 4b6ad18a chore: padronizar o repo — OpenSpec, DOX e contratos de agente
+  - e3626d65 Merge upstream/main (v0.1.17)
+  - 060d7ed0 test: pin both dispatch paths, the output cap, and the resume gate
+  - 88ea839d fix(mcp): floor the worker depth on the inherited env marker
+  - c0f4d123 fix(mcp): hand the worker command to /bin/sh as one quoted argument
+  - d008f680 test(mcp): end-to-end worker lifecycle against a real engine
+  - ea613c00 feat(harness): hand the comet MCP server to Claude and Codex
+  - c14f7b8b feat(mcp): serve the worker tools over stdio from comet mcp-server
+  - 839987f3 feat(mcp): worker tool logic over an engine client seam
+  - 44558187 feat(harness): carry the chat id on RunControls
+  - 21faa016 docs: correct the date on the worker-tools plan and design
+  - bd106f69 docs: plan worker tools over MCP
+  - 6219c779 docs: design worker tools over MCP
+  - 5f84c1e6 fix(ui): validate the tab before marking the terminal open; skip no-op width tweens
+  - c6619048 fix(harness): use the reentrant getpwuid_r, and keep /usr/bin in the probe fixture
+  - dd0cf156 test(engine): compare resolved worktree paths
+  - 6095022e Merge upstream/main (v0.1.9)
+  - fabf13b1 chore: cargo fmt the workspace
+  - ed247188 fix(markdown): keep mending out of nested fences and bound the delimiter scan
+  - d3b489fe Merge upstream/main (v0.1.6): streaming markdown mend + mock harness knobs
+  - 9ca3972c no-mistakes(document): align utility column docs and format new UI code
+  - e4eae00a no-mistakes(review): guard empty utility column, chooser and focus
+  - cd8b9799 fix(ui): harden utility panel toggle
+  - be14b1e5 docs: record utility panel toggle
+  - 821b71e9 feat(ui): toggle the complete utility panel
+  - ef98f7e1 refactor(ui): restore hidden utility tabs
+  - 44747da4 docs: plan utility panel toggle
+  - 1902fccb docs: design utility panel toggle
+  - 06ab8998 feat(ui): unify terminal and changes tabs
+  - 2afb59a1 refactor(ui): model utility tab state
+  - 27e4af25 docs: plan unified utility tabs
+  - f61e0d62 docs: correct utility pane tab design
+  - 7acec15a docs: record full-height utility pane
+  - c7e84341 feat(ui): extend utility pane to window top
+  - dfefb652 refactor(ui): model utility pane close state
+  - 2562063e docs: plan full-height utility pane
+  - 4687cbea docs: design full-height utility pane
+  - 55a6ec6f docs: add functional baseline
+  - af1e75c6 docs(ui): align utility pane comments
+  - 9c02711c chore(ui): preserve existing source formatting
+  - 1d53f963 docs: update lateral terminal inventory
+  - f62d179c style(ui): remove terminal tab divider
+  - f9a1aa47 refactor(ui): remove bottom terminal layout settings
+  - 2cb549d9 feat(ui): add lateral terminal titlebar control
+  - da2f3414 feat(ui): move terminal into right utility pane
+  - 80455308 docs: plan lateral terminal implementation
+  - 2a730c99 docs: design lateral terminal panel
+
+- Sync result: merged
+- Last synced upstream commit: b3fa5187

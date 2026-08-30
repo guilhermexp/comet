@@ -1,0 +1,916 @@
+# Fork Sync Report
+
+## Execution
+- Timestamp (UTC): 2026-08-30T03:32:58Z
+- Repository: /Users/guilhermevarela/Documents/Projetos/SelfHosting/comet-upstream-v0.2.29
+- Branch: chore/upstream-sync-v0.2.29
+- Head before: 350ed33a
+- Head after: 25180e1a
+- Upstream base: upstream/main
+- Upstream head synced: b3fa5187
+- Previous synced upstream commit (from changelog): `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
+- Merge status: merged
+- Local delta base: f080476ab03f6cf71caf463eb281625a67fc912a
+- Local delta patch status: reapplied-overlay
+- Working tree: dirty
+
+## Current Situation
+- Private commits vs upstream: 776
+- Upstream commits detected: 755
+- Upstream files changed: 539
+- Conflicts auto-resolved with local priority: 0
+- Protected path files reapplied from local HEAD: 0
+- Files touched by local delta reapply: 2897
+
+## New From Upstream
+- b3fa5187 Merge pull request #110 from jsgrrchg/feature/sticky-diff-headers
+- 2ebe6ed0 v0.2.29
+- 7d96d5a8 Merge pull request #225 from zeronsh/zeron/picker-stays-open
+- 8e7485d5 Model pick keeps the picker open
+- cd6cb22a Merge pull request #49 from jsgrrchg/t3code/implementar-tipografia-ui-configurable
+- bf5c4cbd Merge pull request #224 from zeronsh/zeron/picker-jump-forward
+- 6240cccb Forward jump slots to the open model menu
+- e8b6a90a Merge pull request #142 from 0xfelixli/docs/readme-zh-cn
+- 0cd9f2c1 Merge pull request #88 from kjj6198/fix/settings-menu-shortcut
+- aedd4346 Merge remote-tracking branch 'origin/main' into HEAD
+- c3d29cd6 fix(ui): use official Geist release fonts
+- 86cf9b08 Merge upstream/main into typography PR
+- faff9621 Merge remote-tracking branch 'upstream/main' into feature/sticky-diff-headers
+- b46a9296 fix(ui): remove sticky diff header shadow
+- bd6f7df6 v0.2.28
+- eb5a59cb Merge pull request #221 from zeronsh/zeron/model-picker-tabs
+- 73ba80a0 Chip loading states: never collapse to a bare icon
+- c4a14a8b fix(ui): match sticky diff headers to themes
+- 3e69d2d6 Merge remote-tracking branch 'upstream/main' into feature/sticky-diff-headers
+- dff4ed05 Drop the divider after the favorites tab
+- ae3b89e0 Merge upstream/main into typography PR
+- 3b0e8638 Picker polish: even insets, tray rows on the model rows' scale
+- 19112a5f Model picker: harness tabs on top, tab-scoped search, traits folded in
+- 750c1a97 Merge pull request #220 from zeronsh/comet/thought-markdown
+- da56a6f9 Thinking renders as markdown inside the tool-group accordion
+- 3f4b731c Merge pull request #215 from gaelcado/publish/accent-themes
+- d3280e78 Merge upstream main (sidebar stack landing) into themes
+- 4f59c8bf Merge pull request #214 from gaelcado/publish/sidebar-view-options
+- 2119bf0c test: diff-sync no longer rewrites chat.branch
+- 52e72564 Merge upstream main (session hotkeys) into sidebar stack
+- bb1f4d7d Merge pull request #219 from zeronsh/zeron/session-bootstrap-ui-and-layout
+- 3e18d38d The splash spinner runs at the app's standard 2.5px cell
+- 45dcb443 The new-session target row sits above the composer, left-aligned
+- ac8a1736 The boot splash trades the hero ascii for the app's dot loader
+- 5826d579 Merge pull request #218 from rabden/fix/composer-completion-popups
+- 7c9f009f Merge pull request #208 from tobi404/zeron/session-hotkeys
+- 2ac0e7e5 fix(ui): full-width scrollable composer completion popups
+- 4ce66a96 The jump hint matches the sidebar PR badge exactly
+- 10d18899 The jump hint is the keyboard-hint badge, ⌘-glyphed on macOS
+- 675c0fa1 Session-nav shortcuts go quiet under an open popover
+- acce6308 The jump hint wears the app's badge
+- 849c0f56 PARITY §1.4 records the jump and archive shortcuts
+- 15d92677 Shortcuts page groups its rows
+- 27c499f6 Cycling reads the one sidebar-list function
+- 1a6c7a21 Shortcuts jump to a session by its place in the sidebar
+- 5613b1d1 A modified digit is not a question-panel answer
+- dcf726f4 A shortcut archives the current session
+- 20483e6f Merge pull request #203 from tobi404/fix/double-click-selects-whole-text-field
+- 53424915 Merge upstream test compatibility into themes
+- f442dcc6 test: initialize conversation source context
+- d0a8ec7e Merge latest upstream sidebar stack into themes
+- 79013bee Merge latest upstream main into sidebar stack
+- 006ffbf3 Merge pull request #125 from ShayanAbbas1/session-cycling
+- 42765ce4 Merge final sidebar formatting into theme stack
+- 42bcf74e chore: format theme contribution
+- da659ff6 chore: format sidebar contribution
+- eea6726b Merge updated sidebar fixes into theme stack
+- 8f62bcf2 TestFlight workflow: audience input for external distribution
+- 6da4e9f9 fix: address sidebar view options review
+- 222f6322 fix(theme): harden linked imports and persistence
+- 8d2d2bc2 chore(theme): refresh lockfile for v0.2.27
+- 6a343b6d refine theme import experience
+- 997de8da chore(theme): refresh lockfile for v0.2.21
+- dbdeb816 Harden custom themes and polish appearance settings
+- 52f08ff2 Add theme registry and VS Code importer
+- eeeb5370 Add theme registry and VS Code imports
+- aeab053a feat(ui): add coherent accent color palettes
+- b1a81142 balance sidebar harness spacing
+- 04d917e1 refine sidebar device and row layout
+- 5b9677b0 polish sidebar disclosure and status layout
+- 270bf09a fix sidebar group height accounting
+- eab54b53 polish sidebar disclosure rhythm
+- 59b63c83 feat: animate sidebar disclosures
+- 34ac9a54 fix: use canonical Solar sort icon
+- 6ff38dd7 fix: refine sidebar dropdown controls
+- 66678603 fix: stabilize sidebar view menu state
+- 12f9fcc3 fix: simplify sidebar view controls
+- d539c71b fix: polish sidebar view options menu
+- 054c17e6 feat: add conversation-aware sidebar views
+- 22f1b55b docs: plan sidebar view options
+- 92b57326 ci: add permanent internal TestFlight workflow (#213)
+- fb056001 v0.2.27
+- 2e17a877 Merge pull request #212 from zeronsh/zeron/sweep-gate-and-ack-strand
+- 28eb39b6 Orphan sweep waits for server truth; unreadable HTTP ack retries
+- ab449372 v0.2.26
+- eac49385 Merge pull request #211 from zeronsh/zeron/registry-cursor-jump
+- 1fc68435 Registry cursor can no longer jump over unapplied rows
+- 4aa0b5b8 v0.2.25
+- 6e2ec414 Merge pull request #210 from zeronsh/zeron/unknown-harness-rows
+- 5306be20 Chat rows survive configs from newer peers; iOS learns opencode
+- 66c7166d v0.2.24
+- e18dad49 Merge pull request #209 from zeronsh/zeron/thinking-in-tool-groups
+- fed1d640 Thinking rides the tool-group accordion
+- e2a2c9bb v0.2.23
+- d45d32a6 Merge pull request #207 from zeronsh/zeron/model-picker-scale
+- 04348956 Model picker scales to thousand-model catalogs; rows attribute their provider
+- dd10dbe2 v0.2.22
+- 59a29685 Merge pull request #205 from zeronsh/zeron/opencode-picker-connected
+- 4fd35579 opencode: the picker offers only connected providers' models
+- 03de7a55 v0.2.21
+- 59e3b0a3 Merge pull request #202 from zeronsh/zeron/opencode-done-signal-and-thinking
+- 9daadcd7 Merge remote-tracking branch 'upstream/main' into session-cycling
+- 1cf70368 A double click in a text field takes the whole value
+- a401432f opencode: gate the first prompt on a live event subscription
+- 705470cb opencode: rustfmt the new driver module
+- 0b421cc2 opencode: bound every HTTP call; a boot-window request parks forever
+- bf634445 opencode: native HTTP/SSE driver replaces the ACP path
+- aa9f8bf1 Reasoning becomes a first-class transcript part
+- 3fc7bb09 v0.2.20
+- b14e9899 Merge pull request #195 from jsgrrchg/fix/chat-viewport-restoration
+- 048f8a2b Fix viewport test row after upstream merge
+- 2d718d9b Merge remote-tracking branch 'upstream/main' into fix/chat-viewport-restoration
+- 4101c57f Merge upstream/main into typography PR
+- 9c8e2132 Merge pull request #200 from gaelcado/fix/streaming-transcript-reasoning-layout
+- 24de9322 Merge upstream/main into typography PR
+- f417d183 Merge remote-tracking branch 'upstream/main' into fix/chat-viewport-restoration
+- 3a3fdca4 Fix transcript copy fidelity and spacing parity
+- 6f9f834f Add entry-level message copying and spacing refinements
+- f8437ea5 Anchor live streams at the transcript end
+- 086db2ec Merge pull request #194 from gaelcado/codex/panel-resize-stability
+- a2db751e fix(ui): reverse right-pane takeover icon
+- be01c650 fix(ui): size project menu with sidebar
+- 27612130 fix(ui): unify new-session action in titlebar
+- 00799720 fix(ui): gate Git add menu by workspace
+- 89cfeef1 fix(ui): refine panel resizing and alignment
+- e744d556 Fix transcript viewport restoration
+- fe0e02bc Merge pull request #193 from neo773/zeron/subagent-model-chip
+- fc600003 Merge remote-tracking branch 'upstream/main' into feature/sticky-diff-headers
+- 34062cbe Merge upstream/main into typography PR
+- cb2f30d7 Spawn chips name the model their subagent runs on
+- 181d6670 An interruption marker is not a steer
+- 6e81686b Merge pull request #173 from neo773/comet/mention-panel-fast-search
+- d2b4a7d7 Merge pull request #84 from neo773/feat/diff-split-view
+- 0545b3c6 Merge pull request #127 from danperks/comet/diff-sync-churn-fix
+- 9c20793a v0.2.19
+- bead2e67 Merge pull request #192 from zeronsh/zeron/lucky-quartz
+- 569793ed Genus-gate subagent binding for every harness
+- 18987da3 Background shell settlements must not bind subagent refs onto Run chips
+- 5019dc19 Fix tool rendering: only agent calls with docs render as subagent chips
+- 0de409e5 Merge upstream/main into typography PR
+- 04b08ea2 v0.2.18
+- f1e0b30e Merge pull request #191 from zeronsh/zeron/ios-warning-cleanup
+- ac34d9f5 ios: clean up build warnings
+- dd994c41 Merge pull request #134 from danperks/engine/harness-installed-gate
+- dff80b16 Merge branch 'main' into engine/harness-installed-gate
+- 80c7da73 Merge pull request #140 from zeronsh/zeron/pullpush-hardening
+- 6e9ea1f9 Merge pull request #145 from rabden/pr/settings-fixes
+- a8ef0aad harnesses: no unrunnable fallback in the composer offer; uninstalled last harness can be disabled
+- 331786f1 Merge pull request #175 from zeronsh/zeron/ios-bundle-id
+- 040d7e34 Merge branch 'main' into pr/settings-fixes
+- e42593a2 Merge pull request #58 from jsgrrchg/worktree/check-chat-width
+- 6a84dc71 Merge pull request #190 from zeronsh/zeron/fix-mcp-account-switch-disconnect
+- f5fb9b97 Preserve live MCP OAuth when switching Claude accounts.
+- 983e23d0 Merge pull request #189 from zeronsh/zeron/render-agent-calls-separately
+- 6530b880 Center chip header content inside the bordered card
+- c22d1693 Merge pull request #171 from zeronsh/zeron/ios-network-reliability
+- 7a051591 Keep agent spawn chips visible outside the tool-group collapse
+- 08e53cd4 ios/chat2: cursor contiguity + gap repair + retry re-issue (PR #172 port)
+- c255f279 v0.2.17
+- 1af8ff48 Merge pull request #185 from zeronsh/zeron/transfer-progress-ring
+- c3d29813 Thumbnail percent ring tracks the real relay transfer, not just staging
+- 0390a3d5 v0.2.16
+- 412f20d4 Merge pull request #183 from rabden/fix/opencode-model-discovery
+- fde9b4b1 fix: harden OpenCode model discovery
+- 8ce0d998 Merge pull request #179 from rabden/fix/selection-autoscroll-terminal-scrollbar
+- 265204bc Merge pull request #178 from gaelcado/codex/fix-inline-code-wrap-rendering
+- 2158d405 Merge pull request #176 from rabden/fix/terminal-sidebar-reopen
+- 685663ee Merge pull request #182 from rabden/fix/grok-acp-model-switch
+- eda27e8f fix(acp): support Grok model switching
+- 36cf9efa v0.2.15
+- 4e0c00de Merge pull request #180 from zeronsh/zeron/attachment-thumb-fixes
+- e8f9e037 Attachment thumbnails: sending indicator back, no post-send blink, corners clip
+- 3536a370 Fix selection edge scrolling and terminal scrollbar
+- f6911c31 ui: fix decorated ranges at soft wraps
+- 889b78eb Fix terminal rendering after sidebar reopen
+- 4769488d v0.2.14
+- b9deeb48 Merge pull request #172 from zeronsh/zeron/retryable-send-attempts
+- b2b0b19e ios: configure App Store bundle identifier
+- fb5d0fa6 Merge upstream/main into typography PR
+- 77543916 chat2: cursor contiguity + gap repair — the new-session random-hang root cause
+- 46de8088 changes: keep an edit paired across no-newline markers
+- abacb45b Expired undelivered sends are re-issuable too
+- 447b6895 Composer: full-width @-mention panel, indexed file search
+- 446ffbff Retry mints a fresh attempt; dead commands terminalize instead of ghosting
+- 6da274d7 ios: send truth, queued attachments, and worktree-on-drain (PRs #159/#164/#165/#168/#170 port)
+- c42f68b2 ios/sync: event-driven reconnect + relay link liveness (PR #168 port)
+- 35f2b7aa Merge pull request #141 from augustoFranke/fix/project-picker-rounded-corners
+- 76123829 v0.2.13
+- 3614040c Merge pull request #166 from 0854321/fix/composer-overscroll
+- e800e8eb Merge pull request #170 from zeronsh/zeron/connectivity-ui-calm
+- da792dad Atomic new-chat sends: stage first, restore to canvas on failure
+- 9116ff6b Connection spinner goes grayscale (mini_mono_spinner)
+- 3bfe3065 Connection line: bare spinner, no surface
+- 061e6ec6 Calm connectivity truth: degrade hysteresis, staging sweep race, quiet pill
+- bafcc4a6 v0.2.12
+- b8d99968 Merge pull request #169 from zeronsh/zeron/opencode-error-surfacing
+- 7616469b Merge pull request #168 from zeronsh/zeron/resilient-delivery-on-bad-networks
+- 296813f6 opencode: effort picker rides model variants — the wire had it all along
+- 7c6c1236 opencode: surface provider failures instead of silent forever-Working
+- fcaae386 Merge remote-tracking branch 'origin/main' into zeron/resilient-delivery-on-bad-networks
+- 77cb93d0 Merge origin/main (v0.2.11: upload progress + parallel chunks, subagent trailer, PR badges)
+- 9af4dc17 Merge pull request #146 from rabden/pr/linux-frost
+- ce35a1a2 gpui: repoint at wingleeio/zed post-merge; frost the change-request card
+- 43965392 Merge pull request #167 from zeronsh/zeron/subagent-steer-durability
+- 454a1dd3 subagent steers: durable across harnesses (claude re-key, engine gates, opencode resume)
+- 23ddd733 Merge remote-tracking branch 'origin/main' into pr146-audit
+- bebc0580 style: rustfmt pass over the durability work
+- d4d4045f delivery: explicit failed state + retry, send-time timestamps (Phase 4)
+- 9055e016 delivery: peer-relay QueueCommand fallback + deterministic flaky-network suite (Phase 3)
+- b98d698a ui: connection truth — pill, composer honesty, Queued badges (Phase 1)
+- 449a1dbe relay: end-to-end peer-link liveness + registry-dark dial parking
+- 8f3bce84 attachments: ride the durable queue — QueueCommand first, bytes chase in drain
+- ed8cd608 sync: event-driven reconnects — online-bus everywhere, path monitor, tighter caps
+- 271269cb v0.2.11
+- 43a6b447 Merge pull request #165 from zeronsh/zeron/worktree-base-default-queued-state
+- 0e086b9c Merge origin/main (subagent trailer restructure + PR #116)
+- d9e55d91 Merge pull request #116 from jsgrrchg/feature/pull-request-status
+- 266262ab ui: contain wheel overscroll inside scrollable composer input
+- 989be0ae doc_host: new-chat join backoff resets on sibling dial success
+- c53ecd12 send: New-worktree never silently degrades; undelivered sends say "Queued"
+- f4383e36 source control: resolve the default branch through gh, never git transport
+- 417888b8 merge: sync with upstream main
+- c36d4034 Merge pull request #163 from zeronsh/zeron/subagent-tab-navigation-refactor
+- 54b2d45e subagent transcripts open with their prompt; opencode+grok forward user messages
+- 17fc449b Merge pull request #164 from zeronsh/zeron/upload-crawl-fix
+- 1f944051 codex: child userMessage items are steers, not delta-channel echoes
+- 80a3f306 subagent tabs: working trailer + parent steer messages
+- a729ed4a attachments: progress ring on the sending thumbnail instead of label swap
+- 48ff7775 attachments: 10x chunks, parallel window, overall deadline, live progress
+- 6d00440b transcript: spawn chips link to the subagent tab, not an accordion
+- d33f7982 Merge pull request #162 from zeronsh/zeron/account-order-stability
+- 479a341c harness: opencode probe example builds again post-worktree field
+- 7207f743 accounts: keep the list order stable — always
+- 196aeb28 Merge pull request #144 from zeronsh/zeron/multi-drive-project-picker
+- fc111c12 landing: point downloads at v0.2.10
+- 102b37f7 v0.2.10
+- 1afd4ee2 Merge pull request #160 from zeronsh/zeron/native-slash-commands
+- dd8932d7 merge: sync with upstream main
+- c06ed221 harness: native drivers rediscover slash commands
+- 913b5328 Merge pull request #159 from zeronsh/zeron/worktree-send-durability
+- 2f86b8a5 Merge pull request #157 from zeronsh/zeron/opencode-harness
+- 3e777c43 send: worktree creation rides the durable command plane; relay calls get deadlines
+- a00aa616 fix composer idle redraw loop
+- 0213cacf opencode: ACP harness with subagent viz off the sidecar event bus
+- d4e1de63 Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width
+- a6db86d2 landing: point downloads at v0.2.9
+- d0ce0100 v0.2.9
+- 840f3c6a Merge pull request #154 from zeronsh/zeron/cursor-store-isolation
+- 69778b76 cursor: isolate each SDK run's agent store — concurrent runs no longer lock
+- 71b221f4 landing: point downloads at v0.2.8
+- 9e5ee600 v0.2.8
+- 683358c9 Merge pull request #153 from zeronsh/zeron/cursor-model-discovery
+- bb90e248 cursor: live model discovery + typed model options actually applied
+- 76ddfb63 landing: point downloads at v0.2.7
+- 077735e4 v0.2.7
+- 0d322e6c Merge pull request #152 from zeronsh/zeron/cursor-connect
+- e21d1467 cursor: in-app Connect via the SDK's browser login + accounts integration
+- 4a4e862b merge: sync with upstream main
+- 76582a05 Merge pull request #149 from zeronsh/zeron/grok-subagent-viz
+- a0ca2bfa Merge upstream/main into typography PR
+- 35791f28 shortcuts: label the alt modifier Opt on macOS
+- a46b7010 grok: subagent visualization over ACP — lifecycle wire events + disk-tailed transcripts
+- a19f95d5 Merge pull request #147 from zeronsh/zeron/remote-session-sending-stall
+- 7e1eaea9 chat2: claim rooms on HTTP first-contact, not just WS join
+- 17925d36 landing: point downloads at v0.2.6
+- 06c47061 v0.2.6
+- 7840ef87 Merge pull request #136 from zeronsh/zeron/native-drivers-subagent-visualization
+- 97221af8 Merge remote-tracking branch 'origin/main' into zeron/native-drivers-subagent-visualization
+- c6ad564b spaces: enumerate custom mounts and accept typed paths (PR #144 feedback)
+- 4e0a89d2 ui: real frosted floats on Linux (wgpu backdrop blur)
+- 9a125476 subagent iconography: bot glyph for tabs and spawn chips
+- bca16a35 accounts: stop Codex add-account opening two identical auth tabs
+- dc6b8e5d accounts: correct Codex free-tier quota window to a month
+- 8528e3bf ui: let installed-only harnesses toggle off; picker requires an installed CLI
+- 1eb0bef9 subagent tab: every open lands at the end
+- 1d30023e spaces: reach other drives from the add-project palette
+- 1fdf1495 shell: jump pills go glass
+- 06fe8d1d subagent tab: scroll follow + jump pill; chip quiets down; top fade
+- 0c31ec41 subagent polish: Agent chip label + codex message paragraphing
+- 7fd861e1 subagent UX: real terminal statuses, bare tab titles, designed chip
+- aad6c594 docs: add Simplified Chinese README
+- 7ac14e66 fix(ui): round project picker section corners
+- 0bd6a6bb sync: pull/push hardening — bearer headers everywhere, body caps, bounded rows response
+- e713383d subagent tabs: contextual titles + top-aligned streaming runway
+- 94b65fb8 fix(ui): lighten sticky diff headers
+- bed83ba1 subagent viz: three live-rig findings fixed
+- 3a7c384c Merge upstream/main into feature/sticky-diff-headers
+- bbe7bee5 landing: point downloads at v0.2.5
+- 81589010 v0.2.5
+- e8ca1f31 sync: cursor amnesty — a cursor above the checkpoint is re-verified, once
+- 786e2d6b sync: an encoded-empty frontier is a vacuous claim — fetch, never skip
+- 2c9e306e sync: empty checkpoint frontier is NOT contained — fetch, never skip history
+- 3bb7d11a sync: pull-path failures are loud on both platforms
+- 6cf87a30 ios: pull's checkpoint fetch must drain the socket's frame buffer
+- 06da4c45 subagent visualization: per-subagent docs, spawn chips, right-pane tab (B)
+- 2133bae5 harness: Grok ACP hardening (A5)
+- 60887f79 harness/engine: retire adapter machinery for claude/codex/cursor (A4)
+- 42d7161a landing: point downloads at v0.2.4
+- c7c7ce6c harness: Cursor driver via the pinned @cursor/sdk shim (A3)
+- 18b915ed v0.2.4
+- 0ce7fc2f harness: native Codex driver over app-server JSON-RPC (A2)
+- 3bea7a58 sync: audit fixes — heal waits for known server state, iOS retires pushes only on edge verdicts
+- 22b5a67d sync: pull-first HTTPS transport — 1-RTT bootstrap, WS demoted to enhancement
+- 7129b505 ios: checkpoint downloads survive redials, registry single-dial, registry-first dial gating
+- 42a7303c net: cap mobile warm dials, overlap checkpoint with backfill, flush sends at state
+- 579678db harness: native Claude driver over stream-json (A1)
+- 4daf42e1 landing: add nine new tweets to the marquee
+- aacb6210 ui: handle empty agent catalogs safely
+- 76b49f0e registry: gate default agent enablement on the installed probe
+- 3ad28b5d Merge pull request #97 from zeronsh/zeron/linux-window-controls-platform-fix
+- a6f05de2 github: add FUNDING.yml so the repo shows a Sponsor button
+- fc30c3bf merge: sync with upstream main
+- 74f4abef diff-sync: stop reconcile churn spawning git diff back-to-back forever
+- c675c35c Merge pull request #83 from neo773/feat/diff-comments
+- 2ca44aed shortcuts: ctrl+tab cycles through sessions
+- 390d6ebf ios: reveal cached transcripts on layout-quiet instead of burning the settle budget
+- 0e7c6e5a test(engine): isolate login shell gh path fixture
+- eee087c1 Merge remote-tracking branch 'upstream/main' into feature/pull-request-status
+- 5bcf1f91 ios: single-flight token refresh, staggered room dials, frame-rate settle
+- b9e90ce8 landing: point downloads at v0.2.3
+- 60965ade fix(engine): evict inactive change request cache entries
+- 048798d0 fix(engine): resolve uncached remote default branch
+- 819fc4c1 fix(engine): use origin for untracked branches
+- 2998ca45 fix(ui): retry pull request watch after host upgrade
+- 4f463378 fix(engine): preserve links on unsupported streams
+- 46ddcf9b fix(engine): resolve gh from login shell path
+- 0cb68c77 fix(ui): frost pull request tooltip
+- ede19ac9 test: cover pull request status across device boundaries
+- ae705664 feat(ios): show host pull requests in session surfaces
+- 2b157a08 feat(ios): support streaming device RPC
+- 0c84d0d3 restore full right pane takeover
+- 0efd627a Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width
+- 72ab1d9c feat(ui): show pull request badges in sidebar and composer
+- bdc8363d feat(ui): track pull requests for local and remote sessions
+- 3adc1551 feat(engine): stream cached checkout change request status
+- 7fb11586 feat(engine): resolve GitHub pull requests with gh
+- e2d6ea2b feat(proto): model checkout change request status
+- 9ab250ce v0.2.3
+- ec314936 sync: remove the legacy s2 room client — chat2 is the only chat transport
+- f14d4691 net: happy-eyeballs dials, backoff reset on success, online wake, non-blocking startup auth
+- 74c5af1a landing: point downloads at v0.2.2
+- 162cbce2 v0.2.2
+- eb3ab9bb fix(ui): preserve glass in sticky diff headers
+- d1d11649 feat(ui): keep active diff file header visible
+- d9744836 refactor(ui): model sticky diff header state
+- 81df4779 harness: managed adapter installs, bounded handshake, legible errors
+- 56ac0205 review: comment-only steers, renames cite the right side, drafts stay put
+- f54398c0 www-redirect: 301 www.zeron.sh to apex via worker route
+- f406c5bd linux: draw caption controls under client-side decorations
+- 48a2da4d ui: expose settings from application menu
+- 2bd9ee33 format right pane resize changes
+- 79d05d55 preserve minimum chat panel width
+- 5d20db80 adapt composer traits control to available width
+- c4e8cd44 fix composer reflow during panel resize
+- 6f15324a Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width
+- 89aa28dc changes: read a diff side by side, not just top to bottom
+- 70a7a493 review: earliest side marker wins, one radius, less prose
+- 45d55624 transcript: a sent prompt shows its folded context as a pill, not bullets
+- 2b4d333e changes: comment a diff line and stage it on the next prompt
+- b53a68e0 landing: point downloads at v0.2.1
+- 65b9a520 v0.2.1
+- 6d518e52 rpc: reject local IPC handshakes that carry an Origin header
+- faf5faa8 edge: stamp room-kind header only on worker-authorized forwards
+- 540537a7 Merge upstream/main into typography PR
+- e5a5f6a9 landing: zeb's tweet fourth in the marquee, devices copy says "pilot"
+- 0995f98a v0.2.0
+- c2936f82 Merge pull request #79 from zeronsh/seamless-sync-import
+- 2a0deea2 review: a dismissed import failure stays reachable
+- c67146f4 Merge origin/main into seamless-sync-import
+- a57a2023 Merge remote-tracking branch 'origin/main' into comet/glass-popover-blur-polish
+- 0e1c96eb v0.1.65
+- ffd25d78 landing: move zeb's tweet to the end of the first marquee row
+- 4468a706 review: fail loudly on partial imports, durable marker, spaces-aware offer, fmt
+- 10a27767 Merge pull request #77 from zeronsh/comet/new-session-shortcut
+- 6994ba4f uploads: remove the write-only R2 attachment mirror
+- bf799a28 Merge pull request #78 from jsgrrchg/worktree/implement-tree-sitter-highlighting
+- 01387911 v0.1.64
+- 0d4ba313 shell: right pane closed by default again
+- 451b6ea7 ui: trim wizard copy
+- d903bd73 fix(syntax): highlight pinned commit diffs
+- 20940c73 Merge upstream/main and preserve free right-pane resizing
+- 78edbe00 Merge upstream/main into worktree/implement-tree-sitter-highlighting
+- fbcd9819 Merge upstream/main into typography PR
+- 9e2373c2 engine: camelCase import-event fields on the wire
+- 43fe2868 v0.1.63
+- eca4aaa0 loaders: splash ascii disables ligatures too
+- 6ee0ce0c Merge upstream/main into worktree/implement-tree-sitter-highlighting
+- 60bfc61b ui: seamless local→synced switch with one-time import wizard
+- 66b644a9 engine: one-time local→synced profile import
+- 9b4aff41 Merge remote-tracking branch 'origin/main' into comet/glass-popover-blur-polish
+- 10f486ae style(syntax): align palette with git graph
+- cbcca92d terminal: disable ligatures so a row never renders short
+- e5f7dc25 terminal: pin glyphs to the grid instead of letting the shaper place them
+- a9cf1f14 shell: right pane opens by default; splash gets the landing hero in glass
+- 34fed4f1 shell: surface picker keeps its heading instead of a logo
+- 78f617c3 shell: true per-pixel horizontal wash fade (gpui bump) + Capy-style picker
+- 692fdc01 shell: chip washes fade at the strip edges
+- d2741344 v0.1.62
+- dee20449 shell: port the old session-tab strip's solved scroll recipe
+- 0dce652b shell: wheel-scroll the surface strip through occluding chips
+- 5b3065ff shell: surface strip actually scrolls, with glass edge fades on overflow
+- b0be3dea rename: comet -> zeron everywhere (binary, crates, env, data dir, iOS)
+- 9fb44d58 shell: surface-tab strip scrolls horizontally
+- c9fbe100 shell: + menu row reads Git, not Git diff
+- 82c5f3b8 changes: contextual diff tab titles + per-commit diff tabs from History
+- dead38b0 terminal: contextual tab names from the OSC title
+- d2c1799a shell: surface-tab drag matches the terminal drawer's animated reorder
+- 8b77cc1a shell: surface tabs — hover x, drag reorder, multiple diff panels, takeover alignment
+- e7519327 shell: surface-tab x renders, embedded terminal shares the pane surface
+- b67ccd70 shell: right pane becomes a tabbed surface host (t3 RightPanelTabs)
+- baccc128 Merge pull request #30 from jsgrrchg/local-first-optional-sync
+- 0fa4d7cf pickers: rail indicator is a left half-capsule pressed on the border
+- b07a0c74 pickers: single moving highlight in the model picker
+- cdc754e0 pickers: model picker polish — aligned header band, purple rail indicator, star re-anchor, versioned labels
+- bfcc8792 pickers: t3-style model picker, model list hygiene, glassy new-project palette
+- f6444643 ui: real glass tint + reference blur for popovers/dropdowns
+- 049f5e43 landing: devices fork section, panel reorder, aligned row edges
+- a1a58107 fix(ui): elect one replacement engine across viewports
+- ad1ea9ec fix(engine): own every Edge worker across runtime shutdown
+- d3c2364e landing: drop panel frame and inner hairlines
+- 0d2e640e landing: panel redesign, gallery, harness diagram, reach ascii
+- 12737ee6 Shortcuts: rebindable New session (mod-n)
+- 426492f9 landing: add tweet marquee section
+- 04aacab4 v0.1.61
+- 6d43e087 Merge pull request #76 from zeronsh/comet/rail-accuracy-chip-tween
+- a1c19028 Transcript: rail reads from the reading line; chip toggles tween the group body
+- 4f4cfc20 v0.1.60
+- c67b42ad Merge pull request #75 from zeronsh/comet/macos-icon-squircle
+- 39644a46 macOS icon: bake squircle mask, margins, and shadow so the installer icon isn't a bare square
+- d4eac936 v0.1.59
+- 6ad663b9 Merge pull request #74 from zeronsh/comet/runway-hard-bottom-polish
+- 447d5f91 Transcript: runway ends at the app bottom, rigid stop, streams in place
+- 9aad47f7 v0.1.58
+- e006ef43 Merge pull request #73 from zeronsh/comet/runway-bottom-hard-stop
+- 6c265535 Transcript: the runway bottom is a hard stop
+- 417d68f7 fix(syntax): address highlighting audit findings
+- 0703b295 chore: align syntax lockfile with upstream
+- 1ef4aca7 fix(rpc): bound dispatcher async stack usage
+- 866ed3dc test(ui): harden syntax highlighting quality and performance
+- 5080b2b4 refactor(ui): remove the legacy syntax tokenizer
+- 4830b2f7 feat(syntax): support embedded language injections
+- ff1693f2 feat(syntax): add core language grammars
+- 9bcc9f61 feat(ui): map full-file syntax into checkout diffs
+- 4898e213 feat(rpc): expose checkout diff source pairs
+- 09bb82aa feat(ui): highlight tool diffs from complete sources
+- c656f9f8 feat(ui): highlight markdown code with tree-sitter
+- cab72399 feat(syntax): add tree-sitter highlighting core
+- 509637ad feat(ui): expand the syntax theme palette
+- 43c0d4f6 refactor(syntax): define shared highlighting contracts
+- 2f875bc2 v0.1.57
+- 85648e4a gpui: bump fork to 8a8954c — macOS 26 window blur fix
+- 3dbeeb93 Merge pull request #72 from zeronsh/comet/runway-short-chat
+- 3fe94768 Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width
+- 78a23f86 Transcript: keep the held layout scrollable; row 0 carries its own inset
+- b44cd3a3 Merge upstream main into local-first-optional-sync
+- 65d97725 Transcript: provisional runway overshoots — short chats have no bounds
+- 629396ec Merge upstream/main into typography PR
+- 902bd799 Merge pull request #52 from zeronsh/comet/tool-chip-full-call
+- c7e94979 v0.1.56
+- add3abe2 Merge pull request #70 from zeronsh/comet/runway-restick-hold
+- 67333a5d Transcript: only a chat switch clears the runway
+- 0ff655e0 Transcript: a restick during a runway re-arms the hold, never the pin
+- 71d59160 Merge pull request #69 from zeronsh/comet/autonomous-turn-end
+- 6d086d80 Sessions: settle self-continued turns — extension turn-end + short quiesce
+- 40fb371e fix(ui): filter incompatible system fonts
+- 9571c905 Tool chips expand to the full tool call
+- 3998dd80 Merge pull request #66 from zeronsh/comet/dmg-ascii-hands
+- 01ead4e0 feat(ui): offer installed interface fonts
+- 792824a4 Merge remote-tracking branch 'upstream/main' into local-first-optional-sync
+- 062666a3 Packaging: ascii-hands dmg with drag-into-Applications layout
+- ee36caf1 Merge upstream/main into typography PR
+- ee98404d v0.1.55
+- cc1d1100 Merge pull request #65 from zeronsh/comet/runway-spring-glide
+- fa327fa4 Merge upstream/main into typography PR
+- cd326b1a Merge remote-tracking branch 'upstream/main' into local-first-optional-sync
+- 41cec8bb Transcript: eased runway entry, absolute hold, and scroll release
+- fb76b49d Merge pull request #57 from jsgrrchg/feature/history-graph
+- ba624962 style: simplify history ref badges
+- ff285916 v0.1.54
+- bf5c128c Merge pull request #64 from zeronsh/comet/macos-signing
+- a6acb2f5 Merge pull request #63 from zeronsh/comet/theres-a-bug-where-the-right-side
+- cdafdfca fix: preserve history ref overflow affordance
+- ecb88a6d Transcript: every send glides the prompt to the top with reserved space
+- f4d112aa macOS releases: Developer ID signing + notarization in CI
+- f186be7b Sessions: never tombstone the resume id on a startup crash; keep stderr
+- 9078f0e6 docs: evidence media for the sending bridge + ref truncation fixes
+- 2d4b51e0 Changes header: truncate the branch and base ref evenly
+- 29b76c30 Working trailer: "Sending…" bridge with no timer until the turn starts
+- ae4576ec Changes header: budget the row gaps so the buttons hold still on expand
+- e91405a3 v0.1.53
+- a6e01a95 Merge pull request #61 from zeronsh/comet/claude-quiet-settle-exemption
+- 3d893609 perf: batch visible history graph paths
+- 99eebc40 feat: fetch remote history from the history pane
+- 90e8c265 feat: show active branch history context
+- 9ee1e479 perf: stabilize history row hover state
+- 524fe279 fix: adapt history refs to available width
+- 3a8c89c1 fix: fit history ref tooltips to content
+- e5ad3f8f feat: add tooltips to history refs
+- f6c6bcff feat: add icons to history refs
+- 139fcb6b fix: contain history reference badges
+- 968d48f8 fix: center active history commit ring
+- af2d2108 Merge branch 'zeronsh:main' into feature/history-graph
+- 34c2d9ed Merge remote-tracking branch 'upstream/main' into t3code/implementar-tipografia-ui-configurable
+- b0b588c5 Merge upstream main into local-first-optional-sync
+- 3c67fd47 ACP: scale the evidence probes — 10-run A/B series + all-harness survey
+- 61518ede ACP: real-stack A/B evidence probe for the Claude quiet-settle exemption
+- 58427f20 ACP: exempt Claude from the blanket quiet settle (false mid-thought Done + stuck-Working orphan)
+- eba0c9b0 v0.1.52
+- aa3d0aef Merge pull request #59 from zeronsh/comet/turn-quiesce-watchdog
+- 4f4bf8ad ACP: injection cost frames must not settle steered turns; all-agent sweep
+- 84c948c4 Merge pull request #60 from zeronsh/agent/readme-landing-screenshot
+- 6ef4e2b8 Use landing screenshot in README
+- a6eefc2d ACP: Claude busy steers ride native queueing, not cancellation
+- e1a02730 ACP: cancel-before-prompt into self-continuing sessions (starve prevention)
+- d9f13cbd ACP: blanket dropped-reply settle for every adapter
+- 485dcc96 ACP: full-stack starve verification against the real adapter
+- 225f484a ACP: settle dropped replies off the turn-end cost frame (~1s, not watchdog)
+- 430dbec8 ACP: starved-turn recovery on noRunningTurn evidence (root-cause fix)
+- 8eabaeae Sessions: quiesce watchdog + fold self-continued output (stuck-Working fix)
+- 0415c398 Brand desktop app as Zeron
+- 82eda869 Brand iOS and landing page as Zeron
+- 7b95aa8a Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width
+- b1214b68 fix(ui): make changes pane freely resizable
+- c773dfe5 style: soften history graph palette
+- fc785b23 fix: center history load more button
+- 6c81e750 feat: add git history graph view
+- 9d97dc38 fix(engine): disconnect synced runtime on sign-out
+- e2b82414 v0.1.50
+- 52826ad8 Merge pull request #56 from zeronsh/comet/popover-toggle-close
+- 88028c86 Merge pull request #55 from zeronsh/comet/gutter-breathing-room
+- a7418b6b Diff gutters: guarantee 6px clear of the accent bar at every width
+- d788a01b Popovers: clicking an open menu's trigger closes it, never close-and-reopen
+- ffb62faf v0.1.49
+- ee09e7fe Merge pull request #54 from zeronsh/comet/diff-line-virtualization
+- e91598d6 fix(auth): shut down synced runtime on sign-out
+- 52468e14 fix(engine): recover synced transports after offline boot
+- 0274ffdb Merge upstream main into local-first optional sync
+- 87b0d008 Diff gutters: size line-number columns to the file's widest number
+- 6653cfdf Diff sidebar: virtualize at line granularity, not file granularity
+- 62ade5ef v0.1.48
+- 3af73750 Landing: Cursor icon in the supported-agents row
+- c0a68907 Merge pull request #53 from zeronsh/comet/traits-chip-selected-options
+- da6ea77f Merge pull request #39 from danperks/feat/cursor-agent-acp
+- ff7a0316 Traits chip: name the effective picks instead of a bare "Traits" label
+- 5a2155ac Merge pull request #42 from jsgrrchg/t3code/fix-desktop-chat-message-order
+- 5d5f9a8a Merge main into feat/cursor-agent-acp
+- 47a0c29c First-turn anchor: trust the chat row, clamp the wheel
+- e36dbfc2 Landing: ascii hands, denser railing, copy pass, Discord link
+- 74ced7cb Merge pull request #51 from zeronsh/comet/desktop-notifications
+- e14ef1cb notify: dash-leading titles are summaries, not notify-send flags
+- 93c8d8db Merge pull request #50 from zeronsh/comet/file-picker-keyboard-navigation
+- 6904151b Slash-descend: exact casing wins over a case-colliding sibling
+- e1d90b99 Desktop notifications: banners on the session ping edges
+- a8df3fd4 Folder picker: slash-to-descend, tab completion, ctrl-n/p
+- 8c36da2e Landing: hero-anchored edge ascii, mobile pass, deploy on push
+- 3518cc45 Landing page: black + purple ASCII redo, deployed as static assets
+- 4a8a3e15 Merge upstream/main into configurable typography
+- 5166e8f7 Merge pull request #48 from zeronsh/comet/user-bubble-selection
+- e1be49cc User bubble text: selectable like rendered markdown
+- a59807f3 Merge pull request #47 from zeronsh/SinaKhalili-patch-1
+- 15a4497b Add DeepWiki badge
+- e87c37ee fix(ui): remeasure transcript after typography changes
+- 9b811c32 fix(ui): serialize settings persistence
+- faf552d7 v0.1.47
+- ec1b4394 Merge pull request #46 from zeronsh/comet/takeover-cluster-rhythm
+- 42df8057 Add configurable UI font size
+- 8f6a79a3 Collapsed-takeover header: scope dropdown on the cluster's 2px rhythm
+- 81957b11 fix(ui): preserve typography on code-related surfaces
+- 76fdfb6a feat(ui): add interface font picker
+- befd129a feat(ui): add bundled interface font catalog
+- 360e8985 v0.1.46
+- a7911c22 Merge pull request #45 from zeronsh/comet/changes-header-truncation
+- 3541f71e Changes scope menu: the 2px row gap every other menu has
+- 54b064cc Changes header: truncate long refs, tighten collapsed-takeover inset
+- 6b1c9c92 v0.1.45
+- 01193156 Merge pull request #44 from zeronsh/comet/diff-watch-gitdir-fallback
+- 75aac65a diff-sync: watch the git dir when the worktree blows the watch budget
+- a895c487 Merge upstream main into local-first optional sync
+- d5c50f7a v0.1.44
+- b285ac1a Merge pull request #43 from zeronsh/comet/changes-header-followups
+- dbc6faaa Changes header: searchable refs, menu gaps, skew copy, collapsed-sidebar takeover
+- a9e38775 Fix initial desktop chat message positioning
+- f8d8be7f v0.1.43
+- 78ec9bc0 Merge pull request #41 from zeronsh/comet/changes-panel-scopes
+- c6bebdb6 Changes header polish: family fold glyph, takeover alignment + border
+- 1fdc4854 Changes header: controls in the titlebar band, full takeover expand
+- 2a7e942d fix(ui): remove projectless onboarding action
+- e53dc3ef Changes panel: flush glass pane, diff scopes, ref selector
+- 72b223fe fix(engine): resolve native device names
+- 48e8da82 v0.1.42
+- 2876bf9a Composer: drop "Don't work in a project", gate sends on a project pick
+- 6dd17f76 Terminal dock: glass fill, floating resize handle, transcript stops at its top
+- 115133e1 Update strip: dark-purple glass fill, icon dropped
+- 8bbadda2 fix(ui): clarify local-only device labels
+- c52b6a61 Merge upstream main into local-first optional sync
+- fecadbc5 fix(daemon): restore systemd start limits
+- 735a25b4 fix(ui): surface deferred engine startup failures
+- d1fe42d4 v0.1.41
+- 7558fad1 Engine: boot-time transcript salvage for blanked born-gen2 chats
+- 92518037 v0.1.40
+- 30e748e7 Engine: born-gen2 race — absent registry row means chat2, stuck s2 handles seed and persist
+- 1ff285c7 iOS: composer tap-anywhere-to-focus, keyboard-open pin re-arm, home header alignment
+- 089ce04f v0.1.39
+- a198b99a Attachment polish: pending photos, strip × stacking/click-through, Esc-close, Show-more gap
+- 2037b481 v0.1.38
+- 885c9fcf Host: reopen chat doc after cutover drop so nudged commands execute
+- 86fb62bc Sidebar edge fade: gate on scroll overflow at paint time
+- 669987b7 Merge remote-tracking branch 'origin/main' into comet/activity-sidebar-and-archive-sync
+- 78ecdd2d iOS: archived shelf + corner status, measured transcript pinning, skeleton loader
+- 524a4d75 v0.1.37
+- 37966d16 Unarchive on send + glass-forward light chrome + shared sidebar tokens
+- 89afa24f gpui pins → 53518c0: edge-fade line merged into comet/line-wrap-closing-punctuation
+- f5962fc8 v0.1.36
+- 59e65a97 Merge pull request #40 from zeronsh/comet/activity-sidebar-with-project-selectors
+- 38b480fb Glass-native transcript + t3 archived shelf + canvas target selectors
+- 5be6f23e Engine test: the project-less flow end to end
+- 45eceef3 Titlebar + joins the window-control cluster; archive swap is corner-hover only
+- eb0657e0 Sidebar/composer polish round: archive-on-hover, device search, richer status text
+- 64070b70 Boot restore respects the no-project opt-out; picker capture knobs for project/device
+- 2a755f6f Rename spaces→projects in UI copy; onboarding allows project-less start
+- b3f3179e Kill the tab strip: titlebar names the session, sidebar goes activity-first
+- dc750654 Composer footer: device + project selectors; refs locked after creation
+- b46d2867 Engine: project-less chats (createChat deviceId, cwd ~ expanded at spawn); UI state grows device pick + no-project opt-out
+- bf714e4c Fix merge fallout: new popover closing param at HEAD-side call sites, open_kind() accessors
+- 7d75f3fe Merge remote-tracking branch 'origin/tabs-spaces-restructure' into comet/activity-sidebar-with-project-selectors
+- 72bdd0ac fix(engine): isolate synced account uploads
+- d7adfced Recover last night's mobile session+UI refactor (lost worktree, replayed)
+- 91a1f770 Add Cursor agent over ACP (`cursor-agent acp`)
+- ff79e49c v0.1.35
+- 9b7e734b Merge pull request #38 from zeronsh/comet/session-state-and-timer-fixes
+- 052f8f0c Host posts a bootstrap checkpoint when its chat2 room has none
+- fc21507f iOS chat2 cutover: mobile abandons s2 entirely
+- 02f3ed33 v0.1.34
+- defa3650 Merge pull request #36 from zeronsh/comet/session-state-and-timer-fixes
+- bfb0bdf5 Full chat2 migration: born on chat2, host sweep, first-contact push
+- c510ba4c v0.1.33
+- b21ce009 Merge pull request #35 from zeronsh/comet/session-state-and-timer-fixes
+- c46bddab style(ui): order settings imports
+- 7ee12cb4 fix(engine): keep local runtimes offline
+- 3e98ba9d Merge branch 'zeronsh:main' into local-first-optional-sync
+- 349f4837 Cutover converges live watchers; smoke driver speaks the framed protocol
+- 4570eadf Robustness batch: seed races closed, steer ledger, watch resubscribe, plan chip
+- e9705076 Session timers are per-message; Steered can never trail Done
+- f2e8cb22 v0.1.32
+- 7202af3d chat2: close the B3 drain race (buffer push holds the client lock)
+- ac32aee3 chat2 cutover: fix the five review blockers + checkpoint spam guard
+- d28cf9c2 chat2 C3/M2/M3: host wiring, roomGen cutover, reader discard-and-adopt
+- 50c99dcd chat2 C3 foundation: engine sink + Range-resuming checkpoint fetcher
+- 259d0c59 v0.1.31
+- 66c9d2ca Transcripts salvage malformed entries; room dials get a deadline
+- 053760b1 v0.1.30
+- 1fc8fd56 Tool chips are one-liners again: outputs stay out of the doc, sidecar parked
+- e3f77f31 v0.1.29
+- e566586b Merge pull request #34 from zeronsh/chat2-sync
+- c359862f chat2 test harnesses: live E2E, cross-language crosscheck, whale rebuild probe
+- 2c08f4e4 chat2 review fixes: push retirement, cold-start backfill, reset signal, '#' part ids
+- df57aae3 chat2: M1 epoch rebuild — thin-doc whale healing core (chat2-sync M)
+- d9c78a3f chat2: Rust ChatClient + cursor-bearing snapshot store (chat2-sync C1/C2)
+- 3bc63f7b chat2: ChatRoom DO — dumb authenticated log relay (chat2-sync B)
+- 9dff5d1a thin docs: strip tool outputs/diffs to summaries + R2 sidecar (chat2-sync A)
+- ca8a6ba6 edge tests: split unit/workerd tiers via vitest-pool-workers
+- 5208fad1 docs: chat2 dumb-relay sync plan — thin docs, log-relay DO, whale-healing migration
+- e19c5c83 v0.1.28
+- ad3b31d1 ACP polish: configOptions-first models, codex yolo, completion + transcript fixes
+- e7b3b450 v0.1.27
+- 6fbd788c Traits dropdown: restore the 2px row gap between menu rows (#33)
+- 9a775fc8 Merge upstream main into local-first optional sync
+- 433ff680 v0.1.26
+- 80ba9cad Refresh composer harness catalog live on Settings → Agents toggles (#32)
+- 00704273 v0.1.25
+- e00c6b97 Harness settings page, model prefetch, picker highlight fix (#31)
+- bea0f610 v0.1.24
+- a8cdbf61 Add Hermes and Pi agents over ACP (#29)
+- 296259b9 fix(e2e): support macOS and transcript deltas
+- 0c4f4526 fix(auth): back off offline refresh failures
+- 15c006b0 fix(ui): clear stale sync restart after revocation
+- d2d6bdb0 fix(auth): avoid unsupported match guard
+- 5dee4fc3 fix(ui): wait for remote engine shutdown
+- 4b985d87 fix(engine): recover truncated device identity
+- cefcbb68 fix(auth): invalidate canceled OAuth exchanges
+- a8246568 fix(ui): stop remote daemon before runtime changes
+- c7df2f85 fix(engine): publish device identity atomically
+- c37dafcb fix(ui): share pending sync restart across viewports
+- f1419428 fix(engine): require a bearer for development sync
+- 484d983e fix(ui): block all synced viewports after sign-out
+- f4fb1290 docs: document local-first usage and optional sync
+- 1002f707 test(engine): lock down local and synced profile isolation
+- 810633a3 feat(cli): make local-only the default daemon lifecycle
+- 23e2fbe6 feat(ui): replace the auth gate with a local sync opt-in
+- 98c2045c feat(engine): boot signed-out installations in local-only mode
+- e077cdc8 refactor(engine): model local and synced workspace profiles
+- 0a0c8eb7 v0.1.23
+- ca05336a Convert claude/codex to ACP: one harness for every agent (#28)
+- 4ae68eed Tool detail cards: clip fix, open/close tween, queued-steer hint (#27)
+- 5bf2c68d Merge pull request #23 from zeronsh/comet/remote-send-acknowledgment-sound-fix
+- 95ee66cb Merge pull request #26 from zeronsh/comet/agent-streaming-scroll-jitter-fix
+- f69d1c30 Transcript: hold the scroll anchor across the live-to-complete resplice
+- 809b3063 Fix phantom worktree spaces + missing harness glyph from the claim race (#25)
+- ac730acb v0.1.22
+- c951c3e3 ACP harness: Grok Build, slash commands, tool output + inline diffs (#24)
+- 2b0dc843 Terminal: mouse text selection and copy (#21)
+- 9f41f601 Terminal: resolve the ANSI palette per appearance, not just the app chrome (#20)
+- 65e51f89 v0.1.21
+- 335079eb Run Codex in yolo mode: force danger-full-access, drop the worktree escalation
+- 138c1815 Send-pending overlay demo media for the PR (A/B recordings + stills)
+- d3141ef0 Send-in-flight overlay: no phantom Completed flash / done-chime on remote sends
+- e7511488 Fade-timestamp demo media for the PR (screenshots + recording)
+- 62c9305e Clear the bottom scroll fade from the last message's timestamp
+- 782b61f5 Merge remote-tracking branch 'origin/main' into tabs-spaces-restructure
+- 6cee4af4 Whale-session sync fix: chunked update-log rows + shallow-aware join backfill
+- 35447940 iOS session polish: interactive keyboard, bottom-edge fade, transcript perf, image attachments
+- 5fcd90de Merge remote-tracking branch 'origin/main' into tabs-spaces-restructure
+- 0c428118 iOS registry sync: port the workspace sidebar from the Loro doc to the row registry
+- b953b805 v0.1.20
+- 92fba3d6 Registry demo media for the PR (screenshots + recording)
+- 1d63c157 Registry polish: clippy clean, fmt, mock-server tidy
+- 8a61311b Registry sidebar sync: row-table workspace state replacing the Loro workspace doc
+- 6f19b76c Revert the aggressive fold triggers; route workspace /append for operator repair
+- bf16add1 foldLog: recycle the isolate when the fold export dies on a pressed heap
+- 4aacc6d4 Workspace live-frontier-trim guard: match any ws generation, not the literal ws3/
+- 469d18a3 Fold the update log when it dwarfs the folded state, not only at fixed budgets
+- 02002cf9 Salvage importable updates before striking; small-payload penalty probe; attributed /stats
+- 3a89e681 Recycle DOs: clear stale in-memory import penalties after fleet doc flatten
+- fb6492ca Retire ws3 workspace rooms — ws4 allocates virgin DO storage
+- 79c8e228 Expose GET /workspace/:orgId/snapshot for doc repair reads
+- c1243c5a Penalty-box devices whose imports keep failing — stop the doomed-push DOS
+- b0194397 Workspace rooms force-trim only at aged checkpoints, never the live frontier
+- 1f2152a8 Never serve a freed doc wrapper; count wasm use-after-free as poison
+- b08aeb90 v0.1.19
+- 6adda950 Never latch a rejected session; count rejections honestly in comet sync
+- 104e449f iOS: kick every room on foreground — suspension kills sockets silently
+- 82ce4419 Automated wedge break boots attached sockets, like /reset-log always did
+- d2a4b571 Force-trim gate counts log bytes, not just the snapshot
+- 81ebf255 Gate cutoff trims on lastTrimAt alone — isShallow re-fired them forever
+- 1f2333d6 Relay accepted updates via per-socket fragmentation, not one raw frame
+- 9176b510 Reset the wasm-poison strike counter on a clean join answer
+- c4a2e46c Force-trim oversized rooms that have no aged checkpoint
+- c202e91d Free idle docs — wasm memory outlives DO instances and never shrinks
+- 5f26832b Make history trims durable before the join continues
+- 4ff80aea Free loro-wasm objects explicitly — GC finalizers never fire under wasm pressure
+- 0fdea0fd Trim history on cold materialization too — idle rooms never trimmed
+- 13704c7b Trim history on log fold, not just the daily alarm
+- 013a0878 Edge join-wedge root cause: wasm-heap poisoning made joins die in silence
+- c1a925d9 Space selectors list alphabetically
+- d24b8b61 Space triggers carry the "@ device" tag: sidebar filter + composer chip
+- e3e7161c Popovers animate out: Popup closing phase, wall-clock fade, blur ride-down
+- ff5e483b Add native Windows caption controls (#16)
+- d0252cec v0.1.18
+- 630f4a02 Durable deaf-socket detection + sync telemetry: presence tripwire, comet sync, device-attributed edge logs
+- 347c920f Deaf-socket healing: probe-on-focus, acks don't feed the probe, edge closes on send failure
+- 22ef2ddc Wash-only selection across every menu: drop the check glyphs
+- f528e984 Space-filter dropdown: drop the check glyph
+- 708f701c Space-filter dropdown opens below the trigger
+- de7f8861 Space-filter trigger: caret at the right edge, names truncate
+- 8289a4cd Device-local tabs + spaces as a sidebar filter dropdown
+- Files touched by upstream commits (sample):
+  - .github/FUNDING.yml
+  - .github/workflows/deploy.yml
+  - .github/workflows/release.yml
+  - .github/workflows/testflight.yml
+  - .gitignore
+  - ARCHITECTURE.md
+  - CONTEXT.md
+  - Cargo.lock
+  - Cargo.toml
+  - README.md
+  - README.zh-CN.md
+  - THIRD_PARTY_NOTICES.md
+  - apps/comet/Cargo.toml
+  - apps/comet/src/auth_cli.rs
+  - apps/comet/src/daemon.rs
+  - apps/comet/src/main.rs
+  - apps/comet/src/update_cli.rs
+  - apps/ios/Comet.xcodeproj/project.pbxproj
+  - apps/ios/Comet.xcodeproj/xcshareddata/xcschemes/Comet.xcscheme
+  - apps/ios/Comet/App/AppConfig.swift
+  - apps/ios/Comet/App/AppModel.swift
+  - apps/ios/Comet/App/CometApp.swift
+  - apps/ios/Comet/App/DemoDataset.swift
+  - apps/ios/Comet/App/E2ERunner.swift
+  - apps/ios/Comet/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png
+  - apps/ios/Comet/Composer/Attachments.swift
+  - apps/ios/Comet/Composer/ComposerView.swift
+  - apps/ios/Comet/Info.plist
+  - apps/ios/Comet/Models/Entities.swift
+  - apps/ios/Comet/Models/HarnessCatalog.swift
+  - apps/ios/Comet/Sync/ChatFrames.swift
+  - apps/ios/Comet/Sync/ChatRoomClient.swift
+  - apps/ios/Comet/Sync/DeviceRelayClient.swift
+  - apps/ios/Comet/Sync/DocDisk.swift
+  - apps/ios/Comet/Sync/LoroProtocol.swift
+  - apps/ios/Comet/Sync/RegistryClient.swift
+  - apps/ios/Comet/Sync/RegistryCore.swift
+  - apps/ios/Comet/Sync/RoomClient.swift
+  - apps/ios/Comet/Sync/SessionStore.swift
+  - apps/ios/Comet/Sync/WorkspaceStore.swift
+  - apps/ios/Comet/Theme/BrandMarks.swift
+  - apps/ios/Comet/Theme/HermesMark.swift
+  - apps/ios/Comet/Transcript/TranscriptView.swift
+  - apps/ios/Comet/Views/ArchivedShelf.swift
+  - apps/ios/Comet/Views/HomeView.swift
+  - apps/ios/Comet/Views/Loaders.swift
+  - apps/ios/Comet/Views/NewSessionView.swift
+  - apps/ios/Comet/Views/SessionView.swift
+  - apps/ios/Comet/Views/SpaceView.swift
+  - apps/ios/CometTests/ChatFramesTests.swift
+  - apps/ios/CometTests/RegistryCoreTests.swift
+  - apps/ios/CometTests/RegistryDocTests.swift
+  - apps/ios/README.md
+  - apps/ios/Zeron.xcodeproj/project.pbxproj
+  - apps/ios/Zeron.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+  - apps/ios/Zeron.xcodeproj/xcshareddata/xcschemes/Zeron.xcscheme
+  - apps/ios/Zeron/App/AppConfig.swift
+  - apps/ios/Zeron/App/AppModel.swift
+  - apps/ios/Zeron/App/BenchRunner.swift
+  - apps/ios/Zeron/App/DemoDataset.swift
+  - ... (+479 more)
+
+## Upstream Impact Analysis
+- Dependencies/build changed: refresh dependencies and validate install/build pipeline.
+- Infra/CI changed: validate deploy scripts, CI jobs, and environment parity.
+- Configuration files changed: compare env/config defaults and update local secrets/templates as needed.
+- Documentation changed: review release notes and update internal runbooks if behavior changed.
+
+## Expected Result
+- Atualizacoes do upstream integradas com prioridade local; customizacoes privadas e caminhos protegidos preservados.
+
+## App Test Validation
+- Validation plan:
+  - cargo test
+- Functional gate command: cargo build -p zeron
+- Executed commands:
+  - cargo test
+  - cargo build -p zeron
+- Test status: failed
+- Functional status: failed
+- Test exit code: 101
+- Failed commands:
+  - cargo test
+  - cargo build -p zeron
+- Test log file: fork_sync_report.tests.log
+
+### Test Log Tail
+        |
+    168 |           appearance::init(
+        |  _________^^^^^^^^^^^^^^^^-
+    169 | |             settings::UiSettings::load(&data_dir).appearance,
+    170 | |             data_dir,
+    171 | |             cx,
+    172 | |         );
+        | |_________- two arguments are missing
+        |
+    note: function defined here
+       --> crates/ui/src/appearance.rs:80:8
+        |
+     80 | pub fn init(
+        |        ^^^^
+    ...
+     84 |     surface: SurfacePreference,
+        |     --------------------------
+     85 |     cx: &mut App,
+        |     ------------
+    help: provide the arguments
+        |
+    168 |         appearance::init(
+    ...
+    171 |             cx,
+    172 ~             /* surface */,
+    173 +             /* &mut gpui::App */,
+    174 ~         );
+        |
+
+    error[E0433]: cannot find module or crate `zeron_theme` in this scope
+       --> crates/ui/src/appearance.rs:285:48
+        |
+    285 | fn model_appearance(appearance: Appearance) -> zeron_theme::Appearance {
+        |                                                ^^^^^^^^^^^ use of unresolved module or unlinked crate `zeron_theme`
+        |
+        = help: if you wanted to use a crate named `zeron_theme`, use `cargo add zeron_theme` to add it to your `Cargo.toml`
+
+    Some errors have detailed explanations: E0061, E0425, E0432, E0433, E0599, E0609.
+    For more information about an error, try `rustc --explain E0061`.
+    error: could not compile `zeron-ui` (lib) due to 16 previous errors
+
+## Origin Publish
+- Origin remote: origin
+- Push enabled: false
+- Push status: skipped-disabled
+- Push exit code: 0
+- Sync before push: unknown
+- Sync after push: unknown
