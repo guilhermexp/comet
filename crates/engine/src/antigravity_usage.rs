@@ -68,6 +68,9 @@ impl AntigravityCredential {
         digest.update([0]);
         digest.update(self.refresh_token.as_bytes());
         digest.update(self.expires_at.to_le_bytes());
+        if let Some(email) = &self.email {
+            digest.update(email.as_bytes());
+        }
         CredentialFingerprint(digest.finalize().into())
     }
 }
@@ -113,6 +116,8 @@ pub(crate) struct AntigravityUsage {
     usage_url: String,
     token_url: String,
     http: reqwest::Client,
+    include_keychain: bool,
+    source_fingerprint: Mutex<Option<CredentialFingerprint>>,
     active_credential: Mutex<Option<AntigravityCredential>>,
     usage_cache: Mutex<Option<CachedAntigravityUsage>>,
     usage_ttl: Duration,
@@ -125,21 +130,41 @@ impl AntigravityUsage {
             std::env::var_os("ANTIGRAVITY_CONFIG_DIR").as_deref(),
             &home_dir(),
         );
-        Self::new(
+        Self::new_inner(
             credential_dir,
             CANONICAL_USAGE_URL.to_string(),
             CANONICAL_TOKEN_URL.to_string(),
             HTTP_TIMEOUT,
             USAGE_TTL,
+            true,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         credential_dir: PathBuf,
         usage_url: String,
         token_url: String,
         timeout: Duration,
         usage_ttl: Duration,
+    ) -> Result<Self, AntigravityUsageError> {
+        Self::new_inner(
+            credential_dir,
+            usage_url,
+            token_url,
+            timeout,
+            usage_ttl,
+            false,
+        )
+    }
+
+    fn new_inner(
+        credential_dir: PathBuf,
+        usage_url: String,
+        token_url: String,
+        timeout: Duration,
+        usage_ttl: Duration,
+        include_keychain: bool,
     ) -> Result<Self, AntigravityUsageError> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -151,6 +176,8 @@ impl AntigravityUsage {
             usage_url,
             token_url,
             http,
+            include_keychain,
+            source_fingerprint: Mutex::new(None),
             active_credential: Mutex::new(None),
             usage_cache: Mutex::new(None),
             usage_ttl,
@@ -175,6 +202,8 @@ impl AntigravityUsage {
             usage_url,
             token_url,
             http,
+            include_keychain: false,
+            source_fingerprint: Mutex::new(None),
             active_credential: Mutex::new(Some(credential)),
             usage_cache: Mutex::new(None),
             usage_ttl: USAGE_TTL,
@@ -274,24 +303,32 @@ impl AntigravityUsage {
     }
 
     async fn ensure_credential(&self) -> Option<AntigravityCredential> {
-        let active = lock(&self.active_credential).clone();
-        if let Some(cred) = active {
-            return Some(cred);
-        }
-
         let dir_creds = read_directory_credentials(&self.credential_dir).unwrap_or_default();
         #[cfg(target_os = "macos")]
-        let keychain_cred = keychain::read_credentials()
-            .await
-            .and_then(|val| credential_from_keychain_json(&val));
+        let keychain_cred = if self.include_keychain {
+            keychain::read_credentials()
+                .await
+                .and_then(|val| credential_from_keychain_json(&val))
+        } else {
+            None
+        };
         #[cfg(not(target_os = "macos"))]
         let keychain_cred = None;
 
         let selected = select_best_credential(&dir_creds, keychain_cred.as_ref());
-        if let Some(cred) = &selected {
-            *lock(&self.active_credential) = Some(cred.clone());
+        let selected_fingerprint = selected.as_ref().map(AntigravityCredential::fingerprint);
+        let source_changed = *lock(&self.source_fingerprint) != selected_fingerprint;
+        let active_missing = lock(&self.active_credential).is_none();
+        if source_changed {
+            *lock(&self.source_fingerprint) = selected_fingerprint;
+            *lock(&self.active_credential) = selected.clone();
+            *lock(&self.usage_cache) = None;
+        } else if active_missing {
+            // A prior 401/403 cleared the in-memory token. Re-read the same
+            // source on the next snapshot so a recovered provider can retry.
+            *lock(&self.active_credential) = selected;
         }
-        selected
+        lock(&self.active_credential).clone()
     }
 }
 
@@ -954,5 +991,70 @@ mod tests {
         // File store names the account; the Keychain blob does not.
         assert_eq!(best.email.as_deref(), Some("new@gmail.com"));
         assert_eq!(best_with_keychain.email, None);
+    }
+
+    #[tokio::test]
+    async fn usage_cache_invalidates_when_selected_store_credential_changes_or_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_file = dir.path().join("antigravity-first@example.com.json");
+        std::fs::write(
+            &first_file,
+            json!({
+                "access_token": "first-access",
+                "refresh_token": "first-refresh",
+                "expired": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let first_credential = AntigravityCredential {
+            access_token: "first-access".into(),
+            refresh_token: "first-refresh".into(),
+            expires_at: DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+                .unwrap()
+                .timestamp(),
+            email: Some("first@example.com".into()),
+        };
+        let usage = AntigravityUsage::with_credential(
+            dir.path().to_path_buf(),
+            "http://127.0.0.1:1/usage".into(),
+            "http://127.0.0.1:1/token".into(),
+            first_credential.clone(),
+        );
+
+        let first = usage.snapshot(false, 0).await;
+        assert!(first.present);
+        assert_eq!(first.email.as_deref(), Some("first@example.com"));
+        *lock(&usage.usage_cache) = Some(CachedAntigravityUsage {
+            credential: first_credential.fingerprint(),
+            windows: vec![AgentUsageWindow {
+                label: "Weekly".into(),
+                used_fraction: 0.25,
+                resets_at: None,
+            }],
+            fetched_at: Instant::now(),
+        });
+        assert_eq!(usage.snapshot(false, 0).await.usage_windows.len(), 1);
+
+        let second_file = dir.path().join("antigravity-second@example.com.json");
+        std::fs::write(
+            &second_file,
+            json!({
+                "access_token": "second-access",
+                "refresh_token": "second-refresh",
+                "expired": "2099-02-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let changed = usage.snapshot(false, 0).await;
+        assert_eq!(changed.email.as_deref(), Some("second@example.com"));
+        assert!(changed.usage_windows.is_empty());
+
+        std::fs::remove_file(first_file).unwrap();
+        std::fs::remove_file(second_file).unwrap();
+        let missing = usage.snapshot(false, 0).await;
+        assert!(!missing.present);
+        assert!(missing.usage_windows.is_empty());
     }
 }

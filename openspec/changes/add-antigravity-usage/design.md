@@ -28,9 +28,11 @@ Add `HarnessId::Antigravity` with kebab-case serialization (`"antigravity"`). Li
 ### 2. Credential discovery and in-memory refresh
 
 Credential sources:
-1. Primary: Glob `~/.cli-proxy-api/antigravity-*.json`. Filter out `disabled: true` and missing `refresh_token`, picking the one with the latest expiry timestamp.
-2. Fallback (macOS): `security find-generic-password -s gemini -a antigravity -w` returning `go-keyring-base64:<base64-json>`.
-3. Pick the latest valid credential between file and Keychain.
+1. Primary on macOS: `security find-generic-password -s gemini -a antigravity -w` returning `go-keyring-base64:<base64-json>`. This is the Antigravity client's own login.
+2. Fallback: glob `~/.cli-proxy-api/antigravity-*.json`, filter out `disabled: true` and missing `refresh_token`, then pick the valid file with the latest expiry timestamp.
+3. Never rank Keychain against proxy files by expiry: they can represent different Google accounts with unrelated quota, so store identity determines precedence.
+
+Every snapshot re-reads the selected store and compares a privacy-safe credential fingerprint. A changed or removed source replaces/clears the active in-memory credential and invalidates cached Usage. An access token refreshed by Comet remains in memory while the source fingerprint is unchanged, avoiding repeated refresh against the intentionally stale third-party store.
 
 Refresh requests use standard client credentials (`client_id` and `client_secret` from CLIProxyAPI) via `POST https://oauth2.googleapis.com/token`. As Google OAuth refresh tokens do not rotate, Comet holds refreshed `access_token` and expiry in-memory only. No data is written back to files or Keychain.
 
@@ -58,3 +60,4 @@ Refresh requests use standard client credentials (`client_id` and `client_secret
 
 - Missing or invalid User-Agent returns HTTP 403 Permission Denied. Ensured by explicit User-Agent header in HTTP client.
 - Malformed payloads or empty groups must produce a clean warning state rather than silent empty windows or panics.
+- A login changed outside Comet could otherwise leave the previous account's quota visible until restart. Re-reading the source fingerprint on every snapshot invalidates that stale cache without exposing credential material.

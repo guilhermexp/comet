@@ -2,14 +2,22 @@
 
 ### Requirement: Detect a managed Antigravity subscription
 
-The system SHALL detect local Antigravity credentials from `~/.cli-proxy-api/antigravity-*.json` or macOS Keychain (service `gemini`, account `antigravity`) as device-local account state, picking the valid credential with the most recent expiry timestamp.
+The system SHALL detect local Antigravity credentials as device-local account state, preferring the Antigravity client's macOS Keychain item (service `gemini`, account `antigravity`) and falling back to the latest-expiring valid `~/.cli-proxy-api/antigravity-*.json` credential.
 
 #### Scenario: Valid managed credential exists
-Test: engine unit test with multiple credential files asserting selection of the latest valid expiry.
+Test: engine unit test asserting Keychain precedence plus latest-expiring file fallback.
 
 - **WHEN** valid Antigravity OAuth credentials exist in `~/.cli-proxy-api/` or macOS Keychain
 - **THEN** the account snapshot contains one active, non-switchable Antigravity provider account
 - **AND** the Antigravity row is eligible for managed Usage refresh
+
+#### Scenario: Selected credential changes or disappears
+Test: engine unit test exercising the real snapshot/cache path with mutable credential files.
+
+- **WHEN** the selected store changes account or removes its credential after a prior Usage snapshot
+- **THEN** the previous account's cached Usage is invalidated
+- **AND** the next snapshot identifies the newly selected account or reports the provider missing
+- **AND** no restart or provider authentication failure is required
 
 #### Scenario: Credential is missing, disabled, or malformed
 Test: engine unit test covering missing, disabled (`disabled: true`), and malformed credential files.
