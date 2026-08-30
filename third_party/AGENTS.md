@@ -10,11 +10,13 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - `cmux/` — checkout local-only do terminal macOS baseado em Ghostty, usado
   apenas como referência de pesquisa.
 - `unpeel-upstream.toml` — proveniência verificável do snapshot vendorizado.
+- `rust/` — snapshots licenciados de crates.io com patches mínimos de compatibilidade do toolchain, documentados em `rust/PATCHES.md` e consumidos por `[patch.crates-io]`.
 
 ## Ownership
 
 - O projeto mantém o snapshot exato de `unpeel/` e suas patches de
   compatibilidade locais, preservando a licença MIT e atribuição upstream.
+- O projeto mantém os snapshots em `rust/` apenas enquanto a resolução transitiva do GPUI pinado exigir as versões incompatíveis, preservando versão, API, licença, checksum de origem e justificativa do patch.
 - `cmux/` não é propriedade nem dependência do projeto e permanece untracked.
 
 ## Local Contracts
@@ -37,6 +39,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   CI ou documento operacional pode depender da sua presença.
 - O fork gpui (`wingleeio/zed`) continua uma dependência Git do Cargo, não um
   diretório desta árvore. Crates GPL do Zed permanecem proibidas.
+- Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico futuro que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
 
 ## Work Guidance
 
@@ -56,6 +59,11 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   terminal do app parecia travado com a vazão média inteira. Hoje são 8/4 ms,
   na faixa dos 12 ms do batcher da engine. Mexer num sem o outro reintroduz a
   jitter — o sintoma não é lentidão, é irregularidade.
+- **Runtime packages em `unpeel/runtimes/` são descobertos automaticamente.**
+  O pacote `agy/` integra o Antigravity CLI com descriptor `runtime.toml`,
+  setup idempotente de workspace trust em `~/.gemini/antigravity-cli/settings.json`,
+  resume adapter e ícone autoral. Validação usa `bun run validate:runtimes`
+  em `third_party/unpeel`.
 
 ## Verification
 
@@ -65,6 +73,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 |---|---|---|
 | `third_party/unpeel` | none — upstream vendorizado; contrato do adaptador é downstream | `cargo test -p zeron-workers-unpeel` |
 | `third_party/cmux` | none — referência local untracked | — |
+| `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 
 ## Child DOX Index
 

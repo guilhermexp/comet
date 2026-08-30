@@ -13,7 +13,11 @@ members = [
     "crates/ui",
     "apps/zeron",
 ]
-exclude = ["third_party/unpeel"]
+exclude = [
+    "third_party/unpeel",
+    "third_party/rust/block-0.1.6",
+    "third_party/rust/proc-macro-error2-2.0.1",
+]
 
 [workspace.package]
 version = "0.2.18"
@@ -111,6 +115,13 @@ rquickjs = "0.9"
 unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 ignore = "0.4"
+
+[patch.crates-io]
+# Both crates are transitive dependencies of the pinned gpui revision. These
+# local, licensed source patches only address Rust future-incompatibility
+# lints; they do not change either dependency's public API or version.
+block = { path = "third_party/rust/block-0.1.6" }
+proc-macro-error2 = { path = "third_party/rust/proc-macro-error2-2.0.1" }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

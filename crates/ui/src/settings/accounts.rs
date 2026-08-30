@@ -124,7 +124,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
 ];
 
 pub fn provider_can_add(harness: HarnessId) -> bool {
-    harness != HarnessId::Kimi
+    harness != HarnessId::Kimi && harness != HarnessId::Antigravity
 }
 
 /// Accounts of one provider, in the engine's order (slot creation). No
@@ -899,7 +899,9 @@ impl AccountsPage {
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(
-                                        if account.switchable || account.harness == HarnessId::Kimi
+                                        if account.switchable
+                                            || account.harness == HarnessId::Kimi
+                                            || account.harness == HarnessId::Antigravity
                                         {
                                             "Usage unavailable"
                                         } else {
@@ -1222,6 +1224,7 @@ impl Render for AccountsPage {
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
             HarnessId::Kimi => (crate::icons::WORKER_KIMI, None),
+            HarnessId::Antigravity => (crate::icons::ANTIGRAVITY, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
             HarnessId::Grok => (crate::icons::GROK_MARK, None),
             HarnessId::Hermes => (crate::icons::HERMES_MARK, None),

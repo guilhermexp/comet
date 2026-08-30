@@ -8,6 +8,23 @@ pub enum ProviderUsageState {
     NotSignedIn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageTone {
+    Neutral,
+    Warning,
+    Danger,
+}
+
+pub fn weekly_usage_tone(remaining_percent: Option<u8>) -> UsageTone {
+    match remaining_percent {
+        Some(0) => UsageTone::Neutral,
+        Some(1..=15) => UsageTone::Danger,
+        Some(16..=50) => UsageTone::Warning,
+        Some(51..) => UsageTone::Neutral,
+        None => UsageTone::Neutral,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageWindowRow {
     pub label: String,
@@ -31,10 +48,10 @@ pub struct ProviderUsageRow {
     pub account_id: Option<String>,
     pub state: ProviderUsageState,
     pub weekly_summary: Option<String>,
+    pub weekly_tone: UsageTone,
     pub windows: Vec<UsageWindowRow>,
     /// Collapsed-header badge for a weekly window about to roll over
-    /// (`Reset 12h 16m`), present only inside [`RESET_SOON_HOURS`]. Its presence
-    /// IS the emphasis gate: the header tints warning exactly when it is set.
+    /// (`Reset 12h 16m`) or when remaining quota is exhausted (`Reset 5d 0h`).
     pub weekly_reset_badge: Option<String>,
     pub usage_lines: Vec<AgentUsageLine>,
 }
@@ -45,16 +62,14 @@ pub fn usage_provider_icon(harness: HarnessId) -> (&'static str, bool) {
     match harness {
         HarnessId::ClaudeCode => (crate::icons::CLAUDE_MARK, true),
         HarnessId::Kimi => (crate::icons::WORKER_KIMI, false),
+        HarnessId::Antigravity => (crate::icons::ANTIGRAVITY, false),
         _ => (crate::icons::OPENAI_MARK, false),
     }
 }
 
-/// How close a weekly reset has to be for the collapsed header to speak up.
-///
-/// Emphasis is deliberately about reset PROXIMITY, not about how much quota is
-/// left: a window at 5% remaining that rolls over next week is not urgent, and
-/// one at 95% remaining that rolls over tonight is the one worth reading. The
-/// remaining-percent thresholds keep driving the bar tones in the expanded body.
+/// How close a weekly reset has to be for the collapsed header to display a
+/// countdown badge when quota remains. When quota is exhausted, the countdown
+/// badge is always displayed as long as a future reset timestamp exists.
 pub const RESET_SOON_HOURS: i64 = 48;
 
 fn reset_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
@@ -75,13 +90,20 @@ fn reset_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<St
     })
 }
 
-/// [`reset_text`] restated as a badge (`Reset 12h 16m`) while the window is
-/// inside [`RESET_SOON_HOURS`]. Reusing one formatter keeps the badge and the
-/// expanded row from ever disagreeing about the same countdown.
-fn reset_badge_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
+/// [`reset_text`] restated as a badge (`Reset 12h 16m` or `Reset 5d 0h`) while the
+/// window is inside [`RESET_SOON_HOURS`] or when remaining quota is 0%. Reusing one
+/// formatter keeps the badge and the expanded row from ever disagreeing about the same countdown.
+fn reset_badge_text(
+    resets_at: Option<DateTime<Utc>>,
+    remaining_percent: u8,
+    now: DateTime<Utc>,
+) -> Option<String> {
     let resets_at = resets_at?;
     let left = resets_at.signed_duration_since(now);
-    if left.num_seconds() <= 0 || left > chrono::Duration::hours(RESET_SOON_HOURS) {
+    if left.num_seconds() <= 0 {
+        return None;
+    }
+    if left > chrono::Duration::hours(RESET_SOON_HOURS) && remaining_percent != 0 {
         return None;
     }
     Some(reset_text(Some(resets_at), now)?.replacen("Resets in ", "Reset ", 1))
@@ -168,6 +190,7 @@ pub fn provider_usage_rows(
         (HarnessId::ClaudeCode, "Claude"),
         (HarnessId::Codex, "Codex"),
         (HarnessId::Kimi, "Kimi"),
+        (HarnessId::Antigravity, "Antigravity"),
     ]
     .into_iter()
     .map(|(harness, label)| {
@@ -183,6 +206,7 @@ pub fn provider_usage_rows(
                 account_id: None,
                 state: ProviderUsageState::NotSignedIn,
                 weekly_summary: None,
+                weekly_tone: UsageTone::Neutral,
                 windows: Vec::new(),
                 weekly_reset_badge: None,
                 usage_lines: Vec::new(),
@@ -216,25 +240,38 @@ pub fn provider_usage_rows(
                 }
             })
             .collect();
-        let weekly_summary = windows
+        let weekly_window = windows
             .iter()
-            .find(|window| window.label.to_lowercase().contains("week"))
-            .map(|window| format!("Weekly {}%", window.remaining_percent));
+            .find(|window| window.label.to_lowercase().contains("week"));
+        let weekly_remaining_percent = weekly_window.map(|w| w.remaining_percent);
+        let weekly_summary =
+            weekly_remaining_percent.map(|remaining| format!("Weekly {remaining}%"));
         let weekly_reset_badge = account
             .usage_windows
             .iter()
             .find(|window| window.label.to_lowercase().contains("week"))
-            .and_then(|window| reset_badge_text(window.resets_at, now));
+            .and_then(|window| {
+                let remaining =
+                    ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u8;
+                reset_badge_text(window.resets_at, remaining, now)
+            });
+        let state = if windows.is_empty() && account.usage_lines.is_empty() {
+            ProviderUsageState::NoUsage
+        } else {
+            ProviderUsageState::Ready
+        };
+        let weekly_tone = if state == ProviderUsageState::Ready {
+            weekly_usage_tone(weekly_remaining_percent)
+        } else {
+            UsageTone::Neutral
+        };
         ProviderUsageRow {
             harness,
             label,
             account_id: Some(account.id.clone()),
-            state: if windows.is_empty() && account.usage_lines.is_empty() {
-                ProviderUsageState::NoUsage
-            } else {
-                ProviderUsageState::Ready
-            },
+            state,
             weekly_summary,
+            weekly_tone,
             windows,
             weekly_reset_badge,
             usage_lines: account.usage_lines.clone(),
@@ -251,7 +288,8 @@ mod tests {
     };
 
     use super::{
-        ProviderUsageState, derive_usage_pace, provider_usage_rows, reset_text, usage_provider_icon,
+        ProviderUsageState, UsageTone, derive_usage_pace, provider_usage_rows, reset_text,
+        usage_provider_icon,
     };
 
     #[test]
@@ -295,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_claude_then_codex_then_kimi_and_use_active_accounts() {
+    fn rows_are_claude_then_codex_then_kimi_then_antigravity_and_use_active_accounts() {
         let reset = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
         let rolling_reset = Utc.with_ymd_and_hms(2026, 8, 20, 15, 0, 0).unwrap();
         let snapshot = AgentAccountsSnapshot {
@@ -347,11 +385,39 @@ mod tests {
                         },
                     ],
                 ),
+                account(
+                    "antigravity-managed",
+                    HarnessId::Antigravity,
+                    true,
+                    vec![
+                        AgentUsageWindow {
+                            label: "Weekly".into(),
+                            used_fraction: 0.3279389,
+                            resets_at: Some(reset),
+                        },
+                        AgentUsageWindow {
+                            label: "5h".into(),
+                            used_fraction: 0.0,
+                            resets_at: Some(rolling_reset),
+                        },
+                        AgentUsageWindow {
+                            label: "Weekly (Claude/GPT)".into(),
+                            used_fraction: 0.0,
+                            resets_at: Some(reset),
+                        },
+                        AgentUsageWindow {
+                            label: "5h (Claude/GPT)".into(),
+                            used_fraction: 0.0,
+                            resets_at: Some(rolling_reset),
+                        },
+                    ],
+                ),
             ],
             warnings: Vec::new(),
         };
         let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
         let rows = provider_usage_rows(&snapshot, now);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].label, "Claude");
         assert_eq!(rows[0].account_id.as_deref(), Some("claude-active"));
         assert_eq!(rows[0].weekly_summary.as_deref(), Some("Weekly 52%"));
@@ -360,6 +426,25 @@ mod tests {
         assert_eq!(rows[2].label, "Kimi");
         assert_eq!(rows[2].weekly_summary.as_deref(), Some("Weekly 60%"));
         assert!(rows[2].windows[1].pace.is_some());
+
+        assert_eq!(rows[3].label, "Antigravity");
+        assert_eq!(rows[3].account_id.as_deref(), Some("antigravity-managed"));
+        assert_eq!(rows[3].weekly_summary.as_deref(), Some("Weekly 67%"));
+        assert_eq!(rows[3].weekly_tone, UsageTone::Neutral);
+        assert_eq!(rows[3].windows.len(), 4);
+        assert_eq!(rows[3].windows[0].label, "Weekly");
+        assert_eq!(rows[3].windows[1].label, "5h");
+        assert_eq!(rows[3].windows[2].label, "Weekly (Claude/GPT)");
+        assert_eq!(rows[3].windows[3].label, "5h (Claude/GPT)");
+        assert!(rows[3].windows[0].pace.is_some());
+        assert!(rows[3].windows[1].pace.is_some());
+        assert!(rows[3].windows[2].pace.is_some());
+        assert!(rows[3].windows[3].pace.is_some());
+
+        assert_eq!(
+            usage_provider_icon(HarnessId::Antigravity),
+            (crate::icons::ANTIGRAVITY, false)
+        );
         assert_eq!(
             usage_provider_icon(HarnessId::Kimi),
             (crate::icons::WORKER_KIMI, false)
@@ -392,10 +477,11 @@ mod tests {
     #[test]
     fn missing_provider_account_is_explicitly_unavailable() {
         let rows = provider_usage_rows(&AgentAccountsSnapshot::default(), Utc::now());
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].state, ProviderUsageState::NotSignedIn);
         assert_eq!(rows[1].state, ProviderUsageState::NotSignedIn);
         assert_eq!(rows[2].state, ProviderUsageState::NotSignedIn);
+        assert_eq!(rows[3].state, ProviderUsageState::NotSignedIn);
     }
 
     #[test]
@@ -441,5 +527,119 @@ mod tests {
             reset_text(Some(now + chrono::Duration::minutes(12 * 60 + 16)), now).as_deref(),
             Some("Resets in 12h 16m")
         );
+    }
+
+    #[test]
+    fn weekly_tone_boundaries() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        let check_tone = |used_fraction| {
+            let snapshot = AgentAccountsSnapshot {
+                accounts: vec![account(
+                    "claude-active",
+                    HarnessId::ClaudeCode,
+                    true,
+                    vec![AgentUsageWindow {
+                        label: "Weekly".into(),
+                        used_fraction,
+                        resets_at: None,
+                    }],
+                )],
+                warnings: Vec::new(),
+            };
+            let rows = provider_usage_rows(&snapshot, now);
+            rows[0].weekly_tone
+        };
+
+        // remaining_percent = round((1 - used) * 100)
+        // 0.49 -> 51% -> Neutral
+        assert_eq!(check_tone(0.49), UsageTone::Neutral);
+        // 0.50 -> 50% -> Warning
+        assert_eq!(check_tone(0.50), UsageTone::Warning);
+        // 0.84 -> 16% -> Warning
+        assert_eq!(check_tone(0.84), UsageTone::Warning);
+        // 0.85 -> 15% -> Danger
+        assert_eq!(check_tone(0.85), UsageTone::Danger);
+        // 0.99 -> 1% -> Danger
+        assert_eq!(check_tone(0.99), UsageTone::Danger);
+        // 1.00 -> 0% -> Neutral
+        assert_eq!(check_tone(1.00), UsageTone::Neutral);
+    }
+
+    #[test]
+    fn weekly_tone_neutral_when_not_signed_in_no_usage_or_no_weekly_window() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        // NotSignedIn
+        let empty_snapshot = AgentAccountsSnapshot::default();
+        let rows = provider_usage_rows(&empty_snapshot, now);
+        assert_eq!(rows[0].weekly_tone, UsageTone::Neutral);
+
+        // NoUsage
+        let no_usage_snapshot = AgentAccountsSnapshot {
+            accounts: vec![account(
+                "claude-active",
+                HarnessId::ClaudeCode,
+                true,
+                vec![],
+            )],
+            warnings: Vec::new(),
+        };
+        let rows = provider_usage_rows(&no_usage_snapshot, now);
+        assert_eq!(rows[0].weekly_tone, UsageTone::Neutral);
+
+        // Ready but with only non-weekly window (e.g. 5h)
+        let non_weekly_snapshot = AgentAccountsSnapshot {
+            accounts: vec![account(
+                "kimi-active",
+                HarnessId::Kimi,
+                true,
+                vec![AgentUsageWindow {
+                    label: "5h".into(),
+                    used_fraction: 0.90,
+                    resets_at: None,
+                }],
+            )],
+            warnings: Vec::new(),
+        };
+        let rows = provider_usage_rows(&non_weekly_snapshot, now);
+        let kimi = rows.iter().find(|r| r.harness == HarnessId::Kimi).unwrap();
+        assert_eq!(kimi.state, ProviderUsageState::Ready);
+        assert_eq!(kimi.weekly_tone, UsageTone::Neutral);
+    }
+
+    #[test]
+    fn weekly_reset_badge_shows_when_exhausted_even_with_distant_reset() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        let reset_5d = now + chrono::Duration::days(5);
+        let reset_12h = now + chrono::Duration::minutes(12 * 60 + 16);
+
+        let make_snapshot = |used_fraction, resets_at| AgentAccountsSnapshot {
+            accounts: vec![account(
+                "claude-active",
+                HarnessId::ClaudeCode,
+                true,
+                vec![AgentUsageWindow {
+                    label: "Weekly".into(),
+                    used_fraction,
+                    resets_at,
+                }],
+            )],
+            warnings: Vec::new(),
+        };
+
+        // 1. remaining_percent == 0 and reset 5 days in the future -> badge present (e.g. "Reset 5d 0h")
+        let rows = provider_usage_rows(&make_snapshot(1.0, Some(reset_5d)), now);
+        assert_eq!(rows[0].weekly_reset_badge.as_deref(), Some("Reset 5d 0h"));
+
+        // 2. remaining_percent == 60 (comfortable quota) and reset 5 days in the future -> badge absent
+        let rows = provider_usage_rows(&make_snapshot(0.40, Some(reset_5d)), now);
+        assert_eq!(rows[0].weekly_reset_badge, None);
+
+        // 3. remaining_percent == 60 and reset in 12h (soon) -> badge present
+        let rows = provider_usage_rows(&make_snapshot(0.40, Some(reset_12h)), now);
+        assert_eq!(rows[0].weekly_reset_badge.as_deref(), Some("Reset 12h 16m"));
+
+        // 4. remaining_percent == 0 and resets_at is None -> badge absent
+        let rows = provider_usage_rows(&make_snapshot(1.0, None), now);
+        assert_eq!(rows[0].weekly_reset_badge, None);
     }
 }

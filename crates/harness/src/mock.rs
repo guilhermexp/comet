@@ -247,6 +247,61 @@ impl Harness for MockHarness {
             )
             .into(),
         });
+        // Dev/testing knob: `ZERON_MOCK_MEDIA=1` exercises the whole inline
+        // media surface — a ReadFile chip naming a checked-in screenshot (the
+        // inline image gallery) plus three fenced diagrams: one that fits the
+        // block at 1:1, one wider than the block, one far wider still. The
+        // only data-side way to put either renderer on screen with the mock
+        // harness.
+        let mock_media = std::env::var("ZERON_MOCK_MEDIA")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let media_tool_events = mock_media
+            .then(|| {
+                [
+                    AgentEvent::ToolCall {
+                        id: "mock-media-read".into(),
+                        call: zeron_proto::ToolCall::ReadFile {
+                            path: "apps/landing/public/assets/shots/diff.png".into(),
+                        },
+                    },
+                    AgentEvent::ToolResult {
+                        id: "mock-media-read".into(),
+                        is_error: false,
+                        output: None,
+                        diff: None,
+                        execution: None,
+                    },
+                ]
+            })
+            .into_iter()
+            .flatten();
+        let media_event = mock_media.then(|| AgentEvent::TextDelta {
+            text: concat!(
+                "\n### Diagram check\n\nA ticket walks one attempt at a time:\n\n",
+                "```mermaid\n",
+                "flowchart LR\n",
+                "  create --> prepare-attempt\n",
+                "  prepare-attempt --> bind-session\n",
+                "  bind-session --> submit\n",
+                "  submit --> verify\n",
+                "  verify --> close\n",
+                "  verify --> reject\n",
+                "  reject --> prepare-attempt\n",
+                "```\n\n",
+                "Wider than the block — fitted down whole:\n\n",
+                "```mermaid\n",
+                "flowchart LR\n",
+                "  ingest[\"ingest events\"] --> fold[\"fold into parts\"] --> diff[\"diff into loro doc\"] --> relay[\"fan out session room\"] --> paint[\"paint transcript row\"]\n",
+                "```\n\n",
+                "Far wider than the block — still whole, and the lightbox opens at fit:\n\n",
+                "```mmd\n",
+                "flowchart LR\n",
+                "  a[\"ingest events\"] --> b[\"fold into parts\"] --> c[\"diff into loro doc\"] --> d[\"coalesce commits 120ms\"] --> e[\"fan out session room\"] --> f[\"mirror on device\"] --> g[\"paint transcript row\"] --> h[\"settle the turn\"] --> i[\"archive the run\"] --> j[\"prune the journal\"] --> k[\"compact the oplog\"] --> l[\"release the lease\"]\n",
+                "```\n\n",
+            )
+            .into(),
+        });
         // Dev/testing knob: `ZERON_MOCK_SUBAGENT=1` appends two spawn chips
         // whose nested traffic arrives as tagged `AgentEvent::Subagent`
         // events — the only data-side way to put spawn chips (running → done)
@@ -462,6 +517,8 @@ impl Harness for MockHarness {
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)
+            .chain(media_tool_events)
+            .chain(media_event)
             .chain(error_event)
             .chain(tail.iter().cloned())
             .map(Ok)

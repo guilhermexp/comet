@@ -1922,7 +1922,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     let requests = seen.lock().unwrap().clone();
     let chat_run = requests
         .iter()
-        .find(|r| r.prompt.contains("what color is this?") && !r.prompt.contains("word title"))
+        .find(|r| r.prompt == prompt)
         .expect("chat run reached the harness");
     assert_eq!(chat_run.attachments, vec![path.clone()]);
     assert!(chat_run.prompt.contains(&path));

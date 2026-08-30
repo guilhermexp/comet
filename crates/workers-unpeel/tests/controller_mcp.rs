@@ -263,6 +263,24 @@ fn briefing_waits_for_a_stable_agent_prompt_and_rejects_unknown_menus() {
         "Choose setup:\n1. Continue\n2. Exit\nPress enter",
         1_000
     ));
+    let agy_ready = "▄▀▀▄        Antigravity CLI 1.1.22\n\
+                     ▀▀▀▀▀▀       agenthermes.varela@gmail.com\n\
+                     ────────────────────────────────────────────────────\n\
+                     >\n\
+                     ────────────────────────────────────────────────────\n\
+                     ? for shortcuts        Gemini 3.7 Flash · high (Google AI Pro)";
+    assert!(controller_mcp_is_briefing_screen_ready(
+        "agy", agy_ready, 400
+    ));
+    let agy_trust_selector = "Do you trust the contents of this project?\n\
+                              Antigravity CLI requires permission to read, edit, and execute files here.\n\
+                              > Yes, I trust this folder\n\
+                                No, exit";
+    assert!(!controller_mcp_is_briefing_screen_ready(
+        "agy",
+        agy_trust_selector,
+        1_000
+    ));
 }
 
 #[test]

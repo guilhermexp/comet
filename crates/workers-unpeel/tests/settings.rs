@@ -173,10 +173,24 @@ fn settings_migrate_new_native_worker_presets_once() -> Result<(), Box<dyn std::
             && runtime.install_command.as_deref()
                 == Some("curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh")
     }));
+    let agy = settings
+        .presets
+        .iter()
+        .find(|preset| preset.id == "agy")
+        .expect("Antigravity preset should be added to existing profiles");
+    assert_eq!(agy.label, "agy --dangerously-skip-permissions");
+    assert_eq!(agy.command, "agy --dangerously-skip-permissions");
+    assert_eq!(agy.cli_id.as_deref(), Some("agy"));
+
+    assert!(settings.runtimes.iter().any(|runtime| {
+        runtime.cli_id == "agy"
+            && runtime.label == "Antigravity"
+            && runtime.official_url.as_deref() == Some("https://antigravity.google")
+    }));
 
     let raw: serde_json::Value =
         serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
-    assert_eq!(raw["comet_workers_preset_catalog_version"], 1);
+    assert_eq!(raw["comet_workers_preset_catalog_version"], 2);
     Ok(())
 }
 
@@ -197,6 +211,41 @@ fn migrated_native_worker_preset_stays_deleted() -> Result<(), Box<dyn std::erro
             .all(|preset| preset.id != "omp"),
         "the one-time migration must not resurrect a preset the user deleted"
     );
+    Ok(())
+}
+
+#[test]
+fn migrating_from_v1_to_v2_adds_agy_without_resurrecting_deleted_v1_presets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = fixture()?;
+
+    // Seed v1 state where the user previously deleted omp
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
+    raw["comet_workers_preset_catalog_version"] = serde_json::json!(1);
+    let raw_presets = raw["presets"].as_array_mut().unwrap();
+    raw_presets.retain(|p| p.get("id").and_then(|id| id.as_str()) != Some("omp"));
+    fs::write(
+        home.path().join("app-state.json"),
+        serde_json::to_vec_pretty(&raw)?,
+    )?;
+
+    let client = LocalWorkersClient::new();
+    let settings = client.settings()?;
+
+    assert!(
+        settings.presets.iter().all(|preset| preset.id != "omp"),
+        "v2 migration must not resurrect deleted v1 preset 'omp'"
+    );
+    assert!(
+        settings.presets.iter().any(|preset| preset.id == "agy"),
+        "v2 migration must add 'agy' preset"
+    );
+
+    let updated: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
+    assert_eq!(updated["comet_workers_preset_catalog_version"], 2);
     Ok(())
 }
 

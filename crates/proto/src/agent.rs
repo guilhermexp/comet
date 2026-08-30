@@ -9,6 +9,8 @@ pub enum HarnessId {
     Codex,
     /// Kimi Code managed account/Usage identity; not a runnable harness.
     Kimi,
+    /// Antigravity managed account/Usage identity; not a runnable harness.
+    Antigravity,
     Cursor,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
@@ -728,12 +730,20 @@ mod tests {
         assert_eq!(serde_json::to_string(&HarnessId::Omp).unwrap(), "\"omp\"");
         assert_eq!(serde_json::to_string(&HarnessId::Kimi).unwrap(), "\"kimi\"");
         assert_eq!(
+            serde_json::to_string(&HarnessId::Antigravity).unwrap(),
+            "\"antigravity\""
+        );
+        assert_eq!(
             serde_json::from_str::<HarnessId>("\"omp\"").unwrap(),
             HarnessId::Omp
         );
         assert_eq!(
             serde_json::from_str::<HarnessId>("\"kimi\"").unwrap(),
             HarnessId::Kimi
+        );
+        assert_eq!(
+            serde_json::from_str::<HarnessId>("\"antigravity\"").unwrap(),
+            HarnessId::Antigravity
         );
     }
 }

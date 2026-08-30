@@ -519,6 +519,148 @@ async fn permanent_rejection_retires_transient_keeps_and_retries() {
     client.shutdown().await;
 }
 
+/// A local enqueue must not bypass the cooldown installed by a quota error.
+/// Removing the quota guard from the nudge branch makes this test observe an
+/// immediate full-queue replay before the retry deadline.
+#[tokio::test(start_paused = true)]
+async fn quota_rejection_blocks_enqueue_nudges_until_retry_deadline() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let empty_state = serde_json::json!({"headSeq": 0, "seqFloor": 0,
+        "checkpointSeq": 0, "checkpointSize": 0, "rowCount": 0, "rowBytes": 0});
+    let (quota_sent_tx, quota_sent_rx) = oneshot::channel();
+    let (inspect_tx, inspect_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_join(&mut end, empty_state, &[], vec![], false).await;
+        let first = expect_kind(&mut end, frame_type::PUSH).await;
+        let first_id = first.header["batchId"].as_str().unwrap().to_string();
+        send(
+            &end,
+            frame_type::ERROR,
+            serde_json::json!({"code": "quota", "message": "later", "batchId": first_id}),
+            &[],
+        )
+        .await;
+        quota_sent_tx.send(()).unwrap();
+        inspect_rx.await.unwrap();
+        assert!(
+            end.rx.try_recv().is_err(),
+            "enqueue nudge sent a push before quota cooldown expired"
+        );
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds");
+
+    client.enqueue_update(vec![0xa0]);
+    quota_sent_rx.await.unwrap();
+    while client.stats().rejected == 0 {
+        tokio::task::yield_now().await;
+    }
+    client.enqueue_update(vec![0xb0]);
+    tokio::time::advance(QUOTA_RETRY - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    inspect_tx.send(()).unwrap();
+    let _keep = server.await.unwrap();
+    client.shutdown().await;
+}
+
+/// Quota recovery is deliberately one-per-grant: the retry clock sends the
+/// rejected head, and only its acknowledgement unlocks the following batch.
+#[tokio::test(start_paused = true)]
+async fn quota_retry_sends_one_head_then_ack_drains_next() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let empty_state = serde_json::json!({"headSeq": 0, "seqFloor": 0,
+        "checkpointSeq": 0, "checkpointSize": 0, "rowCount": 0, "rowBytes": 0});
+    let (quota_sent_tx, quota_sent_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_join(&mut end, empty_state, &[], vec![], false).await;
+        let first = expect_kind(&mut end, frame_type::PUSH).await;
+        let first_id = first.header["batchId"].as_str().unwrap().to_string();
+        assert_eq!(first.payload, vec![0xa1]);
+        send(
+            &end,
+            frame_type::ERROR,
+            serde_json::json!({"code": "quota", "message": "later", "batchId": first_id}),
+            &[],
+        )
+        .await;
+        quota_sent_tx.send(()).unwrap();
+
+        let retry = expect_kind(&mut end, frame_type::PUSH).await;
+        assert_eq!(retry.header["batchId"].as_str().unwrap(), first_id);
+        assert_eq!(
+            retry.payload,
+            vec![0xa1],
+            "retry must send the blocked head"
+        );
+        assert!(
+            end.rx.try_recv().is_err(),
+            "retry tick must not burst the rest of the queue"
+        );
+        send(
+            &end,
+            frame_type::ACK,
+            serde_json::json!({"batchId": first_id, "seq": 1, "dup": false}),
+            &[],
+        )
+        .await;
+
+        let second = expect_kind(&mut end, frame_type::PUSH).await;
+        let second_id = second.header["batchId"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(second.payload, vec![0xb1]);
+        send(
+            &end,
+            frame_type::ACK,
+            serde_json::json!({"batchId": second_id, "seq": 2, "dup": false}),
+            &[],
+        )
+        .await;
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds");
+
+    client.enqueue_update(vec![0xa1]);
+    quota_sent_rx.await.unwrap();
+    while client.stats().rejected == 0 {
+        tokio::task::yield_now().await;
+    }
+    client.enqueue_update(vec![0xb1]);
+    tokio::time::advance(QUOTA_RETRY).await;
+    let _keep = server.await.unwrap();
+    let mut events = client.events();
+    while client.stats().pending_pushes > 0 {
+        let _ = events.recv().await;
+    }
+    assert_eq!(client.stats().cursor, 2);
+    client.shutdown().await;
+}
+
 /// F2: batches over the row cap never enter the replay queue.
 #[tokio::test(start_paused = true)]
 async fn oversized_enqueue_is_refused_at_the_door() {

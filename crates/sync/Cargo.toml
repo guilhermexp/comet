@@ -28,6 +28,11 @@ block2 = "0.6"
 # infrastructure for this crate's tests and zeron-engine's integration tests.
 mock-server = []
 
+[[test]]
+name = "registry_client"
+path = "tests/registry_client.rs"
+required-features = ["mock-server"]
+
 [dev-dependencies]
 chrono.workspace = true
 # chat2_live example only (live checkpoint fetch against a deployed worker).

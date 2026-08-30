@@ -2724,8 +2724,9 @@ fn edit_presets(
 }
 
 const COMET_WORKERS_PRESET_CATALOG_VERSION_KEY: &str = "comet_workers_preset_catalog_version";
-const COMET_WORKERS_PRESET_CATALOG_VERSION: u64 = 1;
+const COMET_WORKERS_PRESET_CATALOG_VERSION: u64 = 2;
 const COMET_WORKERS_PRESET_V1_IDS: [&str; 2] = ["omp", "prime-agent"];
+const COMET_WORKERS_PRESET_V2_IDS: [&str; 1] = ["agy"];
 
 fn migrate_comet_workers_presets() -> Result<Value, WorkersError> {
     let raw = unpeel_core::app_state::load().map_err(WorkersError::State)?;
@@ -2765,12 +2766,25 @@ fn migrate_comet_workers_presets() -> Result<Value, WorkersError> {
             .transpose()
             .map_err(|error| error.to_string())?
             .unwrap_or_default();
-        for builtin in unpeel_core::state::builtin_global_presets()
-            .into_iter()
-            .filter(|preset| COMET_WORKERS_PRESET_V1_IDS.contains(&preset.id.as_str()))
-        {
-            if presets.iter().all(|preset| preset.id != builtin.id) {
-                presets.push(builtin);
+        let builtin_presets = unpeel_core::state::builtin_global_presets();
+        if current_version < 1 {
+            for builtin in builtin_presets
+                .iter()
+                .filter(|preset| COMET_WORKERS_PRESET_V1_IDS.contains(&preset.id.as_str()))
+            {
+                if presets.iter().all(|preset| preset.id != builtin.id) {
+                    presets.push(builtin.clone());
+                }
+            }
+        }
+        if current_version < 2 {
+            for builtin in builtin_presets
+                .iter()
+                .filter(|preset| COMET_WORKERS_PRESET_V2_IDS.contains(&preset.id.as_str()))
+            {
+                if presets.iter().all(|preset| preset.id != builtin.id) {
+                    presets.push(builtin.clone());
+                }
             }
         }
         state.insert(

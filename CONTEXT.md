@@ -37,3 +37,17 @@ _Avoid_: chat dump, backup, download, export de sessão
 **Artifact**:
 Algo substantivo que um Chat produziu — um arquivo escrito, um subagente executado, um output pesado o bastante para não caber inline. É o que um Chat Transcript Export lista no topo para o registro ficar navegável.
 _Avoid_: output, result, file change
+
+## Checkout
+
+**Chat Checkout**:
+O par pasta+ref a que um Chat está fixado — `cwd` e `branch` na row do Chat. Decide onde um run escreve e é o que o card Workspace do Details sidebar mostra. Pertence ao Chat, que é durável; nunca à Session, que é o estado de execução daquele Chat num device.
+_Avoid_: workspace, session branch, worktree (quando se quer dizer o par)
+
+**Ref**:
+Um branch local ou remote-tracking que o repo do Space oferece como destino de um Chat Checkout. Nunca significa commit solto, tag ou detached HEAD.
+_Avoid_: branch (quando se quer dizer a lista de opções), revision, commit
+
+**Retarget**:
+Mover um Chat Checkout para outra pasta que já existe — o worktree do Ref escolhido — em vez de trocar o Ref dentro da pasta atual. Custa a continuidade do harness: o próximo run abre conversa nova, porque resume é escopo de cwd.
+_Avoid_: switch, move, checkout

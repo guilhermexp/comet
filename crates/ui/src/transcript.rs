@@ -77,6 +77,13 @@ const INLINE_IMAGE_CACHE_MAX_ENTRIES: usize = 24;
 const INLINE_IMAGE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const INLINE_IMAGE_CACHE_MAX_TOTAL: usize = 32;
 const INLINE_IMAGE_MAX_INFLIGHT: usize = 4;
+/// On-screen height of an inline image. It is the ONE fixed dimension: the
+/// width follows the picture's own ratio, so the image reads as itself rather
+/// than as a thumbnail cropped into a fixed card, while the row's height stays
+/// analytic for the virtualizer.
+const INLINE_IMAGE_HEIGHT: f32 = 260.0;
+/// Scale factor for inline Mermaid diagrams to improve readability and presence in chat messages.
+const INLINE_MERMAID_SCALE: f32 = 1.25;
 const MERMAID_CACHE_MAX_ENTRIES: usize = 16;
 const MERMAID_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MERMAID_CACHE_MAX_TOTAL: usize = 20;
@@ -87,6 +94,11 @@ pub const GAP_TURN: f32 = 14.0;
 pub const GAP_BLOCK: f32 = 8.0;
 /// Transcript column max width (zeron 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
+/// Gutter each row keeps outside the column (zeron `px-4 @3xl:px-12`). A block
+/// that is a FIGURE rather than prose may reclaim it with a negative margin —
+/// the row's padding is the only free space there, so `-COLUMN_GUTTER` is a
+/// full-bleed breakout that can never leave the transcript's own bounds.
+pub const COLUMN_GUTTER: f32 = 48.0;
 /// Tool chip row height / gap — analytic, so fold heights need no measurement.
 /// A row is the guide rail + a 30px chip card centered in it (zeron
 /// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
@@ -2771,9 +2783,15 @@ pub struct Transcript {
     user_message_preview_focus: gpui::FocusHandle,
     mermaid_preview: Option<crate::mermaid_preview::MermaidPreview>,
     mermaid_preview_focus: gpui::FocusHandle,
+    /// Absolute scale of the open diagram. Opening computes
+    /// [`crate::mermaid_preview::fit_zoom`], never `1.0`: a diagram wider than
+    /// the window would open cropped on every side.
     mermaid_preview_zoom: f32,
     mermaid_preview_pan: gpui::Point<gpui::Pixels>,
-    mermaid_scroll_handles: HashMap<SharedString, gpui::ScrollHandle>,
+    /// Live drag: `(pointer position where the grab started, pan at that
+    /// moment)`. Deltas are measured from the grab, never accumulated per
+    /// move event, so a dropped frame cannot drift the drawing.
+    mermaid_preview_grab: Option<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)>,
     mermaid_copied_svg: Option<Instant>,
     mermaid_copied_code: Option<Instant>,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
@@ -3045,7 +3063,7 @@ impl Transcript {
             mermaid_preview_focus: cx.focus_handle(),
             mermaid_preview_zoom: 1.0,
             mermaid_preview_pan: gpui::point(px(0.0), px(0.0)),
-            mermaid_scroll_handles: HashMap::new(),
+            mermaid_preview_grab: None,
             mermaid_copied_svg: None,
             mermaid_copied_code: None,
             attachment_loads: HashMap::new(),
@@ -4647,22 +4665,17 @@ impl Transcript {
         };
         let mut cards = Vec::new();
         for (ix, path) in paths.iter().enumerate() {
-            let frame = div()
-                .id(SharedString::from(format!("{row_id}#inline-image-{ix}")))
-                .w(px(288.0))
-                .max_w_full()
-                .h(px(192.0))
-                .flex_none()
-                .overflow_hidden()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.09))
-                .bg(crate::theme::ink(0.035));
             match self.inline_image_snapshot(&root, path, cx) {
                 InlineImageSnapshot::Failed => {}
                 InlineImageSnapshot::Loading => {}
+                // Same box as the settled image: a load flip must never change
+                // the row's height under the virtualizer.
                 InlineImageSnapshot::Reloading => cards.push(
-                    frame
+                    div()
+                        .id(SharedString::from(format!("{row_id}#inline-image-{ix}")))
+                        .h(px(INLINE_IMAGE_HEIGHT))
+                        .w(px(INLINE_IMAGE_HEIGHT))
+                        .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -4680,35 +4693,25 @@ impl Transcript {
                         name: name.clone(),
                         image: image.clone(),
                     };
+                    // Just the picture — no card, no border, no filename bar.
+                    // The height is ABSOLUTE and the width AUTO because that
+                    // is the one combination gpui derives from the intrinsic
+                    // ratio (`Img::request_layout`); a percentage width would
+                    // leave the height at natural size and letterbox it.
                     cards.push(
-                        frame
+                        img(image)
+                            .id(SharedString::from(format!("{row_id}#inline-image-{ix}")))
+                            .h(px(INLINE_IMAGE_HEIGHT))
+                            .max_w_full()
+                            .flex_none()
+                            .object_fit(ObjectFit::Contain)
                             .cursor_pointer()
-                            .hover(|style| style.border_color(crate::theme::hairline(0.18)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.user_message_preview = None;
                                 this.attachment_preview = Some(preview.clone());
                                 window.focus(&this.attachment_preview_focus, cx);
                                 cx.notify();
                             }))
-                            .child(
-                                img(image)
-                                    .w_full()
-                                    .h(px(164.0))
-                                    .object_fit(ObjectFit::Contain),
-                            )
-                            .child(
-                                div()
-                                    .h(px(27.0))
-                                    .border_t_1()
-                                    .border_color(crate::theme::hairline(0.07))
-                                    .px(px(9.0))
-                                    .flex()
-                                    .items_center()
-                                    .truncate()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_faint)
-                                    .child(name),
-                            )
                             .into_any_element(),
                     );
                 }
@@ -5219,7 +5222,7 @@ impl Transcript {
                 .left_0()
                 .right_0()
                 .top(px(overlay_top - viewport_top))
-                .px(px(48.0))
+                .px(px(COLUMN_GUTTER))
                 .flex()
                 .justify_center()
                 .child(
@@ -5357,7 +5360,7 @@ impl Transcript {
             .pt(px(top_gap))
             .pb(px(bottom_pad))
             // Wide gutters (zeron `px-4 @3xl:px-12`) around the 46rem column.
-            .px(px(48.0))
+            .px(px(COLUMN_GUTTER))
             .child(
                 div()
                     .w_full()
@@ -6621,12 +6624,6 @@ impl Transcript {
             svg,
         };
 
-        let scroll_handle = self
-            .mermaid_scroll_handles
-            .entry(row_id.clone())
-            .or_default()
-            .clone();
-
         let group: SharedString = format!("mermaid-group-{row_id}").into();
 
         let maximize_btn = {
@@ -6642,63 +6639,59 @@ impl Transcript {
                 .border_1()
                 .border_color(crate::theme::hairline(0.12))
                 .shadow_sm()
-                .text_color(theme.text_muted)
-                .hover(|s| s.text_color(theme.text).bg(crate::theme::ink(0.1)))
+                .hover(|s| s.bg(crate::theme::ink(0.1)))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.user_message_preview = None;
-                    this.attachment_preview = None;
-                    this.mermaid_preview = Some(preview.clone());
-                    this.mermaid_preview_zoom = 1.0;
-                    this.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
-                    window.focus(&this.mermaid_preview_focus, cx);
-                    cx.notify();
+                    this.open_mermaid_preview(preview.clone(), window, cx);
                 }))
-                .child(crate::icons::icon(crate::icons::EXPAND_ARROWS).size(px(13.0)))
+                // The color belongs on the SVG, not on this button: `gpui::Svg`
+                // paints only when its OWN computed style carries a text color
+                // (the parent's never cascades in), so the glyph was silently
+                // absent and the control read as an empty black square.
+                .child(
+                    crate::icons::icon(crate::icons::EXPAND_ARROWS)
+                        .size(px(13.0))
+                        .text_color(theme.text_muted),
+                )
         };
 
         let preview_for_click = preview.clone();
-        let scroll_content = div()
-            .id(SharedString::from(format!("{row_id}#mermaid-scroll")))
-            .track_scroll(&scroll_handle)
+        // The diagram reads WHOLE, inline: it is FITTED to the block instead
+        // of painted at natural size, so nothing is ever cropped and the
+        // lightbox is a choice rather than the only way to see the drawing.
+        // The frame carries the `aspect_ratio` and the `img` fills it —
+        // stamping the ratio on the `img` does nothing, because gpui replaces
+        // an AUTO dimension with the raster's natural size before taffy sees
+        // it (`gpui::Img::request_layout`), which pinned the height at natural
+        // size and letterboxed the drawing inside a taller box. `max_w` scales
+        // diagram up to `INLINE_MERMAID_SCALE` for comfortable readability while
+        // fitting within the row width, and because `w_full` can never exceed the
+        // block there is no overflow to scroll: a fitted figure has no hidden side,
+        // so it needs no scroll container and no edge fade.
+        let fitted = div()
+            .id(SharedString::from(format!("{row_id}#mermaid-figure")))
+            .mx_auto()
             .w_full()
-            .overflow_x_scroll()
-            .py(px(6.0))
+            .max_w(px(width * INLINE_MERMAID_SCALE))
+            .aspect_ratio(width / height)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.user_message_preview = None;
-                this.attachment_preview = None;
-                this.mermaid_preview = Some(preview_for_click.clone());
-                this.mermaid_preview_zoom = 1.0;
-                this.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
-                window.focus(&this.mermaid_preview_focus, cx);
-                cx.notify();
+                this.open_mermaid_preview(preview_for_click.clone(), window, cx);
             }))
-            .child(
-                div()
-                    .min_w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        img(image)
-                            .w(px(width))
-                            .h(px(height))
-                            .object_fit(ObjectFit::Contain)
-                            .flex_none(),
-                    ),
-            );
+            .child(img(image).size_full().object_fit(ObjectFit::Contain));
 
-        let faded_scroll = crate::edge_fade::edge_faded(32.0, false, false, scroll_content)
-            .fade_overflow_x(&scroll_handle);
-
+        // A diagram is a figure, not prose: it reclaims the row's gutters so
+        // the drawing gets the full transcript width to fit into. Width stays
+        // AUTO on purpose — block layout stretches it to
+        // `column + 2 * COLUMN_GUTTER`, whereas `w_full` would resolve 100%
+        // against the column and merely shift the box left.
         div()
             .id(SharedString::from(format!("{row_id}#mermaid-block")))
             .group(group.clone())
             .relative()
-            .w_full()
-            .my(px(8.0))
-            .child(faded_scroll)
+            .mx(px(-COLUMN_GUTTER))
+            .my(px(GAP_BLOCK))
+            .child(fitted)
             .child(
                 div()
                     .opacity(0.0)
@@ -6706,6 +6699,87 @@ impl Transcript {
                     .child(maximize_btn),
             )
             .into_any_element()
+    }
+
+    /// Open the fullscreen diagram at FIT, never at `1.0`: a diagram bigger
+    /// than the window used to open cropped on all four sides, which read as
+    /// a broken preview because nothing on screen could reach the rest.
+    fn open_mermaid_preview(
+        &mut self,
+        preview: crate::mermaid_preview::MermaidPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.user_message_preview = None;
+        self.attachment_preview = None;
+        self.mermaid_preview_zoom =
+            crate::mermaid_preview::fit_zoom(window.viewport_size(), &preview);
+        self.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
+        self.mermaid_preview_grab = None;
+        self.mermaid_preview = Some(preview);
+        window.focus(&self.mermaid_preview_focus, cx);
+        cx.notify();
+    }
+
+    /// The single sink for every lightbox control. Zoom and pan are clamped
+    /// HERE, together: zooming out shrinks the pan slack, so a pan left over
+    /// from a deeper zoom would otherwise strand the drawing off-canvas.
+    fn on_mermaid_preview_action(
+        &mut self,
+        action: crate::mermaid_preview::MermaidPreviewAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::mermaid_preview::{MermaidPreviewAction as Action, clamp_pan, clamp_zoom};
+        let Some(preview) = self.mermaid_preview.clone() else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        match action {
+            Action::ZoomBy(factor) => {
+                self.mermaid_preview_zoom = clamp_zoom(self.mermaid_preview_zoom * factor);
+            }
+            Action::ZoomTo(zoom) => self.mermaid_preview_zoom = clamp_zoom(zoom),
+            Action::Fit => {
+                self.mermaid_preview_zoom = crate::mermaid_preview::fit_zoom(viewport, &preview);
+                self.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
+            }
+            Action::PanBy(delta) => {
+                self.mermaid_preview_pan = gpui::point(
+                    self.mermaid_preview_pan.x + delta.x,
+                    self.mermaid_preview_pan.y + delta.y,
+                );
+            }
+            Action::GrabAt(position) => {
+                self.mermaid_preview_grab = Some((position, self.mermaid_preview_pan));
+            }
+            Action::DragTo(position) => {
+                let Some((origin, pan_origin)) = self.mermaid_preview_grab else {
+                    return;
+                };
+                self.mermaid_preview_pan = gpui::point(
+                    pan_origin.x + (position.x - origin.x),
+                    pan_origin.y + (position.y - origin.y),
+                );
+            }
+            Action::Release => self.mermaid_preview_grab = None,
+            Action::CopySvg => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(preview.svg.clone()));
+                self.mermaid_copied_svg = Some(Instant::now());
+            }
+            Action::CopyCode => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(preview.source.clone()));
+                self.mermaid_copied_code = Some(Instant::now());
+            }
+            Action::Close => {
+                self.mermaid_preview = None;
+                self.mermaid_preview_grab = None;
+            }
+        }
+        let slack =
+            crate::mermaid_preview::pan_slack(viewport, &preview, self.mermaid_preview_zoom);
+        self.mermaid_preview_pan = clamp_pan(self.mermaid_preview_pan, slack);
+        cx.notify();
     }
 
     fn ensure_reasoning_tick(&mut self, cx: &mut Context<Self>) {
@@ -8534,93 +8608,29 @@ impl Render for Transcript {
         if let Some(preview) = self.mermaid_preview.clone() {
             let weak = cx.weak_entity();
             let theme = Theme::of(cx).clone();
-            let zoom = self.mermaid_preview_zoom;
-            let pan = self.mermaid_preview_pan;
-            let copied_svg = self
-                .mermaid_copied_svg
-                .is_some_and(|t| t.elapsed().as_secs() < 2);
-            let copied_code = self
-                .mermaid_copied_code
-                .is_some_and(|t| t.elapsed().as_secs() < 2);
-
-            let weak_in = weak.clone();
-            let weak_out = weak.clone();
-            let weak_fit = weak.clone();
-            let weak_100 = weak.clone();
-            let weak_svg = weak.clone();
-            let weak_code = weak.clone();
-            let weak_close = weak.clone();
-
-            let svg_source = preview.svg.clone();
-            let code_source = preview.source.clone();
+            let view = crate::mermaid_preview::MermaidPreviewView {
+                zoom: self.mermaid_preview_zoom,
+                pan: self.mermaid_preview_pan,
+                grabbed: self.mermaid_preview_grab.is_some(),
+                copied_svg: self
+                    .mermaid_copied_svg
+                    .is_some_and(|t| t.elapsed().as_secs() < 2),
+                copied_code: self
+                    .mermaid_copied_code
+                    .is_some_and(|t| t.elapsed().as_secs() < 2),
+            };
 
             return root.child(crate::mermaid_preview::mermaid_lightbox(
                 window.viewport_size(),
                 &preview,
+                &view,
                 &self.mermaid_preview_focus,
-                zoom,
-                pan,
-                copied_svg,
-                copied_code,
                 &theme,
-                move |_, cx| {
-                    weak_in
-                        .update(cx, |this, cx| {
-                            this.mermaid_preview_zoom = (this.mermaid_preview_zoom * 1.25).min(5.0);
-                            cx.notify();
-                        })
-                        .ok();
-                },
-                move |_, cx| {
-                    weak_out
-                        .update(cx, |this, cx| {
-                            this.mermaid_preview_zoom = (this.mermaid_preview_zoom / 1.25).max(0.2);
-                            cx.notify();
-                        })
-                        .ok();
-                },
-                move |_, cx| {
-                    weak_fit
-                        .update(cx, |this, cx| {
-                            this.mermaid_preview_zoom = 1.0;
-                            this.mermaid_preview_pan = gpui::point(px(0.0), px(0.0));
-                            cx.notify();
-                        })
-                        .ok();
-                },
-                move |_, cx| {
-                    weak_100
-                        .update(cx, |this, cx| {
-                            this.mermaid_preview_zoom = 1.0;
-                            cx.notify();
-                        })
-                        .ok();
-                },
-                move |_, cx| {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(svg_source.clone()));
-                    weak_svg
-                        .update(cx, |this, cx| {
-                            this.mermaid_copied_svg = Some(Instant::now());
-                            cx.notify();
-                        })
-                        .ok();
-                },
-                move |_, cx| {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(code_source.clone()));
-                    weak_code
-                        .update(cx, |this, cx| {
-                            this.mermaid_copied_code = Some(Instant::now());
-                            cx.notify();
-                        })
-                        .ok();
-                },
-                move |_, cx| {
-                    weak_close
-                        .update(cx, |this, cx| {
-                            this.mermaid_preview = None;
-                            cx.notify();
-                        })
-                        .ok();
+                move |action, window, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.on_mermaid_preview_action(action, window, cx);
+                    })
+                    .ok();
                 },
             ));
         }

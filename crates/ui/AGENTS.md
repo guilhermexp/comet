@@ -13,6 +13,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 ## Local Contracts
 
 - gpui vem do fork `wingleeio/zed` pinado por rev no `Cargo.toml` raiz. **Não usamos as crates GPL do Zed** (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos. Puxar uma delas é problema de licença, não de gosto.
+- As macros legadas de `objc 0.2` emitem `cfg(feature = "cargo-clippy")`; `Cargo.toml` declara somente esse valor no `unexpected_cfgs`, mantendo o lint ativo para qualquer outro cfg inesperado.
+- `icons::Assets` também é a fonte virtual dos fallbacks pedidos pelo renderer SVG: os paths IBM Plex Sans e Lilex são aliases para os bytes já embutidos de Geist e Geist Mono. Não adicionar arquivos de fonte duplicados.
 - Knobs de captura (`ZERON_OPEN_ROUTE`, `ZERON_OPEN_DIALOG`, `ZERON_OPEN_PICKER`, `ZERON_FORCE_GATE`, `ZERON_DEMO_UPLOAD`) só valem com `ZERON_UI_CAPTURE=1|true|yes|on` e passam **sempre** por `capture::knob`. Toda nova `SettingsSection` entra também no parser de `ZERON_OPEN_ROUTE`, para a própria página continuar alcançável no QA nativo. `std::env::var` direto para uma knob é proibido: exportada uma vez num shell, ela seguia todo `cargo run` daquele terminal — o app abriu na página Accounts por dias. Run normal boota no chat, ponto.
 - Tema (`theme.rs`) suporta light e dark. Token que sumiu do upstream (ex: `white_alpha`) se remapeia pro equivalente que o upstream aplicou no código gêmeo — não se recria localmente, senão o light mode fica com wash.
 - Animação é camada de **paint**: `with_animation` sobre opacidade nunca altera layout. `prefers-reduced-motion` é honrado.
@@ -94,6 +96,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/shell.rs` (menu EXPORT, resolução do transcript, notice) | unit — decisões puras; render gpui é visual | `cargo test -p zeron-ui --lib export` |
 | `src/url_chips.rs` + projeção da row de usuário | unit | `cargo test -p zeron-ui url_chips` · `cargo test -p zeron-ui transcript` |
 | `src/markdown/**` | unit — parse e mend têm cobertura própria | `cargo test -p zeron-ui` |
+| `Cargo.toml` + macros ObjC (cfg compatibility) | integration | `cargo check -p zeron-ui --message-format short` |
+| `src/icons.rs` (ícones e aliases de fonte do SVG renderer) | unit | `cargo test -p zeron-ui --lib icons::tests` |
 | `src/markdown/render.rs` (invalidação do `RenderCache`) | unit — chaves derivadas caem junto com a row | `cargo test -p zeron-ui invalidate_row` |
 | `src/transcript.rs` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 | `src/markdown_decor.rs` + mapping em `src/composer.rs` | unit — scanner, exact-cover/projeção, IME/cap e estabilidade do flip | `cargo test -p zeron-ui markdown_decor && cargo test -p zeron-ui composer` |

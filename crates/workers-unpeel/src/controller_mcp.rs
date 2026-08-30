@@ -859,6 +859,7 @@ pub fn is_briefing_screen_ready(runtime: &str, screen: &str, stable_for_ms: u64)
         "cline" => lower.contains("cline") && prompt_glyph,
         "amp" => lower.contains("amp") && prompt_glyph,
         "muse" => lower.contains("muse") && prompt_glyph,
+        "agy" => lower.contains("antigravity cli") && lower.contains("for shortcuts"),
         _ => false,
     };
     stable_for_ms >= 300

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
 };
 use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 
 use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
 
@@ -151,6 +152,10 @@ pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcServic
     }
 }
 
+fn incomplete_handshake(error: &WsError) -> bool {
+    matches!(error, WsError::Protocol(ProtocolError::HandshakeIncomplete))
+}
+
 async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
     // Native viewports dial this socket with a bare `connect_async` and send
     // no `Origin` header. A browser always attaches `Origin` to a WebSocket
@@ -177,7 +182,11 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
     let ws = match tokio_tungstenite::accept_hdr_async(stream, reject_cross_origin).await {
         Ok(ws) => ws,
         Err(err) => {
-            tracing::warn!(error = %err, "rpc: websocket handshake failed");
+            if incomplete_handshake(&err) {
+                tracing::debug!("rpc: peer disconnected before websocket handshake completed");
+            } else {
+                tracing::warn!(error = %err, "rpc: websocket handshake failed");
+            }
             return;
         }
     };
@@ -215,4 +224,21 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
 
     serve_connection(service, out_tx, in_rx).await;
     pump.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+
+    #[test]
+    fn only_an_incomplete_websocket_handshake_is_benign() {
+        assert!(incomplete_handshake(&Error::Protocol(
+            ProtocolError::HandshakeIncomplete,
+        )));
+        assert!(!incomplete_handshake(&Error::Protocol(
+            ProtocolError::MissingConnectionUpgradeHeader,
+        )));
+        assert!(!incomplete_handshake(&Error::ConnectionClosed));
+    }
 }

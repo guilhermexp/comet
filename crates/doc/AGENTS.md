@@ -20,6 +20,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 - Write/Edit nunca sincronizam o corpo completo: um único sanitizer em fold/read/write/salvage/rebuild limita o preview a 15 linhas × 512 escalares Unicode; o input histórico integral fica no run journal local do host. Write usa `split('\n')`, contando conteúdo vazio e newline final como linhas adicionadas; `old_text` não muda Write para semântica de Edit.
 - `ToolCallPreview` transitório usa o mesmo tool id da chamada autoritativa; somente o tail limitado atualiza o preview semântico live.
 - `SessionMessageEntry.duration_ms` é metadata aditiva de segmento assistant: `SegmentWriter::finish` só carimba quando a engine tem uma fronteira confiável; docs legados e recovery sem medição mantêm `None`.
+- Durante import incremental, Loro pode expor o map de uma part antes de seus escalares. Só map incompleto sem conteúdo e sem chaves além de `id`/`kind` é shell transitório (diagnóstico `debug`); shape com conteúdo ou chave desconhecida continua salvage com `warn`. O diagnóstico estrutural limita-se a path e kind allowlisted — nunca copia payload.
 - Mudança de nome/shape de container é **destrutiva cross-device** (foi o motivo do `2` em `ws2/{orgId}`). Vai por OpenSpec.
 
 ## Work Guidance
@@ -29,13 +30,14 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Verification
 
-- Comandos: `cargo test -p comet-doc`
+- Comandos: `cargo test -p zeron-doc`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/**` (fold, ledger, mirror) | unit | `cargo test -p comet-doc` |
-| `tests/attachments_roundtrip.rs` | integration | `cargo test -p comet-doc` |
-| Interop de shape com o edge | integration — pelo `crates/sync/tests/edge_convergence.rs` | `cargo test -p comet-sync` |
+| `src/**` (fold, ledger, mirror) | unit | `cargo test -p zeron-doc` |
+| `src/schema.rs` (strict parse, diagnóstico estrutural e salvage de shell incremental) | unit | `cargo test -p zeron-doc schema::tests` |
+| `tests/attachments_roundtrip.rs` | integration | `cargo test -p zeron-doc` |
+| Interop de shape com o edge | integration — pelo `crates/sync/tests/edge_convergence.rs` | `cargo test -p zeron-sync` |
 
 ## Child DOX Index
 

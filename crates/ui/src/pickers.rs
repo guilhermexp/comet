@@ -3758,8 +3758,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
         HarnessId::Kimi => (crate::icons::WORKER_KIMI, None),
+        HarnessId::Antigravity => (crate::icons::ANTIGRAVITY, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-        // Monochrome mark, tinted by the surface like OpenAI's.
         HarnessId::Grok => (crate::icons::GROK_MARK, None),
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),

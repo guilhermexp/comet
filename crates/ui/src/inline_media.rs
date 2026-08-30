@@ -14,6 +14,13 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", 
 const MAX_MERMAID_BYTES: usize = 64 * 1024;
 const MAX_MERMAID_LINES: usize = 2_000;
 const MAX_MERMAID_SVG_BYTES: usize = 4 * 1024 * 1024;
+/// Frame padding the diagram engine leaves around the drawing (its own default
+/// is `40`, which is print-figure spacing: on an inline chat diagram it cost
+/// 80px of width — enough to push an otherwise-fitting flowchart past the
+/// transcript column — plus a matching band of dead vertical space above and
+/// below. The block's own margin supplies the separation from the surrounding
+/// text, so the SVG only needs enough to keep strokes off its own edge.
+const MERMAID_FRAME_PADDING: u32 = 12;
 
 pub struct LoadedInlineImage {
     pub relative_path: String,
@@ -478,6 +485,7 @@ pub fn render_mermaid_svg(source: &str, colors: &MermaidColors) -> Result<Render
         "muted": colors.muted,
         "surface": colors.surface,
         "border": colors.border,
+        "padding": MERMAID_FRAME_PADDING,
         "transparent": true,
     })
     .to_string();

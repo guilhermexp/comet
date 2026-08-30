@@ -831,7 +831,9 @@ impl zeron_harness::Harness for InventoryHarness {
         futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
         zeron_harness::HarnessError,
     > {
-        let titling = request.prompt.starts_with("Reply with ONLY");
+        let titling = request
+            .prompt
+            .starts_with("Write a title for a coding session");
         if titling {
             self.titling_models
                 .lock()

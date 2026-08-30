@@ -903,6 +903,104 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
     }
 }
 
+/// Privacy-safe location of a strict transcript parse failure. Only schema
+/// keys and an allowlisted/inferred part kind are retained; field values are
+/// never copied into the diagnostic.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StructuralParseFailure {
+    field_path: Option<String>,
+    part_kind: Option<&'static str>,
+}
+
+fn structural_part_kind(part: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+    match part.get("kind").and_then(serde_json::Value::as_str) {
+        Some("text") => Some("text"),
+        Some("reasoning") => Some("reasoning"),
+        Some("tool") => Some("tool"),
+        Some("input") => Some("input"),
+        Some("error") => Some("error"),
+        Some("workflowTask") => Some("workflowTask"),
+        Some(_) => Some("unknown"),
+        None if part.contains_key("call") => Some("tool"),
+        None if part.contains_key("task") => Some("workflowTask"),
+        None if part.contains_key("questions") => Some("input"),
+        None if part.contains_key("message") => Some("error"),
+        None if part.contains_key("text") => Some("text"),
+        None => None,
+    }
+}
+
+fn structural_parse_failure(value: &serde_json::Value) -> StructuralParseFailure {
+    let Some(entry) = value.as_object() else {
+        return StructuralParseFailure {
+            field_path: Some("entry".into()),
+            part_kind: None,
+        };
+    };
+    for field in ["id", "role", "createdAt", "deviceId"] {
+        if !entry.contains_key(field) {
+            return StructuralParseFailure {
+                field_path: Some(field.into()),
+                part_kind: None,
+            };
+        }
+    }
+    let Some(parts) = entry.get("parts").and_then(serde_json::Value::as_array) else {
+        return StructuralParseFailure {
+            field_path: Some("parts".into()),
+            part_kind: None,
+        };
+    };
+    for (index, part) in parts.iter().enumerate() {
+        let Some(part) = part.as_object() else {
+            return StructuralParseFailure {
+                field_path: Some(format!("parts[{index}]")),
+                part_kind: None,
+            };
+        };
+        let part_kind = structural_part_kind(part);
+        if part.get("id").and_then(serde_json::Value::as_str).is_none() {
+            return StructuralParseFailure {
+                field_path: Some(format!("parts[{index}].id")),
+                part_kind,
+            };
+        }
+        if part
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return StructuralParseFailure {
+                field_path: Some(format!("parts[{index}].kind")),
+                part_kind,
+            };
+        }
+        if serde_json::from_value::<DocPartJson>(serde_json::Value::Object(part.clone())).is_err() {
+            return StructuralParseFailure {
+                field_path: Some(format!("parts[{index}]")),
+                part_kind,
+            };
+        }
+    }
+    StructuralParseFailure::default()
+}
+
+/// A newly imported Loro map can be observed after the container operation
+/// but before its scalar fields arrive. Only an object containing no fields
+/// beyond the required identity discriminators is safe to classify as that
+/// transient shell; any content or unknown field remains actionable.
+fn transient_part_shell(part: &serde_json::Value) -> bool {
+    let Some(part) = part.as_object() else {
+        return false;
+    };
+    let incomplete = part.get("id").and_then(serde_json::Value::as_str).is_none()
+        || part
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_none();
+    incomplete && part.keys().all(|key| matches!(key.as_str(), "id" | "kind"))
+}
+
 /// Field-level salvage for entries the strict shape rejects. Missing
 /// identity/attribution fields get deterministic stand-ins (content-hashed
 /// id, so repeated reads and continuation joins stay stable); parts are
@@ -927,26 +1025,45 @@ fn salvage_entry(
         .get("role")
         .and_then(|r| serde_json::from_value::<MessageRole>(r.clone()).ok())
         .unwrap_or(MessageRole::Assistant);
+    let failure = structural_parse_failure(&v);
     let mut parts = Vec::new();
     let mut dropped_parts = 0usize;
+    let mut transient_shells = 0usize;
     if let Some(raw_parts) = obj.get("parts").and_then(|p| p.as_array()) {
         for (ix, part) in raw_parts.iter().enumerate() {
             match serde_json::from_value::<DocPartJson>(part.clone()) {
                 Ok(p) => parts.push(from_doc_part(p)),
                 Err(_) => match salvage_part(part, &id, ix) {
                     Some(p) => parts.push(p),
-                    None => dropped_parts += 1,
+                    None => {
+                        dropped_parts += 1;
+                        transient_shells += usize::from(transient_part_shell(part));
+                    }
                 },
             }
         }
     }
-    tracing::warn!(
-        entry = %id,
-        error = %strict_err,
-        salvaged_parts = parts.len(),
-        dropped_parts,
-        "transcript entry failed strict parse; salvaged"
-    );
+    if dropped_parts > 0 && dropped_parts == transient_shells {
+        tracing::debug!(
+            entry = %id,
+            error = %strict_err,
+            field_path = failure.field_path.as_deref().unwrap_or("unknown"),
+            part_kind = failure.part_kind.unwrap_or("unknown"),
+            salvaged_parts = parts.len(),
+            transient_shells,
+            "transcript entry observed during incremental import"
+        );
+    } else {
+        tracing::warn!(
+            entry = %id,
+            error = %strict_err,
+            field_path = failure.field_path.as_deref().unwrap_or("unknown"),
+            part_kind = failure.part_kind.unwrap_or("unknown"),
+            salvaged_parts = parts.len(),
+            dropped_parts,
+            "transcript entry failed strict parse; salvaged"
+        );
+    }
     Ok(SessionMessageEntry {
         id,
         role,
@@ -2336,5 +2453,39 @@ mod tests {
         });
         let entry = entry_from_json(v).expect("strict");
         assert_eq!(entry.id, "m1");
+    }
+
+    #[test]
+    fn structural_parse_failure_names_path_and_kind_without_content() {
+        let value = serde_json::json!({
+            "id": "entry-1",
+            "role": "assistant",
+            "createdAt": 1,
+            "deviceId": "device",
+            "parts": [{
+                "kind": "tool",
+                "call": {"kind": "exec", "command": "SECRET_TOOL_INPUT"},
+                "output": "SECRET_TRANSCRIPT_CONTENT"
+            }]
+        });
+
+        let failure = structural_parse_failure(&value);
+        assert_eq!(failure.field_path.as_deref(), Some("parts[0].id"));
+        assert_eq!(failure.part_kind, Some("tool"));
+        let diagnostic = format!("{failure:?}");
+        assert!(!diagnostic.contains("SECRET_TOOL_INPUT"));
+        assert!(!diagnostic.contains("SECRET_TRANSCRIPT_CONTENT"));
+    }
+
+    #[test]
+    fn only_contentless_incomplete_part_maps_are_transient() {
+        assert!(transient_part_shell(&serde_json::json!({})));
+        assert!(transient_part_shell(&serde_json::json!({"kind": "tool"})));
+        assert!(!transient_part_shell(&serde_json::json!({
+            "kind": "text",
+            "text": "content must stay actionable"
+        })));
+        assert!(!transient_part_shell(&serde_json::json!({"opaque": true})));
+        assert!(!transient_part_shell(&serde_json::json!(null)));
     }
 }

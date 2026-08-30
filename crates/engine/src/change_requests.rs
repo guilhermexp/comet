@@ -269,7 +269,11 @@ impl CheckoutChangeRequests {
                 );
                 state.next_refresh = Instant::now() + delay;
                 if state.last_error != Some(error) {
-                    tracing::warn!(%error, "change request refresh failed; retaining last success");
+                    if actionable_change_request_failure(error) {
+                        tracing::warn!(%error, "change request refresh failed; retaining last success");
+                    } else {
+                        tracing::debug!(%error, "change request provider unavailable for checkout");
+                    }
                     state.last_error = Some(error);
                 }
                 (state.last_success.clone(), state.next_refresh)
@@ -372,6 +376,10 @@ fn failure_backoff(initial: Duration, maximum: Duration, failures: u32) -> Durat
     initial.saturating_mul(1_u32 << exponent).min(maximum)
 }
 
+fn actionable_change_request_failure(error: ChangeRequestError) -> bool {
+    !matches!(error, ChangeRequestError::UnsupportedRepository)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -383,6 +391,23 @@ mod tests {
 
     use super::*;
     use crate::source_control::BranchHeadContext;
+
+    #[test]
+    fn only_operational_change_request_failures_are_actionable() {
+        assert!(!actionable_change_request_failure(
+            ChangeRequestError::UnsupportedRepository,
+        ));
+        for error in [
+            ChangeRequestError::CliUnavailable,
+            ChangeRequestError::Authentication,
+            ChangeRequestError::RateLimited,
+            ChangeRequestError::Timeout,
+            ChangeRequestError::Decode,
+            ChangeRequestError::CommandFailed,
+        ] {
+            assert!(actionable_change_request_failure(error), "{error}");
+        }
+    }
 
     struct FakeLookup {
         source: Mutex<CheckoutSourceContext>,

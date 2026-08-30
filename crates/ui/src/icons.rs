@@ -20,6 +20,9 @@ use std::sync::Arc;
 
 use gpui::{AssetSource, Hsla, Image, ImageFormat, Result, SharedString, Styled as _, Svg, svg};
 
+const SVG_SANS_FONT: &str = "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf";
+const SVG_MONO_FONT: &str = "fonts/lilex/Lilex-Regular.ttf";
+
 mod material_file_icon_assets {
     include!(concat!(env!("OUT_DIR"), "/material_file_icon_assets.rs"));
 }
@@ -40,6 +43,11 @@ macro_rules! icon_assets {
 
         impl AssetSource for Assets {
             fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+                match path {
+                    SVG_SANS_FONT => return Ok(Some(Cow::Borrowed(crate::FONT_GEIST))),
+                    SVG_MONO_FONT => return Ok(Some(Cow::Borrowed(crate::FONT_GEIST_MONO))),
+                    _ => {}
+                }
                 if let Some(bytes) = material_file_icon_assets::load(path) {
                     return Ok(Some(Cow::Borrowed(bytes)));
                 }
@@ -58,6 +66,7 @@ macro_rules! icon_assets {
                 let all = [$(concat!("icons/", $path, ".svg")),+];
                 Ok(all
                     .into_iter()
+                    .chain([SVG_SANS_FONT, SVG_MONO_FONT])
                     .chain(blobatar_subagent_avatar_assets::PATHS.iter().copied())
                     .filter(|p| p.starts_with(path))
                     .map(SharedString::from)
@@ -157,6 +166,9 @@ icon_assets![
     // menu-check.tsx / logo.tsx).
     (TERMINAL, "terminal"),
     (PLUS, "plus"),
+    // `plus` with the vertical stroke removed — the zoom-out half of a zoom
+    // pair has to read as its sibling's opposite, and the set has no minus.
+    (MINUS, "minus"),
     (CLOSE, "close"),
     // Hand-drawn Linux caption glyphs (minimize dash, maximize square,
     // restore stacked squares) in the same style as `close` — drawn for the
@@ -189,6 +201,7 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    (ANTIGRAVITY, "antigravity"),
     // Link-source marks for the GitHub/YouTube URL chips (official marks,
     // single-path so gpui's currentColor tint carries the chip's ink).
     (GITHUB_MARK, "github-mark"),
@@ -234,6 +247,7 @@ icon_assets![
 /// Details-card glyph for the chat-scoped workflow/subagent/worker projection.
 /// The existing widget asset already matches the connected-node visual language.
 pub const DETAILS_WORKERS: &str = WIDGET;
+pub const WORKER_ANTIGRAVITY: &str = ANTIGRAVITY;
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
 /// monochrome surface.
@@ -316,6 +330,26 @@ mod tests {
     #[test]
     fn list_filters_by_prefix() {
         assert!(!Assets.list("icons/").unwrap().is_empty());
-        assert!(Assets.list("fonts/").unwrap().is_empty());
+        assert_eq!(
+            Assets.list("fonts/").unwrap(),
+            vec![
+                SharedString::from("fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+                SharedString::from("fonts/lilex/Lilex-Regular.ttf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn svg_renderer_font_aliases_load_embedded_fonts() {
+        for path in [
+            "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+            "fonts/lilex/Lilex-Regular.ttf",
+        ] {
+            let bytes = Assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing SVG renderer font alias {path}"));
+            assert!(!bytes.is_empty(), "empty SVG renderer font alias {path}");
+        }
     }
 }

@@ -150,7 +150,10 @@ use crate::{
         recency::{FileRecency, RECENCY_TICK, RecencyLevel},
         subagent_avatars::blobatar_subagent_avatar_path,
         todos::{latest_todos, todo_status_layout, todo_viewport_height_px},
-        usage::{ProviderUsageRow, ProviderUsageState, provider_usage_rows, usage_provider_icon},
+        usage::{
+            ProviderUsageRow, ProviderUsageState, UsageTone, provider_usage_rows,
+            usage_provider_icon,
+        },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
             chat_workers_viewport_height_px, property_row, widget_card, workers_tab_presence,
@@ -171,6 +174,8 @@ const RENDERED_FILE_ROW_LIMIT: usize = 800;
 /// rescan keeps the current tree on screen: flipping to `Loading` on every
 /// save flashed the pane empty.
 const RECENCY_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+const USAGE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+const USAGE_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextFileAccess {
@@ -286,6 +291,8 @@ pub struct DetailsSidebar {
     chat_workers: ChatWorkersWidgetState,
     files: LoadState<Vec<FileNode>>,
     usage: LoadState<Vec<ProviderUsageRow>>,
+    usage_snapshot: Option<AgentAccountsSnapshot>,
+    usage_fetched_at: Option<std::time::Instant>,
     search: Entity<ComposerInput>,
     search_visible: bool,
     active_file: Option<String>,
@@ -301,6 +308,7 @@ pub struct DetailsSidebar {
     recency_ticking: bool,
     recency_refresh: Option<Task<()>>,
     usage_task: Option<Task<()>>,
+    usage_tick: Option<Task<()>>,
     _state_observe: Subscription,
     _workers_observe: Subscription,
     _search_events: Subscription,
@@ -345,6 +353,8 @@ impl DetailsSidebar {
             chat_workers: ChatWorkersWidgetState::default(),
             files: LoadState::Idle,
             usage: LoadState::Idle,
+            usage_snapshot: None,
+            usage_fetched_at: None,
             search,
             search_visible: false,
             active_file: None,
@@ -354,6 +364,7 @@ impl DetailsSidebar {
             file_task: None,
             branch_task: None,
             usage_task: None,
+            usage_tick: None,
             recency: FileRecency::default(),
             recency_root: None,
             recency_watch: None,
@@ -365,6 +376,7 @@ impl DetailsSidebar {
             _search_events: search_events,
         };
         sidebar.load_usage(cx);
+        sidebar.ensure_usage_tick(cx);
         sidebar
     }
 
@@ -623,12 +635,44 @@ impl DetailsSidebar {
         }));
     }
 
+    fn ensure_usage_tick(&mut self, cx: &mut Context<Self>) {
+        if self.usage_tick.is_some() {
+            return;
+        }
+        self.usage_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(USAGE_TICK).await;
+                let keep_ticking = this.update(cx, |this, cx| {
+                    if let Some(snapshot) = &this.usage_snapshot {
+                        this.usage =
+                            LoadState::Ready(provider_usage_rows(snapshot, chrono::Utc::now()));
+                        cx.notify();
+                    }
+                    let should_fetch = this
+                        .usage_fetched_at
+                        .is_none_or(|at| at.elapsed() >= USAGE_FETCH_INTERVAL);
+                    if should_fetch && this.usage_task.is_none() {
+                        this.load_usage(cx);
+                    }
+                    true
+                });
+                if !matches!(keep_ticking, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
     fn load_usage(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.app_state.read(cx).engine().cloned() else {
-            self.usage = LoadState::Error("Engine not connected".into());
+            if self.usage_snapshot.is_none() {
+                self.usage = LoadState::Error("Engine not connected".into());
+            }
             return;
         };
-        self.usage = LoadState::Loading;
+        if self.usage_snapshot.is_none() {
+            self.usage = LoadState::Loading;
+        }
         self.usage_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -638,14 +682,26 @@ impl DetailsSidebar {
                 )
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.usage = match result {
+                this.usage_task = None;
+                match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
                         Ok(snapshot) => {
-                            LoadState::Ready(provider_usage_rows(&snapshot, chrono::Utc::now()))
+                            this.usage_fetched_at = Some(std::time::Instant::now());
+                            let snapshot = this.usage_snapshot.insert(snapshot);
+                            let rows = provider_usage_rows(snapshot, chrono::Utc::now());
+                            this.usage = LoadState::Ready(rows);
                         }
-                        Err(error) => LoadState::Error(error.to_string().into()),
+                        Err(error) => {
+                            if this.usage_snapshot.is_none() {
+                                this.usage = LoadState::Error(error.to_string().into());
+                            }
+                        }
                     },
-                    Err(error) => LoadState::Error(error.to_string().into()),
+                    Err(error) => {
+                        if this.usage_snapshot.is_none() {
+                            this.usage = LoadState::Error(error.to_string().into());
+                        }
+                    }
                 };
                 cx.notify();
             });
@@ -1666,7 +1722,11 @@ impl DetailsSidebar {
             .clone()
             .map(SharedString::from)
             .filter(|_| row.state == ProviderUsageState::Ready);
-        let reset_soon = reset_badge.is_some();
+        let (tone_text, badge_bg) = match row.weekly_tone {
+            UsageTone::Neutral => (theme.text_muted, crate::theme::ink(0.08)),
+            UsageTone::Warning => (theme.warning, theme.warning.opacity(0.12)),
+            UsageTone::Danger => (theme.danger, theme.danger.opacity(0.12)),
+        };
         let windows = row.windows.clone();
         let usage_lines = row.usage_lines.clone();
         div()
@@ -1723,10 +1783,10 @@ impl DetailsSidebar {
                                         .rounded(px(4.0))
                                         .px(px(4.0))
                                         .py(px(2.0))
-                                        .bg(theme.warning.opacity(0.12))
+                                        .bg(badge_bg)
                                         .text_size(px(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.warning)
+                                        .text_color(tone_text)
                                         .child(badge),
                                 )
                             })
@@ -1734,11 +1794,7 @@ impl DetailsSidebar {
                                 div()
                                     .flex_none()
                                     .text_size(px(12.0))
-                                    .text_color(if reset_soon {
-                                        theme.warning
-                                    } else {
-                                        theme.text_muted
-                                    })
+                                    .text_color(tone_text)
                                     .child(summary),
                             ),
                     )
@@ -1770,12 +1826,10 @@ impl DetailsSidebar {
                             } else {
                                 theme.success
                             };
-                            let label = if window.label.to_lowercase().contains("week") {
-                                "Weekly".to_string()
-                            } else if window.label.to_lowercase().contains("session") {
-                                "5h".to_string()
-                            } else {
-                                window.label.clone()
+                            let label = match window.label.as_str() {
+                                "Week" => "Weekly".to_string(),
+                                "Session" => "5h".to_string(),
+                                _ => window.label.clone(),
                             };
                             let pace = window.pace.clone();
                             div()

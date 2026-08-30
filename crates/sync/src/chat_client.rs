@@ -1363,19 +1363,28 @@ impl Actor {
 
     async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
         // Clone rather than drain: batches stay queued until their ack.
-        let frames: Vec<Vec<u8>> = lock(&self.shared)
-            .pending
-            .iter()
-            .map(|push| {
-                wire::encode(
-                    frame_type::PUSH,
-                    &wire::PushHeader {
-                        batch_id: &push.batch_id,
-                    },
-                    &push.bytes,
-                )
-            })
-            .collect();
+        let frames: Vec<Vec<u8>> = {
+            let shared = lock(&self.shared);
+            // A quota verdict applies to every eager send trigger, including
+            // enqueue nudges and reconnect flushes. Only the retry clock may
+            // probe the blocked head until an ack grants the next batch.
+            if shared.quota_blocked {
+                return true;
+            }
+            shared
+                .pending
+                .iter()
+                .map(|push| {
+                    wire::encode(
+                        frame_type::PUSH,
+                        &wire::PushHeader {
+                            batch_id: &push.batch_id,
+                        },
+                        &push.bytes,
+                    )
+                })
+                .collect()
+        };
         for frame in frames {
             if pipe.tx.send(frame).await.is_err() {
                 return false;

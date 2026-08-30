@@ -690,6 +690,136 @@ public enum UnpeelRuntimeCatalog {
                 ),
             ]
         ),
+        // runtimes/omp/runtime.toml
+        UnpeelRuntimeMetadata(
+            stableID: "sh.omp.cli",
+            slug: "omp",
+            legacySlug: "omp",
+            legacyOrder: 13,
+            label: "OMP CLI",
+            platforms: Set([.macos, .linux]),
+            supportsQuickLaunch: true,
+            tintColorHex: nil,
+            spinnerTintColorHex: nil,
+            iconKey: "agent",
+            iconSVG: nil,
+            iconIsTemplate: true,
+            iconSource: nil,
+            iconLicense: nil,
+            installURL: "https://omp.sh",
+            installCommand: "curl -fsSL https://omp.sh/install | sh",
+            commandAliases: ["omp"],
+            processAliases: ["omp"],
+            searchPathSuffixes: [],
+            lifecycleSource: "hooks",
+            lifecycleAuthority: "partial",
+            lifecycleFallback: "none",
+            completionReliable: true,
+            attentionReliable: false,
+            anchorStartEventToOutput: true,
+            attentionClearsOnOutput: true,
+            distrustStopsWhileOutputGrows: false,
+            capabilities: [.lifecycleHooks, .notifyWhenDone],
+            usageStores: [
+            ],
+            suggestedPresets: [
+                UnpeelRuntimeSuggestedPreset(
+                    id: "omp",
+                    label: "OMP CLI",
+                    command: "omp",
+                    quickLaunch: false
+                ),
+            ]
+        ),
+        // runtimes/prime-agent/runtime.toml
+        UnpeelRuntimeMetadata(
+            stableID: "ai.primeintellect.prime-agent",
+            slug: "prime-agent",
+            legacySlug: "prime-agent",
+            legacyOrder: 14,
+            label: "Prime Agent",
+            platforms: Set([.macos, .linux]),
+            supportsQuickLaunch: true,
+            tintColorHex: nil,
+            spinnerTintColorHex: nil,
+            iconKey: "agent",
+            iconSVG: nil,
+            iconIsTemplate: true,
+            iconSource: nil,
+            iconLicense: nil,
+            installURL: "https://github.com/PrimeIntellect-ai/prime-agent",
+            installCommand: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
+            commandAliases: ["prime-agent"],
+            processAliases: ["prime-agent"],
+            searchPathSuffixes: [],
+            lifecycleSource: "hooks",
+            lifecycleAuthority: "partial",
+            lifecycleFallback: "none",
+            completionReliable: true,
+            attentionReliable: false,
+            anchorStartEventToOutput: true,
+            attentionClearsOnOutput: true,
+            distrustStopsWhileOutputGrows: false,
+            capabilities: [.lifecycleHooks, .notifyWhenDone],
+            usageStores: [
+            ],
+            suggestedPresets: [
+                UnpeelRuntimeSuggestedPreset(
+                    id: "prime-agent",
+                    label: "prime-agent",
+                    command: "prime-agent",
+                    quickLaunch: false
+                ),
+            ]
+        ),
+        // runtimes/agy/runtime.toml
+        UnpeelRuntimeMetadata(
+            stableID: "com.google.antigravity-cli",
+            slug: "agy",
+            legacySlug: "agy",
+            legacyOrder: 15,
+            label: "Antigravity",
+            platforms: Set([.macos, .linux]),
+            supportsQuickLaunch: true,
+            tintColorHex: 0x4285F4,
+            spinnerTintColorHex: 0x4285F4,
+            iconKey: "agy",
+            iconSVG: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"currentColor\">\n  <path d=\"M11.87 2.74C12.24 2.73 12.62 2.76 12.97 2.86C13.33 2.96 13.67 3.14 13.98 3.34C14.28 3.55 14.56 3.81 14.80 4.09C15.04 4.37 15.25 4.69 15.44 5.01C15.63 5.33 15.79 5.66 15.95 6.00C16.10 6.34 16.24 6.69 16.37 7.04C16.50 7.39 16.61 7.74 16.72 8.09C16.84 8.45 16.95 8.80 17.06 9.16C17.17 9.51 17.27 9.87 17.37 10.23C17.47 10.59 17.56 10.95 17.66 11.30C17.76 11.66 17.86 12.02 17.97 12.38C18.07 12.73 18.17 13.09 18.28 13.45C18.39 13.80 18.51 14.15 18.63 14.51C18.75 14.86 18.87 15.21 19.00 15.56C19.13 15.91 19.28 16.25 19.43 16.59C19.59 16.93 19.76 17.26 19.95 17.58C20.13 17.90 20.32 18.22 20.54 18.52C20.76 18.82 21.03 19.09 21.26 19.38C21.49 19.67 21.88 19.96 21.94 20.26C22.00 20.56 21.86 21.03 21.63 21.17C21.40 21.30 20.88 21.19 20.54 21.07C20.21 20.94 19.92 20.66 19.62 20.44C19.33 20.21 19.04 19.97 18.78 19.71C18.51 19.45 18.28 19.15 18.04 18.86C17.81 18.57 17.59 18.27 17.38 17.96C17.17 17.65 16.97 17.34 16.78 17.02C16.59 16.70 16.41 16.38 16.22 16.05C16.03 15.73 15.85 15.41 15.64 15.10C15.44 14.78 15.24 14.47 15.00 14.18C14.76 13.90 14.50 13.62 14.20 13.40C13.91 13.18 13.57 13.00 13.22 12.88C12.88 12.76 12.49 12.71 12.13 12.70C11.76 12.69 11.37 12.72 11.02 12.82C10.67 12.92 10.32 13.09 10.01 13.29C9.71 13.49 9.44 13.77 9.19 14.04C8.94 14.31 8.73 14.63 8.52 14.94C8.31 15.24 8.13 15.57 7.94 15.89C7.75 16.21 7.57 16.54 7.38 16.86C7.19 17.18 7.00 17.50 6.79 17.81C6.58 18.12 6.37 18.42 6.14 18.71C5.91 19.01 5.67 19.30 5.41 19.57C5.16 19.84 4.88 20.09 4.59 20.32C4.30 20.55 4.01 20.82 3.68 20.97C3.36 21.13 2.90 21.33 2.62 21.26C2.34 21.19 1.99 20.82 1.99 20.55C1.98 20.28 2.37 19.92 2.59 19.63C2.81 19.33 3.10 19.08 3.32 18.79C3.55 18.49 3.76 18.18 3.95 17.86C4.15 17.55 4.32 17.21 4.48 16.88C4.64 16.54 4.79 16.20 4.93 15.86C5.07 15.51 5.21 15.17 5.34 14.82C5.46 14.47 5.58 14.11 5.69 13.76C5.80 13.40 5.90 13.05 6.00 12.69C6.11 12.33 6.21 11.97 6.31 11.62C6.41 11.26 6.51 10.90 6.61 10.54C6.71 10.18 6.81 9.83 6.92 9.47C7.02 9.11 7.13 8.76 7.24 8.40C7.35 8.05 7.45 7.69 7.58 7.34C7.70 6.99 7.84 6.64 7.98 6.30C8.13 5.96 8.29 5.62 8.47 5.29C8.65 4.97 8.83 4.64 9.06 4.35C9.28 4.05 9.54 3.76 9.82 3.53C10.11 3.30 10.44 3.10 10.78 2.97C11.12 2.84 11.51 2.76 11.87 2.74Z\"/>\n</svg>",
+            iconIsTemplate: true,
+            iconSource: "https://antigravity.google/assets/image/brand/antigravity-icon__one-color.png",
+            iconLicense: "vendor-brand-asset",
+            installURL: "https://antigravity.google",
+            installCommand: nil,
+            commandAliases: ["agy"],
+            processAliases: ["agy"],
+            searchPathSuffixes: [".local/bin"],
+            lifecycleSource: "output",
+            lifecycleAuthority: "none",
+            lifecycleFallback: "output",
+            completionReliable: false,
+            attentionReliable: false,
+            anchorStartEventToOutput: true,
+            attentionClearsOnOutput: true,
+            distrustStopsWhileOutputGrows: false,
+            capabilities: [.resume, .restartAgent],
+            usageStores: [
+                UnpeelRuntimeUsageStore(
+                    root: ".gemini/antigravity-cli/conversations",
+                    extensions: Set(["db"]),
+                    fileName: nil,
+                    fileNameSuffix: nil,
+                    parentDirName: nil
+                ),
+            ],
+            suggestedPresets: [
+                UnpeelRuntimeSuggestedPreset(
+                    id: "agy",
+                    label: "agy --dangerously-skip-permissions",
+                    command: "agy --dangerously-skip-permissions",
+                    quickLaunch: false
+                ),
+            ]
+        ),
     ]
 
     private static let identityIndex: [String: Int] = {

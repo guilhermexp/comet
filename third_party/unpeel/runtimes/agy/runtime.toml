@@ -1,0 +1,44 @@
+schema_version = 1
+id = "com.google.antigravity-cli"
+slug = "agy"
+legacy_slug = "agy"
+label = "Antigravity"
+adapter = "builtin:agy"
+legacy_order = 15
+platforms = ["macos", "linux"]
+supports_quick_launch = true
+capabilities = ["resume", "restart_agent"]
+
+[display]
+tint = "#4285F4"
+spinner_tint = "#4285F4"
+icon = "agy"
+icon_asset = "assets/icon.svg"
+icon_source = "https://antigravity.google/assets/image/brand/antigravity-icon__one-color.png"
+icon_license = "vendor-brand-asset"
+
+[install]
+official_url = "https://antigravity.google"
+
+[detection]
+command_aliases = ["agy"]
+process_aliases = ["agy"]
+search_path_suffixes = [".local/bin"]
+script_path_signatures = []
+
+[lifecycle]
+source = "output"
+authority = "none"
+fallback = "output"
+completion_reliable = false
+attention_reliable = false
+
+[[usage.stores]]
+root = ".gemini/antigravity-cli/conversations"
+extensions = ["db"]
+
+[[suggested_presets]]
+id = "agy"
+label = "agy --dangerously-skip-permissions"
+command = "agy --dangerously-skip-permissions"
+quick_launch = false

@@ -111,6 +111,7 @@ pub fn runtime_icon_path(runtime_id: Option<&str>, command: Option<&str>) -> &'s
         "omp" | "sh.omp.cli" => crate::icons::WORKER_OMP,
         "pi" | "dev.mariozechner.pi" => crate::icons::WORKER_PI,
         "prime-agent" | "ai.primeintellect.prime-agent" => crate::icons::WORKER_PRIME_AGENT,
+        "agy" | "com.google.antigravity-cli" => crate::icons::WORKER_ANTIGRAVITY,
         _ => crate::icons::TERMINAL,
     }
 }
@@ -130,6 +131,7 @@ pub fn runtime_spinner_tint(runtime_id: Option<&str>, command: Option<&str>) -> 
         "muse" | "muse-code" | "ai.meta.muse-code" => Some(0x0082FB),
         "opencode" | "ai.opencode.cli" => Some(0x8F8787),
         "pi" | "dev.mariozechner.pi" => Some(0x7C95FF),
+        "agy" | "com.google.antigravity-cli" => Some(0x4285F4),
         _ => None,
     }
 }
@@ -244,6 +246,10 @@ mod tests {
                 "ai.primeintellect.prime-agent",
                 crate::icons::WORKER_PRIME_AGENT,
             ),
+            (
+                "com.google.antigravity-cli",
+                crate::icons::WORKER_ANTIGRAVITY,
+            ),
         ];
         for (runtime_id, expected) in cases {
             assert_eq!(runtime_icon_path(Some(runtime_id), None), expected);
@@ -306,6 +312,7 @@ mod tests {
             ("ai.meta.muse-code", 0x0082FB),
             ("ai.opencode.cli", 0x8F8787),
             ("dev.mariozechner.pi", 0x7C95FF),
+            ("com.google.antigravity-cli", 0x4285F4),
         ];
         for (runtime_id, tint) in cases {
             assert_eq!(runtime_spinner_tint(Some(runtime_id), None), Some(tint));

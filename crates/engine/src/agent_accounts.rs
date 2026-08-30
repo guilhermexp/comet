@@ -55,6 +55,7 @@ use zeron_proto::{
     AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageLine, AgentUsageWindow, HarnessId,
 };
 
+use crate::antigravity_usage::AntigravityUsage;
 use crate::kimi_usage::KimiUsage;
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
@@ -259,6 +260,8 @@ struct Inner {
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
     kimi_usage: Option<KimiUsage>,
     kimi_setup_warning: Option<String>,
+    antigravity_usage: Option<AntigravityUsage>,
+    antigravity_setup_warning: Option<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -280,18 +283,42 @@ impl AgentAccounts {
         } else {
             (None, None)
         };
-        Self::new_inner(config, kimi_usage, kimi_setup_warning)
+        let (antigravity_usage, antigravity_setup_warning) = if config.uses_detected_paths() {
+            match AntigravityUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+        Self::new_inner(
+            config,
+            kimi_usage,
+            kimi_setup_warning,
+            antigravity_usage,
+            antigravity_setup_warning,
+        )
     }
 
     #[cfg(test)]
     fn new_with_kimi_usage(config: AgentAccountsConfig, kimi_usage: KimiUsage) -> Self {
-        Self::new_inner(config, Some(kimi_usage), None)
+        Self::new_inner(config, Some(kimi_usage), None, None, None)
+    }
+
+    #[cfg(test)]
+    fn new_with_antigravity_usage(
+        config: AgentAccountsConfig,
+        antigravity_usage: AntigravityUsage,
+    ) -> Self {
+        Self::new_inner(config, None, None, Some(antigravity_usage), None)
     }
 
     fn new_inner(
         config: AgentAccountsConfig,
         kimi_usage: Option<KimiUsage>,
         kimi_setup_warning: Option<String>,
+        antigravity_usage: Option<AntigravityUsage>,
+        antigravity_setup_warning: Option<String>,
     ) -> Self {
         // Startup sweep: a previous process that crashed mid-login leaves
         // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
@@ -318,6 +345,8 @@ impl AgentAccounts {
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
                 kimi_usage,
                 kimi_setup_warning,
+                antigravity_usage,
+                antigravity_setup_warning,
             }),
         }
     }
@@ -338,6 +367,16 @@ impl AgentAccounts {
                 harness: HarnessId::Kimi,
                 message,
             })
+            .chain(
+                self.inner
+                    .antigravity_setup_warning
+                    .iter()
+                    .cloned()
+                    .map(|message| AgentAccountWarning {
+                        harness: HarnessId::Antigravity,
+                        message,
+                    }),
+            )
             .collect();
         let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
         let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
@@ -366,8 +405,14 @@ impl AgentAccounts {
                 None => None,
             }
         };
-        let (local_usage, (claude, claude_warning), kimi) =
-            tokio::join!(local_usage, self.detect_claude(), kimi);
+        let antigravity = async {
+            match &self.inner.antigravity_usage {
+                Some(usage) => Some(usage.snapshot(force_usage, Utc::now().timestamp()).await),
+                None => None,
+            }
+        };
+        let (local_usage, (claude, claude_warning), kimi, antigravity) =
+            tokio::join!(local_usage, self.detect_claude(), kimi, antigravity);
         if let Some(message) = claude_warning {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::ClaudeCode,
@@ -444,6 +489,30 @@ impl AgentAccounts {
                     usage_windows: kimi.usage_windows.clone(),
                     usage_lines: Vec::new(),
                     display_name: Some("Kimi Code".into()),
+                    organization: None,
+                    auth_kind: Some(AgentAuthKind::Oauth),
+                    switchable: false,
+                    saved_at: None,
+                });
+            }
+        }
+        if let Some(antigravity) = &antigravity {
+            if let Some(message) = &antigravity.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Antigravity,
+                    message: message.clone(),
+                });
+            }
+            if antigravity.present {
+                accounts.push(AgentAccount {
+                    id: "antigravity-managed".into(),
+                    harness: HarnessId::Antigravity,
+                    email: antigravity.email.clone(),
+                    plan_label: Some("Managed".into()),
+                    active: true,
+                    usage_windows: antigravity.usage_windows.clone(),
+                    usage_lines: Vec::new(),
+                    display_name: Some("Antigravity".into()),
                     organization: None,
                     auth_kind: Some(AgentAuthKind::Oauth),
                     switchable: false,
@@ -1646,6 +1715,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Kimi => "kimi",
+        HarnessId::Antigravity => "antigravity",
         HarnessId::Cursor => "cursor",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
@@ -2183,6 +2253,51 @@ mod tests {
         let wire = serde_json::to_string(&snapshot).unwrap();
         assert!(!wire.contains("test-access-private"));
         assert!(!wire.contains("test-refresh-private"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_managed_credential_is_a_non_switchable_device_local_account() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+        };
+        let cred_dir = root.path().join("cli-proxy");
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let credential_file = cred_dir.join("antigravity-user@gmail.com.json");
+        std::fs::write(
+            &credential_file,
+            r#"{"access_token":"ya29.test-private","refresh_token":"1//test-rt-private","expired":"2099-01-01T00:00:00Z","disabled":false}"#,
+        )
+        .unwrap();
+
+        let antigravity = crate::antigravity_usage::AntigravityUsage::new(
+            cred_dir,
+            "http://127.0.0.1:1/v1internal:retrieveUserQuotaSummary".into(),
+            "http://127.0.0.1:1/token".into(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_antigravity_usage(config, antigravity);
+
+        let snapshot = accounts.list(false).await.unwrap();
+
+        let agy = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Antigravity)
+            .unwrap();
+        assert!(agy.active);
+        assert!(!agy.switchable);
+        assert_eq!(agy.display_name.as_deref(), Some("Antigravity"));
+        assert_eq!(agy.auth_kind, Some(AgentAuthKind::Oauth));
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("ya29.test-private"));
+        assert!(!wire.contains("1//test-rt-private"));
     }
 
     #[tokio::test]

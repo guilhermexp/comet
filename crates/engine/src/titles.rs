@@ -157,9 +157,22 @@ impl TitleGenerator {
             }
         };
         let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
+        // The title speaks the USER's language, and is capitalized the way that
+        // language capitalizes titles. The old prompt asked for "Title Case"
+        // with no language rule at all, so an English instruction wrapping a
+        // Portuguese request produced an English title — and "Title Case" is an
+        // English-only convention anyway (PT/ES/FR capitalize the first word
+        // and proper nouns, so imposing it would misspell a correct title).
         let title_prompt = format!(
-            "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
-             for a coding session that begins with this request:\n\n{prompt}"
+            "Write a title for a coding session that begins with the request below.\n\n\
+             Rules:\n\
+             - Reply with ONLY the title: no quotes, no trailing punctuation, no preamble.\n\
+             - Between 3 and 5 words.\n\
+             - Write it in the SAME LANGUAGE the request is written in.\n\
+             - Capitalize it the way titles are capitalized in that language: \
+             English uses Title Case; most other languages capitalize only the \
+             first word and proper nouns.\n\n\
+             Request:\n{prompt}"
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
             let request = RunRequest {

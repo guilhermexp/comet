@@ -12,7 +12,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -341,6 +341,7 @@ fn noop_nudge() -> zeron_rpc::NudgeHandler {
 struct RecoveringToken {
     value: Mutex<Option<String>>,
     changes: tokio::sync::watch::Sender<u64>,
+    subscribed: AtomicBool,
 }
 
 impl RecoveringToken {
@@ -349,6 +350,7 @@ impl RecoveringToken {
         Self {
             value: Mutex::new(value.map(str::to_string)),
             changes,
+            subscribed: AtomicBool::new(false),
         }
     }
 
@@ -363,6 +365,10 @@ impl RecoveringToken {
         self.changes
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
+
+    fn is_subscribed(&self) -> bool {
+        self.subscribed.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait]
@@ -372,6 +378,7 @@ impl TokenSource for RecoveringToken {
     }
 
     fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.subscribed.store(true, Ordering::Release);
         Some(self.changes.subscribe())
     }
 }
@@ -446,6 +453,10 @@ async fn sign_out_closes_cached_peer_links() {
 
     let token = Arc::new(RecoveringToken::new(Some("test-user")));
     let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+    assert!(
+        token.is_subscribed(),
+        "the revocation watcher must subscribe before LinkCache::new returns"
+    );
     let client = links.client("dev-a").await.expect("client dials");
     client
         .call("Echo", serde_json::json!({ "before": "sign-out" }))
