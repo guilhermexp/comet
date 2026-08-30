@@ -68,7 +68,37 @@ impl DetailsSidebarState {
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .filter(|p| !p.starts_with(':'))
             .collect()
+    }
+
+    pub fn projects_worked_collapsed(&self) -> bool {
+        let Some(context) = &self.context else {
+            return false;
+        };
+        self.preferences
+            .expanded
+            .get(&context.key)
+            .map(|paths| paths.iter().any(|p| p == ":projects_worked:collapsed"))
+            .unwrap_or(false)
+    }
+
+    pub fn toggle_projects_worked_collapsed(&mut self) {
+        let Some(context) = &self.context else {
+            return;
+        };
+        let paths = self
+            .preferences
+            .expanded
+            .entry(context.key.clone())
+            .or_default();
+        const KEY: &str = ":projects_worked:collapsed";
+        if let Some(index) = paths.iter().position(|path| path == KEY) {
+            paths.remove(index);
+        } else {
+            paths.push(KEY.to_string());
+            paths.sort();
+        }
     }
 
     pub fn toggle_expanded(&mut self, relative_path: &str) {
@@ -198,6 +228,10 @@ fn context_file_access(
 
 fn details_sidebar_background(_theme: &Theme) -> Option<gpui::Hsla> {
     None
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 #[derive(Debug, Clone)]
@@ -1557,7 +1591,7 @@ impl DetailsSidebar {
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
             .to_string();
-        let workspace_body = div()
+        let mut workspace_body = div()
             .child(property_row(
                 icons::GIT_BRANCH,
                 "Branch",
@@ -1565,6 +1599,125 @@ impl DetailsSidebar {
                 theme,
             ))
             .child(property_row(icons::FOLDER, "Path", folder, theme));
+
+        if context.mode == super::context::DetailsMode::Orchestrator {
+            let home = dirs_home();
+            let worked = super::worked_projects::worked_projects(
+                &self.app_state.read(cx).transcript,
+                self.workers_model.read(cx).projects(),
+                &context.cwd,
+                home.as_deref(),
+            );
+            if !worked.is_empty() {
+                let collapsed = self.sidebar.projects_worked_collapsed();
+                let count = worked.len();
+                let header = div()
+                    .id("projects-worked-header")
+                    .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .cursor_pointer()
+                    .rounded_md()
+                    .hover(|style| style.bg(crate::theme::ink(0.045)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar.toggle_projects_worked_collapsed();
+                        this.emit_preferences(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        icons::icon(icons::FOLDER)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child("Projects worked"),
+                    )
+                    .child(
+                        div()
+                            .ml_auto()
+                            .mr(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(count.to_string()),
+                    )
+                    .child(
+                        icons::icon(if collapsed {
+                            icons::ALT_ARROW_RIGHT
+                        } else {
+                            icons::ALT_ARROW_DOWN
+                        })
+                        .size(px(12.0))
+                        .text_color(theme.text_muted),
+                    );
+
+                let mut worked_section = div()
+                    .mt(px(4.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.55))
+                    .child(header);
+
+                if !collapsed {
+                    let rows =
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .children(worked.into_iter().map(|project| {
+                                let path = project.path.clone();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "worked-project-{}",
+                                        project.id
+                                    )))
+                                    .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
+                                    .px(px(10.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .hover(|style| style.bg(crate::theme::ink(0.045)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.workers_model.update(cx, |model, cx| {
+                                            model.reveal_project(path.clone(), cx);
+                                        });
+                                    }))
+                                    .child(
+                                        icons::icon(icons::FOLDER)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(12.0))
+                                            .text_color(theme.text)
+                                            .child(project.name),
+                                    )
+                            }));
+
+                    worked_section = worked_section.child(
+                        div()
+                            .id("projects-worked-body")
+                            .max_h(px(
+                                super::worked_projects::worked_projects_viewport_height_px(),
+                            ))
+                            .overflow_y_scroll()
+                            .child(rows),
+                    );
+                }
+
+                workspace_body = workspace_body.child(worked_section);
+            }
+        }
         let mut content = div()
             .w_full()
             .flex()
@@ -2286,6 +2439,38 @@ mod tests {
         assert_eq!(preferences.active_tab, DetailsTab::Files);
         assert_eq!(preferences.expanded.get("one").unwrap(), &["src"]);
         assert_eq!(preferences.hidden, HashMap::from([("one".into(), true)]));
+    }
+
+    #[test]
+    fn projects_worked_collapse_toggle_and_round_trip() {
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        state.set_context(Some(context("one")));
+
+        // Default is expanded (not collapsed)
+        assert!(!state.projects_worked_collapsed());
+
+        // Toggle to collapsed
+        state.toggle_projects_worked_collapsed();
+        assert!(state.projects_worked_collapsed());
+
+        // Expanded paths for file tree must NOT contain the collapse key
+        assert!(
+            !state
+                .expanded_paths()
+                .contains(":projects_worked:collapsed")
+        );
+
+        // Switch context: other context defaults to expanded
+        state.set_context(Some(context("two")));
+        assert!(!state.projects_worked_collapsed());
+
+        // Switch back to "one": remains collapsed
+        state.set_context(Some(context("one")));
+        assert!(state.projects_worked_collapsed());
+
+        // Toggle back to expanded
+        state.toggle_projects_worked_collapsed();
+        assert!(!state.projects_worked_collapsed());
     }
 
     #[test]

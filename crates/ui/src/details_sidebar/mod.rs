@@ -8,3 +8,4 @@ pub mod todos;
 pub mod usage;
 pub mod view;
 mod widgets;
+pub mod worked_projects;

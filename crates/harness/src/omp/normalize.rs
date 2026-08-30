@@ -721,6 +721,13 @@ fn normalize_tool(name: &str, input: &Value) -> ToolCall {
             old_string: optional_string(input, "oldText"),
             new_string: optional_string(input, "newText"),
         },
+        "grep" => ToolCall::Search {
+            pattern: string_value(input, "pattern"),
+            path: optional_string(input, "path"),
+        },
+        "glob" => ToolCall::Glob {
+            pattern: string_value(input, "path"),
+        },
         "workers" => ToolCall::Mcp {
             server: "comet-workers".into(),
             tool: "workers".into(),
@@ -1626,5 +1633,52 @@ mod tests {
             ] if items.iter().map(|item| item.text.as_str()).collect::<Vec<_>>()
                 == ["Inspect state", "Run gates"]
         ));
+    }
+
+    #[test]
+    fn omp_normalizes_grep_and_glob_tools() {
+        let grep_call = normalize_tool(
+            "grep",
+            &json!({
+                "pattern": "fn main",
+                "path": "src/main.rs"
+            }),
+        );
+        assert_eq!(
+            grep_call,
+            ToolCall::Search {
+                pattern: "fn main".to_string(),
+                path: Some("src/main.rs".to_string()),
+            }
+        );
+
+        let grep_without_path = normalize_tool(
+            "grep",
+            &json!({
+                "pattern": "TODO"
+            }),
+        );
+        assert_eq!(
+            grep_without_path,
+            ToolCall::Search {
+                pattern: "TODO".to_string(),
+                path: None,
+            }
+        );
+
+        // E3: In OMP protocol, glob pattern arrives in the "path" field.
+        let glob_call = normalize_tool(
+            "glob",
+            &json!({
+                "path": "src/**/*.rs",
+                "pattern": "ignored_pattern"
+            }),
+        );
+        assert_eq!(
+            glob_call,
+            ToolCall::Glob {
+                pattern: "src/**/*.rs".to_string(),
+            }
+        );
     }
 }
