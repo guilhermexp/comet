@@ -6,10 +6,10 @@
 
 ## 2. Registry, Sync, and Wire Safety
 
-- [ ] 2.1 Port registry cursor contiguity tests from `1fc68435`, observe RED, implement the compatible doc/sync behavior, and run focused doc/sync tests.
-- [ ] 2.2 Port server-truth orphan sweep and unreadable-ack retry tests from `28eb39b6`, observe RED, implement engine/sync behavior, and run focused integration tests.
-- [ ] 2.3 Port forward-compatible unknown-harness Chat row tests from `5306be20`, observe RED, implement lenient optional config decoding, and run doc/proto/engine tests.
-- [ ] 2.4 Port bounded diff reconciliation tests from `74f4abef` and `2119bf0c`, observe RED where absent, implement the compatible engine behavior, and run diff-sync tests.
+- [x] 2.1 Port registry cursor contiguity tests from `1fc68435`, observe RED, implement the compatible doc/sync behavior, and run focused doc/sync tests.
+- [x] 2.2 Port server-truth orphan sweep and unreadable-ack retry tests from `28eb39b6`, observe RED, implement engine/sync behavior, and run focused integration tests.
+- [x] 2.3 Port forward-compatible unknown-harness Chat row tests from `5306be20`, observe RED, implement lenient optional config decoding, and run doc/proto/engine tests.
+- [x] 2.4 Port bounded diff reconciliation tests from `74f4abef` and `2119bf0c`, observe RED where absent, implement the compatible engine behavior, and run diff-sync tests.
 
 ## 3. OpenCode and Subagent Runtime
 
