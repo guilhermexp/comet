@@ -1181,9 +1181,11 @@ impl Shell {
         let mut slot = 0usize;
         for (group, rows) in groups {
             let collapsed = group.as_ref().is_some_and(|(key, _)| {
-                self.sidebar_collapsed_groups.contains(
-                    &sidebar_group_collapse_key(self.settings.sidebar_organization, key),
-                )
+                self.sidebar_collapsed_groups
+                    .contains(&sidebar_group_collapse_key(
+                        self.settings.sidebar_organization,
+                        key,
+                    ))
             });
             let mut rendered_rows = Vec::with_capacity(rows.len());
             for row in rows {

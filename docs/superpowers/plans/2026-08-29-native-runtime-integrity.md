@@ -97,4 +97,3 @@ The implementation may derive the path from `serde_path_to_error` only if that d
 - [ ] Run `cargo test` and `cargo build -p zeron`.
 - [ ] Run the bounded headed smoke and assert logs contain neither target error nor transcript payload sentinels.
 - [ ] Validate the OpenSpec strictly and mark evidenced tasks complete.
-

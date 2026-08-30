@@ -797,14 +797,9 @@ mod tests {
   "description": "Within each group, models share a weekly limit and a 5-hour limit."
 }"#;
 
-    async fn antigravity_auth_server() -> (
-        String,
-        Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+    async fn antigravity_auth_server()
+    -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
@@ -1158,9 +1153,6 @@ mod tests {
         assert!(recovered.warning.is_none());
         assert_eq!(recovered.usage_windows.len(), 4);
         server.await.unwrap();
-        assert_eq!(
-            *requests.lock().unwrap(),
-            ["/usage", "/token", "/usage"]
-        );
+        assert_eq!(*requests.lock().unwrap(), ["/usage", "/token", "/usage"]);
     }
 }

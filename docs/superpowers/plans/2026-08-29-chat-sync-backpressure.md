@@ -83,4 +83,3 @@ required-features = ["mock-server"]
 - [ ] Run `cargo test -p zeron-sync --features mock-server`.
 - [ ] Run `cargo test` and `cargo build -p zeron`.
 - [ ] Re-run `openspec validate harden-chat-sync-backpressure --strict` and mark only evidenced tasks complete.
-
