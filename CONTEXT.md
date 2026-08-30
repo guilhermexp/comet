@@ -44,6 +44,10 @@ _Avoid_: output, result, file change
 O par pasta+ref a que um Chat está fixado — `cwd` e `branch` na row do Chat. Decide onde um run escreve e é o que o card Workspace do Details sidebar mostra. Pertence ao Chat, que é durável; nunca à Session, que é o estado de execução daquele Chat num device.
 _Avoid_: workspace, session branch, worktree (quando se quer dizer o par)
 
+**Chat Source Context**:
+O snapshot imutável de repo root, cwd, branch, checkout e HEAD observado imediatamente antes do run de um Chat. Identifica a origem daquela conversa mesmo se outra Chat mudar o checkout compartilhado depois; não é o estado Git vivo.
+_Avoid_: current branch, live checkout, Session context
+
 **Ref**:
 Um branch local ou remote-tracking que o repo do Space oferece como destino de um Chat Checkout. Nunca significa commit solto, tag ou detached HEAD.
 _Avoid_: branch (quando se quer dizer a lista de opções), revision, commit

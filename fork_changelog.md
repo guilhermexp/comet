@@ -8,6 +8,14 @@ Tracks local/private fork changes against upstream.
 - HEAD before sync: `6519eb68cab2298eda734ede2e72a9e019ca9421`
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
+
+## 2026-08-30 — upstream `v0.2.29` reconciled
+
+- Retained branch/worktree: `chore/upstream-sync-v0.2.29` in `comet-upstream-v0.2.29`.
+- Integrated ancestry through `upstream/main@b3fa5187` (`v0.2.29` at `2ebe6ed0`) and reconciled behavior that the local-priority merge could not select automatically.
+- Ported registry/sync repair, native OpenCode, transcript/reasoning/copy/viewport behavior, themes and configurable typography, scalable model picker, conversation-aware sidebar/shortcuts, indexed file mentions, full-width completion popups, split/sticky Changes, pane geometry, splash and new-Chat layout.
+- Preserved fork-only Workers/Details/right-pane ownership, Chat Transcript Export, provider usage, native inspector/media, project ledger, updater presentation and release/deploy identity.
+- Deliberately did not bump the workspace from `0.2.18`, publish, deploy, push, create a tag, or install the upstream TestFlight workflow.
 ## 2026-08-30T03:32:58Z
 
 - Branch: chore/upstream-sync-v0.2.29

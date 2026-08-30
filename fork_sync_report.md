@@ -1,5 +1,14 @@
 # Fork Sync Report
 
+## Final Reconciliation
+
+- Target ancestry: `upstream/main@b3fa5187`; release marker reviewed: `v0.2.29@2ebe6ed0`.
+- Publication boundary: workspace version remains `0.2.18`; no TestFlight workflow, tag, push, deploy, or release action was retained.
+- Merge-overlay gaps were ported as focused commits: sync/registry safety, native OpenCode and subagents, transcript/Changes behavior, themes/typography, model/completion pickers, sidebar views/shortcuts, indexed file search, panel/new-Chat/splash polish.
+- Fork ownership retained for Workers, Details/Files, the single right-pane registry, provider usage, exports, Projects, media/inspector and fork release identity.
+- Post-port audit corrected the last semantic drift: jump/cycle shortcuts now consume the sidebar's configured visible order rather than raw recency.
+- The generated counts below describe the initial mechanical merge at `25180e1a`; they predate the focused reconciliation commits and final verification.
+
 ## Execution
 - Timestamp (UTC): 2026-08-30T03:32:58Z
 - Repository: /Users/guilhermevarela/Documents/Projetos/SelfHosting/comet-upstream-v0.2.29

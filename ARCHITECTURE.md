@@ -27,11 +27,11 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
   whether the engine is in-process or a separate daemon. Organized around **spaces** —
   (device, folder) pairs, local or synced according to the active profile. The sidebar is the
-  session navigator: an attention-sorted list filtered by a searchable spaces dropdown (with
-  "All spaces") that also hosts space management; the titlebar names the selected session.
-  The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last
-  selected space), and sessions are minted onto the picked space's device through relay-capable
-  RPCs.
+  Chat navigator: a searchable project filter plus configurable one-list/device grouping and
+  updated/created sorting; numeric jump and cycle shortcuts consume the exact painted order. The
+  titlebar names the selected Chat. In a new-Chat draft, device/project selectors sit above the
+  composer and checkout/model/ref controls remain below it; the Chat is minted on first send onto
+  the selected project's device through relay-capable RPCs.
 - **Edge (TypeScript, ported from zeron `apps/edge`)**: Worker + ChatRoom DO (per chat, the
   chat2 row protocol; the legacy SessionRoom DO remains deployed only for pre-cutover clients —
   no current client dials it) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
@@ -194,7 +194,9 @@ feature spec `docs/research/feature-inventory.md` §1.
   Enter/Shift+Enter, Send→Steer→Stop morph, drafts + attachments per chat, drag-drop/paste
   images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
-  toggle) as gpui popovers with `menu-in` scale/fade.
+  toggle) as gpui popovers with `menu-in` scale/fade. `@` file completion uses the engine's
+  checkout index; `@` and `/` menus span the pill, scroll internally, and keep keyboard selection
+  visible. Double-click selects the complete field value.
 - **Right-side surfaces**: one tab host owns Terminal, Git diff, and file-preview
   surfaces while a separate `Details / Files` column owns workspace metadata and
   the checkout tree. Both columns are available in Orchestrator and Workers;
@@ -206,8 +208,9 @@ feature spec `docs/research/feature-inventory.md` §1.
   engine side; custom gpui grid element; 12ms input coalescing / 80ms resize debounce, 1MB
   replay, detach ≠ close. Panel chrome (the shared full-height utility column, its Terminal +
   Changes tab strip, drag-reorder) is specced in `docs/research/feature-inventory.md` §1.10.
-- **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
-  (180ms height tween), time-sliced highlight, 200ms width transition on the pane itself.
+- **Diff pane**: unified-patch parser → unified or side-by-side virtualized file/hunk/line rows,
+  paired no-newline markers, sticky active-file headers, per-file collapse (180ms height tween),
+  time-sliced highlight, and an independently resizable/takeover-capable pane.
 - **Animation kit** (`zeron-ui::motion`): small helpers over gpui `Animation` reproducing the
   zeron catalog — `fade-in` (0.5s, cubic-bezier(0.16,1,0.3,1), translateY 4→0), `splash-out`,
   `zeron-pulse` staggered cell wave (boot splash + loaders), `gradient-spin-pulse` matrix
@@ -215,8 +218,9 @@ feature spec `docs/research/feature-inventory.md` §1.
   ease-out width/height transitions for sidebar/panes, sidebar-resort **slide animation**
   (we own the list, so animate row positions directly — the View Transitions equivalent, 260ms
   cubic-bezier(0.22,1,0.36,1)), reduced-motion switch.
-- **Theme**: always-dark monochrome, oklch-derived neutral scale precomputed to Hsla, hairline
-  borders, Geist/Geist Mono bundled fonts.
+- **Theme**: light/dark built-ins plus validated VS Code imports, coherent accent palettes and an
+  independent opaque/frosted preference. Interface family/size are device-local and configurable;
+  code surfaces stay monospaced. Official Geist/Geist Mono release assets remain bundled.
 
 ## 5. Engine plan
 
