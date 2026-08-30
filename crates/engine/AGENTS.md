@@ -1,4 +1,4 @@
-# comet-engine — o backend
+# zeron-engine — o backend
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 
@@ -8,7 +8,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Ownership
 
-É o backend inteiro. `comet headless` é esta crate e mais nada. Se um comportamento precisa sobreviver ao fechamento da UI, ele mora aqui — não em `comet-ui`.
+É o backend inteiro. `zeron headless` é esta crate e mais nada. Se um comportamento precisa sobreviver ao fechamento da UI, ele mora aqui — não em `zeron-ui`.
 
 ## Local Contracts
 
@@ -44,19 +44,19 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 ## Work Guidance
 
 - Recovery e restart são contrato testado (`restart_resume.rs`): mudança em journal ou watchdog reprova ali antes de reprovar em produção.
-- Feature nova de backend normalmente é: RPC em `comet-rpc` + handler aqui + comando no ledger de `comet-doc`. Os três no mesmo commit.
+- Feature nova de backend normalmente é: RPC em `zeron-rpc` + handler aqui + comando no ledger de `zeron-doc`. Os três no mesmo commit.
 
 ## Verification
 
-- Comandos: `cargo test -p comet-engine` · `scripts/e2e-smoke.sh`
+- Comandos: `cargo test -p zeron-engine` · `scripts/e2e-smoke.sh`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/**` (sessões, doc host, repos, terminais) | unit | `cargo test -p comet-engine` |
+| `src/**` (sessões, doc host, repos, terminais) | unit | `cargo test -p zeron-engine` |
 | `src/antigravity_usage.rs` (parser de quota, seleção de credenciais, refresh) | unit | `cargo test -p zeron-engine antigravity` |
 | `src/change_requests.rs` (cache, backoff e classificação de provider) | unit | `cargo test -p zeron-engine change_requests` |
-| `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p comet-engine` |
-| `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p comet-engine` |
+| `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p zeron-engine` |
+| `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p zeron-engine` |
 | `tests/queued_attachments.rs` | integration — bytes + path local no prompt do run | `cargo test -p zeron-engine --test queued_attachments` |
 | Superfície multi-device real | e2e manual | `scripts/e2e-smoke.sh` |
 

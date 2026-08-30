@@ -1,4 +1,4 @@
-# comet-doc — schemas Loro e mirror layer
+# zeron-doc — schemas Loro e mirror layer
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 
@@ -25,7 +25,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Work Guidance
 
-- Bug de "a UI não atualizou" quase sempre é diff não aplicado no mirror, não render — comece por aqui antes de `comet-ui`.
+- Bug de "a UI não atualizou" quase sempre é diff não aplicado no mirror, não render — comece por aqui antes de `zeron-ui`.
 - Mudou schema? Confira o materializador gêmeo em `edge/src/session-doc/` no mesmo commit.
 
 ## Verification

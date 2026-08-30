@@ -1,4 +1,4 @@
-# comet-rpc — a fronteira tipada
+# zeron-rpc — a fronteira tipada
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 
@@ -21,17 +21,17 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Work Guidance
 
-- RPC novo = tipo em `comet-proto` + método aqui + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.
+- RPC novo = tipo em `zeron-proto` + método aqui + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.
 
 ## Verification
 
-- Comandos: `cargo test -p comet-rpc`
+- Comandos: `cargo test -p zeron-rpc`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/**` (envelopes, transporte) | unit | `cargo test -p comet-rpc` |
+| `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
-| `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p comet-rpc` |
+| `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
 | `tests/device_room.rs` (revogação de credencial) | integration | `cargo test -p zeron-rpc --test device_room sign_out_closes_cached_peer_links -- --exact` |
 
 ## Child DOX Index

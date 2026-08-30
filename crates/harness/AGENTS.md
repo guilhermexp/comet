@@ -1,4 +1,4 @@
-# comet-harness — adaptadores de coding agent
+# zeron-harness — adaptadores de coding agent
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 

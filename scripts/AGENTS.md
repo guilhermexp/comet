@@ -16,9 +16,9 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 - `dev-demo.sh` deve continuar compatível com o Bash 3.2 do macOS; não usar arrays associativos (`declare -A`).
 - Captura de UI (rota/dialog/picker/gate/upload fabricado) exige `ZERON_UI_CAPTURE=1` junto da knob: `ZERON_UI_CAPTURE=1 ZERON_OPEN_ROUTE=settings/agents cargo run`. Sem o umbrella a knob é ignorada de propósito — ela ficava exportada no shell e sequestrava todo run seguinte.
 - `e2e-smoke.sh` é o smoke multi-device; roda contra engine real.
-- Os scripts de packaging **consomem `dist/` da raiz**: `package-macos.sh` lê `dist/macos/Info.plist` e gera o iconset de `dist/comet.png`; `package-linux.sh` instala `dist/comet.desktop` e `dist/comet.png`. Apagar essa pasta quebra release sem quebrar build.
+- Os scripts de packaging **consomem `dist/` da raiz**: `package-macos.sh` lê `dist/macos/Info.plist` e gera o iconset de `dist/macos/icon-1024.png`; `package-linux.sh` instala `dist/zeron.desktop` e `dist/zeron.png`. Apagar essa pasta quebra release sem quebrar build.
 - macOS packaging depende de `sips` — só roda num Mac.
-- O workflow `release.yml` (tag `v*`) espera artefato nomeado `comet-<versão>-*` dentro de `dist/`. Renomear artefato quebra o gate de nome no CI.
+- O workflow `release.yml` (tag `v*`) espera artefato nomeado `zeron-<versão>-*` dentro de `dist/`. Renomear artefato quebra o gate de nome no CI.
 
 ## Work Guidance
 

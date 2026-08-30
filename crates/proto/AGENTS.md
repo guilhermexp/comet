@@ -1,4 +1,4 @@
-# comet-proto — tipos de fio e derivações compartilhadas
+# zeron-proto — tipos de fio e derivações compartilhadas
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 
@@ -20,16 +20,16 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Work Guidance
 
-- Lógica de apresentação que a UI e a engine derivam do mesmo estado pertence a `view`, não a `comet-ui` — duplicar ali é como o comportamento diverge entre headed e headless.
+- Lógica de apresentação que a UI e a engine derivam do mesmo estado pertence a `view`, não a `zeron-ui` — duplicar ali é como o comportamento diverge entre headed e headless.
 
 ## Verification
 
-- Comandos: `cargo test -p comet-proto`
+- Comandos: `cargo test -p zeron-proto`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/view` (derivações puras) | unit | `cargo test -p comet-proto` |
-| `src/**` (tipos serde) | unit — roundtrip de serialização quando o shape tem regra | `cargo test -p comet-proto` |
+| `src/view` (derivações puras) | unit | `cargo test -p zeron-proto` |
+| `src/**` (tipos serde) | unit — roundtrip de serialização quando o shape tem regra | `cargo test -p zeron-proto` |
 
 ## Child DOX Index
 

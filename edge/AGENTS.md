@@ -31,7 +31,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/*.test.ts` (device frame, liveness) | unit — vitest | `npm -C edge run test` |
-| `src/{session-room,device-room}.ts` (DOs) | integration — convergência pelo lado Rust | `cargo test -p comet-sync` |
+| `src/{session-room,device-room}.ts` (DOs) | integration — convergência pelo lado Rust | `cargo test -p zeron-sync` |
 | `src/{auth,auth-routes,workos}.ts` | integration | `npm -C edge run test` + `npm -C edge run smoke` |
 | Tipos (todo o `src/**`) | typecheck obrigatório | `npm -C edge run typecheck` |
 
