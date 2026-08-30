@@ -1085,11 +1085,7 @@ impl Shell {
             }
         }
         promote_local_device_group(&mut groups, state.local_device_id.as_deref());
-        groups
-            .into_iter()
-            .flat_map(|(_, rows)| rows)
-            .map(|chat| chat.id)
-            .collect()
+        visible_device_chat_ids(groups, &self.sidebar_collapsed_groups)
     }
 
     /// The sidebar's Sessions list: every session (idle included) of the
@@ -1184,6 +1180,11 @@ impl Shell {
         let mut rendered = Vec::new();
         let mut slot = 0usize;
         for (group, rows) in groups {
+            let collapsed = group.as_ref().is_some_and(|(key, _)| {
+                self.sidebar_collapsed_groups.contains(
+                    &sidebar_group_collapse_key(self.settings.sidebar_organization, key),
+                )
+            });
             let mut rendered_rows = Vec::with_capacity(rows.len());
             for row in rows {
                 let ActiveChatRow {
@@ -1204,7 +1205,7 @@ impl Shell {
                     .flatten();
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
-                let jump_label: Option<SharedString> = if jump_hints {
+                let jump_label: Option<SharedString> = if jump_hints && !collapsed {
                     let combo = keymap.get(ShortcutId::JumpSession(slot));
                     (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
                 } else {
@@ -1230,20 +1231,17 @@ impl Shell {
                     cx,
                 );
                 rendered_rows.push((format!("c:{}", chat.id), height, element));
-                slot += 1;
+                if !collapsed {
+                    slot += 1;
+                }
             }
 
             let Some((key, label)) = group else {
                 rendered.extend(rendered_rows);
                 continue;
             };
-            let organization = match self.settings.sidebar_organization {
-                SidebarOrganization::ByDevice => "device",
-                SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
-            };
-            let collapse_key = format!("{organization}:{key}");
+            let collapse_key = sidebar_group_collapse_key(self.settings.sidebar_organization, &key);
             let motion_key = format!("group:{collapse_key}");
-            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
             let row_count = rendered_rows.len();
             let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
                 + rendered_rows
@@ -3121,11 +3119,38 @@ impl Shell {
     }
 }
 
+fn sidebar_group_collapse_key(organization: SidebarOrganization, key: &str) -> String {
+    let organization = match organization {
+        SidebarOrganization::ByDevice => "device",
+        SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
+    };
+    format!("{organization}:{key}")
+}
+
+fn visible_device_chat_ids(
+    groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)>,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    groups
+        .into_iter()
+        .filter(|(group, _)| {
+            group.as_ref().is_none_or(|(key, _)| {
+                !collapsed.contains(&sidebar_group_collapse_key(
+                    SidebarOrganization::ByDevice,
+                    key,
+                ))
+            })
+        })
+        .flat_map(|(_, rows)| rows)
+        .map(|chat| chat.id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::{compare_sidebar_chats, promote_local_device_group, visible_device_chat_ids};
     use crate::settings::SidebarSort;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
@@ -3187,5 +3212,22 @@ mod tests {
         promote_local_device_group(&mut groups, Some("not-present"));
 
         assert_eq!(groups, before);
+    }
+
+    #[test]
+    fn review_regression_collapsed_device_chats_are_not_navigation_targets() {
+        let groups = vec![
+            (Some(("local".into(), "Local".into())), vec![chat("local")]),
+            (
+                Some(("remote".into(), "Remote".into())),
+                vec![chat("remote-a"), chat("remote-b")],
+            ),
+        ];
+        let collapsed = std::collections::HashSet::from(["device:local".to_string()]);
+
+        assert_eq!(
+            visible_device_chat_ids(groups, &collapsed),
+            ["remote-a", "remote-b"]
+        );
     }
 }

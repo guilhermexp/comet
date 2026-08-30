@@ -128,10 +128,29 @@ pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSetti
     true
 }
 
-/// Replace the central value from a view that owns a working copy, such as the
-/// shell's pane geometry state.
+/// Replace the central value when a caller owns a complete current snapshot.
 pub fn replace(settings: UiSettings, policy: SavePolicy, cx: &mut App) -> bool {
     update(policy, cx, |current| *current = settings)
+}
+
+pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings) {
+    current.sidebar_width = shell.sidebar_width;
+    current.sidebar_collapsed = shell.sidebar_collapsed;
+    current.sidebar_organization = shell.sidebar_organization;
+    current.sidebar_sort = shell.sidebar_sort;
+    current.sidebar_show_harness = shell.sidebar_show_harness;
+    current.sidebar_show_branch = shell.sidebar_show_branch;
+    current.sidebar_show_pull_request = shell.sidebar_show_pull_request;
+    current.last_space_id = shell.last_space_id.clone();
+    current.space_filter = shell.space_filter.clone();
+    current.sound_enabled = shell.sound_enabled;
+    current.notifications_enabled = shell.notifications_enabled;
+    current.notifications_background_only = shell.notifications_background_only;
+    current.right_pane_width = shell.right_pane_width;
+    current.details_sidebar_width = shell.details_sidebar_width;
+    current.details_sidebar_open = shell.details_sidebar_open;
+    current.details_sidebar_preferences = shell.details_sidebar_preferences.clone();
+    current.keymap = shell.keymap.clone();
 }
 
 fn schedule(policy: SavePolicy, cx: &mut App) {
@@ -867,6 +886,40 @@ mod tests {
             reloaded.ui_font_family,
             crate::typography::UiFontFamily::Installed("Inter".into())
         );
+    }
+
+    #[test]
+    fn review_regression_shell_save_preserves_global_appearance_choices() {
+        let mut current = UiSettings {
+            theme_selection: zeron_theme::ThemeSelection {
+                light: "current-light".into(),
+                dark: "current-dark".into(),
+            },
+            accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
+            surface: zeron_theme::SurfacePreference::Frosted,
+            ..UiSettings::default()
+        };
+        let shell = UiSettings {
+            sidebar_width: 320.0,
+            theme_selection: zeron_theme::ThemeSelection {
+                light: "stale-light".into(),
+                dark: "stale-dark".into(),
+            },
+            accent: zeron_theme::AccentSelection::ThemeDefault,
+            surface: zeron_theme::SurfacePreference::ThemeDefault,
+            ..UiSettings::default()
+        };
+
+        apply_shell_settings(&mut current, &shell);
+
+        assert_eq!(current.sidebar_width, 320.0);
+        assert_eq!(current.theme_selection.light, "current-light");
+        assert_eq!(current.theme_selection.dark, "current-dark");
+        assert_eq!(
+            current.accent,
+            zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan)
+        );
+        assert_eq!(current.surface, zeron_theme::SurfacePreference::Frosted);
     }
 
     #[test]

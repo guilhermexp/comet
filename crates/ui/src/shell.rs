@@ -3184,11 +3184,9 @@ impl Shell {
     /// Publish this view's working copy to the central settings store. The
     /// store owns the single debounce task and the only production writer.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        // Global-only controls can change while this shell copy is alive.
-        self.settings.appearance = crate::appearance::mode(cx);
-        self.settings.ui_font_family = crate::typography::requested(cx);
-        self.settings.ui_font_size = crate::typography::font_size(cx);
-        settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
+        settings::update(SavePolicy::Debounced, cx, |current| {
+            settings::apply_shell_settings(current, &self.settings);
+        });
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {

@@ -295,11 +295,23 @@ impl AntigravityUsage {
             }
             Err(error) => {
                 if matches!(error, AntigravityUsageError::UsageUnauthorized) {
-                    *lock(&self.active_credential) = None;
+                    self.expire_rejected_access_token(&cred);
                 }
                 AntigravityUsageSnapshot::unavailable(true, error, cred.email.clone())
             }
         }
+    }
+
+    fn expire_rejected_access_token(&self, rejected: &AntigravityCredential) {
+        let mut active = lock(&self.active_credential);
+        if let Some(current) = active.as_mut()
+            && current.fingerprint() == rejected.fingerprint()
+        {
+            current.access_token.clear();
+            current.expires_at = 0;
+        }
+        drop(active);
+        *lock(&self.usage_cache) = None;
     }
 
     async fn ensure_credential(&self) -> Option<AntigravityCredential> {
@@ -324,8 +336,7 @@ impl AntigravityUsage {
             *lock(&self.active_credential) = selected.clone();
             *lock(&self.usage_cache) = None;
         } else if active_missing {
-            // A prior 401/403 cleared the in-memory token. Re-read the same
-            // source on the next snapshot so a recovered provider can retry.
+            // Re-read an unchanged source after its in-memory copy was dropped.
             *lock(&self.active_credential) = selected;
         }
         lock(&self.active_credential).clone()
@@ -756,8 +767,11 @@ mod keychain {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
 
@@ -782,6 +796,62 @@ mod tests {
   ],
   "description": "Within each group, models share a weekly limit and a 5-hour limit."
 }"#;
+
+    async fn antigravity_auth_server() -> (
+        String,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 2048];
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_string();
+                let refreshed = request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("authorization: Bearer refreshed"));
+                seen.lock().unwrap().push(path.clone());
+                let (status, body) = match path.as_str() {
+                    "/token" => (
+                        "200 OK",
+                        r#"{"access_token":"refreshed","expires_in":3600}"#,
+                    ),
+                    "/usage" if refreshed => ("200 OK", REAL_FIXTURE),
+                    "/usage" => ("401 Unauthorized", r#"{"error":"expired"}"#),
+                    _ => ("404 Not Found", r#"{"error":"not_found"}"#),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), requests, task)
+    }
 
     #[test]
     fn parses_real_production_payload() {
@@ -1056,5 +1126,41 @@ mod tests {
         let missing = usage.snapshot(false, 0).await;
         assert!(!missing.present);
         assert!(missing.usage_windows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_regression_usage_unauthorized_forces_access_token_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("antigravity-user@example.com.json"),
+            json!({
+                "access_token": "rejected",
+                "refresh_token": "refresh-token",
+                "expired": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base, requests, server) = antigravity_auth_server().await;
+        let usage = AntigravityUsage::new(
+            dir.path().to_path_buf(),
+            format!("{base}/usage"),
+            format!("{base}/token"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let rejected = usage.snapshot(true, 1_000).await;
+        assert!(rejected.warning.is_some());
+        let recovered = usage.snapshot(true, 1_000).await;
+
+        assert!(recovered.warning.is_none());
+        assert_eq!(recovered.usage_windows.len(), 4);
+        server.await.unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            ["/usage", "/token", "/usage"]
+        );
     }
 }
