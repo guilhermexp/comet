@@ -3668,12 +3668,7 @@ impl Shell {
     /// A jump shortcut: open the sidebar row at `slot`. A slot past the end of
     /// a short list does nothing.
     fn jump_to_session(&mut self, slot: usize, cx: &mut Context<Self>) {
-        let filter = self.settings.space_filter.clone();
-        let Some(chat_id) = self
-            .state
-            .read(cx)
-            .jump_target(Utc::now(), filter.as_deref(), slot)
-        else {
+        let Some(chat_id) = self.sidebar_visible_order(cx).into_iter().nth(slot) else {
             return;
         };
         // Same path a click on that row takes.

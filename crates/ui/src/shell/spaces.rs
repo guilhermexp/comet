@@ -1059,6 +1059,39 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Flat top-to-bottom Chat ids exactly as [`Self::render_active_rows`]
+    /// draws them: configured sort, device grouping, and local-device
+    /// promotion included. Jump shortcuts and cycling consume this order so
+    /// keyboard navigation cannot drift from the visible sidebar.
+    pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
+        let filter = self.settings.space_filter.clone();
+        let state = self.state.read(cx);
+        let mut chats: Vec<zeron_proto::Chat> = state
+            .sidebar_chats(Utc::now(), filter.as_deref())
+            .into_iter()
+            .map(|(_, chat)| chat.clone())
+            .collect();
+        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
+            return chats.into_iter().map(|chat| chat.id).collect();
+        }
+        let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
+        for chat in chats {
+            let key = Some((chat.device_id.clone(), String::new()));
+            if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
+                existing.push(chat);
+            } else {
+                groups.push((key, vec![chat]));
+            }
+        }
+        promote_local_device_group(&mut groups, state.local_device_id.as_deref());
+        groups
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .map(|chat| chat.id)
+            .collect()
+    }
+
     /// The sidebar's Sessions list: every session (idle included) of the
     /// filter space — or all spaces under "All" — attention-sorted. Rows are
     /// keyed for the FLIP resort glide.

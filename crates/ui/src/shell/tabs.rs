@@ -51,21 +51,12 @@ impl Shell {
     /// underneath the add-space palette, stranding the overlay over a session
     /// they never picked.
     pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !matches!(self.route, Route::Chat) || self.add_space.is_some() {
+        if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
-        let filter = self.settings.space_filter.clone();
-        let (order, selected) = {
-            let state = self.state.read(cx);
-            // The same list `render_active_rows` draws and the jump shortcuts
-            // count — one function, so neither can drift from the screen.
-            let order = state
-                .sidebar_chats(Utc::now(), filter.as_deref())
-                .into_iter()
-                .map(|(_, chat)| chat.id.clone())
-                .collect::<Vec<_>>();
-            (order, state.selected_chat.clone())
-        };
+        // The same list `render_active_rows` draws and jump shortcuts count.
+        let order = self.sidebar_visible_order(cx);
+        let selected = self.state.read(cx).selected_chat.clone();
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
             self.open_chat(target, cx);
         }
@@ -428,28 +419,6 @@ mod cycle_tests {
 
     fn order(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| id.to_string()).collect()
-    }
-
-    fn chat(id: &str, space_id: Option<&str>) -> zeron_proto::Chat {
-        zeron_proto::Chat {
-            id: id.into(),
-            device_id: "dev".into(),
-            title: None,
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            space_id: space_id.map(Into::into),
-            last_seen_at: None,
-            room_gen: None,
-        }
     }
 
     #[test]
