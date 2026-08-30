@@ -187,7 +187,7 @@ fn consider_path(
     let trimmed = raw_path.trim();
     let cleaned = if strip_trailing_punct {
         trimmed
-            .trim_end_matches(|c| matches!(c, ')' | '.' | ',' | ';' | ':'))
+            .trim_end_matches([')', '.', ',', ';', ':'])
             .trim_end_matches('/')
     } else {
         trimmed.trim_end_matches('/')

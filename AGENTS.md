@@ -8,12 +8,12 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Stack
 
-- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,mcp,update,ui}` + `apps/comet`.
+- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,mcp,update,ui}` + `apps/zeron` (membro padrão do workspace).
 - **UI = gpui**, pinado num fork do Zed (`wingleeio/zed`, rev fixado em `Cargo.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
 - **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres, sem Hono server, sem WebRTC.
 - **apps/ios** — cliente iOS (projeto Xcode), fora do workspace Cargo.
-- Binário único `comet`: headed (gpui) ou `comet headless` (só engine).
+- Binário único `zeron`: headed (gpui) ou `zeron headless` (só engine).
 
 ## Comandos
 
@@ -83,7 +83,7 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 | Domínio | Doc | O que mora ali |
 |---|---|---|
 | Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 9 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, MCP, updater, UI/composer, export de Chat Transcript e decoração markdown |
-| Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/comet` (CLI headed/headless) e `apps/ios` |
+| Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/zeron` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |
 | Código externo | [`third_party/AGENTS.md`](third_party/AGENTS.md) | Unpeel vendorizado, patches Rust licenciados, proveniência e referências locais |

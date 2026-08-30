@@ -31,11 +31,11 @@ O registro local e cru do que um agente emitiu durante um run, incluindo as entr
 _Avoid_: log, transcript, history
 
 **Chat Transcript Export**:
-Uma cópia do Chat Transcript num formato levável para fora do comet. Nunca carrega nada que o Chat Transcript já não mostre.
+Uma cópia do Chat Transcript num formato levável para fora do comet. Do transcript nunca carrega nada que o Chat Transcript já não mostre; a única fonte adicional é o índice de CLI Workers do Chat, que entra como Artifact.
 _Avoid_: chat dump, backup, download, export de sessão
 
 **Artifact**:
-Algo substantivo que um Chat produziu — um arquivo escrito, um subagente executado, um output pesado o bastante para não caber inline. É o que um Chat Transcript Export lista no topo para o registro ficar navegável.
+Algo substantivo que um Chat produziu — um arquivo escrito, um subagente executado, um CLI Worker despachado, um output pesado o bastante para não caber inline. É o que um Chat Transcript Export lista no topo para o registro ficar navegável.
 _Avoid_: output, result, file change
 
 ## Checkout
