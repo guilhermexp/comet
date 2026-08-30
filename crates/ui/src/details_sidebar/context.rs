@@ -158,6 +158,7 @@ mod tests {
             cwd: Some("/tmp/project/worktree".into()),
             branch: Some("feature/details".into()),
             checkout_id: Some("checkout-1".into()),
+            source_context: None,
             config: None,
             last_message_preview: None,
             last_message_at: None,

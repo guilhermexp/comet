@@ -5553,9 +5553,10 @@ impl Shell {
                         && !queued
                         && !undelivered
                     {
-                        loaders::mini_gradient_spinner(
+                        loaders::mini_glyph_spinner(
                             format!("chat-working-{id}"),
                             2.0,
+                            theme.glyph,
                             cx.entity_id(),
                             cx,
                         )
