@@ -1109,14 +1109,14 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
     let transport_timeout_seconds = zeron_harness::omp::workers_bridge::TOOL_CALL_TIMEOUT.as_secs();
 
     // The transport timeout must strictly exceed the maximum tool blocking duration,
-    // with at least a 30s margin for IPC round-trip and process scheduling.
+    // with at least a 60s margin for IPC round-trip and process scheduling.
     assert!(
         transport_timeout_seconds > max_timeout_seconds,
         "transport timeout ({transport_timeout_seconds}s) must strictly exceed maximum tool blocking duration ({max_timeout_seconds}s)"
     );
     let margin = transport_timeout_seconds - max_timeout_seconds;
     assert!(
-        margin >= 30,
-        "transport timeout ({transport_timeout_seconds}s) must have at least 30s margin over tool blocking ceiling ({max_timeout_seconds}s), got {margin}s"
+        margin >= 60,
+        "transport timeout ({transport_timeout_seconds}s) must have at least 60s margin over tool blocking ceiling ({max_timeout_seconds}s), got {margin}s"
     );
 }

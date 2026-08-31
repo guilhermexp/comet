@@ -14,6 +14,13 @@ use crate::{
 };
 
 pub const CONTROLLER_MCP_ARG: &str = "__workers_mcp__";
+pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 600;
+
+pub fn clamp_wait_for_status_timeout(timeout_seconds: Option<u64>) -> u64 {
+    timeout_seconds
+        .unwrap_or(30)
+        .clamp(1, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS)
+}
 const CONTROLLER_ENV: &str = "COMET_WORKERS_CONTROLLER";
 const PARENT_CHAT_ENV: &str = "COMET_WORKERS_PARENT_CHAT_ID";
 
@@ -376,7 +383,7 @@ fn dispatch_action(
             "actions": ACTIONS,
             "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker",
             "keys": ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "ctrl-c", "text:<literal>"],
-            "limits": { "wait_seconds": 120, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
+            "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
         })),
         "list_projects" => {
             let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
@@ -949,11 +956,8 @@ fn validate_launch_target(
 fn wait_for_status(client: &LocalWorkersClient, arguments: &Value) -> Result<Value, String> {
     let session_id = required_string(arguments, "session_id")?;
     let wanted = required_string(arguments, "status")?.to_ascii_lowercase();
-    let timeout = arguments
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(30)
-        .clamp(1, 120);
+    let timeout =
+        clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
@@ -1071,7 +1075,7 @@ fn tool_definition() -> Value {
                 "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },
                 "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },
                 "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
-                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120, "description": "wait_for_status: bounded wait in seconds. A blocking wait replaces manual polling." },
+                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: bounded wait in seconds where expiration returns timed_out: true with a worker snapshot as a normal read, not a failure. Long waits do not replace a durable completion check." },
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing submitted once the worker is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },

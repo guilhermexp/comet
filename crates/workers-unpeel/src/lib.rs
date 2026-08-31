@@ -11,7 +11,9 @@ mod session_event_journal;
 pub mod workspace_trust;
 pub mod worktree_config;
 
-pub use controller_mcp::CONTROLLER_MCP_ARG;
+pub use controller_mcp::{
+    CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
+};
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;
 pub use parent_notifications::{

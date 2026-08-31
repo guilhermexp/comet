@@ -615,3 +615,89 @@ fn worker_with_state(state: &str) -> WorkersSession {
         capabilities: WorkersSessionCapabilities::default(),
     }
 }
+
+#[test]
+fn workers_wait_for_status_ceiling_is_unified_at_600s_and_documented() {
+    assert_eq!(
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
+        600,
+        "the public constant for maximum wait duration must be 600s"
+    );
+
+    let tools = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    }))
+    .expect("tools/list responds");
+
+    let tool = &tools["result"]["tools"][0];
+    let timeout_prop = &tool["inputSchema"]["properties"]["timeout_seconds"];
+
+    let max_timeout = timeout_prop["maximum"].as_u64().expect("maximum is u64");
+    assert_eq!(
+        max_timeout,
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
+        "the tools/list schema must derive its maximum blocking wait ceiling from WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS"
+    );
+
+    let help_response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": { "action": "help" }
+        }
+    }))
+    .expect("help action responds");
+    let help_wait_limit = help_response["result"]["structuredContent"]["limits"]["wait_seconds"]
+        .as_u64()
+        .expect("wait_seconds in help limits");
+    assert_eq!(
+        help_wait_limit,
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
+        "help limits must derive wait_seconds from WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS"
+    );
+
+    assert_eq!(
+        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(1000)),
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
+        "clamp must bound upper timeouts to WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS"
+    );
+    assert_eq!(
+        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(0)),
+        1,
+        "clamp must bound lower timeouts to 1"
+    );
+    assert_eq!(
+        zeron_workers_unpeel::clamp_wait_for_status_timeout(None),
+        30,
+        "default timeout when unspecified must be 30s"
+    );
+    assert_eq!(
+        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(300)),
+        300,
+        "valid timeouts within bounds must be preserved"
+    );
+
+    let desc = timeout_prop["description"].as_str().expect("description");
+    assert!(
+        desc.contains("timed_out: true"),
+        "timeout_seconds description must explicitly name timed_out: true: {desc}"
+    );
+    assert!(
+        desc.contains("snapshot"),
+        "timeout_seconds description must explain worker snapshot: {desc}"
+    );
+    assert!(
+        !desc.contains("replaces manual polling"),
+        "timeout_seconds description must not claim it replaces manual polling: {desc}"
+    );
+    let sentence_count = desc.split('.').filter(|s| !s.trim().is_empty()).count();
+    assert!(
+        sentence_count <= 2,
+        "timeout_seconds description must be concise and at most 2 sentences, got {sentence_count}: {desc}"
+    );
+}
