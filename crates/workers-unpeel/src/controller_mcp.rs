@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub const CONTROLLER_MCP_ARG: &str = "__workers_mcp__";
-pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 600;
+pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 120;
 
 pub fn clamp_wait_for_status_timeout(timeout_seconds: Option<u64>) -> u64 {
     timeout_seconds

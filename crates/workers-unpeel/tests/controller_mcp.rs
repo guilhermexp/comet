@@ -617,11 +617,19 @@ fn worker_with_state(state: &str) -> WorkersSession {
 }
 
 #[test]
-fn workers_wait_for_status_ceiling_is_unified_at_600s_and_documented() {
+fn workers_wait_for_status_ceiling_preserves_serial_controller_availability() {
+    assert!(
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS <= 120,
+        "wait_for_status must remain at most 120s while run_stdio dispatches serially: its blocking wait prevents stop_worker and archive_worker on the same control channel"
+    );
+}
+
+#[test]
+fn workers_wait_for_status_ceiling_is_unified_at_120s_and_documented() {
     assert_eq!(
         zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
-        600,
-        "the public constant for maximum wait duration must be 600s"
+        120,
+        "the public constant for maximum wait duration must be 120s"
     );
 
     let tools = controller_mcp_handle_request(json!({
@@ -677,8 +685,8 @@ fn workers_wait_for_status_ceiling_is_unified_at_600s_and_documented() {
         "default timeout when unspecified must be 30s"
     );
     assert_eq!(
-        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(300)),
-        300,
+        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(60)),
+        60,
         "valid timeouts within bounds must be preserved"
     );
 

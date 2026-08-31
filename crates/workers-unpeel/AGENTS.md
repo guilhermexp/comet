@@ -156,7 +156,11 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   (`task` stays inside the caller's session, read-only).
   `tests/controller_mcp.rs` locks both: every action in the enum appears in
   some description, and no field is left without one.
-- **O teto de bloqueio de `wait_for_status` é único e público (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 600s).** O schema do MCP (`maximum`), o help (`limits.wait_seconds`) e o `.clamp` de runtime derivam da mesma constante para evitar divergência silenciosa. A expiração de espera devolve `timed_out: true` com snapshot do worker e é leitura útil normal, nunca falha — e não substitui verificação durável de conclusão.
+- **O teto de bloqueio de `wait_for_status` é único e público (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 120s).** O schema do MCP (`maximum`), o help (`limits.wait_seconds`) e o `.clamp` de runtime derivam da mesma constante para evitar divergência silenciosa. A expiração de espera devolve `timed_out: true` com snapshot do worker e é leitura útil normal, nunca falha — e não substitui verificação durável de conclusão.
+- **Controller MCP dispatches serially.** `run_stdio` handles each request inline, so a blocking
+  `wait_for_status` stalls every action on the channel, including `stop_worker` and `archive_worker`;
+  `notifications/cancelled` is discarded. Raise the wait ceiling only after making the loop
+  concurrent and the wait interruptible.
 - **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
   `project_id` and `validate_launch_target` rejects any id absent from the live
   project list, so the surface must also be able to *add* a project

@@ -31,7 +31,7 @@ pub struct WorkersBridge {
 
 const MAX_PENDING_CALLS: usize = 64;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-// 300s margin over the 600s tool blocking ceiling covers JSON-RPC IPC round-trip, serialization, and host scheduling latency.
+// 900s deliberately keeps transport from timing out a healthy wait; its 780s slack exceeds the 60s IPC and scheduling margin floor.
 pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 impl WorkersBridge {
