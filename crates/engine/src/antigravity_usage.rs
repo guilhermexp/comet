@@ -29,12 +29,15 @@ pub(crate) enum AntigravityUsageError {
     UnreadableDirectory,
     #[error("Antigravity token refresh request failed")]
     RefreshRequest,
+    #[allow(dead_code)]
     #[error("Antigravity OAuth client is not configured")]
     RefreshConfiguration,
     #[error("Antigravity token refresh returned an invalid payload")]
     RefreshPayload,
     #[error("Antigravity token refresh failed: {0}")]
     RefreshUnauthorized(String),
+    #[error("Antigravity credentials expired and cannot be renewed")]
+    CredentialsExpired,
     #[error("Antigravity Usage authentication failed")]
     UsageUnauthorized,
     #[error("Antigravity managed Usage is unavailable")]
@@ -83,6 +86,10 @@ impl AntigravityCredential {
         self.expires_at <= now.saturating_add(MIN_REFRESH_THRESHOLD_SECS)
     }
 
+    pub(crate) fn is_usable(&self, now: i64, can_refresh: bool) -> bool {
+        // A credential that already needs refresh and has no way to refresh is not usable.
+        !self.needs_refresh(now) || (can_refresh && !self.refresh_token.is_empty())
+    }
     fn fingerprint(&self) -> CredentialFingerprint {
         let mut digest = Sha256::new();
         digest.update(self.access_token.as_bytes());
@@ -241,7 +248,7 @@ impl AntigravityUsage {
     }
 
     pub(crate) async fn snapshot(&self, force: bool, now: i64) -> AntigravityUsageSnapshot {
-        let credential = self.ensure_credential().await;
+        let credential = self.ensure_credential(now).await;
         let Some(mut cred) = credential else {
             return AntigravityUsageSnapshot::missing();
         };
@@ -276,7 +283,7 @@ impl AntigravityUsage {
                 let Some(oauth_client) = self.oauth_client.as_ref() else {
                     return AntigravityUsageSnapshot::unavailable(
                         true,
-                        AntigravityUsageError::RefreshConfiguration,
+                        AntigravityUsageError::CredentialsExpired,
                         current.email.clone(),
                     );
                 };
@@ -357,7 +364,7 @@ impl AntigravityUsage {
         *lock(&self.usage_cache) = None;
     }
 
-    async fn ensure_credential(&self) -> Option<AntigravityCredential> {
+    async fn ensure_credential(&self, now: i64) -> Option<AntigravityCredential> {
         let dir_creds = read_directory_credentials(&self.credential_dir).unwrap_or_default();
         #[cfg(target_os = "macos")]
         let keychain_cred = if self.include_keychain {
@@ -370,7 +377,8 @@ impl AntigravityUsage {
         #[cfg(not(target_os = "macos"))]
         let keychain_cred = None;
 
-        let selected = select_best_credential(&dir_creds, keychain_cred.as_ref());
+        let can_refresh = self.oauth_client.is_some();
+        let selected = select_best_credential(&dir_creds, keychain_cred.as_ref(), now, can_refresh);
         let selected_fingerprint = selected.as_ref().map(AntigravityCredential::fingerprint);
         let source_changed = *lock(&self.source_fingerprint) != selected_fingerprint;
         let active_missing = lock(&self.active_credential).is_none();
@@ -502,17 +510,37 @@ pub(crate) fn read_directory_credentials(
 /// Precedence is by STORE, never by expiry: the Keychain item is the Antigravity
 /// client's own live login, while `~/.cli-proxy-api/antigravity-*.json` is a
 /// third-party proxy's copy — and the two are routinely DIFFERENT Google
-/// accounts with unrelated quota. Ranking by "latest expiry" made the row flip
-/// between subscriptions depending on which process had refreshed last, so the
-/// number changed identity without anything on screen saying so. Reading the
-/// product's own store is the same discipline the Claude and Codex probes follow.
+/// accounts with unrelated quota. Reading the product's own store is the same
+/// discipline the Claude and Codex probes follow.
+///
+/// Keychain wins only while its credential is usable; otherwise, the best usable
+/// directory credential by `expires_at` is selected. When no credential is usable,
+/// falls back to the latest directory credential or Keychain so caller can report
+/// an honest diagnostic on the expired store.
 pub(crate) fn select_best_credential(
     dir_creds: &[AntigravityCredential],
     keychain_cred: Option<&AntigravityCredential>,
+    now: i64,
+    can_refresh: bool,
 ) -> Option<AntigravityCredential> {
-    keychain_cred
+    if let Some(keychain) = keychain_cred.filter(|c| c.is_usable(now, can_refresh)) {
+        return Some(keychain.clone());
+    }
+
+    dir_creds
+        .iter()
+        .filter(|c| c.is_usable(now, can_refresh))
+        .max_by_key(|c| c.expires_at)
         .cloned()
-        .or_else(|| dir_creds.iter().max_by_key(|c| c.expires_at).cloned())
+        .or_else(|| {
+            // When no credential is usable, fallback to the latest directory credential
+            // or the Keychain credential so the caller can inspect the expired store.
+            dir_creds
+                .iter()
+                .max_by_key(|c| c.expires_at)
+                .cloned()
+                .or_else(|| keychain_cred.cloned())
+        })
 }
 
 /// Renews the access token in memory. Google does NOT return a new refresh
@@ -1091,8 +1119,10 @@ mod tests {
 
         let creds = read_directory_credentials(dir.path()).unwrap();
         assert_eq!(creds.len(), 2);
-
-        let best = select_best_credential(&creds, None).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-29T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let best = select_best_credential(&creds, None, now, false).unwrap();
         assert_eq!(best.refresh_token, "rt-new");
 
         // The Keychain item is the Antigravity client's own login, so it wins
@@ -1107,12 +1137,65 @@ mod tests {
                 .timestamp(),
             email: None,
         };
-        let best_with_keychain = select_best_credential(&creds, Some(&keychain_cred)).unwrap();
+        let best_with_keychain =
+            select_best_credential(&creds, Some(&keychain_cred), now, false).unwrap();
         assert_eq!(best_with_keychain.refresh_token, "rt-keychain");
 
         // File store names the account; the Keychain blob does not.
         assert_eq!(best.email.as_deref(), Some("new@gmail.com"));
         assert_eq!(best_with_keychain.email, None);
+    }
+
+    #[test]
+    fn stale_keychain_yields_to_valid_file_credential() {
+        let now = DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let stale_keychain = AntigravityCredential {
+            access_token: "token-stale-keychain".into(),
+            refresh_token: "rt-stale-keychain".into(),
+            expires_at: now - 3600, // Expired 1 hour ago
+            email: None,
+        };
+        let valid_file_cred = AntigravityCredential {
+            access_token: "token-valid-file".into(),
+            refresh_token: "rt-valid-file".into(),
+            expires_at: now + 3600, // Valid for 1 hour
+            email: Some("proxy-user@example.com".into()),
+        };
+        let dir_creds = vec![valid_file_cred];
+
+        // When Keychain is stale and cannot be refreshed, the valid file credential must be selected.
+        let selected =
+            select_best_credential(&dir_creds, Some(&stale_keychain), now, false).unwrap();
+        assert_eq!(selected.refresh_token, "rt-valid-file");
+        assert_eq!(selected.email.as_deref(), Some("proxy-user@example.com"));
+    }
+
+    #[test]
+    fn valid_keychain_wins_over_newer_valid_file_credential() {
+        let now = DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let valid_keychain = AntigravityCredential {
+            access_token: "token-keychain".into(),
+            refresh_token: "rt-keychain".into(),
+            expires_at: now + 1800, // Valid for 30m
+            email: None,
+        };
+        let newer_file_cred = AntigravityCredential {
+            access_token: "token-newer-file".into(),
+            refresh_token: "rt-newer-file".into(),
+            expires_at: now + 7200, // Valid for 2h
+            email: Some("proxy-user@example.com".into()),
+        };
+        let dir_creds = vec![newer_file_cred];
+
+        // As long as Keychain is usable, it wins over a file credential with later expiry.
+        let selected =
+            select_best_credential(&dir_creds, Some(&valid_keychain), now, false).unwrap();
+        assert_eq!(selected.refresh_token, "rt-keychain");
+        assert_eq!(selected.email, None);
     }
 
     #[tokio::test]
@@ -1214,7 +1297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_token_without_oauth_client_reports_redacted_configuration_warning() {
+    async fn expired_token_without_oauth_client_reports_redacted_expired_warning() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("antigravity-user@example.com.json"),
@@ -1241,7 +1324,10 @@ mod tests {
 
         assert!(snapshot.present);
         let warning = snapshot.warning.unwrap();
-        assert_eq!(warning, "Antigravity OAuth client is not configured");
+        assert_eq!(
+            warning,
+            "Antigravity credentials expired and cannot be renewed"
+        );
         assert!(!warning.contains("expired-access"));
         assert!(!warning.contains("private-refresh"));
         eprintln!(
