@@ -335,6 +335,9 @@ CFBundleVersion is one monotonic space across channels — check the ledger in
 - Generated runtime catalog and provider-neutral adapter dispatch:
   - `crates/unpeel-core/src/runtime_catalog.rs`
   - `crates/unpeel-core/src/integrations/mod.rs`
+- Provider-neutral per-Session telemetry marker and Host projection:
+  - `crates/unpeel-core/src/session_telemetry.rs`
+  - `crates/unpeel-core/src/controller_host.rs`
 - Shared hook installation primitives and reporters:
   - `crates/unpeel-core/src/hook_assets/`
 - Unpeel Sessions MCP:
@@ -619,6 +622,12 @@ Core behavior:
 - Hook scripts broadcast each event to every port in `~/.unpeel/app-ports`, because multiple Unpeel instances can run at once.
 - The hook server answers `404` for session ids it has no manifest for, so foreign instances do not swallow events.
 - The app maps each accepted event into busy/idle/attention state.
+- Runtime hooks may attach provider conversation id/path as metadata distinct
+  from the URL-addressed Worker Session. The OMP adapter alone interprets its
+  provider-owned JSONL; core canonicalizes the claimed path beneath the
+  trusted OMP Session root and atomically stores only total/per-model tokens.
+  Refresh failure preserves the last valid projection and never blocks the
+  lifecycle event.
 
 Common env used by hooks:
 
@@ -760,6 +769,12 @@ fixtures belong together under `runtimes/<slug>/`. The build discovers and
 validates descriptors, generates the Rust registry, and generates client-safe
 presentation/setup metadata. Keep only provider-neutral enforcement in core
 and clients.
+
+Provider telemetry follows the same boundary: runtime adapters own schema
+normalization and fixtures; core owns trusted-path validation, bounded reads,
+atomic projection persistence and optional Host fields. Do not infer model or
+tokens from terminal output, launch configuration, cost fields, or global
+provider settings.
 
 ## If You Change Launching or Hooks
 

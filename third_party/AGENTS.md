@@ -64,6 +64,11 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   setup idempotente de workspace trust em `~/.gemini/antigravity-cli/settings.json`,
   resume adapter e ícone autoral. Validação usa `bun run validate:runtimes`
   em `third_party/unpeel`.
+- Telemetria provider-owned permanece no pacote do runtime: o adapter OMP lê
+  somente JSONL canônico sob a raiz confiável de Sessions, e `unpeel-core`
+  valida/persiste apenas a projeção provider-neutral. O Host publica campos
+  opcionais; transcript bruto, custo e conteúdo de mensagem nunca atravessam
+  a fronteira vendorizada.
 
 ## Verification
 
@@ -71,7 +76,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `third_party/unpeel` | none — upstream vendorizado; contrato do adaptador é downstream | `cargo test -p zeron-workers-unpeel` |
+| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `bun run --cwd "$PWD/third_party/unpeel" validate:runtimes` · `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 

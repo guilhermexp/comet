@@ -581,6 +581,8 @@ mod tests {
             state: "working".to_owned(),
             activity: "building".to_owned(),
             updated_at_unix_ms: 1000,
+            total_tokens: None,
+            model_usage: Vec::new(),
         }
     }
 

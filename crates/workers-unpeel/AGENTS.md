@@ -15,9 +15,9 @@ internal host modes (`__session_host__` et al.).
 
 | Path | Owns |
 |---|---|
-| `lib.rs` | All typed `Workers*` models, `LocalWorkersClient`, `WorkersRuntime`, `runtime_catalog_snapshot` (o catálogo pinado, público para a UI provar seus espelhos de ícone/tint contra a fonte em vez de copiá-la à mão), session-host mode detection/dispatch (`is_session_host_mode`, `session_host_launch_args`, `session_host_launcher_path`, `run_session_host_mode_if_requested`) |
+| `lib.rs` | All typed `Workers*` models, including optional device-local model/token telemetry on `WorkersSession`, `LocalWorkersClient`, `WorkersRuntime`, `runtime_catalog_snapshot` (o catálogo pinado, público para a UI provar seus espelhos de ícone/tint contra a fonte em vez de copiá-la à mão), session-host mode detection/dispatch (`is_session_host_mode`, `session_host_launch_args`, `session_host_launcher_path`, `run_session_host_mode_if_requested`) |
 | `controller_mcp.rs` | Comet-owned MCP surface for the primary Orchestrator (`CONTROLLER_MCP_ARG`) — intentionally separate from Unpeel's worker-to-worker MCP host |
-| `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend |
+| `activity_bridge.rs` | Frontend bridge for Unpeel's hook-owned session lifecycle — `#[path]`-includes the state machine directly from `third_party/unpeel/crates/unpeel-tui/src/activity.rs` so Start/Stop/PermissionRequest, durable seeds, runtime generations and output fallbacks cannot drift from the pinned TUI frontend; persists provider Session metadata and refreshes provider telemetry fail-soft without replacing the URL Worker identity |
 | `session_event_journal.rs` | Session output/event journaling |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
@@ -113,6 +113,11 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
+- **Model/token telemetry is optional and device-local.** Host wire fields
+  `totalTokens` and `modelUsage` decode to `Option<u64>` and a default-empty
+  typed list. Missing fields are compatibility, not zero usage; this frontier
+  does not sync them through Chat/edge state or reinterpret them as Managed
+  Provider Usage.
 - **O andaime do prompt de notificação não pode ser indentado.** Markdown conta
   espaço: cerca de código aceita no máximo 3 de indentação, e com 4+ ela deixa de
   ser cerca — as crases viram texto literal, a cauda vaza como prosa e a
@@ -233,9 +238,9 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (17), `src/activity_bridge.rs` (10), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (24) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
-| `tests/parent_notifications.rs` (15) | integration | `--test parent_notifications` |
+| `src/lib.rs` (19), `src/activity_bridge.rs` (13 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `tests/controller_mcp.rs` (26) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (3), `tests/local_bootstrap.rs` (2) — client actions over a local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

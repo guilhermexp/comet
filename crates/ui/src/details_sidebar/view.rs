@@ -235,8 +235,8 @@ use crate::{
     details_sidebar::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
-            activity_tasks_from_entries, compact_activity_label, project_chat_workers,
-            snapshot_is_active,
+            activity_tasks_from_entries, compact_activity_label, format_token_total,
+            project_chat_workers, snapshot_is_active, worker_compact_metadata,
         },
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, is_denied_relative, scan_checkout},
@@ -250,7 +250,8 @@ use crate::{
         },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
-            chat_workers_viewport_height_px, property_row, widget_card, workers_tab_presence,
+            chat_workers_viewport_height_px, property_row, widget_card, worker_expansion_key,
+            workers_tab_presence,
         },
     },
     icons,
@@ -1440,7 +1441,7 @@ impl DetailsSidebar {
     }
 
     fn render_worker_row(
-        &self,
+        &mut self,
         worker: ChatWorkerRow,
         chat_id: String,
         theme: &Theme,
@@ -1450,29 +1451,39 @@ impl DetailsSidebar {
         let session_id = worker.session_id.clone();
         let status = self.render_worker_status(&worker, theme, cx);
         let runtime_icon = runtime_icon_path(worker.provider_id.as_deref(), Some(&worker.command));
-        div()
-            .id(SharedString::from(format!(
-                "chat-worker-{}",
-                worker.session_id
-            )))
+        let expansion_key = worker_expansion_key(&worker.session_id);
+        let collapsible = worker.total_tokens.is_some() && !worker.model_usage.is_empty();
+        let expanded = collapsible
+            && self
+                .chat_workers
+                .activity_expanded_with_default(&expansion_key, false);
+        let compact_metadata = worker_compact_metadata(&worker);
+        let model_usage = worker.model_usage.clone();
+        let subtitle = if let Some((model, total)) = compact_metadata {
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(10.0))
+                .text_color(theme.text_muted)
+                .child(div().min_w_0().flex_1().truncate().child(model))
+                .child(div().flex_none().child(total))
+        } else {
+            div()
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted)
+                .child(worker.command.clone())
+        };
+        let open_target = div()
+            .min_w_0()
+            .flex_1()
             .min_h(px(38.0))
-            .px(px(8.0))
             .py(px(5.0))
-            .border_t_1()
-            .border_color(theme.border.opacity(0.45))
             .flex()
             .items_center()
             .gap(px(7.0))
-            .cursor_pointer()
-            .hover(|style| style.bg(crate::theme::ink(0.05)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let still_available = this
-                    .workers_model
-                    .read(cx)
-                    .sessions_for_parent_chat(&chat_id)
-                    .is_ok_and(|sessions| sessions.iter().any(|row| row.id == session_id));
-                cx.emit(worker_click_event(event.clone(), still_available));
-            }))
             .child(
                 icons::icon(runtime_icon)
                     .size(px(14.0))
@@ -1491,15 +1502,113 @@ impl DetailsSidebar {
                             .text_color(theme.text)
                             .child(worker.title),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted)
-                            .child(worker.command),
-                    ),
+                    .child(subtitle),
             )
-            .child(status)
+            .child(status);
+        div()
+            .id(SharedString::from(format!(
+                "chat-worker-{}",
+                worker.session_id
+            )))
+            .border_t_1()
+            .border_color(theme.border.opacity(0.45))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-worker-open-{}",
+                        worker.session_id
+                    )))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::ink(0.05)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let still_available = this
+                            .workers_model
+                            .read(cx)
+                            .sessions_for_parent_chat(&chat_id)
+                            .is_ok_and(|sessions| sessions.iter().any(|row| row.id == session_id));
+                        cx.emit(worker_click_event(event.clone(), still_available));
+                    }))
+                    .when(collapsible, |header| {
+                        let expansion_key = expansion_key.clone();
+                        header.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "worker-telemetry-expand-{}",
+                                    worker.session_id
+                                )))
+                                .size(px(18.0))
+                                .flex_none()
+                                .rounded(px(4.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.chat_workers
+                                        .toggle_activity_with_default(&expansion_key, false);
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icons::icon(if expanded {
+                                        icons::ALT_ARROW_DOWN
+                                    } else {
+                                        icons::ALT_ARROW_RIGHT
+                                    })
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
+                    .when(!collapsible, |header| header.child(div().w(px(18.0))))
+                    .child(open_target),
+            )
+            .when(expanded, |container| {
+                container.child(
+                    div()
+                        .pb(px(5.0))
+                        .children(model_usage.into_iter().map(|usage| {
+                            div()
+                                .ml(px(29.0))
+                                .h(px(22.0))
+                                .pl(px(9.0))
+                                .pr(px(8.0))
+                                .border_l_1()
+                                .border_color(theme.border.opacity(0.55))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().size(px(6.0)).flex_none().rounded_full().bg(
+                                    if usage.active {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted.opacity(0.65)
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text)
+                                        .child(usage.model),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted)
+                                        .child(format_token_total(usage.total_tokens)),
+                                )
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -1514,13 +1623,21 @@ impl DetailsSidebar {
         let workflows = snapshot.workflows.len();
         let subagents = snapshot.subagents.len();
         let workers = snapshot.workers.len();
-        self.chat_workers.sync_activities(
-            snapshot
-                .workflows
-                .iter()
-                .chain(snapshot.subagents.iter())
-                .map(|row| row.id.as_str()),
-        );
+        let expansion_ids = snapshot
+            .workflows
+            .iter()
+            .chain(snapshot.subagents.iter())
+            .map(|row| row.id.clone())
+            .chain(
+                snapshot
+                    .workers
+                    .iter()
+                    .filter(|worker| !worker.model_usage.is_empty())
+                    .map(|worker| worker_expansion_key(&worker.session_id)),
+            )
+            .collect::<Vec<_>>();
+        self.chat_workers
+            .sync_activities(expansion_ids.iter().map(String::as_str));
         // Raw counts, not `workers_tab_presence`: a binding failure lifting the
         // Workers tab from 0 to 1 is an error to surface, not a dispatch to
         // follow. And an errored snapshot goes in as absence, never as zero —
@@ -2708,6 +2825,8 @@ mod tests {
             state: "running".into(),
             activity: "working".into(),
             updated_at_unix_ms: 42,
+            total_tokens: None,
+            model_usage: Vec::new(),
         };
 
         let DetailsSidebarEvent::OpenSubagent {
@@ -2749,6 +2868,8 @@ mod tests {
             state: "disconnected".into(),
             activity: "disconnected".into(),
             updated_at_unix_ms: 42,
+            total_tokens: None,
+            model_usage: Vec::new(),
         };
 
         let DetailsSidebarEvent::OpenWorkerSession {

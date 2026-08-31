@@ -53,6 +53,13 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - O número no header do Usage é quota **restante** (`Weekly 72%`) e seu tom deriva da quota semanal: neutro (>50%), warning (16–50%), danger (1–15%) e neutro ao esgotar (0%). O badge de countdown (`Reset 12h 16m`) usa o mesmo tom e aparece dentro de `RESET_SOON_HOURS` (48h) ou persistentemente enquanto a quota estiver em 0% com reset futuro. O widget re-deriva os countdowns a cada 30s localmente (`USAGE_TICK`) e refaz o fetch a cada 120s (`USAGE_FETCH_INTERVAL`), preservando o snapshot anterior em falhas de rede. Os limiares de 10%/25% continuam valendo para as barras do corpo expandido.
 - Overflow do widget Details: o card Workers rola no próprio body, dimensionado em linhas inteiras (`CHAT_WORKERS_VISIBLE_ROWS` × `CHAT_WORKERS_ROW_HEIGHT` = 6 × 32px); o antigo 152px fixo cortava a quinta linha no meio do glifo. Labels de workflow, subagent e progresso precisam ser normalizados para uma linha visual antes de entrar em rows de altura fixa; label multilinha cru causa sobreposição de texto e é proibido.
 - Activities do widget Workers começam colapsadas; toggles explícitos permanecem keyed pelo id estável. Linhas de subagent preservam avatar e status lifecycle, incluindo spinner paint-only durante `Running`.
+- Telemetria de modelo/token no widget Workers usa o mesmo mapa de disclosure,
+  sob a chave estável `worker:<session-id>`. Colapsado, mostra o modelo ativo e
+  o total da Session; expandido, mantém a ordem current-first recebida e um
+  slot de tokens não encolhível. O chevron interrompe propagação e só expande;
+  o restante da row continua abrindo o terminal. Sem telemetria, o subtítulo
+  permanece o comando existente. Isso não altera Chat Transcript Export nem
+  Managed Provider Usage.
 - Linhas do To-dos usam um único slot circular não encolhível, com check/seta
   centralizados nos dois eixos e a mesma geometria `36/12/9` do card inline;
   estados não recebem offsets ópticos próprios.
@@ -114,6 +121,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/settings/projects.rs` (filtro, git remoto, editor/config e decisões de ícone) | unit; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
 | `src/details_sidebar/worked_projects.rs` (Worked Projects, Leaf Root, expansão de home, primeiro contato) | unit | `cargo test -p zeron-ui worked_projects` |
+| `src/details_sidebar/{chat_workers,widgets}.rs` (projeção, formatação e disclosure de telemetria de Worker) | unit + visual gpui | `cargo test -p zeron-ui details_sidebar` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/view.rs` (ticker de usage, retenção de snapshot, render gpui) | none — ciclo de vida de `Task`/entidade sem harness; validação é visual | `scripts/dev-demo.sh` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 | `src/inspector.rs` (render gpui, picking, toggle) | unit (actions) + visual no `scripts/dev-demo.sh` | `cargo test -p zeron-ui inspector` |

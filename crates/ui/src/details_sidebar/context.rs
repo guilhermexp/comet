@@ -207,6 +207,8 @@ mod tests {
             worktree_branch: Some("worker/fix".into()),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            total_tokens: None,
+            model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
         }
     }

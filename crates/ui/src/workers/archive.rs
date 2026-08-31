@@ -70,6 +70,8 @@ mod tests {
             worktree_branch: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms,
+            total_tokens: None,
+            model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
         }
     }

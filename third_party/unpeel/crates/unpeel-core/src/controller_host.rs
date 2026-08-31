@@ -326,12 +326,14 @@ impl DiskCatalog {
         for manifest in &manifests {
             let project_id = effective_project_id(manifest, &known_ids);
             let archived = crate::session_ops::archived_marker(&manifest.session.id).is_some();
+            let telemetry = crate::session_telemetry::load(&manifest.session.id);
             let summary = session_summary(
                 manifest,
                 &project_id,
                 pinned.contains(&manifest.session.id),
                 archived,
                 activity.get(&manifest.session.id),
+                telemetry.as_ref(),
             );
             if archived {
                 archives
@@ -689,6 +691,7 @@ fn session_summary(
     pinned: bool,
     archived: bool,
     activity: Option<&Value>,
+    telemetry: Option<&crate::session_telemetry::SessionTelemetry>,
 ) -> Value {
     let running = manifest.state == HostedSessionState::Running;
     let updated_at = crate::session_ops::latest_lifecycle_ms(
@@ -777,6 +780,10 @@ fn session_summary(
     }
     if let Some(provider) = provider_id(head) {
         value["providerID"] = provider.into();
+    }
+    if let Some(telemetry) = telemetry {
+        value["totalTokens"] = telemetry.total_tokens.into();
+        value["modelUsage"] = serde_json::to_value(&telemetry.models).unwrap_or_default();
     }
     value
 }
@@ -1189,7 +1196,7 @@ mod tests {
     #[test]
     fn session_summary_advertises_live_runtime_without_rewriting_launch_provider() {
         let manifest = manifest_with_runtime(HostedSessionState::Running, "codex");
-        let summary = session_summary(&manifest, "project-1", false, false, None);
+        let summary = session_summary(&manifest, "project-1", false, false, None, None);
         assert_eq!(summary["activeRuntimeID"], "claude");
         assert_eq!(summary["providerID"], "codex");
         assert!(summary["capabilities"].get("restartAgent").is_none());
@@ -1197,20 +1204,20 @@ mod tests {
         assert_eq!(summary["capabilities"]["restart"], false);
 
         let managed = manifest_with_runtime(HostedSessionState::Running, "claude");
-        let summary = session_summary(&managed, "project-1", false, false, None);
+        let summary = session_summary(&managed, "project-1", false, false, None, None);
         assert!(summary["capabilities"].get("restartAgent").is_none());
         assert_eq!(summary["capabilities"]["resumeAgent"], false);
         assert_eq!(summary["capabilities"]["restart"], false);
 
         let mut returned_to_shell = managed.clone();
         returned_to_shell.runtime = None;
-        let summary = session_summary(&returned_to_shell, "project-1", false, false, None);
+        let summary = session_summary(&returned_to_shell, "project-1", false, false, None, None);
         assert_eq!(summary["capabilities"]["resumeAgent"], true);
         assert_eq!(summary["runtimeLaunchPending"], false);
 
         let mut launch_pending = returned_to_shell.clone();
         launch_pending.runtime_launch_pending = true;
-        let summary = session_summary(&launch_pending, "project-1", false, false, None);
+        let summary = session_summary(&launch_pending, "project-1", false, false, None, None);
         assert_eq!(summary["runtimeLaunchPending"], true);
         assert_eq!(summary["capabilities"]["resumeAgent"], false);
 
@@ -1218,13 +1225,13 @@ mod tests {
         old_host.host_protocol_version =
             Some(session_host::SESSION_HOST_RESTART_AGENT_PROTOCOL_VERSION);
         old_host.runtime = None;
-        let summary = session_summary(&old_host, "project-1", false, false, None);
+        let summary = session_summary(&old_host, "project-1", false, false, None, None);
         assert!(summary["capabilities"].get("restartAgent").is_none());
         assert_eq!(summary["capabilities"]["resumeAgent"], false);
         assert_eq!(summary["capabilities"]["restart"], false);
 
         let blank = manifest_with_runtime(HostedSessionState::Running, "");
-        let summary = session_summary(&blank, "project-1", false, false, None);
+        let summary = session_summary(&blank, "project-1", false, false, None, None);
         assert_eq!(summary["activeRuntimeID"], "claude");
         assert!(summary.get("providerID").is_none());
         assert!(summary["capabilities"].get("restartAgent").is_none());
@@ -1235,11 +1242,33 @@ mod tests {
     #[test]
     fn session_summary_does_not_advertise_an_exited_runtime_observation() {
         let manifest = manifest_with_runtime(HostedSessionState::Exited, "");
-        let summary = session_summary(&manifest, "project-1", false, false, None);
+        let summary = session_summary(&manifest, "project-1", false, false, None, None);
         assert!(summary.get("activeRuntimeID").is_none());
         assert!(summary["capabilities"].get("restartAgent").is_none());
         assert_eq!(summary["capabilities"]["resumeAgent"], false);
         assert_eq!(summary["capabilities"]["restart"], true);
+    }
+
+    #[test]
+    fn session_summary_includes_durable_model_usage() {
+        let manifest = manifest_with_runtime(HostedSessionState::Running, "omp");
+        let telemetry = crate::session_telemetry::SessionTelemetry {
+            total_tokens: 258_700,
+            models: vec![crate::session_telemetry::ModelTokenUsage {
+                model: "openai-codex/gpt-5.6-sol:high".into(),
+                total_tokens: 42_100,
+                active: true,
+            }],
+        };
+
+        let summary = session_summary(&manifest, "project-1", false, false, None, Some(&telemetry));
+
+        assert_eq!(summary["totalTokens"], 258_700);
+        assert_eq!(
+            summary["modelUsage"][0]["model"],
+            "openai-codex/gpt-5.6-sol:high"
+        );
+        assert_eq!(summary["modelUsage"][0]["active"], true);
     }
 
     #[test]

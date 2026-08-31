@@ -105,6 +105,8 @@ mod tests {
             worktree_branch: None,
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
+            total_tokens: None,
+            model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities {
                 restart: true,
                 resume_agent: true,
