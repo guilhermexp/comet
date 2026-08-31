@@ -65,10 +65,12 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   resume adapter e ícone autoral. Validação usa `bun run validate:runtimes`
   em `third_party/unpeel`.
 - Telemetria provider-owned permanece no pacote do runtime: o adapter OMP lê
-  somente JSONL canônico sob a raiz confiável de Sessions, e `unpeel-core`
-  valida/persiste apenas a projeção provider-neutral. O Host publica campos
-  opcionais; transcript bruto, custo e conteúdo de mensagem nunca atravessam
-  a fronteira vendorizada.
+  somente JSONL canônico sob a raiz confiável de Sessions, exige que o registro
+  `session` declare o provider Session ID persistido e limita a leitura a 2 MiB
+  por linha, 16 MiB totais, 100.000 registros e 128 modelos. `unpeel-core`
+  persiste apenas a projeção provider-neutral vinculada a esse ID e não publica
+  marker de binding anterior. O Host publica campos opcionais; transcript bruto,
+  custo e conteúdo de mensagem nunca atravessam a fronteira vendorizada.
 
 ## Verification
 

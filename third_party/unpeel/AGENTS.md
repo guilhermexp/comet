@@ -624,10 +624,12 @@ Core behavior:
 - The app maps each accepted event into busy/idle/attention state.
 - Runtime hooks may attach provider conversation id/path as metadata distinct
   from the URL-addressed Worker Session. The OMP adapter alone interprets its
-  provider-owned JSONL; core canonicalizes the claimed path beneath the
-  trusted OMP Session root and atomically stores only total/per-model tokens.
-  Refresh failure preserves the last valid projection and never blocks the
-  lifecycle event.
+  provider-owned JSONL; it requires the JSONL `session` id to match that binding
+  and rejects input above 2 MiB per line, 16 MiB total, 100,000 records, or 128
+  effective models. Core canonicalizes the claimed path beneath the trusted OMP
+  Session root and atomically stores only provider-bound total/per-model tokens.
+  Refresh failure preserves the last valid projection only for the same provider
+  binding and never blocks the lifecycle event.
 
 Common env used by hooks:
 
@@ -772,9 +774,9 @@ and clients.
 
 Provider telemetry follows the same boundary: runtime adapters own schema
 normalization and fixtures; core owns trusted-path validation, bounded reads,
-atomic projection persistence and optional Host fields. Do not infer model or
-tokens from terminal output, launch configuration, cost fields, or global
-provider settings.
+atomic provider-binding-aware projection persistence and optional Host fields.
+Do not infer model or tokens from terminal output, launch configuration, cost
+fields, or global provider settings.
 
 ## If You Change Launching or Hooks
 

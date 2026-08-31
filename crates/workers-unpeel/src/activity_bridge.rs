@@ -726,7 +726,7 @@ mod tests {
         let transcript = omp_root.join("provider.jsonl");
         std::fs::write(
             &transcript,
-            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"p\",\"model\":\"m\",\"usage\":{\"totalTokens\":10}}}\n",
+            "{\"type\":\"session\",\"id\":\"omp-provider-1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"p\",\"model\":\"m\",\"usage\":{\"totalTokens\":10}}}\n",
         )
         .expect("write OMP transcript");
         let manifest = omp_manifest("worker-1");

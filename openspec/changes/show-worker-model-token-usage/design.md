@@ -59,8 +59,12 @@ misattributed.
 
 Provider-specific JSONL interpretation lives with the OMP runtime package.
 Provider-neutral core owns canonical trusted-root validation, symlink-escape
-rejection, bounded reads, atomic marker replacement, and runtime dispatch. A
-failed refresh preserves the last valid marker.
+rejection, bounded reads, atomic marker replacement, and runtime dispatch. The
+OMP parser accepts at most 2 MiB per line, 16 MiB total, 100,000 records, and
+128 effective models, and requires the JSONL Session id to equal the persisted
+provider binding. The marker carries that binding; a failed refresh preserves
+the last valid marker only while the binding remains unchanged, and loads hide
+markers from any previous binding.
 
 Alternative considered: parse OMP JSONL directly in Comet's UI/frontier.
 Rejected because it leaks provider behavior across the vendored boundary and
@@ -98,7 +102,8 @@ terminal access.
 ## Risks / Trade-offs
 
 - [OMP changes its JSONL schema] → Ignore unknown/malformed records, keep the
-  last valid projection, and lock supported shapes with provider fixtures.
+  last valid same-binding projection, and lock supported shapes with provider
+  fixtures.
 - [A path claim escapes the provider Session root] → Canonicalize both root and
   candidate, reject symlink escape and non-JSONL files before reading.
 - [A lifecycle refresh sees a partially appended JSONL line] → Ignore that
