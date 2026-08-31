@@ -31,7 +31,8 @@ pub struct WorkersBridge {
 
 const MAX_PENDING_CALLS: usize = 64;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+// 60s margin over the 120s tool blocking ceiling covers JSON-RPC IPC round-trip, serialization, and host scheduling latency.
+pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 impl WorkersBridge {
     pub async fn start(options: WorkersBridgeOptions) -> Result<Option<Self>, HarnessError> {

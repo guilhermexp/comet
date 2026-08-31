@@ -29,9 +29,6 @@ pub(crate) enum AntigravityUsageError {
     UnreadableDirectory,
     #[error("Antigravity token refresh request failed")]
     RefreshRequest,
-    #[allow(dead_code)]
-    #[error("Antigravity OAuth client is not configured")]
-    RefreshConfiguration,
     #[error("Antigravity token refresh returned an invalid payload")]
     RefreshPayload,
     #[error("Antigravity token refresh failed: {0}")]
