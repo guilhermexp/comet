@@ -6,13 +6,13 @@ The full architecture and lifecycle analysis is recorded in [`docs/plans/2026-08
 
 ## Architecture
 
-Comet uses two OMP child processes with distinct ownership:
+Comet uses two OMP child processes that share one native session identity but retain distinct write ownership:
 
 ```text
 gpui Live surface
       │ local typed controls/events; no audio
       ▼
-SessionsEngine ───── ephemeral OMP Live frontend child
+SessionsEngine ───── session-bound OMP Live frontend child
       │                         │
       │ durable Run command     │ delegation/progress/final text
       ▼                         │
@@ -21,13 +21,13 @@ command ledger ── OmpHarness backend run child
       └── existing AgentEvent folding ───────────────┘
 ```
 
-The Live child is an ephemeral voice frontend. It handles authentication, DeviceCheck, signaling, microphone capture, WebRTC/Opus, and playback. It does not resume or mutate the Chat's native OMP session and does not execute delegated coding work through its own `AgentSession`.
+The Live child resumes the Chat's native OMP session, or creates and returns the first session identity for a new Chat. It handles authentication, DeviceCheck, signaling, microphone capture, WebRTC/Opus, and playback. In host-delegation mode it does not execute delegated coding work or persist casual voice turns through its own `AgentSession`.
 
-The backend child is the existing OmpHarness run. It resumes the Chat session, handles tools and subagents, emits normalized `AgentEvent` values, and remains the only source of durable Chat Transcript and Run Journal state.
+The backend child is the existing OmpHarness run. It resumes the same Chat session, handles tools and subagents, emits normalized `AgentEvent` values, and remains the only source of durable Chat Transcript and Run Journal state.
 
 ## Decisions
 
-- **D-01: Two OMP processes.** The Live frontend stays connected across delegations while each delegation uses an ordinary backend run child. Sharing one process would bypass or duplicate the durable run lifecycle.
+- **D-01: Shared identity, separate ownership.** The Live frontend resumes or creates the Chat's OMP session and stays connected across delegations, while each delegation uses an ordinary backend run child that resumes the same identity. The Live child is non-writing in host-delegation mode; the backend remains the only coding-session writer.
 - **D-02: Capability probing.** Availability requires `ready.capabilities.liveVoice === 1`; version-string inference is prohibited.
 - **D-03: Durable delegation.** A `live_delegation_created` frame becomes one `SessionCommandPayload::Run` through the existing command ledger. The runtime stores the exact owned command ID for preemption decisions.
 - **D-04: Existing folding remains authoritative.** The Live path never normalizes backend tools, text, usage, questions, or completion. Backend progress and final text are observed from the normal run and appended to Live as bounded transient context.
@@ -40,6 +40,10 @@ The backend child is the existing OmpHarness run. It resumes the Chat session, h
 ## Availability
 
 Start is accepted only when the selected Chat is hosted locally, uses OMP, is not archived, has no active backend run, no other Live call exists, and the installed OMP advertises the capability. The engine enforces these conditions even if a caller bypasses the UI.
+
+## Session binding
+
+Before `live_start`, the harness switches to the Chat's stored OMP session when one exists, reads `get_state`, and requires a non-empty session identity. For a new Chat, the normal OMP RPC child creates the first session. The engine persists the effective identity before exposing Live as active, and every later text or delegated run resumes that same identity.
 
 ## Delegation flow
 

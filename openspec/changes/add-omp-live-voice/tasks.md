@@ -11,17 +11,17 @@
 
 ## 1. Shared contracts and OMP harness
 
-**must_haves:** vendor-neutral shared state; optional unsupported harness defaults; additive OMP capability parsing; ephemeral frontend handle; ordinary backend run behavior unchanged.
+**must_haves:** vendor-neutral shared state; optional unsupported harness defaults; additive OMP capability parsing; session-bound frontend handle; ordinary backend run behavior unchanged.
 
 - [ ] C1 Add shared Live state types in `crates/proto/src/live_voice.rs` and the optional harness contract in `crates/harness/src/lib.rs`. files: `crates/proto/src/live_voice.rs`, `crates/proto/src/lib.rs`, `crates/harness/src/lib.rs`. verify: `cargo test -p zeron-proto live_voice && cargo test -p zeron-harness live_voice_defaults`.
 - [ ] C2 Retain OMP `liveVoice` capability and parse only transient Live frames in the OMP RPC protocol fixture. files: `crates/harness/src/omp/process.rs`, `crates/harness/src/omp/protocol.rs`, `crates/harness/tests/omp_rpc.rs`, `crates/harness/tests/fixtures/fake-omp-rpc.sh`. verify: `cargo test -p zeron-harness omp_live_protocol`.
-- [ ] C3 Implement the OMP Live frontend handle with correlated start, mute, context append, and idempotent stop while preserving the normal run path. files: `crates/harness/src/omp/mod.rs`, `crates/harness/tests/omp_rpc.rs`, `crates/harness/tests/fixtures/fake-omp-rpc.sh`. verify: `cargo test -p zeron-harness omp_live_frontend && cargo test -p zeron-harness --test omp_rpc full_rpc_run_normalizes_events_and_resumes_session`.
+- [ ] C3 Implement the OMP Live frontend handle with existing-session switch or new-session identity return, correlated start, mute, context append, and idempotent stop while preserving the normal run path. files: `crates/harness/src/lib.rs`, `crates/harness/src/omp/mod.rs`, `crates/harness/tests/omp_rpc.rs`, `crates/harness/tests/fixtures/fake-omp-rpc.sh`. verify: `cargo test -p zeron-harness omp_live_frontend && cargo test -p zeron-harness --test omp_rpc full_rpc_run_normalizes_events_and_resumes_session`.
 
 ## 2. Engine lifecycle and local RPC
 
 **must_haves:** one local runtime; exact eligibility reasons; one active delegation; durable Run ownership by exact command ID; competing commands preempt Live; lifecycle methods are never forwarded.
 
-- [ ] C4 Add engine-owned Live state, eligibility checks, lifecycle transitions, and deterministic idempotent cleanup. files: `crates/engine/src/live_voice.rs`, `crates/engine/src/lib.rs`, `crates/engine/src/sessions.rs`. verify: `cargo test -p zeron-engine live_voice_state && cargo test -p zeron-engine live_voice_preconditions`.
+- [ ] C4 Add engine-owned Live state, eligibility checks, lifecycle transitions, existing-session injection, new-session identity persistence, and deterministic idempotent cleanup. files: `crates/engine/src/live_voice.rs`, `crates/engine/src/lib.rs`, `crates/engine/src/sessions.rs`, `crates/engine/tests/e2e.rs`. verify: `cargo test -p zeron-engine live_voice_state && cargo test -p zeron-engine live_voice_preconditions && cargo test -p zeron-engine live_voice_session`.
 - [ ] C5 Convert each Live delegation into one durable `SessionCommandPayload::Run`, observe the existing backend path for bounded progress/final context, and preempt Live for every competing command ID. files: `crates/engine/src/live_voice.rs`, `crates/engine/src/sessions.rs`, `crates/engine/src/doc_host.rs`, `crates/engine/tests/e2e.rs`. verify: `cargo test -p zeron-engine live_voice_delegation && cargo test -p zeron-engine --test e2e deterministic_queue_command_id_is_returned_and_executes_once`.
 - [ ] C6 Expose local-only Live start, mute, stop, and state methods without adding them to the forwardable RPC set. files: `crates/rpc/src/lib.rs`, `crates/engine/src/rpc.rs`. verify: `cargo test -p zeron-engine live_voice_rpc && cargo test -p zeron-rpc`.
 

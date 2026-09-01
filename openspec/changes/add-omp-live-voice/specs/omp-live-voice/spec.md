@@ -21,6 +21,24 @@ The system SHALL transport only control, phase, level, transcript, delegation, a
 - **WHEN** user and assistant exchange realtime speech without a delegation
 - **THEN** no Chat message, command, CRDT field, DeviceRoom frame, upload, or log SHALL contain audio or casual transcript content
 
+### Requirement: Live shares the Chat OMP session
+
+The system SHALL start Live Voice with the Chat's stored OMP session identity when one exists and SHALL persist the effective OMP session identity when Live creates the first session for a Chat.
+
+#### Scenario: Existing OMP session is resumed
+- **Test:** harness integration + engine integration
+
+- **WHEN** Live starts for a Chat with a stored OMP session in the same Checkout
+- **THEN** the Live child SHALL switch to that session before `live_start`
+- **AND** subsequent text runs SHALL resume the same identity
+
+#### Scenario: Live creates the first OMP session
+- **Test:** harness integration + engine integration
+
+- **WHEN** Live starts for an eligible Chat without a stored OMP session
+- **THEN** OMP SHALL create a normal session
+- **AND** Comet SHALL persist its non-empty identity before exposing Live as active
+
 ### Requirement: Delegations use the durable run path
 
 The system SHALL convert one Live delegation into one idempotent `SessionCommandPayload::Run` and SHALL execute it through the existing host executor and `SessionsEngine` pipeline.
