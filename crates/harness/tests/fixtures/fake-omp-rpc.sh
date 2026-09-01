@@ -95,6 +95,9 @@ if [ "$scenario" = "require-skill-scope" ]; then
   has "$body" "enableCodexUser: false" || exit 45
   has "$body" "enablePiUser: false" || exit 46
 fi
+if [ "$scenario" = "live-frontend" ] || [ "$scenario" = "live-crash" ]; then
+  has " $* " " --no-session " || exit 47
+fi
 [ -z "${FAKE_OMP_PID_FILE:-}" ] || printf '%s\n' "$$" > "$FAKE_OMP_PID_FILE"
 if [ "$scenario" = "early-exit" ]; then
   exit 9
@@ -146,6 +149,7 @@ emit_chunked() {
   emit "{\"type\":\"rpc_chunk\",\"chunkId\":\"rpc-1\",\"index\":1,\"count\":2,\"byteLength\":$total,\"data\":\"$second_half\"}"
 }
 
+live_delegations=0
 while IFS= read -r line; do
   case "$(field type "$line")" in
     negotiate_protocol)
@@ -156,6 +160,7 @@ while IFS= read -r line; do
       fi
       ;;
     get_state)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_state 54; fi
       if [ "$scenario" = "missing-session" ]; then
         respond "$line" '{"thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
       else
@@ -173,15 +178,19 @@ while IFS= read -r line; do
       respond "$line" '{"commands":[{"name":"model","description":"Select model","input":{"hint":"provider/model"}},{"name":"compact","description":"Compact context"}]}'
       ;;
     set_subagent_subscription)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_subscription 53; fi
       respond "$line" '{"level":"events"}'
       ;;
     switch_session)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_session 55; fi
       case "$line" in *'"sessionPath":"/tmp/omp-session.jsonl"'*) respond "$line" '{"cancelled":false}' ;; *) exit 22 ;; esac
       ;;
     set_host_tools)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_tools 56; fi
       respond "$line" '{"toolNames":["workers"]}'
       ;;
     set_model)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_model 57; fi
       if has "$line" '"provider":"openai-codex"' && has "$line" '"modelId":"gpt-5.6-sol"'; then
         respond "$line" '{"provider":"openai-codex","id":"gpt-5.6-sol","reasoning":true}'
       else
@@ -189,6 +198,7 @@ while IFS= read -r line; do
       fi
       ;;
     set_thinking_level)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_thinking 58; fi
       case "$line" in *'"level":"high"'*) respond "$line" '{}' ;; *) exit 24 ;; esac
       ;;
     steer)
@@ -200,8 +210,14 @@ while IFS= read -r line; do
     live_start)
       has "$line" '"delegationMode":"host"' || fail_stage live_start 50
       respond "$line" '{"active":true}'
+      if [ "$scenario" = "live-crash" ]; then
+        printf 'Authorization: Bearer token-secret-123\n' >&2
+        exit 60
+      fi
+      live_delegations=1
       emit '{"type":"live_phase","phase":"connecting"}'
       emit '{"type":"live_phase","phase":"listening"}'
+      emit '{"type":"live_levels","input":0.25,"output":0.5}'
       emit '{"type":"live_transcript","role":"user","turn":1,"text":"Inspect auth","final":true}'
       emit '{"type":"live_delegation_created","delegationId":"del-1","request":"Inspect auth"}'
       ;;
@@ -210,17 +226,23 @@ while IFS= read -r line; do
       respond "$line" '{"muted":true}'
       ;;
     live_append_context)
-      has "$line" '"delegationId":"del-1"' || fail_stage live_context 52
+      delegation_id=$(field delegationId "$line")
+      [ "$delegation_id" = "del-$live_delegations" ] || fail_stage live_context 52
       if has "$line" '"kind":"final"'; then
         emit '{"type":"live_phase","phase":"listening"}'
+        if [ "$live_delegations" -eq 1 ]; then
+          live_delegations=2
+          emit '{"type":"live_delegation_created","delegationId":"del-2","request":"Run tests"}'
+        fi
       fi
-      respond "$line" '{"delegationId":"del-1"}'
+      respond "$line" "{\"delegationId\":\"$delegation_id\"}"
       ;;
     live_stop)
       respond "$line" '{"active":false}'
       emit '{"type":"live_ended","error":null}'
       ;;
     prompt)
+      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_prompt 59; fi
       respond "$line" '{"agentInvoked":true}'
       if [ "$scenario" = "full-run" ]; then
         emit '{"type":"agent_start"}'

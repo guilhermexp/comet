@@ -18,9 +18,15 @@ use zeron_proto::{
 
 use self::normalize::{AgentEndDisposition, OmpNormalizer};
 use self::process::{OmpLaunch, OmpProcess};
-use self::protocol::MAX_OUTBOUND_BYTES;
+use self::protocol::{
+    MAX_OUTBOUND_BYTES, live_context_command, live_mute_command, live_start_command,
+    live_stop_command, parse_live_event,
+};
 use self::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
-use crate::{Harness, HarnessError, RunControls, SteerMessage};
+use crate::{
+    Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
+    RunControls, SteerMessage,
+};
 
 #[doc(hidden)]
 pub mod normalize;
@@ -309,6 +315,54 @@ impl Harness for OmpHarness {
         true
     }
 
+    async fn probe_live_voice(&self, cwd: &Path) -> Result<bool, HarnessError> {
+        let process = OmpProcess::start(self.launch(cwd.to_path_buf(), true, None)?).await?;
+        let supported = process.capabilities().live_voice;
+        process.shutdown().await?;
+        Ok(supported)
+    }
+
+    async fn start_live_voice(
+        &self,
+        request: LiveVoiceRequest,
+    ) -> Result<LiveVoiceHandle, HarnessError> {
+        if request.cwd.trim().is_empty() {
+            return Err(HarnessError::Protocol(
+                "OMP Live Voice requires a working directory".into(),
+            ));
+        }
+        let process =
+            OmpProcess::start(self.launch(PathBuf::from(request.cwd), true, None)?).await?;
+        if !process.capabilities().live_voice {
+            let _ = process.shutdown().await;
+            return Err(HarnessError::Unsupported(
+                "installed OMP does not support Live Voice; update OMP".into(),
+            ));
+        }
+        let events = match process.take_events() {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = process.shutdown().await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = process.request(live_start_command()).await {
+            let _ = process.shutdown().await;
+            return Err(error);
+        }
+
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        tokio::spawn(run_live_voice(process, events, control_rx, event_tx));
+        Ok(LiveVoiceHandle {
+            events: futures::stream::unfold(event_rx, |mut receiver| async move {
+                receiver.recv().await.map(|event| (event, receiver))
+            })
+            .boxed(),
+            controls: control_tx,
+        })
+    }
+
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         discover_models_with_launch(self.launch(std::env::current_dir()?, true, None)?).await
     }
@@ -460,6 +514,93 @@ impl Harness for OmpHarness {
             })
             .boxed(),
         )
+    }
+}
+
+async fn run_live_voice(
+    process: OmpProcess,
+    mut frames: mpsc::Receiver<Value>,
+    mut controls: mpsc::Receiver<LiveVoiceControl>,
+    events: mpsc::Sender<Result<LiveVoiceEvent, HarnessError>>,
+) {
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else {
+                    let _ = events
+                        .send(Err(HarnessError::Protocol(
+                            "OMP Live frontend exited unexpectedly".into(),
+                        )))
+                        .await;
+                    let _ = process.shutdown().await;
+                    return;
+                };
+                let event = match parse_live_event(&frame) {
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let _ = events.send(Err(error)).await;
+                        let _ = process.shutdown().await;
+                        return;
+                    }
+                };
+                let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
+                let delivered = if matches!(event, LiveVoiceEvent::Levels { .. }) {
+                    match events.try_send(Ok(event)) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    }
+                } else {
+                    events.send(Ok(event)).await.is_ok()
+                };
+                if terminal || !delivered {
+                    let _ = process.shutdown().await;
+                    return;
+                }
+            }
+            control = controls.recv() => {
+                let Some(control) = control else {
+                    let _ = process.request(live_stop_command()).await;
+                    let _ = events.send(Ok(LiveVoiceEvent::Ended { error: None })).await;
+                    let _ = process.shutdown().await;
+                    return;
+                };
+                let command = match control {
+                    LiveVoiceControl::SetMuted(muted) => live_mute_command(muted),
+                    LiveVoiceControl::AppendContext {
+                        delegation_id,
+                        kind,
+                        text,
+                    } => match live_context_command(&delegation_id, kind, &text) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            let _ = events.send(Err(error)).await;
+                            let _ = process.shutdown().await;
+                            return;
+                        }
+                    },
+                    LiveVoiceControl::Stop => {
+                        match process.request(live_stop_command()).await {
+                            Ok(_) => {
+                                let _ = events
+                                    .send(Ok(LiveVoiceEvent::Ended { error: None }))
+                                    .await;
+                            }
+                            Err(error) => {
+                                let _ = events.send(Err(error)).await;
+                            }
+                        }
+                        let _ = process.shutdown().await;
+                        return;
+                    }
+                };
+                if let Err(error) = process.request(command).await {
+                    let _ = events.send(Err(error)).await;
+                    let _ = process.shutdown().await;
+                    return;
+                }
+            }
+        }
     }
 }
 

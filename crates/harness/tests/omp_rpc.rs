@@ -15,8 +15,8 @@ use zeron_harness::omp::protocol::{
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
 use zeron_harness::{
-    CancellationToken, Harness, HarnessError, LiveVoiceContextKind, LiveVoiceEvent, OmpHarness,
-    RunControls, SteerMessage,
+    CancellationToken, Harness, HarnessError, LiveVoiceContextKind, LiveVoiceControl,
+    LiveVoiceEvent, LiveVoiceRequest, OmpHarness, RunControls, SteerMessage,
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole, ReasoningLevel, RunRequest,
@@ -300,6 +300,213 @@ fn omp_live_protocol_encodes_exact_commands() {
     assert_eq!(live_stop_command(), json!({"type":"live_stop"}));
     assert!(live_context_command("", LiveVoiceContextKind::Progress, "work").is_err());
     assert!(live_context_command("del-1", LiveVoiceContextKind::Progress, " ").is_err());
+}
+
+async fn assert_process_reaped(pid: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("OMP process {pid} was not reaped");
+}
+
+async fn next_live_event(
+    events: &mut BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
+) -> LiveVoiceEvent {
+    tokio::time::timeout(Duration::from_secs(2), events.next())
+        .await
+        .expect("Live event timed out")
+        .expect("Live stream ended")
+        .expect("Live event failed")
+}
+
+#[tokio::test]
+async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("omp.pid");
+    let mut env = fake_env("live-frontend");
+    env.insert(
+        "FAKE_OMP_PID_FILE".into(),
+        pid_file.to_string_lossy().into_owned(),
+    );
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+
+    assert!(harness.probe_live_voice(temp.path()).await.unwrap());
+    let pid = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_process_reaped(pid).await;
+}
+
+#[tokio::test]
+async fn omp_live_frontend_reuses_one_child_for_serial_delegations() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("omp.pid");
+    let mut env = fake_env("live-frontend");
+    env.insert(
+        "FAKE_OMP_PID_FILE".into(),
+        pid_file.to_string_lossy().into_owned(),
+    );
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+    let handle = harness
+        .start_live_voice(LiveVoiceRequest {
+            cwd: temp.path().to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let controls = handle.controls;
+    let mut events = handle.events;
+
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Phase(LiveVoicePhase::Connecting)
+    );
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Phase(LiveVoicePhase::Listening)
+    );
+    assert!(matches!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Levels {
+            input: 0.25,
+            output: 0.5
+        }
+    ));
+    let transcript_event = next_live_event(&mut events).await;
+    assert!(matches!(
+        &transcript_event,
+        LiveVoiceEvent::Transcript(transcript)
+            if transcript.role == LiveVoiceRole::User
+                && transcript.turn == 1
+                && transcript.text == "Inspect auth"
+                && transcript.final_text
+    ));
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Delegation {
+            delegation_id: "del-1".into(),
+            request: "Inspect auth".into(),
+        }
+    );
+
+    controls
+        .send(LiveVoiceControl::SetMuted(true))
+        .await
+        .unwrap();
+    controls
+        .send(LiveVoiceControl::AppendContext {
+            delegation_id: "del-1".into(),
+            kind: LiveVoiceContextKind::Progress,
+            text: "Inspecting".into(),
+        })
+        .await
+        .unwrap();
+    controls
+        .send(LiveVoiceControl::AppendContext {
+            delegation_id: "del-1".into(),
+            kind: LiveVoiceContextKind::Final,
+            text: "Fixed".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Phase(LiveVoicePhase::Listening)
+    );
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Delegation {
+            delegation_id: "del-2".into(),
+            request: "Run tests".into(),
+        }
+    );
+
+    controls
+        .send(LiveVoiceControl::AppendContext {
+            delegation_id: "del-2".into(),
+            kind: LiveVoiceContextKind::Progress,
+            text: "Testing".into(),
+        })
+        .await
+        .unwrap();
+    controls
+        .send(LiveVoiceControl::AppendContext {
+            delegation_id: "del-2".into(),
+            kind: LiveVoiceContextKind::Final,
+            text: "Passed".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Phase(LiveVoicePhase::Listening)
+    );
+    let reused_pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(reused_pid, pid);
+
+    controls.send(LiveVoiceControl::Stop).await.unwrap();
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Ended { error: None }
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .is_none(),
+        "stop must emit one terminal event"
+    );
+    assert_process_reaped(pid).await;
+}
+
+#[tokio::test]
+async fn omp_live_frontend_surfaces_bounded_child_exit() {
+    let harness = fake_harness("live-crash");
+    let handle = harness
+        .start_live_voice(LiveVoiceRequest {
+            cwd: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        })
+        .await
+        .unwrap();
+    let _controls = handle.controls;
+    let mut events = handle.events;
+
+    let error = tokio::time::timeout(Duration::from_secs(2), events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("exited unexpectedly"), "{message}");
+    assert!(message.len() <= 512, "{message}");
+    assert!(!message.contains("token-secret"), "{message}");
 }
 
 #[tokio::test]
