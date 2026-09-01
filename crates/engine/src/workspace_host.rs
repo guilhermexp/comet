@@ -178,7 +178,7 @@ struct WorkspaceHostInner {
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
     room_joined_at: std::sync::atomic::AtomicI64,
     trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
-    last_retained_chat_ids: Mutex<Option<std::collections::BTreeSet<String>>>,
+    last_retained_chat_ids: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
 }
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -293,7 +293,7 @@ impl WorkspaceHost {
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
                 trajectory: Mutex::new(None),
-                last_retained_chat_ids: Mutex::new(None),
+                last_retained_chat_ids: Arc::new(Mutex::new(None)),
             }),
         };
         // read again, so the registry snapshot must exist even if the process
@@ -1138,16 +1138,27 @@ impl WorkspaceHostInner {
                 self.spaces_tx.send_replace(state.spaces);
                 let live_set: std::collections::BTreeSet<String> =
                     live_ids.iter().cloned().collect();
-                let mut last_retained = lock(&self.last_retained_chat_ids);
-                let chat_ids_changed = match &*last_retained {
+                let last_retained = lock(&self.last_retained_chat_ids).clone();
+                let chat_ids_changed = match &last_retained {
                     Some(prev) => prev != &live_set,
                     None => true,
                 };
                 if chat_ids_changed {
-                    *last_retained = Some(live_set);
                     if let Some(traj) = lock(&self.trajectory).clone() {
+                        let last_retained_slot = self.last_retained_chat_ids.clone();
                         tokio::spawn(async move {
-                            let _ = traj.retain_chats_only(&live_ids).await;
+                            match traj.retain_chats_only(&live_ids).await {
+                                Ok(_) => {
+                                    let mut slot = lock(&last_retained_slot);
+                                    *slot = Some(live_set);
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "failed to retain chats in trajectory store; will retry on next publish"
+                                    );
+                                }
+                            }
                         });
                     }
                 }
@@ -1992,6 +2003,7 @@ mod tests {
         host.set_trajectory_store(traj_store.clone());
         // First publish initializes retained chat IDs
         host.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         let initial_chats = super::lock(&host.inner.last_retained_chat_ids).clone();
         assert!(
             initial_chats.is_some(),
@@ -2002,6 +2014,7 @@ mod tests {
         // Multiple subsequent publish calls with unchanged chat set must not mutate or re-trigger retention
         host.inner.publish();
         host.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         let chats_after = super::lock(&host.inner.last_retained_chat_ids).clone();
         assert!(chats_after.unwrap().is_empty());
@@ -2010,8 +2023,70 @@ mod tests {
         host.create_chat("chat_new", None, Some("dev-1"), None, None)
             .unwrap();
         host.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         let chats_updated = super::lock(&host.inner.last_retained_chat_ids).clone();
         assert!(chats_updated.unwrap().contains("chat_new"));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_retention_failure_leaves_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+
+        let host = super::WorkspaceHost::open(
+            store.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+
+        // Create chat
+        host.create_chat("chat_retry", None, Some("dev-1"), None, None)
+            .unwrap();
+
+        // Set a broken trajectory store whose writer channel is closed
+        let (closed_tx, _) = std::sync::mpsc::sync_channel(1);
+        let broken_traj_store = std::sync::Arc::new(crate::trajectory_store::TrajectoryStore {
+            db_path: dir.path().join("trajectory.sqlite3"),
+            journals_dir: dir.path().join("journals"),
+            writer_tx: closed_tx,
+            in_memory_degraded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            degraded_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        });
+        host.set_trajectory_store(broken_traj_store);
+
+        // Publish fails to retain in broken store -> last_retained_chat_ids must NOT be committed
+        host.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let retained_after_fail = super::lock(&host.inner.last_retained_chat_ids).clone();
+        assert!(
+            retained_after_fail.is_none(),
+            "failed retain_chats_only must not commit last_retained_chat_ids"
+        );
+
+        // Now replace with a healthy trajectory store
+        let healthy_traj_store = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap(),
+        );
+        host.set_trajectory_store(healthy_traj_store);
+
+        // Re-publish -> retry succeeds -> last_retained_chat_ids is committed
+        host.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let retained_after_success = super::lock(&host.inner.last_retained_chat_ids).clone();
+        assert!(
+            retained_after_success.is_some(),
+            "successful retry must commit last_retained_chat_ids"
+        );
+        assert!(retained_after_success.unwrap().contains("chat_retry"));
     }
 }

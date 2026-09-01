@@ -117,7 +117,7 @@ pub struct TrajectoryDiagnostics {
     pub db_size_bytes: u64,
 }
 
-enum ReplySender<T: Send + 'static> {
+pub(crate) enum ReplySender<T: Send + 'static> {
     Async(oneshot::Sender<T>),
     Sync(SyncSender<T>),
 }
@@ -136,7 +136,7 @@ impl<T: Send + 'static> ReplySender<T> {
 }
 
 /// Commands for the background writer task.
-enum WriterCommand {
+pub(crate) enum WriterCommand {
     WriteRecords(Vec<TrajectoryRecord>),
     DeleteChat(
         String,
@@ -161,11 +161,11 @@ const CAPTURE_QUEUE_CAPACITY: usize = 2048;
 /// Device-local SQLite trajectory store.
 #[derive(Clone)]
 pub struct TrajectoryStore {
-    db_path: PathBuf,
-    journals_dir: PathBuf,
-    writer_tx: SyncSender<WriterCommand>,
-    in_memory_degraded: Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
-    degraded_reason: Arc<Mutex<Option<String>>>,
+    pub(crate) db_path: PathBuf,
+    pub(crate) journals_dir: PathBuf,
+    pub(crate) writer_tx: SyncSender<WriterCommand>,
+    pub(crate) in_memory_degraded: Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
+    pub(crate) degraded_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl TrajectoryStore {
@@ -259,18 +259,26 @@ impl TrajectoryStore {
         self.degraded_reason.lock().unwrap().is_some()
     }
 
-    /// Check if native (non-legacy) records exist for `chat_id`.
-    pub fn has_native_records(&self, chat_id: &str) -> Result<bool, TrajectoryStoreError> {
+    /// Determine the minimum committed native (non-legacy) `source_seq` for `chat_id`.
+    pub fn min_native_source_seq(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<u64>, TrajectoryStoreError> {
         let conn = self.reader()?;
-        let exists: bool = conn
+        let min_seq: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM trajectory_records WHERE chat_id = ?1 AND run_id NOT LIKE 'legacy_%' LIMIT 1",
+                "SELECT MIN(source_seq) FROM trajectory_records WHERE chat_id = ?1 AND run_id NOT LIKE 'legacy_%'",
                 params![chat_id],
-                |_| Ok(true),
+                |r| r.get(0),
             )
             .optional()?
-            .unwrap_or(false);
-        Ok(exists)
+            .flatten();
+        Ok(min_seq.map(|s| s as u64))
+    }
+
+    /// Check if native (non-legacy) records exist for `chat_id`.
+    pub fn has_native_records(&self, chat_id: &str) -> Result<bool, TrajectoryStoreError> {
+        Ok(self.min_native_source_seq(chat_id)?.is_some())
     }
 
     /// Check if legacy journal has already been imported for `chat_id`.
@@ -296,8 +304,9 @@ impl TrajectoryStore {
         if self.has_legacy_import(chat_id).unwrap_or(false) {
             return Ok(());
         }
-        // Eligible only for truly legacy-only Chat: if native records exist, do not import
-        if self.has_native_records(chat_id).unwrap_or(false) {
+        // Synchronize with writer so any already enqueued native records are committed
+        let _ = self.sync_flush();
+        if self.has_legacy_import(chat_id).unwrap_or(false) {
             return Ok(());
         }
         let journal_path = crate::run_journal::journal_paths(&self.journals_dir, chat_id).0;
@@ -440,6 +449,18 @@ impl TrajectoryStore {
         .map_err(|_| TrajectoryStoreError::ChannelClosed)?
         .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)
+    }
+
+    /// Synchronously flush the background writer queue and await completion.
+    pub fn sync_flush(&self) -> Result<(), TrajectoryStoreError> {
+        if self.is_degraded() {
+            return Ok(());
+        }
+        let (tx, rx) = sync_channel(1);
+        self.writer_tx
+            .send(WriterCommand::Flush(ReplySender::Sync(tx)))
+            .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
+        rx.recv().map_err(|_| TrajectoryStoreError::ChannelClosed)
     }
 
     /// Open an independent reader connection in WAL mode.
@@ -707,17 +728,47 @@ impl TrajectoryStore {
         if !path.exists() {
             return Ok(false);
         }
+        if self.is_degraded() {
+            return Ok(false);
+        }
+
+        // Synchronize with writer before reading import status and native minimum seq
+        let _ = self.sync_flush();
 
         // Check if already imported (one-shot / idempotent)
         if self.has_legacy_import(chat_id)? {
             return Ok(false);
         }
 
-        // Check if native records exist (eligible only for truly legacy-only Chat)
-        if self.has_native_records(chat_id)? {
-            return Ok(false);
-        }
+        // Determine the minimum committed native source_seq for this chat
+        let min_native_seq = self.min_native_source_seq(chat_id)?;
 
+        // If native rows start at seq 1 (N = 1), record a zero-row completed import marker and import nothing
+        if min_native_seq == Some(1) {
+            let metadata = fs::metadata(path)?;
+            let file_len = metadata.len();
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let fingerprint = format!("{}:{}:{}", path.display(), file_len, mtime);
+
+            let (tx, rx) = sync_channel(1);
+            let cmd = WriterCommand::ImportLegacy {
+                chat_id: chat_id.to_string(),
+                fingerprint,
+                records: Vec::new(),
+                reply: Some(ReplySender::Sync(tx)),
+            };
+            self.writer_tx
+                .send(cmd)
+                .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
+            rx.recv()
+                .map_err(|_| TrajectoryStoreError::ChannelClosed)??;
+            return Ok(true);
+        }
         let metadata = fs::metadata(path)?;
         let file_len = metadata.len();
         let mtime = metadata
@@ -858,6 +909,13 @@ impl TrajectoryStore {
             let seq = parsed.seq;
             let event = parsed.event;
 
+            // Coverage cutover: if native rows start at N, import only events with seq < N
+            if let Some(cutover_seq) = min_native_seq {
+                if seq >= cutover_seq {
+                    break;
+                }
+            }
+
             match &event {
                 zeron_proto::AgentEvent::ReasoningDelta { text } => {
                     flush_text(&mut records, &mut current_text);
@@ -902,8 +960,9 @@ impl TrajectoryStore {
         flush_reasoning(&mut records, &mut current_reasoning);
         flush_text(&mut records, &mut current_text);
 
-        // If the journal had no terminal Done event, mark unsettled tool calls and add an interrupted record
-        if !has_done && !records.is_empty() {
+        // If the journal had no terminal Done event and there is no native continuation,
+        // mark unsettled tool calls and add an interrupted record.
+        if min_native_seq.is_none() && !has_done && !records.is_empty() {
             for rec in &mut records {
                 if let Some(call_id) = &rec.call_id {
                     if pending_tools.contains(call_id)
@@ -2430,6 +2489,121 @@ mod tests {
         assert_eq!(groups.len(), 1, "must have exactly 1 run");
         assert!(!groups[0].is_legacy, "run must not be marked legacy");
     }
+    #[tokio::test]
+    async fn test_trajectory_legacy_prefix_cutover_preserves_history_and_native_rows() {
+        let temp = TempDir::new().unwrap();
+        let journals_dir = temp.path().join("journals");
+        fs::create_dir_all(&journals_dir).unwrap();
+        let journal_path = journals_dir.join("chat_prefix.jsonl");
+
+        // Historical journal prefix seq 1..100
+        let mut lines = Vec::new();
+        lines.push(r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#.to_string());
+        for i in 2..=100 {
+            lines.push(format!(
+                r#"{{"seq":{},"event":{{"type":"userMessage","text":"Historical message {}"}}}}"#,
+                i, i
+            ));
+        }
+        fs::write(&journal_path, lines.join("\n")).unwrap();
+
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Enqueue native rows beginning at seq 101
+        store
+            .try_enqueue(sample_record("chat_prefix", "run_native", 101, 0))
+            .unwrap();
+        store
+            .try_enqueue(sample_record("chat_prefix", "run_native", 102, 0))
+            .unwrap();
+
+        // First read returns honest prefix (1..100) + native rows (101, 102) exactly once
+        let records = store.list_all_records("chat_prefix").unwrap();
+        assert_eq!(
+            records.len(),
+            102,
+            "must have exactly 100 legacy prefix records + 2 native records"
+        );
+
+        for (idx, r) in records.iter().enumerate() {
+            let expected_seq = (idx + 1) as u64;
+            assert_eq!(r.source_seq, expected_seq);
+            if expected_seq <= 100 {
+                assert!(
+                    r.run_id.starts_with("legacy_"),
+                    "record at seq {} must be legacy, got {}",
+                    expected_seq,
+                    r.run_id
+                );
+            } else {
+                assert_eq!(
+                    r.run_id, "run_native",
+                    "record at seq {} must be native",
+                    expected_seq
+                );
+            }
+        }
+
+        // Verify legacy import marker is recorded
+        assert!(store.has_legacy_import("chat_prefix").unwrap());
+        let conn = store.reader().unwrap();
+        let imported_count: i64 = conn
+            .query_row(
+                "SELECT imported_records FROM trajectory_legacy_imports WHERE chat_id = ?1",
+                params!["chat_prefix"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_count, 100);
+
+        // Subsequent read returns identical records
+        let records2 = store.list_all_records("chat_prefix").unwrap();
+        assert_eq!(records2, records);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_legacy_enqueue_seq_1_and_immediate_read_no_duplicate() {
+        let temp = TempDir::new().unwrap();
+        let journals_dir = temp.path().join("journals");
+        fs::create_dir_all(&journals_dir).unwrap();
+        let journal_path = journals_dir.join("chat_race.jsonl");
+
+        let lines = vec![
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
+            r#"{"seq":2,"event":{"type":"userMessage","text":"Hello live"}}"#,
+            r#"{"seq":3,"event":{"type":"done","status":"completed","result":"ok"}}"#,
+        ];
+        fs::write(&journal_path, lines.join("\n")).unwrap();
+
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Enqueue native seq 1
+        store
+            .try_enqueue(sample_record("chat_race", "run_live", 1, 0))
+            .unwrap();
+
+        // Immediately read without async flush
+        let records = store.list_all_records("chat_race").unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "must have exactly 1 native record and zero legacy duplicate records"
+        );
+        assert_eq!(records[0].run_id, "run_live");
+        assert_eq!(records[0].source_seq, 1);
+
+        // Verify legacy import marker is recorded as 0-row completed import
+        assert!(store.has_legacy_import("chat_race").unwrap());
+        let conn = store.reader().unwrap();
+        let imported_count: i64 = conn
+            .query_row(
+                "SELECT imported_records FROM trajectory_legacy_imports WHERE chat_id = ?1",
+                params!["chat_race"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_count, 0);
+    }
 
     #[tokio::test]
     async fn test_trajectory_legacy_import_one_shot_idempotent_after_journal_growth() {
@@ -2492,18 +2666,29 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = TrajectoryStore::open(temp.path()).unwrap();
 
-        // Seed some records for chat_victim and chat_survivor
+        // Seed some records for chat_victim and chat_survivor and commit them
         store
             .try_enqueue(sample_record("chat_victim", "r1", 1, 0))
             .unwrap();
         store
             .try_enqueue(sample_record("chat_survivor", "r1", 1, 0))
             .unwrap();
+        store.flush().await.unwrap();
 
-        // Saturate the capture queue with 2048+ records for a dummy chat
-        for i in 1..=2500 {
-            let _ = store.try_enqueue(sample_record("chat_flood", "r_flood", i, 0));
+        // Saturate the capture queue until QueueFull is deterministically returned
+        let mut observed_queue_full = false;
+        for i in 1..=10_000 {
+            if let Err(TrajectoryStoreError::QueueFull) =
+                store.try_enqueue(sample_record("chat_flood", "r_flood", i, 0))
+            {
+                observed_queue_full = true;
+                break;
+            }
         }
+        assert!(
+            observed_queue_full,
+            "precondition: capture queue must be demonstrably saturated with QueueFull immediately before delete submission"
+        );
 
         // Authoritative delete of chat_victim while queue is flooded/saturated
         let del_res = store.delete_chat("chat_victim").await;
