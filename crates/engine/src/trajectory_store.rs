@@ -960,9 +960,9 @@ impl TrajectoryStore {
         flush_reasoning(&mut records, &mut current_reasoning);
         flush_text(&mut records, &mut current_text);
 
-        // If the journal had no terminal Done event and there is no native continuation,
-        // mark unsettled tool calls and add an interrupted record.
-        if min_native_seq.is_none() && !has_done && !records.is_empty() {
+        // If the journal had no terminal Done event, mark unsettled tool calls
+        // and add an interrupted record.
+        if !has_done && !records.is_empty() {
             for rec in &mut records {
                 if let Some(call_id) = &rec.call_id {
                     if pending_tools.contains(call_id)
@@ -973,12 +973,21 @@ impl TrajectoryStore {
                 }
             }
             let last_seq = records.last().map(|r| r.source_seq).unwrap_or(0);
+            let (terminal_seq, terminal_sub_seq) = if min_native_seq.is_some() {
+                // When native rows follow at >= last_seq + 1, place the Interrupted terminal
+                // at the final prefix source sequence with a reserved nonconflicting sub-sequence (u32::MAX),
+                // so it does not collide with or share the ordering slot of the first native row (cutover_seq, 0).
+                (last_seq, u32::MAX)
+            } else {
+                // In legacy-only journals without native continuation, place at last_seq + 1, 0.
+                (last_seq + 1, 0)
+            };
             let interrupted_rec = TrajectoryRecord {
-                id: TrajectoryRecordId::new(&run_id, last_seq + 1, 0),
+                id: TrajectoryRecordId::new(&run_id, terminal_seq, terminal_sub_seq),
                 chat_id: chat_id.to_string(),
                 run_id: run_id.clone(),
-                source_seq: last_seq + 1,
-                sub_seq: 0,
+                source_seq: terminal_seq,
+                sub_seq: terminal_sub_seq,
                 lane: TrajectoryLane::Model,
                 kind: TrajectoryRecordKind::Done,
                 status: TrajectoryStatus::Interrupted,
@@ -2064,8 +2073,7 @@ mod tests {
 
         let rec1 = sample_record("chat_durable_fail", "r1", 100, 0);
         let rec2 = sample_record("chat_durable_fail", "r1", 101, 0);
-        store.try_enqueue(rec1).unwrap();
-        store.try_enqueue(rec2).unwrap();
+        store.try_enqueue_batch(vec![rec1, rec2]).unwrap();
 
         // Writer processes the batch through flush_batch_to_writer and write_records_tx,
         // hits the trigger abort error, rolls back records, and records a degraded interval.
@@ -2499,12 +2507,15 @@ mod tests {
         // Historical journal prefix seq 1..100
         let mut lines = Vec::new();
         lines.push(r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#.to_string());
-        for i in 2..=100 {
+        for i in 2..100 {
             lines.push(format!(
                 r#"{{"seq":{},"event":{{"type":"userMessage","text":"Historical message {}"}}}}"#,
                 i, i
             ));
         }
+        lines.push(
+            r#"{"seq":100,"event":{"type":"done","status":"completed","result":"ok"}}"#.to_string(),
+        );
         fs::write(&journal_path, lines.join("\n")).unwrap();
 
         let store = TrajectoryStore::open(temp.path()).unwrap();
@@ -2559,6 +2570,93 @@ mod tests {
         // Subsequent read returns identical records
         let records2 = store.list_all_records("chat_prefix").unwrap();
         assert_eq!(records2, records);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_legacy_prefix_unmatched_tool_call_and_native_continuation_interrupted()
+    {
+        let temp = TempDir::new().unwrap();
+        let journals_dir = temp.path().join("journals");
+        fs::create_dir_all(&journals_dir).unwrap();
+        let journal_path = journals_dir.join("chat_unsettled_native.jsonl");
+
+        // Legacy prefix with seq 1..2: unmatched ToolCall and no Done event
+        let lines = vec![
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
+            r#"{"seq":2,"event":{"type":"toolCall","id":"c_unsettled_pre","call":{"kind":"exec","command":"sleep 100"}}}"#,
+        ];
+        fs::write(&journal_path, lines.join("\n")).unwrap();
+
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Enqueue native rows starting at seq 3 (N = 3)
+        let native_user = sample_record("chat_unsettled_native", "run_native_3", 3, 0);
+        let mut native_done = sample_record("chat_unsettled_native", "run_native_3", 4, 0);
+        native_done.kind = TrajectoryRecordKind::Done;
+        native_done.status = TrajectoryStatus::Completed;
+        store.try_enqueue(native_user).unwrap();
+        store.try_enqueue(native_done).unwrap();
+
+        let records = store.list_all_records("chat_unsettled_native").unwrap();
+        // Expected records:
+        // 1. legacy SessionStarted (1, 0)
+        // 2. legacy ToolCall Unsettled (2, 0)
+        // 3. legacy Done Interrupted (2, reserved)
+        // 4. native UserMessage (3, 0)
+        // 5. native Done (4, 0)
+        assert_eq!(
+            records.len(),
+            5,
+            "must have 3 legacy records + 2 native records"
+        );
+        assert_eq!(records[0].source_seq, 1);
+        assert_eq!(records[0].run_id, "legacy_chat_unsettled_native");
+
+        assert_eq!(records[1].source_seq, 2);
+        assert_eq!(records[1].sub_seq, 0);
+        assert_eq!(records[1].status, TrajectoryStatus::Unsettled);
+        assert_eq!(records[1].run_id, "legacy_chat_unsettled_native");
+
+        assert_eq!(records[2].source_seq, 2);
+        assert_eq!(records[2].kind, TrajectoryRecordKind::Done);
+        assert_eq!(records[2].status, TrajectoryStatus::Interrupted);
+        assert_eq!(records[2].run_id, "legacy_chat_unsettled_native");
+        assert!(
+            records[2].sub_seq > 0,
+            "terminal must have nonconflicting reserved sub_seq"
+        );
+
+        assert_eq!(records[3].source_seq, 3);
+        assert_eq!(records[3].sub_seq, 0);
+        assert_eq!(records[3].run_id, "run_native_3");
+
+        assert_eq!(records[4].source_seq, 4);
+        assert_eq!(records[4].sub_seq, 0);
+        assert_eq!(records[4].run_id, "run_native_3");
+
+        // Pagination check
+        let page_prefix = store
+            .list_records("chat_unsettled_native", Some(1), Some(3))
+            .unwrap();
+        assert_eq!(page_prefix.len(), 3);
+        assert_eq!(page_prefix[0].id, records[0].id);
+        assert_eq!(page_prefix[1].id, records[1].id);
+        assert_eq!(page_prefix[2].id, records[2].id);
+
+        let page_native = store
+            .list_records("chat_unsettled_native", Some(3), Some(10))
+            .unwrap();
+        assert_eq!(page_native.len(), 2);
+        assert_eq!(page_native[0].id, records[3].id);
+        assert_eq!(page_native[1].id, records[4].id);
+
+        // Groups check
+        let groups = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(groups.len(), 2, "must have legacy run + native run");
+        assert!(groups[0].is_legacy);
+        assert_eq!(groups[0].status, TrajectoryStatus::Interrupted);
+        assert!(!groups[1].is_legacy);
+        assert_eq!(groups[1].status, TrajectoryStatus::Completed);
     }
 
     #[tokio::test]
