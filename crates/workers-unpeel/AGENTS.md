@@ -165,11 +165,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   (`task` stays inside the caller's session, read-only).
   `tests/controller_mcp.rs` locks both: every action in the enum appears in
   some description, and no field is left without one.
-- **O teto de bloqueio de `wait_for_status` é único e público (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 120s).** O schema do MCP (`maximum`), o help (`limits.wait_seconds`) e o `.clamp` de runtime derivam da mesma constante para evitar divergência silenciosa. A expiração de espera devolve `timed_out: true` com snapshot do worker e é leitura útil normal, nunca falha — e não substitui verificação durável de conclusão.
-- **Controller MCP dispatches serially.** `run_stdio` handles each request inline, so a blocking
-  `wait_for_status` stalls every action on the channel, including `stop_worker` and `archive_worker`;
-  `notifications/cancelled` is discarded. Raise the wait ceiling only after making the loop
-  concurrent and the wait interruptible.
+- **O orquestrador é dono da duração de `wait_for_status`; o teto (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 4h) é só sanidade de transporte.** Schema (`maximum`), help (`limits.wait_seconds`) e `.clamp` derivam da mesma constante. Default continua 30s. Expiração devolve `timed_out: true` + snapshot + `next` (`WAIT_TIMED_OUT_NEXT`): esperar de novo com timeout do tamanho do trabalho, ou encerrar o turno e receber `[worker-task-notification]`. Wait curto repetido é polling e custa um turno inteiro do modelo por chamada — foi o que aconteceu com teto de 120s (≈100 chamadas por attempt em worker de horas).
+- **`serve` despacha concorrente e cancelável.** `run_stdio` é casca sobre `serve(reader, writer, handler)`: uma thread por request, `stdout` atrás de `Mutex`, registro de ids em voo. `notifications/cancelled` flipa o flag do request (`wait_until` checa a cada tick de 250ms) e o request cancelado **não recebe resposta** (contrato MCP). EOF flipa só o flag de saída — waits pendentes morrem, respostas em voo ainda são escritas. `wait_until` é o núcleo puro do wait (poll injetado) para testar deadline, cancel e `next` sem host.
 - **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
   `project_id` and `validate_launch_target` rejects any id absent from the live
   project list, so the surface must also be able to *add* a project

@@ -291,6 +291,12 @@ impl ClaudeHarness {
         }
         if let Some(config) = claude_workers_mcp_config(request) {
             cmd.args(["--mcp-config", &config]);
+            // The Workers wait is orchestrator-sized (up to hours); Claude's MCP
+            // client must not expire it first.
+            cmd.env(
+                "MCP_TOOL_TIMEOUT",
+                (crate::WORKERS_CLIENT_DEADLINE_SECONDS * 1000).to_string(),
+            );
         }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
@@ -1008,10 +1014,29 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.iter().any(|arg| arg == "--mcp-config"));
+        let deadline = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "MCP_TOOL_TIMEOUT")
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(
+            deadline.as_deref(),
+            Some(
+                (crate::WORKERS_CLIENT_DEADLINE_SECONDS * 1000)
+                    .to_string()
+                    .as_str()
+            )
+        );
 
         let command =
             harness.build_command(&PathBuf::from("/absolute/claude"), &workers_request(false));
         assert!(command.as_std().get_args().all(|arg| arg != "--mcp-config"));
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| key != "MCP_TOOL_TIMEOUT")
+        );
     }
 
     #[test]

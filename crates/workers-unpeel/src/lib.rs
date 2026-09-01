@@ -158,6 +158,11 @@ pub fn controller_mcp_handle_request(request: Value) -> Option<Value> {
 }
 
 #[doc(hidden)]
+pub use controller_mcp::{
+    WAIT_TIMED_OUT_NEXT, serve as controller_mcp_serve, wait_until as controller_mcp_wait_until,
+};
+
+#[doc(hidden)]
 pub fn controller_mcp_parse_launch(request: Value) -> Result<WorkersLaunchRequest, String> {
     controller_mcp::parse_launch(request)
 }

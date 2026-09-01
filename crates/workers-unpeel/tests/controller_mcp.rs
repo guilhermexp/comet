@@ -619,19 +619,116 @@ fn worker_with_state(state: &str) -> WorkersSession {
 }
 
 #[test]
-fn workers_wait_for_status_ceiling_preserves_serial_controller_availability() {
-    assert!(
-        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS <= 120,
-        "wait_for_status must remain at most 120s while run_stdio dispatches serially: its blocking wait prevents stop_worker and archive_worker on the same control channel"
+fn workers_serve_answers_ping_while_a_request_is_pending_and_drops_cancelled_requests() {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"block","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
+        "\n",
+    );
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let handler = |request: serde_json::Value, cancel: &AtomicBool| {
+        let id = request["id"].clone();
+        if request["method"] == "block" {
+            // A serial loop would never read the cancellation line: this only
+            // returns once `serve` processed it concurrently.
+            while !cancel.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} }))
+    };
+    zeron_workers_unpeel::controller_mcp_serve(
+        Cursor::new(input),
+        SharedWriter(Arc::clone(&output)),
+        handler,
+    )
+    .expect("serve drains its input");
+
+    let written = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let ids: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![json!(2)],
+        "ping is answered and the cancelled request is not: {written}"
     );
 }
 
 #[test]
-fn workers_wait_for_status_ceiling_is_unified_at_120s_and_documented() {
+fn workers_wait_until_times_out_with_next_guidance_and_stops_on_cancel() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let result =
+        zeron_workers_unpeel::controller_mcp_wait_until(1, "gone-for-test", &cancel, || {
+            Ok(worker_with_state("running"))
+        })
+        .expect("timeout is a normal read");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(result["timed_out"], true);
+    assert_eq!(result["worker"]["state"], "running");
+    let next = result["next"].as_str().expect("next guidance");
+    assert!(
+        next.contains("[worker-task-notification]") && next.contains("end your turn"),
+        "{next}"
+    );
+    assert_eq!(next, zeron_workers_unpeel::WAIT_TIMED_OUT_NEXT);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flip = Arc::clone(&cancel);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        flip.store(true, Ordering::SeqCst);
+    });
+    let started = Instant::now();
+    let error =
+        zeron_workers_unpeel::controller_mcp_wait_until(60, "gone-for-test", &cancel, || {
+            Ok(worker_with_state("running"))
+        })
+        .expect_err("cancellation interrupts the wait");
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cancel must not wait for the deadline"
+    );
+
+    let matched =
+        zeron_workers_unpeel::controller_mcp_wait_until(60, "gone-for-test", &cancel, || {
+            Ok(worker_with_state("gone-for-test"))
+        })
+        .expect("match wins even when cancelled");
+    assert_eq!(matched["matched"], true);
+}
+
+#[test]
+fn workers_wait_for_status_ceiling_is_orchestrator_owned_and_documented() {
     assert_eq!(
         zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
-        120,
-        "the public constant for maximum wait duration must be 120s"
+        4 * 60 * 60,
+        "the ceiling is a 4h transport sanity bound; the orchestrator picks the actual wait"
     );
 
     let tools = controller_mcp_handle_request(json!({
@@ -672,7 +769,7 @@ fn workers_wait_for_status_ceiling_is_unified_at_120s_and_documented() {
     );
 
     assert_eq!(
-        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(1000)),
+        zeron_workers_unpeel::clamp_wait_for_status_timeout(Some(1_000_000)),
         zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS,
         "clamp must bound upper timeouts to WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS"
     );

@@ -132,6 +132,12 @@ fn codex_workers_mcp_overrides_for(
     if let Some(args) = server.get("args") {
         overrides.push(format!("mcp_servers.comet-workers.args={args}"));
     }
+    // The Workers wait is orchestrator-sized (up to hours); Codex's MCP client
+    // must not expire it first.
+    overrides.push(format!(
+        "mcp_servers.comet-workers.tool_timeout_sec={}",
+        crate::WORKERS_CLIENT_DEADLINE_SECONDS
+    ));
     if let Some(environment) = server.get("env").and_then(Value::as_array) {
         overrides.extend(environment.iter().filter_map(|row| {
             let name = row.get("name")?.as_str()?;
@@ -1600,6 +1606,14 @@ mod tests {
         assert!(overrides.iter().any(|value| {
             value == "mcp_servers.comet-workers.env.COMET_WORKERS_CONTROLLER=\"1\""
         }));
+        let deadline = format!(
+            "mcp_servers.comet-workers.tool_timeout_sec={}",
+            crate::WORKERS_CLIENT_DEADLINE_SECONDS
+        );
+        assert!(
+            overrides.iter().any(|value| *value == deadline),
+            "{overrides:?}"
+        );
         assert!(overrides.iter().any(|value| {
             value == "mcp_servers.comet-workers.env.COMET_WORKERS_PARENT_CHAT_ID=\"parent-chat\""
         }));
