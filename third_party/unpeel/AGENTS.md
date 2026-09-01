@@ -627,8 +627,10 @@ Core behavior:
   provider-owned JSONL; it requires the JSONL `session` id to match that binding
   and rejects input above 2 MiB per line, 16 MiB total, 100,000 records, or 128
   effective models. The adapter accepts only canonical JSONL beneath the exact
-  OMP `sessions` directory resolved for the default agent, custom agent dir,
-  named profile, or existing XDG data root. Core atomically stores only
+  OMP `sessions` directory resolved from explicit `--session-dir`, the default
+  agent, custom agent dir, named profile, or existing XDG data root. Its latest
+  model/thinking transition is active immediately, including at zero tokens.
+  Core atomically stores only
   total/per-model tokens bound to provider id and canonical transcript path.
   Transient read failure preserves the same-binding projection; trust or budget
   rejection removes it. Neither failure blocks the lifecycle event.
@@ -777,6 +779,8 @@ and clients.
 Provider telemetry follows the same boundary: runtime adapters own schema
 normalization, trusted-path validation, bounded reads, and fixtures; core owns
 atomic provider-id/path-aware projection persistence and optional Host fields.
+Ingress invalidates the prior projection if a newly reported binding cannot be
+persisted, rather than refreshing the old durable identity.
 Do not infer model or tokens from terminal output, launch configuration, cost
 fields, or global provider settings.
 

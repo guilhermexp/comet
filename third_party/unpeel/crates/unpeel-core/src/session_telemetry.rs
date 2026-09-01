@@ -181,6 +181,14 @@ pub fn load(session_id: &str) -> Option<SessionTelemetry> {
     )
 }
 
+pub fn invalidate(session_id: &str) -> Result<(), String> {
+    match std::fs::remove_file(marker_path(&crate::session_host::session_dir(session_id))) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

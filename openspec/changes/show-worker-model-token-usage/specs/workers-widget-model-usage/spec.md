@@ -27,8 +27,11 @@ Test: unit — ordered OMP model and thinking transitions plus disclosure projec
   messages
 - **THEN** each assistant message is attributed to the identity effective when
   that message was produced
-- **AND** the expanded breakdown lists the current identity first and every
-  earlier identity with its own accumulated total
+- **AND** the latest model or thinking transition is the current identity even
+  before it produces another assistant message
+- **AND** the expanded breakdown lists that current identity first, with zero
+  tokens when it has not produced a response, and every earlier identity with
+  its own accumulated total
 
 ### Requirement: Provider evidence is bound to the exact Worker Session
 
@@ -44,8 +47,9 @@ Test: integration — Worker lifecycle hook ingress and durable provider binding
 - **THEN** the provider metadata is persisted for that Worker without replacing
   or confusing the Worker Session identity
 - **AND** only a canonical provider JSONL path beneath the exact OMP `sessions`
-  directory resolved for the active default, custom-agent, named-profile, or
-  existing XDG data layout can contribute telemetry
+  directory resolved from an explicit `--session-dir` or the active default,
+  custom-agent, named-profile, or existing XDG data layout can contribute
+  telemetry
 - **AND** the JSONL `session` record declares the same provider conversation id
   persisted for that Worker
 
@@ -88,6 +92,15 @@ Test: integration — lifecycle refresh after trusted-path or budget rejection.
   validation after a prior successful refresh
 - **THEN** the prior projection is removed
 - **AND** the Worker retains its command-only fallback
+
+#### Scenario: A new provider binding cannot be persisted
+Test: integration — lifecycle binding write failure after valid telemetry.
+
+- **WHEN** a lifecycle event reports a new provider binding but its durable
+  marker cannot be written
+- **THEN** telemetry for the previously persisted binding is invalidated
+- **AND** the lifecycle event remains fail-soft and the Worker retains its
+  command-only fallback
 
 #### Scenario: An older or non-OMP Session has no telemetry fields
 Test: integration — backward-compatible Host bootstrap decoding.

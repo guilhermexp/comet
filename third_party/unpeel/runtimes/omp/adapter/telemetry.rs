@@ -50,6 +50,9 @@ fn parse_line(
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_owned);
+            *active_model = latest_model
+                .clone()
+                .map(|model| with_thinking(model, latest_thinking.as_deref()));
         }
         Some("thinking_level_change") => {
             *latest_thinking = value
@@ -58,6 +61,9 @@ fn parse_line(
                 .map(str::trim)
                 .filter(|thinking| !thinking.is_empty())
                 .map(str::to_owned);
+            *active_model = latest_model
+                .clone()
+                .map(|model| with_thinking(model, latest_thinking.as_deref()));
         }
         Some("message") => {
             let Some(message) = value.get("message") else {
@@ -76,6 +82,7 @@ fn parse_line(
             let Some(model) = effective_model(message, latest_model.as_deref()) else {
                 return Ok(());
             };
+            *latest_model = Some(model.clone());
             let model = with_thinking(model, latest_thinking.as_deref());
             if !totals.contains_key(&model) && totals.len() >= MAX_MODELS {
                 return Err("OMP telemetry exceeds the model bound".into());
@@ -196,6 +203,12 @@ fn read_path_typed(
     let Some(active_model) = active_model else {
         return Ok(None);
     };
+    if !totals.contains_key(&active_model) && totals.len() >= MAX_MODELS {
+        return Err(SessionTelemetryReadError::Rejected(
+            "OMP telemetry exceeds the model bound".into(),
+        ));
+    }
+    totals.entry(active_model.clone()).or_default();
     let total_tokens = totals.values().copied().fold(0u64, u64::saturating_add);
     let mut models = totals
         .into_iter()
@@ -224,22 +237,22 @@ fn nonempty_env(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn command_profile(command: &str) -> Option<String> {
+fn command_option(command: &str, name: &str) -> Option<String> {
     let words = crate::transcripts::shell_words(command);
-    let mut profile = None;
+    let mut value = None;
     let mut words = words.iter();
     while let Some(word) = words.next() {
-        if word == "--profile" {
-            profile = words.next().cloned();
-        } else if let Some(value) = word.strip_prefix("--profile=") {
-            profile = Some(value.to_owned());
+        if word == name {
+            value = words.next().cloned();
+        } else if let Some(option) = word.strip_prefix(&format!("{name}=")) {
+            value = Some(option.to_owned());
         }
     }
-    profile
+    value
 }
 
 fn profile_name(command: &str) -> Result<Option<String>, String> {
-    let profile = command_profile(command)
+    let profile = command_option(command, "--profile")
         .or_else(|| std::env::var("OMP_PROFILE").ok())
         .or_else(|| std::env::var("PI_PROFILE").ok());
     let Some(profile) = profile.map(|value| value.trim().to_owned()) else {
@@ -263,7 +276,18 @@ fn profile_name(command: &str) -> Result<Option<String>, String> {
     Ok(Some(profile))
 }
 
-fn omp_sessions_root(command: &str) -> Result<PathBuf, String> {
+fn omp_sessions_root(command: &str, cwd: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = command_option(command, "--session-dir") {
+        let path = PathBuf::from(path.trim());
+        if path.as_os_str().is_empty() {
+            return Err("OMP Session directory is empty".into());
+        }
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
+    }
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
@@ -312,7 +336,7 @@ pub(crate) fn read(
     let (Some(provider_session_id), Some(path)) = (provider_session_id, path) else {
         return Ok(None);
     };
-    let root = omp_sessions_root(&manifest.session.command)
+    let root = omp_sessions_root(&manifest.session.command, Path::new(&manifest.cwd))
         .map_err(SessionTelemetryReadError::Rejected)?;
     read_path_typed(Path::new(&path), &root, &provider_session_id)
 }
@@ -471,6 +495,38 @@ mod tests {
             .expect("fixture has assistant usage");
         assert_eq!(telemetry.total_tokens, u64::MAX);
         assert_eq!(telemetry.models[0].total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn final_model_change_becomes_active_without_new_usage() {
+        let root = tempfile::tempdir().expect("OMP root");
+        let transcript = root.path().join("final-model-change.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session\",\"id\":\"omp-1\"}\n{\"type\":\"model_change\",\"model\":\"p/a\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":10}}}\n{\"type\":\"model_change\",\"model\":\"p/b\"}\n",
+        )
+        .expect("write model-switch transcript");
+
+        let telemetry = read_path(&transcript, root.path(), "omp-1")
+            .expect("read OMP telemetry")
+            .expect("fixture has telemetry");
+
+        assert_eq!(telemetry.total_tokens, 10);
+        assert_eq!(
+            telemetry.models,
+            vec![
+                ModelTokenUsage {
+                    model: "p/b".into(),
+                    total_tokens: 0,
+                    active: true,
+                },
+                ModelTokenUsage {
+                    model: "p/a".into(),
+                    total_tokens: 10,
+                    active: false,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -641,5 +697,31 @@ mod tests {
                 .expect("XDG profile telemetry")
                 .is_some());
         }
+    }
+
+    #[test]
+    fn resolves_explicit_session_directory_before_implicit_roots() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let unpeel_home = tempfile::tempdir().expect("Unpeel home");
+        let home = tempfile::tempdir().expect("user home");
+        let explicit_root = tempfile::tempdir().expect("explicit Session root");
+        let transcript = explicit_root.path().join("project/explicit.jsonl");
+        write_usage_transcript(&transcript);
+        let _env = EnvGuard::set(&[
+            ("UNPEEL_HOME", Some(unpeel_home.path())),
+            ("HOME", Some(home.path())),
+            ("PI_CODING_AGENT_DIR", None),
+            ("OMP_PROFILE", None),
+            ("PI_PROFILE", None),
+            ("XDG_DATA_HOME", None),
+            ("PI_CONFIG_DIR", None),
+        ]);
+
+        assert!(read(&manifest(
+            &format!("omp --session-dir={}", explicit_root.path().display()),
+            &transcript,
+        ))
+        .expect("explicit Session directory telemetry")
+        .is_some());
     }
 }

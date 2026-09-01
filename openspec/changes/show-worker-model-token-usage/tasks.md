@@ -11,16 +11,18 @@
 
 - [x] 2.1 Add provider-owned OMP JSONL fixtures and RED tests for ordered model
   and thinking transitions, assistant-only totals, malformed records,
-  saturation, and current-first ordering.
+  saturation, terminal model switches with zero usage, and current-first
+  ordering.
 - [x] 2.2 Add RED core tests for trusted-root and JSONL validation, provider-id
   mismatch, byte/record/model bounds, symlink escape rejection, atomic marker
   replacement, canonical-path binding, hard-rejection invalidation, and
   transient same-binding last-valid preservation.
 - [x] 2.3 Implement the provider-neutral telemetry types/persistence seam and
-  the OMP runtime normalizer with official Session-root resolution,
+  the OMP runtime normalizer with explicit/official Session-root resolution,
   provider-id/path binding, bounded parsing, and fail-soft lifecycle handling.
 - [x] 2.4 Refresh the durable projection only after provider metadata changes or
-  accepted Stop lifecycle events, then run runtime and ingress tests to GREEN.
+  accepted Stop lifecycle events, invalidate stale telemetry when binding
+  persistence fails, then run runtime and ingress tests to GREEN.
 
 ## 3. Host and Workers Frontier
 
