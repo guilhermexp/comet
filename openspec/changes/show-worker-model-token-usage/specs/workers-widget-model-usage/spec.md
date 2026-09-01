@@ -27,8 +27,11 @@ Test: unit — ordered OMP model and thinking transitions plus disclosure projec
   messages
 - **THEN** each assistant message is attributed to the identity effective when
   that message was produced
-- **AND** the expanded breakdown lists the current identity first and every
-  earlier identity with its own accumulated total
+- **AND** the latest model or thinking transition is the current identity even
+  before it produces another assistant message
+- **AND** the expanded breakdown lists that current identity first, with zero
+  tokens when it has not produced a response, and every earlier identity with
+  its own accumulated total
 
 ### Requirement: Provider evidence is bound to the exact Worker Session
 
@@ -43,8 +46,20 @@ Test: integration — Worker lifecycle hook ingress and durable provider binding
   transcript path for a URL-addressed Worker Session
 - **THEN** the provider metadata is persisted for that Worker without replacing
   or confusing the Worker Session identity
-- **AND** only a canonical provider JSONL path beneath the trusted OMP Session
-  root can contribute telemetry
+- **AND** only a canonical provider JSONL path beneath the exact OMP `sessions`
+  directory resolved from an explicit `--session-dir` or the active default,
+  custom-agent, named-profile, or existing XDG data layout can contribute
+  telemetry
+- **AND** the JSONL `session` record declares the same provider conversation id
+  persisted for that Worker
+
+#### Scenario: Provider telemetry exceeds its parsing budget
+Test: unit — OMP JSONL byte, record, and distinct-model bounds.
+
+- **WHEN** an OMP transcript exceeds any configured byte, record, or model bound
+- **THEN** no model usage projection is produced from that transcript
+- **AND** any prior projection for that same binding is removed
+- **AND** Worker lifecycle and command fallback remain available
 
 ### Requirement: Worker model usage degrades without disrupting the Worker
 
@@ -61,6 +76,31 @@ Test: unit — parser tolerance, optional wire decode, and UI fallback.
   invented model or token value
 - **AND** all existing Worker lifecycle and terminal behavior continues
   unchanged
+
+#### Scenario: The provider conversation binding changes
+Test: unit — provider-id and canonical-path-bound marker load.
+
+- **WHEN** a Worker's provider conversation id or canonical transcript path
+  changes
+- **THEN** telemetry stored for the previous provider conversation is not exposed
+- **AND** the Worker retains its command-only fallback
+
+#### Scenario: Current provider evidence is definitively rejected
+Test: integration — lifecycle refresh after trusted-path or budget rejection.
+
+- **WHEN** the current binding's transcript fails trusted-path or parsing-budget
+  validation after a prior successful refresh
+- **THEN** the prior projection is removed
+- **AND** the Worker retains its command-only fallback
+
+#### Scenario: A new provider binding cannot be persisted
+Test: integration — lifecycle binding write failure after valid telemetry.
+
+- **WHEN** a lifecycle event reports a new provider binding but its durable
+  marker cannot be written
+- **THEN** telemetry for the previously persisted binding is invalidated
+- **AND** the lifecycle event remains fail-soft and the Worker retains its
+  command-only fallback
 
 #### Scenario: An older or non-OMP Session has no telemetry fields
 Test: integration — backward-compatible Host bootstrap decoding.

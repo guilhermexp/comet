@@ -1737,7 +1737,7 @@ fn read_head_utf8(path: &Path, max_bytes: u64) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn shell_words(command: &str) -> Vec<String> {
+pub(crate) fn shell_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_single = false;

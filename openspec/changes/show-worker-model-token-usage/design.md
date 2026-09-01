@@ -37,7 +37,9 @@ The normalizer reads ordered provider records and never infers model or tokens
 from terminal paint, launch presets, or global configuration. Each assistant
 message contributes its valid non-negative `usage.totalTokens` once to the
 effective `provider/model:thinking` identity. Session total is the saturating
-sum of the per-model totals; reasoning tokens are not added separately.
+sum of the per-model totals; reasoning tokens are not added separately. The
+latest model/thinking transition defines the active identity immediately, with
+a zero-token entry until that identity produces an assistant message.
 
 Alternative considered: use the launch model flag or current OMP configuration.
 Rejected because both can differ from the model that produced earlier messages
@@ -48,8 +50,9 @@ and cannot account for mid-Session switches.
 The lifecycle hook URL remains the Worker Session authority. The OMP extension
 adds only provider conversation id and transcript path from its Session manager.
 Ingress persists those optional fields for the URL-addressed Worker before
-refreshing telemetry. Prompt, message, and response content never enters the
-hook payload.
+refreshing telemetry. If a reported binding cannot be persisted, ingress
+invalidates the previous projection instead of refreshing it under stale
+identity. Prompt, message, and response content never enters the hook payload.
 
 Alternative considered: discover the newest OMP transcript by cwd or mtime.
 Rejected because concurrent Workers can share a checkout and would be
@@ -57,10 +60,17 @@ misattributed.
 
 ### D3 — Core validates and persists; the runtime adapter normalizes
 
-Provider-specific JSONL interpretation lives with the OMP runtime package.
-Provider-neutral core owns canonical trusted-root validation, symlink-escape
-rejection, bounded reads, atomic marker replacement, and runtime dispatch. A
-failed refresh preserves the last valid marker.
+Provider-specific JSONL interpretation and trusted-root validation live with the
+OMP runtime package. The adapter resolves the exact OMP `sessions` directory for
+an explicit `--session-dir`, the default agent directory,
+`PI_CODING_AGENT_DIR`, named profiles, and existing XDG data roots, then rejects
+non-JSONL files and canonical paths that escape it.
+The parser accepts at most 2 MiB per line, 16 MiB total, 100,000 records, and 128
+effective models, and requires the JSONL Session id to equal the persisted
+provider binding. Provider-neutral core atomically stores the projection bound
+to both that id and the canonical transcript path. A transient read failure
+preserves the last valid same-binding marker, while a trust or budget rejection
+removes it; loads hide markers after either binding component changes.
 
 Alternative considered: parse OMP JSONL directly in Comet's UI/frontier.
 Rejected because it leaks provider behavior across the vendored boundary and
@@ -97,8 +107,9 @@ terminal access.
 
 ## Risks / Trade-offs
 
-- [OMP changes its JSONL schema] → Ignore unknown/malformed records, keep the
-  last valid projection, and lock supported shapes with provider fixtures.
+- [OMP changes its JSONL schema] → Ignore unknown/malformed records and lock
+  supported shapes with provider fixtures; definitive validation rejection
+  removes the current projection.
 - [A path claim escapes the provider Session root] → Canonicalize both root and
   candidate, reject symlink escape and non-JSONL files before reading.
 - [A lifecycle refresh sees a partially appended JSONL line] → Ignore that
