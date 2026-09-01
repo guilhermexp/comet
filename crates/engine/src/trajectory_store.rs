@@ -10,6 +10,7 @@
 //! - Queue saturation or transaction failure records explicit degraded intervals rather than failing.
 //! - Stores only sanitized representations and opaque Run Journal references; never duplicate raw bodies.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,7 @@ use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use zeron_proto::trajectory::*;
 use zeron_proto::{AgentEvent, DoneStatus, ToolCall};
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +37,23 @@ pub enum TrajectoryStoreError {
     ChannelClosed,
     #[error("other: {0}")]
     Other(String),
+}
+
+/// Store commit and lifecycle events emitted to watchers.
+#[derive(Debug, Clone)]
+pub enum TrajectoryStoreEvent {
+    RecordsCommitted {
+        chat_id: String,
+        records: Arc<Vec<TrajectoryRecord>>,
+        watermark: (u64, u32),
+    },
+    DegradedRecorded {
+        chat_id: String,
+        interval: TrajectoryDegradedInterval,
+    },
+    ChatDeleted {
+        chat_id: String,
+    },
 }
 
 /// Ordered, append-only migrations.
@@ -166,6 +184,7 @@ pub struct TrajectoryStore {
     pub(crate) writer_tx: SyncSender<WriterCommand>,
     pub(crate) in_memory_degraded: Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
     pub(crate) degraded_reason: Arc<Mutex<Option<String>>>,
+    pub(crate) events_tx: broadcast::Sender<TrajectoryStoreEvent>,
 }
 
 impl TrajectoryStore {
@@ -185,11 +204,11 @@ impl TrajectoryStore {
         }
 
         let (writer_tx, writer_rx) = sync_channel::<WriterCommand>(CAPTURE_QUEUE_CAPACITY);
+        let (events_tx, _) = broadcast::channel(2048);
+        let writer_events_tx = events_tx.clone();
         let writer_db_path = db_path.clone();
         let in_memory_degraded = Arc::new(Mutex::new(Vec::new()));
         let writer_in_mem = in_memory_degraded.clone();
-
-        // Spawn ordered background writer OS thread
         std::thread::Builder::new()
             .name("trajectory-writer".into())
             .spawn(move || {
@@ -212,19 +231,39 @@ impl TrajectoryStore {
                                 match next {
                                     WriterCommand::WriteRecords(more) => records.extend(more),
                                     other => {
-                                        flush_batch_to_writer(&mut conn, &records, &writer_in_mem);
+                                        flush_batch_to_writer(
+                                            &mut conn,
+                                            &records,
+                                            &writer_in_mem,
+                                            &writer_events_tx,
+                                        );
                                         records.clear();
-                                        handle_writer_command(&mut conn, other, &writer_in_mem);
+                                        handle_writer_command(
+                                            &mut conn,
+                                            other,
+                                            &writer_in_mem,
+                                            &writer_events_tx,
+                                        );
                                         break;
                                     }
                                 }
                             }
                             if !records.is_empty() {
-                                flush_batch_to_writer(&mut conn, &records, &writer_in_mem);
+                                flush_batch_to_writer(
+                                    &mut conn,
+                                    &records,
+                                    &writer_in_mem,
+                                    &writer_events_tx,
+                                );
                             }
                         }
                         other => {
-                            handle_writer_command(&mut conn, other, &writer_in_mem);
+                            handle_writer_command(
+                                &mut conn,
+                                other,
+                                &writer_in_mem,
+                                &writer_events_tx,
+                            );
                         }
                     }
                 }
@@ -237,6 +276,7 @@ impl TrajectoryStore {
             writer_tx,
             in_memory_degraded,
             degraded_reason: Arc::new(Mutex::new(None)),
+            events_tx,
         })
     }
 
@@ -245,18 +285,29 @@ impl TrajectoryStore {
         let db_path = store_root.as_ref().join("trajectory.sqlite3");
         let journals_dir = store_root.as_ref().join("journals");
         let (writer_tx, _) = sync_channel(1);
+        let (events_tx, _) = broadcast::channel(2048);
         Self {
             db_path,
             journals_dir,
             writer_tx,
             in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
             degraded_reason: Arc::new(Mutex::new(Some(reason.into()))),
+            events_tx,
         }
     }
-
     /// True if this store is running in degraded mode due to initialization failure.
     pub fn is_degraded(&self) -> bool {
         self.degraded_reason.lock().unwrap().is_some()
+    }
+
+    /// Subscribe to real-time committed records, degraded intervals, and deletions.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<TrajectoryStoreEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Access the event broadcast sender.
+    pub fn events_tx(&self) -> broadcast::Sender<TrajectoryStoreEvent> {
+        self.events_tx.clone()
     }
 
     /// Determine the minimum committed native (non-legacy) `source_seq` for `chat_id`.
@@ -343,7 +394,11 @@ impl TrajectoryStore {
                 reason: format!("Store degraded: {}", reason),
                 recorded_at: Utc::now(),
             };
-            self.record_degraded_in_memory(degraded);
+            self.record_degraded_in_memory(degraded.clone());
+            let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                chat_id: record.chat_id.clone(),
+                interval: degraded,
+            });
             return Err(TrajectoryStoreError::Other(format!(
                 "store degraded: {}",
                 reason
@@ -369,8 +424,11 @@ impl TrajectoryStore {
                     reason: "Queue saturated".into(),
                     recorded_at: Utc::now(),
                 };
-                // Direct in-memory recording does not depend on space in the full queue!
-                self.record_degraded_in_memory(degraded);
+                self.record_degraded_in_memory(degraded.clone());
+                let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                    chat_id: record.chat_id.clone(),
+                    interval: degraded,
+                });
                 Err(TrajectoryStoreError::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -382,7 +440,11 @@ impl TrajectoryStore {
                     reason: "Writer channel closed".into(),
                     recorded_at: Utc::now(),
                 };
-                self.record_degraded_in_memory(degraded);
+                self.record_degraded_in_memory(degraded.clone());
+                let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                    chat_id: record.chat_id.clone(),
+                    interval: degraded,
+                });
                 Err(TrajectoryStoreError::ChannelClosed)
             }
         }
@@ -407,7 +469,11 @@ impl TrajectoryStore {
                     reason: format!("Store degraded: {}", reason),
                     recorded_at: Utc::now(),
                 };
-                self.record_degraded_in_memory(degraded);
+                self.record_degraded_in_memory(degraded.clone());
+                let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                    chat_id: first.chat_id.clone(),
+                    interval: degraded,
+                });
             }
             return Err(TrajectoryStoreError::Other(format!(
                 "store degraded: {}",
@@ -430,7 +496,11 @@ impl TrajectoryStore {
                         reason: "Queue saturated during batch".into(),
                         recorded_at: Utc::now(),
                     };
-                    self.record_degraded_in_memory(degraded);
+                    self.record_degraded_in_memory(degraded.clone());
+                    let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                        chat_id: first.chat_id.clone(),
+                        interval: degraded,
+                    });
                 }
                 Err(TrajectoryStoreError::QueueFull)
             }
@@ -515,6 +585,60 @@ impl TrajectoryStore {
         chat_id: &str,
     ) -> Result<Vec<TrajectoryRecord>, TrajectoryStoreError> {
         self.list_records(chat_id, None, None)
+    }
+
+    /// Read an ordered slice of records for `chat_id` after `after_cursor` in `(source_seq, sub_seq)` order.
+    pub fn list_records_after_cursor(
+        &self,
+        chat_id: &str,
+        after_cursor: Option<zeron_rpc::TrajectoryCursor>,
+        limit: Option<usize>,
+    ) -> Result<Vec<TrajectoryRecord>, TrajectoryStoreError> {
+        if self.is_degraded() {
+            return Ok(Vec::new());
+        }
+        let _ = self.ensure_legacy_imported(chat_id);
+        let conn = self.reader()?;
+        let lim = limit.unwrap_or(10_000) as i64;
+
+        let rows = match after_cursor {
+            Some(cursor) => {
+                let mut stmt = conn.prepare(
+                    "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                            title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                            timing, usage, payload, result, error_message, is_degraded
+                     FROM trajectory_records
+                     WHERE chat_id = ?1 AND (source_seq > ?2 OR (source_seq = ?2 AND sub_seq > ?3))
+                     ORDER BY source_seq ASC, sub_seq ASC
+                     LIMIT ?4",
+                )?;
+                stmt.query_map(
+                    params![
+                        chat_id,
+                        cursor.source_seq as i64,
+                        cursor.sub_seq as i64,
+                        lim
+                    ],
+                    row_to_record,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                            title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                            timing, usage, payload, result, error_message, is_degraded
+                     FROM trajectory_records
+                     WHERE chat_id = ?1
+                     ORDER BY source_seq ASC, sub_seq ASC
+                     LIMIT ?2",
+                )?;
+                stmt.query_map(params![chat_id, lim], row_to_record)?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        Ok(rows)
     }
 
     /// Fetch latest recorded watermark for `chat_id`.
@@ -1035,6 +1159,7 @@ fn flush_batch_to_writer(
     conn: &mut Connection,
     records: &[TrajectoryRecord],
     in_mem: &Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
+    events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
 ) {
     if records.is_empty() {
         return;
@@ -1064,6 +1189,30 @@ fn flush_batch_to_writer(
                     degraded.recorded_at.timestamp_millis()
                 ],
             );
+            let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                chat_id: degraded.chat_id.clone(),
+                interval: degraded,
+            });
+        }
+    } else {
+        let mut by_chat: HashMap<String, Vec<TrajectoryRecord>> = HashMap::new();
+        for r in records {
+            by_chat
+                .entry(r.chat_id.clone())
+                .or_default()
+                .push(r.clone());
+        }
+        for (chat_id, chat_recs) in by_chat {
+            let max_cursor = chat_recs
+                .iter()
+                .map(|r| (r.source_seq, r.sub_seq))
+                .max()
+                .unwrap_or((0, 0));
+            let _ = events_tx.send(TrajectoryStoreEvent::RecordsCommitted {
+                chat_id,
+                records: Arc::new(chat_recs),
+                watermark: max_cursor,
+            });
         }
     }
 }
@@ -1072,19 +1221,25 @@ fn handle_writer_command(
     conn: &mut Connection,
     cmd: WriterCommand,
     in_mem: &Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
+    events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
 ) {
     match cmd {
         WriterCommand::WriteRecords(recs) => {
-            flush_batch_to_writer(conn, &recs, in_mem);
+            flush_batch_to_writer(conn, &recs, in_mem, events_tx);
         }
         WriterCommand::DeleteChat(chat_id, reply) => {
             let res = delete_chat_tx(conn, &chat_id);
+            if res.is_ok() {
+                let _ = events_tx.send(TrajectoryStoreEvent::ChatDeleted {
+                    chat_id: chat_id.clone(),
+                });
+            }
             if let Some(tx) = reply {
                 tx.send(res);
             }
         }
         WriterCommand::RetainChats(live_ids, reply) => {
-            let res = retain_chats_tx(conn, &live_ids);
+            let res = retain_chats_tx(conn, &live_ids, events_tx);
             if let Some(tx) = reply {
                 tx.send(res);
             }
@@ -1102,6 +1257,18 @@ fn handle_writer_command(
                 let count = records.len();
                 write_records_tx(conn, &records)?;
                 record_legacy_import_tx(conn, &chat_id, &fingerprint, count)?;
+                if !records.is_empty() {
+                    let max_cursor = records
+                        .iter()
+                        .map(|r| (r.source_seq, r.sub_seq))
+                        .max()
+                        .unwrap_or((0, 0));
+                    let _ = events_tx.send(TrajectoryStoreEvent::RecordsCommitted {
+                        chat_id: chat_id.clone(),
+                        records: Arc::new(records),
+                        watermark: max_cursor,
+                    });
+                }
                 Ok(())
             })();
             if let Some(tx) = reply {
@@ -1109,6 +1276,29 @@ fn handle_writer_command(
             }
         }
     }
+}
+
+fn retain_chats_tx(
+    conn: &Connection,
+    live_ids: &[String],
+    events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
+) -> Result<usize, TrajectoryStoreError> {
+    let mut total_deleted = 0;
+    let mut stmt = conn.prepare("SELECT DISTINCT chat_id FROM trajectory_records")?;
+    let all_chats: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for chat_id in all_chats {
+        if !live_ids.contains(&chat_id) {
+            delete_chat_tx(conn, &chat_id)?;
+            let _ = events_tx.send(TrajectoryStoreEvent::ChatDeleted {
+                chat_id: chat_id.clone(),
+            });
+            total_deleted += 1;
+        }
+    }
+    Ok(total_deleted)
 }
 
 fn write_records_tx(
@@ -1254,22 +1444,6 @@ fn delete_chat_tx(conn: &Connection, chat_id: &str) -> Result<(), TrajectoryStor
         params![chat_id],
     )?;
     Ok(())
-}
-
-fn retain_chats_tx(conn: &Connection, live_ids: &[String]) -> Result<usize, TrajectoryStoreError> {
-    let mut total_deleted = 0;
-    let mut stmt = conn.prepare("SELECT DISTINCT chat_id FROM trajectory_records")?;
-    let all_chats: Vec<String> = stmt
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for chat_id in all_chats {
-        if !live_ids.contains(&chat_id) {
-            delete_chat_tx(conn, &chat_id)?;
-            total_deleted += 1;
-        }
-    }
-    Ok(total_deleted)
 }
 
 /// Project a normalized AgentEvent into a TrajectoryRecord.
@@ -2035,12 +2209,14 @@ mod tests {
 
         // Dropping the receiver / closing writer simulates channel loss
         let (closed_tx, _) = sync_channel(1);
+        let (events_tx, _) = broadcast::channel(1);
         let broken_store = TrajectoryStore {
             db_path: store.db_path.clone(),
             journals_dir: temp.path().join("journals"),
             writer_tx: closed_tx,
             in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
             degraded_reason: Arc::new(Mutex::new(None)),
+            events_tx,
         };
 
         let rec = sample_record("chat_fail", "r1", 100, 0);
@@ -2111,12 +2287,14 @@ mod tests {
     async fn test_trajectory_store_queue_saturation_direct_marker() {
         let temp = TempDir::new().unwrap();
         let (writer_tx, writer_rx) = sync_channel::<WriterCommand>(1);
+        let (events_tx, _) = broadcast::channel(1);
         let store = TrajectoryStore {
             db_path: temp.path().join("trajectory.sqlite3"),
             journals_dir: temp.path().join("journals"),
             writer_tx,
             in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
             degraded_reason: Arc::new(Mutex::new(None)),
+            events_tx,
         };
 
         // Fill the 1-capacity queue

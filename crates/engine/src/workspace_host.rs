@@ -2053,12 +2053,14 @@ mod tests {
 
         // Set a broken trajectory store whose writer channel is closed
         let (closed_tx, _) = std::sync::mpsc::sync_channel(1);
+        let (events_tx, _) = tokio::sync::broadcast::channel(1);
         let broken_traj_store = std::sync::Arc::new(crate::trajectory_store::TrajectoryStore {
             db_path: dir.path().join("trajectory.sqlite3"),
             journals_dir: dir.path().join("journals"),
             writer_tx: closed_tx,
             in_memory_degraded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             degraded_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            events_tx,
         });
         host.set_trajectory_store(broken_traj_store);
 

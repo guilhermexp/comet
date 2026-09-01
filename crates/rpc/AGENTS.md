@@ -18,6 +18,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - Handler é async e não bloqueia: enumerar path, ler arquivo e afins vão pra `spawn_blocking`.
 - No IPC local, `ProtocolError::HandshakeIncomplete` significa que o peer TCP saiu antes do upgrade e fica em debug; handshakes completos inválidos, `Origin` de browser e demais falhas continuam em warning.
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.
+- `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded). Cursors e watermarks de Trajectory utilizam a tupla completa `(source_seq, sub_seq)` para garantir desambiguação exata.
 
 ## Work Guidance
 
@@ -30,6 +31,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/**` (envelopes, transporte) | unit | `cargo test -p zeron-rpc` |
+| `src/lib.rs` (Trajectory wire contracts, cursor ordering, params/items serde) | unit | `cargo test -p zeron-rpc trajectory` |
 | `src/server.rs` (classificação do handshake IPC) | unit | `cargo test -p zeron-rpc server::tests::only_an_incomplete_websocket_handshake_is_benign -- --exact` |
 | `tests/device_room.rs` | integration — roteamento de socket virtual | `cargo test -p zeron-rpc` |
 | `tests/device_room.rs` (revogação de credencial) | integration | `cargo test -p zeron-rpc --test device_room sign_out_closes_cached_peer_links -- --exact` |

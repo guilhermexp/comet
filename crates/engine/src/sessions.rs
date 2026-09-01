@@ -324,6 +324,14 @@ impl SessionsEngine {
         *slot = Some(store);
     }
 
+    pub fn trajectory_store(&self) -> Option<Arc<TrajectoryStore>> {
+        lock(&self.inner.trajectory).clone()
+    }
+
+    pub fn run_journal(&self) -> Arc<crate::run_journal::RunJournal> {
+        self.inner.journal.clone()
+    }
+
     pub fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
         self.inner.publish(chat_id, event)
     }

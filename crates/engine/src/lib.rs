@@ -443,7 +443,9 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
-        .with_auth(self.auth());
+        .with_auth(self.auth())
+        .with_trajectory_store(self.trajectory.clone())
+        .with_run_journal(self.sessions.run_journal());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

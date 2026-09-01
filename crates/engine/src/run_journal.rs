@@ -19,6 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use zeron_proto::{AgentEvent, FileToolInputSnapshot, ToolCall, ToolDiff};
+use zeron_rpc::{TrajectoryRawField, TrajectoryRawRevealResult, TrajectoryUnavailableReason};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -71,7 +72,7 @@ impl RunJournal {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn path_for(&self, chat_id: &str) -> PathBuf {
+    pub fn path_for(&self, chat_id: &str) -> PathBuf {
         self.dir.join(format!("{}.jsonl", sanitize_id(chat_id)))
     }
 
@@ -199,6 +200,114 @@ impl RunJournal {
         Ok(self
             .file_tool_input_scoped_impl(chat_id, tool_call_id, parent_tool_use_id, max_bytes)?
             .0)
+    }
+
+    /// Locate and extract a raw field from the local Run Journal entry.
+    ///
+    /// Validates `source_seq`, unwrap subagents if `parent_tool_use_id` is provided,
+    /// checks matching `call_id`, and safely extracts the requested `Payload` or `Result`.
+    pub fn raw_reveal(
+        &self,
+        chat_id: &str,
+        source_seq: u64,
+        parent_tool_use_id: Option<&str>,
+        call_id: Option<&str>,
+        field: TrajectoryRawField,
+    ) -> Result<TrajectoryRawRevealResult, JournalError> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return Ok(TrajectoryRawRevealResult::unavailable(
+                field,
+                TrajectoryUnavailableReason::NotFound,
+                Some("Journal file not found".into()),
+            ));
+        }
+
+        let mut matched_result: Option<TrajectoryRawRevealResult> = None;
+        let mut had_corrupt_line = false;
+
+        let stats = scan_lines_reverse_until(&path, |line| {
+            let parsed = match serde_json::from_slice::<JournalLine>(line) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "journal: raw_reveal encountered malformed line"
+                    );
+                    had_corrupt_line = true;
+                    return Ok(false);
+                }
+            };
+
+            if parsed.seq == source_seq {
+                let event = match (parent_tool_use_id, parsed.event) {
+                    (None, AgentEvent::Subagent { .. }) => {
+                        matched_result = Some(TrajectoryRawRevealResult::unavailable(
+                            field,
+                            TrajectoryUnavailableReason::MismatchedReference,
+                            Some(
+                                "Event is a nested subagent event but no parentToolUseId provided"
+                                    .into(),
+                            ),
+                        ));
+                        return Ok(true);
+                    }
+                    (None, event) => event,
+                    (Some(scope), event) => match event_in_subagent_scope(event, scope) {
+                        Some(event) => event,
+                        None => {
+                            matched_result = Some(TrajectoryRawRevealResult::unavailable(
+                                field,
+                                TrajectoryUnavailableReason::MismatchedReference,
+                                Some("Subagent parentToolUseId scope not found in event".into()),
+                            ));
+                            return Ok(true);
+                        }
+                    },
+                };
+
+                let res = match field {
+                    TrajectoryRawField::Payload => extract_raw_payload(&event, call_id),
+                    TrajectoryRawField::Result => extract_raw_result(&event, call_id),
+                };
+                matched_result = Some(res);
+                return Ok(true);
+            }
+
+            if parsed.seq < source_seq {
+                // Since seq increases monotonically, reverse scan passing source_seq means not found
+                return Ok(true);
+            }
+
+            Ok(false)
+        })?;
+
+        if stats.oversized_line {
+            return Ok(TrajectoryRawRevealResult::unavailable(
+                field,
+                TrajectoryUnavailableReason::SourceOversized,
+                Some("Journal source line exceeds maximum scan line size".into()),
+            ));
+        }
+
+        if let Some(res) = matched_result {
+            return Ok(res);
+        }
+
+        if had_corrupt_line {
+            return Ok(TrajectoryRawRevealResult::unavailable(
+                field,
+                TrajectoryUnavailableReason::SourceCorrupt,
+                Some("Journal file contains corrupt line".into()),
+            ));
+        }
+
+        Ok(TrajectoryRawRevealResult::unavailable(
+            field,
+            TrajectoryUnavailableReason::NotFound,
+            Some("Event sequence not found in journal".into()),
+        ))
     }
 
     fn file_tool_input_scoped_impl(
@@ -445,6 +554,196 @@ fn event_in_subagent_scope(event: AgentEvent, scope: &str) -> Option<AgentEvent>
         } if parent_tool_use_id == scope => Some(*event),
         AgentEvent::Subagent { event, .. } => event_in_subagent_scope(*event, scope),
         _ => None,
+    }
+}
+
+const MAX_RAW_REVEAL_BYTES: usize = 1024 * 1024;
+
+fn cap_reveal_text(mut text: String) -> String {
+    truncate_utf8_bytes(&mut text, MAX_RAW_REVEAL_BYTES);
+    text
+}
+
+fn extract_raw_payload(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryRawRevealResult {
+    match event {
+        AgentEvent::SessionStarted {
+            harness,
+            model,
+            tools,
+            cwd,
+            session_id,
+            assistant_message_id,
+        } => {
+            let info = serde_json::json!({
+                "harness": harness,
+                "model": model,
+                "tools": tools,
+                "cwd": cwd,
+                "sessionId": session_id,
+                "assistantMessageId": assistant_message_id,
+            });
+            TrajectoryRawRevealResult::available(
+                TrajectoryRawField::Payload,
+                cap_reveal_text(serde_json::to_string_pretty(&info).unwrap_or_default()),
+            )
+        }
+        AgentEvent::UserMessage { text } => TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Payload,
+            cap_reveal_text(text.clone()),
+        ),
+        AgentEvent::TextDelta { text } => TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Payload,
+            cap_reveal_text(text.clone()),
+        ),
+        AgentEvent::ReasoningDelta { text } => TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Payload,
+            cap_reveal_text(text.clone()),
+        ),
+        AgentEvent::ToolCall { id, call } => {
+            if let Some(expected_id) = call_id {
+                if id != expected_id {
+                    return TrajectoryRawRevealResult::unavailable(
+                        TrajectoryRawField::Payload,
+                        TrajectoryUnavailableReason::MismatchedReference,
+                        Some(format!(
+                            "Call id mismatch: expected {expected_id}, found {id}"
+                        )),
+                    );
+                }
+            }
+            let raw_text = match call {
+                ToolCall::WriteFile {
+                    content: Some(c), ..
+                } => c.clone(),
+                ToolCall::WriteFile {
+                    path,
+                    content: None,
+                } => format!("WriteFile: {path}"),
+                ToolCall::EditFile {
+                    old_string,
+                    new_string,
+                    path,
+                } => serde_json::json!({
+                    "path": path,
+                    "oldString": old_string,
+                    "newString": new_string,
+                })
+                .to_string(),
+                other => {
+                    serde_json::to_string_pretty(other).unwrap_or_else(|_| format!("{:?}", other))
+                }
+            };
+            TrajectoryRawRevealResult::available(
+                TrajectoryRawField::Payload,
+                cap_reveal_text(raw_text),
+            )
+        }
+        AgentEvent::ToolCallPreview { id, call } => {
+            if let Some(expected_id) = call_id {
+                if id != expected_id {
+                    return TrajectoryRawRevealResult::unavailable(
+                        TrajectoryRawField::Payload,
+                        TrajectoryUnavailableReason::MismatchedReference,
+                        Some(format!(
+                            "Call id mismatch: expected {expected_id}, found {id}"
+                        )),
+                    );
+                }
+            }
+            TrajectoryRawRevealResult::available(
+                TrajectoryRawField::Payload,
+                cap_reveal_text(
+                    serde_json::to_string_pretty(call).unwrap_or_else(|_| format!("{:?}", call)),
+                ),
+            )
+        }
+        AgentEvent::InputRequested { questions, .. } => {
+            let raw_text = serde_json::to_string_pretty(questions).unwrap_or_default();
+            TrajectoryRawRevealResult::available(
+                TrajectoryRawField::Payload,
+                cap_reveal_text(raw_text),
+            )
+        }
+        AgentEvent::Error { message } => TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Payload,
+            cap_reveal_text(message.clone()),
+        ),
+        _ => TrajectoryRawRevealResult::unavailable(
+            TrajectoryRawField::Payload,
+            TrajectoryUnavailableReason::MismatchedReference,
+            Some("Event does not have a raw payload field".into()),
+        ),
+    }
+}
+
+fn extract_raw_result(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryRawRevealResult {
+    match event {
+        AgentEvent::ToolResult {
+            id,
+            output,
+            diff,
+            is_error: _,
+            ..
+        } => {
+            if let Some(expected_id) = call_id {
+                if id != expected_id {
+                    return TrajectoryRawRevealResult::unavailable(
+                        TrajectoryRawField::Result,
+                        TrajectoryUnavailableReason::MismatchedReference,
+                        Some(format!(
+                            "Call id mismatch: expected {expected_id}, found {id}"
+                        )),
+                    );
+                }
+            }
+            if let Some(diff) = diff {
+                let diff_text =
+                    serde_json::to_string_pretty(diff).unwrap_or_else(|_| format!("{:?}", diff));
+                TrajectoryRawRevealResult::available(
+                    TrajectoryRawField::Result,
+                    cap_reveal_text(diff_text),
+                )
+            } else if let Some(out) = output {
+                TrajectoryRawRevealResult::available(
+                    TrajectoryRawField::Result,
+                    cap_reveal_text(out.clone()),
+                )
+            } else {
+                TrajectoryRawRevealResult::available(TrajectoryRawField::Result, String::new())
+            }
+        }
+        AgentEvent::Done {
+            status,
+            result,
+            error,
+            ..
+        } => {
+            if let Some(err) = error {
+                TrajectoryRawRevealResult::available(
+                    TrajectoryRawField::Result,
+                    cap_reveal_text(err.clone()),
+                )
+            } else if let Some(res) = result {
+                TrajectoryRawRevealResult::available(
+                    TrajectoryRawField::Result,
+                    cap_reveal_text(res.clone()),
+                )
+            } else {
+                TrajectoryRawRevealResult::available(
+                    TrajectoryRawField::Result,
+                    cap_reveal_text(format!("{:?}", status)),
+                )
+            }
+        }
+        AgentEvent::Error { message } => TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Result,
+            cap_reveal_text(message.clone()),
+        ),
+        _ => TrajectoryRawRevealResult::unavailable(
+            TrajectoryRawField::Result,
+            TrajectoryUnavailableReason::MismatchedReference,
+            Some("Event does not have a raw result field".into()),
+        ),
     }
 }
 

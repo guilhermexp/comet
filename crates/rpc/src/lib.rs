@@ -17,7 +17,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-
+pub use zeron_proto::trajectory::{
+    TrajectoryDegradedInterval, TrajectoryRawField, TrajectoryRawRef, TrajectoryRecord,
+    TrajectoryRecordId,
+};
 mod client;
 pub mod device_room;
 mod server;
@@ -169,6 +172,11 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    // Trajectory (device-local read model & explicit raw reveal; strictly IPC-only, never relay-forwarded).
+    /// Stream of bounded Trajectory snapshot frames and ordered live deltas.
+    pub const WATCH_TRAJECTORY: &str = "WatchTrajectory";
+    /// Device-local unary lookup to reveal one raw field from Run Journal.
+    pub const REVEAL_TRAJECTORY_RAW: &str = "RevealTrajectoryRaw";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -249,6 +257,247 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
     tokio::spawn(serve_connection(service, server_out, server_in));
     RpcClient::new(client_out, client_in)
+}
+
+// ---------------------------------------------------------------------------
+// Trajectory Wire Types
+// ---------------------------------------------------------------------------
+
+/// Full `(source_seq, sub_seq)` watermark/cursor for Trajectory watch and paging.
+///
+/// Critical invariant: `source_seq` alone is insufficient because legacy Interrupted records
+/// can share `source_seq` with a prefix record at `sub_seq = u32::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrajectoryCursor {
+    pub source_seq: u64,
+    pub sub_seq: u32,
+}
+
+impl TrajectoryCursor {
+    pub const fn new(source_seq: u64, sub_seq: u32) -> Self {
+        Self {
+            source_seq,
+            sub_seq,
+        }
+    }
+}
+
+impl From<(u64, u32)> for TrajectoryCursor {
+    fn from((source_seq, sub_seq): (u64, u32)) -> Self {
+        Self::new(source_seq, sub_seq)
+    }
+}
+
+impl From<&TrajectoryRecord> for TrajectoryCursor {
+    fn from(r: &TrajectoryRecord) -> Self {
+        Self::new(r.source_seq, r.sub_seq)
+    }
+}
+
+impl From<TrajectoryRecordId> for TrajectoryCursor {
+    fn from(id: TrajectoryRecordId) -> Self {
+        Self::new(id.source_seq, id.sub_seq)
+    }
+}
+
+impl From<&TrajectoryRecordId> for TrajectoryCursor {
+    fn from(id: &TrajectoryRecordId) -> Self {
+        Self::new(id.source_seq, id.sub_seq)
+    }
+}
+
+/// Request parameters for `WatchTrajectory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchTrajectoryParams {
+    pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_cursor: Option<TrajectoryCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl WatchTrajectoryParams {
+    pub fn new(chat_id: impl Into<String>) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+            after_cursor: None,
+            limit: None,
+        }
+    }
+
+    pub fn with_cursor(mut self, cursor: impl Into<TrajectoryCursor>) -> Self {
+        self.after_cursor = Some(cursor.into());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+/// Reason why a Trajectory watch stream reached a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrajectoryTerminalReason {
+    ChatDeleted,
+    StoreUnavailable,
+}
+
+/// Stream items emitted by `WatchTrajectory`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TrajectoryWatchItem {
+    /// Initial snapshot of historical records up to `watermark`.
+    /// May be delivered in multiple bounded frames if `has_more` is true.
+    Snapshot {
+        records: Vec<TrajectoryRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watermark: Option<TrajectoryCursor>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        degraded: Vec<TrajectoryDegradedInterval>,
+        #[serde(default)]
+        has_more: bool,
+    },
+    /// Live deltas emitted strictly after the snapshot watermark or previous delta watermark.
+    Deltas {
+        records: Vec<TrajectoryRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watermark: Option<TrajectoryCursor>,
+    },
+    /// Notification of a new degraded interval during active watch.
+    Degraded {
+        intervals: Vec<TrajectoryDegradedInterval>,
+    },
+    /// Explicit instruction to client to clear local state and resubscribe / resnapshot
+    /// when an unrecoverable gap is detected.
+    ResyncRequired { reason: String },
+    /// Stream closure due to terminal lifecycle events (e.g. Chat deleted).
+    Terminal {
+        reason: TrajectoryTerminalReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// Request parameters for `RevealTrajectoryRaw`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevealTrajectoryRawParams {
+    pub chat_id: String,
+    pub source_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub field: TrajectoryRawField,
+}
+
+impl RevealTrajectoryRawParams {
+    pub fn new(
+        chat_id: impl Into<String>,
+        source_seq: u64,
+        parent_tool_use_id: Option<String>,
+        call_id: Option<String>,
+        field: TrajectoryRawField,
+    ) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+            source_seq,
+            parent_tool_use_id,
+            call_id,
+            field,
+        }
+    }
+
+    pub fn to_raw_ref(&self) -> TrajectoryRawRef {
+        TrajectoryRawRef {
+            chat_id: self.chat_id.clone(),
+            source_seq: self.source_seq,
+            parent_tool_use_id: self.parent_tool_use_id.clone(),
+            call_id: self.call_id.clone(),
+            field: self.field,
+        }
+    }
+}
+
+impl From<TrajectoryRawRef> for RevealTrajectoryRawParams {
+    fn from(r: TrajectoryRawRef) -> Self {
+        Self {
+            chat_id: r.chat_id,
+            source_seq: r.source_seq,
+            parent_tool_use_id: r.parent_tool_use_id,
+            call_id: r.call_id,
+            field: r.field,
+        }
+    }
+}
+
+impl From<&TrajectoryRawRef> for RevealTrajectoryRawParams {
+    fn from(r: &TrajectoryRawRef) -> Self {
+        Self {
+            chat_id: r.chat_id.clone(),
+            source_seq: r.source_seq,
+            parent_tool_use_id: r.parent_tool_use_id.clone(),
+            call_id: r.call_id.clone(),
+            field: r.field,
+        }
+    }
+}
+
+/// Reason why a raw reveal lookup resulted in unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrajectoryUnavailableReason {
+    NotFound,
+    ForeignDevice,
+    ChatDeleted,
+    SourceCorrupt,
+    SourceOversized,
+    MismatchedReference,
+    UnsupportedSourceVersion,
+    StoreUnavailable,
+}
+
+/// Typed result returned by `RevealTrajectoryRaw`.
+///
+/// Invariant: Raw text is ephemeral response data and must NEVER be persisted or synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum TrajectoryRawRevealResult {
+    Available {
+        field: TrajectoryRawField,
+        text: String,
+    },
+    Unavailable {
+        field: TrajectoryRawField,
+        reason: TrajectoryUnavailableReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+impl TrajectoryRawRevealResult {
+    pub fn available(field: TrajectoryRawField, text: impl Into<String>) -> Self {
+        Self::Available {
+            field,
+            text: text.into(),
+        }
+    }
+
+    pub fn unavailable(
+        field: TrajectoryRawField,
+        reason: TrajectoryUnavailableReason,
+        message: Option<String>,
+    ) -> Self {
+        Self::Unavailable {
+            field,
+            reason,
+            message,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +702,133 @@ mod tests {
         // The next unary call still works — the dead stream didn't wedge the connection.
         let echoed = client.call("Echo", serde_json::json!(2)).await.unwrap();
         assert_eq!(echoed, serde_json::json!(2));
+    }
+
+    #[test]
+    fn test_trajectory_cursor_ordering_and_serialization() {
+        let c1 = TrajectoryCursor::new(1, 0);
+        let c2 = TrajectoryCursor::new(1, 1);
+        let c3 = TrajectoryCursor::new(2, 0);
+        let c4 = TrajectoryCursor::new(1, u32::MAX);
+
+        assert!(c1 < c2);
+        assert!(c2 < c4);
+        assert!(c4 < c3);
+
+        let json = serde_json::to_string(&c2).unwrap();
+        assert_eq!(json, r#"{"sourceSeq":1,"subSeq":1}"#);
+        let parsed: TrajectoryCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, c2);
+    }
+
+    #[test]
+    fn test_watch_trajectory_params_and_items_serde() {
+        let params = WatchTrajectoryParams::new("chat-123")
+            .with_cursor((5, 2))
+            .with_limit(100);
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains(r#""chatId":"chat-123""#));
+        assert!(json.contains(r#""afterCursor":{"sourceSeq":5,"subSeq":2}"#));
+        assert!(json.contains(r#""limit":100"#));
+
+        let parsed: WatchTrajectoryParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, params);
+
+        // Snapshot item
+        let snap_raw = r#"{
+            "kind": "snapshot",
+            "records": [],
+            "watermark": {"sourceSeq": 10, "subSeq": 0},
+            "degraded": [{
+                "chatId": "chat-123",
+                "runId": "run-1",
+                "fromSeq": 1,
+                "toSeq": 3,
+                "reason": "storage fault",
+                "recordedAt": "2026-09-01T12:00:00Z"
+            }],
+            "hasMore": false
+        }"#;
+        let snap: TrajectoryWatchItem = serde_json::from_str(snap_raw).unwrap();
+        let snap_json = serde_json::to_string(&snap).unwrap();
+        assert!(snap_json.contains(r#""kind":"snapshot""#));
+        let parsed_snap: TrajectoryWatchItem = serde_json::from_str(&snap_json).unwrap();
+        assert_eq!(parsed_snap, snap);
+
+        // Deltas item
+        let deltas = TrajectoryWatchItem::Deltas {
+            records: Vec::new(),
+            watermark: Some(TrajectoryCursor::new(11, 0)),
+        };
+        let deltas_json = serde_json::to_string(&deltas).unwrap();
+        assert!(deltas_json.contains(r#""kind":"deltas""#));
+
+        // Degraded item
+        let deg = TrajectoryWatchItem::Degraded {
+            intervals: Vec::new(),
+        };
+        let deg_json = serde_json::to_string(&deg).unwrap();
+        assert!(deg_json.contains(r#""kind":"degraded""#));
+
+        // ResyncRequired item
+        let resync = TrajectoryWatchItem::ResyncRequired {
+            reason: "gap detected".into(),
+        };
+        let resync_json = serde_json::to_string(&resync).unwrap();
+        assert!(resync_json.contains(r#""kind":"resyncRequired""#));
+        assert!(resync_json.contains(r#""reason":"gap detected""#));
+
+        // Terminal item
+        let term = TrajectoryWatchItem::Terminal {
+            reason: TrajectoryTerminalReason::ChatDeleted,
+            message: Some("Chat was deleted".into()),
+        };
+        let term_json = serde_json::to_string(&term).unwrap();
+        assert!(term_json.contains(r#""kind":"terminal""#));
+        assert!(term_json.contains(r#""reason":"chatDeleted""#));
+    }
+
+    #[test]
+    fn test_reveal_trajectory_raw_params_and_result_serde() {
+        let params = RevealTrajectoryRawParams::new(
+            "chat-456",
+            42,
+            Some("parent-tool-1".into()),
+            Some("call-99".into()),
+            TrajectoryRawField::Payload,
+        );
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains(r#""chatId":"chat-456""#));
+        assert!(json.contains(r#""sourceSeq":42"#));
+        assert!(json.contains(r#""parentToolUseId":"parent-tool-1""#));
+        assert!(json.contains(r#""callId":"call-99""#));
+        assert!(json.contains(r#""field":"payload""#));
+
+        let raw_ref = params.to_raw_ref();
+        assert_eq!(raw_ref.chat_id, "chat-456");
+        assert_eq!(raw_ref.source_seq, 42);
+
+        let avail = TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Payload,
+            "const secret = 'raw';",
+        );
+        let avail_json = serde_json::to_string(&avail).unwrap();
+        assert!(avail_json.contains(r#""status":"available""#));
+        assert!(avail_json.contains(r#""text":"const secret = 'raw';""#));
+
+        let unavail = TrajectoryRawRevealResult::unavailable(
+            TrajectoryRawField::Result,
+            TrajectoryUnavailableReason::ForeignDevice,
+            Some("chat is on another device".into()),
+        );
+        let unavail_json = serde_json::to_string(&unavail).unwrap();
+        assert!(unavail_json.contains(r#""status":"unavailable""#));
+        assert!(unavail_json.contains(r#""reason":"foreignDevice""#));
+    }
+
+    #[test]
+    fn test_trajectory_rpc_methods_local_only() {
+        assert_eq!(methods::WATCH_TRAJECTORY, "WatchTrajectory");
+        assert_eq!(methods::REVEAL_TRAJECTORY_RAW, "RevealTrajectoryRaw");
     }
 }
