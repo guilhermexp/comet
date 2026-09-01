@@ -139,7 +139,16 @@ if (this.#delegationMode === "host") {
 	this.#callbacks.onDelegation?.(event.item.id, request);
 	return;
 }
-void this.#session.sendCustomMessage(/* existing message and triggerTurn options */)
+void this.#session
+	.sendCustomMessage(
+		{
+			customType: LIVE_DELEGATION_MESSAGE_TYPE,
+			content: request,
+			display: true,
+			attribution: "agent",
+		},
+		{ triggerTurn: true },
+	)
 	.catch(cause => this.#reportFailure(errorFrom(cause)));
 ```
 
@@ -391,13 +400,24 @@ Expected: FAIL because production dispatch is not wired.
 
 - [ ] **Step 3: Construct the production controller**
 
+Add the RPC-local text extractor:
+
+```ts
+function extractRpcAssistantText(message: AssistantMessage): string {
+	return message.content
+		.map(block => (block.type === "text" ? block.text : ""))
+		.filter(Boolean)
+		.join("\n");
+}
+```
+
 The lifecycle factory creates:
 
 ```ts
 new LiveSessionController({
 	session,
 	callbacks: createRpcLiveCallbacks(output),
-	extractAssistantText: /* reuse the established assistant text extraction helper */,
+	extractAssistantText: extractRpcAssistantText,
 	voice: session.settings.get("live.voice"),
 	delegationMode: "host",
 })
