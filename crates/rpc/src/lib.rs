@@ -382,6 +382,16 @@ pub enum TrajectoryWatchItem {
     },
 }
 
+pub const DEFAULT_TRAJECTORY_PAGE_SIZE: usize = 250;
+pub const MAX_TRAJECTORY_PAGE_SIZE: usize = 1000;
+pub const MIN_TRAJECTORY_PAGE_SIZE: usize = 1;
+
+pub const CURRENT_RAW_SOURCE_VERSION: u32 = 1;
+
+fn default_raw_source_version() -> u32 {
+    CURRENT_RAW_SOURCE_VERSION
+}
+
 /// Request parameters for `RevealTrajectoryRaw`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -393,6 +403,8 @@ pub struct RevealTrajectoryRawParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
     pub field: TrajectoryRawField,
+    #[serde(default = "default_raw_source_version")]
+    pub source_version: u32,
 }
 
 impl RevealTrajectoryRawParams {
@@ -409,7 +421,13 @@ impl RevealTrajectoryRawParams {
             parent_tool_use_id,
             call_id,
             field,
+            source_version: CURRENT_RAW_SOURCE_VERSION,
         }
+    }
+
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.source_version = version;
+        self
     }
 
     pub fn to_raw_ref(&self) -> TrajectoryRawRef {
@@ -419,6 +437,7 @@ impl RevealTrajectoryRawParams {
             parent_tool_use_id: self.parent_tool_use_id.clone(),
             call_id: self.call_id.clone(),
             field: self.field,
+            source_version: self.source_version,
         }
     }
 }
@@ -431,6 +450,7 @@ impl From<TrajectoryRawRef> for RevealTrajectoryRawParams {
             parent_tool_use_id: r.parent_tool_use_id,
             call_id: r.call_id,
             field: r.field,
+            source_version: r.source_version,
         }
     }
 }
@@ -443,7 +463,20 @@ impl From<&TrajectoryRawRef> for RevealTrajectoryRawParams {
             parent_tool_use_id: r.parent_tool_use_id.clone(),
             call_id: r.call_id.clone(),
             field: r.field,
+            source_version: r.source_version,
         }
+    }
+}
+
+impl From<RevealTrajectoryRawParams> for TrajectoryRawRef {
+    fn from(p: RevealTrajectoryRawParams) -> Self {
+        p.to_raw_ref()
+    }
+}
+
+impl From<&RevealTrajectoryRawParams> for TrajectoryRawRef {
+    fn from(p: &RevealTrajectoryRawParams) -> Self {
+        p.to_raw_ref()
     }
 }
 
@@ -803,10 +836,44 @@ mod tests {
         assert!(json.contains(r#""parentToolUseId":"parent-tool-1""#));
         assert!(json.contains(r#""callId":"call-99""#));
         assert!(json.contains(r#""field":"payload""#));
+        assert!(json.contains(r#""sourceVersion":1"#));
+
+        let parsed: RevealTrajectoryRawParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_version, CURRENT_RAW_SOURCE_VERSION);
+
+        // Omitted sourceVersion defaults to CURRENT_RAW_SOURCE_VERSION
+        let legacy_json = r#"{"chatId":"chat-456","sourceSeq":42,"field":"payload"}"#;
+        let parsed_legacy: RevealTrajectoryRawParams = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed_legacy.source_version, CURRENT_RAW_SOURCE_VERSION);
+
+        // Explicit unknown version is parsed accurately (no silent rewrite)
+        let unknown_json =
+            r#"{"chatId":"chat-456","sourceSeq":42,"field":"payload","sourceVersion":99}"#;
+        let parsed_unknown: RevealTrajectoryRawParams = serde_json::from_str(unknown_json).unwrap();
+        assert_eq!(parsed_unknown.source_version, 99);
 
         let raw_ref = params.to_raw_ref();
         assert_eq!(raw_ref.chat_id, "chat-456");
         assert_eq!(raw_ref.source_seq, 42);
+        assert_eq!(raw_ref.source_version, CURRENT_RAW_SOURCE_VERSION);
+
+        // Version 99 preserves across all From and to_raw_ref conversions
+        let v99_params =
+            RevealTrajectoryRawParams::new("chat-99", 100, None, None, TrajectoryRawField::Payload)
+                .with_version(99);
+        assert_eq!(v99_params.source_version, 99);
+
+        let v99_raw_ref = v99_params.to_raw_ref();
+        assert_eq!(v99_raw_ref.source_version, 99);
+
+        let round_trip_params: RevealTrajectoryRawParams = v99_raw_ref.clone().into();
+        assert_eq!(round_trip_params.source_version, 99);
+
+        let round_trip_ref_params: RevealTrajectoryRawParams = (&v99_raw_ref).into();
+        assert_eq!(round_trip_ref_params.source_version, 99);
+
+        let round_trip_raw_ref: TrajectoryRawRef = round_trip_params.into();
+        assert_eq!(round_trip_raw_ref.source_version, 99);
 
         let avail = TrajectoryRawRevealResult::available(
             TrajectoryRawField::Payload,

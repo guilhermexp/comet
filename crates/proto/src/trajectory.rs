@@ -52,6 +52,12 @@ pub enum TrajectoryRawField {
     Result,
 }
 
+pub const CURRENT_RAW_SOURCE_VERSION: u32 = 1;
+
+fn default_raw_source_version() -> u32 {
+    CURRENT_RAW_SOURCE_VERSION
+}
+
 /// Opaque source reference to the underlying local Run Journal entry.
 ///
 /// This reference never carries raw payload or result text. It is used exclusively
@@ -67,6 +73,8 @@ pub struct TrajectoryRawRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
     pub field: TrajectoryRawField,
+    #[serde(default = "default_raw_source_version")]
+    pub source_version: u32,
 }
 
 impl TrajectoryRawRef {
@@ -83,7 +91,13 @@ impl TrajectoryRawRef {
             parent_tool_use_id,
             call_id,
             field,
+            source_version: CURRENT_RAW_SOURCE_VERSION,
         }
+    }
+
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.source_version = version;
+        self
     }
 }
 

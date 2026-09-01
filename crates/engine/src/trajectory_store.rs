@@ -641,6 +641,105 @@ impl TrajectoryStore {
         Ok(rows)
     }
 
+    /// Stream bounded snapshot pages for `chat_id` under a single SQLite WAL read transaction.
+    ///
+    /// The read transaction isolates the snapshot point-in-time from any concurrent commits.
+    pub fn stream_snapshot_pages<F>(
+        &self,
+        chat_id: &str,
+        after_cursor: Option<zeron_rpc::TrajectoryCursor>,
+        page_size: usize,
+        mut emit_page: F,
+    ) -> Result<(), TrajectoryStoreError>
+    where
+        F: FnMut(Vec<TrajectoryRecord>, Option<zeron_rpc::TrajectoryCursor>, bool) -> bool,
+    {
+        if self.is_degraded() {
+            let _ = emit_page(Vec::new(), after_cursor, false);
+            return Ok(());
+        }
+        let _ = self.ensure_legacy_imported(chat_id);
+        let conn = self.reader()?;
+        let tx = conn.unchecked_transaction()?;
+
+        let mut stmt = match after_cursor {
+            Some(_) => tx.prepare(
+                "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                        title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                        timing, usage, payload, result, error_message, is_degraded
+                 FROM trajectory_records
+                 WHERE chat_id = ?1 AND (source_seq > ?2 OR (source_seq = ?2 AND sub_seq > ?3))
+                 ORDER BY source_seq ASC, sub_seq ASC",
+            )?,
+            None => tx.prepare(
+                "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                        title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                        timing, usage, payload, result, error_message, is_degraded
+                 FROM trajectory_records
+                 WHERE chat_id = ?1
+                 ORDER BY source_seq ASC, sub_seq ASC",
+            )?,
+        };
+
+        let mut rows = match after_cursor {
+            Some(cursor) => stmt.query_map(
+                params![chat_id, cursor.source_seq as i64, cursor.sub_seq as i64],
+                row_to_record,
+            )?,
+            None => stmt.query_map(params![chat_id], row_to_record)?,
+        };
+
+        let mut page_buffer = Vec::with_capacity(page_size);
+        let mut current_watermark = after_cursor;
+        let mut next_item: Option<TrajectoryRecord> = None;
+
+        if let Some(row_res) = rows.next() {
+            next_item = Some(row_res?);
+        }
+
+        if next_item.is_none() {
+            let _ = emit_page(Vec::new(), current_watermark, false);
+            return Ok(());
+        }
+
+        while let Some(item) = next_item.take() {
+            page_buffer.push(item);
+
+            if page_buffer.len() == page_size {
+                let has_more = if let Some(row_res) = rows.next() {
+                    next_item = Some(row_res?);
+                    true
+                } else {
+                    false
+                };
+
+                if let Some(last) = page_buffer.last() {
+                    current_watermark = Some(zeron_rpc::TrajectoryCursor::from(last));
+                }
+
+                let keep_going = emit_page(
+                    std::mem::replace(&mut page_buffer, Vec::with_capacity(page_size)),
+                    current_watermark,
+                    has_more,
+                );
+                if !keep_going || !has_more {
+                    return Ok(());
+                }
+            } else if let Some(row_res) = rows.next() {
+                next_item = Some(row_res?);
+            }
+        }
+
+        if !page_buffer.is_empty() {
+            if let Some(last) = page_buffer.last() {
+                current_watermark = Some(zeron_rpc::TrajectoryCursor::from(last));
+            }
+            let _ = emit_page(page_buffer, current_watermark, false);
+        }
+
+        Ok(())
+    }
+
     /// Fetch latest recorded watermark for `chat_id`.
     pub fn get_watermark(&self, chat_id: &str) -> Result<Option<u64>, TrajectoryStoreError> {
         if self.is_degraded() {
@@ -656,6 +755,101 @@ impl TrajectoryStore {
             )
             .optional()?;
         Ok(res.map(|s| s as u64))
+    }
+
+    /// Fetch the highest cursor `(source_seq, sub_seq)` currently committed for `chat_id`.
+    pub fn get_watermark_cursor(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<zeron_rpc::TrajectoryCursor>, TrajectoryStoreError> {
+        if self.is_degraded() {
+            return Ok(None);
+        }
+        let _ = self.ensure_legacy_imported(chat_id);
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_seq, sub_seq FROM trajectory_records
+             WHERE chat_id = ?1
+             ORDER BY source_seq DESC, sub_seq DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![chat_id])?;
+        if let Some(row) = rows.next()? {
+            let source_seq: i64 = row.get(0)?;
+            let sub_seq: i64 = row.get(1)?;
+            Ok(Some(zeron_rpc::TrajectoryCursor::new(
+                source_seq as u64,
+                sub_seq as u32,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Validate that a requested `TrajectoryRawRef` is attached to an existing stored record for this chat.
+    ///
+    /// This is a side-effect-free exact query against persisted records and does NOT trigger legacy import.
+    pub fn validate_raw_ref(
+        &self,
+        raw_ref: &zeron_proto::trajectory::TrajectoryRawRef,
+    ) -> Result<bool, TrajectoryStoreError> {
+        if self.is_degraded() {
+            return Ok(false);
+        }
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT payload, result FROM trajectory_records
+             WHERE chat_id = ?1 AND source_seq = ?2",
+        )?;
+        let rows = stmt.query_map(params![raw_ref.chat_id, raw_ref.source_seq as i64], |row| {
+            let p_json: Option<String> = row.get(0)?;
+            let r_json: Option<String> = row.get(1)?;
+            Ok((p_json, r_json))
+        })?;
+        for row in rows {
+            let (p_json, r_json) = row?;
+            match raw_ref.field {
+                zeron_proto::trajectory::TrajectoryRawField::Payload => {
+                    if let Some(json_str) = p_json {
+                        if let Ok(p) = serde_json::from_str::<
+                            zeron_proto::trajectory::TrajectoryPayloadPreview,
+                        >(&json_str)
+                        {
+                            if let Some(r_ref) = p.raw_ref {
+                                if r_ref.chat_id == raw_ref.chat_id
+                                    && r_ref.source_seq == raw_ref.source_seq
+                                    && r_ref.parent_tool_use_id == raw_ref.parent_tool_use_id
+                                    && r_ref.call_id == raw_ref.call_id
+                                    && r_ref.field == raw_ref.field
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+                zeron_proto::trajectory::TrajectoryRawField::Result => {
+                    if let Some(json_str) = r_json {
+                        if let Ok(r) = serde_json::from_str::<
+                            zeron_proto::trajectory::TrajectoryResultPreview,
+                        >(&json_str)
+                        {
+                            if let Some(r_ref) = r.raw_ref {
+                                if r_ref.chat_id == raw_ref.chat_id
+                                    && r_ref.source_seq == raw_ref.source_seq
+                                    && r_ref.parent_tool_use_id == raw_ref.parent_tool_use_id
+                                    && r_ref.call_id == raw_ref.call_id
+                                    && r_ref.field == raw_ref.field
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Fetch degraded intervals for `chat_id`.
@@ -1166,33 +1360,39 @@ fn flush_batch_to_writer(
     }
     if let Err(err) = write_records_tx(conn, records) {
         tracing::error!(error = %err, "trajectory writer batch failed; recording degraded interval");
-        if let Some(first) = records.first() {
-            let last = records.last().unwrap_or(first);
-            let degraded = TrajectoryDegradedInterval {
-                chat_id: first.chat_id.clone(),
-                run_id: first.run_id.clone(),
-                from_seq: first.source_seq,
-                to_seq: last.source_seq,
-                reason: format!("Durable write failed: {}", err),
-                recorded_at: Utc::now(),
-            };
-            in_mem.lock().unwrap().push(degraded.clone());
-            let _ = conn.execute(
-                "INSERT INTO trajectory_degraded_intervals (chat_id, run_id, from_seq, to_seq, reason, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    degraded.chat_id,
-                    degraded.run_id,
-                    degraded.from_seq as i64,
-                    degraded.to_seq as i64,
-                    degraded.reason,
-                    degraded.recorded_at.timestamp_millis()
-                ],
-            );
-            let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                chat_id: degraded.chat_id.clone(),
-                interval: degraded,
-            });
+        let mut by_chat: HashMap<String, Vec<&TrajectoryRecord>> = HashMap::new();
+        for r in records {
+            by_chat.entry(r.chat_id.clone()).or_default().push(r);
+        }
+        for (chat_id, chat_records) in by_chat {
+            if let Some(first) = chat_records.first() {
+                let last = chat_records.last().unwrap_or(first);
+                let degraded = TrajectoryDegradedInterval {
+                    chat_id: chat_id.clone(),
+                    run_id: first.run_id.clone(),
+                    from_seq: first.source_seq,
+                    to_seq: last.source_seq,
+                    reason: format!("Durable write failed: {}", err),
+                    recorded_at: Utc::now(),
+                };
+                in_mem.lock().unwrap().push(degraded.clone());
+                let _ = conn.execute(
+                    "INSERT INTO trajectory_degraded_intervals (chat_id, run_id, from_seq, to_seq, reason, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        degraded.chat_id,
+                        degraded.run_id,
+                        degraded.from_seq as i64,
+                        degraded.to_seq as i64,
+                        degraded.reason,
+                        degraded.recorded_at.timestamp_millis()
+                    ],
+                );
+                let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                    chat_id: degraded.chat_id.clone(),
+                    interval: degraded,
+                });
+            }
         }
     } else {
         let mut by_chat: HashMap<String, Vec<TrajectoryRecord>> = HashMap::new();
