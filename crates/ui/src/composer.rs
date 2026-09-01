@@ -32,6 +32,7 @@ use zeron_proto::{
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::live_voice::{LiveVoiceTooltip, LiveVoiceViewModel};
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -178,6 +179,12 @@ pub fn escape_stops_run(armed: Option<Instant>, now: Instant) -> bool {
 /// contract cannot accidentally regress into forcing every new chat open.
 pub fn composer_layout_expanded(expanded_mode: bool, _new_chat: bool) -> bool {
     expanded_mode
+}
+
+const LIVE_VOICE_STACK_WIDTH: f32 = 440.0;
+
+fn live_voice_strip_stacked(available_width: f32) -> bool {
+    available_width < LIVE_VOICE_STACK_WIDTH
 }
 
 /// Compact↔expanded flip with hysteresis. `capacity` is the *compact-mode*
@@ -6609,6 +6616,277 @@ impl Composer {
             ))
             .into_any_element()
     }
+
+    fn live_voice_model(&self, cx: &App) -> LiveVoiceViewModel {
+        let state = self.state.read(cx);
+        LiveVoiceViewModel::derive(
+            state.selected_chat.as_deref(),
+            state.live_voice_availability.as_ref(),
+            &state.live_voice,
+        )
+    }
+
+    fn render_live_voice_button(
+        &self,
+        model: &LiveVoiceViewModel,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !model.show_microphone {
+            return None;
+        }
+        let enabled = model.microphone_enabled;
+        let tooltip = SharedString::from(model.microphone_tooltip.clone());
+        Some(
+            div()
+                .id("composer-live-voice")
+                .role(gpui::Role::Button)
+                .aria_label(tooltip.clone())
+                .size(px(32.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .when(!enabled, |element| element.opacity(0.38))
+                .when(enabled, |element| {
+                    element
+                        .tab_index(0)
+                        .focus_visible(|style| {
+                            style.border_1().border_color(theme.accent.opacity(0.75))
+                        })
+                        .cursor_pointer()
+                        .bg(motion::hover_blend(
+                            "composer-live-voice",
+                            gpui::transparent_black(),
+                            theme.accent_wash,
+                        ))
+                        .on_hover(motion::hover_listener("composer-live-voice"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state
+                                .update(cx, |state, cx| state.start_live_voice(cx));
+                        }))
+                })
+                .tooltip(move |_, cx| cx.new(|_| LiveVoiceTooltip::new(tooltip.clone())).into())
+                .tooltip_show_delay(Duration::from_millis(220))
+                .child(
+                    crate::icons::icon(crate::icons::MICROPHONE)
+                        .size(px(16.0))
+                        .text_color(if enabled {
+                            theme.text_muted
+                        } else {
+                            theme.text_faint
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_live_voice_strip(
+        &self,
+        model: &LiveVoiceViewModel,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let stacked =
+            live_voice_strip_stacked(self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH));
+        let level = |id, name: &'static str, value: f32| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .w(px(19.0))
+                        .text_size(px(8.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_faint)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .w(px(52.0))
+                        .h(px(3.0))
+                        .rounded_full()
+                        .overflow_hidden()
+                        .bg(theme.border)
+                        .child(
+                            div()
+                                .w(px(52.0 * value))
+                                .h_full()
+                                .rounded_full()
+                                .bg(theme.accent),
+                        ),
+                )
+        };
+        let muted = model.muted;
+        let mute_label = if muted { "Unmute" } else { "Mute" };
+        let caption_role = model.caption_role.map(|role| match role {
+            zeron_proto::LiveVoiceRole::User => "You",
+            zeron_proto::LiveVoiceRole::Assistant => "Assistant",
+        });
+        let status = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(div().size(px(8.0)).rounded_full().bg(if model.is_error {
+                theme.danger
+            } else {
+                theme.accent
+            }))
+            .child(
+                div()
+                    .w(px(86.0))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from(model.status.clone())),
+            );
+        let levels = div()
+            .w(px(84.0))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(level("live-input-level", "IN", model.input_level))
+            .child(level("live-output-level", "OUT", model.output_level));
+        let caption = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .when_some(caption_role, |element, role| {
+                element.child(
+                    div()
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_faint)
+                        .child(role),
+                )
+            })
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(12.5))
+                    .line_height(px(16.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        model
+                            .caption
+                            .clone()
+                            .unwrap_or_else(|| "Voice transcript will appear here".into()),
+                    )),
+            );
+        let mute = div()
+            .id("live-voice-mute")
+            .role(gpui::Role::Button)
+            .aria_label(mute_label)
+            .aria_selected(muted)
+            .tab_index(0)
+            .h(px(32.0))
+            .px(px(10.0))
+            .rounded_full()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .bg(if muted {
+                theme.accent_wash
+            } else {
+                theme.element_hover
+            })
+            .cursor_pointer()
+            .focus_visible(|style| style.border_1().border_color(theme.accent.opacity(0.75)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.state
+                    .update(cx, |state, cx| state.set_live_voice_muted(!muted, cx));
+            }))
+            .child(
+                crate::icons::icon(crate::icons::MICROPHONE)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(mute_label);
+        let end = div()
+            .id("live-voice-end")
+            .role(gpui::Role::Button)
+            .aria_label("End Live Voice")
+            .tab_index(0)
+            .h(px(32.0))
+            .px(px(12.0))
+            .rounded_full()
+            .flex()
+            .flex_none()
+            .items_center()
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.danger_muted)
+            .bg(theme.danger.opacity(0.08))
+            .cursor_pointer()
+            .focus_visible(|style| style.border_1().border_color(theme.danger.opacity(0.75)))
+            .hover(|style| style.bg(theme.danger.opacity(0.13)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.state.update(cx, |state, cx| state.stop_live_voice(cx));
+            }))
+            .child("End");
+        let content = if stacked {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(status)
+                        .child(levels),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(caption)
+                        .child(mute)
+                        .child(end),
+                )
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_MD))
+                .child(status)
+                .child(levels)
+                .child(caption)
+                .child(mute)
+                .child(end)
+        };
+        div()
+            .id("composer-live-voice-strip")
+            .role(gpui::Role::Group)
+            .aria_label("Live Voice")
+            .tab_group()
+            .min_h(px(if stacked { 88.0 } else { 76.0 }))
+            .rounded(px(COMPOSER_CORNER_RADIUS))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_glass_bg())
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .items_center()
+            .child(content)
+            .into_any_element()
+    }
 }
 
 /// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
@@ -6622,6 +6900,7 @@ impl Focusable for Composer {
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        let live_voice = self.live_voice_model(cx);
         let wizard_active = self.wizard.is_some();
         if self.mention.token.is_some()
             && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
@@ -6895,6 +7174,10 @@ impl Render for Composer {
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
 
+        if live_voice.replaces_editor {
+            return container.child(self.render_live_voice_strip(&live_voice, &theme, cx));
+        }
+
         // Empty new chats use the same compact pill as existing chats. The
         // measured flip still expands for multiline/overflow content.
         let expanded = composer_layout_expanded(expanded, new_chat);
@@ -7032,6 +7315,7 @@ impl Render for Composer {
                         .pb(px(10.0))
                         .child(div().flex_1().min_w_0())
                         .child(context_indicator)
+                        .children(self.render_live_voice_button(&live_voice, &theme, cx))
                         .child(attach)
                         .child(send_button),
                 )
@@ -7084,6 +7368,7 @@ impl Render for Composer {
                                 .relative()
                                 .top(px(-cluster_dy))
                                 .child(context_indicator)
+                                .children(self.render_live_voice_button(&live_voice, &theme, cx))
                                 .child(attach)
                                 .child(send_button),
                         ),
@@ -7358,6 +7643,12 @@ mod tests {
         assert!(!composer_layout_expanded(false, false));
         assert!(composer_layout_expanded(true, true));
         assert!(composer_layout_expanded(true, false));
+    }
+
+    #[test]
+    fn live_voice_strip_stacks_below_threshold() {
+        assert!(!live_voice_strip_stacked(LIVE_VOICE_STACK_WIDTH));
+        assert!(live_voice_strip_stacked(LIVE_VOICE_STACK_WIDTH - 1.0));
     }
 
     /// The press intent is judged by eye everywhere except here: that a

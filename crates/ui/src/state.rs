@@ -32,13 +32,15 @@ use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
-    EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+    EngineInfo, HarnessId, LiveVoiceAvailability, LiveVoicePhase, LiveVoiceState, Session,
+    SessionStatus, Space, WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
+use crate::live_voice::coalesce_caption;
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -575,6 +577,16 @@ pub struct UploadProgress {
     total: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveVoiceProbeKey {
+    chat_id: String,
+    device_id: String,
+    local_device_id: Option<String>,
+    harness: Option<HarnessId>,
+    archived: bool,
+    session_status: Option<SessionStatus>,
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -643,6 +655,11 @@ pub struct AppState {
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
+    pub live_voice: LiveVoiceState,
+    pub live_voice_availability: Option<LiveVoiceAvailability>,
+    live_voice_watch_task: Option<Task<()>>,
+    live_voice_probe_task: Option<Task<()>>,
+    live_voice_probe_key: Option<LiveVoiceProbeKey>,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
@@ -690,6 +707,11 @@ impl AppState {
             diff_comments: HashMap::new(),
             local_device_id: None,
             data_dir: None,
+            live_voice: LiveVoiceState::default(),
+            live_voice_availability: None,
+            live_voice_watch_task: None,
+            live_voice_probe_task: None,
+            live_voice_probe_key: None,
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
@@ -763,6 +785,16 @@ impl AppState {
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+    }
+
+    pub(crate) fn apply_live_voice(&mut self, mut next: LiveVoiceState) {
+        let active = next.phase != LiveVoicePhase::Idle;
+        if active {
+            next.transcript =
+                coalesce_caption(self.live_voice.transcript.as_ref(), next.transcript);
+        }
+        crate::sound::set_live_voice_active(active);
+        self.live_voice = next;
     }
 
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
@@ -1363,6 +1395,119 @@ impl AppState {
         self.engine.as_ref()
     }
 
+    fn current_live_voice_probe_key(&self) -> Option<LiveVoiceProbeKey> {
+        let chat = self.selected_chat_row()?;
+        Some(LiveVoiceProbeKey {
+            chat_id: chat.id.clone(),
+            device_id: chat.device_id.clone(),
+            local_device_id: self.local_device_id.clone(),
+            harness: chat.config.as_ref().map(|config| config.harness),
+            archived: chat.archived,
+            session_status: self.session_for(&chat.id).map(|session| session.status),
+        })
+    }
+
+    fn refresh_live_voice_availability(&mut self, force: bool, cx: &mut Context<Self>) {
+        let key = self.current_live_voice_probe_key();
+        if !force && self.live_voice_probe_key == key {
+            return;
+        }
+        self.live_voice_probe_key = key.clone();
+        self.live_voice_availability = None;
+        self.live_voice_probe_task = None;
+        let (Some(key), Some(handle)) = (key, self.engine.clone()) else {
+            return;
+        };
+        self.live_voice_probe_task = Some(cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call_as::<LiveVoiceAvailability>(
+                    methods::PROBE_LIVE_VOICE,
+                    serde_json::json!({ "chatId": key.chat_id }),
+                )
+                .await;
+            let availability = match result {
+                Ok(availability) => Some(availability),
+                Err(RpcError::UnknownMethod(_)) => Some(LiveVoiceAvailability {
+                    available: false,
+                    reason: Some(zeron_proto::LiveVoiceUnavailableReason::UnsupportedOmp),
+                }),
+                Err(error) => {
+                    tracing::debug!(%error, "Live Voice probe failed");
+                    None
+                }
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.live_voice_probe_key.as_ref() == Some(&key) {
+                    state.live_voice_availability = availability;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    pub fn start_live_voice(&mut self, cx: &mut Context<Self>) {
+        let (Some(chat_id), Some(handle)) = (self.selected_chat.clone(), self.engine.clone())
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = handle
+                .client()
+                .call(
+                    methods::START_LIVE_VOICE,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await
+            {
+                tracing::warn!(%error, "Live Voice start failed");
+                let _ = this.update(cx, |state, cx| {
+                    state.refresh_live_voice_availability(true, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn set_live_voice_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = handle
+                .client()
+                .call(
+                    methods::SET_LIVE_VOICE_MUTED,
+                    serde_json::json!({ "muted": muted }),
+                )
+                .await
+            {
+                tracing::warn!(%error, "Live Voice mute control failed");
+            }
+        })
+        .detach();
+    }
+
+    pub fn stop_live_voice(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = handle
+                .client()
+                .call(methods::STOP_LIVE_VOICE, serde_json::Value::Null)
+                .await
+            {
+                tracing::warn!(%error, "Live Voice stop failed");
+            }
+        })
+        .detach();
+    }
+
+    pub fn live_voice_active(&self) -> bool {
+        self.live_voice.phase != LiveVoicePhase::Idle
+    }
+
     /// Drop every account-scoped view and subscription after its runtime has
     /// stopped. The next bootstrap must never render rows from the previous
     /// account while the local profile is opening.
@@ -1370,6 +1515,11 @@ impl AppState {
         self.engine = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
+        self.live_voice_watch_task = None;
+        self.live_voice_probe_task = None;
+        self.live_voice_probe_key = None;
+        self.apply_live_voice(LiveVoiceState::default());
+        self.live_voice_availability = None;
         self.change_request_tasks.clear();
         self.change_requests = ChangeRequestClientState::default();
         self.connection = ConnectionStatus::Connecting;
@@ -1485,10 +1635,17 @@ impl AppState {
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         self.watch_tasks = watch_tasks;
+        self.live_voice_watch_task = Some(spawn_watch(
+            cx,
+            handle.clone(),
+            methods::WATCH_LIVE_VOICE,
+            AppState::apply_live_voice,
+        ));
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.
         self.connection = ConnectionStatus::Ready;
+        self.refresh_live_voice_availability(true, cx);
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
@@ -1588,6 +1745,9 @@ impl AppState {
             }
             return;
         }
+        if self.live_voice_active() {
+            self.stop_live_voice(cx);
+        }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
@@ -1613,6 +1773,7 @@ impl AppState {
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
         }
+        self.refresh_live_voice_availability(true, cx);
         cx.notify();
     }
 
@@ -1742,6 +1903,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 let alive = this.update(cx, |state, cx| {
                     state.apply_chats(parsed);
                     state.apply_pending_deep_link(cx);
+                    state.refresh_live_voice_availability(false, cx);
                     state.reconcile_change_request_watches(cx);
                     cx.notify();
                 });
@@ -1889,6 +2051,9 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 let alive = this.update(cx, |state, cx| {
                     apply(state, parsed);
                     state.apply_pending_deep_link(cx);
+                    if method == methods::WATCH_SESSIONS {
+                        state.refresh_live_voice_availability(false, cx);
+                    }
                     if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
                         state.reconcile_change_request_watches(cx);
                     }

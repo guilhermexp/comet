@@ -33,6 +33,7 @@ pub mod inline_media;
 #[cfg(debug_assertions)]
 pub mod inspector;
 pub mod links;
+pub mod live_voice;
 pub mod loaders;
 pub mod markdown;
 pub mod markdown_decor;
@@ -203,13 +204,22 @@ pub fn run_app(config: UiConfig) {
         // doc snapshots before the process exits (remote engines outlive us).
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
-            settings::flush(cx);
-            let shutdown =
-                quit_state.read(cx).engine().cloned().map(|handle| {
-                    gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
-                });
+            let task = quit_state.read(cx).engine().cloned().map(|handle| {
+                let executor = cx.background_executor().clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    let _ = attachments::call_with_timeout(
+                        &handle,
+                        &executor,
+                        zeron_rpc::methods::STOP_LIVE_VOICE,
+                        serde_json::Value::Null,
+                        std::time::Duration::from_secs(2),
+                    )
+                    .await;
+                    handle.shutdown().await;
+                })
+            });
             async move {
-                if let Some(task) = shutdown {
+                if let Some(task) = task {
                     let _ = task.await;
                 }
             }
@@ -243,71 +253,46 @@ fn open_main_window(
     workers_model: gpui::Entity<workers::model::WorkersModel>,
     cx: &mut App,
 ) {
-    // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
-    let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(900.), px(600.))),
-            // `kind` is deliberately left at its default `WindowKind::Normal`
-            // (gpui platform.rs WindowOptions::default), which on macOS maps
-            // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
-            // main window. Nothing here raises the window level or touches
-            // presentation options; the "menu bar never appears" symptom came
-            // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
-            // from window kind/level, and `appears_transparent` only affects
-            // the titlebar, not the menu bar.
-            // macOS: frameless-inset chrome like the original Electron app
-            // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
-            // feature-inventory §1.1). No title text — the strip is
-            // custom-drawn (zed sets `title: None` the same way). On
-            // Linux/Windows `appears_transparent` hides the system titlebar
-            // for our custom-drawn chrome; harmless where unsupported.
-            titlebar: Some(TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                // Centered on the titlebar's content line (40px bar, content
-                // shifted 4px down, lights ~12px tall → center 22).
-                traffic_light_position: Some(gpui::point(px(14.), px(14.))),
-            }),
-            // Our own titlebar strip drags the window (WindowControlArea::
-            // Drag + start_window_move) — mark the content view app-owned
-            // so AppKit neither dead-zones the strip nor delays clicks.
-            app_owns_titlebar_drag: true,
-            // Linux: request client-side decorations — zeron draws its own
-            // unified titlebar and (under CSD) its own caption buttons
-            // (shell.rs `render_linux_caption_controls`). Leaving this unset
-            // requests SERVER decorations, which stacked a compositor
-            // titlebar on top of the app's chrome under sway/KDE, while
-            // compositors without SSD support (GNOME) went client-side
-            // anyway — frameless, and before the shell drew caption buttons,
-            // with no window controls at all. The compositor can still
-            // override via xdg-decoration negotiation; the shell re-resolves
-            // what to draw every frame.
-            window_decorations: cfg!(target_os = "linux")
-                .then_some(gpui::WindowDecorations::Client),
-            // Frosted shell (macOS): blur the desktop behind the window; the
-            // shell paints its frost surface translucent so the sidebar reads
-            // as glass (shell.rs root). Elsewhere blur support is compositor
-            // roulette — stay opaque.
-            // One source of truth with the re-apply loop in `appearance::apply`
-            // — if these two ever disagree, vibrancy dies on the first theme
-            // change and never comes back.
-            window_background: theme::Theme::of(cx).window_background_appearance(),
-            app_id: Some("zeron".into()),
-            ..Default::default()
-        },
-        move |window, cx| {
-            // React to the user flipping macOS between light and dark. Detached:
-            // the subscription lives as long as the window does, and the window
-            // owns nothing that would drop it early.
-            appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, workers_model, cx))
-        },
-    )
-    .expect("failed to open window");
-    // Belt and braces: assert the blur once the window actually exists. The
-    // `WindowOptions` value is applied during creation, before the view is
-    // attached; re-pushing it here means a window is never left opaque.
+    let window_size = if capture::knob("ZERON_DEMO_NARROW").is_some() {
+        size(px(900.), px(600.))
+    } else {
+        size(px(1320.), px(880.))
+    };
+    let bounds = Bounds::centered(None, window_size, cx);
+    let shell_state = state.clone();
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(900.), px(600.))),
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    traffic_light_position: Some(gpui::point(px(14.), px(14.))),
+                }),
+                app_owns_titlebar_drag: true,
+                window_decorations: cfg!(target_os = "linux")
+                    .then_some(gpui::WindowDecorations::Client),
+                window_background: theme::Theme::of(cx).window_background_appearance(),
+                app_id: Some("zeron".into()),
+                ..Default::default()
+            },
+            move |window, cx| {
+                appearance::observe_window(window, cx).detach();
+                cx.new(|cx| shell::Shell::new(shell_state, boot, workers_model, cx))
+            },
+        )
+        .expect("failed to open window");
+    let window_id = window.window_id();
+    cx.on_window_closed(move |cx, closed| {
+        if closed == window_id {
+            state.update(cx, |state, cx| {
+                if state.live_voice_active() {
+                    state.stop_live_voice(cx);
+                }
+            });
+        }
+    })
+    .detach();
     appearance::reapply_window_background(cx);
 }

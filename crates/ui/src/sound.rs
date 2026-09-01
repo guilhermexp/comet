@@ -13,9 +13,10 @@
 //!   the session flow.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
+static LIVE_VOICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
@@ -33,7 +34,7 @@ pub enum Sound {
 /// Play a chime on a background thread. Silently a no-op when disabled or no
 /// player is available.
 pub fn play(sound: Sound) {
-    if std::env::var_os(DISABLE_ENV).is_some() {
+    if !should_play(sound) || std::env::var_os(DISABLE_ENV).is_some() {
         return;
     }
     std::thread::spawn(move || {
@@ -45,6 +46,14 @@ pub fn play(sound: Sound) {
             tracing::debug!(?sound, error = %err, "notification sound playback failed");
         }
     });
+}
+
+pub fn set_live_voice_active(active: bool) {
+    LIVE_VOICE_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+fn should_play(_sound: Sound) -> bool {
+    !LIVE_VOICE_ACTIVE.load(Ordering::Relaxed)
 }
 
 fn play_bytes(data: &[u8]) -> Result<(), String> {
@@ -188,6 +197,17 @@ mod tests {
         assert_eq!(sound_for_transition(Working, Working), None);
         assert_eq!(sound_for_transition(Idle, Working), None);
         assert_eq!(sound_for_transition(Working, Errored), None);
+    }
+
+    #[test]
+    fn live_voice_suppresses_both_notification_sounds_until_stopped() {
+        set_live_voice_active(true);
+        assert!(!should_play(Sound::Done));
+        assert!(!should_play(Sound::Request));
+
+        set_live_voice_active(false);
+        assert!(should_play(Sound::Done));
+        assert!(should_play(Sound::Request));
     }
 
     #[test]

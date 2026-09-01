@@ -140,6 +140,7 @@ icon_assets![
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
     (PAPERCLIP, "paperclip"),
+    (MICROPHONE, "microphone"),
     (PEN, "pen"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
