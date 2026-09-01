@@ -4,7 +4,7 @@
 
 | Fase | U-IDs | Seções | Depends on | Audit state | Audited commit | Entrega | UAT mode |
 |---|---|---|---|---|---|---|---|
-| F1 | U1, U2 | §1 | — | gaps_found | 6268bb9843eec2add5e86f25015565dfed79c664 | Typed contracts plus fail-open local store, capture, legacy projection, and deletion lifecycle | none — automated |
+| F1 | U1, U2 | §1 | — | passed | c11fc66b6799dc7d2ad7dd31154450828dd407a6 | Typed contracts plus fail-open local store, capture, legacy projection, and deletion lifecycle | none — automated |
 | F2 | U3 | §2 | F1 | pending | — | Local-only coherent snapshot/delta watch and bounded owner-checked raw reveal | none — automated |
 | F3 | U4, U5 | §3 | F2 | pending | — | Complete GPUI Trajectory surface and one-per-Chat titlebar/right-pane lifecycle | artifact-driven |
 | F4 | U6 | §4 | F3 | pending | — | Native evidence across live, legacy, privacy, degraded, responsive, and theme states; DOX closure | human-driven |
