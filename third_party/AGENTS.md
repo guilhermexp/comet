@@ -72,8 +72,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   por linha, 16 MiB totais, 100.000 registros e 128 modelos. A última transição
   de modelo/thinking vira ativa imediatamente, mesmo ainda com zero tokens.
   `unpeel-core` persiste apenas a projeção provider-neutral vinculada ao ID e ao
-  path canônico, remove-a em rejeição definitiva de confiança/budget e não
-  publica marker de binding anterior. O Host publica campos opcionais;
+  path canônico, invalida-a de forma fail-closed em rejeição definitiva de
+  confiança/budget mesmo quando o marker não pode ser removido e não publica
+  marker de binding anterior. O Host publica campos opcionais;
   transcript bruto, custo e conteúdo de mensagem nunca atravessam a fronteira
   vendorizada.
 

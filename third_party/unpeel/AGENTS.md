@@ -778,7 +778,8 @@ and clients.
 
 Provider telemetry follows the same boundary: runtime adapters own schema
 normalization, trusted-path validation, bounded reads, and fixtures; core owns
-atomic provider-id/path-aware projection persistence and optional Host fields.
+atomic provider-id/path-aware projection persistence, fail-closed invalidation
+even when physical marker removal fails, and optional Host fields.
 Ingress invalidates the prior projection if a newly reported binding cannot be
 persisted, rather than refreshing the old durable identity.
 Do not infer model or tokens from terminal output, launch configuration, cost

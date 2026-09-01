@@ -1,6 +1,8 @@
 use crate::session_host::HostedSessionManifest;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const TELEMETRY_MARKER: &str = "session-telemetry.json";
 
@@ -47,11 +49,54 @@ fn marker_path(session_dir: &Path) -> std::path::PathBuf {
     session_dir.join(TELEMETRY_MARKER)
 }
 
+fn telemetry_state() -> MutexGuard<'static, HashSet<PathBuf>> {
+    static INVALIDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    INVALIDATED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn invalidate_at(session_dir: &Path) -> Result<(), String> {
+    let marker = marker_path(session_dir);
+    let mut invalidated = telemetry_state();
+    invalidated.insert(marker.clone());
+    let overwrite = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&marker)
+        .map(|_| ())
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        });
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            invalidated.remove(&marker);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            invalidated.remove(&marker);
+            Ok(())
+        }
+        Err(_) if overwrite.is_ok() => Ok(()),
+        Err(remove_error) => Err(format!(
+            "failed to invalidate Session telemetry: {}; failed to remove marker: {remove_error}",
+            overwrite.expect_err("overwrite failure")
+        )),
+    }
+}
+
 fn store_at(
     session_dir: &Path,
     binding: &ProviderBinding,
     telemetry: &SessionTelemetry,
 ) -> Result<(), String> {
+    let marker = marker_path(session_dir);
+    let mut invalidated = telemetry_state();
     std::fs::create_dir_all(session_dir).map_err(|error| error.to_string())?;
     let temporary = session_dir.join(format!(
         ".session-telemetry.{}.{}.tmp",
@@ -65,16 +110,22 @@ fn store_at(
     })
     .map_err(|error| error.to_string())?;
     std::fs::write(&temporary, body).map_err(|error| error.to_string())?;
-    if let Err(error) = std::fs::rename(&temporary, marker_path(session_dir)) {
+    if let Err(error) = std::fs::rename(&temporary, &marker) {
         let _ = std::fs::remove_file(temporary);
         return Err(error.to_string());
     }
+    invalidated.remove(&marker);
     Ok(())
 }
 
 fn load_at(session_dir: &Path, binding: Option<&ProviderBinding>) -> Option<SessionTelemetry> {
     let binding = binding?;
-    let raw = std::fs::read(marker_path(session_dir)).ok()?;
+    let marker = marker_path(session_dir);
+    let invalidated = telemetry_state();
+    if invalidated.contains(&marker) {
+        return None;
+    }
+    let raw = std::fs::read(marker).ok()?;
     let stored = serde_json::from_slice::<StoredSessionTelemetry>(&raw).ok()?;
     (stored.provider_session_id == binding.session_id
         && Path::new(&stored.provider_transcript_path) == binding.transcript_path)
@@ -89,7 +140,7 @@ fn refresh_at(
     let telemetry = match read() {
         Ok(telemetry) => telemetry,
         Err(SessionTelemetryReadError::Rejected(error)) => {
-            let _ = std::fs::remove_file(marker_path(session_dir));
+            let _ = invalidate_at(session_dir);
             return Err(error);
         }
         Err(SessionTelemetryReadError::Unavailable(error)) => return Err(error),
@@ -101,7 +152,7 @@ fn refresh_at(
             telemetry,
         )?,
         None => {
-            let _ = std::fs::remove_file(marker_path(session_dir));
+            invalidate_at(session_dir)?;
         }
     }
     Ok(telemetry)
@@ -144,7 +195,7 @@ pub fn refresh(manifest: &HostedSessionManifest) -> Result<Option<SessionTelemet
         Ok(binding) => binding,
         Err(error) => {
             if matches!(result, Err(SessionTelemetryReadError::Rejected(_))) {
-                let _ = std::fs::remove_file(marker_path(&session_dir));
+                let _ = invalidate_at(&session_dir);
             }
             return Err(error);
         }
@@ -182,11 +233,7 @@ pub fn load(session_id: &str) -> Option<SessionTelemetry> {
 }
 
 pub fn invalidate(session_id: &str) -> Result<(), String> {
-    match std::fs::remove_file(marker_path(&crate::session_host::session_dir(session_id))) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
+    invalidate_at(&crate::session_host::session_dir(session_id))
 }
 
 #[cfg(test)]
@@ -270,5 +317,35 @@ mod tests {
         .expect("refresh telemetry");
 
         assert_eq!(load_at(session_dir.path(), Some(&new_binding)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_rejected_refresh_suppresses_marker_when_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let session_dir = tempfile::tempdir().expect("Worker Session directory");
+        let binding = binding(session_dir.path(), "omp-A");
+        store_at(session_dir.path(), &binding, &fixture()).expect("store telemetry");
+        let marker = marker_path(session_dir.path());
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o400))
+            .expect("make marker read-only");
+        std::fs::set_permissions(session_dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("make Session directory read-only");
+
+        let result = refresh_at(session_dir.path(), Some(&binding), || {
+            Err(SessionTelemetryReadError::Rejected(
+                "provider transcript exceeds budget".into(),
+            ))
+        });
+        let loaded = load_at(session_dir.path(), Some(&binding));
+
+        std::fs::set_permissions(session_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore Session directory permissions");
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
+            .expect("restore marker permissions");
+
+        assert!(result.is_err());
+        assert_eq!(loaded, None);
     }
 }

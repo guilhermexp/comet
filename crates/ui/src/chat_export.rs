@@ -341,18 +341,18 @@ pub(crate) fn render_markdown(doc: &ExportDoc) -> String {
 
 fn render_markdown_artifact(artifact: &Artifact) -> String {
     let mut rendered = format!(
-        "- **{}** `{}`",
+        "- **{}** {}",
         artifact.kind.markdown_label(),
-        artifact.tool
+        markdown_inline_code(&artifact.tool)
     );
     if let Some(path) = &artifact.path {
-        rendered.push_str(&format!(" `{path}`"));
+        rendered.push_str(&format!(" {}", markdown_inline_code(path)));
     }
     if let Some(subagent_ref) = &artifact.subagent_ref {
-        rendered.push_str(&format!(" `{subagent_ref}`"));
+        rendered.push_str(&format!(" {}", markdown_inline_code(subagent_ref)));
     }
     if let Some(session_id) = &artifact.session_id {
-        rendered.push_str(&format!(" `{session_id}`"));
+        rendered.push_str(&format!(" {}", markdown_inline_code(session_id)));
     }
     if let Some(output_bytes) = artifact.output_bytes {
         rendered.push_str(&format!(" · {output_bytes} bytes"));
@@ -376,6 +376,35 @@ fn longest_backtick_run(text: &str) -> usize {
         }
     }
     longest
+}
+
+fn single_line(text: &str) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            if !rendered.ends_with(' ') {
+                rendered.push(' ');
+            }
+        } else {
+            rendered.push(ch);
+        }
+    }
+    rendered
+}
+
+fn markdown_inline_code(text: &str) -> String {
+    let text = single_line(text);
+    let fence = "`".repeat(longest_backtick_run(&text) + 1);
+    if text.is_empty()
+        || text.starts_with('`')
+        || text.starts_with(' ')
+        || text.ends_with('`')
+        || text.ends_with(' ')
+    {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
+    }
 }
 
 fn render_markdown_tool(tool: &ExportTool) -> String {
@@ -429,15 +458,19 @@ pub(crate) fn render_text(doc: &ExportDoc) -> String {
 }
 
 fn render_text_artifact(artifact: &Artifact) -> String {
-    let mut rendered = format!("- {} {}", artifact.kind.text_label(), artifact.tool);
+    let mut rendered = format!(
+        "- {} {}",
+        artifact.kind.text_label(),
+        single_line(&artifact.tool)
+    );
     if let Some(path) = &artifact.path {
-        rendered.push_str(&format!(" {path}"));
+        rendered.push_str(&format!(" {}", single_line(path)));
     }
     if let Some(subagent_ref) = &artifact.subagent_ref {
-        rendered.push_str(&format!(" {subagent_ref}"));
+        rendered.push_str(&format!(" {}", single_line(subagent_ref)));
     }
     if let Some(session_id) = &artifact.session_id {
-        rendered.push_str(&format!(" {session_id}"));
+        rendered.push_str(&format!(" {}", single_line(session_id)));
     }
     if let Some(output_bytes) = artifact.output_bytes {
         rendered.push_str(&format!(" ({output_bytes} bytes)"));
@@ -1035,6 +1068,27 @@ Hello\n"
         assert!(
             markdown.find("worker-active-old").unwrap() < markdown.find("worker-settled").unwrap()
         );
+    }
+
+    #[test]
+    fn review_regression_worker_title_stays_within_artifact_line() {
+        let title = "Build `x`\n## forged";
+        let doc = ExportDoc::from_transcript(
+            metadata("Worker title"),
+            &[],
+            &[worker("worker-1", title, WorkerSemantic::Working)],
+        );
+
+        let markdown = render_markdown(&doc);
+        let text = render_text(&doc);
+        let json = render_json(&doc).expect("serialize export");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse export");
+
+        assert!(markdown.contains("- **Worker** ``Build `x` ## forged`` `worker-1`\n"));
+        assert!(!markdown.contains("\n## forged"));
+        assert!(text.contains("- worker Build `x` ## forged worker-1\n"));
+        assert!(!text.contains("\n## forged"));
+        assert_eq!(parsed["artifactIndex"][0]["tool"], title);
     }
 
     #[test]
