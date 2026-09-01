@@ -14,14 +14,16 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, LiveVoicePhase, LiveVoiceTranscript, Model, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +32,8 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// A managed adapter install (npm) failed; carries npm's own output so
     /// the cause is diagnosable from the chat error alone.
     #[error("adapter install failed: {0}")]
@@ -64,6 +68,50 @@ pub struct RunControls {
     pub chat_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveVoiceRequest {
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveVoiceContextKind {
+    Progress,
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveVoiceControl {
+    SetMuted(bool),
+    AppendContext {
+        delegation_id: String,
+        kind: LiveVoiceContextKind,
+        text: String,
+    },
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveVoiceEvent {
+    Phase(LiveVoicePhase),
+    Levels {
+        input: f32,
+        output: f32,
+    },
+    Transcript(LiveVoiceTranscript),
+    Delegation {
+        delegation_id: String,
+        request: String,
+    },
+    Ended {
+        error: Option<String>,
+    },
+}
+
+pub struct LiveVoiceHandle {
+    pub events: BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
+    pub controls: mpsc::Sender<LiveVoiceControl>,
+}
+
 #[async_trait]
 pub trait Harness: Send + Sync {
     fn id(&self) -> HarnessId;
@@ -84,6 +132,18 @@ pub trait Harness: Send + Sync {
     /// for them; adapter-mediated ACP agents keep the watchdog backstop.
     fn deterministic_turn_end(&self) -> bool {
         false
+    }
+    async fn probe_live_voice(&self, _cwd: &Path) -> Result<bool, HarnessError> {
+        Ok(false)
+    }
+    async fn start_live_voice(
+        &self,
+        _request: LiveVoiceRequest,
+    ) -> Result<LiveVoiceHandle, HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "{} does not support Live Voice",
+            self.display_name()
+        )))
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
@@ -313,4 +373,114 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 #[cfg(not(unix))]
 pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::path::Path;
+    use zeron_proto::{DoneStatus, SandboxLevel};
+
+    struct UnsupportedLiveHarness;
+
+    #[async_trait]
+    impl Harness for UnsupportedLiveHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Test"
+        }
+
+        fn supports_steering(&self) -> bool {
+            false
+        }
+
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            Ok(futures::stream::once(async {
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                })
+            })
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_voice_defaults_are_unsupported_without_changing_run() {
+        let harness = UnsupportedLiveHarness;
+        assert!(!harness.probe_live_voice(Path::new(".")).await.unwrap());
+
+        let error = match harness
+            .start_live_voice(LiveVoiceRequest { cwd: ".".into() })
+            .await
+        {
+            Ok(_) => panic!("unsupported harness started Live Voice"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HarnessError::Unsupported(message) if message == "Test does not support Live Voice"
+        ));
+
+        let (_steering_tx, steering) = mpsc::channel(1);
+        let mut events = harness
+            .run(
+                RunRequest {
+                    prompt: "test".into(),
+                    harness: None,
+                    model: None,
+                    reasoning: None,
+                    model_options: serde_json::Map::new(),
+                    cwd: ".".into(),
+                    sandbox: SandboxLevel::ReadOnly,
+                    auto_approve: false,
+                    enable_workers_mcp: false,
+                    workers_parent_chat_id: None,
+                    resume: None,
+                    attachments: Vec::new(),
+                    worktree: None,
+                },
+                RunControls {
+                    request_input: Box::new(|_| {
+                        let (_sender, receiver) = oneshot::channel();
+                        receiver
+                    }),
+                    steering,
+                    interrupt: CancellationToken::new(),
+                    chat_id: "chat-1".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }))
+        ));
+    }
 }
