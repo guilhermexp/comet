@@ -1627,4 +1627,167 @@ mod tests {
         std::fs::write(odd.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         assert_eq!(linked_worktree_root(&odd), None);
     }
+
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_chat_deletion_and_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let traj_store = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap(),
+        );
+
+        let host = super::WorkspaceHost::open(
+            store.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.set_trajectory_store(traj_store.clone());
+
+        // Create 3 chats in workspace
+        host.create_chat("chat_1", None, Some("dev-1"), None, None)
+            .unwrap();
+        host.create_chat("chat_2", None, Some("dev-1"), None, None)
+            .unwrap();
+        host.create_chat("chat_3", None, Some("dev-1"), None, None)
+            .unwrap();
+
+        // Seed trajectory records for all 3 chats
+        let rec1 = zeron_proto::trajectory::TrajectoryRecord {
+            id: zeron_proto::trajectory::TrajectoryRecordId::new("r1", 1, 0),
+            chat_id: "chat_1".into(),
+            run_id: "r1".into(),
+            source_seq: 1,
+            sub_seq: 0,
+            lane: zeron_proto::trajectory::TrajectoryLane::Input,
+            kind: zeron_proto::trajectory::TrajectoryRecordKind::UserMessage,
+            status: zeron_proto::trajectory::TrajectoryStatus::Completed,
+            is_partial: false,
+            title: "Prompt 1".into(),
+            summary: "Prompt 1".into(),
+            turn_id: None,
+            step_id: None,
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: None,
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        };
+        let mut rec2 = rec1.clone();
+        rec2.chat_id = "chat_2".into();
+        let mut rec3 = rec1.clone();
+        rec3.chat_id = "chat_3".into();
+
+        traj_store.try_enqueue(rec1).unwrap();
+        traj_store.try_enqueue(rec2).unwrap();
+        traj_store.try_enqueue(rec3).unwrap();
+        traj_store.flush().await.unwrap();
+
+        assert_eq!(traj_store.list_all_records("chat_1").unwrap().len(), 1);
+        assert_eq!(traj_store.list_all_records("chat_2").unwrap().len(), 1);
+        assert_eq!(traj_store.list_all_records("chat_3").unwrap().len(), 1);
+
+        // Delete chat_1 via WorkspaceHost
+        host.delete_chat("chat_1").unwrap();
+
+        // Wait a tick for async spawn and flush
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        traj_store.flush().await.unwrap();
+
+        // Proves chat_1 is deleted from TrajectoryStore and chat_2/chat_3 are preserved
+        assert_eq!(traj_store.list_all_records("chat_1").unwrap().len(), 0);
+        assert_eq!(traj_store.list_all_records("chat_2").unwrap().len(), 1);
+        assert_eq!(traj_store.list_all_records("chat_3").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_space_deletion_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let traj_store = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap(),
+        );
+
+        let host = super::WorkspaceHost::open(
+            store.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.set_trajectory_store(traj_store.clone());
+
+        // Create a space and 2 chats in that space
+        host.create_space(
+            "space_1",
+            "dev-1",
+            "/work/space1",
+            Some("Space 1".into()),
+            false,
+        )
+        .unwrap();
+        host.create_chat("chat_s1", Some("space_1"), Some("dev-1"), None, None)
+            .unwrap();
+        host.create_chat("chat_s2", Some("space_1"), Some("dev-1"), None, None)
+            .unwrap();
+
+        let rec1 = zeron_proto::trajectory::TrajectoryRecord {
+            id: zeron_proto::trajectory::TrajectoryRecordId::new("r1", 1, 0),
+            chat_id: "chat_s1".into(),
+            run_id: "r1".into(),
+            source_seq: 1,
+            sub_seq: 0,
+            lane: zeron_proto::trajectory::TrajectoryLane::Input,
+            kind: zeron_proto::trajectory::TrajectoryRecordKind::UserMessage,
+            status: zeron_proto::trajectory::TrajectoryStatus::Completed,
+            is_partial: false,
+            title: "Prompt s1".into(),
+            summary: "Prompt s1".into(),
+            turn_id: None,
+            step_id: None,
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: None,
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        };
+        let mut rec2 = rec1.clone();
+        rec2.chat_id = "chat_s2".into();
+
+        traj_store.try_enqueue(rec1).unwrap();
+        traj_store.try_enqueue(rec2).unwrap();
+        traj_store.flush().await.unwrap();
+
+        assert_eq!(traj_store.list_all_records("chat_s1").unwrap().len(), 1);
+        assert_eq!(traj_store.list_all_records("chat_s2").unwrap().len(), 1);
+
+        // Cascade delete space
+        let deleted = host.delete_space("space_1").unwrap();
+        assert_eq!(deleted.chat_ids.len(), 2);
+
+        // Wait a tick for async spawn and flush
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        traj_store.flush().await.unwrap();
+
+        // Both chats in the space are removed from TrajectoryStore
+        assert_eq!(traj_store.list_all_records("chat_s1").unwrap().len(), 0);
+        assert_eq!(traj_store.list_all_records("chat_s2").unwrap().len(), 0);
+    }
 }

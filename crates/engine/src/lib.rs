@@ -216,7 +216,13 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(journal_root.clone())?);
-        let trajectory = Arc::new(TrajectoryStore::open(profile.store_root())?);
+        let trajectory = Arc::new(match TrajectoryStore::open(profile.store_root()) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to open trajectory store; running in degraded mode");
+                TrajectoryStore::degraded(profile.store_root(), err.to_string())
+            }
+        });
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         sessions.set_trajectory_store(trajectory.clone());
         let doc_host = DocHost::new(
@@ -1357,5 +1363,52 @@ fn replace_empty_device_id(temp_path: &Path, path: &Path) -> std::io::Result<()>
             Err(err) => return Err(err),
         }
         std::fs::hard_link(temp_path, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_trajectory_engine_startup_corrupt_store_fails_open() {
+        let temp = TempDir::new().unwrap();
+        let profile = EngineProfile::development(temp.path(), "dev_org", "dev_user");
+
+        // Pre-create a corrupted trajectory.sqlite3 that causes open/migration to fail
+        let store_root = profile.store_root();
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::write(
+            store_root.join("trajectory.sqlite3"),
+            b"CORRUPTED_NON_SQLITE_HEADER",
+        )
+        .unwrap();
+
+        let lock = InstanceLock::acquire(profile.device_root()).unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+
+        // Engine assembly MUST NOT fail even if TrajectoryStore fails to open/migrate
+        let engine = EngineCore::assemble_with_profile_locked(
+            profile,
+            registry,
+            HarnessId::Mock,
+            None,
+            lock,
+        );
+        assert!(
+            engine.is_ok(),
+            "Engine assembly must succeed fail-open when trajectory store fails"
+        );
+        let engine = engine.unwrap();
+
+        // Publishing events still succeeds seamlessly
+        let seq = engine.sessions.publish(
+            "chat-deg",
+            &zeron_proto::AgentEvent::UserMessage {
+                text: "Hello despite corrupted store".into(),
+            },
+        );
+        assert!(seq > 0);
     }
 }

@@ -490,12 +490,15 @@ pub fn sanitize_tool_call(
 }
 
 /// Derive safe summary and preview from a tool result.
+///
+/// Invariant: Raw tool output is NEVER copied into the sanitized preview or summary.
+/// Raw tool output is accessed exclusively via `TrajectoryRawRef` during explicit Raw Reveal.
 pub fn sanitize_tool_result(
     output: Option<&str>,
     diff: Option<&ToolDiff>,
     execution: Option<&ToolExecutionMeta>,
     is_error: bool,
-    byte_cap: usize,
+    _byte_cap: usize,
 ) -> (String, Option<String>, Option<i32>) {
     let exit_code = execution.and_then(|e| e.exit_code);
     let summary = if is_error {
@@ -506,15 +509,10 @@ pub fn sanitize_tool_result(
         }
     } else if let Some(d) = diff {
         format!("Diff on {}", d.path)
+    } else if let Some(code) = exit_code {
+        format!("Completed (exit code {})", code)
     } else if let Some(out) = output {
-        let first_line = out.lines().next().unwrap_or("").trim();
-        if first_line.is_empty() {
-            "Completed".to_string()
-        } else if first_line.len() > 60 {
-            format!("{}…", &first_line[..60])
-        } else {
-            first_line.to_string()
-        }
+        format!("Completed ({} bytes)", out.len())
     } else {
         "Completed".to_string()
     };
@@ -529,8 +527,23 @@ pub fn sanitize_tool_result(
                 .map(|s| s.lines().count())
                 .unwrap_or(0)
         ))
+    } else if is_error {
+        Some(format!(
+            "Tool execution failed{}",
+            exit_code
+                .map(|c| format!(" (exit code {})", c))
+                .unwrap_or_default()
+        ))
     } else {
-        output.map(|out| truncate_preview(out, byte_cap))
+        output.map(|out| {
+            format!(
+                "Output: {} bytes{}",
+                out.len(),
+                exit_code
+                    .map(|c| format!(", exit code {}", c))
+                    .unwrap_or_default()
+            )
+        })
     };
 
     (summary, preview, exit_code)
@@ -1069,11 +1082,32 @@ mod tests {
         assert!(preview.unwrap().contains("Bytes: 5000"));
         assert_eq!(schema.as_deref(), Some("path: string, content: string"));
 
-        let long_output = "Secret output: ".to_string() + &"x".repeat(3000);
+        let secret_output = "Secret output: ghp_123456789012345678901234567890123456";
         let (res_sum, res_prev, exit) =
-            sanitize_tool_result(Some(&long_output), None, None, false, 500);
-        assert!(res_sum.starts_with("Secret output:"));
-        assert!(res_prev.unwrap().contains("… (truncated)"));
+            sanitize_tool_result(Some(secret_output), None, None, false, 500);
+        assert_eq!(res_sum, "Completed (55 bytes)");
+        assert_eq!(res_prev, Some("Output: 55 bytes".to_string()));
         assert_eq!(exit, None);
+        assert!(!res_sum.contains("ghp_"));
+        assert!(!res_prev.as_ref().unwrap().contains("ghp_"));
+
+        let (err_sum, err_prev, err_exit) = sanitize_tool_result(
+            Some(secret_output),
+            None,
+            Some(&ToolExecutionMeta {
+                exit_code: Some(1),
+                duration_ms: None,
+            }),
+            true,
+            500,
+        );
+        assert_eq!(err_sum, "Failed (exit code 1)");
+        assert_eq!(
+            err_prev,
+            Some("Tool execution failed (exit code 1)".to_string())
+        );
+        assert_eq!(err_exit, Some(1));
+        assert!(!err_sum.contains("ghp_"));
+        assert!(!err_prev.as_ref().unwrap().contains("ghp_"));
     }
 }

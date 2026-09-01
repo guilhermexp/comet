@@ -3708,4 +3708,55 @@ mod tests {
             Some("parent_call_10")
         );
     }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_zero_viewers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(store.clone());
+
+        // Publish events without any watch / subscriber / UI viewer connected
+        let chat_id = "chat_headless";
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-model".into(),
+                tools: vec!["bash".into()],
+                cwd: "/root".into(),
+                session_id: "s_zero".into(),
+                assistant_message_id: "m_zero".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Running in background with 0 viewers".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("Completed without viewer".into()),
+                error: None,
+                session_id: Some("s_zero".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+
+        // Proves that all records are captured into TrajectoryStore even with 0 active viewers
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].kind, TrajectoryRecordKind::SessionStarted);
+        assert_eq!(records[1].kind, TrajectoryRecordKind::UserMessage);
+        assert_eq!(records[2].kind, TrajectoryRecordKind::Done);
+    }
 }
