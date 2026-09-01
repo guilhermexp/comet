@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 
 DAEMON_DIR=/tmp/zeron-demo-daemon
 UI_DIR=/tmp/zeron-demo-ui
+WORKERS_DIR=/tmp/zeron-demo-workers
 IPC=27921
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
@@ -72,5 +73,12 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   touch "$DAEMON_DIR/.demo-seeded"
 fi
 
+DEMO_PARENT_CHAT_ID=$(probe WatchChats '{}' --stream 1 | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(next(row["id"] for row in rows if row.get("title") == "Native Zeron Rust Rewrite"))')
+python3 scripts/seed-demo-workers.py \
+  --home "$WORKERS_DIR" \
+  --project-path "$PWD" \
+  --parent-chat-id "$DEMO_PARENT_CHAT_ID"
+
 echo "▸ opening zeron (composer is live — type into it; --slow shows streaming)"
-ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/zeron
+UNPEEL_HOME="$WORKERS_DIR" COMET_WORKERS_HOOKS_DIR="$WORKERS_DIR/hooks" \
+  ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/zeron

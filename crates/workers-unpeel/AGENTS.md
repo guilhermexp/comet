@@ -243,7 +243,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
-| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (3), `tests/local_bootstrap.rs` (2) — client actions over a local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
+| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (3), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (5) | integration | `--test hook_migration` |
 
 ## Child DOX Index
