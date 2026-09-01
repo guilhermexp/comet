@@ -51,6 +51,15 @@ pub struct ChatWorkerRow {
     pub state: String,
     pub activity: String,
     pub updated_at_unix_ms: u64,
+    pub total_tokens: Option<u64>,
+    pub model_usage: Vec<ChatWorkerModelUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatWorkerModelUsage {
+    pub model: String,
+    pub total_tokens: u64,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,11 +104,7 @@ pub fn format_usage(usage: Option<WorkflowUsage>, agent_count: Option<u32>) -> O
     }
     if let Some(usage) = usage {
         if let Some(tokens) = usage.total_tokens {
-            metrics.push(if tokens < 1_000 {
-                format!("{tokens} tokens")
-            } else {
-                format!("{:.1}k tokens", tokens as f64 / 1_000.0)
-            });
+            metrics.push(format_token_total(tokens));
         }
         if let Some(tools) = usage.tool_uses {
             let noun = if tools == 1 { "tool" } else { "tools" };
@@ -115,6 +120,25 @@ pub fn format_usage(usage: Option<WorkflowUsage>, agent_count: Option<u32>) -> O
         }
     }
     (!metrics.is_empty()).then(|| metrics.join(" · "))
+}
+
+pub fn format_token_total(tokens: u64) -> String {
+    if tokens < 1_000 {
+        format!("{tokens} tokens")
+    } else if tokens < 1_000_000 {
+        format!("{:.1}k tokens", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m tokens", tokens as f64 / 1_000_000.0)
+    }
+}
+
+pub fn worker_compact_metadata(row: &ChatWorkerRow) -> Option<(String, String)> {
+    let current = row
+        .model_usage
+        .iter()
+        .find(|usage| usage.active)
+        .or_else(|| row.model_usage.first())?;
+    Some((current.model.clone(), format_token_total(row.total_tokens?)))
 }
 
 fn workflow_task(task: &WorkflowTaskUpdate) -> bool {
@@ -227,6 +251,16 @@ pub fn project_chat_workers(
             state: session.state,
             activity: session.activity,
             updated_at_unix_ms: session.updated_at_unix_ms,
+            total_tokens: session.total_tokens,
+            model_usage: session
+                .model_usage
+                .into_iter()
+                .map(|usage| ChatWorkerModelUsage {
+                    model: usage.model,
+                    total_tokens: usage.total_tokens,
+                    active: usage.active,
+                })
+                .collect(),
         })
         .collect();
     ChatWorkersSnapshot {
@@ -311,12 +345,14 @@ mod tests {
     use zeron_proto::agent::{
         ToolCall, WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
     };
-    use zeron_workers_unpeel::{WorkersSession, WorkersSessionCapabilities};
+    use zeron_workers_unpeel::{
+        WorkersModelTokenUsage, WorkersSession, WorkersSessionCapabilities,
+    };
 
     use super::{
         ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
-        activity_tasks_from_entries, compact_activity_label, format_usage, project_chat_workers,
-        snapshot_is_active, worker_semantic,
+        activity_tasks_from_entries, compact_activity_label, format_token_total, format_usage,
+        project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_semantic,
     };
 
     fn workflow_task(id: &str) -> WorkflowTaskUpdate {
@@ -370,6 +406,8 @@ mod tests {
             worktree_branch: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            total_tokens: None,
+            model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
         }
     }
@@ -416,6 +454,62 @@ mod tests {
         assert_eq!(snapshot.workflows.len(), 1);
         assert_eq!(snapshot.subagents.len(), 1);
         assert_eq!(snapshot.workers.len(), 1);
+    }
+
+    #[test]
+    fn token_totals_use_compact_widget_units() {
+        assert_eq!(format_token_total(999), "999 tokens");
+        assert_eq!(format_token_total(216_600), "216.6k tokens");
+        assert_eq!(format_token_total(1_820_000), "1.8m tokens");
+    }
+
+    #[test]
+    fn worker_projection_preserves_current_first_model_usage() {
+        let mut session = worker_session("worker-1", "running", "working");
+        session.total_tokens = Some(258_700);
+        session.model_usage = vec![
+            WorkersModelTokenUsage {
+                model: "openai-codex/gpt-5.6-sol:high".into(),
+                total_tokens: 42_100,
+                active: true,
+            },
+            WorkersModelTokenUsage {
+                model: "google-antigravity/gemini-3.7-flash:medium".into(),
+                total_tokens: 216_600,
+                active: false,
+            },
+        ];
+
+        let row = project_chat_workers(Vec::new(), vec![session])
+            .workers
+            .pop()
+            .expect("worker row");
+
+        assert_eq!(row.total_tokens, Some(258_700));
+        assert_eq!(row.model_usage[0].model, "openai-codex/gpt-5.6-sol:high");
+        assert!(row.model_usage[0].active);
+        assert_eq!(row.model_usage[1].total_tokens, 216_600);
+        assert_eq!(
+            worker_compact_metadata(&row),
+            Some((
+                "openai-codex/gpt-5.6-sol:high".into(),
+                "258.7k tokens".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn worker_without_telemetry_keeps_command_fallback() {
+        let row = project_chat_workers(
+            Vec::new(),
+            vec![worker_session("worker-1", "running", "working")],
+        )
+        .workers
+        .pop()
+        .expect("worker row");
+
+        assert_eq!(row.command, "codex");
+        assert_eq!(worker_compact_metadata(&row), None);
     }
 
     #[test]
@@ -803,6 +897,8 @@ mod tests {
             state: "running".into(),
             activity: "working".into(),
             updated_at_unix_ms: 0,
+            total_tokens: None,
+            model_usage: Vec::new(),
         };
         let activity = |status| ChatActivityRow {
             id: "a".into(),

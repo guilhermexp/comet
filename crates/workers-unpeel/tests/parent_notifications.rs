@@ -30,6 +30,8 @@ fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSes
         worktree_branch: None,
         created_at_unix_ms: 1_000,
         updated_at_unix_ms: 1_001,
+        total_tokens: None,
+        model_usage: Vec::new(),
         capabilities: WorkersSessionCapabilities::default(),
     }
 }

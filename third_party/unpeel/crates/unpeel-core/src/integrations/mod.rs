@@ -43,6 +43,7 @@ pub struct Integration {
     pub context_adapter: Option<crate::provider_context::ContextAdapter>,
     pub legacy_mcp_gate_kind: Option<LegacyMcpGateKind>,
     pub legacy_mcp_gate_granted: Option<LegacyMcpGateGranted>,
+    pub read_session_telemetry: Option<crate::session_telemetry::ReadSessionTelemetry>,
 }
 
 impl Integration {
@@ -60,6 +61,7 @@ impl Integration {
             context_adapter: None,
             legacy_mcp_gate_kind: None,
             legacy_mcp_gate_granted: None,
+            read_session_telemetry: None,
         }
     }
 
@@ -116,6 +118,14 @@ impl Integration {
         legacy_mcp_gate_granted: LegacyMcpGateGranted,
     ) -> Self {
         self.legacy_mcp_gate_granted = Some(legacy_mcp_gate_granted);
+        self
+    }
+
+    pub const fn with_session_telemetry(
+        mut self,
+        reader: Option<crate::session_telemetry::ReadSessionTelemetry>,
+    ) -> Self {
+        self.read_session_telemetry = reader;
         self
     }
 }

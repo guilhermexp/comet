@@ -22,11 +22,45 @@ impl Default for DetailsSidebarPreferences {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkedProjectsCacheKey {
+    pub context_key: String,
+    pub transcript_len: usize,
+    /// Total tool/text parts across the transcript.
+    ///
+    /// Entry count alone is NOT enough: a streaming turn grows the SAME entry,
+    /// and `TranscriptFrame::Delta` upserts it by removing and reinserting at
+    /// the same id (`zeron_doc::apply_transcript_frame`), so `len()` is
+    /// unchanged while a new `ReadFile`/`Exec` part lands. Without this the
+    /// card freezes for the whole turn — exactly when it is being watched.
+    pub parts_total: usize,
+    pub projects_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WorkedProjectsCache {
+    key: WorkedProjectsCacheKey,
+    result: Vec<super::worked_projects::WorkedProject>,
+}
+
+pub fn projects_snapshot_fingerprint(projects: &[zeron_workers_unpeel::WorkersProject]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for p in projects {
+        p.id.hash(&mut hasher);
+        p.name.hash(&mut hasher);
+        p.path.hash(&mut hasher);
+        p.is_group.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[derive(Debug, Clone)]
 pub struct DetailsSidebarState {
     context: Option<DetailsContext>,
     preferences: DetailsSidebarPreferences,
     load_generation: u64,
+    worked_projects_cache: Option<WorkedProjectsCache>,
 }
 
 impl DetailsSidebarState {
@@ -35,6 +69,7 @@ impl DetailsSidebarState {
             context: None,
             preferences,
             load_generation: 0,
+            worked_projects_cache: None,
         }
     }
 
@@ -68,7 +103,37 @@ impl DetailsSidebarState {
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .filter(|p| !p.starts_with(':'))
             .collect()
+    }
+
+    pub fn projects_worked_collapsed(&self) -> bool {
+        let Some(context) = &self.context else {
+            return false;
+        };
+        self.preferences
+            .expanded
+            .get(&context.key)
+            .map(|paths| paths.iter().any(|p| p == ":projects_worked:collapsed"))
+            .unwrap_or(false)
+    }
+
+    pub fn toggle_projects_worked_collapsed(&mut self) {
+        let Some(context) = &self.context else {
+            return;
+        };
+        let paths = self
+            .preferences
+            .expanded
+            .entry(context.key.clone())
+            .or_default();
+        const KEY: &str = ":projects_worked:collapsed";
+        if let Some(index) = paths.iter().position(|path| path == KEY) {
+            paths.remove(index);
+        } else {
+            paths.push(KEY.to_string());
+            paths.sort();
+        }
     }
 
     pub fn toggle_expanded(&mut self, relative_path: &str) {
@@ -124,6 +189,35 @@ impl DetailsSidebarState {
         self.load_generation == generation
             && self.context.as_ref().map(|context| context.key.as_str()) == Some(context_key)
     }
+
+    pub fn worked_projects(
+        &mut self,
+        context: &DetailsContext,
+        transcript: &[zeron_doc::SessionMessageEntry],
+        projects: &[zeron_workers_unpeel::WorkersProject],
+        home_dir: Option<&std::path::Path>,
+    ) -> Vec<super::worked_projects::WorkedProject> {
+        let key = WorkedProjectsCacheKey {
+            context_key: context.key.clone(),
+            transcript_len: transcript.len(),
+            parts_total: transcript.iter().map(|entry| entry.parts.len()).sum(),
+            projects_revision: projects_snapshot_fingerprint(projects),
+        };
+        if self.worked_projects_cache.as_ref().map(|c| &c.key) != Some(&key) {
+            let result = super::worked_projects::worked_projects(
+                transcript,
+                projects,
+                &context.cwd,
+                home_dir,
+            );
+            self.worked_projects_cache = Some(WorkedProjectsCache { key, result });
+        }
+        self.worked_projects_cache.as_ref().unwrap().result.clone()
+    }
+
+    pub fn worked_projects_cache_key(&self) -> Option<&WorkedProjectsCacheKey> {
+        self.worked_projects_cache.as_ref().map(|c| &c.key)
+    }
 }
 
 use gpui::{
@@ -141,8 +235,8 @@ use crate::{
     details_sidebar::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
-            activity_tasks_from_entries, compact_activity_label, project_chat_workers,
-            snapshot_is_active,
+            activity_tasks_from_entries, compact_activity_label, format_token_total,
+            project_chat_workers, snapshot_is_active, worker_compact_metadata,
         },
         context::detect_git_branch,
         file_tree::{FileNode, flatten_visible_rows, is_denied_relative, scan_checkout},
@@ -156,7 +250,8 @@ use crate::{
         },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
-            chat_workers_viewport_height_px, property_row, widget_card, workers_tab_presence,
+            chat_workers_viewport_height_px, property_row, widget_card, worker_expansion_key,
+            workers_tab_presence,
         },
     },
     icons,
@@ -198,6 +293,10 @@ fn context_file_access(
 
 fn details_sidebar_background(_theme: &Theme) -> Option<gpui::Hsla> {
     None
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 #[derive(Debug, Clone)]
@@ -1342,7 +1441,7 @@ impl DetailsSidebar {
     }
 
     fn render_worker_row(
-        &self,
+        &mut self,
         worker: ChatWorkerRow,
         chat_id: String,
         theme: &Theme,
@@ -1352,29 +1451,39 @@ impl DetailsSidebar {
         let session_id = worker.session_id.clone();
         let status = self.render_worker_status(&worker, theme, cx);
         let runtime_icon = runtime_icon_path(worker.provider_id.as_deref(), Some(&worker.command));
-        div()
-            .id(SharedString::from(format!(
-                "chat-worker-{}",
-                worker.session_id
-            )))
+        let expansion_key = worker_expansion_key(&worker.session_id);
+        let collapsible = worker.total_tokens.is_some() && !worker.model_usage.is_empty();
+        let expanded = collapsible
+            && self
+                .chat_workers
+                .activity_expanded_with_default(&expansion_key, false);
+        let compact_metadata = worker_compact_metadata(&worker);
+        let model_usage = worker.model_usage.clone();
+        let subtitle = if let Some((model, total)) = compact_metadata {
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(10.0))
+                .text_color(theme.text_muted)
+                .child(div().min_w_0().flex_1().truncate().child(model))
+                .child(div().flex_none().child(total))
+        } else {
+            div()
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted)
+                .child(worker.command.clone())
+        };
+        let open_target = div()
+            .min_w_0()
+            .flex_1()
             .min_h(px(38.0))
-            .px(px(8.0))
             .py(px(5.0))
-            .border_t_1()
-            .border_color(theme.border.opacity(0.45))
             .flex()
             .items_center()
             .gap(px(7.0))
-            .cursor_pointer()
-            .hover(|style| style.bg(crate::theme::ink(0.05)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let still_available = this
-                    .workers_model
-                    .read(cx)
-                    .sessions_for_parent_chat(&chat_id)
-                    .is_ok_and(|sessions| sessions.iter().any(|row| row.id == session_id));
-                cx.emit(worker_click_event(event.clone(), still_available));
-            }))
             .child(
                 icons::icon(runtime_icon)
                     .size(px(14.0))
@@ -1393,15 +1502,113 @@ impl DetailsSidebar {
                             .text_color(theme.text)
                             .child(worker.title),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted)
-                            .child(worker.command),
-                    ),
+                    .child(subtitle),
             )
-            .child(status)
+            .child(status);
+        div()
+            .id(SharedString::from(format!(
+                "chat-worker-{}",
+                worker.session_id
+            )))
+            .border_t_1()
+            .border_color(theme.border.opacity(0.45))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-worker-open-{}",
+                        worker.session_id
+                    )))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::ink(0.05)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let still_available = this
+                            .workers_model
+                            .read(cx)
+                            .sessions_for_parent_chat(&chat_id)
+                            .is_ok_and(|sessions| sessions.iter().any(|row| row.id == session_id));
+                        cx.emit(worker_click_event(event.clone(), still_available));
+                    }))
+                    .when(collapsible, |header| {
+                        let expansion_key = expansion_key.clone();
+                        header.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "worker-telemetry-expand-{}",
+                                    worker.session_id
+                                )))
+                                .size(px(18.0))
+                                .flex_none()
+                                .rounded(px(4.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.chat_workers
+                                        .toggle_activity_with_default(&expansion_key, false);
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icons::icon(if expanded {
+                                        icons::ALT_ARROW_DOWN
+                                    } else {
+                                        icons::ALT_ARROW_RIGHT
+                                    })
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
+                    .when(!collapsible, |header| header.child(div().w(px(18.0))))
+                    .child(open_target),
+            )
+            .when(expanded, |container| {
+                container.child(
+                    div()
+                        .pb(px(5.0))
+                        .children(model_usage.into_iter().map(|usage| {
+                            div()
+                                .ml(px(29.0))
+                                .h(px(22.0))
+                                .pl(px(9.0))
+                                .pr(px(8.0))
+                                .border_l_1()
+                                .border_color(theme.border.opacity(0.55))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().size(px(6.0)).flex_none().rounded_full().bg(
+                                    if usage.active {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted.opacity(0.65)
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text)
+                                        .child(usage.model),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted)
+                                        .child(format_token_total(usage.total_tokens)),
+                                )
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -1416,13 +1623,21 @@ impl DetailsSidebar {
         let workflows = snapshot.workflows.len();
         let subagents = snapshot.subagents.len();
         let workers = snapshot.workers.len();
-        self.chat_workers.sync_activities(
-            snapshot
-                .workflows
-                .iter()
-                .chain(snapshot.subagents.iter())
-                .map(|row| row.id.as_str()),
-        );
+        let expansion_ids = snapshot
+            .workflows
+            .iter()
+            .chain(snapshot.subagents.iter())
+            .map(|row| row.id.clone())
+            .chain(
+                snapshot
+                    .workers
+                    .iter()
+                    .filter(|worker| !worker.model_usage.is_empty())
+                    .map(|worker| worker_expansion_key(&worker.session_id)),
+            )
+            .collect::<Vec<_>>();
+        self.chat_workers
+            .sync_activities(expansion_ids.iter().map(String::as_str));
         // Raw counts, not `workers_tab_presence`: a binding failure lifting the
         // Workers tab from 0 to 1 is an error to surface, not a dispatch to
         // follow. And an errored snapshot goes in as absence, never as zero —
@@ -1557,7 +1772,7 @@ impl DetailsSidebar {
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
             .to_string();
-        let workspace_body = div()
+        let mut workspace_body = div()
             .child(property_row(
                 icons::GIT_BRANCH,
                 "Branch",
@@ -1565,6 +1780,119 @@ impl DetailsSidebar {
                 theme,
             ))
             .child(property_row(icons::FOLDER, "Path", folder, theme));
+
+        if context.mode == super::context::DetailsMode::Orchestrator {
+            let home = dirs_home();
+            let worked = self.sidebar.worked_projects(
+                &context,
+                &self.app_state.read(cx).transcript,
+                self.workers_model.read(cx).projects(),
+                home.as_deref(),
+            );
+            if !worked.is_empty() {
+                let collapsed = self.sidebar.projects_worked_collapsed();
+                let count = worked.len();
+                let header = div()
+                    .id("projects-worked-header")
+                    .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .cursor_pointer()
+                    .rounded_md()
+                    .hover(|style| style.bg(crate::theme::ink(0.045)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar.toggle_projects_worked_collapsed();
+                        this.emit_preferences(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        icons::icon(icons::FOLDER)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child("Projects worked"),
+                    )
+                    .child(
+                        div()
+                            .ml_auto()
+                            .mr(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(count.to_string()),
+                    )
+                    .child(
+                        icons::icon(if collapsed {
+                            icons::ALT_ARROW_RIGHT
+                        } else {
+                            icons::ALT_ARROW_DOWN
+                        })
+                        .size(px(12.0))
+                        .text_color(theme.text_muted),
+                    );
+
+                let mut worked_section = div()
+                    .mt(px(4.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.55))
+                    .child(header);
+
+                if !collapsed {
+                    let rows = div()
+                        .flex()
+                        .flex_col()
+                        .children(worked.iter().enumerate().map(|(index, project)| {
+                            let path = project.path.clone();
+                            div()
+                                .id(("worked-project", index))
+                                .h(px(super::worked_projects::WORKED_PROJECTS_ROW_HEIGHT))
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .cursor_pointer()
+                                .rounded_md()
+                                .hover(|style| style.bg(crate::theme::ink(0.045)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.workers_model.update(cx, |model, cx| {
+                                        model.reveal_project(path.clone(), cx);
+                                    });
+                                }))
+                                .child(
+                                    icons::icon(icons::FOLDER)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text)
+                                        .child(zeron_proto::view::single_line(&project.name)),
+                                )
+                        }));
+
+                    worked_section = worked_section.child(
+                        div()
+                            .id("projects-worked-body")
+                            .max_h(px(
+                                super::worked_projects::worked_projects_viewport_height_px(),
+                            ))
+                            .overflow_y_scroll()
+                            .child(rows),
+                    );
+                }
+                workspace_body = workspace_body.child(worked_section);
+            }
+        }
         let mut content = div()
             .w_full()
             .flex()
@@ -2289,6 +2617,174 @@ mod tests {
     }
 
     #[test]
+    fn projects_worked_collapse_toggle_and_round_trip() {
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        state.set_context(Some(context("one")));
+
+        // Default is expanded (not collapsed)
+        assert!(!state.projects_worked_collapsed());
+
+        // Toggle to collapsed
+        state.toggle_projects_worked_collapsed();
+        assert!(state.projects_worked_collapsed());
+
+        // Expanded paths for file tree must NOT contain the collapse key
+        assert!(
+            !state
+                .expanded_paths()
+                .contains(":projects_worked:collapsed")
+        );
+
+        // Switch context: other context defaults to expanded
+        state.set_context(Some(context("two")));
+        assert!(!state.projects_worked_collapsed());
+
+        // Switch back to "one": remains collapsed
+        state.set_context(Some(context("one")));
+        assert!(state.projects_worked_collapsed());
+
+        // Toggle back to expanded
+        state.toggle_projects_worked_collapsed();
+        assert!(!state.projects_worked_collapsed());
+    }
+    #[test]
+    fn worked_projects_cache_key_invalidation() {
+        use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+        use zeron_proto::ToolCall;
+        use zeron_workers_unpeel::{WorkersProject, WorkersSessionSort};
+
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        let ctx_one = context("one");
+        let ctx_two = context("two");
+
+        let p1 = WorkersProject {
+            id: "p1".to_string(),
+            name: "Proj 1".to_string(),
+            path: "/tmp/proj1".to_string(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        };
+
+        let entry1 = SessionMessageEntry {
+            id: "m1".to_string(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "t1".to_string(),
+                call: ToolCall::ReadFile {
+                    path: "/tmp/proj1/file.rs".to_string(),
+                },
+                diff: None,
+                output: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                file_preview: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+                execution: None,
+                resolved: true,
+                is_error: false,
+            }],
+            created_at: 0,
+            device_id: "d1".to_string(),
+            status: None,
+            duration_ms: None,
+            continuation_of: None,
+        };
+
+        let transcript = vec![entry1.clone()];
+        let projects = vec![p1.clone()];
+
+        // 1. First call computes and caches
+        let res1 = state.worked_projects(&ctx_one, &transcript, &projects, None);
+        assert_eq!(res1.len(), 1);
+        let key1 = state.worked_projects_cache_key().unwrap().clone();
+        assert_eq!(key1.context_key, "one");
+        assert_eq!(key1.transcript_len, 1);
+
+        // 2. Same inputs reuse cache (key identical)
+        let res2 = state.worked_projects(&ctx_one, &transcript, &projects, None);
+        assert_eq!(res2.len(), 1);
+        assert_eq!(state.worked_projects_cache_key(), Some(&key1));
+
+        // 3. Changed transcript length recomputes with new key
+        let mut transcript_longer = transcript.clone();
+        transcript_longer.push(entry1.clone());
+        let _ = state.worked_projects(&ctx_one, &transcript_longer, &projects, None);
+        let key2 = state.worked_projects_cache_key().unwrap().clone();
+        assert_ne!(key1, key2);
+        assert_eq!(key2.transcript_len, 2);
+
+        // 4. Changed projects list recomputes with new key
+        let mut projects_modified = projects.clone();
+        projects_modified.push(WorkersProject {
+            id: "p2".to_string(),
+            name: "Proj 2".to_string(),
+            path: "/tmp/proj2".to_string(),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        });
+        let _ = state.worked_projects(&ctx_one, &transcript_longer, &projects_modified, None);
+        let key3 = state.worked_projects_cache_key().unwrap().clone();
+        assert_ne!(key2, key3);
+
+        // 5. Changed context recomputes with new key
+        let _ = state.worked_projects(&ctx_two, &transcript_longer, &projects_modified, None);
+        let key4 = state.worked_projects_cache_key().unwrap().clone();
+        assert_ne!(key3, key4);
+        assert_eq!(key4.context_key, "two");
+
+        // 6. A STREAMING turn grows the same entry: entry count is unchanged
+        //    (`TranscriptFrame::Delta` upserts by id), so only `parts_total`
+        //    can catch it. Without it the card freezes for the whole turn.
+        let mut streaming = vec![entry1.clone()];
+        let MessagePart::Tool { .. } = &streaming[0].parts[0] else {
+            panic!("fixture must start with a tool part");
+        };
+        streaming[0].parts.push(MessagePart::Tool {
+            id: "t2".to_string(),
+            call: ToolCall::ReadFile {
+                path: "/tmp/proj2/other.rs".to_string(),
+            },
+            diff: None,
+            output: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            file_preview: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            execution: None,
+            resolved: true,
+            is_error: false,
+        });
+        let before = state.worked_projects(&ctx_one, &[entry1.clone()], &projects_modified, None);
+        let key_before = state.worked_projects_cache_key().unwrap().clone();
+        let after = state.worked_projects(&ctx_one, &streaming, &projects_modified, None);
+        let key_after = state.worked_projects_cache_key().unwrap().clone();
+        assert_eq!(key_before.transcript_len, key_after.transcript_len);
+        assert_ne!(key_before, key_after);
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 2, "the new part's project must appear");
+    }
+
+    #[test]
     fn open_file_event_carries_context_root_and_relative_path() {
         let event = DetailsSidebarEvent::OpenFile {
             context_key: "project".into(),
@@ -2329,6 +2825,8 @@ mod tests {
             state: "running".into(),
             activity: "working".into(),
             updated_at_unix_ms: 42,
+            total_tokens: None,
+            model_usage: Vec::new(),
         };
 
         let DetailsSidebarEvent::OpenSubagent {
@@ -2370,6 +2868,8 @@ mod tests {
             state: "disconnected".into(),
             activity: "disconnected".into(),
             updated_at_unix_ms: 42,
+            total_tokens: None,
+            model_usage: Vec::new(),
         };
 
         let DetailsSidebarEvent::OpenWorkerSession {

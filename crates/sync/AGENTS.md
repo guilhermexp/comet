@@ -1,4 +1,4 @@
-# comet-sync — cliente de room Loro e persistência local
+# zeron-sync — cliente de room Loro e persistência local
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 
@@ -8,7 +8,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 
 ## Ownership
 
-Único ponto que fala o protocolo de room com os Durable Objects. Se `comet-doc` diz *qual* é a forma, aqui é *como* ela chega e volta.
+Único ponto que fala o protocolo de room com os Durable Objects. Se `zeron-doc` diz *qual* é a forma, aqui é *como* ela chega e volta.
 
 ## Local Contracts
 

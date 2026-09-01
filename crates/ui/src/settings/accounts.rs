@@ -1,8 +1,8 @@
 //! Settings → Agents / accounts (feature-inventory §1.9): provider cards
-//! (Claude Code, Codex, Cursor) with account rows — email, plan badge, Active, usage
-//! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
-//! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons. Zeron retargets devices from the settings
+//! (Claude Code, Codex, Kimi Code, Antigravity, Cursor) with account rows — email,
+//! plan badge, Active, usage meters (indigo → amber ≥80% → red ≥95%, reset time),
+//! Switch / Forget — plus the add-account dialogs (paste-code and browser-poll flows)
+//! and account-shaped loading skeletons. Zeron retargets devices from the settings
 //! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
@@ -116,10 +116,11 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 5] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Kimi, "Kimi Code", "kimi"),
+    (HarnessId::Antigravity, "Antigravity", "agy"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
 ];
 
@@ -1261,6 +1262,7 @@ impl Render for AccountsPage {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
                         HarnessId::Kimi => "accounts-skeleton-kimi",
+                        HarnessId::Antigravity => "accounts-skeleton-antigravity",
                         HarnessId::Cursor => "accounts-skeleton-cursor",
                         _ => "accounts-skeleton-claude",
                     };
@@ -1349,7 +1351,7 @@ impl Render for AccountsPage {
                         let add_id: SharedString = format!("add-account-{name}").into();
                         let card = widgets::section_card(&theme).mt(px(8.0));
                         let empty_copy = match harness {
-                            HarnessId::Kimi => {
+                            HarnessId::Kimi | HarnessId::Antigravity => {
                                 format!("No {name} managed subscription detected on this device.")
                             }
                             // Cursor's app login is SEPARATE from `cursor-agent
@@ -1464,8 +1466,9 @@ impl Render for AccountsPage {
                     .child(widgets::page_subtitle(
                         &theme,
                         "The Claude Code, Codex, and Cursor logins plus managed Kimi Code \
-                         Usage on this device. Zeron keeps switchable accounts backed up; \
-                         Kimi authentication remains owned by its CLI.",
+                         and Antigravity Usage on this device. Zeron keeps switchable \
+                         accounts backed up; authentication for Kimi and Antigravity \
+                         remains owned by their CLIs.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1520,17 +1523,19 @@ mod tests {
     }
 
     #[test]
-    fn managed_kimi_provider_is_visible_but_has_no_login_action() {
+    fn managed_providers_are_visible_but_have_no_login_action() {
         assert_eq!(
             PROVIDERS.map(|(harness, _, _)| harness),
             [
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
                 HarnessId::Kimi,
+                HarnessId::Antigravity,
                 HarnessId::Cursor,
             ]
         );
         assert!(!provider_can_add(HarnessId::Kimi));
+        assert!(!provider_can_add(HarnessId::Antigravity));
         assert!(provider_can_add(HarnessId::ClaudeCode));
     }
 

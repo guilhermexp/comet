@@ -31,7 +31,8 @@ pub struct WorkersBridge {
 
 const MAX_PENDING_CALLS: usize = 64;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+// 900s deliberately keeps transport from timing out a healthy wait; its 780s slack exceeds the 60s IPC and scheduling margin floor.
+pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 impl WorkersBridge {
     pub async fn start(options: WorkersBridgeOptions) -> Result<Option<Self>, HarnessError> {

@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 
 DAEMON_DIR=/tmp/zeron-demo-daemon
 UI_DIR=/tmp/zeron-demo-ui
+WORKERS_DIR=/tmp/zeron-demo-workers
 IPC=27921
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
@@ -35,15 +36,26 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   echo "▸ seeding demo chats"
   DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
   # One space per demo folder, created up-front (chats join by space id).
-  declare -A SPACES=()
-  for project in zeron soccertcg zeron aether; do
+  SPACE_zeron=""
+  SPACE_soccertcg=""
+  SPACE_aether=""
+  for project in zeron soccertcg aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
     probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
-    SPACES[$project]="$sid"
+    case "$project" in
+      zeron) SPACE_zeron="$sid" ;;
+      soccertcg) SPACE_soccertcg="$sid" ;;
+      aether) SPACE_aether="$sid" ;;
+    esac
   done
   seed() { # title project branch age_hours run
     local id; id=$(uuidgen | tr 'A-Z' 'a-z')
-    local sid="${SPACES[$2]}"
+    local sid=""
+    case "$2" in
+      zeron) sid="$SPACE_zeron" ;;
+      soccertcg) sid="$SPACE_soccertcg" ;;
+      aether) sid="$SPACE_aether" ;;
+    esac
     probe Mutate "{\"op\":\"createChat\",\"chatId\":\"$id\",\"spaceId\":\"$sid\",\"config\":{\"harness\":\"mock\",\"model\":\"fable-5\",\"reasoning\":null,\"sandbox\":\"workspace-write\"}}" >/dev/null
     probe Mutate "{\"op\":\"renameChat\",\"chatId\":\"$id\",\"title\":\"$1\"}" >/dev/null
     probe Mutate "{\"op\":\"setChatBranch\",\"chatId\":\"$id\",\"branch\":\"$3\"}" >/dev/null
@@ -61,5 +73,12 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   touch "$DAEMON_DIR/.demo-seeded"
 fi
 
+DEMO_PARENT_CHAT_ID=$(probe WatchChats '{}' --stream 1 | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(next(row["id"] for row in rows if row.get("title") == "Native Zeron Rust Rewrite"))')
+python3 scripts/seed-demo-workers.py \
+  --home "$WORKERS_DIR" \
+  --project-path "$PWD" \
+  --parent-chat-id "$DEMO_PARENT_CHAT_ID"
+
 echo "▸ opening zeron (composer is live — type into it; --slow shows streaming)"
-ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/zeron
+UNPEEL_HOME="$WORKERS_DIR" COMET_WORKERS_HOOKS_DIR="$WORKERS_DIR/hooks" \
+  ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/zeron

@@ -1,0 +1,9 @@
+{"type":"session","id":"omp-1","cwd":"/tmp/project"}
+{"type":"model_change","model":"google-antigravity/gemini-3.7-flash"}
+{"type":"thinking_level_change","thinkingLevel":"medium"}
+{"type":"message","message":{"role":"assistant","provider":"google-antigravity","model":"gemini-3.7-flash","usage":{"totalTokens":216600}}}
+{"type":"model_change","model":"openai-codex/gpt-5.6-sol"}
+{"type":"thinking_level_change","thinkingLevel":"high"}
+{"type":"message","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","usage":{"totalTokens":42100}}}
+{"type":"message","message":{"role":"user","usage":{"totalTokens":999999}}}
+not-json

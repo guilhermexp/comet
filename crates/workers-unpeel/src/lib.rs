@@ -11,7 +11,9 @@ mod session_event_journal;
 pub mod workspace_trust;
 pub mod worktree_config;
 
-pub use controller_mcp::CONTROLLER_MCP_ARG;
+pub use controller_mcp::{
+    CONTROLLER_MCP_ARG, WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, clamp_wait_for_status_timeout,
+};
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;
 pub use parent_notifications::{
@@ -734,6 +736,14 @@ pub struct WorkersSessionCapabilities {
     pub notify_when_done: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkersModelTokenUsage {
+    pub model: String,
+    pub total_tokens: u64,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersSession {
     pub id: String,
@@ -754,6 +764,8 @@ pub struct WorkersSession {
     pub worktree_branch: Option<String>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    pub total_tokens: Option<u64>,
+    pub model_usage: Vec<WorkersModelTokenUsage>,
     pub capabilities: WorkersSessionCapabilities,
 }
 
@@ -2419,6 +2431,10 @@ struct SessionWire {
     #[serde(default)]
     updated_at_unix_ms: u64,
     #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    model_usage: Vec<WorkersModelTokenUsage>,
+    #[serde(default)]
     capabilities: SessionCapabilitiesWire,
 }
 
@@ -2443,6 +2459,8 @@ impl From<SessionWire> for WorkersSession {
             worktree_branch: value.worktree_branch,
             created_at_unix_ms: value.created_at_unix_ms,
             updated_at_unix_ms: value.updated_at_unix_ms,
+            total_tokens: value.total_tokens,
+            model_usage: value.model_usage,
             capabilities: WorkersSessionCapabilities {
                 restart: value.capabilities.restart,
                 resume_agent: value.capabilities.resume_agent,
@@ -3003,6 +3021,8 @@ mod runtime_capability_tests {
             worktree_branch: None,
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
+            total_tokens: None,
+            model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
         }
     }
@@ -3022,6 +3042,54 @@ mod runtime_capability_tests {
         assert!(!sessions[1].capabilities.notify_when_done);
         assert!(sessions[2].capabilities.notify_when_done);
         assert!(sessions[3].capabilities.notify_when_done);
+    }
+}
+
+#[cfg(test)]
+mod session_wire_telemetry_tests {
+    use super::*;
+
+    fn decode(value: serde_json::Value) -> WorkersSession {
+        WorkersSession::from(serde_json::from_value::<SessionWire>(value).expect("Session wire"))
+    }
+
+    #[test]
+    fn bootstrap_session_decodes_model_usage() {
+        let session = decode(serde_json::json!({
+            "id": "worker-1",
+            "projectID": "project-1",
+            "title": "OMP Worker",
+            "status": "running",
+            "totalTokens": 258700,
+            "modelUsage": [{
+                "model": "openai-codex/gpt-5.6-sol:high",
+                "totalTokens": 42100,
+                "active": true
+            }]
+        }));
+
+        assert_eq!(session.total_tokens, Some(258_700));
+        assert_eq!(
+            session.model_usage,
+            vec![WorkersModelTokenUsage {
+                model: "openai-codex/gpt-5.6-sol:high".into(),
+                total_tokens: 42_100,
+                active: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn bootstrap_session_without_telemetry_remains_compatible() {
+        let session = decode(serde_json::json!({
+            "id": "worker-old",
+            "projectID": "project-1",
+            "title": "Old Worker",
+            "status": "running"
+        }));
+
+        assert_eq!(session.total_tokens, None);
+        assert!(session.model_usage.is_empty());
     }
 }
 

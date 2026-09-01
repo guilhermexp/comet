@@ -30,12 +30,16 @@ _Avoid_: history, messages, doc, conversa
 O registro local e cru do que um agente emitiu durante um run, incluindo as entradas de ferramenta que o Chat Transcript remove por privacidade. Existe para retomar um run interrompido, não para ser lido.
 _Avoid_: log, transcript, history
 
+**Trajectory**:
+A leitura local e técnica dos runs de um Chat capturados no device atual, organizada como timeline e ledger de eventos para auditoria. É uma read model própria: não é o Run Journal bruto, não sincroniza entre devices e protege Payload e Result até uma revelação explícita.
+_Avoid_: trace, timeline, log, Run Journal, Chat Transcript
+
 **Chat Transcript Export**:
-Uma cópia do Chat Transcript num formato levável para fora do comet. Nunca carrega nada que o Chat Transcript já não mostre.
+Uma cópia do Chat Transcript num formato levável para fora do comet. Do transcript nunca carrega nada que o Chat Transcript já não mostre; a única fonte adicional é o índice de CLI Workers do Chat, que entra como Artifact.
 _Avoid_: chat dump, backup, download, export de sessão
 
 **Artifact**:
-Algo substantivo que um Chat produziu — um arquivo escrito, um subagente executado, um output pesado o bastante para não caber inline. É o que um Chat Transcript Export lista no topo para o registro ficar navegável.
+Algo substantivo que um Chat produziu — um arquivo escrito, um subagente executado, um CLI Worker despachado, um output pesado o bastante para não caber inline. É o que um Chat Transcript Export lista no topo para o registro ficar navegável.
 _Avoid_: output, result, file change
 
 ## Checkout
@@ -55,3 +59,17 @@ _Avoid_: branch (quando se quer dizer a lista de opções), revision, commit
 **Retarget**:
 Mover um Chat Checkout para outra pasta que já existe — o worktree do Ref escolhido — em vez de trocar o Ref dentro da pasta atual. Custa a continuidade do harness: o próximo run abre conversa nova, porque resume é escopo de cwd.
 _Avoid_: switch, move, checkout
+
+## Projects
+
+**Registered Project**:
+Uma pasta que o usuário cadastrou no working set de projetos (`WorkersProject`, o que `list_projects` retorna) — o universo fechado contra o qual qualquer derivação de projeto casa. Uma pasta que o agente tocou e não está cadastrada não é um Registered Project e não existe para a UI.
+_Avoid_: workspace, folder, repo (quando se quer dizer a row cadastrada)
+
+**Leaf Root**:
+O Registered Project que não é ancestral de nenhum outro Registered Project. Um projeto cadastrado que contém outros cadastrados é um contêiner e nunca participa de casamento por prefixo, senão engole todo caminho abaixo dele.
+_Avoid_: parent project, container, root project
+
+**Worked Project**:
+O Leaf Root que contém ao menos um caminho absoluto tocado pelos próprios turnos de assistente de um Chat — leitura, escrita, edição, busca ou comando. É o que o bloco `Projects worked` do card Workspace lista. Deriva só do transcript daquele Chat: nunca de Worker despachado, nunca de subagente, e nunca inclui o Chat Checkout do próprio Chat.
+_Avoid_: touched folder, visited project, worker project

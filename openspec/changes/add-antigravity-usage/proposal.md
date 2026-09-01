@@ -21,6 +21,7 @@ Comet's Usage widget displays Claude, Codex, and Kimi subscription quotas, but G
 - Add Antigravity icon asset and mapping in `zeron-ui`.
 - Add Antigravity to `provider_usage_rows` in `zeron-ui` after Kimi, preserving window order.
 - Refine label normalization in `details_sidebar/view.rs` to preserve composite labels like `Weekly (Claude/GPT)`.
+- Expose Antigravity managed account in `Settings → Accounts` (`crates/ui/src/settings/accounts.rs`) between Kimi Code and Cursor with managed empty state and updated page subtitle.
 
 ## Capabilities
 
@@ -32,4 +33,4 @@ Comet's Usage widget displays Claude, Codex, and Kimi subscription quotas, but G
 
 - `crates/proto`: `HarnessId::Antigravity` variant and serde round-trip.
 - `crates/engine`: Antigravity credential discovery, in-memory token refresh, and quota fetcher module `antigravity_usage.rs`.
-- `crates/ui`: Usage row, 4-window ordering, label rewrite refinement, and Antigravity icon asset.
+- `crates/ui`: Usage row, 4-window ordering, label rewrite refinement, Antigravity icon asset, and Settings → Accounts provider list with managed empty copy.

@@ -40,6 +40,10 @@ pub fn workers_tab_presence(worker_count: usize, bindings_unavailable: bool) -> 
     worker_count.max(usize::from(bindings_unavailable))
 }
 
+pub fn worker_expansion_key(session_id: &str) -> String {
+    format!("worker:{session_id}")
+}
+
 #[derive(Debug, Default)]
 pub struct ChatWorkersWidgetState {
     context_key: Option<String>,
@@ -223,7 +227,10 @@ pub fn property_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatWorkersTab, ChatWorkersWidgetState, auto_tab, workers_tab_presence};
+    use super::{
+        ChatWorkersTab, ChatWorkersWidgetState, auto_tab, worker_expansion_key,
+        workers_tab_presence,
+    };
 
     #[test]
     fn workers_widget_auto_selects_first_non_empty_tab() {
@@ -279,6 +286,20 @@ mod tests {
 
         assert!(state.activity_expanded_with_default("subagent-b", false));
         assert!(!state.activity_expanded_with_default("subagent-a", false));
+    }
+
+    #[test]
+    fn worker_disclosure_stays_bound_to_session_identity_after_reordering() {
+        let mut state = ChatWorkersWidgetState::default();
+        let worker_a = worker_expansion_key("worker-a");
+        let worker_b = worker_expansion_key("worker-b");
+        state.sync_activities([worker_a.as_str(), worker_b.as_str()]);
+        state.toggle_activity_with_default(&worker_b, false);
+
+        state.sync_activities([worker_b.as_str(), worker_a.as_str()]);
+
+        assert!(state.activity_expanded_with_default(&worker_b, false));
+        assert!(!state.activity_expanded_with_default(&worker_a, false));
     }
 
     #[test]

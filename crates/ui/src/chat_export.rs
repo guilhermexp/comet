@@ -2,6 +2,8 @@ use serde::Serialize;
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use zeron_proto::{ToolCall, view::tool_chip_content};
 
+use crate::details_sidebar::chat_workers::ChatWorkerRow;
+
 const MAX_FILENAME_TITLE_CHARS: usize = 100;
 const MAX_FILENAME_BYTES: usize = 255;
 const HEAVY_OUTPUT_BYTE_THRESHOLD: u64 = 16 * 1024;
@@ -21,6 +23,7 @@ pub(crate) enum ArtifactKind {
     FileWrite,
     HeavyOutput,
     Subagent,
+    Worker,
 }
 
 impl ArtifactKind {
@@ -29,6 +32,7 @@ impl ArtifactKind {
             Self::FileWrite => "File write",
             Self::HeavyOutput => "Heavy output",
             Self::Subagent => "Subagent",
+            Self::Worker => "Worker",
         }
     }
 
@@ -37,6 +41,7 @@ impl ArtifactKind {
             Self::FileWrite => "file-write",
             Self::HeavyOutput => "heavy-output",
             Self::Subagent => "subagent",
+            Self::Worker => "worker",
         }
     }
 }
@@ -45,8 +50,10 @@ impl ArtifactKind {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Artifact {
     pub(crate) kind: ArtifactKind,
-    pub(crate) message_ix: usize,
-    pub(crate) part_ix: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message_ix: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) part_ix: Option<usize>,
     pub(crate) tool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
@@ -54,6 +61,8 @@ pub(crate) struct Artifact {
     pub(crate) output_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subagent_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +126,11 @@ impl ExportTool {
 }
 
 impl ExportDoc {
-    pub(crate) fn from_transcript(chat: ChatMetadata, entries: &[SessionMessageEntry]) -> Self {
+    pub(crate) fn from_transcript(
+        chat: ChatMetadata,
+        entries: &[SessionMessageEntry],
+        workers: &[ChatWorkerRow],
+    ) -> Self {
         let mut messages = Vec::with_capacity(entries.len());
         let mut artifacts = Vec::new();
 
@@ -158,36 +171,39 @@ impl ExportDoc {
                         for path in file_paths {
                             artifacts.push(Artifact {
                                 kind: ArtifactKind::FileWrite,
-                                message_ix,
-                                part_ix,
+                                message_ix: Some(message_ix),
+                                part_ix: Some(part_ix),
                                 tool: tool.to_owned(),
                                 path: Some(path),
                                 output_bytes: None,
                                 subagent_ref: None,
+                                session_id: None,
                             });
                         }
 
                         if let Some(subagent_ref) = subagent_ref {
                             artifacts.push(Artifact {
                                 kind: ArtifactKind::Subagent,
-                                message_ix,
-                                part_ix,
+                                message_ix: Some(message_ix),
+                                part_ix: Some(part_ix),
                                 tool: tool.to_owned(),
                                 path: None,
                                 output_bytes: None,
                                 subagent_ref: Some(subagent_ref.clone()),
+                                session_id: None,
                             });
                         }
 
                         if output_bytes.is_some_and(|bytes| bytes > HEAVY_OUTPUT_BYTE_THRESHOLD) {
                             artifacts.push(Artifact {
                                 kind: ArtifactKind::HeavyOutput,
-                                message_ix,
-                                part_ix,
+                                message_ix: Some(message_ix),
+                                part_ix: Some(part_ix),
                                 tool: tool.to_owned(),
                                 path: None,
                                 output_bytes: *output_bytes,
                                 subagent_ref: None,
+                                session_id: None,
                             });
                         }
                     }
@@ -201,6 +217,19 @@ impl ExportDoc {
                 id: message.id.clone(),
                 role: message.role.into(),
                 parts,
+            });
+        }
+
+        for worker in workers {
+            artifacts.push(Artifact {
+                kind: ArtifactKind::Worker,
+                message_ix: None,
+                part_ix: None,
+                tool: worker.title.clone(),
+                path: None,
+                output_bytes: None,
+                subagent_ref: None,
+                session_id: Some(worker.session_id.clone()),
             });
         }
 
@@ -265,9 +294,19 @@ impl ExportFormat {
 }
 
 pub(crate) fn render_markdown(doc: &ExportDoc) -> String {
+    let worker_count = doc
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Worker)
+        .count();
+    let workers_header = if worker_count > 0 {
+        format!("\n**Workers:** {worker_count}")
+    } else {
+        String::new()
+    };
     let mut rendered = format!(
-        "# {}\n\n**Exported:** {}\n**Project:** {}\n**Branch:** {}\n\n---\n\n## Artifacts\n\n",
-        doc.chat.title, doc.chat.exported_at, doc.chat.cwd, doc.chat.branch
+        "# {}\n\n**Exported:** {}\n**Project:** {}\n**Branch:** {}{}\n\n---\n\n## Artifacts\n\n",
+        doc.chat.title, doc.chat.exported_at, doc.chat.cwd, doc.chat.branch, workers_header
     );
     if doc.artifacts.is_empty() {
         rendered.push_str("_None._\n");
@@ -302,23 +341,26 @@ pub(crate) fn render_markdown(doc: &ExportDoc) -> String {
 
 fn render_markdown_artifact(artifact: &Artifact) -> String {
     let mut rendered = format!(
-        "- **{}** `{}`",
+        "- **{}** {}",
         artifact.kind.markdown_label(),
-        artifact.tool
+        markdown_inline_code(&artifact.tool)
     );
     if let Some(path) = &artifact.path {
-        rendered.push_str(&format!(" `{path}`"));
+        rendered.push_str(&format!(" {}", markdown_inline_code(path)));
     }
     if let Some(subagent_ref) = &artifact.subagent_ref {
-        rendered.push_str(&format!(" `{subagent_ref}`"));
+        rendered.push_str(&format!(" {}", markdown_inline_code(subagent_ref)));
+    }
+    if let Some(session_id) = &artifact.session_id {
+        rendered.push_str(&format!(" {}", markdown_inline_code(session_id)));
     }
     if let Some(output_bytes) = artifact.output_bytes {
         rendered.push_str(&format!(" · {output_bytes} bytes"));
     }
-    rendered.push_str(&format!(
-        " · message {}, part {}\n",
-        artifact.message_ix, artifact.part_ix
-    ));
+    if let (Some(message_ix), Some(part_ix)) = (artifact.message_ix, artifact.part_ix) {
+        rendered.push_str(&format!(" · message {message_ix}, part {part_ix}"));
+    }
+    rendered.push('\n');
     rendered
 }
 
@@ -334,6 +376,35 @@ fn longest_backtick_run(text: &str) -> usize {
         }
     }
     longest
+}
+
+fn single_line(text: &str) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            if !rendered.ends_with(' ') {
+                rendered.push(' ');
+            }
+        } else {
+            rendered.push(ch);
+        }
+    }
+    rendered
+}
+
+fn markdown_inline_code(text: &str) -> String {
+    let text = single_line(text);
+    let fence = "`".repeat(longest_backtick_run(&text) + 1);
+    if text.is_empty()
+        || text.starts_with('`')
+        || text.starts_with(' ')
+        || text.ends_with('`')
+        || text.ends_with(' ')
+    {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
+    }
 }
 
 fn render_markdown_tool(tool: &ExportTool) -> String {
@@ -387,20 +458,27 @@ pub(crate) fn render_text(doc: &ExportDoc) -> String {
 }
 
 fn render_text_artifact(artifact: &Artifact) -> String {
-    let mut rendered = format!("- {} {}", artifact.kind.text_label(), artifact.tool);
+    let mut rendered = format!(
+        "- {} {}",
+        artifact.kind.text_label(),
+        single_line(&artifact.tool)
+    );
     if let Some(path) = &artifact.path {
-        rendered.push_str(&format!(" {path}"));
+        rendered.push_str(&format!(" {}", single_line(path)));
     }
     if let Some(subagent_ref) = &artifact.subagent_ref {
-        rendered.push_str(&format!(" {subagent_ref}"));
+        rendered.push_str(&format!(" {}", single_line(subagent_ref)));
+    }
+    if let Some(session_id) = &artifact.session_id {
+        rendered.push_str(&format!(" {}", single_line(session_id)));
     }
     if let Some(output_bytes) = artifact.output_bytes {
         rendered.push_str(&format!(" ({output_bytes} bytes)"));
     }
-    rendered.push_str(&format!(
-        " @ message {}, part {}\n",
-        artifact.message_ix, artifact.part_ix
-    ));
+    if let (Some(message_ix), Some(part_ix)) = (artifact.message_ix, artifact.part_ix) {
+        rendered.push_str(&format!(" @ message {message_ix}, part {part_ix}"));
+    }
+    rendered.push('\n');
     rendered
 }
 
@@ -492,6 +570,7 @@ pub(crate) fn build_filename(title: &str, chat_id: &str, format: ExportFormat) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::details_sidebar::chat_workers::WorkerSemantic;
     use zeron_doc::{
         FileChangeKind, FileChangePreview, MessagePart, MessageRole, SessionMessageEntry,
         ToolDiffStat,
@@ -521,6 +600,22 @@ mod tests {
             branch: "change/export".to_owned(),
             cwd: "/work/zeron".to_owned(),
             exported_at: "2026-08-26T12:34:56Z".to_owned(),
+        }
+    }
+
+    fn worker(session_id: &str, title: &str, semantic: WorkerSemantic) -> ChatWorkerRow {
+        ChatWorkerRow {
+            session_id: session_id.to_owned(),
+            project_id: "project-shared".to_owned(),
+            title: title.to_owned(),
+            command: "worker command".to_owned(),
+            provider_id: Some("claude-code".to_owned()),
+            semantic,
+            state: "working".to_owned(),
+            activity: "building".to_owned(),
+            updated_at_unix_ms: 1000,
+            total_tokens: None,
+            model_usage: Vec::new(),
         }
     }
 
@@ -560,7 +655,7 @@ mod tests {
             message("m-assistant", MessageRole::Assistant, "Second"),
         ];
 
-        let doc = ExportDoc::from_transcript(metadata("A Chat"), &entries);
+        let doc = ExportDoc::from_transcript(metadata("A Chat"), &entries, &[]);
 
         assert_eq!(doc.messages.len(), 2);
         assert_eq!(doc.messages[0].id, "m-user");
@@ -571,7 +666,7 @@ mod tests {
     #[test]
     fn markdown_keeps_the_chat_spine_and_explicit_empty_artifact_section() {
         let entries = vec![message("m-user", MessageRole::User, "Hello")];
-        let doc = ExportDoc::from_transcript(metadata("A Chat"), &entries);
+        let doc = ExportDoc::from_transcript(metadata("A Chat"), &entries, &[]);
 
         let markdown = render_markdown(&doc);
 
@@ -652,6 +747,7 @@ mod tests {
         let markdown = render_markdown(&ExportDoc::from_transcript(
             metadata("Fences"),
             &[assistant, after],
+            &[],
         ));
 
         assert!(
@@ -720,14 +816,14 @@ mod tests {
         let mut entry = message("m-assistant", MessageRole::Assistant, "Done");
         entry.parts = vec![write, agent, heavy];
 
-        let doc = ExportDoc::from_transcript(metadata("Artifacts"), &[entry]);
+        let doc = ExportDoc::from_transcript(metadata("Artifacts"), &[entry], &[]);
 
         assert_eq!(doc.artifacts.len(), 3);
         assert_eq!(doc.artifacts[0].kind, ArtifactKind::FileWrite);
         assert_eq!(doc.artifacts[0].path.as_deref(), Some("src/export.rs"));
         assert_eq!(
             (doc.artifacts[0].message_ix, doc.artifacts[0].part_ix),
-            (0, 0)
+            (Some(0), Some(0))
         );
         assert_eq!(doc.artifacts[1].kind, ArtifactKind::Subagent);
         assert_eq!(
@@ -736,13 +832,13 @@ mod tests {
         );
         assert_eq!(
             (doc.artifacts[1].message_ix, doc.artifacts[1].part_ix),
-            (0, 1)
+            (Some(0), Some(1))
         );
         assert_eq!(doc.artifacts[2].kind, ArtifactKind::HeavyOutput);
         assert_eq!(doc.artifacts[2].output_bytes, Some(16 * 1024 + 1));
         assert_eq!(
             (doc.artifacts[2].message_ix, doc.artifacts[2].part_ix),
-            (0, 2)
+            (Some(0), Some(2))
         );
 
         let markdown = render_markdown(&doc);
@@ -824,7 +920,11 @@ mod tests {
         let mut entry = message("m-assistant", MessageRole::Assistant, "");
         entry.parts = tools;
 
-        let markdown = render_markdown(&ExportDoc::from_transcript(metadata("Tools"), &[entry]));
+        let markdown = render_markdown(&ExportDoc::from_transcript(
+            metadata("Tools"),
+            &[entry],
+            &[],
+        ));
 
         assert!(markdown.contains("```bash\ncargo test -p zeron-ui\n```"));
         assert!(markdown.contains("> Modified: `src/lib.rs`"));
@@ -861,7 +961,7 @@ mod tests {
             duration_ms: None,
         });
 
-        let doc = ExportDoc::from_transcript(metadata("Sanitized"), &[entry]);
+        let doc = ExportDoc::from_transcript(metadata("Sanitized"), &[entry], &[]);
         let json = render_json(&doc).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -876,6 +976,119 @@ mod tests {
         assert_eq!(parts[1]["kind"], "tool");
         assert_eq!(parts[1]["tool"]["kind"], "exec");
         assert_eq!(parts[1]["tool"]["command"], "cargo test");
+    }
+
+    #[test]
+    fn zero_workers_preserve_the_baseline_bytes_in_every_format() {
+        let doc = ExportDoc::from_transcript(
+            metadata("A Chat"),
+            &[message("m-user", MessageRole::User, "Hello")],
+            &[],
+        );
+
+        assert_eq!(
+            render_markdown(&doc),
+            "# A Chat\n\n\
+**Exported:** 2026-08-26T12:34:56Z\n\
+**Project:** /work/zeron\n\
+**Branch:** change/export\n\n\
+---\n\n\
+## Artifacts\n\n\
+_None._\n\
+\n\
+### **You**\n\n\
+Hello\n"
+        );
+        assert_eq!(
+            render_text(&doc),
+            "A Chat\n\
+Exported: 2026-08-26T12:34:56Z\n\
+Project: /work/zeron\n\
+Branch: change/export\n\n\
+---\n\n\
+ARTIFACTS:\n\
+(none)\n\
+\n\
+You:\n\
+Hello\n"
+        );
+        assert_eq!(
+            render_json(&doc).unwrap(),
+            concat!(
+                "{\n",
+                "  \"exportedAt\": \"2026-08-26T12:34:56Z\",\n",
+                "  \"chat\": {\n",
+                "    \"id\": \"chat-0123456789\",\n",
+                "    \"title\": \"A Chat\",\n",
+                "    \"branch\": \"change/export\",\n",
+                "    \"cwd\": \"/work/zeron\"\n",
+                "  },\n",
+                "  \"artifactIndex\": [],\n",
+                "  \"messages\": [\n",
+                "    {\n",
+                "      \"id\": \"m-user\",\n",
+                "      \"role\": \"user\",\n",
+                "      \"parts\": [\n",
+                "        {\n",
+                "          \"kind\": \"text\",\n",
+                "          \"text\": \"Hello\"\n",
+                "        }\n",
+                "      ]\n",
+                "    }\n",
+                "  ]\n",
+                "}"
+            )
+        );
+    }
+
+    #[test]
+    fn worker_artifacts_preserve_the_projected_order() {
+        let workers = [
+            worker("worker-active-new", "Active new", WorkerSemantic::Working),
+            worker("worker-active-old", "Active old", WorkerSemantic::Blocked),
+            worker("worker-settled", "Settled", WorkerSemantic::Terminal),
+        ];
+
+        let doc = ExportDoc::from_transcript(metadata("Ordered"), &[], &workers);
+
+        let ids = doc
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.session_id.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["worker-active-new", "worker-active-old", "worker-settled"]
+        );
+        let markdown = render_markdown(&doc);
+        assert!(
+            markdown.find("worker-active-new").unwrap()
+                < markdown.find("worker-active-old").unwrap()
+        );
+        assert!(
+            markdown.find("worker-active-old").unwrap() < markdown.find("worker-settled").unwrap()
+        );
+    }
+
+    #[test]
+    fn review_regression_worker_title_stays_within_artifact_line() {
+        let title = "Build `x`\n## forged";
+        let doc = ExportDoc::from_transcript(
+            metadata("Worker title"),
+            &[],
+            &[worker("worker-1", title, WorkerSemantic::Working)],
+        );
+
+        let markdown = render_markdown(&doc);
+        let text = render_text(&doc);
+        let json = render_json(&doc).expect("serialize export");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse export");
+
+        assert!(markdown.contains("- **Worker** ``Build `x` ## forged`` `worker-1`\n"));
+        assert!(!markdown.contains("\n## forged"));
+        assert!(text.contains("- worker Build `x` ## forged worker-1\n"));
+        assert!(!text.contains("\n## forged"));
+        assert_eq!(parsed["artifactIndex"][0]["tool"], title);
     }
 
     #[test]
@@ -914,7 +1127,12 @@ mod tests {
         first.parts.push(write);
         let mut second = message("message-second", MessageRole::Assistant, "SECOND MESSAGE");
         second.parts.push(agent);
-        let doc = ExportDoc::from_transcript(metadata("Shared"), &[first, second]);
+        let worker = worker(
+            "worker-ses-shared",
+            "Build frontend",
+            WorkerSemantic::Working,
+        );
+        let doc = ExportDoc::from_transcript(metadata("Shared"), &[first, second], &[worker]);
 
         let markdown = render_markdown(&doc);
         let text = render_text(&doc);
@@ -931,19 +1149,28 @@ mod tests {
         assert_eq!(message_counts, [2, 2, 2]);
 
         assert!(markdown.contains(
-            "## Artifacts\n\n\
+            "**Exported:** 2026-08-26T12:34:56Z\n\
+**Project:** /work/zeron\n\
+**Branch:** change/export\n\
+**Workers:** 1\n\n\
+---\n\n\
+## Artifacts\n\n\
 - **File write** `Write` `src/shared.rs` · message 0, part 1\n\
-- **Subagent** `Agent` `subagent-doc-shared` · message 1, part 1\n"
+- **Subagent** `Agent` `subagent-doc-shared` · message 1, part 1\n\
+- **Worker** `Build frontend` `worker-ses-shared`\n"
         ));
         assert!(text.contains(
             "ARTIFACTS:\n\
 - file-write Write src/shared.rs @ message 0, part 1\n\
-- subagent Agent subagent-doc-shared @ message 1, part 1\n"
+- subagent Agent subagent-doc-shared @ message 1, part 1\n\
+- worker Build frontend worker-ses-shared\n"
         ));
 
         for rendered in [&markdown, &text, &json] {
             assert!(rendered.contains("src/shared.rs"));
             assert!(rendered.contains("subagent-doc-shared"));
+            assert!(rendered.contains("worker-ses-shared"));
+            assert!(rendered.contains("Build frontend"));
             assert!(
                 rendered.find("FIRST MESSAGE").unwrap() < rendered.find("SECOND MESSAGE").unwrap()
             );
@@ -951,7 +1178,7 @@ mod tests {
 
         assert_eq!(parsed["exportedAt"], "2026-08-26T12:34:56Z");
         assert_eq!(parsed["chat"]["id"], "chat-0123456789");
-        assert_eq!(parsed["artifactIndex"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["artifactIndex"].as_array().unwrap().len(), 3);
         assert_eq!(parsed["artifactIndex"][0]["kind"], "fileWrite");
         assert_eq!(parsed["artifactIndex"][0]["path"], "src/shared.rs");
         assert_eq!(parsed["artifactIndex"][0]["messageIx"], 0);
@@ -963,6 +1190,11 @@ mod tests {
         );
         assert_eq!(parsed["artifactIndex"][1]["messageIx"], 1);
         assert_eq!(parsed["artifactIndex"][1]["partIx"], 1);
+        assert_eq!(parsed["artifactIndex"][2]["kind"], "worker");
+        assert_eq!(parsed["artifactIndex"][2]["tool"], "Build frontend");
+        assert_eq!(parsed["artifactIndex"][2]["sessionId"], "worker-ses-shared");
+        assert!(parsed["artifactIndex"][2].get("messageIx").is_none());
+        assert!(parsed["artifactIndex"][2].get("partIx").is_none());
         assert_eq!(parsed["messages"][1]["parts"][1]["kind"], "tool");
         assert_eq!(parsed["messages"][1]["parts"][1]["tool"]["kind"], "generic");
         assert_eq!(parsed["messages"][1]["parts"][1]["tool"]["label"], "Agent");

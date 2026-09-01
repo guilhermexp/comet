@@ -1,4 +1,4 @@
-# comet-ui — o app gpui
+# zeron-ui — o app gpui
 
 Pai: [`../AGENTS.md`](../AGENTS.md)
 
@@ -8,7 +8,7 @@ O viewport: shell (sidebar de spaces + abas), transcript, composer, painel de te
 
 ## Ownership
 
-Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobreviver à janela fechada — isso é `comet-engine`. Regra derivada compartilhada com a engine mora em `comet-proto::view`, não aqui.
+Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobreviver à janela fechada — isso é `zeron-engine`. Regra derivada compartilhada com a engine mora em `zeron-proto::view`, não aqui.
 
 ## Local Contracts
 
@@ -22,10 +22,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - Altura de linha em code block = linhas × line-height, independente do highlight; o highlight roda time-sliced em background e entra como run de texto (paint-only).
 - Transcript é por **bloco**, não por mensagem: id estável `msgId#blockId`, turno vivo não splitado, re-split na persistência. Eco otimista compartilha o id cunhado no cliente pra persistência não piscar.
 - **A entrega do export mora no shell, a formatação não**: as seis ações do menu resolvem as entries e escolhem destino; `chat_export.rs` continua puro. O transcript vem da memória SÓ quando a linha clicada é a selecionada (`export_reads_memory`) — qualquer outra abre um `WatchDocMessages` transitório e consome apenas o frame `Reset`, porque exportar o chat errado é uma falha silenciosa que produz arquivo plausível. Resultado (sucesso e falha) sai pelo `sidebar_notice`, nunca por `notify::post`: banner de desktop é canal de background e é suprimido justamente com o app em foco. `SidebarNotice` carrega o tom junto do texto para que sucesso não herde o vermelho da falha anterior.
-- **Chat Transcript Export é uma projeção pura do transcript**: `chat_export.rs` percorre `&[SessionMessageEntry]` uma vez para formar um único `ExportDoc`, e Markdown/Text/JSON derivam somente dele. Nunca lê Run Journal, resolve `output_ref`/`diff_ref` ou importa gpui/I/O; tools usam `zeron_proto::view::tool_chip_content`, e só o `ToolCall` já sanitizado decide quais comando/path aparecem.
-  `ExportDoc.messages` usa tipos próprios (`ExportMessage`/`ExportPart`/`ExportTool`),
-  nunca `SessionMessageEntry` bruto: output, diff, refs, reasoning, input e
-  workflow deixam de ser representáveis antes dos três renderers.
+- **Chat Transcript Export usa duas fontes explícitas**: `ExportDoc.messages` é uma projeção pura de `&[SessionMessageEntry]`, enquanto o índice de artifacts recebe também os CLI Workers já projetados pelo `WorkersModel`. O shell captura ambos antes de `cx.spawn`; falha no join de workers degrada para lista vazia **e o resultado sai como `Incomplete`**, nunca como sucesso limpo — arquivo entregue sem o índice de workers é exatamente o arquivo plausível que o notice existe pra denunciar. Nunca lê Run Journal, resolve `output_ref`/`diff_ref` ou importa gpui/I/O; tools usam `zeron_proto::view::tool_chip_content`, e só o `ToolCall` já sanitizado decide quais comando/path aparecem.
+  `ExportDoc.messages` usa tipos próprios (`ExportMessage`/`ExportPart`/`ExportTool`), nunca `SessionMessageEntry` bruto: output, diff, refs, reasoning, input e workflow deixam de ser representáveis antes dos três renderers. Workers carregam título + session id e preservam a ordem determinística de `project_chat_workers`; Markdown e texto normalizam campos de Artifact para uma linha e usam fences dinâmicos, enquanto JSON preserva o valor original. Sem worker, os três formatos permanecem byte-idênticos ao export anterior.
 - Chips GitHub/YouTube existem só em mensagens de usuário já enviadas: `url_chips.rs` segmenta e projeta o texto uma vez em `rows_for_entry`, e a row cacheia spans clicáveis. O paint só consome esses spans; input, assistente e outras URLs continuam texto, a pontuação final fica fora do chip e a mensagem persistida nunca muda.
 - Cards do usuário são sticky por turno: um clone paint-only do renderer existente ocupa o inset do runway e é empurrado pelo próximo user row. A geometria é per-chat, não altera altura da lista, não substitui o runway e não duplica o original quando ele já ocupa a posição.
 - O wrapper externo do sticky é transparente; a oclusão/blur e o bloqueio de mouse/hover subjacente ficam limitados ao card interno arredondado, enquanto wheel/touch continuam chegando ao transcript.
@@ -51,10 +49,17 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - A banda de tabs do pane tem altura fixa (`TAB_BAR_HEIGHT`, `flex_none`) e as chips têm largura natural com `min_w_0`; `size_full`/`flex_1` na banda rouba a altura do conteúdo (superfície em branco) ou divide a largura com a drag region (strip cortada no meio). Chips rolam, `+` e chevron ficam fora do scroller, e a tab recém-selecionada é revelada uma vez via `scroll_to_item`.
 - O gesto de captura (menu nativo de modo → `screencapture` → cancelamento) mora **uma vez** em `workers::session_gallery::pick_and_capture`; `Ok(None)` é cancelamento, não erro. Orchestrator e Workers só escolhem destino e o que fazer com o arquivo.
 - O trailing da titlebar do chat é **um cluster dimensionado pelo conteúdo** (captura, toggle de details, expand/close do pane): o `pr` da row já termina na borda da coluna do chat. Largura explícita (`right_now - pr`) ou overlay absoluto com offset calculado voltam a pintar em cima do título ou dos próprios botões — foi assim duas vezes.
-- Provider autenticado fica expansível quando houver janela remota **ou** linha de usage local. `NoUsage` significa que ambas estão vazias; linhas locais de 24h/7d/30d continuam acessíveis sem quota remota. Providers managed renderam na ordem fixa Claude, Codex, Kimi, Antigravity; Kimi e Antigravity não têm ação de login/add/switch em Accounts; Antigravity usa a marca embutida `ANTIGRAVITY`. O rewrite de label do corpo expandido limita-se a igualdade exata com os labels crus da engine (`"Week"` → `"Weekly"`, `"Session"` → `"5h"`), preservando labels descritivos como `Weekly (Claude/GPT)` e `5h (Claude/GPT)`.
+- Provider autenticado fica expansível quando houver janela remota **ou** linha de usage local. `NoUsage` significa que ambas estão vazias; linhas locais de 24h/7d/30d continuam acessíveis sem quota remota. Providers managed renderam na ordem fixa Claude, Codex, Kimi, Antigravity e Antigravity usa a marca embutida `ANTIGRAVITY` (a linha de Accounts dessas contas está na regra de Settings → Accounts, no fim deste doc). O rewrite de label do corpo expandido limita-se a igualdade exata com os labels crus da engine (`"Week"` → `"Weekly"`, `"Session"` → `"5h"`), preservando labels descritivos como `Weekly (Claude/GPT)` e `5h (Claude/GPT)`.
 - O número no header do Usage é quota **restante** (`Weekly 72%`) e seu tom deriva da quota semanal: neutro (>50%), warning (16–50%), danger (1–15%) e neutro ao esgotar (0%). O badge de countdown (`Reset 12h 16m`) usa o mesmo tom e aparece dentro de `RESET_SOON_HOURS` (48h) ou persistentemente enquanto a quota estiver em 0% com reset futuro. O widget re-deriva os countdowns a cada 30s localmente (`USAGE_TICK`) e refaz o fetch a cada 120s (`USAGE_FETCH_INTERVAL`), preservando o snapshot anterior em falhas de rede. Os limiares de 10%/25% continuam valendo para as barras do corpo expandido.
 - Overflow do widget Details: o card Workers rola no próprio body, dimensionado em linhas inteiras (`CHAT_WORKERS_VISIBLE_ROWS` × `CHAT_WORKERS_ROW_HEIGHT` = 6 × 32px); o antigo 152px fixo cortava a quinta linha no meio do glifo. Labels de workflow, subagent e progresso precisam ser normalizados para uma linha visual antes de entrar em rows de altura fixa; label multilinha cru causa sobreposição de texto e é proibido.
 - Activities do widget Workers começam colapsadas; toggles explícitos permanecem keyed pelo id estável. Linhas de subagent preservam avatar e status lifecycle, incluindo spinner paint-only durante `Running`.
+- Telemetria de modelo/token no widget Workers usa o mesmo mapa de disclosure,
+  sob a chave estável `worker:<session-id>`. Colapsado, mostra o modelo ativo e
+  o total da Session; expandido, mantém a ordem current-first recebida e um
+  slot de tokens não encolhível. O chevron interrompe propagação e só expande;
+  o restante da row continua abrindo o terminal. Sem telemetria, o subtítulo
+  permanece o comando existente. Isso não altera Chat Transcript Export nem
+  Managed Provider Usage.
 - Linhas do To-dos usam um único slot circular não encolhível, com check/seta
   centralizados nos dois eixos e a mesma geometria `36/12/9` do card inline;
   estados não recebem offsets ópticos próprios.
@@ -84,10 +89,11 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Abrir a lightbox usa `fit_zoom`, nunca `1.0`**: diagrama maior que a janela abria recortado nos quatro lados sem nada na tela que alcançasse o resto. `Fit` recalcula pelo viewport corrente e o teto é `MAX_FIT_ZOOM` (2.0 = escala do raster SVG do gpui; além disso só borra). Gestos: **pinch** dá zoom (`on_pinch`, `magnifyWithEvent:` → `PinchEvent` no `gpui_macos`), scroll de dois dedos faz **pan**, ⌘/ctrl + scroll dá zoom pra quem está no mouse. Wheel puro dando zoom era o oposto: redimensionava sem pedir e não sobrava gesto pra mover.
 - **Imagem inline é a imagem, sem moldura**: sem card, sem borda, sem barra de nome — só o `img`, com **altura absoluta** (`INLINE_IMAGE_HEIGHT`) e largura AUTO, porque é a única combinação que o gpui deriva do ratio intrínseco (`Img::request_layout`); largura em porcentagem deixaria a altura no natural e voltaria a letterboxar. A altura fixa é o que mantém a row analítica pro virtualizador, então o estado `Reloading` ocupa a mesma caixa.
 - **GPUI Dev Inspector é exclusivo de development builds (`debug_assertions`)**: `inspector.rs` é gateado sob `#[cfg(debug_assertions)]`, ativado por atalho `cmd-alt-i` (registrado em `shell::apply_keymap`) ou menu `Developer -> Toggle GPUI Inspector`. O renderer monta um painel com botão de picking (`inspector.start_picking()`), exibição de `source_location` (`file:line`), `instance_id` e cópia para clipboard, mais os estados dos elementos inspecionados (`inspector.render_inspector_states`). Compilação em release exclui completamente o módulo e suas chamadas sem qualquer overhead.
+- **Worked Projects no card Workspace é uma projeção pura do transcript**: `details_sidebar/worked_projects.rs` deriva somente de `&[SessionMessageEntry]`, `&[WorkersProject]`, do checkout do chat e de `home_dir`. Casamento filtra grupos organizacionais (`!is_group`), calcula Leaf Roots sobre todos os projetos registrados antes de excluir o own checkout, ignora caminhos relativos, expande `~/` com home dir e respeita fronteira de componente (`/a/kanna` não casa raiz `/a/kanwas`). O bloco só aparece em `DetailsMode::Orchestrator` com contagem > 0, empilha sem gap vertical e o resultado é memoizado em `DetailsSidebarState` por (context key, transcript length, total de parts, fingerprint de projetos). O total de parts não é redundante: `TranscriptFrame::Delta` faz upsert da MESMA entry por id, então `transcript.len()` não muda enquanto uma nova part `ReadFile`/`Exec` entra — sem essa dimensão o card congela pelo turno inteiro.
 
 ## Work Guidance
 
-- "Não atualizou na tela" começa em `comet-doc` (mirror), não aqui.
+- "Não atualizou na tela" começa em `zeron-doc` (mirror), não aqui.
 - Não há harness de render: mudança visual se valida rodando `scripts/dev-demo.sh` e olhando. Screenshot antes de dizer pronto.
 - Toda raiz de `track_focus` precisa de `.id()` + `.role()` (mais `aria_label` / `aria_value` quando o controle carrega texto). Sem role o gpui deixa o elemento fora da árvore AccessKit, loga `a11y: focused element … has no accessibility node` a cada mudança de foco, e a tecnologia assistiva anuncia a janela inteira em vez do controle focado.
 
@@ -111,8 +117,11 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/{popover,pickers,composer}.rs` (completion/model popups) | unit + compile | `cargo test -p zeron-ui scrollbar_metrics && cargo test -p zeron-ui composer` |
 | `src/shell/{spaces,tabs}.rs` (ordem visual e atalhos de Chat) | unit | `cargo test -p zeron-ui shell::spaces::tests && cargo test -p zeron-ui shell::tabs::cycle_tests` |
 | `src/mermaid_preview.rs` (fit, slack de pan, fatores de gesto) | unit — matemática pura; a lightbox em si é visual | `cargo test -p zeron-ui --lib mermaid_preview` · `ZERON_MOCK_MEDIA=1 scripts/dev-demo.sh` |
+| `src/settings/accounts.rs` (ordem de provedores, ausência de add em managed, thresholds e format_reset) | unit | `cargo test -p zeron-ui accounts` |
 | `src/settings/projects.rs` (filtro, git remoto, editor/config e decisões de ícone) | unit; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
+| `src/details_sidebar/worked_projects.rs` (Worked Projects, Leaf Root, expansão de home, primeiro contato) | unit | `cargo test -p zeron-ui worked_projects` |
+| `src/details_sidebar/{chat_workers,widgets}.rs` (projeção, formatação e disclosure de telemetria de Worker) | unit + visual gpui | `cargo test -p zeron-ui details_sidebar` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/view.rs` (ticker de usage, retenção de snapshot, render gpui) | none — ciclo de vida de `Task`/entidade sem harness; validação é visual | `scripts/dev-demo.sh` |
 | `src/{shell,settings,terminal}/**` (render gpui) | none — sem harness de render; validação é visual | `scripts/dev-demo.sh` |
 | `src/inspector.rs` (render gpui, picking, toggle) | unit (actions) + visual no `scripts/dev-demo.sh` | `cargo test -p zeron-ui inspector` |
@@ -146,3 +155,8 @@ Subárvores sem doc próprio (ainda não têm regra local além da desta pasta):
 - **Falha de setup e sucesso parcial visível.** O worktree criado continua
   selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
   ao refresh seguinte e nenhum Worker é lançado automaticamente nele.
+- **Settings → Accounts renderiza provedores na ordem fixa Claude, Codex, Kimi,
+  Antigravity, Cursor.** Contas gerenciadas (Kimi Code, Antigravity) chegam da
+  engine `active: true, switchable: false`; a linha não expõe Add account,
+  Switch nem Forget, e a autenticação permanece nos CLIs. O empty state das
+  duas compartilha a cópia de assinatura gerenciada não detectada.

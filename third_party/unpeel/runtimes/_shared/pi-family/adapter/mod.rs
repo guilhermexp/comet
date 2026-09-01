@@ -29,7 +29,8 @@ fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> Str
 
 pub(crate) const INTEGRATION: Integration =
     Integration::new(Some(setup::install_lifecycle_extension), None)
-        .with_startup_command(prepare_startup_command);
+        .with_startup_command(prepare_startup_command)
+        .with_session_telemetry(SESSION_TELEMETRY_READER);
 
 #[cfg(test)]
 mod tests {

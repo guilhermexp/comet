@@ -1079,3 +1079,44 @@ async fn real_omp_rpc_turn_and_resume_smoke() {
         "follow-up text: {follow_text}"
     );
 }
+
+#[test]
+fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
+    let tools_list_response = zeron_workers_unpeel::controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    }))
+    .expect("controller MCP tools/list response");
+
+    let tools = tools_list_response
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(Value::as_array)
+        .expect("tools array in response");
+
+    let workers_tool = tools
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some("workers"))
+        .expect("workers tool in schema");
+
+    let max_timeout_seconds = workers_tool
+        .pointer("/inputSchema/properties/timeout_seconds/maximum")
+        .and_then(Value::as_u64)
+        .expect("timeout_seconds maximum property in workers tool inputSchema");
+
+    let transport_timeout_seconds = zeron_harness::omp::workers_bridge::TOOL_CALL_TIMEOUT.as_secs();
+
+    // The transport timeout must strictly exceed the maximum tool blocking duration,
+    // with at least a 60s margin for IPC round-trip and process scheduling.
+    assert!(
+        transport_timeout_seconds > max_timeout_seconds,
+        "transport timeout ({transport_timeout_seconds}s) must strictly exceed maximum tool blocking duration ({max_timeout_seconds}s)"
+    );
+    let margin = transport_timeout_seconds - max_timeout_seconds;
+    assert!(
+        margin >= 60,
+        "transport timeout ({transport_timeout_seconds}s) must have at least 60s margin over tool blocking ceiling ({max_timeout_seconds}s), got {margin}s"
+    );
+}

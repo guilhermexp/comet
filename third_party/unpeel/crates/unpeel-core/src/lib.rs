@@ -46,6 +46,7 @@ pub mod session_artifacts;
 pub mod session_host;
 pub mod session_input;
 pub mod session_ops;
+pub mod session_telemetry;
 pub mod setup;
 pub mod ssh_connection;
 pub mod state;

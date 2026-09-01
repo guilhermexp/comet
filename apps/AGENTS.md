@@ -4,11 +4,11 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-Os executáveis. `apps/comet` é o binário único (headed por padrão, `headless` como subcomando) e a superfície de CLI: auth, update, daemon. `apps/ios` é o cliente iOS, projeto Xcode, fora do workspace Cargo.
+Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headless` como subcomando) e a superfície de CLI: auth, update, daemon. `apps/ios` é o cliente iOS, projeto Xcode, fora do workspace Cargo.
 
 ## Ownership
 
-`apps/comet` é casca: parse de argumento, escolha de modo, wiring. Comportamento mora nas crates. Lógica que apareceu em `main.rs` provavelmente pertence a `comet-engine` ou `comet-ui`.
+`apps/zeron` é casca: parse de argumento, escolha de modo, wiring. Comportamento mora nas crates. Lógica que apareceu em `main.rs` provavelmente pertence a `zeron-engine` ou `zeron-ui`.
 
 ## Local Contracts
 
@@ -24,11 +24,11 @@ Os executáveis. `apps/comet` é o binário único (headed por padrão, `headles
 
 ## Verification
 
-- Comandos: `cargo build -p comet` · `scripts/e2e-smoke.sh`
+- Comandos: `cargo build -p zeron` · `scripts/e2e-smoke.sh`
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `comet/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p comet` |
+| `zeron/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p zeron` |
 | Fluxo headed/headless real | e2e | `scripts/e2e-smoke.sh` · `scripts/dev-demo.sh` |
 | `ios/**` | none — sem suite; validação manual no Xcode | Xcode |
 

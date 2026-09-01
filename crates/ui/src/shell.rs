@@ -1074,7 +1074,32 @@ enum ExportDelivery {
 enum ExportOutcome {
     Downloaded(String),
     Copied,
+    /// Delivered, but a piece of the document could not be resolved (the CLI
+    /// Workers join read broken state). The file on disk looks complete, so
+    /// the loss only exists if the notice says it out loud.
+    Incomplete {
+        delivered: String,
+        reason: String,
+    },
     Failed(String),
+}
+
+/// Fold a failed workers join into a delivered outcome. A delivery that never
+/// happened stays a plain failure — the reason it failed is the one worth
+/// reading.
+fn export_outcome_with_worker_loss(
+    outcome: ExportOutcome,
+    worker_error: Option<String>,
+) -> ExportOutcome {
+    match (outcome, worker_error) {
+        (delivered @ (ExportOutcome::Downloaded(_) | ExportOutcome::Copied), Some(reason)) => {
+            ExportOutcome::Incomplete {
+                delivered: export_notice(&delivered).text.to_string(),
+                reason,
+            }
+        }
+        (outcome, _) => outcome,
+    }
 }
 
 fn export_notice(outcome: &ExportOutcome) -> SidebarNotice {
@@ -1083,6 +1108,9 @@ fn export_notice(outcome: &ExportOutcome) -> SidebarNotice {
             SidebarNotice::success(format!("Exported to Downloads: {file}"))
         }
         ExportOutcome::Copied => SidebarNotice::success("Chat copied to clipboard"),
+        ExportOutcome::Incomplete { delivered, reason } => {
+            SidebarNotice::failure(format!("{delivered} — without the worker index: {reason}"))
+        }
         ExportOutcome::Failed(reason) => SidebarNotice::failure(format!("Export failed: {reason}")),
     }
 }
@@ -3464,11 +3492,27 @@ impl Shell {
             self.report_export(ExportOutcome::Failed("chat not found".into()), cx);
             return;
         };
-        // Resolve the entries BEFORE spawning: whether this row is the selected
-        // one is a fact about now, not about whenever the task gets scheduled.
+        // Resolve the entries and workers BEFORE spawning: whether this row is the selected
+        // one and what workers belong to it are facts about now, not about whenever the
+        // task gets scheduled.
         let in_memory = export_reads_memory(state.selected_chat.as_deref(), &chat_id)
             .then(|| state.transcript.clone());
         let engine = state.engine().cloned();
+        let (workers, worker_error) = match self
+            .workers_model
+            .read(cx)
+            .sessions_for_parent_chat(&chat_id)
+        {
+            Ok(sessions) => (
+                crate::details_sidebar::chat_workers::project_chat_workers(
+                    Vec::new(),
+                    sessions.into_iter().cloned().collect(),
+                )
+                .workers,
+                None,
+            ),
+            Err(error) => (Vec::new(), Some(error)),
+        };
 
         let metadata = crate::chat_export::ChatMetadata {
             id: chat.id.clone(),
@@ -3506,7 +3550,7 @@ impl Shell {
             };
 
             let title = metadata.title.clone();
-            let doc = crate::chat_export::ExportDoc::from_transcript(metadata, &entries);
+            let doc = crate::chat_export::ExportDoc::from_transcript(metadata, &entries, &workers);
             let rendered = match format {
                 crate::chat_export::ExportFormat::Markdown => {
                     Ok(crate::chat_export::render_markdown(&doc))
@@ -3562,6 +3606,7 @@ impl Shell {
                     }
                 }
             };
+            let outcome = export_outcome_with_worker_loss(outcome, worker_error);
             this.update(cx, |shell, cx| shell.report_export(outcome, cx))
                 .ok();
         }));
@@ -9404,6 +9449,41 @@ mod tests {
             SidebarNotice::failure("Export failed: permission denied")
         );
         assert!(!failed.ok);
+    }
+
+    /// A broken workers join delivers a file that reads as complete. The
+    /// notice is the only place the loss can surface, so it stops being a
+    /// success notice.
+    #[test]
+    fn export_with_a_broken_worker_join_reports_the_loss() {
+        let incomplete = export_outcome_with_worker_loss(
+            ExportOutcome::Downloaded("Fix_the_thing-a1b2c3d4.md".into()),
+            Some("parse app-state.json: expected value".into()),
+        );
+        let notice = export_notice(&incomplete);
+        assert!(!notice.ok);
+        assert!(notice.text.contains("Fix_the_thing-a1b2c3d4.md"));
+        assert!(notice.text.contains("parse app-state.json"));
+
+        let copied = export_notice(&export_outcome_with_worker_loss(
+            ExportOutcome::Copied,
+            Some("boom".into()),
+        ));
+        assert!(!copied.ok);
+
+        // A healthy join leaves the outcome untouched.
+        assert_eq!(
+            export_outcome_with_worker_loss(ExportOutcome::Copied, None),
+            ExportOutcome::Copied
+        );
+        // A delivery that never happened keeps its own reason.
+        assert_eq!(
+            export_outcome_with_worker_loss(
+                ExportOutcome::Failed("no home directory to write into".into()),
+                Some("boom".into()),
+            ),
+            ExportOutcome::Failed("no home directory to write into".into())
+        );
     }
 
     /// The six actions are declared once, so a format can never lose its copy
