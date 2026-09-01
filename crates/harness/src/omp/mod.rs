@@ -332,29 +332,45 @@ impl Harness for OmpHarness {
             ));
         }
         let process =
-            OmpProcess::start(self.launch(PathBuf::from(request.cwd), true, None)?).await?;
-        if !process.capabilities().live_voice {
-            let _ = process.shutdown().await;
-            return Err(HarnessError::Unsupported(
-                "installed OMP does not support Live Voice; update OMP".into(),
-            ));
+            OmpProcess::start(self.launch(PathBuf::from(request.cwd), false, None)?).await?;
+        let setup = async {
+            if !process.capabilities().live_voice {
+                return Err(HarnessError::Unsupported(
+                    "installed OMP does not support Live Voice; update OMP".into(),
+                ));
+            }
+            if let Some(session_path) = request.resume.as_deref() {
+                let response = process
+                    .request(json!({ "type": "switch_session", "sessionPath": session_path }))
+                    .await?;
+                if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                    return Err(HarnessError::Protocol(
+                        "OMP Live session resume was cancelled".into(),
+                    ));
+                }
+            }
+            let state = process.request(json!({ "type": "get_state" })).await?;
+            let session_id = state_session_id(&state).ok_or_else(|| {
+                HarnessError::Protocol("OMP Live state omitted its session identity".into())
+            })?;
+            let events = process.take_events()?;
+            process.request(live_start_command()).await?;
+            Ok((session_id, events))
         }
-        let events = match process.take_events() {
-            Ok(events) => events,
+        .await;
+        let (session_id, events) = match setup {
+            Ok(setup) => setup,
             Err(error) => {
                 let _ = process.shutdown().await;
                 return Err(error);
             }
         };
-        if let Err(error) = process.request(live_start_command()).await {
-            let _ = process.shutdown().await;
-            return Err(error);
-        }
 
         let (control_tx, control_rx) = mpsc::channel(16);
         let (event_tx, event_rx) = mpsc::channel(32);
         tokio::spawn(run_live_voice(process, events, control_rx, event_tx));
         Ok(LiveVoiceHandle {
+            session_id,
             events: futures::stream::unfold(event_rx, |mut receiver| async move {
                 receiver.recv().await.map(|event| (event, receiver))
             })

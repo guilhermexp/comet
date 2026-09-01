@@ -95,9 +95,16 @@ if [ "$scenario" = "require-skill-scope" ]; then
   has "$body" "enableCodexUser: false" || exit 45
   has "$body" "enablePiUser: false" || exit 46
 fi
-if [ "$scenario" = "live-frontend" ] || [ "$scenario" = "live-crash" ]; then
-  has " $* " " --no-session " || exit 47
-fi
+case "$scenario" in
+  live-probe)
+    has " $* " " --no-session " || exit 47
+    ;;
+  live-frontend|live-crash)
+    for arg in "$@"; do
+      [ "$arg" != "--no-session" ] || exit 48
+    done
+    ;;
+esac
 [ -z "${FAKE_OMP_PID_FILE:-}" ] || printf '%s\n' "$$" > "$FAKE_OMP_PID_FILE"
 if [ "$scenario" = "early-exit" ]; then
   exit 9
@@ -150,6 +157,7 @@ emit_chunked() {
 }
 
 live_delegations=0
+live_state_seen=0
 while IFS= read -r line; do
   case "$(field type "$line")" in
     negotiate_protocol)
@@ -160,7 +168,7 @@ while IFS= read -r line; do
       fi
       ;;
     get_state)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_state 54; fi
+      live_state_seen=1
       if [ "$scenario" = "missing-session" ]; then
         respond "$line" '{"thinkingLevel":"high","model":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true}}'
       else
@@ -182,7 +190,6 @@ while IFS= read -r line; do
       respond "$line" '{"level":"events"}'
       ;;
     switch_session)
-      if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_session 55; fi
       case "$line" in *'"sessionPath":"/tmp/omp-session.jsonl"'*) respond "$line" '{"cancelled":false}' ;; *) exit 22 ;; esac
       ;;
     set_host_tools)
@@ -209,6 +216,7 @@ while IFS= read -r line; do
       ;;
     live_start)
       has "$line" '"delegationMode":"host"' || fail_stage live_start 50
+      [ "$live_state_seen" -eq 1 ] || fail_stage live_state_order 59
       respond "$line" '{"active":true}'
       if [ "$scenario" = "live-crash" ]; then
         printf 'Authorization: Bearer token-secret-123\n' >&2

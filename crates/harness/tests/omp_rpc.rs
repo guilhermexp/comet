@@ -331,7 +331,7 @@ async fn next_live_event(
 async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("omp.pid");
-    let mut env = fake_env("live-frontend");
+    let mut env = fake_env("live-probe");
     env.insert(
         "FAKE_OMP_PID_FILE".into(),
         pid_file.to_string_lossy().into_owned(),
@@ -351,7 +351,7 @@ async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
 }
 
 #[tokio::test]
-async fn omp_live_frontend_reuses_one_child_for_serial_delegations() {
+async fn omp_live_frontend_resumes_session_and_reuses_one_child_for_serial_delegations() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("omp.pid");
     let mut env = fake_env("live-frontend");
@@ -366,9 +366,11 @@ async fn omp_live_frontend_reuses_one_child_for_serial_delegations() {
     let handle = harness
         .start_live_voice(LiveVoiceRequest {
             cwd: temp.path().to_string_lossy().into_owned(),
+            resume: Some("/tmp/omp-session.jsonl".into()),
         })
         .await
         .unwrap();
+    assert_eq!(handle.session_id, "/tmp/omp-session.jsonl");
     let pid: u32 = std::fs::read_to_string(&pid_file)
         .unwrap()
         .trim()
@@ -484,6 +486,20 @@ async fn omp_live_frontend_reuses_one_child_for_serial_delegations() {
 }
 
 #[tokio::test]
+async fn omp_live_frontend_returns_new_session_identity_without_resume() {
+    let handle = fake_harness("live-frontend")
+        .start_live_voice(LiveVoiceRequest {
+            cwd: ".".into(),
+            resume: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(handle.session_id, "/tmp/omp-session.jsonl");
+    handle.controls.send(LiveVoiceControl::Stop).await.unwrap();
+}
+
+#[tokio::test]
 async fn omp_live_frontend_surfaces_bounded_child_exit() {
     let harness = fake_harness("live-crash");
     let handle = harness
@@ -492,6 +508,7 @@ async fn omp_live_frontend_surfaces_bounded_child_exit() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
+            resume: None,
         })
         .await
         .unwrap();

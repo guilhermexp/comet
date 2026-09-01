@@ -71,6 +71,7 @@ pub struct RunControls {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveVoiceRequest {
     pub cwd: String,
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub enum LiveVoiceEvent {
 }
 
 pub struct LiveVoiceHandle {
+    pub session_id: String,
     pub events: BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
     pub controls: mpsc::Sender<LiveVoiceControl>,
 }
@@ -433,7 +435,10 @@ mod tests {
         assert!(!harness.probe_live_voice(Path::new(".")).await.unwrap());
 
         let error = match harness
-            .start_live_voice(LiveVoiceRequest { cwd: ".".into() })
+            .start_live_voice(LiveVoiceRequest {
+                cwd: ".".into(),
+                resume: None,
+            })
             .await
         {
             Ok(_) => panic!("unsupported harness started Live Voice"),
