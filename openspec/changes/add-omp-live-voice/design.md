@@ -36,14 +36,15 @@ The backend child is the existing OmpHarness run. It resumes the same Chat sessi
 - **D-07: One call and one unresolved delegation.** One Live runtime may exist per device. It owns at most one delegation and accepts context only for that delegation ID.
 - **D-08: Deterministic release.** End, Escape, Chat switch, surface close, engine shutdown, transport failure, app quit, or any competing durable command stops Live before conflicting work proceeds.
 - **D-09: OMP owns media.** No audio frame crosses Comet's harness boundary; Comet adds no audio dependency or public Realtime API integration.
+- **D-10: Voice-first Chat materialization.** The new-Chat canvas shows Live for a local OMP draft. The first Live click resolves the selected Checkout and materializes the same ordinary Chat metadata as a first text send without navigating away from the draft. After Live starts successfully, the UI selects that Chat. Creation or start failure removes the still-untouched Chat and worktree; navigation during startup cancels the attempt instead of stealing selection.
 
 ## Availability
 
-Start is accepted only when the selected Chat is hosted locally, uses OMP, is not archived, has no active backend run, no other Live call exists, and the installed OMP advertises the capability. The engine enforces these conditions even if a caller bypasses the UI.
+Start is accepted only when the selected Chat is hosted locally, uses OMP, is not archived, has no active backend run, no other Live call exists, and the installed OMP advertises the capability. The new-Chat canvas may expose Live before a Chat exists when its draft targets the local device and OMP; the click first materializes a normal Chat, the engine applies the same authoritative eligibility checks, and the UI selects it only after start succeeds.
 
 ## Session binding
 
-Before `live_start`, the harness switches to the Chat's stored OMP session when one exists, reads `get_state`, and requires a non-empty session identity. For a new Chat, the normal OMP RPC child creates the first session. The engine persists the effective identity before exposing Live as active, and every later text or delegated run resumes that same identity.
+Before `live_start`, the harness switches to the Chat's stored OMP session when one exists, reads `get_state`, and requires a non-empty session identity. When Live is the first action on the new-Chat canvas, the UI first materializes a normal Chat with the selected device, project, Checkout, and OMP configuration. The normal OMP RPC child then creates the first session; the engine persists the effective identity before exposing Live as active, and every later text or delegated run resumes that same identity.
 
 ## Delegation flow
 

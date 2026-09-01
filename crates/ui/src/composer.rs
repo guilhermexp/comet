@@ -26,15 +26,15 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion,
+    FileSearchMatch, HarnessId, LiveVoiceAvailability, RunRequest, SandboxLevel, SlashCommand,
+    UserInputAnswer, UserInputQuestion,
 };
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::live_voice::{LiveVoiceTooltip, LiveVoiceViewModel};
 use crate::motion;
-use crate::pickers::Pickers;
+use crate::pickers::{CheckoutPlan, Pickers};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
@@ -185,6 +185,74 @@ const LIVE_VOICE_STACK_WIDTH: f32 = 440.0;
 
 fn live_voice_strip_stacked(available_width: f32) -> bool {
     available_width < LIVE_VOICE_STACK_WIDTH
+}
+
+fn draft_live_voice_available(
+    engine_connected: bool,
+    target_device_id: Option<&str>,
+    local_device_id: Option<&str>,
+    harness: Option<HarnessId>,
+) -> bool {
+    let local_target = target_device_id.is_none_or(|target| local_device_id == Some(target));
+    engine_connected && local_target && harness == Some(HarnessId::Omp)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NewChatLiveCheckout {
+    Ready { cwd: String, branch: Option<String> },
+    CreateWorktree { repo_path: String, base: String },
+}
+
+fn new_chat_live_checkout(plan: &CheckoutPlan, space_path: Option<&str>) -> NewChatLiveCheckout {
+    match plan {
+        CheckoutPlan::CurrentCheckout { branch } => NewChatLiveCheckout::Ready {
+            cwd: space_path.unwrap_or("~").to_owned(),
+            branch: branch.clone(),
+        },
+        CheckoutPlan::ReuseWorktree { path, branch } => NewChatLiveCheckout::Ready {
+            cwd: path.clone(),
+            branch: Some(branch.clone()),
+        },
+        CheckoutPlan::NewWorktree { base } => match space_path {
+            Some(repo_path) => NewChatLiveCheckout::CreateWorktree {
+                repo_path: repo_path.to_owned(),
+                base: base.clone().unwrap_or_else(|| "HEAD".to_owned()),
+            },
+            None => NewChatLiveCheckout::Ready {
+                cwd: "~".to_owned(),
+                branch: base.clone(),
+            },
+        },
+    }
+}
+
+fn create_chat_mutation(
+    chat_id: &str,
+    space_id: Option<&str>,
+    device_id: &str,
+    cwd: Option<&str>,
+    branch: Option<&str>,
+    config: Option<&zeron_proto::ChatConfig>,
+) -> serde_json::Value {
+    // A Chat belongs to a Space *or* to a device, never to both.
+    let (owner_key, owner_id) = match space_id {
+        Some(space_id) => ("spaceId", space_id),
+        None => ("deviceId", device_id),
+    };
+    let mut mutation = serde_json::Map::new();
+    mutation.insert("op".into(), "createChat".into());
+    mutation.insert("chatId".into(), chat_id.into());
+    mutation.insert(owner_key.into(), owner_id.into());
+    if let Some(cwd) = cwd {
+        mutation.insert("cwd".into(), cwd.into());
+    }
+    if let Some(branch) = branch {
+        mutation.insert("branch".into(), branch.into());
+    }
+    if let Some(config) = config.and_then(|config| serde_json::to_value(config).ok()) {
+        mutation.insert("config".into(), config);
+    }
+    serde_json::Value::Object(mutation)
 }
 
 /// Compact↔expanded flip with hysteresis. `capacity` is the *compact-mode*
@@ -4011,6 +4079,7 @@ pub struct Composer {
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
+    live_start_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -4169,6 +4238,7 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
+            live_start_task: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -5886,45 +5956,15 @@ impl Composer {
                 // (idempotent; the doc host would materialize the chat on
                 // first command anyway, so failures are non-fatal).
                 if is_new {
-                    let mut mutate = serde_json::json!({
-                        "op": "createChat",
-                        "chatId": chat_id,
-                    });
-                    if let Some(object) = mutate.as_object_mut() {
-                        match &space_id {
-                            Some(space_id) => {
-                                object.insert(
-                                    "spaceId".into(),
-                                    serde_json::Value::String(space_id.clone()),
-                                );
-                            }
-                            None => {
-                                object.insert(
-                                    "deviceId".into(),
-                                    serde_json::Value::String(device_id.clone()),
-                                );
-                            }
-                        }
-                    }
-                    if let Some(object) = mutate.as_object_mut() {
-                        if let Some(worktree_cwd) = &worktree_cwd {
-                            object.insert(
-                                "cwd".into(),
-                                serde_json::Value::String(worktree_cwd.clone()),
-                            );
-                        }
-                        if let Some(branch) = &chat_branch {
-                            object.insert(
-                                "branch".into(),
-                                serde_json::Value::String(branch.clone()),
-                            );
-                        }
-                        if let Some(config) = resolved.chat_config()
-                            && let Ok(config) = serde_json::to_value(&config)
-                        {
-                            object.insert("config".into(), config);
-                        }
-                    }
+                    let chat_config = resolved.chat_config();
+                    let mutate = create_chat_mutation(
+                        &chat_id,
+                        space_id.as_deref(),
+                        &device_id,
+                        worktree_cwd.as_deref(),
+                        chat_branch.as_deref(),
+                        chat_config.as_ref(),
+                    );
                     if let Err(err) = attachments::call_with_timeout(
                         &engine,
                         cx.background_executor(),
@@ -6617,13 +6657,208 @@ impl Composer {
             .into_any_element()
     }
 
+    fn start_live_voice(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.is_some() {
+            self.state
+                .update(cx, |state, cx| state.start_live_voice(cx));
+            return;
+        }
+        if self.live_start_task.is_some() {
+            return;
+        }
+
+        let (engine, space, target_device_id, local_device_id) = {
+            let state = self.state.read(cx);
+            (
+                state.engine().cloned(),
+                state.selected_space_row().cloned(),
+                state.effective_device_id(),
+                state.local_device_id.clone(),
+            )
+        };
+        let resolved = self.pickers.read(cx).resolved(cx);
+        if !draft_live_voice_available(
+            engine.is_some(),
+            target_device_id.as_deref(),
+            local_device_id.as_deref(),
+            resolved.harness,
+        ) {
+            return;
+        }
+        let Some(engine) = engine else {
+            return;
+        };
+        let plan = new_chat_live_checkout(
+            &self.pickers.read(cx).checkout_plan(),
+            space.as_ref().map(|space| space.path.as_str()),
+        );
+        let chat_config = resolved
+            .chat_config()
+            .expect("an OMP draft always resolves a Chat config");
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let device_id = target_device_id
+            .or(local_device_id)
+            .unwrap_or_else(|| "local".to_owned());
+        let space_id = space.map(|space| space.id);
+        self.failure = None;
+        self.failure_key = None;
+
+        self.live_start_task = Some(cx.spawn(async move |this, cx| {
+            let mut created_worktree: Option<(String, String)> = None;
+            let mut live_started = false;
+            let result: Result<(), String> = async {
+                let (cwd, branch) = match plan {
+                    NewChatLiveCheckout::Ready { cwd, branch } => (cwd, branch),
+                    NewChatLiveCheckout::CreateWorktree { repo_path, base } => {
+                        let value = attachments::call_with_timeout(
+                            &engine,
+                            cx.background_executor(),
+                            methods::CREATE_WORKTREE,
+                            serde_json::json!({
+                                "repoPath": repo_path,
+                                "branch": base,
+                            }),
+                            Duration::from_secs(150),
+                        )
+                        .await?;
+                        if let (Some(repo_path), Some(path)) = (
+                            value.get("repoPath").and_then(serde_json::Value::as_str),
+                            value.get("path").and_then(serde_json::Value::as_str),
+                        ) {
+                            created_worktree = Some((repo_path.to_owned(), path.to_owned()));
+                        }
+                        let worktree: zeron_proto::Worktree = serde_json::from_value(value)
+                            .map_err(|error| {
+                                format!("CreateWorktree returned invalid data: {error}")
+                            })?;
+                        (worktree.path, Some(worktree.branch))
+                    }
+                };
+                let mutation = create_chat_mutation(
+                    &chat_id,
+                    space_id.as_deref(),
+                    &device_id,
+                    Some(&cwd),
+                    branch.as_deref(),
+                    Some(&chat_config),
+                );
+                attachments::call_with_timeout(
+                    &engine,
+                    cx.background_executor(),
+                    methods::MUTATE,
+                    mutation,
+                    Duration::from_secs(30),
+                )
+                .await?;
+                engine
+                    .client()
+                    .call(
+                        methods::START_LIVE_VOICE,
+                        serde_json::json!({ "chatId": chat_id }),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                live_started = true;
+                let selected = this
+                    .update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            if state.selected_chat.is_some() {
+                                return false;
+                            }
+                            state.select_chat(Some(chat_id.clone()), cx);
+                            true
+                        })
+                    })
+                    .map_err(|_| "Composer closed before Live Voice started".to_owned())?;
+                if !selected {
+                    return Err(
+                        "another Chat was selected while Live Voice was starting".to_owned()
+                    );
+                }
+                Ok(())
+            }
+            .await;
+
+            if result.is_err() {
+                if live_started {
+                    let _ = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::STOP_LIVE_VOICE,
+                        serde_json::Value::Null,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                }
+                let _ = attachments::call_with_timeout(
+                    &engine,
+                    cx.background_executor(),
+                    methods::MUTATE,
+                    serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
+                    Duration::from_secs(5),
+                )
+                .await;
+                if let Some((repo_path, worktree_path)) = created_worktree {
+                    let _ = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::DELETE_WORKTREE,
+                        serde_json::json!({
+                            "repoPath": repo_path,
+                            "worktreePath": worktree_path,
+                        }),
+                        Duration::from_secs(30),
+                    )
+                    .await;
+                }
+            }
+
+            this.update(cx, |composer, cx| {
+                composer.live_start_task = None;
+                match result {
+                    Ok(()) => {
+                        composer.failure = None;
+                        composer.failure_key = None;
+                    }
+                    Err(error) => {
+                        composer.failure = Some(format!("Live Voice failed: {error}").into());
+                        composer.failure_key = Some(String::new());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn live_voice_model(&self, cx: &App) -> LiveVoiceViewModel {
         let state = self.state.read(cx);
-        LiveVoiceViewModel::derive(
+        let is_draft = state.selected_chat.is_none();
+        let draft_availability = (is_draft
+            && draft_live_voice_available(
+                state.engine().is_some(),
+                state.effective_device_id().as_deref(),
+                state.local_device_id.as_deref(),
+                self.pickers.read(cx).resolved(cx).harness,
+            ))
+        .then(|| LiveVoiceAvailability {
+            available: true,
+            reason: None,
+        });
+        let mut model = LiveVoiceViewModel::derive(
             state.selected_chat.as_deref(),
-            state.live_voice_availability.as_ref(),
+            state
+                .live_voice_availability
+                .as_ref()
+                .or(draft_availability.as_ref()),
             &state.live_voice,
-        )
+        );
+        if is_draft && self.live_start_task.is_some() {
+            model.microphone_enabled = false;
+            model.microphone_tooltip = "Starting Live Voice…".to_owned();
+        }
+        model
     }
 
     fn render_live_voice_button(
@@ -6663,8 +6898,7 @@ impl Composer {
                         ))
                         .on_hover(motion::hover_listener("composer-live-voice"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.state
-                                .update(cx, |state, cx| state.start_live_voice(cx));
+                            this.start_live_voice(cx);
                         }))
                 })
                 .tooltip(move |_, cx| cx.new(|_| LiveVoiceTooltip::new(tooltip.clone())).into())
@@ -7454,6 +7688,106 @@ mod tests {
             at += run.len;
         }
         panic!("offset {offset} is covered by the exact run plan");
+    }
+
+    #[test]
+    fn live_voice_new_chat_accepts_local_omp_draft() {
+        assert!(draft_live_voice_available(
+            true,
+            Some("local-device"),
+            Some("local-device"),
+            Some(HarnessId::Omp),
+        ));
+        assert!(!draft_live_voice_available(
+            true,
+            Some("remote-device"),
+            Some("local-device"),
+            Some(HarnessId::Omp),
+        ));
+        assert!(!draft_live_voice_available(
+            true,
+            Some("local-device"),
+            Some("local-device"),
+            Some(HarnessId::Codex),
+        ));
+    }
+
+    #[test]
+    fn live_voice_new_chat_builds_normal_chat_mutation() {
+        assert_eq!(
+            create_chat_mutation(
+                "chat-1",
+                Some("space-1"),
+                "local-device",
+                Some("/repo-wt"),
+                Some("feature"),
+                None,
+            ),
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": "chat-1",
+                "spaceId": "space-1",
+                "cwd": "/repo-wt",
+                "branch": "feature",
+            })
+        );
+        assert_eq!(
+            create_chat_mutation("chat-2", None, "local-device", None, None, None),
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": "chat-2",
+                "deviceId": "local-device",
+            })
+        );
+    }
+
+    #[test]
+    fn live_voice_new_chat_uses_current_checkout() {
+        assert_eq!(
+            new_chat_live_checkout(
+                &crate::pickers::CheckoutPlan::CurrentCheckout {
+                    branch: Some("main".into()),
+                },
+                Some("/repo"),
+            ),
+            NewChatLiveCheckout::Ready {
+                cwd: "/repo".into(),
+                branch: Some("main".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn live_voice_new_chat_reuses_existing_worktree() {
+        assert_eq!(
+            new_chat_live_checkout(
+                &crate::pickers::CheckoutPlan::ReuseWorktree {
+                    path: "/repo-wt".into(),
+                    branch: "feature".into(),
+                },
+                Some("/repo"),
+            ),
+            NewChatLiveCheckout::Ready {
+                cwd: "/repo-wt".into(),
+                branch: Some("feature".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn live_voice_new_chat_creates_selected_worktree() {
+        assert_eq!(
+            new_chat_live_checkout(
+                &crate::pickers::CheckoutPlan::NewWorktree {
+                    base: Some("develop".into()),
+                },
+                Some("/repo"),
+            ),
+            NewChatLiveCheckout::CreateWorktree {
+                repo_path: "/repo".into(),
+                base: "develop".into(),
+            }
+        );
     }
 
     #[test]

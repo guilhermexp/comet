@@ -2,7 +2,7 @@
 
 ### Requirement: Local OMP Live availability
 
-The system SHALL offer Live Voice only when the selected Chat is hosted on the current device, uses OMP, is not archived, has no active run, no other Live call exists, and the installed OMP advertises `liveVoice`.
+The system SHALL offer Live Voice when an existing selected Chat is hosted on the current device, uses OMP, is not archived, has no active run, no other Live call exists, and the installed OMP advertises `liveVoice`. It SHALL also offer the action on an OMP new-Chat draft targeting the current device; start-time validation remains authoritative.
 
 #### Scenario: Unsupported OMP is rejected
 - **Test:** engine integration
@@ -10,6 +10,19 @@ The system SHALL offer Live Voice only when the selected Chat is hosted on the c
 - **WHEN** capability probing returns no `liveVoice`
 - **THEN** start SHALL fail with an actionable OMP update reason
 - **AND** start SHALL NOT mutate the Chat
+
+### Requirement: Live can create the first Chat
+
+The system SHALL allow Live Voice to be the first action in a new-Chat draft by materializing an ordinary Chat with the selected target, Checkout, and OMP configuration before starting Live.
+
+#### Scenario: New Chat starts with voice
+- **Test:** UI unit + UI integration
+
+- **WHEN** the new-Chat canvas targets the current device and selects OMP
+- **THEN** the microphone action SHALL be visible and enabled without a prior text prompt
+- **AND** invoking it SHALL create a normal Chat, start Live, and select that Chat only after start succeeds
+- **AND** a failed creation or Live start SHALL remove the untouched empty Chat and preserve the user's current surface
+- **AND** later text runs SHALL resume the OMP session created by Live
 
 ### Requirement: Media remains inside OMP
 

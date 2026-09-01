@@ -69,7 +69,8 @@ impl LiveVoiceViewModel {
         }
         .to_owned();
         Self {
-            show_microphone: selected_chat_id.is_some() && !active_for_selected,
+            show_microphone: (selected_chat_id.is_some() || availability.is_some())
+                && !active_for_selected,
             microphone_enabled,
             microphone_tooltip,
             replaces_editor: active_for_selected,
@@ -279,6 +280,17 @@ mod tests {
         assert!(model.microphone_enabled);
         assert_eq!(model.microphone_tooltip, "Start Live Voice");
         assert!(!model.replaces_editor);
+    }
+
+    #[test]
+    fn live_voice_new_chat_shows_microphone_for_draft_availability() {
+        let availability = availability(true, None);
+        let model =
+            LiveVoiceViewModel::derive(None, Some(&availability), &LiveVoiceState::default());
+
+        assert!(model.show_microphone);
+        assert!(model.microphone_enabled);
+        assert_eq!(model.microphone_tooltip, "Start Live Voice");
     }
 
     #[test]

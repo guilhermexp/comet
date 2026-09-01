@@ -30,6 +30,7 @@
 **must_haves:** stable composer action; transient status strip; eligibility/update affordance; keyboard and accessibility behavior; normal sound cues suppressed only during Live; no layout shift.
 
 - [x] C7 Build the native gpui Live control and strip, wire lifecycle actions and sound suppression, and add the microphone icon. files: `crates/ui/src/live_voice.rs`, `crates/ui/assets/icons/microphone.svg`, `crates/ui/src/lib.rs`, `crates/ui/src/icons.rs`, `crates/ui/src/state.rs`, `crates/ui/src/composer.rs`, `crates/ui/src/shell.rs`, `crates/ui/src/sound.rs`. verify: `cargo test -p zeron-ui live_voice && cargo build -p zeron && scripts/dev-demo.sh`.
+- [x] C7a Expose Live on a local OMP new-Chat draft, materialize the selected target and Checkout on first voice use, select the Chat only after Live starts, and roll back untouched resources on failure. files: `crates/ui/src/live_voice.rs`, `crates/ui/src/composer.rs`, `crates/ui/src/state.rs`. verify: `cargo test -p zeron-ui live_voice && cargo build -p zeron`.
 
 ## 4. Packaging and closure
 

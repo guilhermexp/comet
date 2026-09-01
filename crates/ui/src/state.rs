@@ -1733,6 +1733,13 @@ impl AppState {
         self.deep_link_notice.take()
     }
 
+    fn live_voice_stops_for_chat_selection(
+        live_voice: &LiveVoiceState,
+        next_chat_id: Option<&str>,
+    ) -> bool {
+        live_voice.phase != LiveVoicePhase::Idle && live_voice.chat_id.as_deref() != next_chat_id
+    }
+
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
@@ -1745,7 +1752,7 @@ impl AppState {
             }
             return;
         }
-        if self.live_voice_active() {
+        if Self::live_voice_stops_for_chat_selection(&self.live_voice, chat_id.as_deref()) {
             self.stop_live_voice(cx);
         }
         self.selected_chat = chat_id.clone();
@@ -3308,6 +3315,29 @@ mod tests {
         // An already archived chat stays put — the shortcut never unarchives.
         state.selected_chat = Some("a".into());
         assert_eq!(state.archivable_selected_chat(), None);
+    }
+
+    #[test]
+    fn selecting_the_live_chat_does_not_stop_its_call() {
+        let live = LiveVoiceState {
+            chat_id: Some("voice-chat".into()),
+            phase: LiveVoicePhase::Connecting,
+            ..LiveVoiceState::default()
+        };
+
+        assert!(!AppState::live_voice_stops_for_chat_selection(
+            &live,
+            Some("voice-chat")
+        ));
+        assert!(AppState::live_voice_stops_for_chat_selection(
+            &live,
+            Some("other-chat")
+        ));
+        assert!(AppState::live_voice_stops_for_chat_selection(&live, None));
+        assert!(!AppState::live_voice_stops_for_chat_selection(
+            &LiveVoiceState::default(),
+            Some("other-chat")
+        ));
     }
 
     #[test]
