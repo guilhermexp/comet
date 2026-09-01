@@ -30,6 +30,10 @@ _Avoid_: history, messages, doc, conversa
 O registro local e cru do que um agente emitiu durante um run, incluindo as entradas de ferramenta que o Chat Transcript remove por privacidade. Existe para retomar um run interrompido, não para ser lido.
 _Avoid_: log, transcript, history
 
+**Trajectory**:
+A leitura local e técnica dos runs de um Chat capturados no device atual, organizada como timeline e ledger de eventos para auditoria. É uma read model própria: não é o Run Journal bruto, não sincroniza entre devices e protege Payload e Result até uma revelação explícita.
+_Avoid_: trace, timeline, log, Run Journal, Chat Transcript
+
 **Chat Transcript Export**:
 Uma cópia do Chat Transcript num formato levável para fora do comet. Do transcript nunca carrega nada que o Chat Transcript já não mostre; a única fonte adicional é o índice de CLI Workers do Chat, que entra como Artifact.
 _Avoid_: chat dump, backup, download, export de sessão

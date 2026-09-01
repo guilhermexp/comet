@@ -29,21 +29,29 @@ The canonical OMP RPC command set does not expose Live controls or Live events. 
 
 ## Decision
 
-Extend the OMP RPC protocol with a headless Live capability. The extension reuses `LiveSessionController` and emits its presentation callbacks as additive JSONL events.
+Extend the OMP RPC protocol with a headless Live frontend capability. The Live child reuses OMP's Codex transport and media implementation but delegates coding work back to Comet. Comet submits each delegation through its existing durable command queue and ordinary `OmpHarness` run.
 
 ```text
 Comet gpui
    │ local typed control/events; no audio
    ▼
-Comet engine ── OmpHarness ── omp --mode rpc-ui
-                                  │
-                                  ├── OAuth + DeviceCheck + signaling
-                                  ├── microphone → Opus/WebRTC
-                                  ├── Codex audio → Opus decode → speaker
-                                  └── AgentSession → tools/subagents/results
+Comet LiveVoiceRuntime ── OMP Live child
+   │                        ├── OAuth + DeviceCheck + signaling
+   │                        ├── microphone → Opus/WebRTC
+   │                        └── Codex audio → Opus decode → speaker
+   │
+   └── durable QueueCommand ── OmpHarness run child ── tools/subagents/results
+              ▲                                          │
+              └──────── existing SessionsEngine folding ─┘
 ```
 
-This keeps vendor-specific behavior in `zeron-harness`, keeps durable behavior in `zeron-engine`, and keeps pixels in `zeron-ui`.
+The two child processes have intentionally different ownership:
+
+- the Live child is an ephemeral voice frontend and never writes the Chat's native OMP session;
+- the run child follows the existing Comet path, resumes the Chat's `sessionFile`, and owns all durable coding work;
+- progress and the final backend result return to the Live child as text-only context append commands.
+
+This preserves Comet's command-ledger, Run Journal, folding, and session invariants instead of creating a second agent-run pipeline.
 
 ## Alternatives rejected
 
@@ -81,14 +89,28 @@ An older OMP omits the field. Comet must not infer support from version strings.
 ### Commands
 
 ```json
-{ "id": "live-1", "type": "live_start" }
+{ "id": "live-1", "type": "live_start", "delegationMode": "host" }
 { "id": "live-2", "type": "live_set_muted", "muted": true }
-{ "id": "live-3", "type": "live_stop" }
+{
+  "id": "live-3",
+  "type": "live_append_context",
+  "delegationId": "del_123",
+  "kind": "progress",
+  "text": "Inspecting authentication call sites."
+}
+{
+  "id": "live-4",
+  "type": "live_append_context",
+  "delegationId": "del_123",
+  "kind": "final",
+  "text": "The authentication regression is fixed and the focused tests pass."
+}
+{ "id": "live-5", "type": "live_stop" }
 ```
 
-`live_start` uses OMP's effective `live.voice` setting; Comet does not add a second voice preference in the first release.
+`live_start` uses OMP's effective `live.voice` setting; Comet does not add a second voice preference in the first release. RPC Live requires `delegationMode: "host"`: OMP emits delegation requests but does not call its internal `AgentSession`.
 
-Commands are correlated through the existing RPC response envelope. `live_stop` is idempotent. A second `live_start` while Live is starting, connected, or stopping fails explicitly.
+Commands are correlated through the existing RPC response envelope. `live_append_context` is accepted only for the active delegation. A `final` append closes that delegation and returns Live to listening. `live_stop` is idempotent. A second `live_start` while Live is starting, connected, or stopping fails explicitly.
 
 ### Events
 
@@ -128,52 +150,50 @@ Audio never appears in RPC events. `output_audio.delta` remains inside the nativ
 
 ### Delegation ordering
 
-`live_delegation_created` must be emitted synchronously before `LiveSessionController` calls `sendCustomMessage(..., { triggerTurn: true })`.
+In host-delegation mode, `live_delegation_created` replaces the internal `sendCustomMessage(..., { triggerTurn: true })` call.
 
 Required ordering:
 
 ```text
-live_delegation_created
-agent_start
-message/tool events
-agent_end
+OMP Live: live_delegation_created
+Comet:    durable QueueCommand
+Comet:    normal OmpHarness AgentEvent stream and folding
+Comet:    live_append_context(progress | final)
+OMP Live: spoken progress/result
 ```
 
-This gives Comet a durable user-side boundary before assistant output arrives. The OMP RPC writer must preserve this order. Comet may buffer early agent events defensively, but ordering is an OMP protocol contract rather than a timing assumption.
+OMP permits only one unresolved host delegation. Comet sends context only with the matching `delegationId`; stale or unknown IDs fail explicitly.
 
-### OMP session ownership
+### OMP process ownership
 
-Before `live_start`, Comet performs the same setup as a normal OMP run:
+Before `live_start`, Comet:
 
-1. launch `omp --mode rpc-ui` in the Chat Checkout cwd;
-2. negotiate RPC protocol v2;
-3. enable subagent events;
-4. resume the Chat's native `sessionFile` with `switch_session`;
-5. register applicable host tools;
-6. apply the selected model and thinking level;
-7. read state and retain the current `sessionFile`;
-8. issue `live_start`.
+1. launches an ephemeral `omp --mode rpc-ui` child in the Chat Checkout cwd;
+2. negotiates RPC protocol v2;
+3. verifies the `liveVoice` ready capability;
+4. issues `live_start` with `delegationMode: "host"`.
 
-The same OMP `AgentSession` handles every delegation during the call. Compaction, tools, subagents, questions, model context, and native session persistence remain OMP behavior.
+The Live child does not resume the Chat's native `sessionFile`, register coding host tools, or apply the Chat's backend model/thinking selection. Those steps remain on the existing per-run `OmpHarness` path after Comet durably queues a delegation.
+
+The Live child persists between delegations. Each backend run uses Comet's ordinary OMP process lifecycle and native session resume, so compaction, tools, subagents, questions, model context, and session persistence remain existing behavior.
 
 ## Comet harness boundary
 
-Live Voice is an optional harness capability. The shared harness contract exposes support and a Live start operation with an unsupported default; only `OmpHarness` implements it.
+Live Voice is an optional harness capability. The shared harness contract exposes capability probing and a Live frontend start operation with an unsupported default; only `OmpHarness` implements it.
 
-The Live stream multiplexes transient voice events and the already-normalized agent stream:
+The Live frontend stream carries only transient events:
 
 ```text
 LiveVoiceEvent::Phase
 LiveVoiceEvent::Levels
 LiveVoiceEvent::Transcript
 LiveVoiceEvent::Delegation
-LiveVoiceEvent::Agent(AgentEvent)
 LiveVoiceEvent::Ended
 ```
 
-`OmpNormalizer` remains the sole parser for text, reasoning, tools, usage, questions, workflow activity, subagents, and errors. The Live path must not duplicate normalization or document folding.
+Its control channel carries mute, stop, and delegation context appends. `OmpNormalizer` and the normal `OmpHarness::run` path remain the sole parser for backend text, reasoning, tools, usage, questions, workflow activity, subagents, and errors. The Live path does not normalize or fold backend agent events.
 
-The OMP Live runner differs from a normal OMP run in one lifecycle rule: terminal `agent_end` closes the current delegated run but does not stop the OMP process. Only `live_stop`, transport failure, or host teardown ends the Live process.
+Terminal backend `AgentEvent::Done` ends only the ordinary run child. The engine sends the final result to the still-connected Live child, which can then accept another delegation.
 
 ## Engine lifecycle
 
@@ -182,9 +202,9 @@ The engine owns at most one device-local `LiveVoiceRuntime`:
 ```text
 LiveVoiceRuntime
 ├── chat_id
-├── OmpProcess / harness handle
+├── ephemeral OMP Live handle
 ├── phase
-├── active delegation
+├── active delegation + owned command id
 ├── control sender
 └── event task
 ```
@@ -221,15 +241,16 @@ The Live connection is ephemeral engine state and does not occupy the durable Ch
 
 For each `live_delegation_created`:
 
-1. start a delegated run segment and Run Journal;
-2. append the delegation request as one user entry in the Chat Transcript;
-3. feed subsequent `AgentEvent` values into the existing run folding path;
-4. settle that run on terminal `agent_end`;
-5. keep the Live OMP process connected for another delegation.
+1. subscribe to the Chat's existing `SessionsEngine` event hub before dispatch;
+2. mint stable command and message IDs from the Live call ID and `delegationId`;
+3. queue one ordinary `SessionCommandPayload::Run` with the spoken request;
+4. let the existing host executor, `SessionsEngine::dispatch`, Run Journal, document folding, tools, questions, and subagents handle the run unchanged;
+5. forward bounded progress text and the final assistant result to the Live child through `live_append_context`;
+6. keep the Live child connected for another delegation.
 
-A new delegation while work is active becomes a user message in the current run, equivalent to steering. The shared event contract must therefore permit an unwrapped main-Chat `AgentEvent::UserMessage`; today that shape is documented as subagent-only.
+The active runtime records the exact command ID it owns. Before executing any durable command, the host executor asks `SessionsEngine` to stop Live unless the command ID is that active voice delegation. This enforces “normal command stops Live” without adding a new durable command schema or relying on an ID prefix.
 
-Casual user and realtime-assistant transcripts stay only in local Live state. The spoken paraphrase of the backend result is not persisted because the normal assistant result already is.
+Only one voice delegation may be active. Casual user and realtime-assistant transcripts stay only in local Live state. The spoken paraphrase of the backend result is not persisted because the normal assistant result already is.
 
 ### Interaction with normal commands
 
@@ -261,12 +282,12 @@ Live stops on:
 Teardown order:
 
 ```text
-stop AudioCapture
+send live_stop
+→ OMP stops AudioCapture
 → send session.close
 → close sideband
 → close WebRTC and playback
-→ retain updated session identity
-→ shut down OMP child
+→ shut down the ephemeral Live child
 → clear runtime
 → notify UI
 ```
@@ -305,7 +326,7 @@ Starting Live replaces the editor with one focused native strip containing:
 - Mute/Unmute;
 - End.
 
-The Chat remains visible, and delegated work enters its normal transcript. `Esc` ends Live. Comet's ordinary TTS vocalizer is suspended while Live owns speaker playback.
+The Chat remains visible, and delegated work enters its normal transcript. `Esc` ends Live. Comet's completion/request notification chimes are suppressed while Live owns speaker playback.
 
 The UI stores no lifecycle authority. Closing or dropping the surface sends stop, while the engine also owns cleanup if the UI disappears unexpectedly.
 
@@ -329,8 +350,9 @@ No audio is recorded to disk. Diagnostics must not log OAuth tokens, attestation
 - Missing or expired Codex OAuth: actionable error directing the user to OMP/Codex account login.
 - Microphone permission denied: explicit permission error; no Chat entry.
 - Signaling or sideband failure before delegation: ephemeral Live error only.
-- OMP exit during delegation: settle the current run as errored and retain already-folded transcript data.
-- OMP exit while idle: close the Live surface with an error; no Chat mutation.
+- Live child exit during a backend run: stop the Live surface; allow the already-durable normal run to finish and retain its transcript.
+- Backend run failure: preserve existing run error folding and send a final failure context to Live when the Live child is still connected.
+- Live child exit while idle: close the Live surface with an error; no Chat mutation.
 - Unknown additive Live event: bounded diagnostic and ignore; do not crash the process.
 - Repeated stop after failure: successful idempotent cleanup.
 - No automatic fallback to local dictation or public Realtime API.
@@ -341,11 +363,13 @@ No audio is recorded to disk. Diagnostics must not log OAuth tokens, attestation
 
 - ready frame advertises `liveVoice` only when compiled with the capability;
 - commands parse, correlate, and reject invalid state;
+- host-delegation start never calls the internal `AgentSession`;
+- only one unresolved delegation is permitted;
+- progress/final context appends require the active delegation ID;
+- a final append returns the controller to listening;
 - second start fails;
 - stop is idempotent;
 - mute forwards to the active controller;
-- delegation event precedes agent lifecycle events;
-- multiple terminal `agent_end` events do not close Live;
 - signaling failure emits one terminal Live event;
 - RPC disposal closes capture and playback.
 
@@ -354,22 +378,23 @@ No audio is recorded to disk. Diagnostics must not log OAuth tokens, attestation
 A fake OMP RPC fixture proves:
 
 - capability discovery;
-- start/resume/model setup ordering;
-- transient phase/transcript parsing;
-- delegation to normalized agent stream;
-- two delegations reuse one child and one native session;
-- terminal agent events settle delegations without ending Live;
-- stop and unexpected child exit produce deterministic terminal events.
+- the Live child starts without `switch_session`, model setup, or host-tool registration;
+- transient phase/transcript/delegation parsing;
+- progress and final context append encoding;
+- two serial delegations reuse one Live child;
+- ordinary backend runs still use the existing OMP setup and normalizer;
+- stop and unexpected Live child exit produce deterministic terminal events.
 
 ### Engine tests
 
 - casual transcript events do not modify the Chat Transcript;
-- one delegation creates exactly one user entry;
-- assistant text, tools, questions, and subagents use existing folding;
-- a second delegation during work creates a steering-style user boundary;
-- normal command arrival stops Live before execution;
-- remote Chat, non-OMP Chat, unsupported OMP, and concurrent Live are rejected;
-- failure during delegation settles the run as errored;
+- one delegation queues exactly one durable Run command and creates one user entry;
+- the owned voice command does not stop its Live runtime;
+- a different durable command stops Live before execution;
+- assistant text, tools, questions, and subagents use the unchanged SessionsEngine folding;
+- progress/final text returns through the Live control channel without a second durable assistant entry;
+- backend run failure remains durable even if the Live child exits;
+- remote Chat, non-OMP Chat, unsupported OMP, active backend run, and concurrent Live are rejected;
 - UI disconnect and engine shutdown release the runtime.
 
 ### UI tests and visual validation
