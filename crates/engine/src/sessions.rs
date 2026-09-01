@@ -29,15 +29,19 @@ use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     SessionMessageEntry, fold_event_into_parts, merge_workflow_task, sanitize_tool_call,
 };
-use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use zeron_harness::{
+    CancellationToken, Harness, LiveVoiceControl, LiveVoiceRequest, RunControls, SteerMessage,
+};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
+    LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion, WorkflowTaskStatus, WorkflowTaskUpdate,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
+use crate::live_voice::{LiveVoiceCoordinator, attach_live_handle};
 use crate::{EngineError, new_id, now_ms};
 
 /// One published event. Durable events carry their journal seq; transient
@@ -202,6 +206,7 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    live_voice: LiveVoiceCoordinator,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -209,6 +214,27 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String {
+    match reason {
+        LiveVoiceUnavailableReason::RemoteChat => {
+            "Live Voice is available only on the Chat's host device".into()
+        }
+        LiveVoiceUnavailableReason::NonOmp => "Live Voice requires an OMP Chat".into(),
+        LiveVoiceUnavailableReason::Archived => {
+            "Live Voice is unavailable for archived Chats".into()
+        }
+        LiveVoiceUnavailableReason::ActiveRun => {
+            "Stop the active run before starting Live Voice".into()
+        }
+        LiveVoiceUnavailableReason::UnsupportedOmp => {
+            "Installed OMP does not support Live Voice; update OMP".into()
+        }
+        LiveVoiceUnavailableReason::AnotherLiveCall => {
+            "Another Live Voice call is already active on this device".into()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -237,6 +263,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                live_voice: LiveVoiceCoordinator::new(),
             }),
         }
     }
@@ -305,6 +332,120 @@ impl SessionsEngine {
 
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
         lock(&self.inner.statuses).get(chat_id).cloned()
+    }
+
+    pub fn watch_live_voice(&self) -> watch::Receiver<LiveVoiceState> {
+        self.inner.live_voice.watch()
+    }
+
+    pub async fn probe_live_voice(
+        &self,
+        chat_id: &str,
+    ) -> Result<LiveVoiceAvailability, EngineError> {
+        let (reason, cwd) = self.live_voice_precondition(chat_id)?;
+        if let Some(reason) = reason {
+            return Ok(LiveVoiceAvailability {
+                available: false,
+                reason: Some(reason),
+            });
+        }
+        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
+        let available = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
+        Ok(LiveVoiceAvailability {
+            available,
+            reason: (!available).then_some(LiveVoiceUnavailableReason::UnsupportedOmp),
+        })
+    }
+
+    pub async fn start_live_voice(&self, chat_id: &str) -> Result<(), EngineError> {
+        let (reason, cwd) = self.live_voice_precondition(chat_id)?;
+        if let Some(reason) = reason {
+            return Err(EngineError::Other(live_voice_unavailable_message(reason)));
+        }
+        let call_id = self.inner.live_voice.reserve(chat_id)?;
+        let harness = match self.inner.registry.resolve(HarnessId::Omp) {
+            Ok(harness) => harness,
+            Err(error) => {
+                self.inner.live_voice.fail(&call_id, &error.to_string());
+                return Err(error.into());
+            }
+        };
+        let supported = match harness
+            .probe_live_voice(std::path::Path::new(&cwd))
+            .await
+        {
+            Ok(supported) => supported,
+            Err(error) => {
+                self.inner.live_voice.fail(&call_id, &error.to_string());
+                return Err(error.into());
+            }
+        };
+        if !supported {
+            let message = live_voice_unavailable_message(
+                LiveVoiceUnavailableReason::UnsupportedOmp,
+            );
+            self.inner.live_voice.fail(&call_id, &message);
+            return Err(EngineError::Other(message));
+        }
+        if !self.inner.live_voice.matches(&call_id) {
+            return Err(EngineError::Other(
+                "Live Voice start was cancelled".into(),
+            ));
+        }
+        let handle = match harness.start_live_voice(LiveVoiceRequest { cwd }).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.inner.live_voice.fail(&call_id, &error.to_string());
+                return Err(error.into());
+            }
+        };
+        if let Err(handle) = attach_live_handle(&self.inner.live_voice, &call_id, handle) {
+            let _ = handle.controls.send(LiveVoiceControl::Stop).await;
+            return Err(EngineError::Other(
+                "Live Voice start was cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn set_live_voice_muted(&self, muted: bool) -> Result<(), EngineError> {
+        self.inner.live_voice.set_muted(muted).await
+    }
+
+    pub async fn stop_live_voice(&self) -> Result<(), EngineError> {
+        self.inner.live_voice.stop().await
+    }
+
+    fn live_voice_precondition(
+        &self,
+        chat_id: &str,
+    ) -> Result<(Option<LiveVoiceUnavailableReason>, String), EngineError> {
+        let workspace = self
+            .inner
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace is unavailable".into()))?;
+        let chat = workspace
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other(format!("no such chat: {chat_id}")))?;
+        let cwd = chat
+            .cwd
+            .clone()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .ok_or_else(|| EngineError::Other("Chat has no working directory".into()))?;
+        let reason = if chat.device_id != self.inner.device_id {
+            Some(LiveVoiceUnavailableReason::RemoteChat)
+        } else if chat.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp) {
+            Some(LiveVoiceUnavailableReason::NonOmp)
+        } else if chat.archived {
+            Some(LiveVoiceUnavailableReason::Archived)
+        } else if self.has_live_run(chat_id) {
+            Some(LiveVoiceUnavailableReason::ActiveRun)
+        } else if self.inner.live_voice.is_active() {
+            Some(LiveVoiceUnavailableReason::AnotherLiveCall)
+        } else {
+            None
+        };
+        Ok((reason, cwd))
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -884,6 +1025,9 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        if let Err(err) = self.stop_live_voice().await {
+            tracing::warn!(error = %err, "Live Voice shutdown failed");
+        }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
