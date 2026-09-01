@@ -4,12 +4,12 @@ use tempfile::TempDir;
 use zeron_workers_unpeel::{LocalWorkersClient, worker_parent_links_at};
 
 #[test]
-fn dev_demo_fixture_exposes_omp_usage_to_real_bootstrap()
--> Result<(), Box<dyn std::error::Error>> {
+fn dev_demo_fixture_exposes_omp_usage_to_real_bootstrap() -> Result<(), Box<dyn std::error::Error>>
+{
     let home = TempDir::new()?;
     let project = TempDir::new()?;
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/seed-demo-workers.py");
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/seed-demo-workers.py");
 
     let output = Command::new("python3")
         .arg(script)

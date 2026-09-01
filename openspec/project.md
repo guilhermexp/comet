@@ -13,7 +13,7 @@ local OAuth credential through snapshots or sync.
 
 ## Tech Stack
 
-- **Rust** edition 2024, workspace `crates/{proto,doc,sync,harness,engine,rpc,mcp,update,ui}` + `apps/comet`.
+- **Rust** edition 2024, workspace `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel}` + `apps/zeron`.
 - **UI**: gpui, fork do Zed (`wingleeio/zed`) pinado por rev. Sem as crates GPL do Zed.
 - **Sync**: `loro` 1.13 + `loro-protocol` 0.3.
 - **Edge**: TypeScript no Cloudflare Workers — Worker + SessionRoom DO + DeviceRoom DO + R2 + auth WorkOS.
@@ -32,10 +32,10 @@ local OAuth credential through snapshots or sync.
 
 ### Architecture Patterns
 
-- **Camadas não sobem**: `proto` → `doc` → `sync` → `harness` → `engine` → `rpc` → `ui`/`mcp`.
+- **Camadas não sobem**: `proto` → `doc` → `sync` → `harness` → `engine` → `rpc` → `ui`; `workers-unpeel` é a fronteira local com o Unpeel vendorizado.
 - **Comando é dado durável**, não chamada: send/steer/interrupt/respondInput viram entradas no ledger do session doc, executadas pelo device host do chat.
 - **Um protocolo só** para in-process, daemon local e device remoto — o modo in-process roda sobre duplex em memória sem atalho de serialização.
-- **Regra derivada compartilhada** entre UI e engine mora em `comet-proto::view`, nunca duplicada nos dois lados.
+- **Regra derivada compartilhada** entre UI e engine mora em `zeron-proto::view`, nunca duplicada nos dois lados.
 - **Usage de provider fica fora do CRDT**: `AgentAccountsSnapshot` carrega janelas remotas e linhas locais apenas pelo RPC engine→UI.
 - **Kimi Code é identidade de conta/Usage não executável** no `HarnessId`. A engine compartilha a credencial device-local restrita por permissão com locking cross-process limitado, re-leitura pós-lock e rotação atômica; janelas normalizadas com sucesso têm cache device-local de 60s.
 - Mapa de onde editar: `AGENTS.md` na raiz e por subárvore (DOX).
