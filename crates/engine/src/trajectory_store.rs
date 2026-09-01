@@ -15,15 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
-use zeron_proto::trajectory::{
-    TrajectoryDegradedInterval, TrajectoryLane, TrajectoryPayloadPreview, TrajectoryRawField,
-    TrajectoryRawRef, TrajectoryRecord, TrajectoryRecordId, TrajectoryRecordKind,
-    TrajectoryResultPreview, TrajectoryStatus, TrajectoryTiming, TrajectoryUsage,
-};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use tokio::sync::oneshot;
+use zeron_proto::trajectory::*;
 use zeron_proto::{AgentEvent, DoneStatus, ToolCall};
 #[derive(Debug, thiserror::Error)]
 pub enum TrajectoryStoreError {
@@ -120,19 +117,43 @@ pub struct TrajectoryDiagnostics {
     pub db_size_bytes: u64,
 }
 
+enum ReplySender<T: Send + 'static> {
+    Async(oneshot::Sender<T>),
+    Sync(SyncSender<T>),
+}
+
+impl<T: Send + 'static> ReplySender<T> {
+    fn send(self, val: T) {
+        match self {
+            ReplySender::Async(tx) => {
+                let _ = tx.send(val);
+            }
+            ReplySender::Sync(tx) => {
+                let _ = tx.send(val);
+            }
+        }
+    }
+}
+
 /// Commands for the background writer task.
 enum WriterCommand {
     WriteRecords(Vec<TrajectoryRecord>),
     RecordDegraded(TrajectoryDegradedInterval),
     DeleteChat(
         String,
-        Option<oneshot::Sender<Result<(), TrajectoryStoreError>>>,
+        Option<ReplySender<Result<(), TrajectoryStoreError>>>,
     ),
     RetainChats(
         Vec<String>,
-        Option<oneshot::Sender<Result<usize, TrajectoryStoreError>>>,
+        Option<ReplySender<Result<usize, TrajectoryStoreError>>>,
     ),
-    Flush(oneshot::Sender<()>),
+    ImportLegacy {
+        chat_id: String,
+        fingerprint: String,
+        records: Vec<TrajectoryRecord>,
+        reply: Option<ReplySender<Result<(), TrajectoryStoreError>>>,
+    },
+    Flush(ReplySender<()>),
 }
 
 /// Default capacity for the nonblocking capture queue.
@@ -142,7 +163,8 @@ const CAPTURE_QUEUE_CAPACITY: usize = 2048;
 #[derive(Clone)]
 pub struct TrajectoryStore {
     db_path: PathBuf,
-    writer_tx: mpsc::Sender<WriterCommand>,
+    journals_dir: PathBuf,
+    writer_tx: SyncSender<WriterCommand>,
     in_memory_degraded: Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
     degraded_reason: Arc<Mutex<Option<String>>>,
 }
@@ -153,7 +175,7 @@ impl TrajectoryStore {
         let store_root = store_root.as_ref();
         fs::create_dir_all(store_root)?;
         let db_path = store_root.join("trajectory.sqlite3");
-
+        let journals_dir = store_root.join("journals");
         // Run initial migrations on open
         {
             let mut conn = Connection::open(&db_path)?;
@@ -163,53 +185,56 @@ impl TrajectoryStore {
             migrate(&mut conn)?;
         }
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterCommand>(CAPTURE_QUEUE_CAPACITY);
+        let (writer_tx, writer_rx) = sync_channel::<WriterCommand>(CAPTURE_QUEUE_CAPACITY);
         let writer_db_path = db_path.clone();
         let in_memory_degraded = Arc::new(Mutex::new(Vec::new()));
         let writer_in_mem = in_memory_degraded.clone();
 
-        // Spawn ordered background writer task
-        tokio::spawn(async move {
-            let mut conn = match Connection::open(&writer_db_path) {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to open trajectory writer connection");
-                    return;
-                }
-            };
-            let _ = conn.pragma_update(None, "journal_mode", "WAL");
-            let _ = conn.pragma_update(None, "synchronous", "NORMAL");
-            let _ = conn.busy_timeout(Duration::from_secs(5));
+        // Spawn ordered background writer OS thread
+        std::thread::Builder::new()
+            .name("trajectory-writer".into())
+            .spawn(move || {
+                let mut conn = match Connection::open(&writer_db_path) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to open trajectory writer connection");
+                        return;
+                    }
+                };
+                let _ = conn.pragma_update(None, "journal_mode", "WAL");
+                let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+                let _ = conn.busy_timeout(Duration::from_secs(5));
 
-            while let Some(cmd) = writer_rx.recv().await {
-                match cmd {
-                    WriterCommand::WriteRecords(mut records) => {
-                        // Drain any immediately available batched records
-                        while let Ok(next) = writer_rx.try_recv() {
-                            match next {
-                                WriterCommand::WriteRecords(more) => records.extend(more),
-                                other => {
-                                    // Process batch so far then process other command
-                                    flush_batch_to_writer(&mut conn, &records, &writer_in_mem);
-                                    records.clear();
-                                    handle_writer_command(&mut conn, other, &writer_in_mem);
-                                    break;
+                while let Ok(cmd) = writer_rx.recv() {
+                    match cmd {
+                        WriterCommand::WriteRecords(mut records) => {
+                            // Drain any immediately available batched records
+                            while let Ok(next) = writer_rx.try_recv() {
+                                match next {
+                                    WriterCommand::WriteRecords(more) => records.extend(more),
+                                    other => {
+                                        flush_batch_to_writer(&mut conn, &records, &writer_in_mem);
+                                        records.clear();
+                                        handle_writer_command(&mut conn, other, &writer_in_mem);
+                                        break;
+                                    }
                                 }
                             }
+                            if !records.is_empty() {
+                                flush_batch_to_writer(&mut conn, &records, &writer_in_mem);
+                            }
                         }
-                        if !records.is_empty() {
-                            flush_batch_to_writer(&mut conn, &records, &writer_in_mem);
+                        other => {
+                            handle_writer_command(&mut conn, other, &writer_in_mem);
                         }
-                    }
-                    other => {
-                        handle_writer_command(&mut conn, other, &writer_in_mem);
                     }
                 }
-            }
-        });
+            })
+            .map_err(|e| TrajectoryStoreError::Other(e.to_string()))?;
 
         Ok(Self {
             db_path,
+            journals_dir,
             writer_tx,
             in_memory_degraded,
             degraded_reason: Arc::new(Mutex::new(None)),
@@ -219,9 +244,11 @@ impl TrajectoryStore {
     /// Construct a degraded trajectory store that logs operations and reports degradation without panicking.
     pub fn degraded(store_root: impl AsRef<Path>, reason: impl Into<String>) -> Self {
         let db_path = store_root.as_ref().join("trajectory.sqlite3");
-        let (writer_tx, _) = mpsc::channel(1);
+        let journals_dir = store_root.as_ref().join("journals");
+        let (writer_tx, _) = sync_channel(1);
         Self {
             db_path,
+            journals_dir,
             writer_tx,
             in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
             degraded_reason: Arc::new(Mutex::new(Some(reason.into()))),
@@ -231,6 +258,18 @@ impl TrajectoryStore {
     /// True if this store is running in degraded mode due to initialization failure.
     pub fn is_degraded(&self) -> bool {
         self.degraded_reason.lock().unwrap().is_some()
+    }
+
+    /// Lazily ensure eligible legacy Run Journal data for `chat_id` is imported on first access.
+    pub fn ensure_legacy_imported(&self, chat_id: &str) -> Result<(), TrajectoryStoreError> {
+        if self.is_degraded() {
+            return Ok(());
+        }
+        let journal_path = crate::run_journal::journal_paths(&self.journals_dir, chat_id).0;
+        if journal_path.exists() {
+            let _ = self.import_legacy_journal(chat_id, &journal_path)?;
+        }
+        Ok(())
     }
 
     fn record_degraded_in_memory(&self, degraded: TrajectoryDegradedInterval) {
@@ -271,7 +310,7 @@ impl TrajectoryStore {
             .try_send(WriterCommand::WriteRecords(vec![record.clone()]))
         {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(TrySendError::Full(_)) => {
                 tracing::warn!(
                     chat = %record.chat_id,
                     run = %record.run_id,
@@ -290,7 +329,7 @@ impl TrajectoryStore {
                 self.record_degraded_in_memory(degraded);
                 Err(TrajectoryStoreError::QueueFull)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(TrySendError::Disconnected(_)) => {
                 let degraded = TrajectoryDegradedInterval {
                     chat_id: record.chat_id.clone(),
                     run_id: record.run_id.clone(),
@@ -336,7 +375,7 @@ impl TrajectoryStore {
             .try_send(WriterCommand::WriteRecords(records))
         {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(WriterCommand::WriteRecords(recs))) => {
+            Err(TrySendError::Full(WriterCommand::WriteRecords(recs))) => {
                 if let Some(first) = recs.first() {
                     let last = recs.last().unwrap_or(first);
                     let degraded = TrajectoryDegradedInterval {
@@ -351,17 +390,15 @@ impl TrajectoryStore {
                 }
                 Err(TrajectoryStoreError::QueueFull)
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(TrajectoryStoreError::ChannelClosed),
+            Err(TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(TrajectoryStoreError::ChannelClosed),
         }
     }
-
     /// Flush the background writer queue and await completion.
     pub async fn flush(&self) -> Result<(), TrajectoryStoreError> {
         let (tx, rx) = oneshot::channel();
         self.writer_tx
-            .send(WriterCommand::Flush(tx))
-            .await
+            .try_send(WriterCommand::Flush(ReplySender::Async(tx)))
             .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)
     }
@@ -390,6 +427,7 @@ impl TrajectoryStore {
         if self.is_degraded() {
             return Ok(Vec::new());
         }
+        let _ = self.ensure_legacy_imported(chat_id);
         let conn = self.reader()?;
         let from = from_seq.unwrap_or(0);
         let lim = limit.unwrap_or(10_000) as i64;
@@ -421,6 +459,10 @@ impl TrajectoryStore {
 
     /// Fetch latest recorded watermark for `chat_id`.
     pub fn get_watermark(&self, chat_id: &str) -> Result<Option<u64>, TrajectoryStoreError> {
+        if self.is_degraded() {
+            return Ok(None);
+        }
+        let _ = self.ensure_legacy_imported(chat_id);
         let conn = self.reader()?;
         let res = conn
             .query_row(
@@ -505,7 +547,7 @@ impl TrajectoryStore {
         &self,
         chat_id: &str,
     ) -> Result<TrajectoryDiagnostics, TrajectoryStoreError> {
-        if let Some(_) = self.degraded_reason.lock().unwrap().as_ref() {
+        if self.is_degraded() {
             return Ok(TrajectoryDiagnostics {
                 chat_id: chat_id.to_string(),
                 record_count: 0,
@@ -515,6 +557,7 @@ impl TrajectoryStore {
                 db_size_bytes: 0,
             });
         }
+        let _ = self.ensure_legacy_imported(chat_id);
         let conn = self.reader()?;
         let record_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM trajectory_records WHERE chat_id = ?1",
@@ -548,8 +591,10 @@ impl TrajectoryStore {
     pub async fn delete_chat(&self, chat_id: &str) -> Result<(), TrajectoryStoreError> {
         let (tx, rx) = oneshot::channel();
         self.writer_tx
-            .send(WriterCommand::DeleteChat(chat_id.to_string(), Some(tx)))
-            .await
+            .try_send(WriterCommand::DeleteChat(
+                chat_id.to_string(),
+                Some(ReplySender::Async(tx)),
+            ))
             .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)?
     }
@@ -561,8 +606,10 @@ impl TrajectoryStore {
     ) -> Result<usize, TrajectoryStoreError> {
         let (tx, rx) = oneshot::channel();
         self.writer_tx
-            .send(WriterCommand::RetainChats(live_chat_ids.to_vec(), Some(tx)))
-            .await
+            .try_send(WriterCommand::RetainChats(
+                live_chat_ids.to_vec(),
+                Some(ReplySender::Async(tx)),
+            ))
             .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)?
     }
@@ -583,41 +630,17 @@ impl TrajectoryStore {
         Ok(fp)
     }
 
-    /// Record completed legacy import.
-    pub fn record_legacy_import(
-        &self,
-        chat_id: &str,
-        fingerprint: &str,
-        records_count: usize,
-    ) -> Result<(), TrajectoryStoreError> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.execute(
-            "INSERT INTO trajectory_legacy_imports (chat_id, source_fingerprint, imported_records, imported_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(chat_id) DO UPDATE SET
-                 source_fingerprint = excluded.source_fingerprint,
-                 imported_records = excluded.imported_records,
-                 imported_at = excluded.imported_at",
-            params![chat_id, fingerprint, records_count as i64, Utc::now().timestamp_millis()],
-        )?;
-        Ok(())
-    }
-
-    /// Synchronous batch write helper (for direct tests or legacy imports).
-    pub fn sync_write_records(
-        &self,
-        records: &[TrajectoryRecord],
-    ) -> Result<(), TrajectoryStoreError> {
-        let mut conn = Connection::open(&self.db_path)?;
-        write_records_tx(&mut conn, records)
-    }
-
-    /// Synchronous delete chat helper (for direct tests).
+    /// Synchronous delete chat helper (for direct tests), routed through the ordered writer.
     pub fn sync_delete_chat(&self, chat_id: &str) -> Result<(), TrajectoryStoreError> {
-        let conn = Connection::open(&self.db_path)?;
-        delete_chat_tx(&conn, chat_id)
+        let (tx, rx) = sync_channel(1);
+        self.writer_tx
+            .try_send(WriterCommand::DeleteChat(
+                chat_id.to_string(),
+                Some(ReplySender::Sync(tx)),
+            ))
+            .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
+        rx.recv().map_err(|_| TrajectoryStoreError::ChannelClosed)?
     }
-
     /// Lazily import a legacy Run Journal JSONL file into the Trajectory store.
     ///
     /// Properties:
@@ -688,10 +711,10 @@ impl TrajectoryStore {
             if matches!(event, zeron_proto::AgentEvent::Done { .. }) {
                 has_done = true;
             }
-            if let zeron_proto::AgentEvent::ToolCall { ref id, .. } = event {
+            if let zeron_proto::AgentEvent::ToolCall { id, .. } = &event {
                 pending_tools.insert(id.clone());
             }
-            if let zeron_proto::AgentEvent::ToolResult { ref id, .. } = event {
+            if let zeron_proto::AgentEvent::ToolResult { id, .. } = &event {
                 pending_tools.remove(id);
             }
 
@@ -701,10 +724,10 @@ impl TrajectoryStore {
             }
         }
 
-        // If the journal had no terminal Done event, mark unsettled tool calls and add an interrupted record if needed
+        // If the journal had no terminal Done event, mark unsettled tool calls and add an interrupted record
         if !has_done && !records.is_empty() {
             for rec in &mut records {
-                if let Some(ref call_id) = rec.call_id {
+                if let Some(call_id) = &rec.call_id {
                     if pending_tools.contains(call_id)
                         && matches!(rec.kind, TrajectoryRecordKind::ToolCall { .. })
                     {
@@ -712,11 +735,47 @@ impl TrajectoryStore {
                     }
                 }
             }
+            let last_seq = records.last().map(|r| r.source_seq).unwrap_or(0);
+            let interrupted_rec = TrajectoryRecord {
+                id: TrajectoryRecordId::new(&run_id, last_seq + 1, 0),
+                chat_id: chat_id.to_string(),
+                run_id: run_id.clone(),
+                source_seq: last_seq + 1,
+                sub_seq: 0,
+                lane: TrajectoryLane::Model,
+                kind: TrajectoryRecordKind::Done,
+                status: TrajectoryStatus::Interrupted,
+                is_partial: false,
+                title: "Done (Interrupted)".to_string(),
+                summary: "Interrupted".to_string(),
+                turn_id: None,
+                step_id: None,
+                call_id: None,
+                parent_tool_use_id: None,
+                timing: Some(TrajectoryTiming::sequence_only()),
+                usage: None,
+                payload: None,
+                result: None,
+                error_message: Some("Run interrupted".to_string()),
+                is_degraded: false,
+            };
+            records.push(interrupted_rec);
         }
 
-        let count = records.len();
-        self.sync_write_records(&records)?;
-        self.record_legacy_import(chat_id, &fingerprint, count)?;
+        let (tx, rx) = sync_channel(1);
+        let cmd = WriterCommand::ImportLegacy {
+            chat_id: chat_id.to_string(),
+            fingerprint,
+            records,
+            reply: Some(ReplySender::Sync(tx)),
+        };
+
+        if let Err(_) = self.writer_tx.try_send(cmd) {
+            return Err(TrajectoryStoreError::QueueFull);
+        }
+
+        rx.recv()
+            .map_err(|_| TrajectoryStoreError::ChannelClosed)??;
 
         Ok(true)
     }
@@ -789,7 +848,32 @@ fn handle_writer_command(
         WriterCommand::DeleteChat(chat_id, reply) => {
             let res = delete_chat_tx(conn, &chat_id);
             if let Some(tx) = reply {
-                let _ = tx.send(res);
+                tx.send(res);
+            }
+        }
+        WriterCommand::RetainChats(live_ids, reply) => {
+            let res = retain_chats_tx(conn, &live_ids);
+            if let Some(tx) = reply {
+                tx.send(res);
+            }
+        }
+        WriterCommand::Flush(reply) => {
+            reply.send(());
+        }
+        WriterCommand::ImportLegacy {
+            chat_id,
+            fingerprint,
+            records,
+            reply,
+        } => {
+            let res = (|| {
+                let count = records.len();
+                write_records_tx(conn, &records)?;
+                record_legacy_import_tx(conn, &chat_id, &fingerprint, count)?;
+                Ok(())
+            })();
+            if let Some(tx) = reply {
+                tx.send(res);
             }
         }
         WriterCommand::RetainChats(live_ids, reply) => {
@@ -904,6 +988,24 @@ fn write_records_tx(
     }
 
     tx.commit()?;
+    Ok(())
+}
+
+fn record_legacy_import_tx(
+    conn: &Connection,
+    chat_id: &str,
+    fingerprint: &str,
+    records_count: usize,
+) -> Result<(), TrajectoryStoreError> {
+    conn.execute(
+        "INSERT INTO trajectory_legacy_imports (chat_id, source_fingerprint, imported_records, imported_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(chat_id) DO UPDATE SET
+             source_fingerprint = excluded.source_fingerprint,
+             imported_records = excluded.imported_records,
+             imported_at = excluded.imported_at",
+        params![chat_id, fingerprint, records_count as i64, Utc::now().timestamp_millis()],
+    )?;
     Ok(())
 }
 
@@ -1697,7 +1799,6 @@ mod tests {
         store
             .writer_tx
             .send(WriterCommand::RecordDegraded(degraded))
-            .await
             .unwrap();
         store.flush().await.unwrap();
 
@@ -1714,9 +1815,10 @@ mod tests {
         let store = TrajectoryStore::open(temp.path()).unwrap();
 
         // Dropping the receiver / closing writer simulates channel loss
-        let (closed_tx, _) = mpsc::channel(1);
+        let (closed_tx, _) = sync_channel(1);
         let broken_store = TrajectoryStore {
             db_path: store.db_path.clone(),
+            journals_dir: temp.path().join("journals"),
             writer_tx: closed_tx,
             in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
             degraded_reason: Arc::new(Mutex::new(None)),
@@ -1733,7 +1835,6 @@ mod tests {
         assert_eq!(intervals[0].to_seq, 100);
         assert_eq!(intervals[0].reason, "Writer channel closed");
     }
-
     #[tokio::test]
     async fn test_trajectory_store_durable_write_failure() {
         let temp = TempDir::new().unwrap();
@@ -1788,13 +1889,13 @@ mod tests {
             intervals[0].reason
         );
     }
-
     #[tokio::test]
     async fn test_trajectory_store_queue_saturation_direct_marker() {
         let temp = TempDir::new().unwrap();
-        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterCommand>(1);
+        let (writer_tx, writer_rx) = sync_channel::<WriterCommand>(1);
         let store = TrajectoryStore {
             db_path: temp.path().join("trajectory.sqlite3"),
+            journals_dir: temp.path().join("journals"),
             writer_tx,
             in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
             degraded_reason: Arc::new(Mutex::new(None)),
@@ -1808,11 +1909,10 @@ mod tests {
             )]))
             .unwrap();
 
-        // Saturated enqueue
-        let saturated_rec = sample_record("c_sat", "r1", 2, 0);
-        let res = store.try_enqueue(saturated_rec);
+        // Second enqueue must saturate and fail with QueueFull
+        let rec2 = sample_record("c_sat", "r1", 2, 0);
+        let res = store.try_enqueue(rec2);
         assert!(matches!(res, Err(TrajectoryStoreError::QueueFull)));
-
         // Saturated queue must record marker in memory without needing space in the full queue
         let intervals = store.get_degraded_intervals("c_sat").unwrap();
         assert_eq!(intervals.len(), 1);
@@ -1988,11 +2088,13 @@ mod tests {
         assert!(imported);
 
         let records = store.list_all_records("chat_corrupt").unwrap();
-        // Exactly the 3 valid prefix records are imported
-        assert_eq!(records.len(), 3);
+        // Exactly the 3 valid prefix records plus terminal interrupted record are imported
+        assert_eq!(records.len(), 4);
         assert_eq!(records[0].source_seq, 1);
         assert_eq!(records[1].source_seq, 2);
         assert_eq!(records[2].source_seq, 3);
+        assert_eq!(records[3].status, TrajectoryStatus::Interrupted);
+        assert_eq!(records[3].kind, TrajectoryRecordKind::Done);
     }
 
     #[tokio::test]
@@ -2014,8 +2116,74 @@ mod tests {
         assert!(imported);
 
         let records = store.list_all_records("chat_unsettled").unwrap();
-        assert_eq!(records.len(), 2);
+        // SessionStarted, ToolCall (Unsettled), Done (Interrupted)
+        assert_eq!(records.len(), 3);
         assert_eq!(records[1].status, TrajectoryStatus::Unsettled);
+        assert_eq!(records[2].status, TrajectoryStatus::Interrupted);
+        assert_eq!(records[2].kind, TrajectoryRecordKind::Done);
+
+        let groups = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, TrajectoryStatus::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_legacy_production_path_lazy_projection() {
+        let temp = TempDir::new().unwrap();
+        let journals_dir = temp.path().join("journals");
+        fs::create_dir_all(&journals_dir).unwrap();
+
+        // Write legacy journal directly to the standard journals directory
+        let journal_path = journals_dir.join("chat_lazy.jsonl");
+        let lines = vec![
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
+            r#"{"seq":2,"event":{"type":"userMessage","text":"Hello lazy legacy"}}"#,
+            r#"{"seq":3,"event":{"type":"done","status":"completed","result":"ok"}}"#,
+        ];
+        fs::write(&journal_path, lines.join("\n")).unwrap();
+
+        // Open store without manually calling import_legacy_journal
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Querying on first access automatically projects the legacy journal
+        let records = store.list_all_records("chat_lazy").unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].source_seq, 1);
+        assert_eq!(records[1].summary, "Hello lazy legacy");
+
+        // Watermark and diagnostics reflect the lazily projected data
+        let watermark = store.get_watermark("chat_lazy").unwrap();
+        assert_eq!(watermark, Some(3));
+
+        let diag = store.diagnostics("chat_lazy").unwrap();
+        assert_eq!(diag.record_count, 3);
+        assert_eq!(diag.last_watermark, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_ordered_writer_concurrency() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(TrajectoryStore::open(temp.path()).unwrap());
+
+        let mut handles = Vec::new();
+
+        for task_idx in 0..8 {
+            let store_clone = store.clone();
+            handles.push(tokio::spawn(async move {
+                let chat_id = format!("chat_concurrent_{}", task_idx);
+                for seq in 1..=20 {
+                    let rec = sample_record(&chat_id, "run_1", seq, 0);
+                    store_clone.try_enqueue(rec).unwrap();
+                }
+                store_clone.flush().await.unwrap();
+                let records = store_clone.list_all_records(&chat_id).unwrap();
+                assert_eq!(records.len(), 20);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
     }
 
     #[tokio::test]

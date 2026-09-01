@@ -302,10 +302,10 @@ pub fn format_duration_ms(ms: u64) -> String {
 }
 
 /// Format duration or return a fixed unavailable placeholder ("—").
-pub fn format_duration_or_unavailable(timing: Option<&TrajectoryTiming>) -> &'static str {
+pub fn format_duration_or_unavailable(timing: Option<&TrajectoryTiming>) -> String {
     match format_duration(timing) {
-        Some(_) => "measured",
-        None => "—",
+        Some(d) => d,
+        None => "—".to_string(),
     }
 }
 
@@ -379,7 +379,11 @@ pub fn truncate_preview(text: &str, byte_cap: usize) -> String {
 pub fn sanitize_prompt_preview(text: &str, byte_cap: usize) -> (String, Option<String>) {
     let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let summary = if single.len() > MAX_SUMMARY_LEN {
-        format!("{}…", &single[..MAX_SUMMARY_LEN])
+        let mut end = MAX_SUMMARY_LEN;
+        while end > 0 && !single.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &single[..end])
     } else {
         single
     };
@@ -664,8 +668,11 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
         let run = &mut runs[run_idx];
         if record.status == TrajectoryStatus::Error {
             run.status = TrajectoryStatus::Error;
+        } else if record.status == TrajectoryStatus::Interrupted
+            && run.status != TrajectoryStatus::Error
+        {
+            run.status = TrajectoryStatus::Interrupted;
         }
-
         let turn_id = record
             .turn_id
             .clone()
@@ -685,8 +692,11 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
         let turn = &mut run.turns[turn_idx];
         if record.status == TrajectoryStatus::Error {
             turn.status = TrajectoryStatus::Error;
+        } else if record.status == TrajectoryStatus::Interrupted
+            && turn.status != TrajectoryStatus::Error
+        {
+            turn.status = TrajectoryStatus::Interrupted;
         }
-
         let step_id = record
             .step_id
             .clone()
@@ -706,8 +716,11 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
         let step = &mut turn.steps[step_idx];
         if record.status == TrajectoryStatus::Error {
             step.status = TrajectoryStatus::Error;
+        } else if record.status == TrajectoryStatus::Interrupted
+            && step.status != TrajectoryStatus::Error
+        {
+            step.status = TrajectoryStatus::Interrupted;
         }
-        step.records.push(record.clone());
     }
 
     runs
@@ -962,14 +975,17 @@ mod tests {
         let seq_timing = TrajectoryTiming::sequence_only();
         assert_eq!(format_duration(Some(&seq_timing)), None);
         assert_eq!(format_duration_or_unavailable(Some(&seq_timing)), "—");
+        assert_eq!(format_duration_or_unavailable(None), "—");
 
         let rec_timing = TrajectoryTiming::recorded(None, None, Some(1500), None);
         assert_eq!(format_duration(Some(&rec_timing)), Some("1.50s".into()));
+        assert_eq!(format_duration_or_unavailable(Some(&rec_timing)), "1.50s");
 
         let start = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 2).unwrap();
         let calc_timing = TrajectoryTiming::recorded(Some(start), Some(end), None, None);
         assert_eq!(format_duration(Some(&calc_timing)), Some("2.00s".into()));
+        assert_eq!(format_duration_or_unavailable(Some(&calc_timing)), "2.00s");
     }
 
     #[test]
@@ -1109,5 +1125,21 @@ mod tests {
         assert_eq!(err_exit, Some(1));
         assert!(!err_sum.contains("ghp_"));
         assert!(!err_prev.as_ref().unwrap().contains("ghp_"));
+    }
+
+    #[test]
+    fn test_multibyte_prompt_sanitization_boundary() {
+        // Multibyte characters (e.g. 3-byte Japanese kanji, 4-byte emojis) crossing the 256-byte summary cap
+        // must not panic with slice indexing errors.
+        let kanji_text =
+            "日本語テスト文字列で256バイトの境界線を越えるテストケースを作成します。".repeat(10);
+        let (summary, preview) = sanitize_prompt_preview(&kanji_text, 1024);
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= MAX_SUMMARY_LEN + '…'.len_utf8());
+        assert!(preview.is_some());
+
+        let emoji_text = "🚀🦀✨🔥🎉".repeat(30);
+        let (emoji_summary, _) = sanitize_prompt_preview(&emoji_text, 500);
+        assert!(emoji_summary.ends_with('…'));
     }
 }

@@ -34,11 +34,7 @@ use zeron_harness::{
     CancellationToken, Harness, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent,
     LiveVoiceHandle, LiveVoiceRequest, RunControls, SteerMessage,
 };
-use zeron_proto::trajectory::{
-    TrajectoryLane, TrajectoryPayloadPreview, TrajectoryRawField, TrajectoryRawRef,
-    TrajectoryRecord, TrajectoryRecordId, TrajectoryRecordKind, TrajectoryResultPreview,
-    TrajectoryStatus, TrajectoryTiming, TrajectoryUsage,
-};
+use zeron_proto::trajectory::*;
 use zeron_proto::{
     AgentEvent, Chat, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
     LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
@@ -191,7 +187,6 @@ struct InFlightTrajectory {
     text: String,
     last_emitted_len: usize,
     last_emitted_at: std::time::Instant,
-    is_reasoning: bool,
     turn_id: Option<String>,
     step_id: Option<String>,
 }
@@ -222,7 +217,9 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     live_voice: LiveVoiceCoordinator,
     trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
-    in_flight_trajectory: Mutex<HashMap<String, InFlightTrajectory>>,
+    in_flight_text: Mutex<HashMap<String, InFlightTrajectory>>,
+    in_flight_reasoning: Mutex<HashMap<String, InFlightTrajectory>>,
+    fallback_trajectory_runs: Mutex<HashMap<String, String>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -315,7 +312,9 @@ impl SessionsEngine {
                 turn_listener: OnceLock::new(),
                 live_voice: LiveVoiceCoordinator::new(),
                 trajectory: Mutex::new(None),
-                in_flight_trajectory: Mutex::new(HashMap::new()),
+                in_flight_text: Mutex::new(HashMap::new()),
+                in_flight_reasoning: Mutex::new(HashMap::new()),
+                fallback_trajectory_runs: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1314,10 +1313,11 @@ impl Inner {
                 .get(chat_id)
                 .map(|h| h.run_id.clone())
                 .unwrap_or_else(|| {
-                    lock(&self.in_flight_trajectory)
-                        .get(chat_id)
-                        .map(|inf| inf.run_id.clone())
-                        .unwrap_or_else(|| format!("run_{}", seq.max(1)))
+                    let mut fallback = lock(&self.fallback_trajectory_runs);
+                    fallback
+                        .entry(chat_id.to_string())
+                        .or_insert_with(|| format!("run_{}", seq.max(1)))
+                        .clone()
                 });
             self.capture_trajectory_event(&store, chat_id, &run_id, seq, event);
         }
@@ -1552,6 +1552,103 @@ impl Inner {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
+            lock(&self.fallback_trajectory_runs).remove(chat_id);
+        }
+    }
+
+    fn flush_in_flight_reasoning(&self, store: &Arc<TrajectoryStore>, chat_id: &str) {
+        let inf = lock(&self.in_flight_reasoning).remove(chat_id);
+        if let Some(inf) = inf {
+            let rec = TrajectoryRecord {
+                id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 1),
+                chat_id: chat_id.to_string(),
+                run_id: inf.run_id.clone(),
+                source_seq: inf.start_seq,
+                sub_seq: 1,
+                lane: TrajectoryLane::Model,
+                kind: TrajectoryRecordKind::Reasoning,
+                status: TrajectoryStatus::Completed,
+                is_partial: false,
+                title: "Reasoning".into(),
+                summary: zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024).0,
+                turn_id: inf.turn_id,
+                step_id: inf.step_id,
+                call_id: None,
+                parent_tool_use_id: None,
+                timing: Some(TrajectoryTiming::recorded(
+                    None,
+                    Some(Utc::now()),
+                    None,
+                    None,
+                )),
+                usage: None,
+                payload: Some(TrajectoryPayloadPreview {
+                    summary: "Reasoning completed".to_string(),
+                    sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
+                        &inf.text, 1024,
+                    )),
+                    schema_info: None,
+                    raw_ref: Some(TrajectoryRawRef::new(
+                        chat_id,
+                        inf.start_seq,
+                        None,
+                        None,
+                        TrajectoryRawField::Payload,
+                    )),
+                }),
+                result: None,
+                error_message: None,
+                is_degraded: false,
+            };
+            let _ = store.try_enqueue(rec);
+        }
+    }
+
+    fn flush_in_flight_text(&self, store: &Arc<TrajectoryStore>, chat_id: &str) {
+        let inf = lock(&self.in_flight_text).remove(chat_id);
+        if let Some(inf) = inf {
+            let rec = TrajectoryRecord {
+                id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 0),
+                chat_id: chat_id.to_string(),
+                run_id: inf.run_id.clone(),
+                source_seq: inf.start_seq,
+                sub_seq: 0,
+                lane: TrajectoryLane::Model,
+                kind: TrajectoryRecordKind::AssistantMessage,
+                status: TrajectoryStatus::Completed,
+                is_partial: false,
+                title: "Assistant".into(),
+                summary: zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024).0,
+                turn_id: inf.turn_id,
+                step_id: inf.step_id,
+                call_id: None,
+                parent_tool_use_id: None,
+                timing: Some(TrajectoryTiming::recorded(
+                    None,
+                    Some(Utc::now()),
+                    None,
+                    None,
+                )),
+                usage: None,
+                payload: Some(TrajectoryPayloadPreview {
+                    summary: "Response completed".to_string(),
+                    sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
+                        &inf.text, 1024,
+                    )),
+                    schema_info: None,
+                    raw_ref: Some(TrajectoryRawRef::new(
+                        chat_id,
+                        inf.start_seq,
+                        None,
+                        None,
+                        TrajectoryRawField::Payload,
+                    )),
+                }),
+                result: None,
+                error_message: None,
+                is_degraded: false,
+            };
+            let _ = store.try_enqueue(rec);
         }
     }
 
@@ -1565,7 +1662,7 @@ impl Inner {
     ) {
         match event {
             AgentEvent::TextDelta { text } => {
-                let mut in_flight = lock(&self.in_flight_trajectory);
+                let mut in_flight = lock(&self.in_flight_text);
                 let entry =
                     in_flight
                         .entry(chat_id.to_string())
@@ -1575,7 +1672,6 @@ impl Inner {
                             text: String::new(),
                             last_emitted_len: 0,
                             last_emitted_at: std::time::Instant::now(),
-                            is_reasoning: false,
                             turn_id: None,
                             step_id: None,
                         });
@@ -1633,7 +1729,7 @@ impl Inner {
                 }
             }
             AgentEvent::ReasoningDelta { text } => {
-                let mut in_flight = lock(&self.in_flight_trajectory);
+                let mut in_flight = lock(&self.in_flight_reasoning);
                 let entry =
                     in_flight
                         .entry(chat_id.to_string())
@@ -1643,18 +1739,17 @@ impl Inner {
                             text: String::new(),
                             last_emitted_len: 0,
                             last_emitted_at: std::time::Instant::now(),
-                            is_reasoning: true,
                             turn_id: None,
                             step_id: None,
                         });
                 entry.text.push_str(text);
                 if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
                     let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(run_id, entry.start_seq, 0),
+                        id: TrajectoryRecordId::new(run_id, entry.start_seq, 1),
                         chat_id: chat_id.to_string(),
                         run_id: run_id.to_string(),
                         source_seq: entry.start_seq,
-                        sub_seq: 0,
+                        sub_seq: 1,
                         lane: TrajectoryLane::Model,
                         kind: TrajectoryRecordKind::Reasoning,
                         status: TrajectoryStatus::Running,
@@ -1701,123 +1796,34 @@ impl Inner {
                 }
             }
             AgentEvent::AssistantMessageCompleted { .. } => {
-                let in_flight = lock(&self.in_flight_trajectory).remove(chat_id);
-                if let Some(inf) = in_flight {
-                    let kind = if inf.is_reasoning {
-                        TrajectoryRecordKind::Reasoning
-                    } else {
-                        TrajectoryRecordKind::AssistantMessage
-                    };
-                    let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(run_id, inf.start_seq, 0),
-                        chat_id: chat_id.to_string(),
-                        run_id: run_id.to_string(),
-                        source_seq: inf.start_seq,
-                        sub_seq: 0,
-                        lane: TrajectoryLane::Model,
-                        kind,
-                        status: TrajectoryStatus::Completed,
-                        is_partial: false,
-                        title: if inf.is_reasoning {
-                            "Reasoning".into()
-                        } else {
-                            "Assistant".into()
-                        },
-                        summary: zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024)
-                            .0,
-                        turn_id: inf.turn_id,
-                        step_id: inf.step_id,
-                        call_id: None,
-                        parent_tool_use_id: None,
-                        timing: Some(TrajectoryTiming::recorded(
-                            None,
-                            Some(Utc::now()),
-                            None,
-                            None,
-                        )),
-                        usage: None,
-                        payload: Some(TrajectoryPayloadPreview {
-                            summary: "Response completed".to_string(),
-                            sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
-                                &inf.text, 1024,
-                            )),
-                            schema_info: None,
-                            raw_ref: Some(TrajectoryRawRef::new(
-                                chat_id,
-                                inf.start_seq,
-                                None,
-                                None,
-                                TrajectoryRawField::Payload,
-                            )),
-                        }),
-                        result: None,
-                        error_message: None,
-                        is_degraded: false,
-                    };
-                    let _ = store.try_enqueue(rec);
+                self.flush_in_flight_reasoning(store, chat_id);
+                self.flush_in_flight_text(store, chat_id);
+            }
+            AgentEvent::SessionStarted { .. } => {
+                self.flush_in_flight_reasoning(store, chat_id);
+                self.flush_in_flight_text(store, chat_id);
+                if lock(&self.runs).get(chat_id).is_none() {
+                    lock(&self.fallback_trajectory_runs)
+                        .insert(chat_id.to_string(), format!("run_{}", seq.max(1)));
+                }
+                if let Some(record) = crate::trajectory_store::project_event_to_record(
+                    chat_id, run_id, seq, event, None,
+                ) {
+                    let _ = store.try_enqueue(record);
                 }
             }
             _ => {
-                let in_flight = lock(&self.in_flight_trajectory).remove(chat_id);
-                if let Some(inf) = in_flight {
-                    let kind = if inf.is_reasoning {
-                        TrajectoryRecordKind::Reasoning
-                    } else {
-                        TrajectoryRecordKind::AssistantMessage
-                    };
-                    let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(run_id, inf.start_seq, 0),
-                        chat_id: chat_id.to_string(),
-                        run_id: run_id.to_string(),
-                        source_seq: inf.start_seq,
-                        sub_seq: 0,
-                        lane: TrajectoryLane::Model,
-                        kind,
-                        status: TrajectoryStatus::Completed,
-                        is_partial: false,
-                        title: if inf.is_reasoning {
-                            "Reasoning".into()
-                        } else {
-                            "Assistant".into()
-                        },
-                        summary: zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024)
-                            .0,
-                        turn_id: inf.turn_id,
-                        step_id: inf.step_id,
-                        call_id: None,
-                        parent_tool_use_id: None,
-                        timing: Some(TrajectoryTiming::recorded(
-                            None,
-                            Some(Utc::now()),
-                            None,
-                            None,
-                        )),
-                        usage: None,
-                        payload: Some(TrajectoryPayloadPreview {
-                            summary: "Response".to_string(),
-                            sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
-                                &inf.text, 1024,
-                            )),
-                            schema_info: None,
-                            raw_ref: Some(TrajectoryRawRef::new(
-                                chat_id,
-                                inf.start_seq,
-                                None,
-                                None,
-                                TrajectoryRawField::Payload,
-                            )),
-                        }),
-                        result: None,
-                        error_message: None,
-                        is_degraded: false,
-                    };
-                    let _ = store.try_enqueue(rec);
-                }
+                self.flush_in_flight_reasoning(store, chat_id);
+                self.flush_in_flight_text(store, chat_id);
 
                 if let Some(record) = crate::trajectory_store::project_event_to_record(
                     chat_id, run_id, seq, event, None,
                 ) {
                     let _ = store.try_enqueue(record);
+                }
+
+                if matches!(event, AgentEvent::Done { .. }) {
+                    lock(&self.fallback_trajectory_runs).remove(chat_id);
                 }
             }
         }
@@ -3635,17 +3641,20 @@ mod tests {
     async fn test_trajectory_capture_fail_open() {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
-        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let degraded_store = Arc::new(TrajectoryStore::degraded(
+            dir.path(),
+            "simulated IO failure",
+        ));
         let engine = SessionsEngine::new(
             "device".into(),
             journal.clone(),
             Arc::new(HarnessRegistry::new()),
         );
-        engine.set_trajectory_store(store.clone());
+        engine.set_trajectory_store(degraded_store.clone());
 
-        // Even if trajectory store channel is closed, publish continues
-        drop(store);
+        assert!(degraded_store.is_degraded());
 
+        // Even with a failed/degraded trajectory store, publication and journal replay continue without panic
         let seq1 = engine.publish(
             "chat-3",
             &AgentEvent::UserMessage {
@@ -3666,6 +3675,196 @@ mod tests {
         assert_eq!(seq2, 2);
         let journal_events = journal.replay("chat-3", 0).unwrap();
         assert_eq!(journal_events.len(), 2);
+
+        // The degraded store records degraded intervals
+        let intervals = degraded_store.get_degraded_intervals("chat-3").unwrap();
+        assert!(!intervals.is_empty());
+        assert!(intervals[0].reason.contains("simulated IO failure"));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_mixed_stream_interleaved_reasoning_and_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_mixed";
+        engine.publish(
+            chat_id,
+            &AgentEvent::ReasoningDelta {
+                text: "Thinking part 1. ".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "Response part 1. ".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ReasoningDelta {
+                text: "Thinking part 2.".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "Response part 2.".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "msg_1".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+
+        // Must have exactly two distinct records: one Reasoning and one AssistantMessage
+        assert_eq!(records.len(), 2);
+
+        let reasoning_rec = records
+            .iter()
+            .find(|r| matches!(r.kind, TrajectoryRecordKind::Reasoning))
+            .expect("must have distinct Reasoning record");
+        let assistant_rec = records
+            .iter()
+            .find(|r| matches!(r.kind, TrajectoryRecordKind::AssistantMessage))
+            .expect("must have distinct AssistantMessage record");
+
+        assert_eq!(reasoning_rec.title, "Reasoning");
+        assert!(
+            reasoning_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Thinking part 1. Thinking part 2.")
+        );
+        assert!(
+            !reasoning_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Response")
+        );
+
+        assert_eq!(assistant_rec.title, "Assistant");
+        assert!(
+            assistant_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Response part 1. Response part 2.")
+        );
+        assert!(
+            !assistant_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Thinking")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_fallback_run_id_grouping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_headless_multi_event";
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "First turn".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCall {
+                id: "tool_1".into(),
+                call: zeron_proto::ToolCall::ReadFile {
+                    path: "foo.rs".into(),
+                },
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolResult {
+                id: "tool_1".into(),
+                is_error: false,
+                output: Some("content".into()),
+                diff: None,
+                execution: None,
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("finished turn 1".into()),
+                error: None,
+                session_id: None,
+            },
+        );
+
+        // Publish turn 2
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Second turn".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("finished turn 2".into()),
+                error: None,
+                session_id: None,
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 6);
+
+        // Turn 1 records (first 4) must share the same stable run_id
+        let turn1_run_id = &records[0].run_id;
+        assert_eq!(&records[1].run_id, turn1_run_id);
+        assert_eq!(&records[2].run_id, turn1_run_id);
+        assert_eq!(&records[3].run_id, turn1_run_id);
+
+        // Turn 2 records (last 2) must share their own stable run_id
+        let turn2_run_id = &records[4].run_id;
+        assert_eq!(&records[5].run_id, turn2_run_id);
+        assert_ne!(turn1_run_id, turn2_run_id);
+
+        // Pure projection grouping produces exactly two distinct runs
+        let runs = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].turns.len(), 1);
+        assert_eq!(runs[1].turns.len(), 1);
     }
 
     #[tokio::test]
