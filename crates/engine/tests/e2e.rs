@@ -237,6 +237,7 @@ impl Harness for LiveDelegationHarness {
             }
         });
         Ok(LiveVoiceHandle {
+            session_id: "/tmp/live-fixture.jsonl".into(),
             events: futures::stream::unfold(event_rx, |mut rx| async move {
                 rx.recv().await.map(|event| (event, rx))
             })

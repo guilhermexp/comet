@@ -422,13 +422,22 @@ impl SessionsEngine {
         if !self.inner.live_voice.matches(&call_id) {
             return Err(EngineError::Other("Live Voice start was cancelled".into()));
         }
-        let handle = match harness.start_live_voice(LiveVoiceRequest { cwd }).await {
+        let resume = self.inner.resume_for(chat_id, &cwd);
+        let handle = match harness
+            .start_live_voice(LiveVoiceRequest {
+                cwd: cwd.clone(),
+                resume,
+            })
+            .await
+        {
             Ok(handle) => handle,
             Err(error) => {
                 self.inner.live_voice.fail(&call_id, &error.to_string());
                 return Err(error.into());
             }
         };
+        self.inner
+            .remember_harness_session(chat_id, &handle.session_id, &cwd);
         if let Err(handle) = self.attach_live_handle(&call_id, handle) {
             let _ = handle.controls.send(LiveVoiceControl::Stop).await;
             return Err(EngineError::Other("Live Voice start was cancelled".into()));

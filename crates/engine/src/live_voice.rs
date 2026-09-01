@@ -668,6 +668,8 @@ mod tests {
     struct FakeLiveHarness {
         supported: std::sync::atomic::AtomicBool,
         controls: Arc<Mutex<Vec<LiveVoiceControl>>>,
+        live_requests: Mutex<Vec<LiveVoiceRequest>>,
+        run_requests: Mutex<Vec<RunRequest>>,
     }
 
     impl FakeLiveHarness {
@@ -675,6 +677,8 @@ mod tests {
             Self {
                 supported: std::sync::atomic::AtomicBool::new(true),
                 controls: Arc::new(Mutex::new(Vec::new())),
+                live_requests: Mutex::new(Vec::new()),
+                run_requests: Mutex::new(Vec::new()),
             }
         }
 
@@ -716,11 +720,12 @@ mod tests {
 
         async fn start_live_voice(
             &self,
-            _request: LiveVoiceRequest,
+            request: LiveVoiceRequest,
         ) -> Result<LiveVoiceHandle, HarnessError> {
             if !self.supported.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(HarnessError::Unsupported("update OMP".into()));
             }
+            lock(&self.live_requests).push(request);
             let (control_tx, mut control_rx) = mpsc::channel::<LiveVoiceControl>(16);
             let (event_tx, event_rx) = mpsc::channel::<Result<LiveVoiceEvent, HarnessError>>(16);
             let seen = Arc::clone(&self.controls);
@@ -767,6 +772,7 @@ mod tests {
                 }
             });
             Ok(LiveVoiceHandle {
+                session_id: "/tmp/live-created.jsonl".into(),
                 events: futures::stream::unfold(event_rx, |mut receiver| async move {
                     receiver.recv().await.map(|event| (event, receiver))
                 })
@@ -777,9 +783,10 @@ mod tests {
 
         async fn run(
             &self,
-            _request: RunRequest,
+            request: RunRequest,
             controls: RunControls,
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            lock(&self.run_requests).push(request);
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
                 let _ = tx
@@ -964,6 +971,97 @@ mod tests {
             lock(&harness.controls).as_slice(),
             [LiveVoiceControl::SetMuted(true), LiveVoiceControl::Stop]
         );
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_voice_reuses_existing_and_created_sessions_for_live_and_text_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = Arc::new(FakeLiveHarness::supported());
+        let registry = crate::registry::HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            crate::EngineCore::assemble(temp.path(), Arc::new(registry), HarnessId::Omp, None)
+                .unwrap();
+        let local_device = core.device_id.clone();
+        for chat_id in ["existing", "new"] {
+            core.workspace
+                .create_chat(
+                    chat_id,
+                    None,
+                    Some(local_device.as_str()),
+                    Some(omp_config()),
+                    Some("/tmp".into()),
+                )
+                .unwrap();
+        }
+        core.workspace.set_chat_harness_session(
+            "existing",
+            "/tmp/existing-session.jsonl",
+            "/tmp",
+        );
+
+        core.sessions.start_live_voice("existing").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        assert_eq!(
+            lock(&harness.live_requests)[0].resume.as_deref(),
+            Some("/tmp/existing-session.jsonl")
+        );
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+
+        core.sessions.start_live_voice("new").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        assert_eq!(lock(&harness.live_requests)[1].resume, None);
+        assert_eq!(
+            core.workspace.chat_harness_session("new"),
+            Some((
+                "/tmp/live-created.jsonl".into(),
+                Some("/tmp".into())
+            ))
+        );
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+
+        core.sessions.start_live_voice("new").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        assert_eq!(
+            lock(&harness.live_requests)[2].resume.as_deref(),
+            Some("/tmp/live-created.jsonl")
+        );
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+
+        core.sessions
+            .dispatch(
+                "new",
+                HarnessId::Omp,
+                run_request(),
+                Some("text-after-live".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !lock(&harness.run_requests)
+                .iter()
+                .any(|request| request.prompt == "busy")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let requests = lock(&harness.run_requests);
+        let request = requests
+            .iter()
+            .find(|request| request.prompt == "busy")
+            .unwrap();
+        assert_eq!(
+            (request.cwd.as_str(), request.resume.as_deref()),
+            ("/tmp", Some("/tmp/live-created.jsonl"))
+        );
+        drop(requests);
+        core.sessions.interrupt("new").await.unwrap();
         core.sessions.shutdown().await;
     }
 }
