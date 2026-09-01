@@ -655,13 +655,14 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-
     #[test]
     fn omp_live_protocol_capability_requires_numeric_one() {
-        assert!(parse_capabilities(&json!({
-            "capabilities": { "liveVoice": 1 }
-        }))
-        .live_voice);
+        assert!(
+            parse_capabilities(&json!({
+                "capabilities": { "liveVoice": 1 }
+            }))
+            .live_voice
+        );
         for unsupported in [
             json!({}),
             json!({ "capabilities": null }),
