@@ -54,8 +54,9 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 | Camada / path | Tier exigido | Como rodar |
 | `src/**` (sessões, doc host, repos, terminais) | unit | `cargo test -p zeron-engine` |
-| `src/trajectory_store.rs` (SQLite WAL, writer/reader, legacy import, degraded, retention) | unit | `cargo test -p zeron-engine trajectory_store && cargo test -p zeron-engine trajectory_legacy` |
+| `src/trajectory_store.rs` (SQLite WAL, writer/reader, durable write, legacy import, degraded, retention) | unit | `cargo test -p zeron-engine trajectory_store && cargo test -p zeron-engine trajectory_store_durable_write && cargo test -p zeron-engine trajectory_legacy` |
 | `src/sessions.rs` (captura e coalescing de Trajectory em publish) | unit | `cargo test -p zeron-engine trajectory_capture` |
+| `src/workspace_host.rs` (lifecycle de Chat, Space cascade e sync deletion de Trajectory) | unit | `cargo test -p zeron-engine trajectory_workspace_host_sync` |
 | `src/change_requests.rs` (cache, backoff e classificação de provider) | unit | `cargo test -p zeron-engine change_requests` |
 | `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p zeron-engine` |
 | `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p zeron-engine` |

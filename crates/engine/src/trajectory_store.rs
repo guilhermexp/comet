@@ -1709,7 +1709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trajectory_store_durable_write_failure_and_channel_loss() {
+    async fn test_trajectory_store_channel_loss() {
         let temp = TempDir::new().unwrap();
         let store = TrajectoryStore::open(temp.path()).unwrap();
 
@@ -1732,6 +1732,61 @@ mod tests {
         assert_eq!(intervals[0].from_seq, 100);
         assert_eq!(intervals[0].to_seq, 100);
         assert_eq!(intervals[0].reason, "Writer channel closed");
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_durable_write_failure() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Induce a real SQLite durable write failure on the writer connection by installing an abort trigger
+        {
+            let conn = Connection::open(&store.db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER test_fail_write_records BEFORE INSERT ON trajectory_records
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced sqlite durable write failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let rec1 = sample_record("chat_durable_fail", "r1", 100, 0);
+        let rec2 = sample_record("chat_durable_fail", "r1", 101, 0);
+        store.try_enqueue(rec1).unwrap();
+        store.try_enqueue(rec2).unwrap();
+
+        // Writer processes the batch through flush_batch_to_writer and write_records_tx,
+        // hits the trigger abort error, rolls back records, and records a degraded interval.
+        store.flush().await.unwrap();
+
+        // Records were not persisted to SQLite
+        let records = store.list_all_records("chat_durable_fail").unwrap();
+        assert_eq!(
+            records.len(),
+            0,
+            "failed durable write must not persist uncommitted records"
+        );
+
+        // Degraded interval covers the lost sequence range and is queryable
+        let intervals = store.get_degraded_intervals("chat_durable_fail").unwrap();
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].chat_id, "chat_durable_fail");
+        assert_eq!(intervals[0].run_id, "r1");
+        assert_eq!(intervals[0].from_seq, 100);
+        assert_eq!(intervals[0].to_seq, 101);
+        assert!(
+            intervals[0].reason.contains("Durable write failed:"),
+            "expected 'Durable write failed:' prefix in reason: {}",
+            intervals[0].reason
+        );
+        assert!(
+            intervals[0]
+                .reason
+                .contains("forced sqlite durable write failure"),
+            "expected underlying SQLite error in reason: {}",
+            intervals[0].reason
+        );
     }
 
     #[tokio::test]

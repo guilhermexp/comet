@@ -1628,6 +1628,173 @@ mod tests {
         assert_eq!(linked_worktree_root(&odd), None);
     }
 
+    async fn wait_for<F>(mut predicate: F, what: &str)
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !predicate() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_sync_chat_deletion() {
+        let server = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = std::sync::Arc::new(zeron_sync::DocsStore::open(dir_a.path()).unwrap());
+        let traj_store_a = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir_a.path()).unwrap(),
+        );
+
+        let host_a = super::WorkspaceHost::open(
+            store_a.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Host A".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host_a.set_trajectory_store(traj_store_a.clone());
+        host_a.connect_registry_url(&server.url());
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = std::sync::Arc::new(zeron_sync::DocsStore::open(dir_b.path()).unwrap());
+        let host_b = super::WorkspaceHost::open(
+            store_b.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-b".into(),
+                device_name: "Host B".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host_b.connect_registry_url(&server.url());
+
+        // Create 2 chats on host_a
+        host_a
+            .create_chat("chat_remote_del", None, Some("dev-a"), None, None)
+            .unwrap();
+        host_a
+            .create_chat("chat_surviving", None, Some("dev-a"), None, None)
+            .unwrap();
+
+        // Seed trajectory records for both chats
+        let rec1 = zeron_proto::trajectory::TrajectoryRecord {
+            id: zeron_proto::trajectory::TrajectoryRecordId::new("r1", 1, 0),
+            chat_id: "chat_remote_del".into(),
+            run_id: "r1".into(),
+            source_seq: 1,
+            sub_seq: 0,
+            lane: zeron_proto::trajectory::TrajectoryLane::Input,
+            kind: zeron_proto::trajectory::TrajectoryRecordKind::UserMessage,
+            status: zeron_proto::trajectory::TrajectoryStatus::Completed,
+            is_partial: false,
+            title: "Prompt del".into(),
+            summary: "Prompt del".into(),
+            turn_id: None,
+            step_id: None,
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: None,
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        };
+        let mut rec2 = rec1.clone();
+        rec2.chat_id = "chat_surviving".into();
+        rec2.title = "Prompt surviving".into();
+        rec2.summary = "Prompt surviving".into();
+
+        traj_store_a.try_enqueue(rec1).unwrap();
+        traj_store_a.try_enqueue(rec2).unwrap();
+        traj_store_a.flush().await.unwrap();
+
+        assert_eq!(
+            traj_store_a
+                .list_all_records("chat_remote_del")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            traj_store_a
+                .list_all_records("chat_surviving")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Wait until host_b receives both chats via registry sync
+        wait_for(
+            || {
+                host_b.chat("chat_remote_del").ok().flatten().is_some()
+                    && host_b.chat("chat_surviving").ok().flatten().is_some()
+            },
+            "both chats synced to host_b",
+        )
+        .await;
+
+        // Authoritative deletion happens on host_b (remote device)
+        host_b.delete_chat("chat_remote_del").unwrap();
+
+        // Wait until host_a ingests the remote deletion via sync reconciliation
+        wait_for(
+            || host_a.chat("chat_remote_del").ok().flatten().is_none(),
+            "chat_remote_del deleted on host_a via sync",
+        )
+        .await;
+
+        // Wait a tick for async retain_chats_only spawn and flush traj_store_a
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        traj_store_a.flush().await.unwrap();
+
+        // Verify trajectory rows for chat_remote_del are purged while chat_surviving rows remain
+        assert_eq!(
+            traj_store_a
+                .list_all_records("chat_remote_del")
+                .unwrap()
+                .len(),
+            0,
+            "trajectory records for deleted chat must be removed after sync reconciliation"
+        );
+        assert_eq!(
+            traj_store_a
+                .list_all_records("chat_surviving")
+                .unwrap()
+                .len(),
+            1,
+            "trajectory records for surviving chat must remain"
+        );
+        assert!(
+            host_a
+                .read_chats()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == "chat_surviving")
+        );
+        assert!(
+            !host_a
+                .read_chats()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == "chat_remote_del")
+        );
+    }
     #[tokio::test]
     async fn test_trajectory_workspace_host_chat_deletion_and_retention() {
         let dir = tempfile::tempdir().unwrap();
