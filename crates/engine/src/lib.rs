@@ -37,9 +37,9 @@ pub mod source_control;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
+pub mod trajectory_store;
 pub mod uploads;
 pub mod workspace_host;
-
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
@@ -64,6 +64,7 @@ pub use source_control::{
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
+pub use trajectory_store::TrajectoryStore;
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
@@ -83,6 +84,8 @@ pub enum EngineError {
     Harness(#[from] zeron_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("trajectory: {0}")]
+    Trajectory(#[from] crate::trajectory_store::TrajectoryStoreError),
     #[error("{0}")]
     Other(String),
 }
@@ -129,9 +132,9 @@ pub struct EngineCore {
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
+    pub trajectory: Arc<TrajectoryStore>,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
-    /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
@@ -213,7 +216,9 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(journal_root.clone())?);
+        let trajectory = Arc::new(TrajectoryStore::open(profile.store_root())?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        sessions.set_trajectory_store(trajectory.clone());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -233,6 +238,7 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         )?;
+        workspace.set_trajectory_store(trajectory.clone());
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
@@ -298,6 +304,7 @@ impl EngineCore {
             diff_sync,
             spaces_sync,
             uploads,
+            trajectory,
             agent_accounts,
             device_id,
             local_import,

@@ -30,8 +30,8 @@ use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
+use crate::trajectory_store::TrajectoryStore;
 use crate::{EngineError, now_ms};
-
 /// Legacy Loro workspace snapshot row — now only read once, as the migration
 /// source for the registry seed. Kept on disk for rollback.
 pub const WORKSPACE_DOC_ID: &str = "workspace2";
@@ -176,10 +176,9 @@ struct WorkspaceHostInner {
     presence_watch: Mutex<PresenceWatch>,
     /// Epoch ms of the registry room's most recent (re)join — the dial gate's
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
-    /// anyone's heartbeat yet, and that silence must not read as "offline".
     room_joined_at: std::sync::atomic::AtomicI64,
+    trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
 }
-
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -292,9 +291,9 @@ impl WorkspaceHost {
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
+                trajectory: Mutex::new(None),
             }),
         };
-        // Persist immediately: after this boot the migration source is never
         // read again, so the registry snapshot must exist even if the process
         // dies before the first debounced save.
         host.inner.save_snapshot();
@@ -649,6 +648,11 @@ impl WorkspaceHost {
         self.inner.sessions_tx.subscribe()
     }
 
+    pub fn set_trajectory_store(&self, store: Arc<TrajectoryStore>) {
+        let mut slot = lock(&self.inner.trajectory);
+        *slot = Some(store);
+    }
+
     pub fn watch_spaces(&self) -> watch::Receiver<Vec<Space>> {
         self.inner.spaces_tx.subscribe()
     }
@@ -934,9 +938,17 @@ impl WorkspaceHost {
     /// The caller (rpc layer) tears down live runs / doc-host handles for the
     /// returned chat ids.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_space(space_id))?)
+        let res = self.mutate(|doc| doc.delete_space(space_id))?;
+        if let Some(traj) = lock(&self.inner.trajectory).clone() {
+            let chat_ids = res.chat_ids.clone();
+            tokio::spawn(async move {
+                for cid in chat_ids {
+                    let _ = traj.delete_chat(&cid).await;
+                }
+            });
+        }
+        Ok(res)
     }
-
     /// Synced seen marker (any device; LWW + monotonic guard in the doc layer).
     pub fn mark_chat_seen(
         &self,
@@ -1045,9 +1057,17 @@ impl WorkspaceHost {
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
     /// doc remains untouched.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_chat(chat_id))?)
+        let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
+        if deleted {
+            if let Some(traj) = lock(&self.inner.trajectory).clone() {
+                let cid = chat_id.to_string();
+                tokio::spawn(async move {
+                    let _ = traj.delete_chat(&cid).await;
+                });
+            }
+        }
+        Ok(deleted)
     }
-
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_device(device_id, name))?)
     }
@@ -1106,6 +1126,7 @@ impl WorkspaceHostInner {
         match lock(&self.reg).read_all() {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
+                let live_ids: Vec<String> = state.chats.iter().map(|c| c.id.clone()).collect();
                 // send_replace, NOT send: `watch::Sender::send` drops the value when
                 // no receiver exists yet, so a stream subscribed later would start
                 // from a stale snapshot (found the hard way by the e2e smoke).
@@ -1113,6 +1134,11 @@ impl WorkspaceHostInner {
                 self.devices_tx.send_replace(state.devices);
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
+                if let Some(traj) = lock(&self.trajectory).clone() {
+                    tokio::spawn(async move {
+                        let _ = traj.retain_chats_only(&live_ids).await;
+                    });
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "registry read failed");

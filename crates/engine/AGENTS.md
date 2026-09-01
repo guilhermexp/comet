@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journal, recovery, watchdog de stall), doc host + executor de comandos, repos/worktrees, sync de checkout-diff, terminais (`portable-pty`), uploads, contas de agente (troca de credencial), auth (WorkOS via edge), host/peers do device room e identidade.
+Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journal, recovery, watchdog de stall), doc host + executor de comandos, repos/worktrees, sync de checkout-diff, terminais (`portable-pty`), uploads, contas de agente (troca de credencial), auth (WorkOS via edge), host/peers do device room, identidade e read model local de Trajectory (`crates/engine/src/trajectory_store.rs`).
 
 ## Ownership
 
@@ -40,6 +40,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - **Carimbar a entry `aborted` não assenta as parts dela.** As duas varreduras passam por `mark_abandoned_streams`, que chama `settle_pending_parts`: tool sem resultado resolve como erro, subagente `running` vira `failed`, reasoning completa, input pendente resolve. Sem isso o card ficava girando embaixo do próprio aviso de interrupção. A decisão vem da entry LIDA, nunca do mapa Loro cru — `resolved` é derivado na leitura, e julgar por presença de chave marcava como erro tool que terminou bem.
 - Fallback órfão de `RespondInput` é gated por `has_live_run`, não pelo status da entry: com run vivo o guard de entry `streaming` continua (resolver recém-consumido não pode virar turno duplicado); sem run vivo não há nada pra correr, então pergunta aberta em entry `streaming` é respondível e entra como turno novo.
 - O rail de anexos queued é content-agnostic: bytes de imagem ou texto chegam pelo mesmo `pending://`, são materializados no device do run e têm o path absoluto reescrito tanto em `RunRequest.attachments` quanto no trailer do prompt.
+- **Trajectory Store & Fail-Open Capture:** o read model de Trajectory persiste em SQLite profile-local (`{store_root}/trajectory.sqlite3`) com WAL e separação estrita entre um único writer em background (fila `mpsc` bounded não bloqueante) e leitores independentes. `SessionsEngine::publish` projeta eventos semanticamente e enfileira de forma não bloqueante; saturação da fila ou falha de transação grava um intervalo degradado explícito e nunca bloqueia nem falha o run do agente, o Run Journal ou o Chat Transcript.
+- **Projeção legada e ciclo de vida de Chat:** importação de journals legados é idempotente (fingerprint), opera em modo sequence-only sem inventar durações ou conclusões e tolera corrupt tails na última linha válida. Archive retém histórico de Trajectory; delete local, sincronizado e Space cascade convergem pela observação do conjunto autoritativo de Chats do workspace.
 
 ## Work Guidance
 
@@ -51,9 +53,9 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 - Comandos: `cargo test -p zeron-engine` · `scripts/e2e-smoke.sh`
 
 | Camada / path | Tier exigido | Como rodar |
-|---|---|---|
 | `src/**` (sessões, doc host, repos, terminais) | unit | `cargo test -p zeron-engine` |
-| `src/antigravity_usage.rs` (parser de quota, seleção de credenciais, refresh) | unit | `cargo test -p zeron-engine antigravity` |
+| `src/trajectory_store.rs` (SQLite WAL, writer/reader, legacy import, degraded, retention) | unit | `cargo test -p zeron-engine trajectory_store && cargo test -p zeron-engine trajectory_legacy` |
+| `src/sessions.rs` (captura e coalescing de Trajectory em publish) | unit | `cargo test -p zeron-engine trajectory_capture` |
 | `src/change_requests.rs` (cache, backoff e classificação de provider) | unit | `cargo test -p zeron-engine change_requests` |
 | `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p zeron-engine` |
 | `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p zeron-engine` |
