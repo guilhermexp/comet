@@ -36,4 +36,12 @@
 
 **must_haves:** microphone purpose string in the signed app; strict validation and targeted gates; Finder-launched permission smoke; audit evidence recorded before archive.
 
-- [ ] C8 Add `NSMicrophoneUsageDescription`, run all targeted gates, package and sign the app, perform the Finder-launched microphone/TCC smoke, record audit evidence, strictly validate all OpenSpec changes, and archive this change after acceptance. files: `dist/macos/Info.plist`, `openspec/changes/add-omp-live-voice/tasks.md`. verify: `cargo fmt --all && cargo test -p zeron-proto live_voice && cargo test -p zeron-harness omp_live && cargo test -p zeron-engine live_voice && cargo test -p zeron-ui live_voice && cargo test -p zeron-rpc && cargo build -p zeron && cargo clippy -p zeron-harness -p zeron-engine -p zeron-ui --all-targets -- -D warnings && openspec validate add-omp-live-voice --strict --no-interactive && scripts/package-macos.sh && openspec validate --all --strict`.
+- [x] C8 Add `NSMicrophoneUsageDescription`, run all targeted gates, package and sign the app, perform the Finder-launched microphone/TCC smoke, record audit evidence, strictly validate all OpenSpec changes, and archive this change after acceptance. files: `dist/macos/Info.plist`, `openspec/changes/add-omp-live-voice/tasks.md`. verify: `cargo fmt --all && cargo test -p zeron-proto live_voice && cargo test -p zeron-harness omp_live && cargo test -p zeron-engine live_voice && cargo test -p zeron-ui live_voice && cargo test -p zeron-rpc && cargo build -p zeron && cargo clippy -p zeron-harness -p zeron-engine -p zeron-ui --all-targets -- -D warnings && openspec validate add-omp-live-voice --strict --no-interactive && scripts/package-macos.sh && openspec validate --all --strict`.
+
+### Acceptance evidence
+
+- Implementation: Comet commit `91967774`; compatible OMP RPC implementation inspected at commit `4d7a19cc2dd35c4f53027b060d97ced9ecd58d1b`.
+- Automated verification: 16 Live-focused UI tests and the complete 1005-test UI suite passed; `cargo build -p zeron` passed; strict OpenSpec validation passed with 29 changes and no failures.
+- Package verification: the final `target/package/Zeron.app`, app tarball, and DMG were rebuilt after the lifecycle fixes; `codesign --verify --deep --strict --verbose=2 target/package/Zeron.app` passed.
+- Review: new-Chat rollback, selection, worktree, foreign-call, and same-owner selection races were resolved; final review reported no remaining actionable defect.
+- Manual acceptance: on September 1, 2026, the user confirmed that the Finder-launched signed app completed the voice-first new-Chat Live flow successfully.
