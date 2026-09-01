@@ -26,22 +26,24 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    SessionMessageEntry, fold_event_into_parts, merge_workflow_task, sanitize_tool_call,
+    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter,
+    SessionCommandPayload, SessionDoc, SessionMessageEntry, fold_event_into_parts,
+    merge_workflow_task, sanitize_tool_call,
 };
 use zeron_harness::{
-    CancellationToken, Harness, LiveVoiceControl, LiveVoiceRequest, RunControls, SteerMessage,
+    CancellationToken, Harness, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent,
+    LiveVoiceHandle, LiveVoiceRequest, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
+    AgentEvent, Chat, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
     LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion, WorkflowTaskStatus, WorkflowTaskUpdate,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
+use crate::live_voice::{BackendSpeechAccumulator, BackendSpeechUpdate, LiveVoiceCoordinator};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
-use crate::live_voice::{LiveVoiceCoordinator, attach_live_handle};
 use crate::{EngineError, new_id, now_ms};
 
 /// One published event. Durable events carry their journal seq; transient
@@ -237,6 +239,40 @@ fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String 
     }
 }
 
+fn live_delegation_run_request(chat: &Chat, prompt: String) -> Result<RunRequest, EngineError> {
+    if prompt.trim().is_empty() {
+        return Err(EngineError::Other(
+            "Live Voice delegation request is empty".into(),
+        ));
+    }
+    let config = chat
+        .config
+        .as_ref()
+        .ok_or_else(|| EngineError::Other("OMP Chat has no run configuration".into()))?;
+    let cwd = chat
+        .source_context
+        .as_ref()
+        .map(|context| context.cwd.clone())
+        .or_else(|| chat.cwd.clone())
+        .filter(|cwd| !cwd.trim().is_empty())
+        .ok_or_else(|| EngineError::Other("Chat has no working directory".into()))?;
+    Ok(RunRequest {
+        prompt,
+        harness: Some(HarnessId::Omp),
+        model: config.model.clone(),
+        reasoning: config.reasoning,
+        model_options: config.model_options.clone(),
+        cwd,
+        sandbox: config.sandbox,
+        auto_approve: false,
+        enable_workers_mcp: true,
+        workers_parent_chat_id: None,
+        resume: None,
+        attachments: Vec::new(),
+        worktree: None,
+    })
+}
+
 #[derive(Clone)]
 pub struct SessionsEngine {
     inner: Arc<Inner>,
@@ -370,10 +406,7 @@ impl SessionsEngine {
                 return Err(error.into());
             }
         };
-        let supported = match harness
-            .probe_live_voice(std::path::Path::new(&cwd))
-            .await
-        {
+        let supported = match harness.probe_live_voice(std::path::Path::new(&cwd)).await {
             Ok(supported) => supported,
             Err(error) => {
                 self.inner.live_voice.fail(&call_id, &error.to_string());
@@ -381,16 +414,13 @@ impl SessionsEngine {
             }
         };
         if !supported {
-            let message = live_voice_unavailable_message(
-                LiveVoiceUnavailableReason::UnsupportedOmp,
-            );
+            let message =
+                live_voice_unavailable_message(LiveVoiceUnavailableReason::UnsupportedOmp);
             self.inner.live_voice.fail(&call_id, &message);
             return Err(EngineError::Other(message));
         }
         if !self.inner.live_voice.matches(&call_id) {
-            return Err(EngineError::Other(
-                "Live Voice start was cancelled".into(),
-            ));
+            return Err(EngineError::Other("Live Voice start was cancelled".into()));
         }
         let handle = match harness.start_live_voice(LiveVoiceRequest { cwd }).await {
             Ok(handle) => handle,
@@ -399,11 +429,9 @@ impl SessionsEngine {
                 return Err(error.into());
             }
         };
-        if let Err(handle) = attach_live_handle(&self.inner.live_voice, &call_id, handle) {
+        if let Err(handle) = self.attach_live_handle(&call_id, handle) {
             let _ = handle.controls.send(LiveVoiceControl::Stop).await;
-            return Err(EngineError::Other(
-                "Live Voice start was cancelled".into(),
-            ));
+            return Err(EngineError::Other("Live Voice start was cancelled".into()));
         }
         Ok(())
     }
@@ -414,6 +442,170 @@ impl SessionsEngine {
 
     pub async fn stop_live_voice(&self) -> Result<(), EngineError> {
         self.inner.live_voice.stop().await
+    }
+
+    pub(crate) async fn prepare_for_command(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+    ) -> Result<(), EngineError> {
+        if !self.inner.live_voice.is_active()
+            || self.inner.live_voice.owns_command(chat_id, command_id)
+        {
+            return Ok(());
+        }
+        self.stop_live_voice().await
+    }
+
+    fn attach_live_handle(
+        &self,
+        call_id: &str,
+        mut handle: LiveVoiceHandle,
+    ) -> Result<(), LiveVoiceHandle> {
+        if !self
+            .inner
+            .live_voice
+            .attach_controls(call_id, handle.controls.clone())
+        {
+            return Err(handle);
+        }
+        let Some(cancellation) = self.inner.live_voice.cancellation(call_id) else {
+            return Err(handle);
+        };
+        let sessions = self.clone();
+        let task_call_id = call_id.to_owned();
+        let coordinator = self.inner.live_voice.clone();
+        let task_coordinator = coordinator.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    event = handle.events.next() => match event {
+                        Some(Ok(LiveVoiceEvent::Delegation {
+                            delegation_id,
+                            request,
+                        })) => {
+                            if let Err(error) = sessions
+                                .handle_live_delegation(&task_call_id, &delegation_id, request)
+                                .await
+                            {
+                                task_coordinator.fail(&task_call_id, &error.to_string());
+                                return;
+                            }
+                        }
+                        Some(Ok(event)) => {
+                            let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
+                            task_coordinator.handle_event(&task_call_id, event);
+                            if terminal {
+                                return;
+                            }
+                        }
+                        Some(Err(error)) => {
+                            task_coordinator.fail(&task_call_id, &error.to_string());
+                            return;
+                        }
+                        None => {
+                            task_coordinator.fail(
+                                &task_call_id,
+                                "Live Voice event stream closed unexpectedly",
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        coordinator.attach_task(call_id, task);
+        Ok(())
+    }
+
+    async fn handle_live_delegation(
+        &self,
+        call_id: &str,
+        delegation_id: &str,
+        request: String,
+    ) -> Result<(), EngineError> {
+        let ownership = self
+            .inner
+            .live_voice
+            .claim_delegation(call_id, delegation_id)?;
+        if !ownership.newly_created {
+            return Ok(());
+        }
+        let chat_id = self
+            .inner
+            .live_voice
+            .active_chat_id()
+            .ok_or_else(|| EngineError::Other("Live Voice call is no longer active".into()))?;
+        let (_, receiver) = self.subscribe(&chat_id, u64::MAX)?;
+        let workspace = self
+            .inner
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace is unavailable".into()))?;
+        let chat = workspace
+            .chat(&chat_id)?
+            .ok_or_else(|| EngineError::Other(format!("no such chat: {chat_id}")))?;
+        let run_request = live_delegation_run_request(&chat, request)?;
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
+        host.queue_command_with_id(
+            &chat_id,
+            ownership.command_id.clone(),
+            SessionCommandPayload::Run {
+                request: run_request,
+                message_id: ownership.message_id,
+            },
+        )?;
+        self.spawn_live_backend_observer(call_id.to_owned(), delegation_id.to_owned(), receiver);
+        Ok(())
+    }
+
+    fn spawn_live_backend_observer(
+        &self,
+        call_id: String,
+        delegation_id: String,
+        mut receiver: broadcast::Receiver<JournaledEvent>,
+    ) {
+        let coordinator = self.inner.live_voice.clone();
+        tokio::spawn(async move {
+            let mut speech = BackendSpeechAccumulator::default();
+            loop {
+                let event = match receiver.recv().await {
+                    Ok(event) => event.event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                match speech.observe(&event) {
+                    BackendSpeechUpdate::None => {}
+                    BackendSpeechUpdate::Progress(text) => {
+                        let _ = coordinator
+                            .append_delegation_context(
+                                &call_id,
+                                &delegation_id,
+                                LiveVoiceContextKind::Progress,
+                                text,
+                            )
+                            .await;
+                    }
+                    BackendSpeechUpdate::Final(text) => {
+                        if coordinator
+                            .append_delegation_context(
+                                &call_id,
+                                &delegation_id,
+                                LiveVoiceContextKind::Final,
+                                text,
+                            )
+                            .await
+                        {
+                            coordinator.complete_delegation(&call_id, &delegation_id);
+                        }
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     fn live_voice_precondition(
@@ -2565,16 +2757,71 @@ mod tests {
     use super::{
         HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine, SubagentSink,
         apply_context_usage_to_session, apply_run_error_to_session, finish_segment,
-        resolve_pending_question, segment_duration_ms, should_journal_event, subagent_doc_id,
-        workflow_tasks_from_entries,
+        live_delegation_run_request, resolve_pending_question, segment_duration_ms,
+        should_journal_event, subagent_doc_id, workflow_tasks_from_entries,
     };
     use chrono::Utc;
     use tokio::sync::oneshot;
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     use zeron_proto::{
-        AgentEvent, ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus,
-        ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
+        AgentEvent, Chat, ChatConfig, ContextUsage, ConversationSourceContext, HarnessId,
+        ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus, ToolCall,
+        WorkflowTaskStatus, WorkflowTaskUpdate,
     };
+
+    #[test]
+    fn live_voice_delegation_run_request_uses_authoritative_chat_configuration() {
+        let mut model_options = serde_json::Map::new();
+        model_options.insert("temperature".into(), serde_json::json!(0.2));
+        let chat = Chat {
+            id: "chat-live".into(),
+            device_id: "device".into(),
+            title: None,
+            archived: false,
+            cwd: Some("/chat-cwd".into()),
+            branch: None,
+            checkout_id: Some("checkout".into()),
+            source_context: Some(ConversationSourceContext {
+                checkout_id: "checkout".into(),
+                repo_root: "/repo".into(),
+                cwd: "/source-cwd".into(),
+                branch: "main".into(),
+                head_sha: Some("abc123".into()),
+                observed_at: Utc::now(),
+            }),
+            config: Some(ChatConfig {
+                harness: HarnessId::Omp,
+                model: Some("model-live".into()),
+                reasoning: Some(ReasoningLevel::High),
+                model_options: model_options.clone(),
+                sandbox: SandboxLevel::ReadOnly,
+            }),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: Some(2),
+        };
+
+        let request =
+            live_delegation_run_request(&chat, "delegate this".into()).expect("valid request");
+        assert_eq!(request.prompt, "delegate this");
+        assert_eq!(request.harness, Some(HarnessId::Omp));
+        assert_eq!(request.model.as_deref(), Some("model-live"));
+        assert_eq!(request.reasoning, Some(ReasoningLevel::High));
+        assert_eq!(request.model_options, model_options);
+        assert_eq!(request.cwd, "/source-cwd");
+        assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
+        assert!(!request.auto_approve);
+        assert!(request.enable_workers_mcp);
+        assert!(request.workers_parent_chat_id.is_none());
+        assert!(request.resume.is_none());
+        assert!(request.attachments.is_empty());
+        assert!(request.worktree.is_none());
+    }
 
     #[test]
     fn journal_policy_skips_transient_preview_but_keeps_authoritative_file_call() {

@@ -16,10 +16,13 @@ use zeron_doc::{
 };
 use zeron_engine::{EngineCore, HarnessRegistry, RunJournal};
 use zeron_harness::mock::MockHarness;
-use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_harness::{
+    Harness, HarnessError, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle,
+    LiveVoiceRequest, RunControls,
+};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, LiveVoicePhase, Model, ReasoningLevel,
+    RunRequest, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use zeron_sync::DocsStore;
 
@@ -140,6 +143,170 @@ impl Harness for ScriptedHarness {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LiveFixtureMode {
+    Stable,
+    Conflict,
+    ExitAfterDelegation,
+    Passive,
+}
+
+struct LiveDelegationHarness {
+    mode: LiveFixtureMode,
+    controls: Arc<tokio::sync::Mutex<Vec<LiveVoiceControl>>>,
+    order: Arc<tokio::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl LiveDelegationHarness {
+    fn new(mode: LiveFixtureMode) -> Self {
+        Self {
+            mode,
+            controls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Harness for LiveDelegationHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Omp
+    }
+
+    fn display_name(&self) -> &str {
+        "Live delegation fixture"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn probe_live_voice(&self, _cwd: &std::path::Path) -> Result<bool, HarnessError> {
+        Ok(true)
+    }
+
+    async fn start_live_voice(
+        &self,
+        _request: LiveVoiceRequest,
+    ) -> Result<LiveVoiceHandle, HarnessError> {
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<LiveVoiceEvent, HarnessError>>(16);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
+        let controls = Arc::clone(&self.controls);
+        let order = Arc::clone(&self.order);
+        let mode = self.mode;
+        tokio::spawn(async move {
+            let _ = event_tx
+                .send(Ok(LiveVoiceEvent::Phase(LiveVoicePhase::Listening)))
+                .await;
+            if !matches!(mode, LiveFixtureMode::Passive) {
+                let delegation = LiveVoiceEvent::Delegation {
+                    delegation_id: "delegation-1".into(),
+                    request: "Fix the durable bug".into(),
+                };
+                let _ = event_tx.send(Ok(delegation.clone())).await;
+                let _ = event_tx.send(Ok(delegation)).await;
+                if matches!(mode, LiveFixtureMode::Conflict) {
+                    let _ = event_tx
+                        .send(Ok(LiveVoiceEvent::Delegation {
+                            delegation_id: "delegation-2".into(),
+                            request: "Start conflicting work".into(),
+                        }))
+                        .await;
+                }
+            }
+            if matches!(mode, LiveFixtureMode::ExitAfterDelegation) {
+                return;
+            }
+            while let Some(control) = control_rx.recv().await {
+                if control == LiveVoiceControl::Stop {
+                    order.lock().await.push("stop");
+                    let _ = event_tx
+                        .send(Ok(LiveVoiceEvent::Ended { error: None }))
+                        .await;
+                }
+                controls.lock().await.push(control);
+            }
+        });
+        Ok(LiveVoiceHandle {
+            events: futures::stream::unfold(event_rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed(),
+            controls: control_tx,
+        })
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.order.lock().await.push("run");
+        let expected_prompt = if matches!(self.mode, LiveFixtureMode::Passive) {
+            "manual command"
+        } else {
+            "Fix the durable bug"
+        };
+        assert_eq!(request.prompt, expected_prompt);
+        let script = vec![
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Omp,
+                model: "omp-default".into(),
+                tools: Vec::new(),
+                cwd: request.cwd,
+                session_id: "voice-session".into(),
+                assistant_message_id: "voice-assistant".into(),
+            },
+            AgentEvent::TextDelta {
+                text: "Inspecting".into(),
+            },
+            AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "voice-assistant".into(),
+            },
+            AgentEvent::TextDelta {
+                text: "Durable answer".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("Fixed final".into()),
+                error: None,
+                session_id: Some("voice-session".into()),
+            },
+        ];
+        let mut script = script.into_iter();
+        let first = script.next().expect("non-empty Live Voice script");
+        let stream = futures::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(first)
+        })
+        .chain(futures::stream::iter(script.map(Ok)));
+        Ok(stream.boxed())
+    }
+}
+
+fn omp_chat_config() -> ChatConfig {
+    ChatConfig {
+        harness: HarnessId::Omp,
+        model: Some("omp-default".into()),
+        reasoning: Some(ReasoningLevel::Medium),
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    }
+}
+
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(harness);
@@ -149,6 +316,26 @@ fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
     EngineCore::assemble(dir, registry_with(harness), HarnessId::Mock, None)
         .expect("engine core assembles")
+}
+
+fn assemble_live(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
+    EngineCore::assemble(dir, registry_with(harness), HarnessId::Omp, None)
+        .expect("live engine core assembles")
+}
+
+fn create_omp_chat(core: &EngineCore) {
+    core.workspace
+        .create_chat(
+            CHAT,
+            None,
+            Some(&core.device_id),
+            Some(omp_chat_config()),
+            Some("/tmp".into()),
+        )
+        .expect("create OMP chat");
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("pre-title OMP chat");
 }
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
@@ -818,6 +1005,201 @@ async fn deterministic_queue_command_id_is_returned_and_executes_once() {
             .filter(|entry| entry.role == MessageRole::Assistant)
             .count(),
         1
+    );
+}
+#[tokio::test]
+async fn live_voice_delegation_is_one_durable_run_with_transient_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Stable));
+    let core = assemble_live(dir.path(), harness.clone());
+    create_omp_chat(&core);
+
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+    wait_for(
+        || {
+            let handle = core.doc_host.open(CHAT).expect("open live chat");
+            let run_commands = handle
+                .doc()
+                .read_commands()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+                .count();
+            let durable_messages = entries_now(&core)
+                .into_iter()
+                .filter(|entry| matches!(entry.role, MessageRole::User | MessageRole::Assistant))
+                .count();
+            run_commands == 1 && durable_messages == 2
+        },
+        "one durable Live Voice delegation",
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let controls = harness.controls.lock().await.clone();
+        let has_progress = controls.iter().any(|control| {
+            matches!(
+                control,
+                LiveVoiceControl::AppendContext {
+                    delegation_id,
+                    kind: LiveVoiceContextKind::Progress,
+                    text,
+                } if delegation_id == "delegation-1" && text == "Inspecting"
+            )
+        });
+        let has_final = controls.iter().any(|control| {
+            matches!(
+                control,
+                LiveVoiceControl::AppendContext {
+                    delegation_id,
+                    kind: LiveVoiceContextKind::Final,
+                    text,
+                } if delegation_id == "delegation-1" && text == "Fixed final"
+            )
+        });
+        if has_progress && has_final {
+            assert!(
+                !controls.contains(&LiveVoiceControl::Stop),
+                "the owned durable command must not preempt its Live Voice call"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for Live Voice progress and final context"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let commands = handle.doc().read_commands().unwrap();
+    let runs = commands
+        .iter()
+        .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 1, "duplicate delegation id must be idempotent");
+    assert!(!runs[0].id.is_empty());
+    let SessionCommandPayload::Run { message_id, .. } = &runs[0].payload else {
+        unreachable!()
+    };
+    assert!(!message_id.is_empty());
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| matches!(entry.role, MessageRole::User | MessageRole::Assistant))
+            .count(),
+        2,
+        "spoken progress/final controls must not append extra chat messages"
+    );
+    core.sessions.stop_live_voice().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_voice_conflict_ends_call_but_backend_finishes_durably() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Conflict));
+    let core = assemble_live(dir.path(), harness);
+    create_omp_chat(&core);
+
+    let mut state = core.sessions.watch_live_voice();
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|entry| entry.role == MessageRole::Assistant)
+        },
+        "durable backend completion after Live Voice conflict",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.borrow().phase != LiveVoicePhase::Error {
+            state.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("conflicting delegation ends Live Voice");
+    assert!(
+        state
+            .borrow()
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("delegation")),
+        "conflict reports a bounded delegation error"
+    );
+    assert_eq!(
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .iter()
+            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn live_voice_child_exit_does_not_cancel_queued_backend_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(
+        LiveFixtureMode::ExitAfterDelegation,
+    ));
+    let core = assemble_live(dir.path(), harness);
+    create_omp_chat(&core);
+
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|entry| entry.role == MessageRole::Assistant)
+        },
+        "backend completion after Live Voice child exit",
+    )
+    .await;
+    assert_eq!(
+        core.sessions.watch_live_voice().borrow().phase,
+        LiveVoicePhase::Error
+    );
+}
+
+#[tokio::test]
+async fn unrelated_durable_command_stops_live_voice_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Passive));
+    let core = assemble_live(dir.path(), harness.clone());
+    create_omp_chat(&core);
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+
+    let mut request = run_request("manual command");
+    request.harness = Some(HarnessId::Omp);
+    core.doc_host
+        .queue_command_with_id(
+            CHAT,
+            "manual-command".into(),
+            SessionCommandPayload::Run {
+                request,
+                message_id: "manual-message".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|entry| entry.role == MessageRole::Assistant)
+        },
+        "manual command after Live Voice preemption",
+    )
+    .await;
+    assert_eq!(
+        harness.order.lock().await.as_slice(),
+        ["stop", "run"],
+        "Live Voice must stop before unrelated durable dispatch"
     );
 }
 

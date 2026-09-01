@@ -1,12 +1,10 @@
-use futures::{StreamExt, stream::BoxStream};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use zeron_harness::{
-    CancellationToken, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle,
-};
-use zeron_proto::{LiveVoicePhase, LiveVoiceState};
+use zeron_harness::{CancellationToken, LiveVoiceControl, LiveVoiceEvent};
+use zeron_proto::{AgentEvent, DoneStatus, LiveVoicePhase, LiveVoiceState};
 
 use crate::{EngineError, new_id};
 
@@ -17,13 +15,105 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BackendSpeechUpdate {
+    None,
+    Progress(String),
+    Final(String),
+}
+
+#[derive(Default)]
+pub(crate) struct BackendSpeechAccumulator {
+    current: String,
+    last_segment: Option<String>,
+}
+
+impl BackendSpeechAccumulator {
+    pub(crate) fn observe(&mut self, event: &AgentEvent) -> BackendSpeechUpdate {
+        match event {
+            AgentEvent::TextDelta { text } => {
+                push_bounded(&mut self.current, text);
+                BackendSpeechUpdate::None
+            }
+            AgentEvent::AssistantMessageCompleted { .. } => {
+                let Some(segment) = take_trimmed(&mut self.current) else {
+                    return BackendSpeechUpdate::None;
+                };
+                self.last_segment = Some(segment.clone());
+                BackendSpeechUpdate::Progress(segment)
+            }
+            AgentEvent::Done {
+                status,
+                result,
+                error,
+                ..
+            } => {
+                if let Some(segment) = take_trimmed(&mut self.current) {
+                    self.last_segment = Some(segment);
+                }
+                let final_text = if *status == DoneStatus::Errored {
+                    non_empty(error)
+                        .or_else(|| non_empty(result))
+                        .unwrap_or_else(|| "The coding run failed without an error message.".into())
+                } else {
+                    non_empty(result)
+                        .or_else(|| self.last_segment.clone())
+                        .unwrap_or_else(|| match status {
+                            DoneStatus::Completed => {
+                                "The coding run completed without a final text response.".into()
+                            }
+                            DoneStatus::Interrupted => "The coding run was interrupted.".into(),
+                            DoneStatus::Errored => unreachable!(),
+                        })
+                };
+                BackendSpeechUpdate::Final(truncate_live_text(final_text))
+            }
+            _ => BackendSpeechUpdate::None,
+        }
+    }
+}
+
+fn push_bounded(target: &mut String, value: &str) {
+    let remaining = MAX_LIVE_TEXT_BYTES.saturating_sub(target.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut boundary = remaining.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    target.push_str(&value[..boundary]);
+}
+
+fn take_trimmed(value: &mut String) -> Option<String> {
+    let trimmed = value.trim();
+    let result = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    value.clear();
+    result
+}
+
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+pub(crate) struct LiveDelegationOwnership {
+    pub(crate) command_id: String,
+    pub(crate) message_id: String,
+    pub(crate) newly_created: bool,
+}
+
 struct ActiveLiveVoice {
     call_id: String,
     chat_id: String,
     controls: Option<mpsc::Sender<LiveVoiceControl>>,
     phase_before_mute: LiveVoicePhase,
-    pub(crate) active_delegation_id: Option<String>,
-    pub(crate) owned_command_id: Option<String>,
+    active_delegation_id: Option<String>,
+    owned_command_id: Option<String>,
+    owned_message_id: Option<String>,
     cancellation: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -78,6 +168,7 @@ impl LiveVoiceCoordinator {
             phase_before_mute: LiveVoicePhase::Listening,
             active_delegation_id: None,
             owned_command_id: None,
+            owned_message_id: None,
             cancellation: CancellationToken::new(),
             task: None,
         });
@@ -95,14 +186,105 @@ impl LiveVoiceCoordinator {
         controls: mpsc::Sender<LiveVoiceControl>,
     ) -> bool {
         let mut active = lock(&self.inner.active);
-        let Some(active) = active
-            .as_mut()
-            .filter(|active| active.call_id == call_id)
-        else {
+        let Some(active) = active.as_mut().filter(|active| active.call_id == call_id) else {
             return false;
         };
         active.controls = Some(controls);
         true
+    }
+
+    pub(crate) fn claim_delegation(
+        &self,
+        call_id: &str,
+        delegation_id: &str,
+    ) -> Result<LiveDelegationOwnership, EngineError> {
+        let mut active = lock(&self.inner.active);
+        let active = active
+            .as_mut()
+            .filter(|active| active.call_id == call_id)
+            .ok_or_else(|| EngineError::Other("Live Voice call is no longer active".into()))?;
+        match active.active_delegation_id.as_deref() {
+            Some(existing) if existing != delegation_id => {
+                return Err(EngineError::Other(
+                    "another Live Voice delegation is already active".into(),
+                ));
+            }
+            Some(_) => {
+                return Ok(LiveDelegationOwnership {
+                    command_id: active
+                        .owned_command_id
+                        .clone()
+                        .expect("active delegation owns a command id"),
+                    message_id: active
+                        .owned_message_id
+                        .clone()
+                        .expect("active delegation owns a message id"),
+                    newly_created: false,
+                });
+            }
+            None => {}
+        }
+        let command_id = new_id();
+        let message_id = new_id();
+        active.active_delegation_id = Some(delegation_id.to_owned());
+        active.owned_command_id = Some(command_id.clone());
+        active.owned_message_id = Some(message_id.clone());
+        Ok(LiveDelegationOwnership {
+            command_id,
+            message_id,
+            newly_created: true,
+        })
+    }
+
+    pub(crate) fn owns_command(&self, chat_id: &str, command_id: &str) -> bool {
+        lock(&self.inner.active).as_ref().is_some_and(|active| {
+            active.chat_id == chat_id && active.owned_command_id.as_deref() == Some(command_id)
+        })
+    }
+
+    pub(crate) async fn append_delegation_context(
+        &self,
+        call_id: &str,
+        delegation_id: &str,
+        kind: zeron_harness::LiveVoiceContextKind,
+        text: String,
+    ) -> bool {
+        let controls = lock(&self.inner.active)
+            .as_ref()
+            .filter(|active| {
+                active.call_id == call_id
+                    && active.active_delegation_id.as_deref() == Some(delegation_id)
+            })
+            .and_then(|active| active.controls.clone());
+        let Some(controls) = controls else {
+            return false;
+        };
+        if controls
+            .send(LiveVoiceControl::AppendContext {
+                delegation_id: delegation_id.to_owned(),
+                kind,
+                text: truncate_live_text(text),
+            })
+            .await
+            .is_err()
+        {
+            self.fail(call_id, "Live Voice control channel closed");
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn complete_delegation(&self, call_id: &str, delegation_id: &str) {
+        let mut active = lock(&self.inner.active);
+        let Some(active) = active.as_mut().filter(|active| {
+            active.call_id == call_id
+                && active.active_delegation_id.as_deref() == Some(delegation_id)
+        }) else {
+            return;
+        };
+        active.active_delegation_id = None;
+        active.owned_command_id = None;
+        active.owned_message_id = None;
     }
 
     pub(crate) fn cancellation(&self, call_id: &str) -> Option<CancellationToken> {
@@ -114,10 +296,7 @@ impl LiveVoiceCoordinator {
 
     pub(crate) fn attach_task(&self, call_id: &str, task: JoinHandle<()>) {
         let mut active = lock(&self.inner.active);
-        if let Some(active) = active
-            .as_mut()
-            .filter(|active| active.call_id == call_id)
-        {
+        if let Some(active) = active.as_mut().filter(|active| active.call_id == call_id) {
             active.task = Some(task);
         } else {
             task.abort();
@@ -130,9 +309,7 @@ impl LiveVoiceCoordinator {
             LiveVoiceEvent::Ended { error: None } => self.finish(call_id),
             LiveVoiceEvent::Phase(phase) => {
                 let mut active = lock(&self.inner.active);
-                let Some(active) = active
-                    .as_mut()
-                    .filter(|active| active.call_id == call_id)
+                let Some(active) = active.as_mut().filter(|active| active.call_id == call_id)
                 else {
                     return;
                 };
@@ -221,9 +398,10 @@ impl LiveVoiceCoordinator {
         self.inner.state.send_replace(stopping);
 
         let send_result = if let Some(controls) = active.controls.take() {
-            controls.send(LiveVoiceControl::Stop).await.map_err(|_| {
-                EngineError::Other("Live Voice control channel closed".into())
-            })
+            controls
+                .send(LiveVoiceControl::Stop)
+                .await
+                .map_err(|_| EngineError::Other("Live Voice control channel closed".into()))
         } else {
             Ok(())
         };
@@ -279,57 +457,6 @@ impl LiveVoiceCoordinator {
     }
 }
 
-pub(crate) fn spawn_live_event_task(
-    coordinator: LiveVoiceCoordinator,
-    call_id: String,
-    mut events: BoxStream<'static, Result<LiveVoiceEvent, HarnessError>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(cancellation) = coordinator.cancellation(&call_id) else {
-            return;
-        };
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => return,
-                event = events.next() => match event {
-                    Some(Ok(event)) => {
-                        let terminal = matches!(event, LiveVoiceEvent::Ended { .. });
-                        coordinator.handle_event(&call_id, event);
-                        if terminal {
-                            return;
-                        }
-                    }
-                    Some(Err(error)) => {
-                        coordinator.fail(&call_id, &error.to_string());
-                        return;
-                    }
-                    None => {
-                        coordinator.fail(&call_id, "Live Voice event stream closed unexpectedly");
-                        return;
-                    }
-                }
-            }
-        }
-    })
-}
-
-pub(crate) fn attach_live_handle(
-    coordinator: &LiveVoiceCoordinator,
-    call_id: &str,
-    handle: LiveVoiceHandle,
-) -> Result<(), LiveVoiceHandle> {
-    if !coordinator.attach_controls(call_id, handle.controls.clone()) {
-        return Err(handle);
-    }
-    let task = spawn_live_event_task(
-        coordinator.clone(),
-        call_id.to_owned(),
-        handle.events,
-    );
-    coordinator.attach_task(call_id, task);
-    Ok(())
-}
-
 fn truncate_live_text(mut text: String) -> String {
     if text.len() <= MAX_LIVE_TEXT_BYTES {
         return text;
@@ -351,14 +478,98 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
     use zeron_harness::{
-        Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle,
-        LiveVoiceRequest, RunControls,
+        Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
+        RunControls,
     };
     use zeron_proto::{
         AgentEvent, ChatConfig, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole,
         LiveVoiceTranscript, LiveVoiceUnavailableReason, Model, ReasoningLevel, RunRequest,
         SandboxLevel, SteeringMode,
     };
+
+    #[test]
+    fn live_voice_delegation_speech_accumulator_uses_only_visible_backend_text() {
+        let mut speech = BackendSpeechAccumulator::default();
+        assert_eq!(
+            speech.observe(&AgentEvent::ReasoningDelta {
+                text: "private reasoning".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                context_usage: None,
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::TextDelta {
+                text: " Inspecting ".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "assistant-1".into(),
+            }),
+            BackendSpeechUpdate::Progress("Inspecting".into())
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "assistant-1".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("Inspecting".into())
+        );
+
+        let mut result_wins = BackendSpeechAccumulator::default();
+        result_wins.observe(&AgentEvent::TextDelta {
+            text: "fallback".into(),
+        });
+        assert_eq!(
+            result_wins.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some(" final result ".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("final result".into())
+        );
+
+        let mut errored = BackendSpeechAccumulator::default();
+        assert_eq!(
+            errored.observe(&AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: Some("ignored".into()),
+                error: Some("actual backend error".into()),
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("actual backend error".into())
+        );
+
+        let mut empty = BackendSpeechAccumulator::default();
+        assert_eq!(
+            empty.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final(
+                "The coding run completed without a final text response.".into()
+            )
+        );
+    }
 
     #[tokio::test]
     async fn live_voice_state_tracks_transient_events_and_exact_mute() {
@@ -369,10 +580,7 @@ mod tests {
         assert!(coordinator.attach_controls(&call_id, controls));
         assert_eq!(state.borrow().phase, LiveVoicePhase::Connecting);
 
-        coordinator.handle_event(
-            &call_id,
-            LiveVoiceEvent::Phase(LiveVoicePhase::Listening),
-        );
+        coordinator.handle_event(&call_id, LiveVoiceEvent::Phase(LiveVoicePhase::Listening));
         coordinator.handle_event(
             &call_id,
             LiveVoiceEvent::Levels {
@@ -398,10 +606,16 @@ mod tests {
         );
 
         coordinator.set_muted(true).await.unwrap();
-        assert_eq!(received.recv().await, Some(LiveVoiceControl::SetMuted(true)));
+        assert_eq!(
+            received.recv().await,
+            Some(LiveVoiceControl::SetMuted(true))
+        );
         assert_eq!(state.borrow().phase, LiveVoicePhase::Muted);
         coordinator.set_muted(false).await.unwrap();
-        assert_eq!(received.recv().await, Some(LiveVoiceControl::SetMuted(false)));
+        assert_eq!(
+            received.recv().await,
+            Some(LiveVoiceControl::SetMuted(false))
+        );
         assert_eq!(state.borrow().phase, LiveVoicePhase::Listening);
         assert!(coordinator.reserve("chat-2").is_err());
     }
@@ -411,7 +625,10 @@ mod tests {
         let coordinator = LiveVoiceCoordinator::new();
         let mut state = coordinator.watch();
         let (controls, mut received) = mpsc::channel(1);
-        controls.send(LiveVoiceControl::SetMuted(false)).await.unwrap();
+        controls
+            .send(LiveVoiceControl::SetMuted(false))
+            .await
+            .unwrap();
         let call_id = coordinator.reserve("chat-1").unwrap();
         assert!(coordinator.attach_controls(&call_id, controls));
         state.borrow_and_update();
@@ -422,7 +639,10 @@ mod tests {
         };
         state.changed().await.unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Stopping);
-        assert_eq!(received.recv().await, Some(LiveVoiceControl::SetMuted(false)));
+        assert_eq!(
+            received.recv().await,
+            Some(LiveVoiceControl::SetMuted(false))
+        );
         assert_eq!(received.recv().await, Some(LiveVoiceControl::Stop));
         stopping.await.unwrap().unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
@@ -491,24 +711,18 @@ mod tests {
         }
 
         async fn probe_live_voice(&self, _cwd: &std::path::Path) -> Result<bool, HarnessError> {
-            Ok(self
-                .supported
-                .load(std::sync::atomic::Ordering::SeqCst))
+            Ok(self.supported.load(std::sync::atomic::Ordering::SeqCst))
         }
 
         async fn start_live_voice(
             &self,
             _request: LiveVoiceRequest,
         ) -> Result<LiveVoiceHandle, HarnessError> {
-            if !self
-                .supported
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if !self.supported.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(HarnessError::Unsupported("update OMP".into()));
             }
             let (control_tx, mut control_rx) = mpsc::channel::<LiveVoiceControl>(16);
-            let (event_tx, event_rx) =
-                mpsc::channel::<Result<LiveVoiceEvent, HarnessError>>(16);
+            let (event_tx, event_rx) = mpsc::channel::<Result<LiveVoiceEvent, HarnessError>>(16);
             let seen = Arc::clone(&self.controls);
             tokio::spawn(async move {
                 let _ = event_tx
@@ -643,13 +857,9 @@ mod tests {
         let harness = Arc::new(FakeLiveHarness::supported());
         let registry = crate::registry::HarnessRegistry::new();
         registry.register(harness.clone());
-        let core = crate::EngineCore::assemble(
-            temp.path(),
-            Arc::new(registry),
-            HarnessId::Omp,
-            None,
-        )
-        .unwrap();
+        let core =
+            crate::EngineCore::assemble(temp.path(), Arc::new(registry), HarnessId::Omp, None)
+                .unwrap();
         let local_device = core.device_id.clone();
 
         for (id, device, config) in [
@@ -699,7 +909,12 @@ mod tests {
         );
 
         core.sessions
-            .dispatch("active", HarnessId::Omp, run_request(), Some("busy-1".into()))
+            .dispatch(
+                "active",
+                HarnessId::Omp,
+                run_request(),
+                Some("busy-1".into()),
+            )
             .await
             .unwrap();
         assert_eq!(

@@ -3182,6 +3182,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        sessions.prepare_for_command(chat_id, &entry.id).await?;
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
