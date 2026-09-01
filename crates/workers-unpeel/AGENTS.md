@@ -123,6 +123,29 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   vez de continuar. As capabilities `resume`/`restart_agent` vivem no
   `runtime.toml` de cada runtime, e `runtime_catalog_resume_capabilities_match_adapter_callbacks`
   (em `unpeel-core`) fica vermelho se a declaração e o adapter divergirem.
+- **A política de hibernação é pura, e o clock dela não é `updated_at_unix_ms`.**
+  `hibernation_candidates` decide sobre o snapshot que o painel já busca, sem
+  I/O e sem UI: recebe sessões, settings de Resources, a sessão selecionada e
+  o relógio, e devolve quem parar, do mais ocioso para o mais novo. O clock é
+  `WorkersSession::idle_since_unix_ms`, preenchido pelo `activity_bridge` com
+  o máximo entre `screen_changed_at` do manifest e o sinal de atividade
+  command-aware do Unpeel. `updated_at_unix_ms` não serve: ele anda com o
+  heartbeat de 60 s do host e com o mtime de `output.bin`, e num `omp` parado
+  há 24 h os dois tinham idade 0 h enquanto `screen_changed_at` marcava 24,2 h.
+  Sem evidência (`None`) o Worker é protegido, nunca hibernado. A elegibilidade
+  exige `unpeel_core::resume::can_resume` do comando — é o mesmo teste que
+  exclui sessões de terminal, cujo shell não tem receita de resume, e é o que
+  impede jogar fora uma conversa irrecuperável. Hibernar `omp`/`prime-agent` só
+  ficou seguro depois da receita de resume da família pi, acima.
+- **`send_text` num Worker morto é entrada perdida, não erro do host.**
+  `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
+  esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
+  para Workers ociosos por conta própria e o Orquestrador não tem como
+  adivinhar. `restart_worker` usa `RestoreAndResume` e devolve o id da sessão
+  **resultante**: relançar substitui a Session por uma nova (novo uuid), e o
+  endpoint de session-action responde só `{"ok": true}`, então o id novo é
+  descoberto comparando a listagem antes e depois. Duas sessões novas ao mesmo
+  tempo (outro launch concorrente) devolvem o id antigo em vez de um palpite.
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -252,8 +275,8 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19), `src/activity_bridge.rs` (13 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (26) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `src/lib.rs` (19 + 6 de hibernação), `src/activity_bridge.rs` (14 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |

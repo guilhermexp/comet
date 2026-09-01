@@ -55,6 +55,7 @@ const ACTIONS: &[&str] = &[
     "wait_for_status",
     "stop_worker",
     "archive_worker",
+    "restart_worker",
 ];
 
 pub fn run_stdio() -> Result<(), String> {
@@ -475,7 +476,7 @@ fn dispatch_action(
     match action.as_str() {
         "help" => Ok(json!({
             "actions": ACTIONS,
-            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker",
+            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
             "keys": ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "ctrl-c", "text:<literal>"],
             "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
         })),
@@ -639,6 +640,7 @@ fn dispatch_action(
         }
         "send_text" => {
             let session = find_session(client, arguments)?;
+            live_worker_guard(&session)?;
             let text = required_string(arguments, "text")?;
             if text.len() > 64 * 1024 {
                 return Err("text exceeds 64 KiB".into());
@@ -688,6 +690,7 @@ fn dispatch_action(
         }
         "send_keys" => {
             let session = find_session(client, arguments)?;
+            live_worker_guard(&session)?;
             let keys = arguments
                 .get("keys")
                 .and_then(Value::as_array)
@@ -721,6 +724,28 @@ fn dispatch_action(
                 .session_command(&session, WorkersSessionCommand::Archive)
                 .map_err(|error| error.to_string())?;
             Ok(json!({ "session_id": session.id, "archived": true }))
+        }
+        "restart_worker" => {
+            let session = find_session(client, arguments)?;
+            if session.is_live() {
+                return Err(format!(
+                    "Worker '{}' is already live. restart_worker brings a stopped or hibernated Worker back.",
+                    session.id
+                ));
+            }
+            let before = worker_ids(client)?;
+            client
+                .session_command(&session, WorkersSessionCommand::RestoreAndResume)
+                .map_err(|error| error.to_string())?;
+            // Relaunching replaces the Session, so the id the caller asked
+            // with is gone: report the one it must address from now on.
+            let session_id = replacement_session_id(&before, &worker_ids(client)?)
+                .unwrap_or_else(|| session.id.clone());
+            Ok(json!({
+                "session_id": session_id,
+                "restarted": true,
+                "previous_session_id": session.id
+            }))
         }
         _ => Err(format!(
             "Unknown workers action '{action}'. Use action=help."
@@ -1021,6 +1046,38 @@ pub fn archive_guard(session: &WorkersSession) -> Result<(), String> {
     Ok(())
 }
 
+/// Writing into a Worker that is not live would type into a dead PTY and be
+/// silently lost. Hibernation stops idle Workers on its own, so the error has
+/// to name the way back instead of just refusing.
+pub fn live_worker_guard(session: &WorkersSession) -> Result<(), String> {
+    if session.is_live() {
+        return Ok(());
+    }
+    Err(format!(
+        "Worker '{}' is not running (state={}, archived={}). Call restart_worker to bring it back with its conversation, then send input.",
+        session.id, session.state, session.archived
+    ))
+}
+
+fn worker_ids(client: &LocalWorkersClient) -> Result<Vec<String>, String> {
+    Ok(client
+        .bootstrap()
+        .map_err(|error| error.to_string())?
+        .sessions
+        .into_iter()
+        .map(|session| session.id)
+        .collect())
+}
+
+/// The single id that appeared while restarting. Anything else — no new id,
+/// or more than one because another Worker launched concurrently — is
+/// reported as unknown rather than guessed.
+pub fn replacement_session_id(before: &[String], after: &[String]) -> Option<String> {
+    let mut new_ids = after.iter().filter(|id| !before.contains(id));
+    let replacement = new_ids.next()?;
+    new_ids.next().is_none().then(|| replacement.clone())
+}
+
 fn validate_launch_target(
     client: &LocalWorkersClient,
     request: &WorkersLaunchRequest,
@@ -1174,7 +1231,10 @@ fn tool_definition() -> Value {
         `timeout_seconds` sized to the work (you decide, up to `limits.wait_seconds`) \
         or end your turn — a `[worker-task-notification]` arrives in this chat when \
         the worker finishes; never poll with short waits. `read_output` inspects \
-        evidence, then `stop_worker` or `archive_worker`. \
+        evidence, then `stop_worker` or `archive_worker`. A worker that is not \
+        running — stopped, or hibernated by the idle policy — refuses input until \
+        `restart_worker` brings it back with its conversation under a new \
+        `session_id`. \
         Launch one worker per independent slice: N calls for N slices is the normal \
         shape of parallel delegation. `action=help` returns the live per-action \
         contract and limits.",
@@ -1187,7 +1247,7 @@ fn tool_definition() -> Value {
                 "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
                 "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
                 "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
-                "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker and archive_worker." },
+                "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker, archive_worker and restart_worker." },
                 "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
                 "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },
                 "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },

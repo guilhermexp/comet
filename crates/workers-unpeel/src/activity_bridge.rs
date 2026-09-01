@@ -110,6 +110,7 @@ impl ActivityBridge {
                 continue;
             }
             let session_dir = unpeel_core::session_host::session_dir(&session.id);
+            session.idle_since_unix_ms = idle_since_unix_ms(&session.id, &manifest);
             session.updated_at_unix_ms = latest_activity_timestamp(
                 session.updated_at_unix_ms,
                 file_modified_unix_ms(&session_dir.join("output.bin")),
@@ -186,6 +187,23 @@ fn latest_activity_timestamp(
         .into_iter()
         .chain(hook_updated_at)
         .fold(manifest_updated_at, u64::max)
+}
+
+/// The idle clock for hibernation: the newest of the host's parsed-screen
+/// change stamp (a text hash, so an identical repaint does not move it) and
+/// Unpeel's own command-aware activity signal (the durable last-hook event
+/// for hook-capable runtimes). The manifest heartbeat and `output.bin` mtime
+/// are deliberately absent — both advance on a Worker parked at its prompt.
+fn idle_since_unix_ms(
+    session_id: &str,
+    manifest: &unpeel_core::session_host::HostedSessionManifest,
+) -> Option<u64> {
+    manifest
+        .screen_changed_at
+        .max(unpeel_core::session_ops::last_activity_ms(
+            session_id,
+            &manifest.session.command,
+        ))
 }
 
 impl Drop for ActivityBridge {
@@ -735,6 +753,36 @@ mod tests {
             heartbeat_at: 1,
             updated_at: 1,
         }
+    }
+
+    /// A Worker parked at its prompt keeps writing: the host heartbeats every
+    /// 60 s and the TUI repaints the same screen. Measured on an `omp` idle for
+    /// 24 h, both `updated_at` and `output.bin` looked 0 h old — which is why
+    /// the idle clock reads the screen-text stamp and the durable hook event
+    /// instead.
+    #[test]
+    fn the_idle_clock_ignores_heartbeat_and_identical_repaint() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary Unpeel home");
+        let _home = UnpeelHomeGuard::set(home.path(), home.path());
+        let session_dir = home.path().join("app-sessions/worker-1");
+        std::fs::create_dir_all(&session_dir).expect("worker session directory");
+        std::fs::write(session_dir.join("output.bin"), b"same screen repainted")
+            .expect("write output");
+        let mut manifest = omp_manifest("worker-1");
+        manifest.screen_changed_at = Some(1_000);
+        manifest.heartbeat_at = 9_000_000;
+        manifest.updated_at = 9_000_000;
+
+        assert_eq!(idle_since_unix_ms("worker-1", &manifest), Some(1_000));
+
+        std::fs::write(session_dir.join("last-hook-event.json"), b"{}").expect("write hook seed");
+        let after_hook =
+            idle_since_unix_ms("worker-1", &manifest).expect("hook advances the clock");
+        assert!(
+            after_hook > 1_000,
+            "a real lifecycle event must advance the idle clock, got {after_hook}"
+        );
     }
 
     #[test]

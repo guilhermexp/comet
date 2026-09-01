@@ -149,6 +149,7 @@ fn resource_stepper(
     theme: &Theme,
     id: &'static str,
     value: u16,
+    unit: &'static str,
     decrement: WorkersResourceSettings,
     increment: WorkersResourceSettings,
     cx: &mut Context<WorkersSettingsView>,
@@ -162,7 +163,7 @@ fn resource_stepper(
                 .mr(px(4.0))
                 .text_size(px(11.0))
                 .text_color(theme.text_muted)
-                .child(format!("{value} GiB")),
+                .child(format!("{value} {unit}")),
         )
         .child(
             div()
@@ -1173,6 +1174,36 @@ impl WorkersSettingsView {
             notifications_enabled: !settings.notifications_enabled,
             ..settings.clone()
         };
+        let hibernation_next = WorkersResourceSettings {
+            hibernation_enabled: !settings.hibernation_enabled,
+            ..settings.clone()
+        };
+        let idle_minutes_decrement = WorkersResourceSettings {
+            hibernate_after_idle_minutes: add_signed_u16(
+                settings.hibernate_after_idle_minutes,
+                -5,
+                1,
+                10_080,
+            ),
+            ..settings.clone()
+        };
+        let idle_minutes_increment = WorkersResourceSettings {
+            hibernate_after_idle_minutes: add_signed_u16(
+                settings.hibernate_after_idle_minutes,
+                5,
+                1,
+                10_080,
+            ),
+            ..settings.clone()
+        };
+        let live_idle_decrement = WorkersResourceSettings {
+            max_live_idle_workers: add_signed_u16(settings.max_live_idle_workers, -1, 1, 256),
+            ..settings.clone()
+        };
+        let live_idle_increment = WorkersResourceSettings {
+            max_live_idle_workers: add_signed_u16(settings.max_live_idle_workers, 1, 1, 256),
+            ..settings.clone()
+        };
         let warning_decrement = threshold_settings(&settings, ThresholdKind::Warning, -1);
         let warning_increment = threshold_settings(&settings, ThresholdKind::Warning, 1);
         let critical_decrement = threshold_settings(&settings, ThresholdKind::Critical, -1);
@@ -1227,6 +1258,7 @@ impl WorkersSettingsView {
                     theme,
                     "workers-resource-warning",
                     settings.per_worker_warning_gib,
+                    "GiB",
                     warning_decrement,
                     warning_increment,
                     cx,
@@ -1242,8 +1274,58 @@ impl WorkersSettingsView {
                     theme,
                     "workers-resource-critical",
                     settings.per_worker_critical_gib,
+                    "GiB",
                     critical_decrement,
                     critical_increment,
+                    cx,
+                )),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Hibernate idle workers",
+                    "Stops and archives workers that sat idle, keeping the conversation for Restart.",
+                )
+                .child(
+                    widgets::toggle_switch(theme, settings.hibernation_enabled)
+                        .id("workers-resource-hibernation")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.update(cx, |model, cx| {
+                                model.set_resource_settings(hibernation_next.clone(), cx)
+                            });
+                        })),
+                ),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Hibernate after",
+                    "How long a worker may sit idle before it is put away.",
+                )
+                .child(resource_stepper(
+                    theme,
+                    "workers-resource-hibernate-after",
+                    settings.hibernate_after_idle_minutes,
+                    "min",
+                    idle_minutes_decrement,
+                    idle_minutes_increment,
+                    cx,
+                )),
+            )
+            .child(
+                resource_setting_row(
+                    theme,
+                    "Live idle workers",
+                    "Above this many idle workers, the oldest are hibernated early.",
+                )
+                .child(resource_stepper(
+                    theme,
+                    "workers-resource-live-idle",
+                    settings.max_live_idle_workers,
+                    "workers",
+                    live_idle_decrement,
+                    live_idle_increment,
                     cx,
                 )),
             );

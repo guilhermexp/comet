@@ -8,8 +8,9 @@ use zeron_workers_unpeel::{
     controller_mcp_briefing_stability_key, controller_mcp_choose_semantic_output,
     controller_mcp_clean_output, controller_mcp_consume_authority_marker,
     controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_is_booting_screen,
-    controller_mcp_is_briefing_screen_ready, controller_mcp_parse_launch,
-    controller_mcp_parse_launch_briefing, controller_mcp_sanitize_text,
+    controller_mcp_is_briefing_screen_ready, controller_mcp_live_worker_guard,
+    controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
+    controller_mcp_replacement_session_id, controller_mcp_sanitize_text,
     controller_mcp_startup_prompt_response, controller_mcp_take_parent_chat_id,
     controller_mcp_tracks_task_episode, ensure_controller_mcp_host_launcher, is_session_host_mode,
     register_worker_parent_at, worker_parent_links_at,
@@ -584,6 +585,47 @@ fn archive_requires_an_explicit_stop_for_live_workers() {
     assert!(controller_mcp_archive_guard(&session).is_ok());
 }
 
+/// Hibernation stops idle Workers behind the orchestrator's back, so writing
+/// to one must name the way back instead of typing into a dead PTY.
+#[test]
+fn writing_to_a_hibernated_worker_names_restart_worker() {
+    let mut session = worker_with_state("exited");
+    session.archived = true;
+    let error =
+        controller_mcp_live_worker_guard(&session).expect_err("a stopped Worker refuses input");
+    assert!(
+        error.contains("restart_worker"),
+        "the guard must name the action that brings the Worker back: {error}"
+    );
+
+    let live = worker_with_state("running");
+    assert!(controller_mcp_live_worker_guard(&live).is_ok());
+}
+
+/// Restarting replaces the Session, so the orchestrator needs the id it got
+/// back, not the one it asked with.
+#[test]
+fn restart_reports_the_replacement_session_id() {
+    let before = ["worker-1".to_owned(), "worker-2".to_owned()];
+    let after = ["worker-2".to_owned(), "worker-3".to_owned()];
+    assert_eq!(
+        controller_mcp_replacement_session_id(&before, &after),
+        Some("worker-3".to_owned())
+    );
+    // An ambiguous or unchanged listing must not invent an id.
+    assert_eq!(
+        controller_mcp_replacement_session_id(&before, &before),
+        None
+    );
+    assert_eq!(
+        controller_mcp_replacement_session_id(
+            &before,
+            &["worker-3".to_owned(), "worker-4".to_owned()]
+        ),
+        None
+    );
+}
+
 #[test]
 fn controller_text_uses_the_runtime_sanitizer() {
     assert_eq!(
@@ -612,6 +654,7 @@ fn worker_with_state(state: &str) -> WorkersSession {
         worktree_branch: None,
         created_at_unix_ms: 1,
         updated_at_unix_ms: 1,
+        idle_since_unix_ms: None,
         total_tokens: None,
         model_usage: Vec::new(),
         capabilities: WorkersSessionCapabilities::default(),
