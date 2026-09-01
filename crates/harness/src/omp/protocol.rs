@@ -1,8 +1,9 @@
 use base64::Engine as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
-use crate::HarnessError;
+use crate::{HarnessError, LiveVoiceContextKind, LiveVoiceEvent};
+use zeron_proto::{LiveVoicePhase, LiveVoiceRole, LiveVoiceTranscript};
 
 pub const MAX_INBOUND_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OUTBOUND_BYTES: usize = 2 * 1024 * 1024;
@@ -39,6 +40,144 @@ pub fn serialize_frame(value: &Value) -> Result<String, HarnessError> {
         )));
     }
     Ok(serialized)
+}
+
+pub fn parse_live_event(frame: &Value) -> Result<Option<LiveVoiceEvent>, HarnessError> {
+    let event = match frame.get("type").and_then(Value::as_str) {
+        Some("live_phase") => {
+            let phase = match required_str(frame, "phase")? {
+                "connecting" => LiveVoicePhase::Connecting,
+                "listening" => LiveVoicePhase::Listening,
+                "speaking" => LiveVoicePhase::Speaking,
+                "working" => LiveVoicePhase::Working,
+                "muted" => LiveVoicePhase::Muted,
+                "error" => LiveVoicePhase::Error,
+                phase => return Err(live_error(format!("unknown phase {phase}"))),
+            };
+            LiveVoiceEvent::Phase(phase)
+        }
+        Some("live_levels") => {
+            let input = required_finite_level(frame, "input")?;
+            let output = required_finite_level(frame, "output")?;
+            LiveVoiceEvent::Levels { input, output }
+        }
+        Some("live_transcript") => {
+            let role = match required_str(frame, "role")? {
+                "user" => LiveVoiceRole::User,
+                "assistant" => LiveVoiceRole::Assistant,
+                role => return Err(live_error(format!("unknown transcript role {role}"))),
+            };
+            let turn = frame
+                .get("turn")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| live_error("transcript turn must be an unsigned integer"))?;
+            let text = bounded_non_empty(frame, "text", MAX_INBOUND_BYTES)?;
+            let final_text = frame
+                .get("final")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| live_error("transcript final must be a boolean"))?;
+            LiveVoiceEvent::Transcript(LiveVoiceTranscript {
+                role,
+                turn,
+                text: text.to_owned(),
+                final_text,
+            })
+        }
+        Some("live_delegation_created") => {
+            let delegation_id = bounded_non_empty(frame, "delegationId", 256)?;
+            let request = bounded_non_empty(frame, "request", MAX_INBOUND_BYTES)?;
+            LiveVoiceEvent::Delegation {
+                delegation_id: delegation_id.to_owned(),
+                request: request.to_owned(),
+            }
+        }
+        Some("live_ended") => {
+            let error = match frame.get("error") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(error)) => {
+                    let sanitized = sanitize_diagnostic(error);
+                    (!sanitized.is_empty()).then_some(sanitized)
+                }
+                Some(_) => return Err(live_error("ended error must be a string or null")),
+            };
+            LiveVoiceEvent::Ended { error }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
+pub fn live_start_command() -> Value {
+    json!({ "type": "live_start", "delegationMode": "host" })
+}
+
+pub fn live_mute_command(muted: bool) -> Value {
+    json!({ "type": "live_set_muted", "muted": muted })
+}
+
+pub fn live_context_command(
+    delegation_id: &str,
+    kind: LiveVoiceContextKind,
+    text: &str,
+) -> Result<Value, HarnessError> {
+    validate_non_empty("delegation id", delegation_id, 256)?;
+    validate_non_empty("context text", text, MAX_OUTBOUND_BYTES)?;
+    let kind = match kind {
+        LiveVoiceContextKind::Progress => "progress",
+        LiveVoiceContextKind::Final => "final",
+    };
+    Ok(json!({
+        "type": "live_append_context",
+        "delegationId": delegation_id,
+        "kind": kind,
+        "text": text,
+    }))
+}
+
+pub fn live_stop_command() -> Value {
+    json!({ "type": "live_stop" })
+}
+
+fn required_str<'a>(frame: &'a Value, field: &str) -> Result<&'a str, HarnessError> {
+    frame
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| live_error(format!("{field} must be a string")))
+}
+
+fn bounded_non_empty<'a>(
+    frame: &'a Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str, HarnessError> {
+    let value = required_str(frame, field)?;
+    validate_non_empty(field, value, max_bytes)?;
+    Ok(value)
+}
+
+fn validate_non_empty(field: &str, value: &str, max_bytes: usize) -> Result<(), HarnessError> {
+    if value.trim().is_empty() {
+        return Err(live_error(format!("{field} must not be empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(live_error(format!("{field} exceeded {max_bytes} bytes")));
+    }
+    Ok(())
+}
+
+fn required_finite_level(frame: &Value, field: &str) -> Result<f32, HarnessError> {
+    let level = frame
+        .get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| live_error(format!("{field} level must be numeric")))?;
+    if !level.is_finite() {
+        return Err(live_error(format!("{field} level must be finite")));
+    }
+    Ok(level.clamp(0.0, 1.0) as f32)
+}
+
+fn live_error(reason: impl std::fmt::Display) -> HarnessError {
+    HarnessError::Protocol(format!("OMP Live frame {reason}"))
 }
 
 /// Remonta os frames `rpc_chunk` da v2 do protocolo do OMP.

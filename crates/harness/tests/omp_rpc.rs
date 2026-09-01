@@ -8,16 +8,19 @@ use serde_json::{Value, json};
 use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
-    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, parse_frame, sanitize_diagnostic,
+    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command,
+    live_mute_command, live_start_command, live_stop_command, parse_frame, parse_live_event,
+    sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
 use zeron_harness::{
-    CancellationToken, Harness, HarnessError, OmpHarness, RunControls, SteerMessage,
+    CancellationToken, Harness, HarnessError, LiveVoiceContextKind, LiveVoiceEvent, OmpHarness,
+    RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
-    ToolDiff, UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole, ReasoningLevel, RunRequest,
+    SandboxLevel, ToolCall, ToolDiff, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -192,6 +195,111 @@ fn protocol_bounds_and_redacts_frames() {
         "before -----BEGIN RSA PRIVATE KEY-----\nsecret-body\n-----END RSA PRIVATE KEY----- after",
     );
     assert_eq!(pem, "before [redacted private key] after");
+}
+
+#[tokio::test]
+async fn omp_live_protocol_retains_additive_capability() {
+    let supported = OmpProcess::start(fake_launch("live-protocol")).await.unwrap();
+    assert!(supported.capabilities().live_voice);
+    supported.shutdown().await.unwrap();
+
+    let unsupported = OmpProcess::start(fake_launch("no-live-capability"))
+        .await
+        .unwrap();
+    assert!(!unsupported.capabilities().live_voice);
+    unsupported.shutdown().await.unwrap();
+}
+
+#[test]
+fn omp_live_protocol_parses_and_validates_transient_events() {
+    assert_eq!(
+        parse_live_event(&json!({"type":"live_phase","phase":"working"})).unwrap(),
+        Some(LiveVoiceEvent::Phase(LiveVoicePhase::Working))
+    );
+    assert_eq!(
+        parse_live_event(&json!({"type":"live_levels","input":-0.5,"output":1.5})).unwrap(),
+        Some(LiveVoiceEvent::Levels {
+            input: 0.0,
+            output: 1.0,
+        })
+    );
+    assert_eq!(
+        parse_live_event(&json!({
+            "type":"live_transcript",
+            "role":"assistant",
+            "turn":2,
+            "text":"Done",
+            "final":true
+        }))
+        .unwrap(),
+        Some(LiveVoiceEvent::Transcript(
+            zeron_proto::LiveVoiceTranscript {
+                role: LiveVoiceRole::Assistant,
+                turn: 2,
+                text: "Done".into(),
+                final_text: true,
+            }
+        ))
+    );
+    assert_eq!(
+        parse_live_event(&json!({
+            "type":"live_delegation_created",
+            "delegationId":"del-1",
+            "request":"Inspect auth"
+        }))
+        .unwrap(),
+        Some(LiveVoiceEvent::Delegation {
+            delegation_id: "del-1".into(),
+            request: "Inspect auth".into(),
+        })
+    );
+    let ended = parse_live_event(&json!({
+        "type":"live_ended",
+        "error":"Authorization: Bearer token-secret-123"
+    }))
+    .unwrap();
+    assert!(matches!(
+        ended,
+        Some(LiveVoiceEvent::Ended { error: Some(error) })
+            if error == "Authorization=[redacted]"
+    ));
+    assert_eq!(
+        parse_live_event(&json!({"type":"future_additive_event","value":1})).unwrap(),
+        None
+    );
+
+    for malformed in [
+        json!({"type":"live_levels","input":"bad","output":0.5}),
+        json!({"type":"live_transcript","role":"system","turn":1,"text":"bad","final":true}),
+        json!({"type":"live_delegation_created","delegationId":"","request":"bad"}),
+        json!({"type":"live_phase","phase":"future"}),
+    ] {
+        assert!(parse_live_event(&malformed).is_err(), "{malformed}");
+    }
+}
+
+#[test]
+fn omp_live_protocol_encodes_exact_commands() {
+    assert_eq!(
+        live_start_command(),
+        json!({"type":"live_start","delegationMode":"host"})
+    );
+    assert_eq!(
+        live_mute_command(true),
+        json!({"type":"live_set_muted","muted":true})
+    );
+    assert_eq!(
+        live_context_command("del-1", LiveVoiceContextKind::Final, "Fixed").unwrap(),
+        json!({
+            "type":"live_append_context",
+            "delegationId":"del-1",
+            "kind":"final",
+            "text":"Fixed"
+        })
+    );
+    assert_eq!(live_stop_command(), json!({"type":"live_stop"}));
+    assert!(live_context_command("", LiveVoiceContextKind::Progress, "work").is_err());
+    assert!(live_context_command("del-1", LiveVoiceContextKind::Progress, " ").is_err());
 }
 
 #[tokio::test]

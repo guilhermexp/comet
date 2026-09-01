@@ -104,7 +104,11 @@ if [ "$scenario" = "stderr-crash" ]; then
   exit 7
 fi
 
-emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
+if [ "$scenario" = "no-live-capability" ]; then
+  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
+else
+  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"capabilities":{"liveVoice":1}}'
+fi
 
 if [ "$scenario" = "oversized-no-newline" ]; then
   dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\000' x
@@ -192,6 +196,29 @@ while IFS= read -r line; do
       ;;
     abort)
       respond "$line" '{}'
+      ;;
+    live_start)
+      has "$line" '"delegationMode":"host"' || fail_stage live_start 50
+      respond "$line" '{"active":true}'
+      emit '{"type":"live_phase","phase":"connecting"}'
+      emit '{"type":"live_phase","phase":"listening"}'
+      emit '{"type":"live_transcript","role":"user","turn":1,"text":"Inspect auth","final":true}'
+      emit '{"type":"live_delegation_created","delegationId":"del-1","request":"Inspect auth"}'
+      ;;
+    live_set_muted)
+      has "$line" '"muted":true' || fail_stage live_mute 51
+      respond "$line" '{"muted":true}'
+      ;;
+    live_append_context)
+      has "$line" '"delegationId":"del-1"' || fail_stage live_context 52
+      if has "$line" '"kind":"final"'; then
+        emit '{"type":"live_phase","phase":"listening"}'
+      fi
+      respond "$line" '{"delegationId":"del-1"}'
+      ;;
+    live_stop)
+      respond "$line" '{"active":false}'
+      emit '{"type":"live_ended","error":null}'
       ;;
     prompt)
       respond "$line" '{"agentInvoked":true}'

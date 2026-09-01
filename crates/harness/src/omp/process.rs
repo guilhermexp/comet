@@ -96,10 +96,17 @@ struct Inner {
     frames_before_ready: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OmpCapabilities {
+    pub chunked_frames: bool,
+    pub live_voice: bool,
+}
+
 pub struct OmpProcess {
     inner: Arc<Inner>,
     child: Arc<tokio::sync::Mutex<Child>>,
     events: Arc<Mutex<Option<mpsc::Receiver<Value>>>>,
+    capabilities: OmpCapabilities,
 }
 
 impl Clone for OmpProcess {
@@ -108,6 +115,7 @@ impl Clone for OmpProcess {
             inner: Arc::clone(&self.inner),
             child: Arc::clone(&self.child),
             events: Arc::clone(&self.events),
+            capabilities: self.capabilities,
         }
     }
 }
@@ -241,18 +249,20 @@ impl OmpProcess {
             frames_before_ready: AtomicU64::new(0),
         });
         let (event_tx, event_rx) = mpsc::channel(256);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<bool, String>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<OmpCapabilities, String>>();
         let reader_inner = Arc::clone(&inner);
         tokio::spawn(read_stdout(stdout, reader_inner, event_tx, ready_tx));
 
-        let process = Self {
+        let mut process = Self {
             inner,
             child: Arc::new(tokio::sync::Mutex::new(child)),
             events: Arc::new(Mutex::new(Some(event_rx))),
+            capabilities: OmpCapabilities::default(),
         };
         match tokio::time::timeout(launch.handshake_timeout, ready_rx).await {
-            Ok(Ok(Ok(chunked_frames))) => {
-                if chunked_frames {
+            Ok(Ok(Ok(capabilities))) => {
+                process.capabilities = capabilities;
+                if capabilities.chunked_frames {
                     process.negotiate_chunked_frames().await;
                 }
                 Ok(process)
@@ -292,6 +302,10 @@ impl OmpProcess {
                 )))
             }
         }
+    }
+
+    pub fn capabilities(&self) -> OmpCapabilities {
+        self.capabilities
     }
 
     /// Pede a v2 do protocolo, a que parte um frame acima de 1 MiB em
@@ -424,7 +438,7 @@ async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     inner: Arc<Inner>,
     event_tx: mpsc::Sender<Value>,
-    ready_tx: oneshot::Sender<Result<bool, String>>,
+    ready_tx: oneshot::Sender<Result<OmpCapabilities, String>>,
 ) {
     let mut ready_tx = Some(ready_tx);
     // `event_rx` so e retirado do processo DEPOIS que `start` retorna, entao
@@ -484,7 +498,7 @@ async fn read_stdout(
         match frame.get("type").and_then(Value::as_str) {
             Some("ready") => {
                 if let Some(ready) = ready_tx.take() {
-                    let _ = ready.send(Ok(supports_chunked_frames(&frame)));
+                    let _ = ready.send(Ok(parse_capabilities(&frame)));
                 }
                 // O receptor so comeca a ser drenado depois do handshake:
                 // segurar os frames aqui e o que impede o bloqueio descrito em
@@ -561,14 +575,20 @@ where
     }
 }
 
-/// O `ready` anuncia as versoes de protocolo que o filho aceita; a v2 e a que
-/// parte frames grandes em `rpc_chunk`. Um `omp` que nao anuncia nada fica em
-/// v1 e nunca recebe um `negotiate_protocol` que ele nao entenderia.
-fn supports_chunked_frames(ready: &Value) -> bool {
-    ready
-        .get("supportedProtocolVersions")
-        .and_then(Value::as_array)
-        .is_some_and(|versions| versions.iter().any(|version| version.as_u64() == Some(2)))
+/// The ready frame advertises additive capabilities. Protocol v2 enables
+/// chunked frames; Live Voice is supported only by the exact numeric version 1.
+fn parse_capabilities(ready: &Value) -> OmpCapabilities {
+    OmpCapabilities {
+        chunked_frames: ready
+            .get("supportedProtocolVersions")
+            .and_then(Value::as_array)
+            .is_some_and(|versions| versions.iter().any(|version| version.as_u64() == Some(2))),
+        live_voice: ready
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("liveVoice"))
+            .and_then(Value::as_u64)
+            == Some(1),
+    }
 }
 
 fn route_response(inner: &Inner, frame: Value) {
@@ -635,6 +655,22 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn omp_live_protocol_capability_requires_numeric_one() {
+        assert!(parse_capabilities(&json!({
+            "capabilities": { "liveVoice": 1 }
+        }))
+        .live_voice);
+        for unsupported in [
+            json!({}),
+            json!({ "capabilities": null }),
+            json!({ "capabilities": { "liveVoice": true } }),
+            json!({ "capabilities": { "liveVoice": 2 } }),
+        ] {
+            assert!(!parse_capabilities(&unsupported).live_voice);
+        }
+    }
     #[test]
     fn the_skill_scope_overlay_is_nested_yaml_and_idempotent() {
         let first = skill_scope_overlay().unwrap();
