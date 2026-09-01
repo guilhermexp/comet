@@ -1,0 +1,2 @@
+[env]
+OMP_EXECUTABLE = { value = "scripts/omp-dev", relative = true }

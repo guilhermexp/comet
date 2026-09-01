@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+omp_source=${ZERON_OMP_SOURCE_DIR:-"$script_dir/../../oh-my-pi"}
+omp_cli="$omp_source/packages/coding-agent/src/cli.ts"
+
+if [ -x "$omp_cli" ]; then
+  exec "$omp_cli" "$@"
+fi
+
+exec omp "$@"
