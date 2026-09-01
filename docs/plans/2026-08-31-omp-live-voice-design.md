@@ -45,13 +45,15 @@ Comet LiveVoiceRuntime ── OMP Live child
               └──────── existing SessionsEngine folding ─┘
 ```
 
-The two child processes have intentionally different ownership:
+The two child processes share one native OMP session identity but retain different write ownership:
 
-- the Live child is an ephemeral voice frontend and never writes the Chat's native OMP session;
-- the run child follows the existing Comet path, resumes the Chat's `sessionFile`, and owns all durable coding work;
+- the Live child resumes the Chat's native OMP session before connecting realtime voice;
+- for a new Chat, the Live child creates a normal OMP session and Comet records its identity immediately;
+- the Live child remains a media and conversational frontend in host-delegation mode: it does not execute tools or persist casual voice turns;
+- the run child follows the existing durable Comet path, resumes that same session, and remains the only writer for coding work;
 - progress and the final backend result return to the Live child as text-only context append commands.
 
-This preserves Comet's command-ledger, Run Journal, folding, and session invariants instead of creating a second agent-run pipeline.
+This gives voice and text one OMP conversation identity while preserving Comet's command ledger, Run Journal, folding, and single-writer execution invariants.
 
 ## Alternatives rejected
 
@@ -168,14 +170,16 @@ OMP permits only one unresolved host delegation. Comet sends context only with t
 
 Before `live_start`, Comet:
 
-1. launches an ephemeral `omp --mode rpc-ui` child in the Chat Checkout cwd;
-2. negotiates RPC protocol v2;
-3. verifies the `liveVoice` ready capability;
-4. issues `live_start` with `delegationMode: "host"`.
+1. launches a normal `omp --mode rpc-ui` child in the Chat Checkout cwd;
+2. negotiates RPC protocol v2 and verifies the `liveVoice` ready capability;
+3. sends `switch_session` when the Chat already has an OMP session;
+4. reads `get_state` and requires a non-empty session identity;
+5. issues `live_start` with `delegationMode: "host"`;
+6. records the returned session identity on the Chat.
 
-The Live child does not resume the Chat's native `sessionFile`, register coding host tools, or apply the Chat's backend model/thinking selection. Those steps remain on the existing per-run `OmpHarness` path after Comet durably queues a delegation.
+The Live child resumes the Chat's native session but does not register coding host tools, trigger internal `AgentSession` turns, or persist casual voice transcripts. Those mutations remain on the existing per-run `OmpHarness` path after Comet durably queues a delegation.
 
-The Live child persists between delegations. Each backend run uses Comet's ordinary OMP process lifecycle and native session resume, so compaction, tools, subagents, questions, model context, and session persistence remain existing behavior.
+For a new Chat, the normal RPC child creates the first OMP session; Comet stores that identity before exposing Live as active. The Live child persists between delegations. Each backend run resumes the same identity through Comet's ordinary process lifecycle, so compaction, tools, subagents, questions, model context, and session persistence remain existing behavior.
 
 ## Comet harness boundary
 
@@ -202,7 +206,7 @@ The engine owns at most one device-local `LiveVoiceRuntime`:
 ```text
 LiveVoiceRuntime
 ├── chat_id
-├── ephemeral OMP Live handle
+├── session-bound OMP Live handle
 ├── phase
 ├── active delegation + owned command id
 ├── control sender
@@ -287,7 +291,7 @@ send live_stop
 → send session.close
 → close sideband
 → close WebRTC and playback
-→ shut down the ephemeral Live child
+→ shut down the session-bound Live child
 → clear runtime
 → notify UI
 ```
@@ -349,6 +353,7 @@ No audio is recorded to disk. Diagnostics must not log OAuth tokens, attestation
 
 - Missing or expired Codex OAuth: actionable error directing the user to OMP/Codex account login.
 - Microphone permission denied: explicit permission error; no Chat entry.
+- Session resume cancellation or missing OMP session identity: fail Live startup before exposing an active call.
 - Signaling or sideband failure before delegation: ephemeral Live error only.
 - Live child exit during a backend run: stop the Live surface; allow the already-durable normal run to finish and retain its transcript.
 - Backend run failure: preserve existing run error folding and send a final failure context to Live when the Live child is still connected.
@@ -378,11 +383,13 @@ No audio is recorded to disk. Diagnostics must not log OAuth tokens, attestation
 A fake OMP RPC fixture proves:
 
 - capability discovery;
-- the Live child starts without `switch_session`, model setup, or host-tool registration;
+- the Live child switches to an existing Chat session before `live_start`;
+- a new Chat returns a session identity that the engine can persist;
+- the Live child starts without model setup or host-tool registration;
 - transient phase/transcript/delegation parsing;
 - progress and final context append encoding;
-- two serial delegations reuse one Live child;
-- ordinary backend runs still use the existing OMP setup and normalizer;
+- two serial delegations reuse one session-bound Live child;
+- ordinary backend runs still resume the same OMP session and use the existing normalizer;
 - stop and unexpected Live child exit produce deterministic terminal events.
 
 ### Engine tests
@@ -393,6 +400,8 @@ A fake OMP RPC fixture proves:
 - a different durable command stops Live before execution;
 - assistant text, tools, questions, and subagents use the unchanged SessionsEngine folding;
 - progress/final text returns through the Live control channel without a second durable assistant entry;
+- Live start resumes an existing Chat session or records the new session identity;
+- the next normal text run resumes the same identity created or selected by Live;
 - backend run failure remains durable even if the Live child exits;
 - remote Chat, non-OMP Chat, unsupported OMP, active backend run, and concurrent Live are rejected;
 - UI disconnect and engine shutdown release the runtime.
@@ -424,6 +433,7 @@ From the signed Finder-launched app:
 - Live is offered only for a supported local OMP Chat.
 - Comet reuses OMP's Codex OAuth and Live media implementation.
 - Casual voice conversation remains transient.
+- Voice and text use the same native OMP session identity for the Chat.
 - Delegated work appears exactly once in the durable Chat Transcript.
 - Backend tools and final output retain existing Comet behavior.
 - The spoken result does not duplicate the durable assistant response.
