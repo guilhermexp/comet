@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn provider_telemetry_refreshes_on_binding_change_and_stop() {
-        let _lock = ENV_LOCK.lock().expect("environment test lock");
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let state_home = tempfile::tempdir().expect("temporary Unpeel home");
         let user_home = tempfile::tempdir().expect("temporary user home");
         let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
@@ -763,6 +763,85 @@ mod tests {
                 .total_tokens,
             15
         );
+    }
+
+    #[test]
+    fn provider_telemetry_hard_rejection_removes_current_marker() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        std::fs::create_dir_all(state_home.path().join("app-sessions/worker-1"))
+            .expect("worker session directory");
+        let omp_root = user_home.path().join(".omp/agent/sessions/project");
+        std::fs::create_dir_all(&omp_root).expect("OMP Session root");
+        let transcript = omp_root.join("provider.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session\",\"id\":\"omp-provider-1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"p\",\"model\":\"m\",\"usage\":{\"totalTokens\":10}}}\n",
+        )
+        .expect("write valid OMP transcript");
+        let manifest = omp_manifest("worker-1");
+        let event = HookEvent {
+            session_id: "worker-1".into(),
+            event_name: "Stop".into(),
+            tool_name: None,
+            provider_session_id: Some("omp-provider-1".into()),
+            provider_transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            runtime_generation: Some(1),
+            received_at: SystemTime::UNIX_EPOCH,
+        };
+        update_provider_telemetry(&event, &manifest);
+        assert!(unpeel_core::session_telemetry::load("worker-1").is_some());
+
+        let padding = "x".repeat(1024 * 1024 - 32);
+        let mut oversized = String::from("{\"type\":\"session\",\"id\":\"omp-provider-1\"}\n");
+        for _ in 0..17 {
+            oversized.push_str(&format!("{{\"padding\":\"{padding}\"}}\n"));
+        }
+        std::fs::write(&transcript, oversized).expect("write oversized OMP transcript");
+
+        update_provider_telemetry(&event, &manifest);
+
+        assert!(unpeel_core::session_telemetry::load("worker-1").is_none());
+    }
+
+    #[test]
+    fn provider_telemetry_is_bound_to_the_canonical_transcript_path() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        std::fs::create_dir_all(state_home.path().join("app-sessions/worker-1"))
+            .expect("worker session directory");
+        let omp_root = user_home.path().join(".omp/agent/sessions/project");
+        std::fs::create_dir_all(&omp_root).expect("OMP Session root");
+        let first = omp_root.join("first.jsonl");
+        let second = omp_root.join("second.jsonl");
+        let body = "{\"type\":\"session\",\"id\":\"omp-provider-1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"p\",\"model\":\"m\",\"usage\":{\"totalTokens\":10}}}\n";
+        std::fs::write(&first, body).expect("write first OMP transcript");
+        std::fs::write(&second, body).expect("write second OMP transcript");
+        let manifest = omp_manifest("worker-1");
+        let first_event = HookEvent {
+            session_id: "worker-1".into(),
+            event_name: "Stop".into(),
+            tool_name: None,
+            provider_session_id: Some("omp-provider-1".into()),
+            provider_transcript_path: Some(first.to_string_lossy().into_owned()),
+            runtime_generation: Some(1),
+            received_at: SystemTime::UNIX_EPOCH,
+        };
+        update_provider_telemetry(&first_event, &manifest);
+        assert!(unpeel_core::session_telemetry::load("worker-1").is_some());
+
+        unpeel_core::session_ops::set_provider_session(
+            "worker-1",
+            Some("omp-provider-1"),
+            Some(&second.to_string_lossy()),
+        )
+        .expect("change provider transcript path");
+
+        assert!(unpeel_core::session_telemetry::load("worker-1").is_none());
     }
 
     #[test]

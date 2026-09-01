@@ -57,14 +57,16 @@ misattributed.
 
 ### D3 — Core validates and persists; the runtime adapter normalizes
 
-Provider-specific JSONL interpretation lives with the OMP runtime package.
-Provider-neutral core owns canonical trusted-root validation, symlink-escape
-rejection, bounded reads, atomic marker replacement, and runtime dispatch. The
-OMP parser accepts at most 2 MiB per line, 16 MiB total, 100,000 records, and
-128 effective models, and requires the JSONL Session id to equal the persisted
-provider binding. The marker carries that binding; a failed refresh preserves
-the last valid marker only while the binding remains unchanged, and loads hide
-markers from any previous binding.
+Provider-specific JSONL interpretation and trusted-root validation live with the
+OMP runtime package. The adapter resolves the exact OMP `sessions` directory for
+the default agent directory, `PI_CODING_AGENT_DIR`, named profiles, and existing
+XDG data roots, then rejects non-JSONL files and canonical paths that escape it.
+The parser accepts at most 2 MiB per line, 16 MiB total, 100,000 records, and 128
+effective models, and requires the JSONL Session id to equal the persisted
+provider binding. Provider-neutral core atomically stores the projection bound
+to both that id and the canonical transcript path. A transient read failure
+preserves the last valid same-binding marker, while a trust or budget rejection
+removes it; loads hide markers after either binding component changes.
 
 Alternative considered: parse OMP JSONL directly in Comet's UI/frontier.
 Rejected because it leaks provider behavior across the vendored boundary and
@@ -101,9 +103,9 @@ terminal access.
 
 ## Risks / Trade-offs
 
-- [OMP changes its JSONL schema] → Ignore unknown/malformed records, keep the
-  last valid same-binding projection, and lock supported shapes with provider
-  fixtures.
+- [OMP changes its JSONL schema] → Ignore unknown/malformed records and lock
+  supported shapes with provider fixtures; definitive validation rejection
+  removes the current projection.
 - [A path claim escapes the provider Session root] → Canonicalize both root and
   candidate, reject symlink escape and non-JSONL files before reading.
 - [A lifecycle refresh sees a partially appended JSONL line] → Ignore that

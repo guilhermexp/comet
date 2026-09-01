@@ -43,8 +43,9 @@ Test: integration — Worker lifecycle hook ingress and durable provider binding
   transcript path for a URL-addressed Worker Session
 - **THEN** the provider metadata is persisted for that Worker without replacing
   or confusing the Worker Session identity
-- **AND** only a canonical provider JSONL path beneath the trusted OMP Session
-  root can contribute telemetry
+- **AND** only a canonical provider JSONL path beneath the exact OMP `sessions`
+  directory resolved for the active default, custom-agent, named-profile, or
+  existing XDG data layout can contribute telemetry
 - **AND** the JSONL `session` record declares the same provider conversation id
   persisted for that Worker
 
@@ -53,6 +54,7 @@ Test: unit — OMP JSONL byte, record, and distinct-model bounds.
 
 - **WHEN** an OMP transcript exceeds any configured byte, record, or model bound
 - **THEN** no model usage projection is produced from that transcript
+- **AND** any prior projection for that same binding is removed
 - **AND** Worker lifecycle and command fallback remain available
 
 ### Requirement: Worker model usage degrades without disrupting the Worker
@@ -72,11 +74,19 @@ Test: unit — parser tolerance, optional wire decode, and UI fallback.
   unchanged
 
 #### Scenario: The provider conversation binding changes
-Test: unit — provider-bound marker load and failed-refresh preservation.
+Test: unit — provider-id and canonical-path-bound marker load.
 
-- **WHEN** a Worker changes from one provider conversation id to another and the
-  new telemetry refresh is unavailable or rejected
+- **WHEN** a Worker's provider conversation id or canonical transcript path
+  changes
 - **THEN** telemetry stored for the previous provider conversation is not exposed
+- **AND** the Worker retains its command-only fallback
+
+#### Scenario: Current provider evidence is definitively rejected
+Test: integration — lifecycle refresh after trusted-path or budget rejection.
+
+- **WHEN** the current binding's transcript fails trusted-path or parsing-budget
+  validation after a prior successful refresh
+- **THEN** the prior projection is removed
 - **AND** the Worker retains its command-only fallback
 
 #### Scenario: An older or non-OMP Session has no telemetry fields

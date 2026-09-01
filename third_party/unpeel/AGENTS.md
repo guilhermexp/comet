@@ -626,10 +626,12 @@ Core behavior:
   from the URL-addressed Worker Session. The OMP adapter alone interprets its
   provider-owned JSONL; it requires the JSONL `session` id to match that binding
   and rejects input above 2 MiB per line, 16 MiB total, 100,000 records, or 128
-  effective models. Core canonicalizes the claimed path beneath the trusted OMP
-  Session root and atomically stores only provider-bound total/per-model tokens.
-  Refresh failure preserves the last valid projection only for the same provider
-  binding and never blocks the lifecycle event.
+  effective models. The adapter accepts only canonical JSONL beneath the exact
+  OMP `sessions` directory resolved for the default agent, custom agent dir,
+  named profile, or existing XDG data root. Core atomically stores only
+  total/per-model tokens bound to provider id and canonical transcript path.
+  Transient read failure preserves the same-binding projection; trust or budget
+  rejection removes it. Neither failure blocks the lifecycle event.
 
 Common env used by hooks:
 
@@ -773,8 +775,8 @@ presentation/setup metadata. Keep only provider-neutral enforcement in core
 and clients.
 
 Provider telemetry follows the same boundary: runtime adapters own schema
-normalization and fixtures; core owns trusted-path validation, bounded reads,
-atomic provider-binding-aware projection persistence and optional Host fields.
+normalization, trusted-path validation, bounded reads, and fixtures; core owns
+atomic provider-id/path-aware projection persistence and optional Host fields.
 Do not infer model or tokens from terminal output, launch configuration, cost
 fields, or global provider settings.
 

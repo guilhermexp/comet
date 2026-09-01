@@ -14,9 +14,11 @@
   saturation, and current-first ordering.
 - [x] 2.2 Add RED core tests for trusted-root and JSONL validation, provider-id
   mismatch, byte/record/model bounds, symlink escape rejection, atomic marker
-  replacement, and same-binding last-valid preservation.
+  replacement, canonical-path binding, hard-rejection invalidation, and
+  transient same-binding last-valid preservation.
 - [x] 2.3 Implement the provider-neutral telemetry types/persistence seam and
-  the OMP runtime normalizer with provider-bound, bounded, fail-soft parsing.
+  the OMP runtime normalizer with official Session-root resolution,
+  provider-id/path binding, bounded parsing, and fail-soft lifecycle handling.
 - [x] 2.4 Refresh the durable projection only after provider metadata changes or
   accepted Stop lifecycle events, then run runtime and ingress tests to GREEN.
 

@@ -1,5 +1,5 @@
 use crate::session_host::HostedSessionManifest;
-use crate::session_telemetry::{ModelTokenUsage, SessionTelemetry};
+use crate::session_telemetry::{ModelTokenUsage, SessionTelemetry, SessionTelemetryReadError};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, Read};
@@ -103,13 +103,26 @@ fn trusted_jsonl_path(path: &Path, root: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(test)]
 pub(crate) fn read_path(
     path: &Path,
     root: &Path,
     expected_provider_session_id: &str,
 ) -> Result<Option<SessionTelemetry>, String> {
-    let path = trusted_jsonl_path(path, root)?;
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    read_path_typed(path, root, expected_provider_session_id).map_err(|error| match error {
+        SessionTelemetryReadError::Rejected(error)
+        | SessionTelemetryReadError::Unavailable(error) => error,
+    })
+}
+
+fn read_path_typed(
+    path: &Path,
+    root: &Path,
+    expected_provider_session_id: &str,
+) -> Result<Option<SessionTelemetry>, SessionTelemetryReadError> {
+    let path = trusted_jsonl_path(path, root).map_err(SessionTelemetryReadError::Rejected)?;
+    let file = std::fs::File::open(path)
+        .map_err(|error| SessionTelemetryReadError::Unavailable(error.to_string()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut latest_model = None;
     let mut latest_thinking = None;
@@ -124,20 +137,26 @@ pub(crate) fn read_path(
             .by_ref()
             .take(MAX_JSONL_LINE_BYTES + 1)
             .read_until(b'\n', &mut line)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| SessionTelemetryReadError::Unavailable(error.to_string()))?;
         if read == 0 {
             break;
         }
         if read as u64 > MAX_JSONL_LINE_BYTES {
-            return Err("OMP telemetry JSONL line exceeds the read bound".into());
+            return Err(SessionTelemetryReadError::Rejected(
+                "OMP telemetry JSONL line exceeds the read bound".into(),
+            ));
         }
         total_bytes = total_bytes.saturating_add(read as u64);
         if total_bytes > MAX_JSONL_TOTAL_BYTES {
-            return Err("OMP telemetry JSONL exceeds the total read bound".into());
+            return Err(SessionTelemetryReadError::Rejected(
+                "OMP telemetry JSONL exceeds the total read bound".into(),
+            ));
         }
         records = records.saturating_add(1);
         if records > MAX_JSONL_RECORDS {
-            return Err("OMP telemetry JSONL exceeds the record bound".into());
+            return Err(SessionTelemetryReadError::Rejected(
+                "OMP telemetry JSONL exceeds the record bound".into(),
+            ));
         }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
@@ -148,9 +167,15 @@ pub(crate) fn read_path(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
-                .ok_or_else(|| "OMP telemetry Session record has no id".to_string())?;
+                .ok_or_else(|| {
+                    SessionTelemetryReadError::Rejected(
+                        "OMP telemetry Session record has no id".into(),
+                    )
+                })?;
             if declared_id != expected_provider_session_id {
-                return Err("OMP telemetry Session id does not match the provider binding".into());
+                return Err(SessionTelemetryReadError::Rejected(
+                    "OMP telemetry Session id does not match the provider binding".into(),
+                ));
             }
             session_validated = true;
         }
@@ -160,10 +185,13 @@ pub(crate) fn read_path(
             &mut latest_thinking,
             &mut active_model,
             &mut totals,
-        )?;
+        )
+        .map_err(SessionTelemetryReadError::Rejected)?;
     }
     if !session_validated {
-        return Err("OMP telemetry JSONL has no matching Session record".into());
+        return Err(SessionTelemetryReadError::Rejected(
+            "OMP telemetry JSONL has no matching Session record".into(),
+        ));
     }
     let Some(active_model) = active_model else {
         return Ok(None);
@@ -190,15 +218,93 @@ pub(crate) fn read_path(
     }))
 }
 
-fn omp_root() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+fn nonempty_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn command_profile(command: &str) -> Option<String> {
+    let words = crate::transcripts::shell_words(command);
+    let mut profile = None;
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if word == "--profile" {
+            profile = words.next().cloned();
+        } else if let Some(value) = word.strip_prefix("--profile=") {
+            profile = Some(value.to_owned());
+        }
+    }
+    profile
+}
+
+fn profile_name(command: &str) -> Result<Option<String>, String> {
+    let profile = command_profile(command)
+        .or_else(|| std::env::var("OMP_PROFILE").ok())
+        .or_else(|| std::env::var("PI_PROFILE").ok());
+    let Some(profile) = profile.map(|value| value.trim().to_owned()) else {
+        return Ok(None);
+    };
+    if profile.is_empty() || profile == "default" {
+        return Ok(None);
+    }
+    let valid = profile.len() <= 64
+        && profile != "."
+        && profile != ".."
+        && !profile.ends_with('.')
+        && profile.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' => index > 0,
+            _ => false,
+        });
+    if !valid {
+        return Err("invalid OMP profile name".into());
+    }
+    Ok(Some(profile))
+}
+
+fn omp_sessions_root(command: &str) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
-        .map(|home| home.join(".omp").join("agent"))
+        .ok_or_else(|| "could not resolve OMP Session root".to_string())?;
+    let config_root = nonempty_env("PI_CONFIG_DIR")
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                home.join(path)
+            }
+        })
+        .unwrap_or_else(|| home.join(".omp"));
+    let xdg_root = nonempty_env("XDG_DATA_HOME").map(|path| path.join("omp"));
+    if let Some(profile) = profile_name(command)? {
+        if let Some(root) = xdg_root
+            .as_ref()
+            .map(|root| root.join("profiles").join(&profile))
+            .filter(|root| root.is_dir())
+        {
+            return Ok(root.join("sessions"));
+        }
+        return Ok(config_root
+            .join("profiles")
+            .join(profile)
+            .join("agent")
+            .join("sessions"));
+    }
+    if let Some(agent_dir) = nonempty_env("PI_CODING_AGENT_DIR") {
+        return Ok(agent_dir.join("sessions"));
+    }
+    if let Some(root) = xdg_root.filter(|root| root.is_dir()) {
+        return Ok(root.join("sessions"));
+    }
+    Ok(config_root.join("agent").join("sessions"))
 }
 
-pub(crate) fn read(manifest: &HostedSessionManifest) -> Result<Option<SessionTelemetry>, String> {
+pub(crate) fn read(
+    manifest: &HostedSessionManifest,
+) -> Result<Option<SessionTelemetry>, SessionTelemetryReadError> {
     let (provider_session_id, provider_transcript_path) =
         crate::session_ops::provider_session_marker(&manifest.session.id);
     let provider_session_id = provider_session_id.or_else(|| manifest.provider_session_id.clone());
@@ -206,13 +312,111 @@ pub(crate) fn read(manifest: &HostedSessionManifest) -> Result<Option<SessionTel
     let (Some(provider_session_id), Some(path)) = (provider_session_id, path) else {
         return Ok(None);
     };
-    let root = omp_root().ok_or_else(|| "could not resolve OMP Session root".to_string())?;
-    read_path(Path::new(&path), &root, &provider_session_id)
+    let root = omp_sessions_root(&manifest.session.command)
+        .map_err(SessionTelemetryReadError::Rejected)?;
+    read_path_typed(Path::new(&path), &root, &provider_session_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn set(entries: &[(&'static str, Option<&Path>)]) -> Self {
+            let previous = entries
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in entries {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn manifest(command: &str, transcript: &Path) -> HostedSessionManifest {
+        HostedSessionManifest {
+            session: crate::state::SessionInfo {
+                id: "worker-1".into(),
+                project_id: "project-1".into(),
+                label: "OMP".into(),
+                custom_title: false,
+                command: command.into(),
+                created_at: 1,
+                tag_id: None,
+                worktree_path: None,
+                worktree_branch: None,
+                parent_session_id: None,
+                spawned_by: None,
+                role: None,
+                task: None,
+            },
+            cwd: "/tmp".into(),
+            state: crate::session_host::HostedSessionState::Running,
+            pid: None,
+            pid_started_at: None,
+            exit_code: None,
+            host_build_id: None,
+            host_protocol_version: None,
+            has_been_written_to: true,
+            provider_session_id: Some("omp-1".into()),
+            provider_transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            managed_storage_path: None,
+            resume_failure_markers: Vec::new(),
+            runtime: None,
+            runtime_launch_generation: 1,
+            runtime_launch_pending: false,
+            runtime_launched_at: Some(1),
+            runtime_launch_output_offset: 0,
+            mcp_enabled: None,
+            browser_mcp_enabled: None,
+            computer_mcp_enabled: None,
+            mcp_client_registered: false,
+            browser_client_registered: false,
+            computer_client_registered: false,
+            menu_prompt_active: false,
+            screen_changed_at: None,
+            detected_local_urls: Vec::new(),
+            heartbeat_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn write_usage_transcript(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("transcript parent"))
+            .expect("create transcript directory");
+        std::fs::write(
+            path,
+            "{\"type\":\"session\",\"id\":\"omp-1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"p\",\"model\":\"m\",\"usage\":{\"totalTokens\":1}}}\n",
+        )
+        .expect("write OMP transcript");
+    }
 
     #[test]
     fn normalizes_ordered_omp_model_usage() {
@@ -355,5 +559,87 @@ mod tests {
         std::fs::write(&transcript, body).expect("write model-heavy transcript");
 
         assert!(read_path(&transcript, root.path(), "omp-1").is_err());
+    }
+
+    #[test]
+    fn rejects_jsonl_beside_the_sessions_directory() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let unpeel_home = tempfile::tempdir().expect("Unpeel home");
+        let home = tempfile::tempdir().expect("user home");
+        let _env = EnvGuard::set(&[
+            ("UNPEEL_HOME", Some(unpeel_home.path())),
+            ("HOME", Some(home.path())),
+            ("PI_CODING_AGENT_DIR", None),
+            ("OMP_PROFILE", None),
+            ("PI_PROFILE", None),
+            ("XDG_DATA_HOME", None),
+            ("PI_CONFIG_DIR", None),
+        ]);
+        let transcript = home.path().join(".omp/agent/not-a-session.jsonl");
+        write_usage_transcript(&transcript);
+
+        assert!(read(&manifest("omp", &transcript)).is_err());
+    }
+
+    #[test]
+    fn resolves_custom_profile_and_xdg_session_roots() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let unpeel_home = tempfile::tempdir().expect("Unpeel home");
+        let home = tempfile::tempdir().expect("user home");
+        let custom_agent = home.path().join("custom-agent");
+        let xdg = home.path().join("xdg-data");
+
+        let custom_transcript = custom_agent.join("sessions/project/custom.jsonl");
+        write_usage_transcript(&custom_transcript);
+        {
+            let _env = EnvGuard::set(&[
+                ("UNPEEL_HOME", Some(unpeel_home.path())),
+                ("HOME", Some(home.path())),
+                ("PI_CODING_AGENT_DIR", Some(custom_agent.as_path())),
+                ("OMP_PROFILE", None),
+                ("PI_PROFILE", None),
+                ("XDG_DATA_HOME", None),
+                ("PI_CONFIG_DIR", None),
+            ]);
+            assert!(read(&manifest("omp", &custom_transcript))
+                .expect("custom agent telemetry")
+                .is_some());
+        }
+
+        let profile_transcript = home
+            .path()
+            .join(".omp/profiles/work/agent/sessions/project/profile.jsonl");
+        write_usage_transcript(&profile_transcript);
+        {
+            let _env = EnvGuard::set(&[
+                ("UNPEEL_HOME", Some(unpeel_home.path())),
+                ("HOME", Some(home.path())),
+                ("PI_CODING_AGENT_DIR", Some(custom_agent.as_path())),
+                ("OMP_PROFILE", None),
+                ("PI_PROFILE", None),
+                ("XDG_DATA_HOME", None),
+                ("PI_CONFIG_DIR", None),
+            ]);
+            assert!(read(&manifest("omp --profile work", &profile_transcript))
+                .expect("named profile telemetry")
+                .is_some());
+        }
+
+        let xdg_transcript = xdg.join("omp/profiles/work/sessions/project/xdg.jsonl");
+        write_usage_transcript(&xdg_transcript);
+        {
+            let _env = EnvGuard::set(&[
+                ("UNPEEL_HOME", Some(unpeel_home.path())),
+                ("HOME", Some(home.path())),
+                ("PI_CODING_AGENT_DIR", Some(custom_agent.as_path())),
+                ("OMP_PROFILE", None),
+                ("PI_PROFILE", None),
+                ("XDG_DATA_HOME", Some(xdg.as_path())),
+                ("PI_CONFIG_DIR", None),
+            ]);
+            assert!(read(&manifest("omp --profile=work", &xdg_transcript))
+                .expect("XDG profile telemetry")
+                .is_some());
+        }
     }
 }
