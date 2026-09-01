@@ -110,6 +110,19 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o ramo deixa o
   diretorio do repo vazio para tras e a contagem cresce a cada rodada (cresceu,
   16 vezes, antes do `Drop` do fixture cobrir o pai).
+- **A família pi retoma por id, e `--continue` só sob diretório pinado.** `omp`
+  e `prime-agent` compartilham a receita de resume em
+  `third_party/unpeel/runtimes/_shared/pi-family/adapter/resume.rs`: aceitam
+  `-c/--continue`, `-r/--resume <id>`, `--session-dir` e `--no-session`, e **não**
+  têm `--session` nem `--fork` — copiar a receita do `pi` gera comando inválido.
+  Todo Worker novo da família nasce com `--session-dir
+  <unpeel_home>/pi-sessions/<session_id>` pinado, e é isso que torna
+  `--continue` exato: sem diretório pinado ele pegaria a conversa mais recente
+  do worktree compartilhado, que na máquina de desenvolvimento é de outro
+  Worker. Por isso sessão legada sem marker e sem diretório reinicia limpa em
+  vez de continuar. As capabilities `resume`/`restart_agent` vivem no
+  `runtime.toml` de cada runtime, e `runtime_catalog_resume_capabilities_match_adapter_callbacks`
+  (em `unpeel-core`) fica vermelho se a declaração e o adapter divergirem.
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -244,7 +257,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
-| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (3), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
+| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (5) | integration | `--test hook_migration` |
 
 ## Child DOX Index

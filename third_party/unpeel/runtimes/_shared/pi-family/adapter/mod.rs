@@ -7,6 +7,13 @@ pub(crate) mod setup {
     ));
 }
 
+pub(crate) mod resume {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../runtimes/_shared/pi-family/adapter/resume.rs"
+    ));
+}
+
 pub(crate) fn startup_command(command: &str) -> String {
     let trimmed = command.trim();
     let head = shared::command_head(trimmed);
@@ -30,6 +37,7 @@ fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> Str
 pub(crate) const INTEGRATION: Integration =
     Integration::new(Some(setup::install_lifecycle_extension), None)
         .with_startup_command(prepare_startup_command)
+        .with_resume_adapter(resume::ADAPTER)
         .with_session_telemetry(SESSION_TELEMETRY_READER);
 
 #[cfg(test)]
