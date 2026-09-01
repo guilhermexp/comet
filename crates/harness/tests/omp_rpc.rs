@@ -8,9 +8,8 @@ use serde_json::{Value, json};
 use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
-    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command,
-    live_mute_command, live_start_command, live_stop_command, parse_frame, parse_live_event,
-    sanitize_diagnostic,
+    ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command, live_mute_command,
+    live_start_command, live_stop_command, parse_frame, parse_live_event, sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
@@ -199,7 +198,9 @@ fn protocol_bounds_and_redacts_frames() {
 
 #[tokio::test]
 async fn omp_live_protocol_retains_additive_capability() {
-    let supported = OmpProcess::start(fake_launch("live-protocol")).await.unwrap();
+    let supported = OmpProcess::start(fake_launch("live-protocol"))
+        .await
+        .unwrap();
     assert!(supported.capabilities().live_voice);
     supported.shutdown().await.unwrap();
 

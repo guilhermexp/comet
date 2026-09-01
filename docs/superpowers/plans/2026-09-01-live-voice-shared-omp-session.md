@@ -313,7 +313,7 @@ Expected for this branch: the repository-wide gate may still fail on pre-existin
 - [ ] **Step 4: Package and verify the signed app**
 
 ```bash
-CODESIGN_IDENTITY="Apple Development: guilhermehenriquevarela@gmail.com (VBGAFQN569)" scripts/package-macos.sh
+test -n "$CODESIGN_IDENTITY" && scripts/package-macos.sh
 codesign --verify --deep --strict --verbose=2 target/package/Zeron.app
 plutil -extract NSMicrophoneUsageDescription raw target/package/Zeron.app/Contents/Info.plist
 ```

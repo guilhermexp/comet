@@ -37,6 +37,8 @@
     </array>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Comet uses the microphone for realtime voice conversations with your coding agent.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
