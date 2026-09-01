@@ -23,6 +23,9 @@
 - [x] 2.4 Refresh the durable projection only after provider metadata changes or
   accepted Stop lifecycle events, invalidate stale telemetry when binding
   persistence fails, then run runtime and ingress tests to GREEN.
+- [x] 2.5 Migrate the short-lived unbound local marker shape at bridge startup
+  by recomputing from the current trusted provider binding; never expose the
+  legacy value or rescan already-bound markers.
 
 ## 3. Host and Workers Frontier
 

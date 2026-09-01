@@ -54,6 +54,7 @@ impl ActivityBridge {
     fn start() -> Arc<Self> {
         let change_epoch = Arc::new(AtomicU64::new(0));
         let ingress = start_hook_ingress(Arc::clone(&change_epoch)).ok();
+        migrate_legacy_telemetry(Arc::clone(&change_epoch));
         Arc::new(Self {
             engine: Mutex::new(ActivityEngine::default()),
             ingress,
@@ -146,6 +147,24 @@ impl ActivityBridge {
         engine.apply_hook_event(session_id, "Stop", None, SystemTime::now());
         self.change_epoch.fetch_add(1, Ordering::Release);
     }
+}
+
+fn migrate_legacy_telemetry(change_epoch: Arc<AtomicU64>) {
+    std::thread::spawn(move || {
+        let migrated = unpeel_core::session_host::list_manifests()
+            .iter()
+            .filter(|manifest| migrate_legacy_telemetry_for_manifest(manifest))
+            .count();
+        if migrated > 0 {
+            change_epoch.fetch_add(1, Ordering::Release);
+        }
+    });
+}
+
+fn migrate_legacy_telemetry_for_manifest(
+    manifest: &unpeel_core::session_host::HostedSessionManifest,
+) -> bool {
+    unpeel_core::session_telemetry::refresh_legacy(manifest).unwrap_or(false)
 }
 
 fn file_modified_unix_ms(path: &Path) -> Option<u64> {
@@ -768,6 +787,43 @@ mod tests {
                 .total_tokens,
             15
         );
+    }
+
+    #[test]
+    fn startup_migrates_legacy_unbound_telemetry_from_provider_evidence() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let state_home = tempfile::tempdir().expect("temporary Unpeel home");
+        let user_home = tempfile::tempdir().expect("temporary user home");
+        let _home = UnpeelHomeGuard::set(state_home.path(), user_home.path());
+        let session_dir = state_home.path().join("app-sessions/worker-1");
+        std::fs::create_dir_all(&session_dir).expect("worker session directory");
+        let omp_root = user_home.path().join(".omp/agent/sessions/project");
+        std::fs::create_dir_all(&omp_root).expect("OMP Session root");
+        let transcript = omp_root.join("provider.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session\",\"id\":\"omp-provider-1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"provider\":\"p\",\"model\":\"m\",\"usage\":{\"totalTokens\":10}}}\n",
+        )
+        .expect("write OMP transcript");
+        unpeel_core::session_ops::set_provider_session(
+            "worker-1",
+            Some("omp-provider-1"),
+            Some(&transcript.to_string_lossy()),
+        )
+        .expect("persist provider binding");
+        std::fs::write(
+            session_dir.join("session-telemetry.json"),
+            r#"{"totalTokens":1,"models":[{"model":"stale/model","totalTokens":1,"active":true}]}"#,
+        )
+        .expect("write legacy telemetry marker");
+
+        let migrated = migrate_legacy_telemetry_for_manifest(&omp_manifest("worker-1"));
+
+        assert!(migrated);
+        let telemetry = unpeel_core::session_telemetry::load("worker-1")
+            .expect("bound telemetry after startup migration");
+        assert_eq!(telemetry.total_tokens, 10);
+        assert_eq!(telemetry.models[0].model, "p/m");
     }
 
     #[test]

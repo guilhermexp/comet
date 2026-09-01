@@ -85,6 +85,16 @@ Test: unit — provider-id and canonical-path-bound marker load.
 - **THEN** telemetry stored for the previous provider conversation is not exposed
 - **AND** the Worker retains its command-only fallback
 
+#### Scenario: A legacy local projection has no provider binding
+Test: unit + integration — startup migration from current provider evidence.
+
+- **WHEN** startup finds the short-lived legacy telemetry marker shape that
+  contains totals but no provider conversation id or canonical transcript path
+- **THEN** the legacy totals are not exposed directly
+- **AND** the system recomputes telemetry from the current trusted provider
+  binding and atomically replaces the marker with the bound format
+- **AND** markers already using the bound format are not rescanned
+
 #### Scenario: Current provider evidence is definitively rejected
 Test: integration — lifecycle refresh after trusted-path or budget rejection.
 

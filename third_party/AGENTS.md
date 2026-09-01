@@ -77,6 +77,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   marker de binding anterior. O Host publica campos opcionais;
   transcript bruto, custo e conteúdo de mensagem nunca atravessam a fronteira
   vendorizada.
+  O formato local transitório sem binding nunca é aceito diretamente: ele só
+  dispara uma releitura do provider atual no startup, que o substitui pelo
+  marker vinculado; marker já vinculado não é relido por essa migração.
 
 ## Verification
 

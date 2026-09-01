@@ -123,8 +123,10 @@ terminal access.
 
 1. Ship optional provider metadata and telemetry parsing behind OMP's existing
    lifecycle integration.
-2. Publish optional Host/frontier fields; older persisted Sessions require no
-   migration and remain command-only until a valid lifecycle refresh occurs.
+2. Publish optional Host/frontier fields. Older Sessions without telemetry
+   remain command-only. Startup detects the short-lived unbound marker shape,
+   treats it only as a migration trigger, and recomputes a bound projection
+   from current trusted provider evidence in the background.
 3. Add the widget projection and disclosure after compatibility tests pass.
 4. Rollback is code-only: unknown optional marker/wire fields are ignored, and
    removing the renderer restores the existing command subtitle.

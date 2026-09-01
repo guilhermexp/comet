@@ -12,6 +12,10 @@ _Avoid_: API usage, token billing, synced usage
 Moonshot AI's managed coding subscription served from the Kimi Code platform. It is distinct from the Moonshot Open Platform API.
 _Avoid_: Moonshot API, Kimi API billing
 
+**Antigravity Account Pool**:
+The set of usable Antigravity credentials discovered from CLIProxyAPI's device-local credential directory. Every credential is independently visible with its own Managed Provider Usage; none is the singular active account because CLIProxyAPI owns routing across the pool.
+_Avoid_: active Antigravity account, switchable Antigravity slot, Comet-owned login
+
 ## Chat
 
 **Chat**:

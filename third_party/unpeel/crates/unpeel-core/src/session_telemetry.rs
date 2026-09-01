@@ -132,6 +132,26 @@ fn load_at(session_dir: &Path, binding: Option<&ProviderBinding>) -> Option<Sess
         .then_some(stored.telemetry)
 }
 
+fn refresh_legacy_at(
+    session_dir: &Path,
+    binding: Option<&ProviderBinding>,
+    read: impl FnOnce() -> Result<Option<SessionTelemetry>, SessionTelemetryReadError>,
+) -> Result<bool, String> {
+    if !is_legacy_marker_at(session_dir) {
+        return Ok(false);
+    }
+    refresh_at(session_dir, binding, read)?;
+    Ok(true)
+}
+
+fn is_legacy_marker_at(session_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read(marker_path(session_dir)) else {
+        return false;
+    };
+    serde_json::from_slice::<StoredSessionTelemetry>(&raw).is_err()
+        && serde_json::from_slice::<SessionTelemetry>(&raw).is_ok()
+}
+
 fn refresh_at(
     session_dir: &Path,
     binding: Option<&ProviderBinding>,
@@ -207,6 +227,32 @@ pub fn refresh(manifest: &HostedSessionManifest) -> Result<Option<SessionTelemet
         };
         telemetry
     })
+}
+
+/// Recompute a marker written by the short-lived unbound telemetry format.
+/// The legacy value is never exposed: it only triggers a fresh provider read,
+/// which is then persisted with the current provider id and canonical path.
+pub fn refresh_legacy(manifest: &HostedSessionManifest) -> Result<bool, String> {
+    let session_dir = crate::session_host::session_dir(&manifest.session.id);
+    if !is_legacy_marker_at(&session_dir) {
+        return Ok(false);
+    }
+    let initial_raw_binding = raw_binding(manifest);
+    let reader = crate::integrations::integration_for_command(&manifest.session.command)
+        .and_then(|integration| integration.read_session_telemetry);
+    let result = match reader {
+        Some(read) => read(manifest),
+        None => Ok(None),
+    };
+    let current_raw_binding = raw_binding(manifest);
+    if current_raw_binding != initial_raw_binding {
+        return Err("provider Session binding changed during telemetry refresh".into());
+    }
+    let binding = initial_raw_binding
+        .as_ref()
+        .map(canonical_binding)
+        .transpose()?;
+    refresh_legacy_at(&session_dir, binding.as_ref(), || result)
 }
 
 pub fn load(session_id: &str) -> Option<SessionTelemetry> {
@@ -317,6 +363,36 @@ mod tests {
         .expect("refresh telemetry");
 
         assert_eq!(load_at(session_dir.path(), Some(&new_binding)), None);
+    }
+
+    #[test]
+    fn legacy_unbound_marker_is_refreshed_from_current_provider_evidence() {
+        let session_dir = tempfile::tempdir().expect("Worker Session directory");
+        let binding = binding(session_dir.path(), "omp-A");
+        std::fs::write(
+            marker_path(session_dir.path()),
+            serde_json::to_vec(&fixture()).expect("serialize legacy telemetry"),
+        )
+        .expect("write legacy telemetry marker");
+        let replacement = SessionTelemetry {
+            total_tokens: 84,
+            models: vec![ModelTokenUsage {
+                model: "provider/model:high".into(),
+                total_tokens: 84,
+                active: true,
+            }],
+        };
+
+        let migrated = refresh_legacy_at(session_dir.path(), Some(&binding), || {
+            Ok(Some(replacement.clone()))
+        })
+        .expect("refresh legacy telemetry");
+
+        assert!(migrated);
+        assert_eq!(
+            load_at(session_dir.path(), Some(&binding)),
+            Some(replacement)
+        );
     }
 
     #[cfg(unix)]

@@ -633,7 +633,10 @@ Core behavior:
   Core atomically stores only
   total/per-model tokens bound to provider id and canonical transcript path.
   Transient read failure preserves the same-binding projection; trust or budget
-  rejection removes it. Neither failure blocks the lifecycle event.
+  rejection removes it. A short-lived legacy marker without those binding
+  fields is never exposed directly: bridge startup uses it only to trigger a
+  fresh provider read and bound atomic replacement. Neither failure blocks the
+  lifecycle event.
 
 Common env used by hooks:
 
