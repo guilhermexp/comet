@@ -104,6 +104,7 @@ pub(crate) struct LiveDelegationOwnership {
     pub(crate) command_id: String,
     pub(crate) message_id: String,
     pub(crate) newly_created: bool,
+    pub(crate) cancellation: CancellationToken,
 }
 
 struct ActiveLiveVoice {
@@ -114,6 +115,7 @@ struct ActiveLiveVoice {
     active_delegation_id: Option<String>,
     owned_command_id: Option<String>,
     owned_message_id: Option<String>,
+    delegation_cancellation: Option<CancellationToken>,
     cancellation: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -169,6 +171,7 @@ impl LiveVoiceCoordinator {
             active_delegation_id: None,
             owned_command_id: None,
             owned_message_id: None,
+            delegation_cancellation: None,
             cancellation: CancellationToken::new(),
             task: None,
         });
@@ -219,6 +222,11 @@ impl LiveVoiceCoordinator {
                         .owned_message_id
                         .clone()
                         .expect("active delegation owns a message id"),
+                    cancellation: active
+                        .delegation_cancellation
+                        .as_ref()
+                        .expect("active delegation owns a cancellation token")
+                        .clone(),
                     newly_created: false,
                 });
             }
@@ -226,13 +234,16 @@ impl LiveVoiceCoordinator {
         }
         let command_id = new_id();
         let message_id = new_id();
+        let cancellation = active.cancellation.child_token();
         active.active_delegation_id = Some(delegation_id.to_owned());
         active.owned_command_id = Some(command_id.clone());
         active.owned_message_id = Some(message_id.clone());
+        active.delegation_cancellation = Some(cancellation.clone());
         Ok(LiveDelegationOwnership {
             command_id,
             message_id,
             newly_created: true,
+            cancellation,
         })
     }
 
@@ -240,6 +251,16 @@ impl LiveVoiceCoordinator {
         lock(&self.inner.active).as_ref().is_some_and(|active| {
             active.chat_id == chat_id && active.owned_command_id.as_deref() == Some(command_id)
         })
+    }
+
+    pub(crate) fn complete_command(&self, chat_id: &str, command_id: &str) {
+        let mut active = lock(&self.inner.active);
+        let Some(active) = active.as_mut().filter(|active| {
+            active.chat_id == chat_id && active.owned_command_id.as_deref() == Some(command_id)
+        }) else {
+            return;
+        };
+        clear_delegation(active);
     }
 
     pub(crate) async fn append_delegation_context(
@@ -282,9 +303,7 @@ impl LiveVoiceCoordinator {
         }) else {
             return;
         };
-        active.active_delegation_id = None;
-        active.owned_command_id = None;
-        active.owned_message_id = None;
+        clear_delegation(active);
     }
 
     pub(crate) fn cancellation(&self, call_id: &str) -> Option<CancellationToken> {
@@ -457,6 +476,15 @@ impl LiveVoiceCoordinator {
     }
 }
 
+fn clear_delegation(active: &mut ActiveLiveVoice) {
+    if let Some(cancellation) = active.delegation_cancellation.take() {
+        cancellation.cancel();
+    }
+    active.active_delegation_id = None;
+    active.owned_command_id = None;
+    active.owned_message_id = None;
+}
+
 fn truncate_live_text(mut text: String) -> String {
     if text.len() <= MAX_LIVE_TEXT_BYTES {
         return text;
@@ -568,6 +596,31 @@ mod tests {
             BackendSpeechUpdate::Final(
                 "The coding run completed without a final text response.".into()
             )
+        );
+    }
+
+    #[test]
+    fn terminal_live_command_releases_delegation_without_backend_done() {
+        let coordinator = LiveVoiceCoordinator::new();
+        let call_id = coordinator.reserve("chat-1").unwrap();
+        let first = coordinator
+            .claim_delegation(&call_id, "delegation-1")
+            .unwrap();
+
+        coordinator.complete_command("chat-1", "different-command");
+        assert!(!first.cancellation.is_cancelled());
+        assert!(
+            coordinator
+                .claim_delegation(&call_id, "delegation-2")
+                .is_err()
+        );
+
+        coordinator.complete_command("chat-1", &first.command_id);
+        assert!(first.cancellation.is_cancelled());
+        assert!(
+            coordinator
+                .claim_delegation(&call_id, "delegation-2")
+                .is_ok()
         );
     }
 
@@ -995,11 +1048,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        core.workspace.set_chat_harness_session(
-            "existing",
-            "/tmp/existing-session.jsonl",
-            "/tmp",
-        );
+        core.workspace
+            .set_chat_harness_session("existing", "/tmp/existing-session.jsonl", "/tmp");
 
         core.sessions.start_live_voice("existing").await.unwrap();
         wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
@@ -1015,10 +1065,7 @@ mod tests {
         assert_eq!(lock(&harness.live_requests)[1].resume, None);
         assert_eq!(
             core.workspace.chat_harness_session("new"),
-            Some((
-                "/tmp/live-created.jsonl".into(),
-                Some("/tmp".into())
-            ))
+            Some(("/tmp/live-created.jsonl".into(), Some("/tmp".into())))
         );
         core.sessions.stop_live_voice().await.unwrap();
         wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;

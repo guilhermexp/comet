@@ -149,6 +149,7 @@ enum LiveFixtureMode {
     Conflict,
     ExitAfterDelegation,
     Passive,
+    ClosedControls,
 }
 
 struct LiveDelegationHarness {
@@ -207,6 +208,11 @@ impl Harness for LiveDelegationHarness {
             let _ = event_tx
                 .send(Ok(LiveVoiceEvent::Phase(LiveVoicePhase::Listening)))
                 .await;
+            if matches!(mode, LiveFixtureMode::ClosedControls) {
+                drop(control_rx);
+                std::future::pending::<()>().await;
+                return;
+            }
             if !matches!(mode, LiveFixtureMode::Passive) {
                 let delegation = LiveVoiceEvent::Delegation {
                     delegation_id: "delegation-1".into(),
@@ -256,7 +262,10 @@ impl Harness for LiveDelegationHarness {
         _controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.order.lock().await.push("run");
-        let expected_prompt = if matches!(self.mode, LiveFixtureMode::Passive) {
+        let expected_prompt = if matches!(
+            self.mode,
+            LiveFixtureMode::Passive | LiveFixtureMode::ClosedControls
+        ) {
             "manual command"
         } else {
             "Fix the durable bug"
@@ -1166,6 +1175,51 @@ async fn live_voice_child_exit_does_not_cancel_queued_backend_work() {
         core.sessions.watch_live_voice().borrow().phase,
         LiveVoicePhase::Error
     );
+}
+
+#[tokio::test]
+async fn live_voice_closed_control_does_not_reject_unrelated_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::ClosedControls));
+    let core = assemble_live(dir.path(), harness);
+    create_omp_chat(&core);
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+    let command_id = "manual-after-closed-live";
+
+    let mut request = run_request("manual command");
+    request.harness = Some(HarnessId::Omp);
+    core.doc_host
+        .queue_command_with_id(
+            CHAT,
+            command_id.into(),
+            SessionCommandPayload::Run {
+                request,
+                message_id: "manual-after-closed-live-message".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            command_status(&core, command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "command resolution after closed Live control",
+    )
+    .await;
+
+    assert_eq!(
+        command_status(&core, command_id).unwrap().0,
+        SessionCommandStatus::Applied
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|entry| entry.role == MessageRole::Assistant)
+        },
+        "unrelated command execution after closed Live control",
+    )
+    .await;
 }
 
 #[tokio::test]

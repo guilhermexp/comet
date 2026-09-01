@@ -453,17 +453,24 @@ impl SessionsEngine {
         self.inner.live_voice.stop().await
     }
 
-    pub(crate) async fn prepare_for_command(
-        &self,
-        chat_id: &str,
-        command_id: &str,
-    ) -> Result<(), EngineError> {
+    pub(crate) async fn prepare_for_command(&self, chat_id: &str, command_id: &str) {
         if !self.inner.live_voice.is_active()
             || self.inner.live_voice.owns_command(chat_id, command_id)
         {
-            return Ok(());
+            return;
         }
-        self.stop_live_voice().await
+        if let Err(error) = self.stop_live_voice().await {
+            tracing::warn!(
+                chat = %chat_id,
+                command = %command_id,
+                error = %error,
+                "Live Voice stop failed after releasing the call; continuing command"
+            );
+        }
+    }
+
+    pub(crate) fn complete_live_command(&self, chat_id: &str, command_id: &str) {
+        self.inner.live_voice.complete_command(chat_id, command_id);
     }
 
     fn attach_live_handle(
@@ -567,7 +574,12 @@ impl SessionsEngine {
                 message_id: ownership.message_id,
             },
         )?;
-        self.spawn_live_backend_observer(call_id.to_owned(), delegation_id.to_owned(), receiver);
+        self.spawn_live_backend_observer(
+            call_id.to_owned(),
+            delegation_id.to_owned(),
+            ownership.cancellation,
+            receiver,
+        );
         Ok(())
     }
 
@@ -575,16 +587,20 @@ impl SessionsEngine {
         &self,
         call_id: String,
         delegation_id: String,
+        cancellation: CancellationToken,
         mut receiver: broadcast::Receiver<JournaledEvent>,
     ) {
         let coordinator = self.inner.live_voice.clone();
         tokio::spawn(async move {
             let mut speech = BackendSpeechAccumulator::default();
             loop {
-                let event = match receiver.recv().await {
-                    Ok(event) => event.event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
+                let event = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    event = receiver.recv() => match event {
+                        Ok(event) => event.event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
                 };
                 match speech.observe(&event) {
                     BackendSpeechUpdate::None => {}

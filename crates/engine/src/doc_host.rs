@@ -3162,10 +3162,14 @@ impl DocHost {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) {
-        if let Err(err) = handle
+        let ends_live_delegation = !matches!(status, SessionCommandStatus::Applied);
+        let result = handle
             .doc
-            .set_command_status(command_id, status, resolution)
-        {
+            .set_command_status(command_id, status, resolution);
+        if ends_live_delegation && let Some(sessions) = self.sessions() {
+            sessions.complete_live_command(&handle.chat_id, command_id);
+        }
+        if let Err(err) = result {
             tracing::warn!(
                 chat = %handle.chat_id,
                 command = %command_id,
@@ -3182,7 +3186,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
-        sessions.prepare_for_command(chat_id, &entry.id).await?;
+        sessions.prepare_for_command(chat_id, &entry.id).await;
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
