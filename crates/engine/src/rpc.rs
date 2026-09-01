@@ -82,6 +82,11 @@ struct ChatParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetLiveVoiceMutedParams {
+    muted: bool,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
@@ -1265,6 +1270,41 @@ impl RpcService for EngineRpc {
                     handle.watch_messages(),
                 )))
             }
+            methods::PROBE_LIVE_VOICE => {
+                let p: ChatParams = parse_params(params)?;
+                let availability = self
+                    .sessions
+                    .probe_live_voice(&p.chat_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&availability)
+            }
+            methods::START_LIVE_VOICE => {
+                let p: ChatParams = parse_params(params)?;
+                self.sessions
+                    .start_live_voice(&p.chat_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "active": true }))
+            }
+            methods::SET_LIVE_VOICE_MUTED => {
+                let p: SetLiveVoiceMutedParams = parse_params(params)?;
+                self.sessions
+                    .set_live_voice_muted(p.muted)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "muted": p.muted }))
+            }
+            methods::STOP_LIVE_VOICE => {
+                self.sessions
+                    .stop_live_voice()
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "active": false }))
+            }
+            methods::WATCH_LIVE_VOICE => Ok(RpcReply::Stream(watch_stream(
+                self.sessions.watch_live_voice(),
+            ))),
             methods::PROBE_SYNC => {
                 self.workspace.probe();
                 self.doc_host.probe_open_chats();
@@ -2018,6 +2058,15 @@ mod tests {
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(forwardable(methods::FETCH_TOOL_INPUT));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+    }
+
+    #[test]
+    fn live_voice_rpc_methods_are_local_only() {
+        assert!(!forwardable(methods::PROBE_LIVE_VOICE));
+        assert!(!forwardable(methods::START_LIVE_VOICE));
+        assert!(!forwardable(methods::SET_LIVE_VOICE_MUTED));
+        assert!(!forwardable(methods::STOP_LIVE_VOICE));
+        assert!(!forwardable(methods::WATCH_LIVE_VOICE));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —

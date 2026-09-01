@@ -78,6 +78,13 @@ pub mod methods {
     pub const WATCH_SESSIONS: &str = "WatchSessions";
     /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
+    /// Local-only OMP Live Voice lifecycle. Media remains inside OMP; Comet
+    /// exposes only control, state, and transcript metadata.
+    pub const PROBE_LIVE_VOICE: &str = "ProbeLiveVoice";
+    pub const START_LIVE_VOICE: &str = "StartLiveVoice";
+    pub const SET_LIVE_VOICE_MUTED: &str = "SetLiveVoiceMuted";
+    pub const STOP_LIVE_VOICE: &str = "StopLiveVoice";
+    pub const WATCH_LIVE_VOICE: &str = "WatchLiveVoice";
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.

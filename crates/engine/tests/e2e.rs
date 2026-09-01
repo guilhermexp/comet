@@ -1204,6 +1204,136 @@ async fn unrelated_durable_command_stops_live_voice_before_dispatch() {
 }
 
 #[tokio::test]
+async fn live_voice_rpc_controls_are_local_exact_and_watchable() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Passive));
+    let core = assemble_live(dir.path(), harness.clone());
+    create_omp_chat(&core);
+    core.workspace
+        .create_chat(
+            "remote-live-chat",
+            None,
+            Some("remote-device"),
+            Some(omp_chat_config()),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let mut states = client
+        .subscribe_checked(
+            zeron_rpc::methods::WATCH_LIVE_VOICE,
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("watch Live Voice");
+    assert_eq!(
+        states.recv().await.unwrap()["phase"],
+        serde_json::json!("idle")
+    );
+
+    let availability = client
+        .call(
+            zeron_rpc::methods::PROBE_LIVE_VOICE,
+            serde_json::json!({ "chatId": CHAT }),
+        )
+        .await
+        .expect("probe local OMP Chat");
+    assert_eq!(
+        availability,
+        serde_json::json!({ "available": true, "reason": null })
+    );
+    let remote_availability = client
+        .call(
+            zeron_rpc::methods::PROBE_LIVE_VOICE,
+            serde_json::json!({ "chatId": "remote-live-chat" }),
+        )
+        .await
+        .expect("probe reports remote Chat unavailability");
+    assert_eq!(
+        remote_availability,
+        serde_json::json!({ "available": false, "reason": "remoteChat" })
+    );
+    assert!(
+        client
+            .call(
+                zeron_rpc::methods::START_LIVE_VOICE,
+                serde_json::json!({ "chatId": "remote-live-chat" }),
+            )
+            .await
+            .is_err(),
+        "local-only Live Voice start rejects remote Chats"
+    );
+
+    assert_eq!(
+        client
+            .call(
+                zeron_rpc::methods::START_LIVE_VOICE,
+                serde_json::json!({ "chatId": CHAT }),
+            )
+            .await
+            .expect("start Live Voice"),
+        serde_json::json!({ "active": true })
+    );
+    let listening = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = states.recv().await.expect("Live Voice watch update");
+            if state["phase"] == "listening" {
+                return state;
+            }
+        }
+    })
+    .await
+    .expect("watch reaches listening");
+    assert_eq!(listening["chatId"], CHAT);
+
+    assert_eq!(
+        client
+            .call(
+                zeron_rpc::methods::SET_LIVE_VOICE_MUTED,
+                serde_json::json!({ "muted": true }),
+            )
+            .await
+            .expect("mute Live Voice"),
+        serde_json::json!({ "muted": true })
+    );
+    assert!(
+        harness
+            .controls
+            .lock()
+            .await
+            .contains(&LiveVoiceControl::SetMuted(true))
+    );
+    assert_eq!(
+        client
+            .call(zeron_rpc::methods::STOP_LIVE_VOICE, serde_json::Value::Null,)
+            .await
+            .expect("stop Live Voice"),
+        serde_json::json!({ "active": false })
+    );
+    assert_eq!(
+        client
+            .call(zeron_rpc::methods::STOP_LIVE_VOICE, serde_json::Value::Null,)
+            .await
+            .expect("repeat stop Live Voice"),
+        serde_json::json!({ "active": false })
+    );
+    let reset = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = states.recv().await.expect("Live Voice reset update");
+            if state["phase"] == "idle" {
+                return state;
+            }
+        }
+    })
+    .await
+    .expect("watch resets to idle");
+    assert_eq!(
+        reset,
+        serde_json::to_value(zeron_proto::LiveVoiceState::default()).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn fetch_tool_input_returns_journal_body_only_for_the_local_chat_owner() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
