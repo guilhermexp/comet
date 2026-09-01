@@ -1314,6 +1314,9 @@ impl Inner {
                 .map(|h| h.run_id.clone())
                 .unwrap_or_else(|| {
                     let mut fallback = lock(&self.fallback_trajectory_runs);
+                    if matches!(event, AgentEvent::SessionStarted { .. }) {
+                        fallback.insert(chat_id.to_string(), format!("run_{}", seq.max(1)));
+                    }
                     fallback
                         .entry(chat_id.to_string())
                         .or_insert_with(|| format!("run_{}", seq.max(1)))
@@ -1802,10 +1805,6 @@ impl Inner {
             AgentEvent::SessionStarted { .. } => {
                 self.flush_in_flight_reasoning(store, chat_id);
                 self.flush_in_flight_text(store, chat_id);
-                if lock(&self.runs).get(chat_id).is_none() {
-                    lock(&self.fallback_trajectory_runs)
-                        .insert(chat_id.to_string(), format!("run_{}", seq.max(1)));
-                }
                 if let Some(record) = crate::trajectory_store::project_event_to_record(
                     chat_id, run_id, seq, event, None,
                 ) {
@@ -3606,14 +3605,68 @@ mod tests {
         engine.set_trajectory_store(store.clone());
 
         let chat_id = "chat-2";
-        for i in 0..50 {
-            engine.publish(
-                chat_id,
-                &AgentEvent::TextDelta {
-                    text: format!("token{} ", i),
-                },
-            );
-        }
+        // 1. Initial text delta
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "token0 ".into(),
+            },
+        );
+
+        // 2. Sleep 130ms crossing the 120ms in-flight threshold and emit second delta
+        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "token1 ".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let partial_records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(
+            partial_records.len(),
+            1,
+            "partial delta must create 1 in-flight record"
+        );
+        let partial = &partial_records[0];
+        assert_eq!(partial.lane, TrajectoryLane::Model);
+        assert_eq!(partial.kind, TrajectoryRecordKind::AssistantMessage);
+        assert!(
+            partial.is_partial,
+            "in-flight delta crossing 120ms must be marked partial"
+        );
+        assert_eq!(partial.status, TrajectoryStatus::Running);
+        assert!(partial.summary.contains("token0"));
+        let stable_id = partial.id.clone();
+
+        // 3. Sleep 130ms again and emit third delta
+        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "token2 ".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let updated_records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(updated_records.len(), 1);
+        assert_eq!(
+            updated_records[0].id, stable_id,
+            "record identity must remain stable across partial updates"
+        );
+        assert!(updated_records[0].is_partial);
+        assert!(
+            updated_records[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.sanitized_text.as_ref())
+                .unwrap()
+                .contains("token2")
+        );
+
+        // 4. Complete assistant message
         engine.publish(
             chat_id,
             &AgentEvent::AssistantMessageCompleted {
@@ -3622,19 +3675,26 @@ mod tests {
         );
 
         store.flush().await.unwrap();
-        let records = store.list_all_records(chat_id).unwrap();
-        // The 50 rapid deltas should NOT create 50 separate completed rows, but reconcile/coalesce
-        assert!(records.len() <= 2);
-        let last = records.last().unwrap();
-        assert_eq!(last.lane, TrajectoryLane::Model);
-        assert!(!last.is_partial);
-        assert!(last.summary.contains("token0"));
+        let final_records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(
+            final_records.len(),
+            1,
+            "finalized response must remain a single record"
+        );
+        let final_rec = &final_records[0];
+        assert_eq!(
+            final_rec.id, stable_id,
+            "final record must have the exact same stable identity"
+        );
+        assert!(!final_rec.is_partial, "final record must not be partial");
+        assert_eq!(final_rec.status, TrajectoryStatus::Completed);
         assert!(
-            last.payload
+            final_rec
+                .payload
                 .as_ref()
                 .and_then(|p| p.sanitized_text.as_ref())
                 .unwrap()
-                .contains("token49")
+                .contains("token0 token1 token2")
         );
     }
     #[tokio::test]
@@ -3865,6 +3925,88 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].turns.len(), 1);
         assert_eq!(runs[1].turns.len(), 1);
+    }
+    #[tokio::test]
+    async fn test_trajectory_capture_missing_done_headless_then_session_started() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_headless_missing_done";
+        // Run 1: UserMessage and AssistantMessageCompleted WITHOUT a Done event
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Prompt 1".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCall {
+                id: "tool_1".into(),
+                call: zeron_proto::ToolCall::ReadFile {
+                    path: "foo.rs".into(),
+                },
+            },
+        );
+
+        // Run 2: Starts with SessionStarted
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "model-2".into(),
+                cwd: "/work".into(),
+                session_id: "s2".into(),
+                assistant_message_id: "m2".into(),
+                tools: Vec::new(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Prompt 2".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("ok".into()),
+                error: None,
+                session_id: Some("s2".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 5);
+
+        // Records from Run 1 (indices 0 and 1) must have the first run_id
+        let run1_id = records[0].run_id.clone();
+        assert_eq!(records[1].run_id, run1_id);
+
+        // SessionStarted and subsequent records must have a NEW run_id
+        let session_started_rec = &records[2];
+        assert_eq!(
+            session_started_rec.kind,
+            TrajectoryRecordKind::SessionStarted
+        );
+        let run2_id = session_started_rec.run_id.clone();
+        assert_ne!(
+            run2_id, run1_id,
+            "SessionStarted must rotate to a new fallback run ID and not inherit previous unfinished run ID"
+        );
+        assert_eq!(records[3].run_id, run2_id);
+        assert_eq!(records[4].run_id, run2_id);
+
+        let runs = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, run1_id);
+        assert_eq!(runs[1].run_id, run2_id);
     }
 
     #[tokio::test]

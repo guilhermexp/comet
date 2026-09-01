@@ -375,6 +375,18 @@ pub fn truncate_preview(text: &str, byte_cap: usize) -> String {
     format!("{}… (truncated)", truncated.trim_end())
 }
 
+/// Bounded summary truncation preserving UTF-8 boundaries.
+pub fn truncate_summary(text: &str) -> String {
+    if text.len() <= MAX_SUMMARY_LEN {
+        return text.to_string();
+    }
+    let mut end = MAX_SUMMARY_LEN;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// Sanitize prompt or message text for preview.
 pub fn sanitize_prompt_preview(text: &str, byte_cap: usize) -> (String, Option<String>) {
     let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -402,12 +414,12 @@ pub fn sanitize_tool_call(
 ) -> (String, Option<String>, Option<String>) {
     match call {
         ToolCall::Exec { command } => {
-            let summary = format!("$ {}", command);
+            let summary = truncate_summary(&format!("$ {}", command));
             let bounded = truncate_preview(command, byte_cap);
             (summary, Some(bounded), Some("command: string".to_string()))
         }
         ToolCall::ReadFile { path } => {
-            let summary = format!("Read {}", path);
+            let summary = truncate_summary(&format!("Read {}", path));
             (
                 summary,
                 Some(path.clone()),
@@ -415,7 +427,7 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::WriteFile { path, content } => {
-            let summary = format!("Write {}", path);
+            let summary = truncate_summary(&format!("Write {}", path));
             let len = content.as_ref().map(|c| c.len()).unwrap_or(0);
             let bounded = format!("Path: {}\nBytes: {}", path, len);
             (
@@ -425,7 +437,7 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::EditFile { path, .. } => {
-            let summary = format!("Edit {}", path);
+            let summary = truncate_summary(&format!("Edit {}", path));
             let bounded = format!("Path: {}", path);
             (
                 summary,
@@ -434,15 +446,15 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::ApplyPatch { path } => {
-            let summary = format!("Patch {}", path.as_deref().unwrap_or(""));
+            let summary = truncate_summary(&format!("Patch {}", path.as_deref().unwrap_or("")));
             (summary, path.clone(), Some("path: string".to_string()))
         }
         ToolCall::WebFetch { url, .. } => {
-            let summary = format!("Fetch {}", url);
+            let summary = truncate_summary(&format!("Fetch {}", url));
             (summary, Some(url.clone()), Some("url: string".to_string()))
         }
         ToolCall::WebSearch { query } => {
-            let summary = format!("Search \"{}\"", query);
+            let summary = truncate_summary(&format!("Search \"{}\"", query));
             (
                 summary,
                 Some(query.clone()),
@@ -450,7 +462,7 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::Search { pattern, path } => {
-            let summary = format!("Search \"{}\"", pattern);
+            let summary = truncate_summary(&format!("Search \"{}\"", pattern));
             let bounded = format!("Pattern: {}\nPath: {:?}", pattern, path);
             (
                 summary,
@@ -459,7 +471,7 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::Glob { pattern } => {
-            let summary = format!("Glob {}", pattern);
+            let summary = truncate_summary(&format!("Glob {}", pattern));
             (
                 summary,
                 Some(pattern.clone()),
@@ -467,7 +479,7 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::Todo { items } => {
-            let summary = format!("Todo ({} items)", items.len());
+            let summary = truncate_summary(&format!("Todo ({} items)", items.len()));
             (summary, None, Some("items: array".to_string()))
         }
         ToolCall::Mcp {
@@ -475,7 +487,7 @@ pub fn sanitize_tool_call(
             tool,
             input,
         } => {
-            let summary = format!("MCP {}/{}", server, tool);
+            let summary = truncate_summary(&format!("MCP {}/{}", server, tool));
             let input_str = input.as_ref().map(|v| v.to_string()).unwrap_or_default();
             let bounded = truncate_preview(&input_str, byte_cap);
             (
@@ -485,7 +497,7 @@ pub fn sanitize_tool_call(
             )
         }
         ToolCall::Unknown { name, input } => {
-            let summary = format!("Tool {}", name);
+            let summary = truncate_summary(&format!("Tool {}", name));
             let input_str = input.as_ref().map(|v| v.to_string()).unwrap_or_default();
             let bounded = truncate_preview(&input_str, byte_cap);
             (summary, Some(bounded), Some(format!("tool: {}", name)))
@@ -721,6 +733,7 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
         {
             step.status = TrajectoryStatus::Interrupted;
         }
+        step.records.push(record.clone());
     }
 
     runs
@@ -968,6 +981,70 @@ mod tests {
         assert_eq!(groups[1].run_id, "run-2");
         assert_eq!(groups[1].label, "Run 2");
     }
+    #[test]
+    fn test_group_records_step_record_collection_and_content() {
+        let r1 = TrajectoryRecord {
+            id: TrajectoryRecordId::new("run-1", 1, 0),
+            chat_id: "chat-1".into(),
+            run_id: "run-1".into(),
+            source_seq: 1,
+            sub_seq: 0,
+            lane: TrajectoryLane::Input,
+            kind: TrajectoryRecordKind::UserMessage,
+            status: TrajectoryStatus::Completed,
+            is_partial: false,
+            title: "User".into(),
+            summary: "Hello".into(),
+            turn_id: Some("t1".into()),
+            step_id: Some("s1".into()),
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: Some(TrajectoryTiming::sequence_only()),
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        };
+        let r2 = TrajectoryRecord {
+            id: TrajectoryRecordId::new("run-1", 2, 0),
+            chat_id: "chat-1".into(),
+            run_id: "run-1".into(),
+            source_seq: 2,
+            sub_seq: 0,
+            lane: TrajectoryLane::Model,
+            kind: TrajectoryRecordKind::AssistantMessage,
+            status: TrajectoryStatus::Completed,
+            is_partial: false,
+            title: "Assistant".into(),
+            summary: "Hi there".into(),
+            turn_id: Some("t1".into()),
+            step_id: Some("s1".into()),
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: Some(TrajectoryTiming::sequence_only()),
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        };
+
+        let groups = group_records(&[r1.clone(), r2.clone()]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].turns.len(), 1);
+        assert_eq!(groups[0].turns[0].steps.len(), 1);
+        let step = &groups[0].turns[0].steps[0];
+        assert_eq!(
+            step.records.len(),
+            2,
+            "grouped step must collect all records"
+        );
+        assert_eq!(step.records[0].id, r1.id);
+        assert_eq!(step.records[0].summary, "Hello");
+        assert_eq!(step.records[1].id, r2.id);
+        assert_eq!(step.records[1].summary, "Hi there");
+    }
 
     #[test]
     fn test_timing_sequence_only_vs_recorded() {
@@ -1141,5 +1218,25 @@ mod tests {
         let emoji_text = "🚀🦀✨🔥🎉".repeat(30);
         let (emoji_summary, _) = sanitize_prompt_preview(&emoji_text, 500);
         assert!(emoji_summary.ends_with('…'));
+    }
+    #[test]
+    fn test_multibyte_tool_call_summary_bounds_and_no_panic() {
+        let long_cmd = "echo 🚀🦀✨🔥🎉".repeat(50);
+        let exec_call = ToolCall::Exec { command: long_cmd };
+        let (summary, _, _) = sanitize_tool_call(&exec_call, 1024);
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= MAX_SUMMARY_LEN + '…'.len_utf8() + 4);
+
+        let long_path = "日本語パスディレクトリ名/".repeat(30) + "ファイル.rs";
+        let read_call = ToolCall::ReadFile { path: long_path };
+        let (summary, _, _) = sanitize_tool_call(&read_call, 1024);
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= MAX_SUMMARY_LEN + '…'.len_utf8() + 4);
+
+        let long_query = "🔍検索クエリ".repeat(50);
+        let search_call = ToolCall::WebSearch { query: long_query };
+        let (summary, _, _) = sanitize_tool_call(&search_call, 1024);
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= MAX_SUMMARY_LEN + '…'.len_utf8() + 4);
     }
 }

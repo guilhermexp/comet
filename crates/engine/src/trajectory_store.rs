@@ -138,7 +138,6 @@ impl<T: Send + 'static> ReplySender<T> {
 /// Commands for the background writer task.
 enum WriterCommand {
     WriteRecords(Vec<TrajectoryRecord>),
-    RecordDegraded(TrajectoryDegradedInterval),
     DeleteChat(
         String,
         Option<ReplySender<Result<(), TrajectoryStoreError>>>,
@@ -260,9 +259,45 @@ impl TrajectoryStore {
         self.degraded_reason.lock().unwrap().is_some()
     }
 
+    /// Check if native (non-legacy) records exist for `chat_id`.
+    pub fn has_native_records(&self, chat_id: &str) -> Result<bool, TrajectoryStoreError> {
+        let conn = self.reader()?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM trajectory_records WHERE chat_id = ?1 AND run_id NOT LIKE 'legacy_%' LIMIT 1",
+                params![chat_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(exists)
+    }
+
+    /// Check if legacy journal has already been imported for `chat_id`.
+    pub fn has_legacy_import(&self, chat_id: &str) -> Result<bool, TrajectoryStoreError> {
+        let conn = self.reader()?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM trajectory_legacy_imports WHERE chat_id = ?1 LIMIT 1",
+                params![chat_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(exists)
+    }
+
     /// Lazily ensure eligible legacy Run Journal data for `chat_id` is imported on first access.
     pub fn ensure_legacy_imported(&self, chat_id: &str) -> Result<(), TrajectoryStoreError> {
         if self.is_degraded() {
+            return Ok(());
+        }
+        // One-shot: if already imported once, do nothing
+        if self.has_legacy_import(chat_id).unwrap_or(false) {
+            return Ok(());
+        }
+        // Eligible only for truly legacy-only Chat: if native records exist, do not import
+        if self.has_native_records(chat_id).unwrap_or(false) {
             return Ok(());
         }
         let journal_path = crate::run_journal::journal_paths(&self.journals_dir, chat_id).0;
@@ -397,9 +432,13 @@ impl TrajectoryStore {
     /// Flush the background writer queue and await completion.
     pub async fn flush(&self) -> Result<(), TrajectoryStoreError> {
         let (tx, rx) = oneshot::channel();
-        self.writer_tx
-            .try_send(WriterCommand::Flush(ReplySender::Async(tx)))
-            .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
+        let writer_tx = self.writer_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            writer_tx.send(WriterCommand::Flush(ReplySender::Async(tx)))
+        })
+        .await
+        .map_err(|_| TrajectoryStoreError::ChannelClosed)?
+        .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)
     }
 
@@ -590,12 +629,17 @@ impl TrajectoryStore {
     /// Delete all trajectory data for `chat_id` asynchronously through the writer.
     pub async fn delete_chat(&self, chat_id: &str) -> Result<(), TrajectoryStoreError> {
         let (tx, rx) = oneshot::channel();
-        self.writer_tx
-            .try_send(WriterCommand::DeleteChat(
-                chat_id.to_string(),
+        let writer_tx = self.writer_tx.clone();
+        let chat_id = chat_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            writer_tx.send(WriterCommand::DeleteChat(
+                chat_id,
                 Some(ReplySender::Async(tx)),
             ))
-            .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
+        })
+        .await
+        .map_err(|_| TrajectoryStoreError::ChannelClosed)?
+        .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)?
     }
 
@@ -605,12 +649,17 @@ impl TrajectoryStore {
         live_chat_ids: &[String],
     ) -> Result<usize, TrajectoryStoreError> {
         let (tx, rx) = oneshot::channel();
-        self.writer_tx
-            .try_send(WriterCommand::RetainChats(
-                live_chat_ids.to_vec(),
+        let writer_tx = self.writer_tx.clone();
+        let live_chat_ids = live_chat_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            writer_tx.send(WriterCommand::RetainChats(
+                live_chat_ids,
                 Some(ReplySender::Async(tx)),
             ))
-            .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
+        })
+        .await
+        .map_err(|_| TrajectoryStoreError::ChannelClosed)?
+        .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
         rx.await.map_err(|_| TrajectoryStoreError::ChannelClosed)?
     }
 
@@ -634,7 +683,7 @@ impl TrajectoryStore {
     pub fn sync_delete_chat(&self, chat_id: &str) -> Result<(), TrajectoryStoreError> {
         let (tx, rx) = sync_channel(1);
         self.writer_tx
-            .try_send(WriterCommand::DeleteChat(
+            .send(WriterCommand::DeleteChat(
                 chat_id.to_string(),
                 Some(ReplySender::Sync(tx)),
             ))
@@ -659,6 +708,16 @@ impl TrajectoryStore {
             return Ok(false);
         }
 
+        // Check if already imported (one-shot / idempotent)
+        if self.has_legacy_import(chat_id)? {
+            return Ok(false);
+        }
+
+        // Check if native records exist (eligible only for truly legacy-only Chat)
+        if self.has_native_records(chat_id)? {
+            return Ok(false);
+        }
+
         let metadata = fs::metadata(path)?;
         let file_len = metadata.len();
         let mtime = metadata
@@ -669,12 +728,6 @@ impl TrajectoryStore {
             .unwrap_or(0);
         let fingerprint = format!("{}:{}:{}", path.display(), file_len, mtime);
 
-        if let Ok(Some(existing_fp)) = self.legacy_import_fingerprint(chat_id) {
-            if existing_fp == fingerprint {
-                return Ok(false);
-            }
-        }
-
         let file = fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         use std::io::BufRead;
@@ -683,6 +736,103 @@ impl TrajectoryStore {
         let mut records: Vec<TrajectoryRecord> = Vec::new();
         let mut has_done = false;
         let mut pending_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let mut current_text: Option<(u64, String)> = None;
+        let mut current_reasoning: Option<(u64, String)> = None;
+
+        let flush_text = |records: &mut Vec<TrajectoryRecord>,
+                          current: &mut Option<(u64, String)>| {
+            if let Some((first_seq, text)) = current.take() {
+                if !text.is_empty() {
+                    let (sum, _prev) =
+                        zeron_proto::trajectory::sanitize_prompt_preview(&text, 1024);
+                    let rec = TrajectoryRecord {
+                        id: TrajectoryRecordId::new(&run_id, first_seq, 0),
+                        chat_id: chat_id.to_string(),
+                        run_id: run_id.clone(),
+                        source_seq: first_seq,
+                        sub_seq: 0,
+                        lane: TrajectoryLane::Model,
+                        kind: TrajectoryRecordKind::AssistantMessage,
+                        status: TrajectoryStatus::Completed,
+                        is_partial: false,
+                        title: "Assistant".into(),
+                        summary: sum,
+                        turn_id: None,
+                        step_id: None,
+                        call_id: None,
+                        parent_tool_use_id: None,
+                        timing: Some(TrajectoryTiming::sequence_only()),
+                        usage: None,
+                        payload: Some(TrajectoryPayloadPreview {
+                            summary: "Response completed".to_string(),
+                            sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
+                                &text, 1024,
+                            )),
+                            schema_info: None,
+                            raw_ref: Some(TrajectoryRawRef::new(
+                                chat_id,
+                                first_seq,
+                                None,
+                                None,
+                                TrajectoryRawField::Payload,
+                            )),
+                        }),
+                        result: None,
+                        error_message: None,
+                        is_degraded: false,
+                    };
+                    records.push(rec);
+                }
+            }
+        };
+
+        let flush_reasoning = |records: &mut Vec<TrajectoryRecord>,
+                               current: &mut Option<(u64, String)>| {
+            if let Some((first_seq, text)) = current.take() {
+                if !text.is_empty() {
+                    let (sum, _prev) =
+                        zeron_proto::trajectory::sanitize_prompt_preview(&text, 1024);
+                    let rec = TrajectoryRecord {
+                        id: TrajectoryRecordId::new(&run_id, first_seq, 1),
+                        chat_id: chat_id.to_string(),
+                        run_id: run_id.clone(),
+                        source_seq: first_seq,
+                        sub_seq: 1,
+                        lane: TrajectoryLane::Model,
+                        kind: TrajectoryRecordKind::Reasoning,
+                        status: TrajectoryStatus::Completed,
+                        is_partial: false,
+                        title: "Reasoning".into(),
+                        summary: sum,
+                        turn_id: None,
+                        step_id: None,
+                        call_id: None,
+                        parent_tool_use_id: None,
+                        timing: Some(TrajectoryTiming::sequence_only()),
+                        usage: None,
+                        payload: Some(TrajectoryPayloadPreview {
+                            summary: "Reasoning completed".to_string(),
+                            sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
+                                &text, 1024,
+                            )),
+                            schema_info: None,
+                            raw_ref: Some(TrajectoryRawRef::new(
+                                chat_id,
+                                first_seq,
+                                None,
+                                None,
+                                TrajectoryRawField::Payload,
+                            )),
+                        }),
+                        result: None,
+                        error_message: None,
+                        is_degraded: false,
+                    };
+                    records.push(rec);
+                }
+            }
+        };
 
         for line_res in reader.lines() {
             let line = match line_res {
@@ -708,21 +858,49 @@ impl TrajectoryStore {
             let seq = parsed.seq;
             let event = parsed.event;
 
-            if matches!(event, zeron_proto::AgentEvent::Done { .. }) {
-                has_done = true;
-            }
-            if let zeron_proto::AgentEvent::ToolCall { id, .. } = &event {
-                pending_tools.insert(id.clone());
-            }
-            if let zeron_proto::AgentEvent::ToolResult { id, .. } = &event {
-                pending_tools.remove(id);
-            }
+            match &event {
+                zeron_proto::AgentEvent::ReasoningDelta { text } => {
+                    flush_text(&mut records, &mut current_text);
+                    if let Some((_, accumulated)) = &mut current_reasoning {
+                        accumulated.push_str(text);
+                    } else {
+                        current_reasoning = Some((seq, text.clone()));
+                    }
+                }
+                zeron_proto::AgentEvent::TextDelta { text } => {
+                    flush_reasoning(&mut records, &mut current_reasoning);
+                    if let Some((_, accumulated)) = &mut current_text {
+                        accumulated.push_str(text);
+                    } else {
+                        current_text = Some((seq, text.clone()));
+                    }
+                }
+                _ => {
+                    flush_reasoning(&mut records, &mut current_reasoning);
+                    flush_text(&mut records, &mut current_text);
 
-            if let Some(mut rec) = project_event_to_record(chat_id, &run_id, seq, &event, None) {
-                rec.timing = Some(TrajectoryTiming::sequence_only());
-                records.push(rec);
+                    if matches!(event, zeron_proto::AgentEvent::Done { .. }) {
+                        has_done = true;
+                    }
+                    if let zeron_proto::AgentEvent::ToolCall { id, .. } = &event {
+                        pending_tools.insert(id.clone());
+                    }
+                    if let zeron_proto::AgentEvent::ToolResult { id, .. } = &event {
+                        pending_tools.remove(id);
+                    }
+
+                    if let Some(mut rec) =
+                        project_event_to_record(chat_id, &run_id, seq, &event, None)
+                    {
+                        rec.timing = Some(TrajectoryTiming::sequence_only());
+                        records.push(rec);
+                    }
+                }
             }
         }
+
+        flush_reasoning(&mut records, &mut current_reasoning);
+        flush_text(&mut records, &mut current_text);
 
         // If the journal had no terminal Done event, mark unsettled tool calls and add an interrupted record
         if !has_done && !records.is_empty() {
@@ -770,9 +948,9 @@ impl TrajectoryStore {
             reply: Some(ReplySender::Sync(tx)),
         };
 
-        if let Err(_) = self.writer_tx.try_send(cmd) {
-            return Err(TrajectoryStoreError::QueueFull);
-        }
+        self.writer_tx
+            .send(cmd)
+            .map_err(|_| TrajectoryStoreError::ChannelClosed)?;
 
         rx.recv()
             .map_err(|_| TrajectoryStoreError::ChannelClosed)??;
@@ -831,20 +1009,6 @@ fn handle_writer_command(
         WriterCommand::WriteRecords(recs) => {
             flush_batch_to_writer(conn, &recs, in_mem);
         }
-        WriterCommand::RecordDegraded(degraded) => {
-            let _ = conn.execute(
-                "INSERT INTO trajectory_degraded_intervals (chat_id, run_id, from_seq, to_seq, reason, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    degraded.chat_id,
-                    degraded.run_id,
-                    degraded.from_seq as i64,
-                    degraded.to_seq as i64,
-                    degraded.reason,
-                    degraded.recorded_at.timestamp_millis()
-                ],
-            );
-        }
         WriterCommand::DeleteChat(chat_id, reply) => {
             let res = delete_chat_tx(conn, &chat_id);
             if let Some(tx) = reply {
@@ -875,15 +1039,6 @@ fn handle_writer_command(
             if let Some(tx) = reply {
                 tx.send(res);
             }
-        }
-        WriterCommand::RetainChats(live_ids, reply) => {
-            let res = retain_chats_tx(conn, &live_ids);
-            if let Some(tx) = reply {
-                let _ = tx.send(res);
-            }
-        }
-        WriterCommand::Flush(reply) => {
-            let _ = reply.send(());
         }
     }
 }
@@ -1796,11 +1951,7 @@ mod tests {
             recorded_at: Utc::now(),
         };
 
-        store
-            .writer_tx
-            .send(WriterCommand::RecordDegraded(degraded))
-            .unwrap();
-        store.flush().await.unwrap();
+        store.record_degraded_in_memory(degraded);
 
         let intervals = store.get_degraded_intervals("c1").unwrap();
         assert_eq!(intervals.len(), 1);
@@ -2216,5 +2367,211 @@ mod tests {
         store.flush().await.unwrap();
         assert_eq!(store.list_all_records("chat_active").unwrap().len(), 0);
         assert_eq!(store.list_all_records("chat_archived").unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn test_trajectory_legacy_eligibility_production_layout_no_duplicate_legacy_run() {
+        let temp = TempDir::new().unwrap();
+        let journal =
+            Arc::new(crate::run_journal::RunJournal::open(temp.path().join("journals")).unwrap());
+        let store = Arc::new(TrajectoryStore::open(temp.path()).unwrap());
+        let engine = crate::sessions::SessionsEngine::new(
+            "device".into(),
+            journal,
+            Arc::new(crate::HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_native_live";
+        // Native capture via live publish
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: zeron_proto::HarnessId::Mock,
+                model: "model".into(),
+                cwd: "/work".into(),
+                session_id: "s1".into(),
+                assistant_message_id: "m1".into(),
+                tools: Vec::new(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Hello live".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("done".into()),
+                error: None,
+                session_id: Some("s1".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+
+        // Reading records must NOT import the live journal as a parallel legacy run
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(
+            records.len(),
+            3,
+            "must have exactly 3 native records and no legacy duplicate"
+        );
+        for r in &records {
+            assert!(
+                !r.run_id.starts_with("legacy_"),
+                "run_id must be native, got {}",
+                r.run_id
+            );
+        }
+        let groups = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(groups.len(), 1, "must have exactly 1 run");
+        assert!(!groups[0].is_legacy, "run must not be marked legacy");
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_legacy_import_one_shot_idempotent_after_journal_growth() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+        let journal_path = temp.path().join("journals").join("chat_grow.jsonl");
+        fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+
+        // Initial legacy journal with 2 events (no Done yet)
+        let lines1 = vec![
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
+            r#"{"seq":2,"event":{"type":"userMessage","text":"First line"}}"#,
+        ];
+        fs::write(&journal_path, lines1.join("\n")).unwrap();
+
+        // First read triggers one-shot import (and adds Interrupted since no Done)
+        let records1 = store.list_all_records("chat_grow").unwrap();
+        assert_eq!(records1.len(), 3); // SessionStarted, UserMessage, Done(Interrupted)
+        assert_eq!(records1[2].status, TrajectoryStatus::Interrupted);
+
+        // Check legacy import table has exactly 1 entry
+        let conn = store.reader().unwrap();
+        let import_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trajectory_legacy_imports WHERE chat_id = ?1",
+                params!["chat_grow"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(import_count, 1);
+
+        // Now simulate journal file growth on disk (new lines appended, file len/mtime changed)
+        let lines2 = vec![
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
+            r#"{"seq":2,"event":{"type":"userMessage","text":"First line"}}"#,
+            r#"{"seq":3,"event":{"type":"userMessage","text":"Appended line"}}"#,
+            r#"{"seq":4,"event":{"type":"done","status":"completed","result":"ok"}}"#,
+        ];
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(&journal_path, lines2.join("\n")).unwrap();
+
+        // Repeated reads (list, watermark, diagnostics) must NOT trigger re-parse or duplicate rows
+        let records2 = store.list_all_records("chat_grow").unwrap();
+        assert_eq!(
+            records2.len(),
+            3,
+            "one-shot legacy import must not re-import after journal growth"
+        );
+        assert_eq!(records2, records1);
+
+        let wm = store.get_watermark("chat_grow").unwrap();
+        assert_eq!(wm, Some(3));
+
+        let diag = store.diagnostics("chat_grow").unwrap();
+        assert_eq!(diag.record_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_saturated_queue_deletion_acknowledged() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Seed some records for chat_victim and chat_survivor
+        store
+            .try_enqueue(sample_record("chat_victim", "r1", 1, 0))
+            .unwrap();
+        store
+            .try_enqueue(sample_record("chat_survivor", "r1", 1, 0))
+            .unwrap();
+
+        // Saturate the capture queue with 2048+ records for a dummy chat
+        for i in 1..=2500 {
+            let _ = store.try_enqueue(sample_record("chat_flood", "r_flood", i, 0));
+        }
+
+        // Authoritative delete of chat_victim while queue is flooded/saturated
+        let del_res = store.delete_chat("chat_victim").await;
+        assert!(
+            del_res.is_ok(),
+            "delete_chat must succeed and acknowledge even under queue saturation"
+        );
+
+        store.flush().await.unwrap();
+
+        let victim_records = store.list_all_records("chat_victim").unwrap();
+        assert_eq!(
+            victim_records.len(),
+            0,
+            "victim chat records must be completely deleted"
+        );
+
+        let survivor_records = store.list_all_records("chat_survivor").unwrap();
+        assert_eq!(
+            survivor_records.len(),
+            1,
+            "survivor chat records must remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_legacy_import_coalesce_text_and_reasoning_deltas() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+        let journal_path = temp.path().join("deltas_chat.jsonl");
+
+        let lines = vec![
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
+            r#"{"seq":2,"event":{"type":"userMessage","text":"Explain rust"}}"#,
+            r#"{"seq":3,"event":{"type":"reasoningDelta","text":"Thinking about "}}"#,
+            r#"{"seq":4,"event":{"type":"reasoningDelta","text":"ownership and borrowing."}}"#,
+            r#"{"seq":5,"event":{"type":"textDelta","text":"Rust provides "}}"#,
+            r#"{"seq":6,"event":{"type":"textDelta","text":"memory safety without GC."}}"#,
+            r#"{"seq":7,"event":{"type":"done","status":"completed","result":"finished"}}"#,
+        ];
+        fs::write(&journal_path, lines.join("\n")).unwrap();
+
+        let imported = store
+            .import_legacy_journal("chat_deltas", &journal_path)
+            .unwrap();
+        assert!(imported);
+
+        let records = store.list_all_records("chat_deltas").unwrap();
+        // Expect: SessionStarted(1), UserMessage(2), Reasoning(3), AssistantMessage(5), Done(7)
+        assert_eq!(records.len(), 5);
+
+        let reasoning_rec = &records[2];
+        assert_eq!(reasoning_rec.source_seq, 3);
+        assert_eq!(reasoning_rec.kind, TrajectoryRecordKind::Reasoning);
+        assert_eq!(reasoning_rec.lane, TrajectoryLane::Model);
+        assert_eq!(reasoning_rec.title, "Reasoning");
+        assert!(reasoning_rec.summary.contains("ownership and borrowing"));
+
+        let text_rec = &records[3];
+        assert_eq!(text_rec.source_seq, 5);
+        assert_eq!(text_rec.kind, TrajectoryRecordKind::AssistantMessage);
+        assert_eq!(text_rec.lane, TrajectoryLane::Model);
+        assert_eq!(text_rec.title, "Assistant");
+        assert!(text_rec.summary.contains("memory safety without GC"));
+
+        assert_ne!(
+            reasoning_rec.id, text_rec.id,
+            "reasoning and assistant records must have distinct identities"
+        );
     }
 }

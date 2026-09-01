@@ -178,6 +178,7 @@ struct WorkspaceHostInner {
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
     room_joined_at: std::sync::atomic::AtomicI64,
     trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
+    last_retained_chat_ids: Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -292,6 +293,7 @@ impl WorkspaceHost {
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
                 trajectory: Mutex::new(None),
+                last_retained_chat_ids: Mutex::new(None),
             }),
         };
         // read again, so the registry snapshot must exist even if the process
@@ -1134,10 +1136,20 @@ impl WorkspaceHostInner {
                 self.devices_tx.send_replace(state.devices);
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
-                if let Some(traj) = lock(&self.trajectory).clone() {
-                    tokio::spawn(async move {
-                        let _ = traj.retain_chats_only(&live_ids).await;
-                    });
+                let live_set: std::collections::BTreeSet<String> =
+                    live_ids.iter().cloned().collect();
+                let mut last_retained = lock(&self.last_retained_chat_ids);
+                let chat_ids_changed = match &*last_retained {
+                    Some(prev) => prev != &live_set,
+                    None => true,
+                };
+                if chat_ids_changed {
+                    *last_retained = Some(live_set);
+                    if let Some(traj) = lock(&self.trajectory).clone() {
+                        tokio::spawn(async move {
+                            let _ = traj.retain_chats_only(&live_ids).await;
+                        });
+                    }
                 }
             }
             Err(err) => {
@@ -1956,5 +1968,50 @@ mod tests {
         // Both chats in the space are removed from TrajectoryStore
         assert_eq!(traj_store.list_all_records("chat_s1").unwrap().len(), 0);
         assert_eq!(traj_store.list_all_records("chat_s2").unwrap().len(), 0);
+    }
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_unchanged_publish_skips_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let traj_store = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap(),
+        );
+
+        let host = super::WorkspaceHost::open(
+            store.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.set_trajectory_store(traj_store.clone());
+        // First publish initializes retained chat IDs
+        host.inner.publish();
+        let initial_chats = super::lock(&host.inner.last_retained_chat_ids).clone();
+        assert!(
+            initial_chats.is_some(),
+            "publish must initialize retained chat IDs"
+        );
+        assert!(initial_chats.unwrap().is_empty());
+
+        // Multiple subsequent publish calls with unchanged chat set must not mutate or re-trigger retention
+        host.inner.publish();
+        host.inner.publish();
+
+        let chats_after = super::lock(&host.inner.last_retained_chat_ids).clone();
+        assert!(chats_after.unwrap().is_empty());
+
+        // Create a chat -> set changes -> publish updates last_retained_chat_ids
+        host.create_chat("chat_new", None, Some("dev-1"), None, None)
+            .unwrap();
+        host.inner.publish();
+
+        let chats_updated = super::lock(&host.inner.last_retained_chat_ids).clone();
+        assert!(chats_updated.unwrap().contains("chat_new"));
     }
 }
