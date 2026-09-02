@@ -102,7 +102,7 @@ pub(crate) fn installed_entry(pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn find_npm() -> Option<PathBuf> {
-    crate::acp::find_on_paths("npm", Vec::new())
+    crate::find_on_paths("npm", Vec::new())
 }
 
 /// How to spawn an installed entry: JS entries (the overwhelming npm norm,
@@ -125,7 +125,7 @@ pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), H
         .and_then(|npm| npm.parent().map(|d| d.join("node")))
         .into_iter()
         .collect();
-    let node = crate::acp::find_on_paths("node", extra).ok_or_else(|| {
+    let node = crate::find_on_paths("node", extra).ok_or_else(|| {
         HarnessError::NotInstalled(
             "node (required to run the agent's npm-distributed ACP adapter; \
              searched PATH, the login shell's PATH, and fnm/nvm/volta/pnpm/bun \

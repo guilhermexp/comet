@@ -126,32 +126,6 @@ fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String 
     text.to_owned()
 }
 
-/// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
-pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    candidates.extend(extra);
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
-}
-
 /// Generic effort ladder for agents without their own clamping rules.
 fn default_effort_values(
     reasoning: Option<ReasoningLevel>,
@@ -399,9 +373,9 @@ pub fn prewarm_managed_adapters() {
             continue;
         };
         let pin = crate::adapter_install::NpmPin::parse(pkg);
-        if find_on_paths(spec.executable, (spec.extra_paths)()).is_some()
+        if crate::find_on_paths(spec.executable, (spec.extra_paths)()).is_some()
             || crate::adapter_install::installed_entry(&pin, spec.executable).is_some()
-            || find_on_paths(spec.cli_executable, (spec.cli_extra_paths)()).is_none()
+            || crate::find_on_paths(spec.cli_executable, (spec.cli_extra_paths)()).is_none()
             || crate::adapter_install::find_npm().is_none()
         {
             continue;
@@ -563,7 +537,7 @@ impl AcpHarness {
         {
             return Ok(Launch::Program(PathBuf::from(p), spec_args));
         }
-        if let Some(found) = find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
+        if let Some(found) = crate::find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
             return Ok(Launch::Program(found, spec_args));
         }
         if let Some(pkg) = self.spec.npm_package {
@@ -1068,7 +1042,7 @@ impl Harness for AcpHarness {
         if std::env::var_os(self.spec.env_override).is_some_and(|v| !v.is_empty()) {
             return true;
         }
-        find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
+        crate::find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
     }
 
     /// ACP is the source of truth: a short-lived probe reads the agent's

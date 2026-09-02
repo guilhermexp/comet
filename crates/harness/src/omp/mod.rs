@@ -219,7 +219,7 @@ impl OmpHarness {
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from)
             })
-            .or_else(|| crate::acp::find_on_paths("omp", Vec::new()))
+            .or_else(|| crate::find_on_paths("omp", Vec::new()))
     }
 
     fn is_orchestrator_workspace(&self, cwd: &Path) -> bool {
