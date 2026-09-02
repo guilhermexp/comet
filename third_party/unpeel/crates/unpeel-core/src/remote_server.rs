@@ -1439,14 +1439,7 @@ fn api_write_raw<W: Write>(
 }
 
 fn write_session(session_id: &str, data: &str, write_id: Option<String>) -> Result<(), String> {
-    session_host::send_command(
-        session_id,
-        &SessionHostCommand::Write {
-            data: data.to_string(),
-            write_id,
-            task_episode_receipt: None,
-        },
-    )
+    crate::session_ops::write_session_input(session_id, data.to_string(), write_id, None, None)
 }
 
 /// Resize the session PTY. Callers that render a shared session should

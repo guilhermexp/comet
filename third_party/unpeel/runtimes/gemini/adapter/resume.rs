@@ -38,8 +38,13 @@ fn prepare_new_launch(command: &str, _context: NewLaunchContext<'_>) -> Prepared
     }
 }
 
-pub(super) const ADAPTER: ResumeAdapter =
-    ResumeAdapter::new(resumed, fresh).with_new_launch_preparation(prepare_new_launch);
+fn embedded_conversation_id(command: &str) -> Option<String> {
+    id_in_command(&tokenize(command), ID_FLAGS)
+}
+
+pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh)
+    .with_new_launch_preparation(prepare_new_launch)
+    .with_embedded_conversation_id(embedded_conversation_id);
 
 #[cfg(test)]
 mod tests {

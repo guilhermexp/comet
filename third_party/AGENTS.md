@@ -51,6 +51,38 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   sejam dependências binárias intencionais já documentadas.
 - Mudanças em `third_party/unpeel` precisam provar o consumidor real com
   `cargo test -p zeron-workers-unpeel`.
+- **A máquina de estados de atividade é lida por dois consumidores, e o sweep
+  não é fim de turno.** `unpeel-tui/src/activity.rs` é incluída por `#[path]`
+  no `activity_bridge` do Comet, então acessor novo se acrescenta AQUI, nunca
+  numa cópia local. `hook_owned_state` devolve `Idle` tanto para um
+  `Stop`/`StopFailure` real quanto para o sweep de `HOOK_IDLE_TIMEOUT` (5 min
+  sem mudança de tela); `hook_confirmed_idle` (patch local) separa os dois por
+  `stopped_at`, porque consumidor que age de forma destrutiva sobre ociosidade
+  — a hibernação de Workers — mataria turno em andamento com o primeiro. O
+  re-arme de `Busy` por crescimento de saída após um `Stop` desconfiado
+  (`distrust_stops_while_output_grows`, codex) limpa `stopped_at` como
+  `Start`/`UserPromptSubmit`: turno vivo de novo não tem fim confirmado, e
+  o sweep seguinte precisa voltar a ler como não confirmado. Para qualquer
+  runtime, qualquer crescimento do sinal em `Idle` limpa `stopped_at`; a
+  `STOP_REARM_GRACE` decide apenas se `Busy` também será re-armado. Runtime que só posta `Stop`
+  não tem hook de início para revogar a confirmação no turno seguinte. A limpeza de
+  atenção pelo app (`clear_attention_unconfirmed`, patch local) leva a `Idle`
+  sem gravar `stopped_at`, porque um clique não é o runtime dizendo que o
+  turno acabou. `ResumeAdapter::embedded_conversation_id` (patch local, um
+  callback por runtime) expõe o id de conversa que o comando já fixa, para a
+  sonda de retomada do Comet não depender de comparar receitas.
+- **Atividade e hibernação automática se encontram no Session Host.**
+  O protocolo 5 minta um token com a revisão em memória do Host mais hook,
+  tela, marker de input, geração e incarnação persistidos. `Write`,
+  `StreamInput`, resume e cada leitura do PTY avançam a revisão sob o mesmo
+  lock usado por `Hibernate`, e o Host recusa mintar (e hibernar) enquanto a
+  última atividade estiver dentro de `HIBERNATION_QUIET_WINDOW_MS` — o teto de
+  latência entre atividade observada e traço persistido, para o token nunca
+  absorver atividade que a avaliação do cliente ainda não viu. Output já
+  pendente também rejeita a ação antes do Kill. Todo input de cliente passa por
+  `session_ops::write_session_input` (marker + lifecycle lock). `session_ops`
+  segura o lifecycle lock, espera o manifest `exited` e só então grava Archive.
+  O Archive manual permanece sem precondição.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são
@@ -101,6 +133,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `bun run --cwd "$PWD/third_party/unpeel" validate:runtimes` · `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
+| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 

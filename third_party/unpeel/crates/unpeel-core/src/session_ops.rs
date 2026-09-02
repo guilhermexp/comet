@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::app_paths;
 use crate::session_host::{
     load_manifest, socket_path, write_launch_file, HostedSessionManifest, HostedSessionState,
-    SessionHostLaunch,
+    SessionHostCommand, SessionHostLaunch,
 };
 use crate::state::{BrowserAccess, SessionInfo};
 
@@ -32,6 +32,7 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(1_000);
 const STOP_WAIT: Duration = Duration::from_secs(8);
 const DIR_DELETE_RETRIES: u32 = 10;
 const DIR_DELETE_RETRY_DELAY: Duration = Duration::from_millis(300);
+const INPUT_ACTIVITY_MARKER: &str = "controller-input-activity.json";
 
 /// A stable, path-safe lock target for one logical Session. Lifecycle locks
 /// live outside `app-sessions`: removing a Session directory must not unlink
@@ -164,6 +165,114 @@ fn stop_session_unlocked(session_id: &str) -> Result<(), String> {
     ))
 }
 
+fn persisted_hibernation_activity_token(session_id: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let manifest = load_manifest(session_id)?;
+    let mut digest = Sha256::new();
+    digest.update(format!(
+        "{:?}|{:?}|{}|{}|{:?}",
+        manifest.state,
+        manifest.pid_started_at,
+        manifest.runtime_launch_generation,
+        manifest.runtime_launch_pending,
+        manifest.screen_changed_at
+    ));
+    for name in ["last-hook-event.json", INPUT_ACTIVITY_MARKER] {
+        let path = session_dir(session_id).join(name);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map(|value| value.as_nanos())
+                    .unwrap_or_default();
+                digest.update(modified.to_le_bytes());
+                digest.update(metadata.len().to_le_bytes());
+                if let Ok(bytes) = std::fs::read(path) {
+                    digest.update(bytes);
+                }
+            }
+            Err(_) => digest.update([0]),
+        }
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn host_hibernation_activity_token(
+    session_id: &str,
+    activity_revision: u64,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let persisted = persisted_hibernation_activity_token(session_id)?;
+    let mut digest = Sha256::new();
+    digest.update(persisted);
+    digest.update(activity_revision.to_le_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+pub fn hibernation_activity_token(session_id: &str) -> Option<String> {
+    let response = socket_command(
+        session_id,
+        serde_json::json!({ "type": "hibernation_token" }),
+    )
+    .ok()?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    response
+        .get("activity_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn write_input_activity_marker_unlocked(session_id: &str) -> Result<(), String> {
+    let dir = session_dir(session_id);
+    let body = serde_json::json!({
+        "at": now_ms(),
+        "revision": uuid::Uuid::new_v4().to_string(),
+    });
+    let temporary = dir.join(".controller-input-activity.json.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&body).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, dir.join(INPUT_ACTIVITY_MARKER)).map_err(|error| error.to_string())
+}
+
+/// The single client entry for typing into a hosted session: controller API,
+/// Sessions MCP, secure remote input, and typed Host actions all land here so
+/// every input path moves the idle clock (`INPUT_ACTIVITY_MARKER`) and is
+/// serialized with lifecycle operations on the same lease.
+pub fn write_session_input(
+    session_id: &str,
+    data: String,
+    write_id: Option<String>,
+    task_episode_receipt: Option<u64>,
+    timeout: Option<Duration>,
+) -> Result<(), String> {
+    let _lifecycle_lock = lock_session_lifecycle(session_id)?;
+    let manifest = manifest(session_id)?;
+    if manifest.state != HostedSessionState::Running {
+        return Err(format!("session {session_id} is not running"));
+    }
+    write_input_activity_marker_unlocked(session_id)?;
+    let command = SessionHostCommand::Write {
+        data,
+        write_id,
+        task_episode_receipt,
+    };
+    match timeout {
+        Some(timeout) => {
+            crate::session_host::send_command_with_timeout(session_id, &command, timeout)
+        }
+        None => crate::session_host::send_command(session_id, &command),
+    }
+}
+
 fn wait_for_exited_manifest(session_id: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -189,6 +298,38 @@ pub const ARCHIVE_MARKER: &str = "archived.json";
 pub fn archive_session(session_id: &str) -> Result<(), String> {
     let _lifecycle_lock = lock_session_lifecycle(session_id)?;
     stop_session_unlocked(session_id)?;
+    archive_session_unlocked(session_id)
+}
+
+pub fn archive_session_if_activity_matches(
+    session_id: &str,
+    expected_activity_token: &str,
+) -> Result<(), String> {
+    let _lifecycle_lock = lock_session_lifecycle(session_id)?;
+    let response = socket_command(
+        session_id,
+        serde_json::json!({
+            "type": "hibernate",
+            "expected_activity_token": expected_activity_token,
+        }),
+    )?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("session host rejected hibernation")
+            .to_owned());
+    }
+    if !wait_for_exited_manifest(session_id, STOP_WAIT) {
+        return Err(format!(
+            "session {session_id} host did not publish an exited manifest within {}ms",
+            STOP_WAIT.as_millis()
+        ));
+    }
+    archive_session_unlocked(session_id)
+}
+
+fn archive_session_unlocked(session_id: &str) -> Result<(), String> {
     let dir = session_dir(session_id);
     if !dir.exists() {
         return Err(format!("no session dir for {session_id}"));
@@ -811,15 +952,19 @@ pub fn last_activity_ms(session_id: &str, command: &str) -> Option<u64> {
         let modified = std::fs::metadata(dir.join(name)).ok()?.modified().ok()?;
         Some(modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64)
     };
-    if crate::integrations::uses_hook_port(crate::integrations::command_head(command)) {
-        // A hook-capable session with no seed yet has simply never had a
-        // turn — its creation time is the honest answer.
-        return mtime("last-hook-event.json");
-    }
-    // The host's parsed-screen change stamp beats output.bin's mtime: the
-    // text only changes when the screen really shows something new, so it
-    // stays put through idle repaint loops. Older hosts don't write it.
-    screen_changed_at_ms(session_id).or_else(|| mtime("output.bin"))
+    let controller_input = std::fs::read(dir.join(INPUT_ACTIVITY_MARKER))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("at").and_then(serde_json::Value::as_u64));
+    let runtime_activity =
+        if crate::integrations::uses_hook_port(crate::integrations::command_head(command)) {
+            // A hook-capable session with no seed yet has simply never had a
+            // turn — its creation time is the honest answer.
+            mtime("last-hook-event.json")
+        } else {
+            screen_changed_at_ms(session_id).or_else(|| mtime("output.bin"))
+        };
+    runtime_activity.max(controller_input)
 }
 
 /// Canonical "latest lifecycle" timestamp used by a sidebar group sorted as

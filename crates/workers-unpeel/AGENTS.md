@@ -138,6 +138,68 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   exclui sessões de terminal, cujo shell não tem receita de resume, e é o que
   impede jogar fora uma conversa irrecuperável. Hibernar `omp`/`prime-agent` só
   ficou seguro depois da receita de resume da família pi, acima.
+- **Hibernar exige evidência positiva; ausência de sinal protege.** `idle` no
+  wire não basta e `can_resume` não basta. `hibernation_candidates` exige
+  também `idle_confirmed_by_hook` e `resumable_conversation`, os dois
+  preenchidos pelo `activity_bridge`:
+  - `idle_confirmed_by_hook` vem de `ActivityEngine::hook_confirmed_idle`
+    (`stopped_at` presente), e é lido DEPOIS de `derive_activity`, que é quem
+    roda o sweep do tick. A confirmação é perecível: só sobrevive enquanto
+    NADA acontece. Qualquer crescimento do sinal de atividade em `Idle`
+    limpa `stopped_at` antes de considerar a graça de
+    re-arme (`STOP_REARM_GRACE`, 5 s) para qualquer
+    runtime, porque codex, cursor-agent, gemini, amp e opencode só postam
+    `Stop` e não têm evento de início de turno para revogar a confirmação
+    quando o orquestrador manda texto; o estado visível pode seguir `Idle`,
+    mas sem confirmação. Sinal parado mantém a confirmação através de
+    quantos sweeps forem, e um `Stop` posterior reconfirma. Sem isso o `HookState::Idle` do sweep
+    (`HOOK_IDLE_TIMEOUT`, 5 min sem mudança de tela) entrava na política com
+    relógio datado do `agent_start` — prazo estourado por construção — e o
+    `Archive` matava turno em andamento de `omp` dentro de subprocesso longo
+    e silencioso. Sweep e Stop são o MESMO estado em `hook_owned_state`: só
+    `hook_confirmed_idle` os separa.
+  - `resumable_conversation` é evidência de identidade DESTE Worker,
+    verificada diretamente e nunca por comparação de strings (as receitas são
+    idempotentes sobre o próprio output, então `resumed != comando` dava
+    falso para todo Worker já retomado uma vez): id de conversa de provider
+    capturado no marker, OU diretório de sessão gerenciado
+    (`resume::managed_storage_path`) fixado exatamente no diretório canônico
+    `<unpeel_home>/pi-sessions/<session_id>` deste Worker, OU
+    id explícito de conversa já no comando
+    (`resume::embedded_conversation_id`, callback por adapter). Receita que
+    só sabe retomar "a mais recente do diretório" sem nenhuma das três
+    (`codex resume --last`, `gemini --resume latest`, `--continue` solto) não
+    qualifica: dois Workers no mesmo cwd retomariam a conversa um do outro,
+    o que é pior do que não hibernar. Para a família pi essa é a forma das
+    sessões legadas há muito ociosas — hiberná-las reiniciaria limpo e
+    sumiria com a conversa.
+  - `ClearAttention` do menu não é fim de turno: o bridge chama
+    `ActivityEngine::clear_attention_unconfirmed`, que leva a `Idle` sem
+    gravar `stopped_at`. Só `Stop`/`StopFailure` de hook real confirmam.
+  Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
+  quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
+- **A decisão de hibernar é tomada por Worker e confirmada no Host.**
+  `hibernate_confirmed_candidates` é o laço por candidato, puro para ser
+  testável sem gpui, e a ordem é o contrato: mintar o token do Host PRIMEIRO,
+  depois bootstrap fresco, depois reler a seleção, depois
+  `confirmed_hibernation_candidates` (que nunca amplia a primeira passada) e só
+  então `Hibernate`, não o `Archive` manual. O token não mora no
+  `WorkersSession` nem é mintado no `enrich` (uma ida ao socket por Worker a
+  cada bootstrap): só `capture_hibernation_activity_token` no caminho por
+  candidato. Hosts no protocolo 5 mintam um token opaco da geração/incarnação,
+  hook/tela/marker de input e de uma revisão em memória que avança
+  sincronicamente para `Write`, `StreamInput`, resume e cada leitura de output —
+  e recusam mintar enquanto a última atividade estiver dentro de
+  `HIBERNATION_QUIET_WINDOW_MS` (5 s, acima do scan + coalescing da tela). É a
+  janela que fecha a corrida: atividade depois do mint diverge o token, dentro
+  da janela impede o mint, e mais antiga já está persistida e visível ao
+  bootstrap que decide. O Host compara sob o mesmo lock, recusa output pendente
+  e só então aceita o Stop; `session_ops` mantém o lifecycle lock até o manifest
+  `exited` e só depois grava Archive. Todo input de cliente (controller API,
+  `send_text`/`send_keys` do MCP, remoto, `session_input`) passa por
+  `session_ops::write_session_input`, que grava o marker de atividade e segura o
+  mesmo lifecycle lock. Mudança de input, output, hook, tela, geração, Host ou
+  seleção protege o Worker. `Archive` manual continua incondicional.
 - **`send_text` num Worker morto é entrada perdida, não erro do host.**
   `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
   esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
@@ -300,7 +362,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 6 de hibernação), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (14 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (16 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

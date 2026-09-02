@@ -69,6 +69,8 @@ fn session() -> WorkersSession {
         created_at_unix_ms: 1,
         updated_at_unix_ms: 2,
         idle_since_unix_ms: None,
+        idle_confirmed_by_hook: false,
+        resumable_conversation: false,
         total_tokens: None,
         model_usage: Vec::new(),
         capabilities: WorkersSessionCapabilities::default(),
@@ -175,9 +177,12 @@ fn session_command_contract_contains_every_local_unpeel_verb() {
         },
         WorkersSessionCommand::SetNotifyWhenDone { enabled: true },
         WorkersSessionCommand::Archive,
+        WorkersSessionCommand::Hibernate {
+            expected_activity_token: "activity-token".into(),
+        },
         WorkersSessionCommand::Restore,
         WorkersSessionCommand::RestoreAndResume,
         WorkersSessionCommand::Remove,
     ];
-    assert_eq!(commands.len(), 12);
+    assert_eq!(commands.len(), 13);
 }

@@ -8,7 +8,7 @@
 //! (`~/.unpeel/app-sessions/<id>/session.sock`); no running desktop app is
 //! required beyond the hosts themselves.
 
-use crate::session_host::{self, HostedSessionManifest, HostedSessionState, SessionHostCommand};
+use crate::session_host::{self, HostedSessionManifest, HostedSessionState};
 use crate::session_input::sanitize_paste_text;
 #[cfg(test)]
 use crate::session_input::{encode_bracketed_paste, looks_like_it_contains_a_path};
@@ -2852,14 +2852,7 @@ fn load_manifest(session_id: &str) -> Option<HostedSessionManifest> {
 }
 
 fn write_to_session(session_id: &str, data: &str) -> Result<(), String> {
-    session_host::send_command(
-        session_id,
-        &SessionHostCommand::Write {
-            data: data.to_string(),
-            write_id: None,
-            task_episode_receipt: None,
-        },
-    )
+    crate::session_ops::write_session_input(session_id, data.to_string(), None, None, None)
 }
 
 /// Single delivery choke point for typing an inter-session message into a

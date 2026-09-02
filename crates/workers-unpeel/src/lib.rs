@@ -31,6 +31,7 @@ pub use parent_notifications::{
 pub use project_git::{AnchorCommit, ProjectGitStatus};
 pub use project_ledger::{LedgerProject, LiveProject, ProjectRow};
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -788,6 +789,23 @@ pub struct WorkersSession {
     /// identical TUI repaint, which is what makes it the idle clock for
     /// hibernation. `None` means "no evidence" and protects the Worker.
     pub idle_since_unix_ms: Option<u64>,
+    /// Whether the reported idleness was CONFIRMED by the runtime's own
+    /// end-of-turn hook, instead of inferred from a screen that stopped
+    /// changing. Device-local, filled by the activity bridge. A swept idle
+    /// (`HOOK_IDLE_TIMEOUT`, five minutes without a screen change) is what a
+    /// long silent subprocess and a stalled provider call also look like, and
+    /// its idle clock points at the START of the turn — so acting on it
+    /// destructively kills work in flight.
+    pub idle_confirmed_by_hook: bool,
+    /// Whether relaunching this Worker would really resume ITS conversation:
+    /// direct evidence of this Worker's identity — a captured provider
+    /// conversation id in the marker, a managed session dir fixed in the
+    /// command, or an explicit conversation id already in the command. A
+    /// recipe that only falls back to the newest conversation of the
+    /// directory (`codex resume --last`, `gemini --resume latest`) is false,
+    /// because it could resume another Worker's conversation from the same
+    /// cwd — worse than not hibernating.
+    pub resumable_conversation: bool,
     pub total_tokens: Option<u64>,
     pub model_usage: Vec<WorkersModelTokenUsage>,
     pub capabilities: WorkersSessionCapabilities,
@@ -948,6 +966,7 @@ pub enum WorkersSessionCommand {
     AppendSystemContext { text: String },
     SetNotifyWhenDone { enabled: bool },
     Archive,
+    Hibernate { expected_activity_token: String },
     Restore,
     RestoreAndResume,
     Remove,
@@ -1114,6 +1133,15 @@ impl LocalWorkersClient {
     /// The UI can refresh immediately without inferring activity from time.
     pub fn activity_epoch(&self) -> u64 {
         self.activity.change_epoch()
+    }
+
+    /// Ask the Host for its hibernation token. `None` when the Host has no
+    /// confirmed-idle evidence or saw activity inside its quiet window, so the
+    /// caller must mint BEFORE the bootstrap it will decide on: anything the
+    /// token covers is then already persisted and visible to that bootstrap,
+    /// and anything after it diverges the token at the Host.
+    pub fn capture_hibernation_activity_token(&self, session_id: &str) -> Option<String> {
+        unpeel_core::session_ops::hibernation_activity_token(session_id)
     }
 
     pub fn resource_snapshot(
@@ -2092,6 +2120,16 @@ impl LocalWorkersClient {
                 )?;
                 Ok(None)
             }
+            WorkersSessionCommand::Hibernate {
+                expected_activity_token,
+            } => {
+                unpeel_core::session_ops::archive_session_if_activity_matches(
+                    session_id,
+                    &expected_activity_token,
+                )
+                .map_err(WorkersError::State)?;
+                Ok(None)
+            }
             WorkersSessionCommand::Restore => {
                 self.set_session_organization(
                     session_id,
@@ -2483,9 +2521,12 @@ impl From<SessionWire> for WorkersSession {
             worktree_branch: value.worktree_branch,
             created_at_unix_ms: value.created_at_unix_ms,
             updated_at_unix_ms: value.updated_at_unix_ms,
-            // Local to the frontier: the activity bridge fills it from disk
+            // Local to the frontier: the activity bridge fills these from disk
             // after the bootstrap decodes, so there is no new Host wire field.
+            // Absent evidence protects the Worker, so both start false.
             idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
             total_tokens: value.total_tokens,
             model_usage: value.model_usage,
             capabilities: WorkersSessionCapabilities {
@@ -2737,6 +2778,22 @@ fn apply_runtime_capabilities(sessions: &mut [WorkersSession]) {
 /// not mid-launch, and its command names a runtime with a resume recipe —
 /// which is also what excludes terminal sessions, whose shell has none.
 /// Hibernating a Worker that cannot resume would throw the conversation away.
+///
+/// Eligibility needs POSITIVE evidence on both halves of that sentence, not
+/// the absence of contrary signs:
+///
+/// - `idle_confirmed_by_hook`: the runtime said the turn ended. A swept idle
+///   (five minutes without a screen change) reads identically to an `omp`
+///   Worker inside a long silent subprocess, and its idle clock points at the
+///   START of that turn — so the deadline is already blown the moment the
+///   sweep fires, and `Archive` would stop work in flight.
+/// - `resumable_conversation`: relaunching would really resume THIS Worker's
+///   conversation. `can_resume` only proves the runtime HAS a recipe; the bit
+///   needs direct identity evidence (captured provider id, managed session
+///   dir, or explicit conversation id in the command), so a pi-family legacy
+///   session with none (the long-idle shape this policy is meant to reclaim)
+///   and a `codex`/`gemini` session whose recipe would resume "the newest of
+///   the directory" both stay protected.
 pub fn hibernation_candidates<'a>(
     sessions: &'a [WorkersSession],
     settings: &WorkersResourceSettings,
@@ -2753,6 +2810,8 @@ pub fn hibernation_candidates<'a>(
             (session.is_live()
                 && !session.archived
                 && session.activity == "idle"
+                && session.idle_confirmed_by_hook
+                && session.resumable_conversation
                 && !session.pinned
                 && !session.runtime_launch_pending
                 && selected_session_id != Some(session.id.as_str())
@@ -2785,6 +2844,77 @@ pub fn hibernation_candidates<'a>(
             .map(|(session, _)| session),
     );
     candidates
+}
+
+/// Second pass over a FRESH snapshot, keeping only the Workers that were
+/// candidates in both.
+///
+/// The decision and the `Archive` that executes it are separated by a
+/// bootstrap round-trip and a background hop, and `Archive` stops a live
+/// session without re-checking activity. In that window a `send_text` can
+/// land: the first snapshot was decoded before the host stamped the new
+/// screen change and before the `agent_start` hook arrived, so the Worker
+/// still looked idle since the previous turn. Re-deciding on fresh evidence
+/// and intersecting is what keeps that race from stopping a Worker that was
+/// just given work.
+pub fn confirmed_hibernation_candidates<'a>(
+    previous: &[String],
+    fresh: &'a [WorkersSession],
+    settings: &WorkersResourceSettings,
+    selected_session_id: Option<&str>,
+    now_unix_ms: u64,
+) -> Vec<&'a WorkersSession> {
+    if previous.is_empty() {
+        return Vec::new();
+    }
+    let previous: std::collections::HashSet<&str> = previous.iter().map(String::as_str).collect();
+    hibernation_candidates(fresh, settings, selected_session_id, now_unix_ms)
+        .into_iter()
+        .filter(|session| previous.contains(session.id.as_str()))
+        .collect()
+}
+
+/// The per-candidate hibernation loop, kept free of the UI so its ordering
+/// can be exercised without a gpui harness. For each candidate: `recheck`
+/// mints the Host token and re-bootstraps (in that order), the selection is
+/// re-read, the policy is re-decided by `confirmed_hibernation_candidates`,
+/// and only then `hibernate` sends the conditional stop. `selected_session_id`
+/// returning `None` means the panel is gone and the loop stops.
+pub async fn hibernate_confirmed_candidates<R, RF, S, H, HF>(
+    candidate_ids: Vec<String>,
+    settings: &WorkersResourceSettings,
+    mut recheck: R,
+    mut selected_session_id: S,
+    mut hibernate: H,
+) where
+    R: FnMut(&str) -> RF,
+    RF: Future<Output = Option<(String, Vec<WorkersSession>)>>,
+    S: FnMut() -> Option<Option<String>>,
+    H: FnMut(WorkersSession, String) -> HF,
+    HF: Future<Output = ()>,
+{
+    for candidate_id in candidate_ids {
+        let Some((expected_activity_token, fresh)) = recheck(&candidate_id).await else {
+            continue;
+        };
+        let Some(selected) = selected_session_id() else {
+            return;
+        };
+        let previous = [candidate_id];
+        let Some(session) = confirmed_hibernation_candidates(
+            &previous,
+            &fresh,
+            settings,
+            selected.as_deref(),
+            now_unix_ms(),
+        )
+        .into_iter()
+        .next()
+        .cloned() else {
+            continue;
+        };
+        hibernate(session, expected_activity_token).await;
+    }
 }
 
 fn set_notify_when_done_overlay(session_id: &str, enabled: bool) -> Result<(), WorkersError> {
@@ -3107,6 +3237,8 @@ mod runtime_capability_tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
@@ -3627,8 +3759,21 @@ mod worktree_setup_wiring_tests {
 #[cfg(test)]
 mod hibernation_tests {
     use super::{
-        WorkersResourceSettings, WorkersSession, WorkersSessionCapabilities, hibernation_candidates,
+        WorkersResourceSettings, WorkersSession, WorkersSessionCapabilities,
+        confirmed_hibernation_candidates, hibernate_confirmed_candidates, hibernation_candidates,
     };
+    use std::cell::RefCell;
+    use std::future::{Future, ready};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+    }
 
     const MINUTE_MS: u64 = 60_000;
     const NOW: u64 = 100_000 * MINUTE_MS;
@@ -3663,6 +3808,8 @@ mod hibernation_tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: NOW,
             idle_since_unix_ms: Some(NOW - idle_minutes * MINUTE_MS),
+            idle_confirmed_by_hook: true,
+            resumable_conversation: true,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
@@ -3731,6 +3878,123 @@ mod hibernation_tests {
         unknown.command = "some-agent --yolo".into();
 
         assert!(ids(&[terminal, unknown], None).is_empty());
+    }
+
+    #[test]
+    fn a_swept_idle_never_hibernates_because_it_can_be_a_silent_turn() {
+        // The sweep reports idle after five minutes without a screen change
+        // and dates it from the start of the turn, so a Worker inside a long
+        // silent subprocess is indistinguishable from a finished one.
+        let mut swept = worker("long-silent-subprocess", 16);
+        swept.idle_confirmed_by_hook = false;
+
+        assert!(ids(&[swept], None).is_empty());
+    }
+
+    #[test]
+    fn a_conversation_that_would_not_resume_is_never_hibernated() {
+        // `can_resume("omp")` is true, but a legacy pi-family session with no
+        // captured provider id and no pinned session dir relaunches clean.
+        let mut legacy = worker("legacy-omp-without-marker", 24 * 60);
+        legacy.resumable_conversation = false;
+
+        assert!(ids(&[legacy], None).is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_stopped_being_idle_between_the_two_passes_is_spared() {
+        let decided = vec![worker("worker-a", 60), worker("worker-b", 60)];
+        let previous = ids(&decided, None);
+        assert_eq!(previous.len(), 2);
+
+        let mut worker_a = worker("worker-a", 0);
+        worker_a.activity = "working".into();
+        worker_a.idle_confirmed_by_hook = false;
+        let fresh = vec![worker_a, worker("worker-b", 60)];
+
+        let confirmed = confirmed_hibernation_candidates(&previous, &fresh, &settings(), None, NOW)
+            .into_iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(confirmed, vec!["worker-b".to_owned()]);
+    }
+
+    #[test]
+    fn a_worker_selected_between_candidates_is_skipped_by_the_reread_selection() {
+        let log = RefCell::new(Vec::<String>::new());
+        let fresh = vec![worker("worker-a", 60), worker("worker-b", 60)];
+        let selections = RefCell::new(vec![None, Some("worker-b".to_owned())].into_iter());
+
+        block_on(hibernate_confirmed_candidates(
+            vec!["worker-a".to_owned(), "worker-b".to_owned()],
+            &settings(),
+            |candidate_id| {
+                log.borrow_mut().push(format!("recheck:{candidate_id}"));
+                ready(Some((format!("token:{candidate_id}"), fresh.clone())))
+            },
+            || {
+                log.borrow_mut().push("selection".into());
+                Some(
+                    selections
+                        .borrow_mut()
+                        .next()
+                        .expect("one read per candidate"),
+                )
+            },
+            |session, token| {
+                log.borrow_mut()
+                    .push(format!("hibernate:{}:{token}", session.id));
+                ready(())
+            },
+        ));
+
+        assert_eq!(
+            log.into_inner(),
+            vec![
+                "recheck:worker-a",
+                "selection",
+                "hibernate:worker-a:token:worker-a",
+                "recheck:worker-b",
+                "selection",
+            ],
+            "selection is re-read after each candidate's own recheck, and the \
+             newly selected Worker gets no stop"
+        );
+    }
+
+    #[test]
+    fn a_candidate_the_host_refuses_to_tokenize_is_skipped_without_a_stop() {
+        let hibernated = RefCell::new(Vec::<String>::new());
+        let fresh = vec![worker("worker-a", 60), worker("worker-b", 60)];
+
+        block_on(hibernate_confirmed_candidates(
+            vec!["worker-a".to_owned(), "worker-b".to_owned()],
+            &settings(),
+            |candidate_id| {
+                ready((candidate_id == "worker-b").then(|| ("token".to_owned(), fresh.clone())))
+            },
+            || Some(None),
+            |session, _| {
+                hibernated.borrow_mut().push(session.id);
+                ready(())
+            },
+        ));
+
+        assert_eq!(hibernated.into_inner(), vec!["worker-b".to_owned()]);
+    }
+
+    #[test]
+    fn the_second_pass_never_widens_the_first_decision() {
+        let previous = vec!["worker-a".to_owned()];
+        let fresh = vec![worker("worker-a", 60), worker("worker-new", 24 * 60)];
+
+        let confirmed = confirmed_hibernation_candidates(&previous, &fresh, &settings(), None, NOW)
+            .into_iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(confirmed, vec!["worker-a".to_owned()]);
     }
 
     #[test]

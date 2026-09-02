@@ -46,6 +46,7 @@ pub struct ResumeAdapter {
     pub forked: Option<ForkResume>,
     pub resume_failure_markers: Option<ResumeFailureMarkers>,
     pub managed_session_dir: Option<fn(&str, &str) -> Option<String>>,
+    pub embedded_conversation_id: Option<fn(&str) -> Option<String>>,
 }
 
 impl ResumeAdapter {
@@ -57,6 +58,7 @@ impl ResumeAdapter {
             forked: None,
             resume_failure_markers: None,
             managed_session_dir: None,
+            embedded_conversation_id: None,
         }
     }
 
@@ -86,6 +88,14 @@ impl ResumeAdapter {
         managed_session_dir: fn(&str, &str) -> Option<String>,
     ) -> Self {
         self.managed_session_dir = Some(managed_session_dir);
+        self
+    }
+
+    pub const fn with_embedded_conversation_id(
+        mut self,
+        embedded_conversation_id: fn(&str) -> Option<String>,
+    ) -> Self {
+        self.embedded_conversation_id = Some(embedded_conversation_id);
         self
     }
 }
@@ -228,6 +238,17 @@ pub fn pinning_pi_session_dir(command: &str, directory: &str) -> (String, bool) 
 /// the command was pinned beneath `root`.
 pub fn unpeel_managed_pi_session_dir(command: &str, root: &str) -> Option<String> {
     managed_storage_path(command, Path::new(root)).map(|path| path.to_string_lossy().to_string())
+}
+
+/// The conversation id `command` already targets explicitly (`codex resume
+/// <id>`, `--resume <id>`, `--conversation <id>`), as the runtime adapter
+/// reads it. Picker and newest-of-directory forms (`resume --last`,
+/// `--resume latest`, bare `--continue`) are not a target and return None.
+pub fn embedded_conversation_id(command: &str) -> Option<String> {
+    adapter(command)
+        .and_then(|adapter| adapter.embedded_conversation_id)
+        .and_then(|embedded| embedded(command))
+        .filter(|id| !id.is_empty())
 }
 
 /// Return runtime-owned storage referenced by `command`, but only when the
@@ -478,6 +499,29 @@ pub(crate) fn join(tokens: Vec<String>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_conversation_id_only_reports_an_explicit_target() {
+        use super::embedded_conversation_id;
+        assert_eq!(
+            embedded_conversation_id("codex resume 't1' --full-auto").as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            embedded_conversation_id("omp --resume 'omp-1'").as_deref(),
+            Some("omp-1")
+        );
+        assert_eq!(
+            embedded_conversation_id("gemini --resume 'g1'").as_deref(),
+            Some("g1")
+        );
+        assert_eq!(embedded_conversation_id("codex resume --last"), None);
+        assert_eq!(embedded_conversation_id("gemini --resume latest"), None);
+        assert_eq!(embedded_conversation_id("claude --continue"), None);
+        assert_eq!(embedded_conversation_id("cursor-agent resume"), None);
+        assert_eq!(embedded_conversation_id("omp --continue"), None);
+        assert_eq!(embedded_conversation_id("bash"), None);
+    }
+
     use super::*;
     use crate::runtime_catalog::RuntimeCapability;
 

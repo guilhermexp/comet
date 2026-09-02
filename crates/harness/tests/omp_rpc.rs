@@ -363,6 +363,53 @@ async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
 }
 
 #[tokio::test]
+async fn older_omp_keeps_idle_live_available_but_rejects_session_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = fake_harness("live-basic-only");
+
+    let support = harness.probe_live_voice(temp.path()).await.unwrap();
+    assert!(support.available);
+    assert!(!support.session_context);
+    assert!(support.usable(false));
+    assert!(!support.usable(true));
+
+    let handle = harness
+        .start_live_voice(LiveVoiceRequest {
+            cwd: temp.path().to_string_lossy().into_owned(),
+            resume: None,
+        })
+        .await
+        .unwrap();
+    let controls = handle.controls;
+    let mut events = handle.events;
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Phase(LiveVoicePhase::Connecting)
+    );
+    for _ in 0..4 {
+        next_live_event(&mut events).await;
+    }
+
+    controls
+        .send(LiveVoiceControl::AppendSessionContext {
+            text: "Session status: Working".into(),
+        })
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), events.next())
+        .await
+        .expect("session-context rejection timed out")
+        .expect("Live event stream ended without rejecting session context")
+        .expect_err("an older OMP must reject unsupported session context");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support session context"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn omp_live_frontend_resumes_session_and_reuses_one_child_for_serial_delegations() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("omp.pid");

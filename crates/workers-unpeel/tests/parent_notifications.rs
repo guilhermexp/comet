@@ -31,6 +31,8 @@ fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSes
         created_at_unix_ms: 1_000,
         updated_at_unix_ms: 1_001,
         idle_since_unix_ms: None,
+        idle_confirmed_by_hook: false,
+        resumable_conversation: false,
         total_tokens: None,
         model_usage: Vec::new(),
         capabilities: WorkersSessionCapabilities::default(),

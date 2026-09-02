@@ -100,9 +100,14 @@ fn managed_session_dir(command: &str, root: &str) -> Option<String> {
     Some(directory)
 }
 
+fn embedded_conversation_id(command: &str) -> Option<String> {
+    id_in_command(&tokenize(command), ID_FLAGS)
+}
+
 pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh)
     .with_new_launch_preparation(prepare_new_launch)
-    .with_managed_session_dir(managed_session_dir);
+    .with_managed_session_dir(managed_session_dir)
+    .with_embedded_conversation_id(embedded_conversation_id);
 
 #[cfg(test)]
 mod tests {
