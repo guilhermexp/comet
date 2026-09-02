@@ -561,8 +561,20 @@ impl SessionsEngine {
         let producer_cancellation = cancellation.clone();
         tokio::spawn(async move {
             loop {
+                let flush_due = async {
+                    match context.next_flush_at() {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                };
                 let event = tokio::select! {
                     _ = producer_cancellation.cancelled() => return,
+                    _ = flush_due => {
+                        if context.flush_at(std::time::Instant::now()) {
+                            context_tx.send_replace(context.render());
+                        }
+                        continue;
+                    }
                     event = events.recv() => match event {
                         Ok(event) => event.event,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,

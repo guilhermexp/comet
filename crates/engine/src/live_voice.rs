@@ -107,6 +107,7 @@ pub(crate) struct LiveOperationalContext {
     active_tool: Option<(String, &'static str)>,
     visible_error: Option<String>,
     last_text_update: Option<Instant>,
+    pending_text: bool,
 }
 
 impl LiveOperationalContext {
@@ -117,6 +118,7 @@ impl LiveOperationalContext {
             active_tool: None,
             visible_error: None,
             last_text_update: None,
+            pending_text: false,
         };
         context.push_visible_text(visible_text);
         context
@@ -156,30 +158,64 @@ impl LiveOperationalContext {
     }
 
     /// Reports whether the rendered context should be republished. Boundaries
-    /// (status, tool, error, message end, turn start) publish at once; streamed
-    /// text publishes on the [`LIVE_TEXT_UPDATE_INTERVAL`] clock.
+    /// (status, tool, error, message end, turn start) publish at once, carrying
+    /// any streamed text still pending; streamed text alone publishes on the
+    /// [`LIVE_TEXT_UPDATE_INTERVAL`] clock, whatever event (or [`Self::flush_at`]
+    /// tick) observes the interval expiring.
     pub(crate) fn observe_at(&mut self, event: &AgentEvent, now: Instant) -> bool {
-        let changed = self.apply(event, now);
+        let changed = match event {
+            AgentEvent::TextDelta { text } => {
+                self.push_visible_text(text);
+                self.pending_text = !self.visible_text.trim().is_empty();
+                self.text_interval_elapsed(now)
+            }
+            AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::Usage { .. }
+            | AgentEvent::Subagent { .. } => self.text_interval_elapsed(now),
+            _ => self.apply(event) || self.pending_text,
+        };
         if changed {
-            self.last_text_update = Some(now);
+            self.mark_published(now);
         }
         changed
     }
 
-    fn apply(&mut self, event: &AgentEvent, now: Instant) -> bool {
+    /// Earliest instant at which pending streamed text is due for publication.
+    pub(crate) fn next_flush_at(&self) -> Option<Instant> {
+        self.pending_text.then(|| {
+            self.last_text_update
+                .map_or(Instant::now(), |last| last + LIVE_TEXT_UPDATE_INTERVAL)
+        })
+    }
+
+    /// Clock-driven publication of pending streamed text when no event arrives.
+    pub(crate) fn flush_at(&mut self, now: Instant) -> bool {
+        let due = self.text_interval_elapsed(now);
+        if due {
+            self.mark_published(now);
+        }
+        due
+    }
+
+    fn text_interval_elapsed(&self, now: Instant) -> bool {
+        self.pending_text
+            && self
+                .last_text_update
+                .is_none_or(|last| now.duration_since(last) >= LIVE_TEXT_UPDATE_INTERVAL)
+    }
+
+    fn mark_published(&mut self, now: Instant) {
+        self.last_text_update = Some(now);
+        self.pending_text = false;
+    }
+
+    fn apply(&mut self, event: &AgentEvent) -> bool {
         match event {
             AgentEvent::SessionStarted { .. } => {
                 let had_tool = self.active_tool.take().is_some();
                 let had_error = self.visible_error.take().is_some();
                 let had_text = self.clear_visible_text();
                 self.set_status(SessionStatus::Working) || had_tool || had_error || had_text
-            }
-            AgentEvent::TextDelta { text } => {
-                self.push_visible_text(text);
-                !self.visible_text.trim().is_empty()
-                    && self
-                        .last_text_update
-                        .is_none_or(|last| now.duration_since(last) >= LIVE_TEXT_UPDATE_INTERVAL)
             }
             AgentEvent::AssistantMessageCompleted { .. } => !self.visible_text.trim().is_empty(),
             AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
@@ -995,6 +1031,59 @@ mod tests {
         );
         assert!(heavy.render().ends_with(chunk.trim_end()));
         assert!(heavy.render().len() <= LIVE_VISIBLE_TEXT_WINDOW_BYTES + 64);
+    }
+
+    #[test]
+    fn live_operational_context_flushes_pending_text_without_another_text_event() {
+        let start = Instant::now();
+        let delta = |text: &str| AgentEvent::TextDelta { text: text.into() };
+        let reasoning = AgentEvent::ReasoningDelta {
+            text: "private".into(),
+        };
+
+        let mut clocked = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(clocked.observe_at(&steered(), start));
+        assert!(!clocked.observe_at(&delta("Running the "), start + Duration::from_millis(300)));
+        assert!(!clocked.observe_at(&delta("tests now."), start + Duration::from_millis(800)));
+        assert!(!clocked.observe_at(&reasoning, start + Duration::from_millis(900)));
+        assert_eq!(
+            clocked.next_flush_at(),
+            Some(start + LIVE_TEXT_UPDATE_INTERVAL)
+        );
+        assert!(!clocked.flush_at(start + Duration::from_millis(950)));
+        assert!(clocked.flush_at(start + LIVE_TEXT_UPDATE_INTERVAL));
+        assert_eq!(clocked.next_flush_at(), None);
+        assert!(!clocked.flush_at(start + Duration::from_secs(30)));
+        assert_eq!(
+            clocked.render(),
+            "Session status: Working\nVisible assistant update: Running the tests now."
+        );
+
+        let mut by_reasoning = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(by_reasoning.observe_at(&steered(), start));
+        assert!(!by_reasoning.observe_at(&delta("pending"), start + Duration::from_millis(500)));
+        assert!(by_reasoning.observe_at(&reasoning, start + LIVE_TEXT_UPDATE_INTERVAL));
+        assert!(!by_reasoning.observe_at(&reasoning, start + Duration::from_secs(30)));
+
+        let mut by_boundary = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(by_boundary.observe_at(&steered(), start));
+        assert!(!by_boundary.observe_at(&delta("pending"), start + Duration::from_millis(100)));
+        assert!(by_boundary.observe_at(
+            &AgentEvent::ToolResult {
+                id: "unknown-tool".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: None,
+            },
+            start + Duration::from_millis(200)
+        ));
+        assert_eq!(by_boundary.next_flush_at(), None);
+        assert!(
+            by_boundary
+                .render()
+                .ends_with("Visible assistant update: pending")
+        );
     }
 
     #[test]
