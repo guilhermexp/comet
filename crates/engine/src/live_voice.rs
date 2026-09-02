@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -12,6 +12,16 @@ use crate::{EngineError, new_id};
 
 pub const MAX_LIVE_TEXT_BYTES: usize = 64 * 1024;
 const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Minimum spacing between text-only context updates. OMP streams a turn as
+/// `TextDelta`s with no message-boundary event, so streamed text has to reach
+/// the voice model on a clock; one second is slow enough that a long answer
+/// costs a few dozen updates instead of one per token, and fast enough that
+/// the voice model never talks about a paragraph the coding run has moved past.
+pub(crate) const LIVE_TEXT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+/// The operational context carries only the tail of the current turn's text,
+/// so each update is bounded by this window rather than by everything streamed
+/// so far: an N-byte answer costs O(N) bytes over its updates, not O(N²).
+pub(crate) const LIVE_VISIBLE_TEXT_WINDOW_BYTES: usize = 2 * 1024;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -96,17 +106,34 @@ pub(crate) struct LiveOperationalContext {
     visible_text: String,
     active_tool: Option<(String, &'static str)>,
     visible_error: Option<String>,
+    last_text_update: Option<Instant>,
 }
 
 impl LiveOperationalContext {
     pub(crate) fn new(status: SessionStatus, visible_text: &str) -> Self {
-        let mut bounded_text = String::new();
-        push_bounded(&mut bounded_text, visible_text);
-        Self {
+        let mut context = Self {
             status,
-            visible_text: bounded_text,
+            visible_text: String::new(),
             active_tool: None,
             visible_error: None,
+            last_text_update: None,
+        };
+        context.push_visible_text(visible_text);
+        context
+    }
+
+    fn push_visible_text(&mut self, text: &str) {
+        self.visible_text.push_str(text);
+        let excess = self
+            .visible_text
+            .len()
+            .saturating_sub(LIVE_VISIBLE_TEXT_WINDOW_BYTES);
+        if excess > 0 {
+            let mut boundary = excess;
+            while !self.visible_text.is_char_boundary(boundary) {
+                boundary += 1;
+            }
+            self.visible_text.drain(..boundary);
         }
     }
 
@@ -125,6 +152,21 @@ impl LiveOperationalContext {
     }
 
     pub(crate) fn observe(&mut self, event: &AgentEvent) -> bool {
+        self.observe_at(event, Instant::now())
+    }
+
+    /// Reports whether the rendered context should be republished. Boundaries
+    /// (status, tool, error, message end, turn start) publish at once; streamed
+    /// text publishes on the [`LIVE_TEXT_UPDATE_INTERVAL`] clock.
+    pub(crate) fn observe_at(&mut self, event: &AgentEvent, now: Instant) -> bool {
+        let changed = self.apply(event, now);
+        if changed {
+            self.last_text_update = Some(now);
+        }
+        changed
+    }
+
+    fn apply(&mut self, event: &AgentEvent, now: Instant) -> bool {
         match event {
             AgentEvent::SessionStarted { .. } => {
                 let had_tool = self.active_tool.take().is_some();
@@ -133,8 +175,11 @@ impl LiveOperationalContext {
                 self.set_status(SessionStatus::Working) || had_tool || had_error || had_text
             }
             AgentEvent::TextDelta { text } => {
-                push_bounded(&mut self.visible_text, text);
-                false
+                self.push_visible_text(text);
+                !self.visible_text.trim().is_empty()
+                    && self
+                        .last_text_update
+                        .is_none_or(|last| now.duration_since(last) >= LIVE_TEXT_UPDATE_INTERVAL)
             }
             AgentEvent::AssistantMessageCompleted { .. } => !self.visible_text.trim().is_empty(),
             AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
@@ -900,6 +945,56 @@ mod tests {
         assert!(rendered.contains("Current action: Running command"));
         assert!(rendered.contains("Visible assistant update: Already visible Tests are running."));
         assert!(!rendered.contains("secret command"));
+    }
+
+    #[test]
+    fn live_operational_context_publishes_streamed_text_on_a_clock_without_message_end() {
+        let start = Instant::now();
+        let mut context = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(context.observe_at(&steered(), start));
+        let delta = |text: &str| AgentEvent::TextDelta { text: text.into() };
+        assert!(!context.observe_at(&delta("First "), start + Duration::from_millis(300)));
+        assert!(context.observe_at(&delta("second "), start + LIVE_TEXT_UPDATE_INTERVAL));
+        assert!(!context.observe_at(
+            &delta("third "),
+            start + LIVE_TEXT_UPDATE_INTERVAL + Duration::from_millis(900)
+        ));
+        assert!(context.observe_at(&delta("fourth"), start + LIVE_TEXT_UPDATE_INTERVAL * 2));
+        assert_eq!(
+            context.render(),
+            "Session status: Working\nVisible assistant update: First second third fourth"
+        );
+
+        let mut heavy = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(heavy.observe_at(&steered(), start));
+        let deltas = 500;
+        let step = Duration::from_millis(10);
+        let chunk = "streamed text chunk ";
+        let mut updates = 0;
+        let mut payload = 0;
+        for index in 0..deltas {
+            let now = start + step * index;
+            if heavy.observe_at(&delta(chunk), now) {
+                updates += 1;
+                payload += heavy.render().len();
+            }
+        }
+        let total_text = chunk.len() * deltas as usize;
+        let elapsed_secs = (step * deltas).as_secs_f64();
+        assert!(
+            updates <= elapsed_secs.ceil() as usize + 1,
+            "{updates} updates for {elapsed_secs}s of streaming"
+        );
+        assert!(
+            payload <= updates * (LIVE_VISIBLE_TEXT_WINDOW_BYTES + 64),
+            "each update is bounded by the text window, got {payload} bytes"
+        );
+        assert!(
+            payload < total_text * 2,
+            "{payload} bytes for {total_text} bytes of text"
+        );
+        assert!(heavy.render().ends_with(chunk.trim_end()));
+        assert!(heavy.render().len() <= LIVE_VISIBLE_TEXT_WINDOW_BYTES + 64);
     }
 
     #[test]

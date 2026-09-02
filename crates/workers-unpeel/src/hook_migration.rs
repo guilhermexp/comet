@@ -26,12 +26,17 @@ pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
     let has_live_sessions = unpeel_core::session_host::list_manifests()
         .into_iter()
         .any(|manifest| manifest.state == unpeel_core::session_host::HostedSessionState::Running);
-    remove_legacy_hook_root_at(
+    let pruned = remove_legacy_hook_root_at(
         &legacy_root,
         &managed_provider_config_paths(),
         has_live_sessions,
-    )?;
-    installed
+    );
+    match (installed, pruned) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Err(prune)) => Err(prune),
+        (Err(install), Ok(_)) => Err(install),
+        (Err(install), Err(prune)) => Err(format!("{install}; {prune}")),
+    }
 }
 
 pub(crate) fn is_comet_application_process() -> bool {
