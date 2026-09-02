@@ -134,6 +134,14 @@ pub fn live_context_command(
     }))
 }
 
+pub fn live_session_context_command(text: &str) -> Result<Value, HarnessError> {
+    validate_non_empty("session context text", text, MAX_OUTBOUND_BYTES)?;
+    Ok(json!({
+        "type": "live_append_session_context",
+        "text": text,
+    }))
+}
+
 pub fn live_stop_command() -> Value {
     json!({ "type": "live_stop" })
 }

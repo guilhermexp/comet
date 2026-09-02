@@ -8,7 +8,9 @@
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
 //! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
 //!
-//! All git access is via subprocess (`tokio::process`) — never libgit2.
+//! All git access is via subprocess, never libgit2 — and every spawn goes
+//! through [`crate::process::ProcessRunner`], which is also the seam a test
+//! swaps for a fake.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,10 +25,17 @@ use zeron_proto::{
 };
 
 use crate::EngineError;
+use crate::process::{
+    LONG_GIT_TIMEOUT, ProcessRequest, ProcessRunError, ProcessRunner, SystemProcessRunner,
+};
 
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
 const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ceiling on a single git invocation's stdout. Generous — the biggest reader
+/// here is a paged history log — but bounded: a runaway command must not be
+/// buffered whole.
+const GIT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Hard wall-clock ceiling for a folder listing (the walk runs in a disposable
 /// blocking task; on expiry the caller unblocks and the task is abandoned).
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
@@ -92,6 +101,7 @@ struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    runner: std::sync::Arc<dyn ProcessRunner>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     file_index: FileIndexCache,
 }
@@ -123,15 +133,47 @@ impl Repos {
 
     /// Explicit worktree root (tests).
     pub fn with_worktrees_root(data_dir: &Path, device_id: &str, worktrees_root: PathBuf) -> Self {
+        Self::build(
+            data_dir,
+            device_id,
+            worktrees_root,
+            std::sync::Arc::new(SystemProcessRunner),
+        )
+    }
+
+    /// Explicit process runner (tests): every git invocation this instance
+    /// makes goes to `runner` instead of a real child process.
+    #[cfg(test)]
+    pub(crate) fn with_runner(
+        data_dir: &Path,
+        device_id: &str,
+        runner: std::sync::Arc<dyn ProcessRunner>,
+    ) -> Self {
+        Self::build(data_dir, device_id, default_worktrees_root(), runner)
+    }
+
+    fn build(
+        data_dir: &Path,
+        device_id: &str,
+        worktrees_root: PathBuf,
+        runner: std::sync::Arc<dyn ProcessRunner>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(ReposInner {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                runner,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
                 file_index: std::sync::Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// The runner this instance spawns git through — the diff capture borrows
+    /// it so an injected fake covers those paths too.
+    pub(crate) fn runner(&self) -> &dyn ProcessRunner {
+        self.inner.runner.as_ref()
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -167,28 +209,47 @@ impl Repos {
 
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(args);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
+        let output = self
+            .inner
+            .runner
+            .run(ProcessRequest {
+                program: "git".into(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd: cwd.map(Path::to_path_buf),
+                env: Vec::new(),
+                timeout: LONG_GIT_TIMEOUT,
+                output_limit: GIT_OUTPUT_LIMIT,
+                kill_on_drop: false,
+            })
             .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
-        if !output.status.success() {
+            .map_err(|error| {
+                EngineError::Other(match error {
+                    ProcessRunError::Spawn(kind) => format!("git spawn failed: {kind}"),
+                    ProcessRunError::Timeout => format!(
+                        "git {} timed out after {}s",
+                        args.first().unwrap_or(&"?"),
+                        LONG_GIT_TIMEOUT.as_secs()
+                    ),
+                    ProcessRunError::Io => "git io failed".to_string(),
+                })
+            })?;
+        if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
             return Err(EngineError::Other(if message.is_empty() {
-                format!(
-                    "git {} failed ({})",
-                    args.first().unwrap_or(&"?"),
-                    output.status
-                )
+                format!("git {} failed", args.first().unwrap_or(&"?"))
             } else {
                 format!("git: {message}")
             }));
+        }
+        // Truncated stdout would be parsed as if it were the whole answer —
+        // a short branch list or a half-read porcelain stanza. Say so instead.
+        if output.stdout_truncated {
+            return Err(EngineError::Other(format!(
+                "git {} output exceeded {} bytes",
+                args.first().unwrap_or(&"?"),
+                GIT_OUTPUT_LIMIT
+            )));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -1553,6 +1614,32 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::ProcessOutput;
+
+    /// The runner seam: `Repos` never spawns git itself, so a failure is
+    /// whatever the runner reports — stderr and all.
+    #[tokio::test]
+    async fn git_failure_surfaces_stderr() {
+        struct Fail;
+        #[async_trait::async_trait]
+        impl ProcessRunner for Fail {
+            async fn run(&self, _r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+                Ok(ProcessOutput {
+                    success: false,
+                    stdout: vec![],
+                    stderr: b"fatal: not a git repository\n".to_vec(),
+                    stdout_truncated: false,
+                })
+            }
+        }
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::with_runner(data.path(), "dev", std::sync::Arc::new(Fail));
+        let err = repos.git(&["status"], None).await.unwrap_err().to_string();
+        assert!(
+            err.contains("not a git repository"),
+            "unexpected error: {err}"
+        );
+    }
 
     fn score(query: &str, candidate: &str) -> Option<u32> {
         let mut matcher = nucleo_matcher::Matcher::new({

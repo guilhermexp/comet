@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{Context, Entity, Task};
 use zeron_doc::SessionCommandPayload;
@@ -10,10 +10,10 @@ use zeron_workers_unpeel::{
     WorkerParentNotification, WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap,
     WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
     WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
-    WorkersResourceSettings, WorkersSession, WorkersSessionSort, WorkersSettingsSnapshot,
-    WorkersTranscriptSettings, WorkersWorktreeResult, ack_worker_parent_notification,
-    build_worker_parent_notification_prompt, pending_worker_parent_notifications,
-    worker_parent_links,
+    WorkersResourceSettings, WorkersSession, WorkersSessionCommand, WorkersSessionSort,
+    WorkersSettingsSnapshot, WorkersTranscriptSettings, WorkersWorktreeResult,
+    ack_worker_parent_notification, build_worker_parent_notification_prompt,
+    hibernation_candidates, pending_worker_parent_notifications, worker_parent_links,
 };
 
 use crate::state::AppState;
@@ -391,7 +391,7 @@ pub struct WorkersModel {
 
 impl WorkersModel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let client = LocalWorkersClient::new();
+        let client = crate::workers::client::shared();
         let poll_client = client.clone();
         let poll_task = cx.spawn(async move |this, cx| {
             let mut observed_epoch = poll_client.activity_epoch();
@@ -803,6 +803,7 @@ impl WorkersModel {
                         }
                         let app_focused = cx.active_window().is_some();
                         model.apply_snapshot(snapshot, app_focused);
+                        model.hibernate_idle_workers(cx);
                         model.dispatch_parent_notifications(deliveries, cx);
                     }
                     Err(error) => model.error = Some(error.to_string()),
@@ -814,6 +815,59 @@ impl WorkersModel {
             })
             .ok();
         }));
+    }
+
+    fn unix_time_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Stop and archive the Workers the resource settings say are idle past
+    /// their welcome. Fire-and-forget on purpose: the next refresh sees the
+    /// result on disk and retries whatever failed, so there is no local
+    /// "already tried" state to drift from the host.
+    fn hibernate_idle_workers(&mut self, cx: &mut Context<Self>) {
+        let (Some(snapshot), Some(settings)) = (self.snapshot.as_ref(), self.settings.as_ref())
+        else {
+            return;
+        };
+        let candidates = hibernation_candidates(
+            &snapshot.sessions,
+            &settings.resources,
+            self.selected_session_id.as_deref(),
+            Self::unix_time_ms(),
+        )
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        cx.background_executor()
+            .spawn(async move {
+                for session in candidates {
+                    let idle_minutes = session
+                        .idle_since_unix_ms
+                        .map(|idle_since| Self::unix_time_ms().saturating_sub(idle_since) / 60_000);
+                    match client.session_command(&session, WorkersSessionCommand::Archive) {
+                        Ok(_) => tracing::info!(
+                            session_id = %session.id,
+                            title = %session.title,
+                            idle_minutes,
+                            "hibernated idle worker"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            session_id = %session.id,
+                            "could not hibernate idle worker"
+                        ),
+                    }
+                }
+            })
+            .detach();
     }
 
     fn dispatch_parent_notifications(
@@ -2013,6 +2067,7 @@ mod tests {
             worktree_branch: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
+            idle_since_unix_ms: None,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),

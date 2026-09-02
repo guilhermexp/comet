@@ -1,5 +1,6 @@
 pub mod activity_menu;
 pub mod archive;
+pub(crate) mod client;
 pub mod menu_bar;
 pub mod model;
 pub mod new_session_menu;

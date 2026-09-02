@@ -775,7 +775,7 @@ impl UiSettings {
         if self.accent == zeron_theme::AccentSelection::ThemeDefault
             && let Some(accent) = self.legacy_accent_color.take()
         {
-            self.accent = zeron_theme::AccentSelection::Preset(accent.into());
+            self.accent = zeron_theme::AccentSelection::Preset(accent);
         }
         self.legacy_accent_color = None;
         self

@@ -18,7 +18,7 @@ use zeron_engine::{EngineCore, HarnessRegistry, RunJournal};
 use zeron_harness::mock::MockHarness;
 use zeron_harness::{
     Harness, HarnessError, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle,
-    LiveVoiceRequest, RunControls,
+    LiveVoiceRequest, LiveVoiceSupport, RunControls,
 };
 use zeron_proto::{
     AgentEvent, ChatConfig, DoneStatus, HarnessId, LiveVoicePhase, Model, ReasoningLevel,
@@ -146,6 +146,7 @@ impl Harness for ScriptedHarness {
 #[derive(Clone, Copy)]
 enum LiveFixtureMode {
     Stable,
+    ActiveSteer,
     Conflict,
     ExitAfterDelegation,
     Passive,
@@ -190,8 +191,14 @@ impl Harness for LiveDelegationHarness {
         &[ReasoningLevel::Medium]
     }
 
-    async fn probe_live_voice(&self, _cwd: &std::path::Path) -> Result<bool, HarnessError> {
-        Ok(true)
+    async fn probe_live_voice(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> Result<LiveVoiceSupport, HarnessError> {
+        Ok(LiveVoiceSupport {
+            available: true,
+            session_context: true,
+        })
     }
 
     async fn start_live_voice(
@@ -259,18 +266,64 @@ impl Harness for LiveDelegationHarness {
     async fn run(
         &self,
         request: RunRequest,
-        _controls: RunControls,
+        mut controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.order.lock().await.push("run");
         let expected_prompt = if matches!(
             self.mode,
-            LiveFixtureMode::Passive | LiveFixtureMode::ClosedControls
+            LiveFixtureMode::Passive
+                | LiveFixtureMode::ClosedControls
+                | LiveFixtureMode::ActiveSteer
         ) {
             "manual command"
         } else {
             "Fix the durable bug"
         };
         assert_eq!(request.prompt, expected_prompt);
+        if matches!(self.mode, LiveFixtureMode::ActiveSteer) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(AgentEvent::SessionStarted {
+                        harness: HarnessId::Omp,
+                        model: "omp-default".into(),
+                        tools: Vec::new(),
+                        cwd: request.cwd,
+                        session_id: "active-session".into(),
+                        assistant_message_id: "active-assistant".into(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "Initial work".into(),
+                    }))
+                    .await;
+                let message = controls.steering.recv().await.expect("Live steer");
+                assert_eq!(message.prompt, "Fix the durable bug");
+                let _ = tx
+                    .send(Ok(AgentEvent::Steered {
+                        assistant_message_id: Some("active-assistant".into()),
+                        next_assistant_message_id: Some("steered-assistant".into()),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "Durable answer".into(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(AgentEvent::AssistantMessageCompleted {
+                        assistant_message_id: "steered-assistant".into(),
+                    }))
+                    .await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                std::future::pending::<()>().await;
+            });
+            return Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed());
+        }
         let script = vec![
             AgentEvent::SessionStarted {
                 harness: HarnessId::Omp,
@@ -291,7 +344,7 @@ impl Harness for LiveDelegationHarness {
             },
             AgentEvent::Done {
                 status: DoneStatus::Completed,
-                result: Some("Fixed final".into()),
+                result: None,
                 error: None,
                 session_id: Some("voice-session".into()),
             },
@@ -303,7 +356,11 @@ impl Harness for LiveDelegationHarness {
             Ok(first)
         })
         .chain(futures::stream::iter(script.map(Ok)));
-        Ok(stream.boxed())
+        if matches!(self.mode, LiveFixtureMode::Stable) {
+            Ok(stream.chain(futures::stream::pending()).boxed())
+        } else {
+            Ok(stream.boxed())
+        }
     }
 }
 
@@ -1018,7 +1075,7 @@ async fn deterministic_queue_command_id_is_returned_and_executes_once() {
     );
 }
 #[tokio::test]
-async fn live_voice_delegation_is_one_durable_run_with_transient_context() {
+async fn live_voice_delegation_is_one_durable_turn_with_transient_context() {
     let dir = tempfile::tempdir().unwrap();
     let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::Stable));
     let core = assemble_live(dir.path(), harness.clone());
@@ -1028,18 +1085,18 @@ async fn live_voice_delegation_is_one_durable_run_with_transient_context() {
     wait_for(
         || {
             let handle = core.doc_host.open(CHAT).expect("open live chat");
-            let run_commands = handle
+            let steer_commands = handle
                 .doc()
                 .read_commands()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+                .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
                 .count();
             let durable_messages = entries_now(&core)
                 .into_iter()
                 .filter(|entry| matches!(entry.role, MessageRole::User | MessageRole::Assistant))
                 .count();
-            run_commands == 1 && durable_messages == 2
+            steer_commands == 1 && durable_messages == 2
         },
         "one durable Live Voice delegation",
     )
@@ -1065,7 +1122,7 @@ async fn live_voice_delegation_is_one_durable_run_with_transient_context() {
                     delegation_id,
                     kind: LiveVoiceContextKind::Final,
                     text,
-                } if delegation_id == "delegation-1" && text == "Fixed final"
+                } if delegation_id == "delegation-1" && text == "Durable answer"
             )
         });
         if has_progress && has_final {
@@ -1084,16 +1141,24 @@ async fn live_voice_delegation_is_one_durable_run_with_transient_context() {
 
     let handle = core.doc_host.open(CHAT).unwrap();
     let commands = handle.doc().read_commands().unwrap();
-    let runs = commands
+    let steers = commands
         .iter()
-        .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+        .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
         .collect::<Vec<_>>();
-    assert_eq!(runs.len(), 1, "duplicate delegation id must be idempotent");
-    assert!(!runs[0].id.is_empty());
-    let SessionCommandPayload::Run { message_id, .. } = &runs[0].payload else {
+    assert_eq!(
+        steers.len(),
+        1,
+        "duplicate delegation id must be idempotent"
+    );
+    assert!(!steers[0].id.is_empty());
+    let SessionCommandPayload::Steer { message_id, .. } = &steers[0].payload else {
         unreachable!()
     };
-    assert!(!message_id.is_empty());
+    assert!(
+        message_id
+            .as_ref()
+            .is_some_and(|message_id| !message_id.is_empty())
+    );
     assert_eq!(
         entries(&core)
             .iter()
@@ -1102,6 +1167,110 @@ async fn live_voice_delegation_is_one_durable_run_with_transient_context() {
         2,
         "spoken progress/final controls must not append extra chat messages"
     );
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|session| session.status == SessionStatus::Idle)
+        },
+        "delegated run to park",
+    )
+    .await;
+    core.sessions.stop_live_voice().await.unwrap();
+    let availability = core.sessions.probe_live_voice(CHAT).await.unwrap();
+    assert!(
+        availability.available,
+        "a completed parked OMP run must not block Live Voice restart: {:?}",
+        availability.reason
+    );
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+    core.sessions.stop_live_voice().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_voice_delegation_steers_the_active_run_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(LiveDelegationHarness::new(LiveFixtureMode::ActiveSteer));
+    let core = assemble_live(dir.path(), harness.clone());
+    create_omp_chat(&core);
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-active-run",
+        SessionCommandPayload::Run {
+            request: run_request("manual command"),
+            message_id: "message-active-run".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|session| session.status == SessionStatus::Working)
+        },
+        "active run before Live Voice start",
+    )
+    .await;
+
+    core.sessions.start_live_voice(CHAT).await.unwrap();
+    wait_for(
+        || {
+            let commands = core
+                .doc_host
+                .open(CHAT)
+                .unwrap()
+                .doc()
+                .read_commands()
+                .unwrap_or_default();
+            commands
+                .iter()
+                .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
+                .count()
+                == 1
+                && core
+                    .sessions
+                    .session_status(CHAT)
+                    .is_some_and(|session| session.status == SessionStatus::Idle)
+        },
+        "confirmed Live Voice instruction steered active run",
+    )
+    .await;
+
+    let commands = handle.doc().read_commands().unwrap();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(harness.order.lock().await.as_slice(), ["run"]);
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| entry.role == MessageRole::User)
+            .count(),
+        2
+    );
+    let controls = harness.controls.lock().await.clone();
+    assert!(controls.iter().any(|control| {
+        matches!(
+            control,
+            LiveVoiceControl::AppendContext {
+                delegation_id,
+                kind: LiveVoiceContextKind::Final,
+                text,
+            } if delegation_id == "delegation-1" && text == "Durable answer"
+        )
+    }));
+    assert!(!controls.contains(&LiveVoiceControl::Stop));
     core.sessions.stop_live_voice().await.unwrap();
 }
 
@@ -1146,7 +1315,7 @@ async fn live_voice_conflict_ends_call_but_backend_finishes_durably() {
             .read_commands()
             .unwrap()
             .iter()
-            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Run { .. }))
+            .filter(|entry| matches!(entry.payload, SessionCommandPayload::Steer { .. }))
             .count(),
         1
     );

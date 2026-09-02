@@ -9,7 +9,8 @@ use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
     ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command, live_mute_command,
-    live_start_command, live_stop_command, parse_frame, parse_live_event, sanitize_diagnostic,
+    live_session_context_command, live_start_command, live_stop_command, parse_frame,
+    parse_live_event, sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
@@ -298,9 +299,17 @@ fn omp_live_protocol_encodes_exact_commands() {
             "text":"Fixed"
         })
     );
+    assert_eq!(
+        live_session_context_command("Session status: Working").unwrap(),
+        json!({
+            "type":"live_append_session_context",
+            "text":"Session status: Working"
+        })
+    );
     assert_eq!(live_stop_command(), json!({"type":"live_stop"}));
     assert!(live_context_command("", LiveVoiceContextKind::Progress, "work").is_err());
     assert!(live_context_command("del-1", LiveVoiceContextKind::Progress, " ").is_err());
+    assert!(live_session_context_command(" ").is_err());
 }
 
 async fn assert_process_reaped(pid: u32) {
@@ -342,7 +351,9 @@ async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
         .with_env(env)
         .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
 
-    assert!(harness.probe_live_voice(temp.path()).await.unwrap());
+    let support = harness.probe_live_voice(temp.path()).await.unwrap();
+    assert!(support.available);
+    assert!(support.session_context);
     let pid = std::fs::read_to_string(pid_file)
         .unwrap()
         .trim()
@@ -412,6 +423,12 @@ async fn omp_live_frontend_resumes_session_and_reuses_one_child_for_serial_deleg
         }
     );
 
+    controls
+        .send(LiveVoiceControl::AppendSessionContext {
+            text: "Session status: Working".into(),
+        })
+        .await
+        .unwrap();
     controls
         .send(LiveVoiceControl::SetMuted(true))
         .await
@@ -1439,17 +1456,32 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
         .and_then(Value::as_u64)
         .expect("timeout_seconds maximum property in workers tool inputSchema");
 
-    let transport_timeout_seconds = zeron_harness::omp::workers_bridge::TOOL_CALL_TIMEOUT.as_secs();
+    let bridge = &zeron_harness::omp::workers_bridge::TOOL_CALL_TIMEOUT;
+    let at_ceiling = zeron_harness::omp::workers_bridge::call_timeout_for(
+        &json!({ "action": "wait_for_status", "timeout_seconds": max_timeout_seconds }),
+        *bridge,
+    )
+    .as_secs();
 
-    // The transport timeout must strictly exceed the maximum tool blocking duration,
-    // with at least a 60s margin for IPC round-trip and process scheduling.
-    assert!(
-        transport_timeout_seconds > max_timeout_seconds,
-        "transport timeout ({transport_timeout_seconds}s) must strictly exceed maximum tool blocking duration ({max_timeout_seconds}s)"
+    // The per-call transport deadline is the requested wait plus a fixed 60s
+    // margin for IPC round-trip and process scheduling, at the controller
+    // ceiling the orchestrator can request.
+    assert_eq!(
+        at_ceiling,
+        max_timeout_seconds + 60,
+        "transport deadline at the controller ceiling is the wait plus a 60s margin"
     );
-    let margin = transport_timeout_seconds - max_timeout_seconds;
-    assert!(
-        margin >= 60,
-        "transport timeout ({transport_timeout_seconds}s) must have at least 60s margin over tool blocking ceiling ({max_timeout_seconds}s), got {margin}s"
+    assert_eq!(
+        zeron_harness::omp::workers_bridge::call_timeout_for(
+            &json!({ "action": "read_output", "timeout_seconds": max_timeout_seconds }),
+            *bridge
+        ),
+        *bridge,
+        "only wait_for_status derives its deadline from timeout_seconds"
+    );
+    assert_eq!(
+        zeron_harness::WORKERS_CLIENT_DEADLINE_SECONDS,
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS + 60,
+        "native runtimes' MCP client deadline is pinned to the controller ceiling plus slack"
     );
 }

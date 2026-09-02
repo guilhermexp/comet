@@ -21,7 +21,7 @@ internal host modes (`__session_host__` et al.).
 | `session_event_journal.rs` | Session output/event journaling |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
-| `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()`, then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
+| `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
 | `tests/` | Integration tests per surface |
 
@@ -30,7 +30,7 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 
 ## Local Contracts
 
-- **Request id é sequência única do processo.** O `REPLAY_CACHE` do host é global e chaveado por `(principal, request_id)`, e todo `LocalWorkersClient` fala pelo mesmo principal (`comet-local`). Um contador por instância fazia cada `new()` recomeçar em 1 — e a UI cria cinco (terminal, model, resource monitor, workspace, settings/projects). Colidir com payload diferente devolve `409: request id reused with different request`; colidir com payload **igual** é pior, porque o segundo cliente recebe a resposta do primeiro sem erro nenhum. `next_request_id` é `shared_next_request_id()`, no mesmo padrão `OnceLock` dos outros campos compartilhados.
+- **Request id é sequência única do processo.** O `REPLAY_CACHE` do host é global e chaveado por `(principal, request_id)`, e todo `LocalWorkersClient` fala pelo mesmo principal (`comet-local`). Um contador por instância fazia cada `new()` recomeçar em 1 — e a UI criava cinco (terminal, model, resource monitor, workspace, settings/projects). Hoje a UI passa por `crate::workers::client::shared()` e tem **uma** instância, mas o contador compartilhado permanece como segunda defesa: qualquer consumidor novo (controller MCP, teste, host) volta a criar clientes próprios. Colidir com payload diferente devolve `409: request id reused with different request`; colidir com payload **igual** é pior, porque o segundo cliente recebe a resposta do primeiro sem erro nenhum. `next_request_id` é `shared_next_request_id()`, no mesmo padrão `OnceLock` dos outros campos compartilhados.
 
 - **`third_party/unpeel` e codigo vendorizado, nao submodulo.** O upstream
   `unpeel-com/unpeel` deixou de existir publicamente; enquanto foi submodulo,
@@ -55,8 +55,9 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   (`unpeel_core::integrations::legacy_mcp_gate_kind`). Browser is a *domain* of
   `MCP_HOST_ARG`, never its own server.
 - **Controller MCP is Comet-owned.** Only ACP controller sessions receive this
-  process in their `mcpServers` list (injected by zeron-harness's
-  `workers_mcp_servers*`); it is NOT Unpeel's worker-to-worker MCP host.
+  process in their `mcpServers` list (resolved by zeron-harness's
+  `workers_mcp.rs` and rendered into each runtime's dialect); it is NOT
+  Unpeel's worker-to-worker MCP host.
 - **Activity state machine is shared by include.** `activity_bridge.rs`
   includes o fonte vendorizado via `#[path]` — a disciplina de edicao continua:
   nao forke a maquina de estados numa copia local; mude no proprio
@@ -110,6 +111,42 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   O caminho e `<worktrees>/repo-<hash>/<branch>`: apagar so o ramo deixa o
   diretorio do repo vazio para tras e a contagem cresce a cada rodada (cresceu,
   16 vezes, antes do `Drop` do fixture cobrir o pai).
+- **A família pi retoma por id, e `--continue` só sob diretório pinado.** `omp`
+  e `prime-agent` compartilham a receita de resume em
+  `third_party/unpeel/runtimes/_shared/pi-family/adapter/resume.rs`: aceitam
+  `-c/--continue`, `-r/--resume <id>`, `--session-dir` e `--no-session`, e **não**
+  têm `--session` nem `--fork` — copiar a receita do `pi` gera comando inválido.
+  Todo Worker novo da família nasce com `--session-dir
+  <unpeel_home>/pi-sessions/<session_id>` pinado, e é isso que torna
+  `--continue` exato: sem diretório pinado ele pegaria a conversa mais recente
+  do worktree compartilhado, que na máquina de desenvolvimento é de outro
+  Worker. Por isso sessão legada sem marker e sem diretório reinicia limpa em
+  vez de continuar. As capabilities `resume`/`restart_agent` vivem no
+  `runtime.toml` de cada runtime, e `runtime_catalog_resume_capabilities_match_adapter_callbacks`
+  (em `unpeel-core`) fica vermelho se a declaração e o adapter divergirem.
+- **A política de hibernação é pura, e o clock dela não é `updated_at_unix_ms`.**
+  `hibernation_candidates` decide sobre o snapshot que o painel já busca, sem
+  I/O e sem UI: recebe sessões, settings de Resources, a sessão selecionada e
+  o relógio, e devolve quem parar, do mais ocioso para o mais novo. O clock é
+  `WorkersSession::idle_since_unix_ms`, preenchido pelo `activity_bridge` com
+  o máximo entre `screen_changed_at` do manifest e o sinal de atividade
+  command-aware do Unpeel. `updated_at_unix_ms` não serve: ele anda com o
+  heartbeat de 60 s do host e com o mtime de `output.bin`, e num `omp` parado
+  há 24 h os dois tinham idade 0 h enquanto `screen_changed_at` marcava 24,2 h.
+  Sem evidência (`None`) o Worker é protegido, nunca hibernado. A elegibilidade
+  exige `unpeel_core::resume::can_resume` do comando — é o mesmo teste que
+  exclui sessões de terminal, cujo shell não tem receita de resume, e é o que
+  impede jogar fora uma conversa irrecuperável. Hibernar `omp`/`prime-agent` só
+  ficou seguro depois da receita de resume da família pi, acima.
+- **`send_text` num Worker morto é entrada perdida, não erro do host.**
+  `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
+  esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
+  para Workers ociosos por conta própria e o Orquestrador não tem como
+  adivinhar. `restart_worker` usa `RestoreAndResume` e devolve o id da sessão
+  **resultante**: relançar substitui a Session por uma nova (novo uuid), e o
+  endpoint de session-action responde só `{"ok": true}`, então o id novo é
+  descoberto comparando a listagem antes e depois. Duas sessões novas ao mesmo
+  tempo (outro launch concorrente) devolvem o id antigo em vez de um palpite.
 - **Typed frontier only.** The UI and engine consume the `Workers*` types from
   this crate; do not leak raw `unpeel_core` types into zeron-ui — map them
   here.
@@ -165,11 +202,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   (`task` stays inside the caller's session, read-only).
   `tests/controller_mcp.rs` locks both: every action in the enum appears in
   some description, and no field is left without one.
-- **O teto de bloqueio de `wait_for_status` é único e público (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 120s).** O schema do MCP (`maximum`), o help (`limits.wait_seconds`) e o `.clamp` de runtime derivam da mesma constante para evitar divergência silenciosa. A expiração de espera devolve `timed_out: true` com snapshot do worker e é leitura útil normal, nunca falha — e não substitui verificação durável de conclusão.
-- **Controller MCP dispatches serially.** `run_stdio` handles each request inline, so a blocking
-  `wait_for_status` stalls every action on the channel, including `stop_worker` and `archive_worker`;
-  `notifications/cancelled` is discarded. Raise the wait ceiling only after making the loop
-  concurrent and the wait interruptible.
+- **O orquestrador é dono da duração de `wait_for_status`; o teto (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 4h) é só sanidade de transporte.** Schema (`maximum`), help (`limits.wait_seconds`) e `.clamp` derivam da mesma constante. Default continua 30s. Expiração devolve `timed_out: true` + snapshot + `next` (`WAIT_TIMED_OUT_NEXT`): esperar de novo com timeout do tamanho do trabalho, ou encerrar o turno e receber `[worker-task-notification]`. Wait curto repetido é polling e custa um turno inteiro do modelo por chamada — foi o que aconteceu com teto de 120s (≈100 chamadas por attempt em worker de horas).
+- **`serve` despacha concorrente e cancelável.** `run_stdio` é casca sobre `serve(reader, writer, handler)`: uma thread por request, `stdout` atrás de `Mutex`, registro de ids em voo. `notifications/cancelled` flipa o flag do request (`wait_until` checa a cada tick de 250ms) e o request cancelado **não recebe resposta** (contrato MCP). EOF flipa só o flag de saída — waits pendentes morrem, respostas em voo ainda são escritas. `wait_until` é o núcleo puro do wait (poll injetado) para testar deadline, cancel e `next` sem host.
 - **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
   `project_id` and `validate_launch_target` rejects any id absent from the live
   project list, so the surface must also be able to *add* a project
@@ -212,6 +246,30 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   a trace breadcrumb instead of failing the turn when no interpreter exists.
   Codex hooks deliver their payload on **stdin** (`argc=0`, measured), so any
   new hook asset that reads `$1` must keep the `cat` fallback.
+- **Os três CLIs da família pi são hook-owned, `pi` inclusive.** `pi`, `omp` e
+  `prime-agent` aceitam `-e/--extension` e rodam a mesma API de extensão
+  (`agent_start`/`agent_end`), então os três recebem
+  `runtimes/_shared/pi-family/assets/lifecycle-extension.js` e declaram
+  `lifecycle_hooks` + `notify_when_done`. O append idempotente do flag mora em
+  `setup::with_lifecycle_extension`; o gate de alias fica no adapter de cada
+  runtime, porque `pi` tem resume/context próprios e não inclui o `mod.rs`
+  compartilhado. Runtime sem hooks no catálogo hoje é o `agy` — é ele que os
+  testes usam para exercitar o ramo hookless de `derive_activity`.
+- **Reinstalação limpa de CLI é o caso normal, não a exceção.** Apagar
+  `~/.unpeel` (ou a poda do root legado) some com o diretório onde a extensão
+  de lifecycle é escrita, e `write_file_atomic` falhava com `No such file or
+  directory`: medido em 2026-09-01, `Failed to install Comet hooks for runtime
+  sh.omp.cli (omp)` no `trace.log`. Duas regras saíram disso: o writer cria o
+  diretório pai (como `write_executable_script` sempre fez), e
+  `install_comet_managed_hooks` acumula falhas em vez de sair no primeiro `?`
+  — o loop é o único instalador, então abortar nele deixava todo runtime
+  atrás do que falhou (ordem do catálogo) sem hooks, com o usuário vendo
+  "todos os outros funcionam".
+- **Hook alheio sob `/tmp` não é asset nosso.** `config_has_stale_managed_hook`
+  casa root temporário e nome de hook gerenciado **na mesma linha**: o teste
+  por arquivo inteiro fazia um wrapper de outra ferramenta em
+  `~/.codex/hooks.json` (`/private/tmp/orchestrator-…`) parecer asset stale e
+  bloqueava a migração para sempre.
 
 ## Work Guidance
 
@@ -242,13 +300,13 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19), `src/activity_bridge.rs` (13 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (26) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `src/lib.rs` (19 + 6 de hibernação), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (14 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
-| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (3), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
-| `tests/hook_migration.rs` (5) | integration | `--test hook_migration` |
+| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
+| `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
 
 ## Child DOX Index
 

@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::sanitize_diagnostic;
 use crate::HarnessError;
-use crate::acp::workers_mcp_servers_for;
 use crate::jsonrpc::{Incoming, RpcClient};
+use crate::workers_mcp;
 
 pub struct WorkersBridgeOptions {
     pub enabled: bool,
@@ -31,40 +31,46 @@ pub struct WorkersBridge {
 
 const MAX_PENDING_CALLS: usize = 64;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-// 900s deliberately keeps transport from timing out a healthy wait; its 780s slack exceeds the 60s IPC and scheduling margin floor.
+/// Transport deadline for every action except `wait_for_status`, whose deadline
+/// follows the requested wait (see [`call_timeout_for`]).
 pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Slack over the requested wait for JSON-RPC IPC round-trip, serialization and
+/// host scheduling, so the transport is never the first thing to expire.
+pub const WAIT_TRANSPORT_MARGIN: Duration = Duration::from_secs(60);
+
+/// Per-call transport deadline: `timeout_seconds + margin` for `wait_for_status`
+/// (the orchestrator sizes the wait to the work), `default` otherwise. The 24h
+/// cap only keeps a nonsense argument from overflowing; the controller clamps
+/// the real ceiling.
+pub fn call_timeout_for(arguments: &Value, default: Duration) -> Duration {
+    let is_wait = arguments.get("action").and_then(Value::as_str) == Some("wait_for_status");
+    match arguments.get("timeout_seconds").and_then(Value::as_u64) {
+        Some(seconds) if is_wait => {
+            Duration::from_secs(seconds.min(24 * 60 * 60)) + WAIT_TRANSPORT_MARGIN
+        }
+        _ => default,
+    }
+}
 
 impl WorkersBridge {
     pub async fn start(options: WorkersBridgeOptions) -> Result<Option<Self>, HarnessError> {
         if !options.enabled {
             return Ok(None);
         }
-        let rows = workers_mcp_servers_for(
+        let server = workers_mcp::resolve_for(
             &options.executable,
             true,
             false,
             options.parent_chat_id.as_deref(),
-        );
-        let server = rows.first().ok_or_else(|| {
+        )
+        .ok_or_else(|| {
             HarnessError::Protocol("Workers controller sidecar is unavailable".into())
         })?;
-        let executable = server
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| HarnessError::Protocol("Workers sidecar has no command".into()))?;
-        let mut command = Command::new(executable);
-        if let Some(args) = server.get("args").and_then(Value::as_array) {
-            command.args(args.iter().filter_map(Value::as_str));
-        }
-        if let Some(environment) = server.get("env").and_then(Value::as_array) {
-            for row in environment {
-                if let (Some(name), Some(value)) = (
-                    row.get("name").and_then(Value::as_str),
-                    row.get("value").and_then(Value::as_str),
-                ) {
-                    command.env(name, value);
-                }
-            }
+        let executable = server.command.to_string_lossy().into_owned();
+        let mut command = Command::new(&executable);
+        command.args(&server.args);
+        for (name, value) in &server.env {
+            command.env(name, value);
         }
         command
             .stdin(Stdio::piped())
@@ -213,7 +219,7 @@ impl WorkersBridge {
 
         let client = self.client.clone();
         let pending = Arc::clone(&self.pending);
-        let request_timeout = self.request_timeout;
+        let request_timeout = call_timeout_for(&arguments, self.request_timeout);
         let id = id.to_owned();
         let tool_name = tool_name.to_owned();
         let (resolved, receiver) = oneshot::channel();

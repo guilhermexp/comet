@@ -64,6 +64,19 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   setup idempotente de workspace trust em `~/.gemini/antigravity-cli/settings.json`,
   resume adapter e ícone autoral. Validação usa `bun run validate:runtimes`
   em `third_party/unpeel`.
+- **A extensão de lifecycle da família pi serve os três CLIs.** `pi`, `omp` e
+  `prime-agent` recebem `--extension
+  <unpeel_home>/hooks/pi-family-lifecycle-extension.js` e emitem `Start`/`Stop`
+  com id de conversa e transcript do provider. O append idempotente é
+  `_shared/pi-family/adapter/setup.rs::with_lifecycle_extension`; cada runtime
+  mantém o próprio gate de alias, porque `pi` tem resume/context próprios e não
+  inclui o `mod.rs` compartilhado. `runtime.toml` com `source = "hooks"` exige
+  a capability `lifecycle_hooks` (e `completion_reliable` exige
+  `notify_when_done`) — o catálogo valida os dois pares.
+- **Asset gerenciado cria o diretório dele.** `hook_assets::write_file_atomic`
+  faz `create_dir_all` do pai: um root apagado (reinstalação limpa de CLI,
+  poda do root legado) fazia a instalação inteira morrer com `No such file or
+  directory`.
 - Telemetria provider-owned permanece no pacote do runtime: o adapter OMP lê
   somente JSONL canônico sob o diretório `sessions` resolvido por
   `--session-dir` explícito ou pelo layout oficial do agent padrão,

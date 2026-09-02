@@ -14,7 +14,7 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -74,6 +74,20 @@ pub struct LiveVoiceRequest {
     pub resume: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveVoiceSupport {
+    pub available: bool,
+    pub session_context: bool,
+}
+
+impl LiveVoiceSupport {
+    /// Live Voice needs the base capability; starting on top of an already
+    /// active run additionally needs the operational-context capability.
+    pub fn usable(&self, active_run: bool) -> bool {
+        self.available && (!active_run || self.session_context)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveVoiceContextKind {
     Progress,
@@ -86,6 +100,9 @@ pub enum LiveVoiceControl {
     AppendContext {
         delegation_id: String,
         kind: LiveVoiceContextKind,
+        text: String,
+    },
+    AppendSessionContext {
         text: String,
     },
     Stop,
@@ -135,8 +152,8 @@ pub trait Harness: Send + Sync {
     fn deterministic_turn_end(&self) -> bool {
         false
     }
-    async fn probe_live_voice(&self, _cwd: &Path) -> Result<bool, HarnessError> {
-        Ok(false)
+    async fn probe_live_voice(&self, _cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
+        Ok(LiveVoiceSupport::default())
     }
     async fn start_live_voice(
         &self,
@@ -161,6 +178,14 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+/// MCP client deadline handed to native orchestrator runtimes (Claude via
+/// `MCP_TOOL_TIMEOUT`, Codex via `tool_timeout_sec`) when the Workers controller
+/// is mounted: the controller's `wait_for_status` ceiling plus transport slack.
+/// Pinned to `zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS + 60` by
+/// test rather than by dependency, so the harness keeps no production link to
+/// the workers crate.
+pub const WORKERS_CLIENT_DEADLINE_SECONDS: u64 = 4 * 60 * 60 + 60;
+
 pub mod acp;
 pub(crate) mod adapter_install;
 pub mod claude;
@@ -173,6 +198,7 @@ pub use omp::OmpHarness;
 pub mod opencode;
 mod partial_tool_input;
 pub mod shell_env;
+pub(crate) mod workers_mcp;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
@@ -213,6 +239,32 @@ pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
         }
     }
     dirs
+}
+
+/// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
+pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(shell_path) = crate::shell_env::login_shell_path() {
+        candidates.extend(
+            std::env::split_paths(shell_path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe)),
+        );
+    }
+    candidates.extend(extra);
+    candidates.extend(
+        crate::node_version_manager_bins()
+            .into_iter()
+            .map(|d| d.join(exe)),
+    );
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Add the login shell's PATH to a child process while preserving the PATH of
@@ -432,7 +484,10 @@ mod tests {
     #[tokio::test]
     async fn live_voice_defaults_are_unsupported_without_changing_run() {
         let harness = UnsupportedLiveHarness;
-        assert!(!harness.probe_live_voice(Path::new(".")).await.unwrap());
+        assert_eq!(
+            harness.probe_live_voice(Path::new(".")).await.unwrap(),
+            LiveVoiceSupport::default()
+        );
 
         let error = match harness
             .start_live_voice(LiveVoiceRequest {

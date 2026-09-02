@@ -49,44 +49,9 @@ use zeron_proto::{
     RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-const WORKERS_MCP_ARG: &str = "__workers_mcp__";
-
-#[doc(hidden)]
-pub fn workers_mcp_servers_for(
-    executable: &std::path::Path,
-    enabled: bool,
-    disabled_by_environment: bool,
-    parent_chat_id: Option<&str>,
-) -> Vec<Value> {
-    if !enabled || disabled_by_environment || !executable.is_absolute() {
-        return Vec::new();
-    }
-    let mut env = vec![json!({ "name": "COMET_WORKERS_CONTROLLER", "value": "1" })];
-    if let Some(parent_chat_id) = parent_chat_id.filter(|value| !value.trim().is_empty()) {
-        env.push(json!({
-            "name": "COMET_WORKERS_PARENT_CHAT_ID",
-            "value": parent_chat_id
-        }));
-    }
-    vec![json!({
-        "type": "stdio",
-        "name": "comet-workers",
-        "command": executable.to_string_lossy(),
-        "args": [WORKERS_MCP_ARG],
-        "env": env
-    })]
-}
-
 fn workers_mcp_servers(enabled: bool, parent_chat_id: Option<&str>) -> Vec<Value> {
-    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
-        .ok()
-        .is_some_and(|value| value == "1");
-    let executable = std::env::var_os("ZERON_WORKERS_MCP_BIN")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok());
-    executable
-        .as_deref()
-        .map(|executable| workers_mcp_servers_for(executable, enabled, disabled, parent_chat_id))
+    crate::workers_mcp::resolve(enabled, parent_chat_id)
+        .map(|server| vec![server.acp_value()])
         .unwrap_or_default()
 }
 
@@ -159,32 +124,6 @@ struct AcpAgentSpec {
 
 fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
     text.to_owned()
-}
-
-/// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
-pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    candidates.extend(extra);
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Generic effort ladder for agents without their own clamping rules.
@@ -434,9 +373,9 @@ pub fn prewarm_managed_adapters() {
             continue;
         };
         let pin = crate::adapter_install::NpmPin::parse(pkg);
-        if find_on_paths(spec.executable, (spec.extra_paths)()).is_some()
+        if crate::find_on_paths(spec.executable, (spec.extra_paths)()).is_some()
             || crate::adapter_install::installed_entry(&pin, spec.executable).is_some()
-            || find_on_paths(spec.cli_executable, (spec.cli_extra_paths)()).is_none()
+            || crate::find_on_paths(spec.cli_executable, (spec.cli_extra_paths)()).is_none()
             || crate::adapter_install::find_npm().is_none()
         {
             continue;
@@ -598,7 +537,7 @@ impl AcpHarness {
         {
             return Ok(Launch::Program(PathBuf::from(p), spec_args));
         }
-        if let Some(found) = find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
+        if let Some(found) = crate::find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
             return Ok(Launch::Program(found, spec_args));
         }
         if let Some(pkg) = self.spec.npm_package {
@@ -1103,7 +1042,7 @@ impl Harness for AcpHarness {
         if std::env::var_os(self.spec.env_override).is_some_and(|v| !v.is_empty()) {
             return true;
         }
-        find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
+        crate::find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
     }
 
     /// ACP is the source of truth: a short-lived probe reads the agent's

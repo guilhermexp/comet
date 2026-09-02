@@ -51,6 +51,30 @@ fn verified_unreferenced_legacy_hook_root_is_deleted() {
 }
 
 #[test]
+fn a_foreign_tool_hook_under_a_temp_root_does_not_look_like_our_stale_asset() {
+    let temp = TempDir::new().unwrap();
+    let legacy = temp.path().join(".unpeel/hooks");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("notify-hook.sh"), "#!/bin/sh\n").unwrap();
+    let config = temp.path().join("hooks.json");
+    // Our live hook plus an unrelated tool's hook under /private/tmp: two
+    // separate commands, neither of them a stale managed asset.
+    std::fs::write(
+        &config,
+        concat!(
+            "{\n",
+            "  \"a\": \"/Users/me/.zeron/workers/hooks/codex-notify-hook.sh\",\n",
+            "  \"b\": \"/private/tmp/orchestrator-1234/agent-hooks/emit-status\"\n",
+            "}\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(remove_legacy_hook_root_at(&legacy, &[config], false).unwrap());
+    assert!(!legacy.exists());
+}
+
+#[test]
 fn legacy_hook_pruning_keeps_the_upstream_owned_lifecycle_extension() {
     let temp = TempDir::new().unwrap();
     let legacy = temp.path().join(".unpeel/hooks");

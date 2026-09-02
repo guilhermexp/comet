@@ -19,13 +19,13 @@ use zeron_proto::{
 use self::normalize::{AgentEndDisposition, OmpNormalizer};
 use self::process::{OmpLaunch, OmpProcess};
 use self::protocol::{
-    MAX_OUTBOUND_BYTES, live_context_command, live_mute_command, live_start_command,
-    live_stop_command, parse_live_event,
+    MAX_OUTBOUND_BYTES, live_context_command, live_mute_command, live_session_context_command,
+    live_start_command, live_stop_command, parse_live_event,
 };
 use self::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use crate::{
     Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
-    RunControls, SteerMessage,
+    LiveVoiceSupport, RunControls, SteerMessage,
 };
 
 #[doc(hidden)]
@@ -219,7 +219,7 @@ impl OmpHarness {
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from)
             })
-            .or_else(|| crate::acp::find_on_paths("omp", Vec::new()))
+            .or_else(|| crate::find_on_paths("omp", Vec::new()))
     }
 
     fn is_orchestrator_workspace(&self, cwd: &Path) -> bool {
@@ -315,11 +315,14 @@ impl Harness for OmpHarness {
         true
     }
 
-    async fn probe_live_voice(&self, cwd: &Path) -> Result<bool, HarnessError> {
+    async fn probe_live_voice(&self, cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
         let process = OmpProcess::start(self.launch(cwd.to_path_buf(), true, None)?).await?;
-        let supported = process.capabilities().live_voice;
+        let capabilities = process.capabilities();
         process.shutdown().await?;
-        Ok(supported)
+        Ok(LiveVoiceSupport {
+            available: capabilities.live_voice,
+            session_context: capabilities.live_voice_session_context,
+        })
     }
 
     async fn start_live_voice(
@@ -582,19 +585,15 @@ async fn run_live_voice(
                     return;
                 };
                 let command = match control {
-                    LiveVoiceControl::SetMuted(muted) => live_mute_command(muted),
+                    LiveVoiceControl::SetMuted(muted) => Ok(live_mute_command(muted)),
                     LiveVoiceControl::AppendContext {
                         delegation_id,
                         kind,
                         text,
-                    } => match live_context_command(&delegation_id, kind, &text) {
-                        Ok(command) => command,
-                        Err(error) => {
-                            let _ = events.send(Err(error)).await;
-                            let _ = process.shutdown().await;
-                            return;
-                        }
-                    },
+                    } => live_context_command(&delegation_id, kind, &text),
+                    LiveVoiceControl::AppendSessionContext { text } => {
+                        live_session_context_command(&text)
+                    }
                     LiveVoiceControl::Stop => {
                         match process.request(live_stop_command()).await {
                             Ok(_) => {
@@ -610,7 +609,11 @@ async fn run_live_voice(
                         return;
                     }
                 };
-                if let Err(error) = process.request(command).await {
+                let sent = match command {
+                    Ok(command) => process.request(command).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = sent {
                     let _ = events.send(Err(error)).await;
                     let _ = process.shutdown().await;
                     return;

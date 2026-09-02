@@ -50,6 +50,10 @@ impl Appearance {
     pub fn is_dark(self) -> bool {
         matches!(self, Self::Dark)
     }
+
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -275,11 +279,16 @@ pub struct ColorParseError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AccentPreset {
+    /// The exact upstream Zeron indigo. The legacy aliases are on-disk
+    /// compatibility: settings written before the presets were named this way
+    /// still deserialize.
     #[default]
+    #[serde(alias = "violet", alias = "indigo", alias = "red", alias = "purple")]
     Zeron,
     Orange,
     Amber,
     Green,
+    #[serde(alias = "teal")]
     Cyan,
     Blue,
     Pink,
@@ -762,6 +771,16 @@ mod tests {
             let json = serde_json::to_string(&color).unwrap();
             assert_eq!(serde_json::from_str::<Color>(&json).unwrap(), color);
         }
+    }
+
+    #[test]
+    fn legacy_accent_names_deserialize_to_zeron() {
+        for legacy in ["violet", "indigo", "red", "purple"] {
+            let v: AccentPreset = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            assert_eq!(v, AccentPreset::Zeron);
+        }
+        let teal: AccentPreset = serde_json::from_str("\"teal\"").unwrap();
+        assert_eq!(teal, AccentPreset::Cyan);
     }
 
     #[test]

@@ -209,6 +209,7 @@ mod tests {
             worktree_branch: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
+            idle_since_unix_ms: None,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),

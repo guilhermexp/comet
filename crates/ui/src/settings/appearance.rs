@@ -412,13 +412,6 @@ fn preview(
     }
 }
 
-fn model_appearance(appearance: Appearance) -> zeron_theme::Appearance {
-    match appearance {
-        Appearance::Dark => zeron_theme::Appearance::Dark,
-        Appearance::Light => zeron_theme::Appearance::Light,
-    }
-}
-
 fn palette_preview(theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
@@ -710,16 +703,10 @@ impl AppearancePage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let registry = ThemeRegistry::active();
-        let selected_id = selections
-            .variant_id(model_appearance(appearance_kind))
-            .to_owned();
+        let selected_id = selections.variant_id(appearance_kind).to_owned();
         let selected_variant = registry
             .variant(&selected_id)
-            .or_else(|| {
-                registry
-                    .variants_for(model_appearance(appearance_kind))
-                    .next()
-            })
+            .or_else(|| registry.variants_for(appearance_kind).next())
             .expect("the built-in registry has both appearances");
         let selected_theme = Theme::for_selection(
             appearance_kind,
@@ -812,46 +799,43 @@ impl AppearancePage {
                 .flex_col()
                 .gap(px(2.0))
                 .child(popover::menu_heading(theme, heading))
-                .children(
-                    registry
-                        .variants_for(model_appearance(appearance_kind))
-                        .enumerate()
-                        .map(|(index, variant)| {
-                            let id = variant.id.clone();
-                            let name = variant.name.clone();
-                            let active = id == selected_id;
-                            let sample = Theme::for_selection(
-                                appearance_kind,
-                                &id,
-                                AccentSelection::ThemeDefault,
-                                theme.surface_preference,
-                            );
-                            popover::menu_row(
-                                theme,
-                                active,
-                                SharedString::from(format!(
-                                    "appearance-theme-menu-{appearance_kind:?}-{index}"
-                                )),
+                .children(registry.variants_for(appearance_kind).enumerate().map(
+                    |(index, variant)| {
+                        let id = variant.id.clone();
+                        let name = variant.name.clone();
+                        let active = id == selected_id;
+                        let sample = Theme::for_selection(
+                            appearance_kind,
+                            &id,
+                            AccentSelection::ThemeDefault,
+                            theme.surface_preference,
+                        );
+                        popover::menu_row(
+                            theme,
+                            active,
+                            SharedString::from(format!(
+                                "appearance-theme-menu-{appearance_kind:?}-{index}"
+                            )),
+                        )
+                        .id(SharedString::from(format!(
+                            "appearance-theme-row-{appearance_kind:?}-{index}"
+                        )))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            appearance::set_theme(appearance_kind, id.clone(), cx);
+                            this.close_theme_menu(appearance_kind, cx);
+                            cx.notify();
+                        }))
+                        .child(palette_preview(&sample))
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .when(active, |row| {
+                            row.child(
+                                icons::icon(icons::CHECK)
+                                    .size(px(14.0))
+                                    .text_color(theme.accent),
                             )
-                            .id(SharedString::from(format!(
-                                "appearance-theme-row-{appearance_kind:?}-{index}"
-                            )))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                appearance::set_theme(appearance_kind, id.clone(), cx);
-                                this.close_theme_menu(appearance_kind, cx);
-                                cx.notify();
-                            }))
-                            .child(palette_preview(&sample))
-                            .child(div().flex_1().min_w_0().truncate().child(name))
-                            .when(active, |row| {
-                                row.child(
-                                    icons::icon(icons::CHECK)
-                                        .size(px(14.0))
-                                        .text_color(theme.accent),
-                                )
-                            })
-                        }),
-                )
+                        })
+                    },
+                ))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu_below(
                 SharedString::from(format!(

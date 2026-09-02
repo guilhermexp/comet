@@ -7,20 +7,20 @@ pub(crate) mod setup {
     ));
 }
 
+pub(crate) mod resume {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../runtimes/_shared/pi-family/adapter/resume.rs"
+    ));
+}
+
 pub(crate) fn startup_command(command: &str) -> String {
     let trimmed = command.trim();
     let head = shared::command_head(trimmed);
     if !head.eq_ignore_ascii_case("omp") && !head.eq_ignore_ascii_case("prime-agent") {
         return trimmed.to_string();
     }
-
-    let path = setup::lifecycle_extension_path();
-    let raw_path = path.to_string_lossy();
-    let quoted_path = shared::shell_quote(&raw_path);
-    if trimmed.contains(raw_path.as_ref()) || trimmed.contains(&quoted_path) {
-        return trimmed.to_string();
-    }
-    format!("{trimmed} --extension {quoted_path}")
+    setup::with_lifecycle_extension(trimmed)
 }
 
 fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> String {
@@ -30,6 +30,7 @@ fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> Str
 pub(crate) const INTEGRATION: Integration =
     Integration::new(Some(setup::install_lifecycle_extension), None)
         .with_startup_command(prepare_startup_command)
+        .with_resume_adapter(resume::ADAPTER)
         .with_session_telemetry(SESSION_TELEMETRY_READER);
 
 #[cfg(test)]

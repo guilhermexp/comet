@@ -137,7 +137,7 @@ fn resolve_opencode_executable() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    crate::acp::find_on_paths("opencode", opencode_install_paths())
+    crate::find_on_paths("opencode", opencode_install_paths())
 }
 
 /// Effort ladder surfaced in the picker; applied per run by picking the

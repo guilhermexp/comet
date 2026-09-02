@@ -1,15 +1,27 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use zeron_harness::{CancellationToken, LiveVoiceControl, LiveVoiceEvent};
-use zeron_proto::{AgentEvent, DoneStatus, LiveVoicePhase, LiveVoiceState};
+use zeron_proto::view::tool_presentation;
+use zeron_proto::{AgentEvent, DoneStatus, LiveVoicePhase, LiveVoiceState, SessionStatus};
 
 use crate::{EngineError, new_id};
 
 pub const MAX_LIVE_TEXT_BYTES: usize = 64 * 1024;
 const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Minimum spacing between text-only context updates. OMP streams a turn as
+/// `TextDelta`s with no message-boundary event, so streamed text has to reach
+/// the voice model on a clock; one second is slow enough that a long answer
+/// costs a few dozen updates instead of one per token, and fast enough that
+/// the voice model never talks about a paragraph the coding run has moved past.
+pub(crate) const LIVE_TEXT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+/// The operational context carries only the tail of the current turn's text,
+/// so each update is bounded by this window rather than by everything streamed
+/// so far: an N-byte answer costs O(N) bytes over its updates, not O(N²).
+pub(crate) const LIVE_VISIBLE_TEXT_WINDOW_BYTES: usize = 2 * 1024;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -22,14 +34,30 @@ pub(crate) enum BackendSpeechUpdate {
     Final(String),
 }
 
+/// Speech for one delegation. Stays disarmed until the event that opens the
+/// delegated turn (`Steered` on the steer path, `SessionStarted` on the
+/// new-turn fallback): anything before it, including the in-flight turn's
+/// `Done`, belongs to a previous turn and is not this delegation's result.
 #[derive(Default)]
 pub(crate) struct BackendSpeechAccumulator {
+    armed: bool,
     current: String,
     last_segment: Option<String>,
 }
 
 impl BackendSpeechAccumulator {
     pub(crate) fn observe(&mut self, event: &AgentEvent) -> BackendSpeechUpdate {
+        if !self.armed {
+            if matches!(
+                event,
+                AgentEvent::Steered { .. } | AgentEvent::SessionStarted { .. }
+            ) {
+                self.armed = true;
+                self.current.clear();
+                self.last_segment = None;
+            }
+            return BackendSpeechUpdate::None;
+        }
         match event {
             AgentEvent::TextDelta { text } => {
                 push_bounded(&mut self.current, text);
@@ -73,16 +101,255 @@ impl BackendSpeechAccumulator {
     }
 }
 
-fn push_bounded(target: &mut String, value: &str) {
+pub(crate) struct LiveOperationalContext {
+    status: SessionStatus,
+    visible_text: String,
+    active_tool: Option<(String, &'static str)>,
+    visible_error: Option<String>,
+    last_text_update: Option<Instant>,
+    pending_text: bool,
+}
+
+impl LiveOperationalContext {
+    pub(crate) fn new(status: SessionStatus, visible_text: &str) -> Self {
+        let mut context = Self {
+            status,
+            visible_text: String::new(),
+            active_tool: None,
+            visible_error: None,
+            last_text_update: None,
+            pending_text: false,
+        };
+        context.push_visible_text(visible_text);
+        context
+    }
+
+    fn push_visible_text(&mut self, text: &str) {
+        self.visible_text.push_str(text);
+        let excess = self
+            .visible_text
+            .len()
+            .saturating_sub(LIVE_VISIBLE_TEXT_WINDOW_BYTES);
+        if excess > 0 {
+            let mut boundary = excess;
+            while !self.visible_text.is_char_boundary(boundary) {
+                boundary += 1;
+            }
+            self.visible_text.drain(..boundary);
+        }
+    }
+
+    /// Latest-value status transition; reports whether it actually moved.
+    fn set_status(&mut self, next: SessionStatus) -> bool {
+        let changed = self.status != next;
+        self.status = next;
+        changed
+    }
+
+    /// Turn boundary: the visible text describes the current turn only.
+    fn clear_visible_text(&mut self) -> bool {
+        let had_text = !self.visible_text.trim().is_empty();
+        self.visible_text.clear();
+        had_text
+    }
+
+    pub(crate) fn observe(&mut self, event: &AgentEvent) -> bool {
+        self.observe_at(event, Instant::now())
+    }
+
+    /// Reports whether the rendered context should be republished. Boundaries
+    /// (status, tool, error, message end, turn start) publish at once, carrying
+    /// any streamed text still pending; streamed text alone publishes on the
+    /// [`LIVE_TEXT_UPDATE_INTERVAL`] clock, whatever event (or [`Self::flush_at`]
+    /// tick) observes the interval expiring.
+    pub(crate) fn observe_at(&mut self, event: &AgentEvent, now: Instant) -> bool {
+        let changed = match event {
+            AgentEvent::TextDelta { text } => {
+                self.push_visible_text(text);
+                self.pending_text = !self.visible_text.trim().is_empty();
+                self.text_interval_elapsed(now)
+            }
+            AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::Usage { .. }
+            | AgentEvent::Subagent { .. } => self.text_interval_elapsed(now),
+            _ => self.apply(event) || self.pending_text,
+        };
+        if changed {
+            self.mark_published(now);
+        }
+        changed
+    }
+
+    /// Earliest instant at which pending streamed text is due for publication.
+    pub(crate) fn next_flush_at(&self) -> Option<Instant> {
+        self.pending_text.then(|| {
+            self.last_text_update
+                .map_or(Instant::now(), |last| last + LIVE_TEXT_UPDATE_INTERVAL)
+        })
+    }
+
+    /// Clock-driven publication of pending streamed text when no event arrives.
+    pub(crate) fn flush_at(&mut self, now: Instant) -> bool {
+        let due = self.text_interval_elapsed(now);
+        if due {
+            self.mark_published(now);
+        }
+        due
+    }
+
+    fn text_interval_elapsed(&self, now: Instant) -> bool {
+        self.pending_text
+            && self
+                .last_text_update
+                .is_none_or(|last| now.duration_since(last) >= LIVE_TEXT_UPDATE_INTERVAL)
+    }
+
+    fn mark_published(&mut self, now: Instant) {
+        self.last_text_update = Some(now);
+        self.pending_text = false;
+    }
+
+    fn apply(&mut self, event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::SessionStarted { .. } => {
+                let had_tool = self.active_tool.take().is_some();
+                let had_error = self.visible_error.take().is_some();
+                let had_text = self.clear_visible_text();
+                self.set_status(SessionStatus::Working) || had_tool || had_error || had_text
+            }
+            AgentEvent::AssistantMessageCompleted { .. } => !self.visible_text.trim().is_empty(),
+            AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
+                let label = tool_presentation(call, false, false).label;
+                let next = (id.clone(), label);
+                if self.active_tool.as_ref() == Some(&next) {
+                    false
+                } else {
+                    self.active_tool = Some(next);
+                    true
+                }
+            }
+            AgentEvent::ToolResult { id, is_error, .. } => {
+                let cleared = self
+                    .active_tool
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| active_id == id);
+                if cleared {
+                    self.active_tool = None;
+                }
+                let next_error = is_error.then(|| "The current tool failed.".to_owned());
+                let error_changed = self.visible_error != next_error;
+                self.visible_error = next_error;
+                cleared || error_changed
+            }
+            AgentEvent::InputRequested { .. } => self.set_status(SessionStatus::AwaitingInput),
+            AgentEvent::InputResolved { .. } => self.set_status(SessionStatus::Working),
+            AgentEvent::Steered { .. } => {
+                let had_text = self.clear_visible_text();
+                self.set_status(SessionStatus::Working) || had_text
+            }
+            AgentEvent::Error { message } => {
+                let next = truncate_live_text(message.trim().to_owned());
+                if self.visible_error.as_deref() == Some(next.as_str()) {
+                    false
+                } else {
+                    self.visible_error = Some(next);
+                    true
+                }
+            }
+            AgentEvent::Done {
+                status,
+                result,
+                error,
+                ..
+            } => {
+                let next_status = if *status == DoneStatus::Errored {
+                    SessionStatus::Errored
+                } else {
+                    SessionStatus::Idle
+                };
+                let next_error = if *status == DoneStatus::Errored {
+                    non_empty(error)
+                        .or_else(|| non_empty(result))
+                        .or_else(|| Some("The coding run failed without an error message.".into()))
+                } else {
+                    None
+                };
+                let changed = self.status != next_status
+                    || self.active_tool.is_some()
+                    || self.visible_error != next_error;
+                self.status = next_status;
+                self.active_tool = None;
+                self.visible_error = next_error;
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut output = format!("Session status: {}", session_status_label(self.status));
+        if let Some((_, label)) = self.active_tool.as_ref() {
+            output.push_str("\nCurrent action: ");
+            output.push_str(label);
+        }
+        let visible_text = self.visible_text.trim();
+        if !visible_text.is_empty() {
+            output.push_str("\nVisible assistant update: ");
+            output.push_str(visible_text);
+        }
+        if let Some(error) = self
+            .visible_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            output.push_str("\nVisible error: ");
+            output.push_str(error);
+        }
+        truncate_live_text(output)
+    }
+}
+
+pub(crate) fn latest_visible_assistant_text(entries: &[SessionMessageEntry]) -> String {
+    let mut text = String::new();
+    for entry in entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.role == MessageRole::Assistant)
+    {
+        text.clear();
+        for part in &entry.parts {
+            if let MessagePart::Text { text: value, .. } = part {
+                push_bounded(&mut text, value);
+            }
+        }
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    text
+}
+
+fn session_status_label(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "Idle",
+        SessionStatus::Working => "Working",
+        SessionStatus::AwaitingInput => "AwaitingInput",
+        SessionStatus::Errored => "Errored",
+    }
+}
+
+fn push_bounded(target: &mut String, value: &str) -> bool {
     let remaining = MAX_LIVE_TEXT_BYTES.saturating_sub(target.len());
     if remaining == 0 {
-        return;
+        return false;
     }
     let mut boundary = remaining.min(value.len());
     while !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
     target.push_str(&value[..boundary]);
+    boundary != 0
 }
 
 fn take_trimmed(value: &mut String) -> Option<String> {
@@ -295,6 +562,22 @@ impl LiveVoiceCoordinator {
         true
     }
 
+    pub(crate) async fn append_session_context(&self, call_id: &str, text: String) -> bool {
+        let controls = lock(&self.inner.active)
+            .as_ref()
+            .filter(|active| active.call_id == call_id)
+            .and_then(|active| active.controls.clone());
+        let Some(controls) = controls else {
+            return false;
+        };
+        controls
+            .send(LiveVoiceControl::AppendSessionContext {
+                text: truncate_live_text(text),
+            })
+            .await
+            .is_ok()
+    }
+
     pub(crate) fn complete_delegation(&self, call_id: &str, delegation_id: &str) {
         let mut active = lock(&self.inner.active);
         let Some(active) = active.as_mut().filter(|active| {
@@ -432,21 +715,17 @@ impl LiveVoiceCoordinator {
             active.cancellation.cancel();
             let _ = task.await;
         }
+        active.cancellation.cancel();
         self.inner.state.send_replace(LiveVoiceState::default());
         send_result
     }
 
     pub(crate) fn fail(&self, call_id: &str, message: &str) {
-        let mut active = lock(&self.inner.active);
-        if !active
-            .as_ref()
-            .is_some_and(|active| active.call_id == call_id)
-        {
+        let mut guard = lock(&self.inner.active);
+        let Some(active) = guard.take_if(|active| active.call_id == call_id) else {
             return;
-        }
-        if let Some(active) = active.take() {
-            active.cancellation.cancel();
-        }
+        };
+        active.cancellation.cancel();
         let mut state = self.inner.state.borrow().clone();
         state.phase = LiveVoicePhase::Error;
         state.input_level = 0.0;
@@ -456,16 +735,11 @@ impl LiveVoiceCoordinator {
     }
 
     fn finish(&self, call_id: &str) {
-        let mut active = lock(&self.inner.active);
-        if !active
-            .as_ref()
-            .is_some_and(|active| active.call_id == call_id)
-        {
+        let mut guard = lock(&self.inner.active);
+        let Some(active) = guard.take_if(|active| active.call_id == call_id) else {
             return;
-        }
-        if let Some(active) = active.take() {
-            active.cancellation.cancel();
-        }
+        };
+        active.cancellation.cancel();
         self.inner.state.send_replace(LiveVoiceState::default());
     }
 
@@ -505,19 +779,106 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
+    use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
     use zeron_harness::{
         Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
-        RunControls,
+        LiveVoiceSupport, RunControls,
     };
     use zeron_proto::{
         AgentEvent, ChatConfig, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole,
         LiveVoiceTranscript, LiveVoiceUnavailableReason, Model, ReasoningLevel, RunRequest,
-        SandboxLevel, SteeringMode,
+        SandboxLevel, SessionStatus, SteeringMode, ToolCall,
     };
+
+    fn steered() -> AgentEvent {
+        AgentEvent::Steered {
+            assistant_message_id: Some("active-assistant".into()),
+            next_assistant_message_id: Some("steered-assistant".into()),
+        }
+    }
+
+    fn armed_accumulator() -> BackendSpeechAccumulator {
+        let mut speech = BackendSpeechAccumulator::default();
+        assert_eq!(speech.observe(&steered()), BackendSpeechUpdate::None);
+        speech
+    }
+
+    #[test]
+    fn live_voice_delegation_speech_ignores_the_turn_that_finishes_before_the_steer() {
+        let mut speech = BackendSpeechAccumulator::default();
+        assert_eq!(
+            speech.observe(&AgentEvent::TextDelta {
+                text: "previous turn text".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "previous-assistant".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("previous turn result".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(speech.observe(&steered()), BackendSpeechUpdate::None);
+        assert_eq!(
+            speech.observe(&AgentEvent::TextDelta {
+                text: "delegated answer".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("delegated answer".into())
+        );
+
+        let mut fallback = BackendSpeechAccumulator::default();
+        assert_eq!(
+            fallback.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("previous turn result".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            fallback.observe(&AgentEvent::SessionStarted {
+                harness: HarnessId::Omp,
+                model: "omp-default".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "session".into(),
+                assistant_message_id: "assistant".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            fallback.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("fallback result".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("fallback result".into())
+        );
+    }
 
     #[test]
     fn live_voice_delegation_speech_accumulator_uses_only_visible_backend_text() {
-        let mut speech = BackendSpeechAccumulator::default();
+        let mut speech = armed_accumulator();
         assert_eq!(
             speech.observe(&AgentEvent::ReasoningDelta {
                 text: "private reasoning".into(),
@@ -560,7 +921,7 @@ mod tests {
             BackendSpeechUpdate::Final("Inspecting".into())
         );
 
-        let mut result_wins = BackendSpeechAccumulator::default();
+        let mut result_wins = armed_accumulator();
         result_wins.observe(&AgentEvent::TextDelta {
             text: "fallback".into(),
         });
@@ -574,7 +935,7 @@ mod tests {
             BackendSpeechUpdate::Final("final result".into())
         );
 
-        let mut errored = BackendSpeechAccumulator::default();
+        let mut errored = armed_accumulator();
         assert_eq!(
             errored.observe(&AgentEvent::Done {
                 status: DoneStatus::Errored,
@@ -585,7 +946,7 @@ mod tests {
             BackendSpeechUpdate::Final("actual backend error".into())
         );
 
-        let mut empty = BackendSpeechAccumulator::default();
+        let mut empty = armed_accumulator();
         assert_eq!(
             empty.observe(&AgentEvent::Done {
                 status: DoneStatus::Completed,
@@ -597,6 +958,262 @@ mod tests {
                 "The coding run completed without a final text response.".into()
             )
         );
+    }
+
+    #[test]
+    fn live_operational_context_exposes_only_visible_status_text_and_tool_label() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "Already visible");
+        assert!(context.observe(&AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: ToolCall::Exec {
+                command: "secret command".into(),
+            },
+        }));
+        assert!(!context.observe(&AgentEvent::TextDelta {
+            text: " Tests are running.".into(),
+        }));
+        assert!(context.observe(&AgentEvent::AssistantMessageCompleted {
+            assistant_message_id: "assistant-1".into(),
+        }));
+
+        let rendered = context.render();
+        assert!(rendered.contains("Session status: Working"));
+        assert!(rendered.contains("Current action: Running command"));
+        assert!(rendered.contains("Visible assistant update: Already visible Tests are running."));
+        assert!(!rendered.contains("secret command"));
+    }
+
+    #[test]
+    fn live_operational_context_publishes_streamed_text_on_a_clock_without_message_end() {
+        let start = Instant::now();
+        let mut context = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(context.observe_at(&steered(), start));
+        let delta = |text: &str| AgentEvent::TextDelta { text: text.into() };
+        assert!(!context.observe_at(&delta("First "), start + Duration::from_millis(300)));
+        assert!(context.observe_at(&delta("second "), start + LIVE_TEXT_UPDATE_INTERVAL));
+        assert!(!context.observe_at(
+            &delta("third "),
+            start + LIVE_TEXT_UPDATE_INTERVAL + Duration::from_millis(900)
+        ));
+        assert!(context.observe_at(&delta("fourth"), start + LIVE_TEXT_UPDATE_INTERVAL * 2));
+        assert_eq!(
+            context.render(),
+            "Session status: Working\nVisible assistant update: First second third fourth"
+        );
+
+        let mut heavy = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(heavy.observe_at(&steered(), start));
+        let deltas = 500;
+        let step = Duration::from_millis(10);
+        let chunk = "streamed text chunk ";
+        let mut updates = 0;
+        let mut payload = 0;
+        for index in 0..deltas {
+            let now = start + step * index;
+            if heavy.observe_at(&delta(chunk), now) {
+                updates += 1;
+                payload += heavy.render().len();
+            }
+        }
+        let total_text = chunk.len() * deltas as usize;
+        let elapsed_secs = (step * deltas).as_secs_f64();
+        assert!(
+            updates <= elapsed_secs.ceil() as usize + 1,
+            "{updates} updates for {elapsed_secs}s of streaming"
+        );
+        assert!(
+            payload <= updates * (LIVE_VISIBLE_TEXT_WINDOW_BYTES + 64),
+            "each update is bounded by the text window, got {payload} bytes"
+        );
+        assert!(
+            payload < total_text * 2,
+            "{payload} bytes for {total_text} bytes of text"
+        );
+        assert!(heavy.render().ends_with(chunk.trim_end()));
+        assert!(heavy.render().len() <= LIVE_VISIBLE_TEXT_WINDOW_BYTES + 64);
+    }
+
+    #[test]
+    fn live_operational_context_flushes_pending_text_without_another_text_event() {
+        let start = Instant::now();
+        let delta = |text: &str| AgentEvent::TextDelta { text: text.into() };
+        let reasoning = AgentEvent::ReasoningDelta {
+            text: "private".into(),
+        };
+
+        let mut clocked = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(clocked.observe_at(&steered(), start));
+        assert!(!clocked.observe_at(&delta("Running the "), start + Duration::from_millis(300)));
+        assert!(!clocked.observe_at(&delta("tests now."), start + Duration::from_millis(800)));
+        assert!(!clocked.observe_at(&reasoning, start + Duration::from_millis(900)));
+        assert_eq!(
+            clocked.next_flush_at(),
+            Some(start + LIVE_TEXT_UPDATE_INTERVAL)
+        );
+        assert!(!clocked.flush_at(start + Duration::from_millis(950)));
+        assert!(clocked.flush_at(start + LIVE_TEXT_UPDATE_INTERVAL));
+        assert_eq!(clocked.next_flush_at(), None);
+        assert!(!clocked.flush_at(start + Duration::from_secs(30)));
+        assert_eq!(
+            clocked.render(),
+            "Session status: Working\nVisible assistant update: Running the tests now."
+        );
+
+        let mut by_reasoning = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(by_reasoning.observe_at(&steered(), start));
+        assert!(!by_reasoning.observe_at(&delta("pending"), start + Duration::from_millis(500)));
+        assert!(by_reasoning.observe_at(&reasoning, start + LIVE_TEXT_UPDATE_INTERVAL));
+        assert!(!by_reasoning.observe_at(&reasoning, start + Duration::from_secs(30)));
+
+        let mut by_boundary = LiveOperationalContext::new(SessionStatus::Idle, "");
+        assert!(by_boundary.observe_at(&steered(), start));
+        assert!(!by_boundary.observe_at(&delta("pending"), start + Duration::from_millis(100)));
+        assert!(by_boundary.observe_at(
+            &AgentEvent::ToolResult {
+                id: "unknown-tool".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+                execution: None,
+            },
+            start + Duration::from_millis(200)
+        ));
+        assert_eq!(by_boundary.next_flush_at(), None);
+        assert!(
+            by_boundary
+                .render()
+                .ends_with("Visible assistant update: pending")
+        );
+    }
+
+    #[test]
+    fn live_operational_context_resets_visible_text_at_turn_boundaries() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "Previous turn");
+        assert!(context.observe(&steered()));
+        assert_eq!(context.render(), "Session status: Working");
+        assert!(!context.observe(&AgentEvent::TextDelta {
+            text: "Current turn".into(),
+        }));
+        assert!(context.observe(&AgentEvent::AssistantMessageCompleted {
+            assistant_message_id: "assistant-1".into(),
+        }));
+        assert_eq!(
+            context.render(),
+            "Session status: Working\nVisible assistant update: Current turn"
+        );
+        assert!(context.observe(&AgentEvent::SessionStarted {
+            harness: HarnessId::Omp,
+            model: "omp-default".into(),
+            tools: Vec::new(),
+            cwd: "/tmp".into(),
+            session_id: "session".into(),
+            assistant_message_id: "assistant-2".into(),
+        }));
+        assert_eq!(context.render(), "Session status: Working");
+    }
+
+    #[test]
+    fn live_operational_context_excludes_reasoning_and_tool_payloads() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "");
+        assert!(!context.observe(&AgentEvent::ReasoningDelta {
+            text: "private reasoning".into(),
+        }));
+        assert!(context.observe(&AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: ToolCall::Exec {
+                command: "private command".into(),
+            },
+        }));
+        assert!(context.observe(&AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            is_error: true,
+            output: Some("private output".into()),
+            diff: None,
+            execution: None,
+        }));
+
+        let rendered = context.render();
+        assert!(rendered.contains("Visible error: The current tool failed."));
+        assert!(!rendered.contains("private reasoning"));
+        assert!(!rendered.contains("private command"));
+        assert!(!rendered.contains("private output"));
+    }
+
+    #[test]
+    fn live_operational_context_tracks_input_and_terminal_state_without_question_payloads() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "");
+        assert!(context.observe(&AgentEvent::InputRequested {
+            request_id: "input-1".into(),
+            questions: Vec::new(),
+        }));
+        assert_eq!(context.render(), "Session status: AwaitingInput");
+        assert!(context.observe(&AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("visible failure".into()),
+            session_id: None,
+        }));
+        assert_eq!(
+            context.render(),
+            "Session status: Errored\nVisible error: visible failure"
+        );
+    }
+
+    #[test]
+    fn latest_live_assistant_text_excludes_non_text_transcript_parts() {
+        let entries = vec![
+            SessionMessageEntry {
+                id: "user".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "user-text".into(),
+                    text: "user prompt".into(),
+                }],
+                created_at: 1,
+                device_id: "device".into(),
+                status: None,
+                duration_ms: None,
+                continuation_of: None,
+            },
+            SessionMessageEntry {
+                id: "assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning {
+                        id: "reasoning".into(),
+                        text: "private reasoning".into(),
+                        completed: false,
+                        duration_ms: None,
+                    },
+                    MessagePart::Text {
+                        id: "answer".into(),
+                        text: "Visible answer".into(),
+                    },
+                ],
+                created_at: 2,
+                device_id: "device".into(),
+                status: None,
+                duration_ms: None,
+                continuation_of: None,
+            },
+            SessionMessageEntry {
+                id: "assistant-protected".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Reasoning {
+                    id: "newer-reasoning".into(),
+                    text: "newer private reasoning".into(),
+                    completed: false,
+                    duration_ms: None,
+                }],
+                created_at: 3,
+                device_id: "device".into(),
+                status: None,
+                duration_ms: None,
+                continuation_of: None,
+            },
+        ];
+
+        assert_eq!(latest_visible_assistant_text(&entries), "Visible answer");
     }
 
     #[test]
@@ -684,6 +1301,8 @@ mod tests {
             .unwrap();
         let call_id = coordinator.reserve("chat-1").unwrap();
         assert!(coordinator.attach_controls(&call_id, controls));
+        let cancellation = coordinator.cancellation(&call_id).unwrap();
+        let child = cancellation.child_token();
         state.borrow_and_update();
 
         let stopping = {
@@ -699,6 +1318,8 @@ mod tests {
         assert_eq!(received.recv().await, Some(LiveVoiceControl::Stop));
         stopping.await.unwrap().unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
+        assert!(cancellation.is_cancelled());
+        assert!(child.is_cancelled());
         coordinator.stop().await.unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
     }
@@ -720,6 +1341,7 @@ mod tests {
     #[derive(Default)]
     struct FakeLiveHarness {
         supported: std::sync::atomic::AtomicBool,
+        session_context_supported: std::sync::atomic::AtomicBool,
         controls: Arc<Mutex<Vec<LiveVoiceControl>>>,
         live_requests: Mutex<Vec<LiveVoiceRequest>>,
         run_requests: Mutex<Vec<RunRequest>>,
@@ -729,6 +1351,7 @@ mod tests {
         fn supported() -> Self {
             Self {
                 supported: std::sync::atomic::AtomicBool::new(true),
+                session_context_supported: std::sync::atomic::AtomicBool::new(true),
                 controls: Arc::new(Mutex::new(Vec::new())),
                 live_requests: Mutex::new(Vec::new()),
                 run_requests: Mutex::new(Vec::new()),
@@ -737,6 +1360,11 @@ mod tests {
 
         fn set_supported(&self, supported: bool) {
             self.supported
+                .store(supported, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_session_context_supported(&self, supported: bool) {
+            self.session_context_supported
                 .store(supported, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -767,8 +1395,17 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn probe_live_voice(&self, _cwd: &std::path::Path) -> Result<bool, HarnessError> {
-            Ok(self.supported.load(std::sync::atomic::Ordering::SeqCst))
+        async fn probe_live_voice(
+            &self,
+            _cwd: &std::path::Path,
+        ) -> Result<LiveVoiceSupport, HarnessError> {
+            let available = self.supported.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(LiveVoiceSupport {
+                available,
+                session_context: self
+                    .session_context_supported
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            })
         }
 
         async fn start_live_voice(
@@ -814,6 +1451,7 @@ mod tests {
                             };
                             let _ = event_tx.send(Ok(LiveVoiceEvent::Phase(phase))).await;
                         }
+                        LiveVoiceControl::AppendSessionContext { .. } => {}
                         LiveVoiceControl::Stop => {
                             let _ = event_tx
                                 .send(Ok(LiveVoiceEvent::Ended { error: None }))
@@ -839,6 +1477,7 @@ mod tests {
             request: RunRequest,
             controls: RunControls,
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let await_input = request.prompt == "await-input";
             lock(&self.run_requests).push(request);
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
@@ -852,7 +1491,22 @@ mod tests {
                         assistant_message_id: "assistant-1".into(),
                     }))
                     .await;
-                controls.interrupt.cancelled().await;
+                if await_input {
+                    let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
+                        id: "q1".into(),
+                        header: "Pick".into(),
+                        question: "Private question?".into(),
+                        options: vec!["a".into(), "b".into()],
+                        multi_select: false,
+                    }]);
+                    tokio::pin!(answers);
+                    tokio::select! {
+                        _ = &mut answers => {}
+                        _ = controls.interrupt.cancelled() => {}
+                    }
+                } else {
+                    controls.interrupt.cancelled().await;
+                }
                 let _ = tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Interrupted,
@@ -911,6 +1565,18 @@ mod tests {
         .unwrap();
     }
 
+    /// Polls a condition on the same 5ms/1s budget every operational-context
+    /// assertion in this module needs.
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
     #[tokio::test]
     async fn live_voice_preconditions_and_transient_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
@@ -934,6 +1600,7 @@ mod tests {
             ),
             ("archived", local_device.as_str(), Some(omp_config())),
             ("active", local_device.as_str(), Some(omp_config())),
+            ("awaiting", local_device.as_str(), Some(omp_config())),
             ("live-a", local_device.as_str(), Some(omp_config())),
             ("live-b", local_device.as_str(), Some(omp_config())),
         ] {
@@ -977,15 +1644,93 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            core.sessions
+                .probe_live_voice("active")
+                .await
+                .unwrap()
+                .available
+        );
+        core.sessions.start_live_voice("active").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        wait_until("Working operational context", || {
+            lock(&harness.controls).iter().any(|control| {
+                matches!(
+                    control,
+                    LiveVoiceControl::AppendSessionContext { text }
+                        if text.contains("Session status: Working")
+                )
+            })
+        })
+        .await;
+        assert_eq!(
+            lock(&harness.run_requests)
+                .iter()
+                .filter(|request| request.prompt == "busy")
+                .count(),
+            1
+        );
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+        assert_eq!(
+            core.sessions.session_status("active").unwrap().status,
+            SessionStatus::Working
+        );
+        harness.set_session_context_supported(false);
         assert_eq!(
             core.sessions
                 .probe_live_voice("active")
                 .await
                 .unwrap()
                 .reason,
-            Some(LiveVoiceUnavailableReason::ActiveRun)
+            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
         );
         core.sessions.interrupt("active").await.unwrap();
+        assert!(
+            core.sessions
+                .probe_live_voice("active")
+                .await
+                .unwrap()
+                .available
+        );
+        core.sessions.start_live_voice("active").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+        harness.set_session_context_supported(true);
+
+        let mut awaiting_request = run_request();
+        awaiting_request.prompt = "await-input".into();
+        core.sessions
+            .dispatch(
+                "awaiting",
+                HarnessId::Omp,
+                awaiting_request,
+                Some("awaiting-1".into()),
+            )
+            .await
+            .unwrap();
+        wait_until("awaiting-input run status", || {
+            core.sessions
+                .session_status("awaiting")
+                .is_some_and(|session| session.status == SessionStatus::AwaitingInput)
+        })
+        .await;
+        core.sessions.start_live_voice("awaiting").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        wait_until("AwaitingInput operational context", || {
+            lock(&harness.controls).iter().any(|control| {
+                matches!(
+                    control,
+                    LiveVoiceControl::AppendSessionContext { text }
+                        if text == "Session status: AwaitingInput"
+                )
+            })
+        })
+        .await;
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+        core.sessions.interrupt("awaiting").await.unwrap();
 
         harness.set_supported(false);
         assert_eq!(
@@ -1022,7 +1767,22 @@ mod tests {
         assert_eq!(doc.doc().read_commands().unwrap(), commands_before);
         assert_eq!(
             lock(&harness.controls).as_slice(),
-            [LiveVoiceControl::SetMuted(true), LiveVoiceControl::Stop]
+            [
+                LiveVoiceControl::AppendSessionContext {
+                    text: "Session status: Working".into(),
+                },
+                LiveVoiceControl::Stop,
+                LiveVoiceControl::Stop,
+                LiveVoiceControl::AppendSessionContext {
+                    text: "Session status: AwaitingInput".into(),
+                },
+                LiveVoiceControl::Stop,
+                LiveVoiceControl::AppendSessionContext {
+                    text: "Session status: Idle".into(),
+                },
+                LiveVoiceControl::SetMuted(true),
+                LiveVoiceControl::Stop,
+            ]
         );
         core.sessions.shutdown().await;
     }
