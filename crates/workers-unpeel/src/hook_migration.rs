@@ -31,6 +31,16 @@ pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
         &managed_provider_config_paths(),
         has_live_sessions,
     );
+    combine_migration_outcome(installed, pruned)
+}
+
+/// Report both halves of the migration: a cached install failure is the root
+/// cause behind the predictable prune failure (the failed runtime's config
+/// still points at the legacy root), so neither error may mask the other.
+fn combine_migration_outcome(
+    installed: Result<(), String>,
+    pruned: Result<bool, String>,
+) -> Result<(), String> {
     match (installed, pruned) {
         (Ok(()), Ok(_)) => Ok(()),
         (Ok(()), Err(prune)) => Err(prune),
@@ -54,23 +64,34 @@ pub(crate) fn is_comet_application_process() -> bool {
 fn install_comet_managed_hooks() -> Result<(), String> {
     std::fs::create_dir_all(unpeel_core::app_paths::app_hooks_root())
         .map_err(|error| format!("Failed to create Comet hook root: {error}"))?;
+    let runtimes = unpeel_core::runtime_catalog::builtin_runtime_catalog()
+        .current_platform_descriptors()
+        .into_iter()
+        .filter_map(|runtime| {
+            let alias = runtime.detection.command_aliases.first()?;
+            unpeel_core::integrations::has_runtime_support_installer(alias)
+                .then(|| (runtime.id.clone(), alias.clone()))
+        });
+    install_runtime_hooks_with(runtimes, |alias| {
+        unpeel_core::integrations::install_runtime_support(alias)
+    })
+}
+
+/// Attempt every `(runtime id, alias)` in catalog order, once per runtime id,
+/// and accumulate failures instead of stopping at the first one.
+fn install_runtime_hooks_with(
+    runtimes: impl IntoIterator<Item = (String, String)>,
+    mut install: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
     let mut installed = HashSet::new();
     let mut failures = Vec::new();
-    for runtime in
-        unpeel_core::runtime_catalog::builtin_runtime_catalog().current_platform_descriptors()
-    {
-        let Some(alias) = runtime.detection.command_aliases.first() else {
-            continue;
-        };
-        if !unpeel_core::integrations::has_runtime_support_installer(alias)
-            || !installed.insert(runtime.id.clone())
-        {
+    for (runtime_id, alias) in runtimes {
+        if !installed.insert(runtime_id.clone()) {
             continue;
         }
-        if let Err(error) = unpeel_core::integrations::install_runtime_support(alias) {
+        if let Err(error) = install(&alias) {
             failures.push(format!(
-                "Failed to install Comet hooks for runtime {} ({alias}): {error}",
-                runtime.id
+                "Failed to install Comet hooks for runtime {runtime_id} ({alias}): {error}"
             ));
         }
     }
@@ -235,4 +256,65 @@ fn config_has_stale_managed_hook(raw: &str, legacy_root: &str) -> bool {
             .iter()
             .any(|name| line.contains(name))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(id: &str, alias: &str) -> (String, String) {
+        (id.to_string(), alias.to_string())
+    }
+
+    #[test]
+    fn a_failing_runtime_does_not_skip_the_runtimes_behind_it() {
+        let mut attempted = Vec::new();
+        let result = install_runtime_hooks_with(
+            [
+                pair("claude", "claude"),
+                pair("pi", "pi"),
+                pair("pi", "pi-agent"),
+                pair("omp", "omp"),
+            ],
+            |alias| {
+                attempted.push(alias.to_string());
+                if alias == "pi" {
+                    Err("hook asset missing".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(
+            attempted,
+            ["claude", "pi", "omp"],
+            "order kept, duplicate id skipped"
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("runtime pi (pi)"), "{error}");
+        assert!(error.contains("hook asset missing"), "{error}");
+        assert!(!error.contains("omp"), "omp installed fine: {error}");
+    }
+
+    #[test]
+    fn prune_failure_keeps_the_cached_install_failure_as_root_cause() {
+        let error = combine_migration_outcome(
+            Err("Failed to install Comet hooks for runtime pi (pi): ENOENT".to_string()),
+            Err("Provider configs still reference a stale managed hook: x".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("Failed to install Comet hooks for runtime pi (pi): ENOENT; "));
+        assert!(error.ends_with("Provider configs still reference a stale managed hook: x"));
+        assert_eq!(
+            combine_migration_outcome(Ok(()), Err("prune".to_string())),
+            Err("prune".to_string())
+        );
+        assert_eq!(
+            combine_migration_outcome(Err("install".to_string()), Ok(true)),
+            Err("install".to_string())
+        );
+        assert_eq!(combine_migration_outcome(Ok(()), Ok(false)), Ok(()));
+    }
 }

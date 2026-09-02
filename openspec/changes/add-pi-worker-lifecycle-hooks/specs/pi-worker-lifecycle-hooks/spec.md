@@ -58,10 +58,11 @@ Test: unit — escrita atômica de asset gerenciado.
 - **AND** a instalação não falha por diretório ausente
 
 #### Scenario: Falha de um runtime não silencia os outros
-Test: none — o loop percorre instaladores reais contra o home do usuário; o
-único seam testável seria uma lista de instaladores injetada, que custa mais
-do que a regressão de três linhas que ela pegaria. A causa raiz que produzia a
-falha (`root` apagado) está coberta acima.
+Test: unit — `install_runtime_hooks_with` recebe a lista de runtimes e o
+instalador como closure; a regressão injeta falha no alias do meio e prova que
+todos os aliases foram tentados em ordem e que o erro nomeia o runtime. A
+composição install+prune (`combine_migration_outcome`) tem regressão própria
+provando que o motivo raiz da instalação não é mascarado pelo erro da poda.
 
 - **WHEN** a instalação de um runtime falha
 - **THEN** os runtimes restantes ainda são instalados

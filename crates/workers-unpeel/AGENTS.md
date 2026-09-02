@@ -300,7 +300,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 6 de hibernação), `src/activity_bridge.rs` (14 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (19 + 6 de hibernação), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (14 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
