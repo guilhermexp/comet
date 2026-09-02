@@ -3,8 +3,10 @@
 //! This is intentionally separate from Unpeel's worker-to-worker MCP host: only
 //! ACP controller sessions receive this process in their `mcpServers` list.
 
-use std::io::{BufRead as _, Write as _};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -14,7 +16,16 @@ use crate::{
 };
 
 pub const CONTROLLER_MCP_ARG: &str = "__workers_mcp__";
-pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 120;
+/// Ceiling for one `wait_for_status` call. The orchestrator owns the actual
+/// duration: it knows whether the delegated work takes minutes or hours. This is
+/// only a transport sanity bound; `serve` dispatches concurrently and honours
+/// cancellation, so a long wait blocks neither `stop_worker` nor the host.
+pub const WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
+/// Guidance attached to every `timed_out: true` result: the two legitimate moves
+/// are a longer wait sized to the work, or ending the turn — the parent chat
+/// receives `[worker-task-notification]` when the worker finishes. Short repeated
+/// waits are polling and burn a full model turn each.
+pub const WAIT_TIMED_OUT_NEXT: &str = "Worker still running. Either call wait_for_status again with a timeout_seconds sized to the remaining work (up to limits.wait_seconds), or end your turn: a [worker-task-notification] arrives in this chat when the worker finishes. Do not poll with short waits.";
 
 pub fn clamp_wait_for_status_timeout(timeout_seconds: Option<u64>) -> u64 {
     timeout_seconds
@@ -44,29 +55,108 @@ const ACTIONS: &[&str] = &[
     "wait_for_status",
     "stop_worker",
     "archive_worker",
+    "restart_worker",
 ];
 
 pub fn run_stdio() -> Result<(), String> {
     consume_authority_marker()?;
     let parent_chat_id = take_parent_chat_id();
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
+    serve(stdin.lock(), std::io::stdout(), move |request, cancel| {
+        handle_request_with_parent(request, parent_chat_id.as_deref(), cancel)
+    })
+}
+
+/// Concurrent JSON-RPC loop over line-delimited stdio. Each request runs on its
+/// own thread so a pending `wait_for_status` never stalls `stop_worker`,
+/// `archive_worker` or `ping` on the same channel. `notifications/cancelled`
+/// flips the named request's cancel flag and that request gets no response
+/// (MCP cancellation contract). EOF cancels every pending request so the
+/// sidecar exits with its client instead of outliving a multi-hour wait.
+pub fn serve<R, W, H>(reader: R, writer: W, handler: H) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write + Send + 'static,
+    H: Fn(Value, &AtomicBool) -> Option<Value> + Send + Sync + 'static,
+{
+    let writer = Arc::new(Mutex::new(writer));
+    let handler = Arc::new(handler);
+    // key -> (cancel flag seen by the handler, cancelled-by-client marker).
+    // EOF flips only the first so pending waits exit; only a client
+    // cancellation suppresses the response.
+    let in_flight: InFlight = Arc::default();
+    let mut threads = Vec::new();
+    for line in reader.lines() {
         let line = line.map_err(|error| error.to_string())?;
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => handle_request_with_parent(request, parent_chat_id.as_deref()),
-            Err(_) => Some(error_response(Value::Null, -32700, "Parse error")),
+        let request = match serde_json::from_str::<Value>(&line) {
+            Ok(request) => request,
+            Err(_) => {
+                write_response(&writer, &error_response(Value::Null, -32700, "Parse error"))?;
+                continue;
+            }
         };
-        if let Some(response) = response {
-            serde_json::to_writer(&mut stdout, &response).map_err(|error| error.to_string())?;
-            stdout.write_all(b"\n").map_err(|error| error.to_string())?;
-            stdout.flush().map_err(|error| error.to_string())?;
+        if request.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            if let Some(id) = request.pointer("/params/requestId")
+                && let Some((flag, by_client)) = lock(&in_flight).get(&request_key(id))
+            {
+                by_client.store(true, Ordering::SeqCst);
+                flag.store(true, Ordering::SeqCst);
+            }
+            continue;
         }
+        let key = request.get("id").map(request_key);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelled_by_client = Arc::new(AtomicBool::new(false));
+        if let Some(key) = &key {
+            lock(&in_flight).insert(
+                key.clone(),
+                (Arc::clone(&cancel), Arc::clone(&cancelled_by_client)),
+            );
+        }
+        let writer = Arc::clone(&writer);
+        let handler = Arc::clone(&handler);
+        let in_flight = Arc::clone(&in_flight);
+        threads.push(std::thread::spawn(move || {
+            let response = handler(request, &cancel);
+            if let Some(key) = &key {
+                lock(&in_flight).remove(key);
+            }
+            if cancelled_by_client.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(response) = response {
+                let _ = write_response(&writer, &response);
+            }
+        }));
+    }
+    for (flag, _) in lock(&in_flight).values() {
+        flag.store(true, Ordering::SeqCst);
+    }
+    for thread in threads {
+        let _ = thread.join();
     }
     Ok(())
+}
+
+/// key -> (cancel flag seen by the handler, cancelled-by-client marker).
+type InFlight = Arc<Mutex<HashMap<String, (Arc<AtomicBool>, Arc<AtomicBool>)>>>;
+
+fn request_key(id: &Value) -> String {
+    id.to_string()
+}
+
+fn write_response<W: Write>(writer: &Mutex<W>, response: &Value) -> Result<(), String> {
+    let mut writer = lock(writer);
+    serde_json::to_writer(&mut *writer, response).map_err(|error| error.to_string())?;
+    writer.write_all(b"\n").map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub fn take_parent_chat_id() -> Option<String> {
@@ -92,10 +182,14 @@ pub fn consume_authority_marker() -> Result<(), String> {
 }
 
 pub fn handle_request(request: Value) -> Option<Value> {
-    handle_request_with_parent(request, None)
+    handle_request_with_parent(request, None, &AtomicBool::new(false))
 }
 
-fn handle_request_with_parent(request: Value, parent_chat_id: Option<&str>) -> Option<Value> {
+fn handle_request_with_parent(
+    request: Value,
+    parent_chat_id: Option<&str>,
+    cancel: &AtomicBool,
+) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str);
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || method.is_none() {
@@ -132,7 +226,7 @@ fn handle_request_with_parent(request: Value, parent_chat_id: Option<&str>) -> O
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                match dispatch_action(controller_client(), &arguments, parent_chat_id) {
+                match dispatch_action(controller_client(), &arguments, parent_chat_id, cancel) {
                     Ok(value) => tool_success(id, value),
                     Err(error) => tool_error(id, &error),
                 }
@@ -376,12 +470,13 @@ fn dispatch_action(
     client: &LocalWorkersClient,
     arguments: &Value,
     parent_chat_id: Option<&str>,
+    cancel: &AtomicBool,
 ) -> Result<Value, String> {
     let action = required_string(arguments, "action")?;
     match action.as_str() {
         "help" => Ok(json!({
             "actions": ACTIONS,
-            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker",
+            "workflow": "list_projects (add_project when the checkout is not listed) -> list_presets -> launch_worker -> wait_for_status/read_output -> stop_worker/archive_worker. A Worker that is not running (stopped, or hibernated by the idle policy) refuses send_text and send_keys: call restart_worker first and use the session_id it returns.",
             "keys": ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "ctrl-c", "text:<literal>"],
             "limits": { "wait_seconds": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "keys": 64, "output_bytes": 65536, "transcript_bytes": 98304 }
         })),
@@ -545,6 +640,7 @@ fn dispatch_action(
         }
         "send_text" => {
             let session = find_session(client, arguments)?;
+            live_worker_guard(&session)?;
             let text = required_string(arguments, "text")?;
             if text.len() > 64 * 1024 {
                 return Err("text exceeds 64 KiB".into());
@@ -594,6 +690,7 @@ fn dispatch_action(
         }
         "send_keys" => {
             let session = find_session(client, arguments)?;
+            live_worker_guard(&session)?;
             let keys = arguments
                 .get("keys")
                 .and_then(Value::as_array)
@@ -612,7 +709,7 @@ fn dispatch_action(
                 .map_err(|error| error.to_string())?;
             Ok(json!({ "session_id": session.id, "sent": true, "key_count": keys.len() }))
         }
-        "wait_for_status" => wait_for_status(client, arguments),
+        "wait_for_status" => wait_for_status(client, arguments, cancel),
         "stop_worker" => {
             let session = find_session(client, arguments)?;
             client
@@ -627,6 +724,28 @@ fn dispatch_action(
                 .session_command(&session, WorkersSessionCommand::Archive)
                 .map_err(|error| error.to_string())?;
             Ok(json!({ "session_id": session.id, "archived": true }))
+        }
+        "restart_worker" => {
+            let session = find_session(client, arguments)?;
+            if session.is_live() {
+                return Err(format!(
+                    "Worker '{}' is already live. restart_worker brings a stopped or hibernated Worker back.",
+                    session.id
+                ));
+            }
+            let before = worker_ids(client)?;
+            client
+                .session_command(&session, WorkersSessionCommand::RestoreAndResume)
+                .map_err(|error| error.to_string())?;
+            // Relaunching replaces the Session, so the id the caller asked
+            // with is gone: report the one it must address from now on.
+            let session_id = replacement_session_id(&before, &worker_ids(client)?)
+                .unwrap_or_else(|| session.id.clone());
+            Ok(json!({
+                "session_id": session_id,
+                "restarted": true,
+                "previous_session_id": session.id
+            }))
         }
         _ => Err(format!(
             "Unknown workers action '{action}'. Use action=help."
@@ -927,6 +1046,38 @@ pub fn archive_guard(session: &WorkersSession) -> Result<(), String> {
     Ok(())
 }
 
+/// Writing into a Worker that is not live would type into a dead PTY and be
+/// silently lost. Hibernation stops idle Workers on its own, so the error has
+/// to name the way back instead of just refusing.
+pub fn live_worker_guard(session: &WorkersSession) -> Result<(), String> {
+    if session.is_live() {
+        return Ok(());
+    }
+    Err(format!(
+        "Worker '{}' is not running (state={}, archived={}). Call restart_worker to bring it back with its conversation, then send input.",
+        session.id, session.state, session.archived
+    ))
+}
+
+fn worker_ids(client: &LocalWorkersClient) -> Result<Vec<String>, String> {
+    Ok(client
+        .bootstrap()
+        .map_err(|error| error.to_string())?
+        .sessions
+        .into_iter()
+        .map(|session| session.id)
+        .collect())
+}
+
+/// The single id that appeared while restarting. Anything else — no new id,
+/// or more than one because another Worker launched concurrently — is
+/// reported as unknown rather than guessed.
+pub fn replacement_session_id(before: &[String], after: &[String]) -> Option<String> {
+    let mut new_ids = after.iter().filter(|id| !before.contains(id));
+    let replacement = new_ids.next()?;
+    new_ids.next().is_none().then(|| replacement.clone())
+}
+
 fn validate_launch_target(
     client: &LocalWorkersClient,
     request: &WorkersLaunchRequest,
@@ -953,32 +1104,52 @@ fn validate_launch_target(
     Ok(())
 }
 
-fn wait_for_status(client: &LocalWorkersClient, arguments: &Value) -> Result<Value, String> {
+fn wait_for_status(
+    client: &LocalWorkersClient,
+    arguments: &Value,
+    cancel: &AtomicBool,
+) -> Result<Value, String> {
     let session_id = required_string(arguments, "session_id")?;
     let wanted = required_string(arguments, "status")?.to_ascii_lowercase();
     let timeout =
         clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    loop {
-        let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
-        let Some(session) = bootstrap
+    wait_until(timeout, &wanted, cancel, || {
+        client
+            .bootstrap()
+            .map_err(|error| error.to_string())?
             .sessions
             .into_iter()
             .find(|session| session.id == session_id)
-        else {
-            return Err(format!("Worker '{session_id}' no longer exists."));
-        };
-        let matched = session.activity.eq_ignore_ascii_case(&wanted)
-            || session.state.eq_ignore_ascii_case(&wanted);
+            .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))
+    })
+}
+
+/// The blocking core of `wait_for_status`, separated from the host client so the
+/// deadline, cancellation and `next` guidance are testable without a worker host.
+pub fn wait_until(
+    timeout_seconds: u64,
+    wanted: &str,
+    cancel: &AtomicBool,
+    mut poll: impl FnMut() -> Result<WorkersSession, String>,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let session = poll()?;
+        let matched = session.activity.eq_ignore_ascii_case(wanted)
+            || session.state.eq_ignore_ascii_case(wanted);
         if matched {
             return Ok(json!({ "matched": true, "worker": session_json(&session) }));
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Err("wait_for_status cancelled by the host".into());
         }
         if Instant::now() >= deadline {
             return Ok(json!({
                 "matched": false,
                 "timed_out": true,
                 "wanted": wanted,
-                "worker": session_json(&session)
+                "worker": session_json(&session),
+                "next": WAIT_TIMED_OUT_NEXT
             }));
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -1056,8 +1227,14 @@ fn tool_definition() -> Value {
         started one level up runs every command, gate and relative path against \
         the wrong tree — then \
         `list_presets` to pick a preset, `launch_worker` with a self-contained \
-        briefing in `initial_text`, `wait_for_status` instead of polling, \
-        `read_output` to inspect evidence, then `stop_worker` or `archive_worker`. \
+        briefing in `initial_text`, then either `wait_for_status` with a \
+        `timeout_seconds` sized to the work (you decide, up to `limits.wait_seconds`) \
+        or end your turn — a `[worker-task-notification]` arrives in this chat when \
+        the worker finishes; never poll with short waits. `read_output` inspects \
+        evidence, then `stop_worker` or `archive_worker`. A worker that is not \
+        running — stopped, or hibernated by the idle policy — refuses input until \
+        `restart_worker` brings it back with its conversation under a new \
+        `session_id`. \
         Launch one worker per independent slice: N calls for N slices is the normal \
         shape of parallel delegation. `action=help` returns the live per-action \
         contract and limits.",
@@ -1070,12 +1247,12 @@ fn tool_definition() -> Value {
                 "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
                 "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
                 "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
-                "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker and archive_worker." },
+                "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker, archive_worker and restart_worker." },
                 "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
                 "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },
                 "submit": { "type": "boolean", "description": "send_text: submit the text with a carriage return. Defaults to true." },
                 "status": { "type": "string", "description": "wait_for_status: the worker status to block on, as reported by list_workers and inspect_worker." },
-                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: bounded wait in seconds where expiration returns timed_out: true with a worker snapshot as a normal read, not a failure. Long waits do not replace a durable completion check." },
+                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS, "description": "wait_for_status: how long to block, chosen by you to fit the work (default 30, maximum 4h); expiration returns timed_out: true with a worker snapshot and a next hint as a normal read, not a failure. The wait is cancellable and does not block other actions." },
                 "entries": { "type": "integer", "minimum": 1, "maximum": 500, "description": "read_transcript: how many transcript entries to return. Defaults to 50." },
                 "initial_text": { "type": "string", "description": "launch_worker: the self-contained briefing submitted once the worker is ready. Workers inherit no conversation, so it carries objective, scope, constraints, acceptance criteria and expected evidence." },
                 "worktree_path": { "type": "string", "description": "launch_worker: run the worker in this existing git worktree instead of the project root." },

@@ -7,7 +7,7 @@ adapter = "builtin:prime-agent"
 legacy_order = 14
 platforms = ["macos", "linux"]
 supports_quick_launch = true
-capabilities = ["lifecycle_hooks", "notify_when_done"]
+capabilities = ["lifecycle_hooks", "notify_when_done", "resume", "restart_agent"]
 
 [display]
 icon = "agent"

@@ -1439,17 +1439,36 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
         .and_then(Value::as_u64)
         .expect("timeout_seconds maximum property in workers tool inputSchema");
 
-    let transport_timeout_seconds = zeron_harness::omp::workers_bridge::TOOL_CALL_TIMEOUT.as_secs();
+    let bridge = &zeron_harness::omp::workers_bridge::TOOL_CALL_TIMEOUT;
+    let at_ceiling = zeron_harness::omp::workers_bridge::call_timeout_for(
+        &json!({ "action": "wait_for_status", "timeout_seconds": max_timeout_seconds }),
+        *bridge,
+    )
+    .as_secs();
 
-    // The transport timeout must strictly exceed the maximum tool blocking duration,
-    // with at least a 60s margin for IPC round-trip and process scheduling.
+    // The per-call transport deadline must strictly exceed the requested wait,
+    // with at least a 60s margin for IPC round-trip and process scheduling —
+    // for any wait the orchestrator can request, up to the controller ceiling.
     assert!(
-        transport_timeout_seconds > max_timeout_seconds,
-        "transport timeout ({transport_timeout_seconds}s) must strictly exceed maximum tool blocking duration ({max_timeout_seconds}s)"
+        at_ceiling > max_timeout_seconds,
+        "transport deadline ({at_ceiling}s) must strictly exceed the requested wait ({max_timeout_seconds}s)"
     );
-    let margin = transport_timeout_seconds - max_timeout_seconds;
     assert!(
-        margin >= 60,
-        "transport timeout ({transport_timeout_seconds}s) must have at least 60s margin over tool blocking ceiling ({max_timeout_seconds}s), got {margin}s"
+        at_ceiling - max_timeout_seconds >= 60,
+        "transport deadline must keep a 60s margin over the requested wait, got {}s",
+        at_ceiling - max_timeout_seconds
+    );
+    assert_eq!(
+        zeron_harness::omp::workers_bridge::call_timeout_for(
+            &json!({ "action": "read_output", "timeout_seconds": max_timeout_seconds }),
+            *bridge
+        ),
+        *bridge,
+        "only wait_for_status derives its deadline from timeout_seconds"
+    );
+    assert_eq!(
+        zeron_harness::WORKERS_CLIENT_DEADLINE_SECONDS,
+        zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS + 60,
+        "native runtimes' MCP client deadline is pinned to the controller ceiling plus slack"
     );
 }

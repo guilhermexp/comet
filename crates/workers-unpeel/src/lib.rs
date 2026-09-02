@@ -158,6 +158,11 @@ pub fn controller_mcp_handle_request(request: Value) -> Option<Value> {
 }
 
 #[doc(hidden)]
+pub use controller_mcp::{
+    WAIT_TIMED_OUT_NEXT, serve as controller_mcp_serve, wait_until as controller_mcp_wait_until,
+};
+
+#[doc(hidden)]
 pub fn controller_mcp_parse_launch(request: Value) -> Result<WorkersLaunchRequest, String> {
     controller_mcp::parse_launch(request)
 }
@@ -235,6 +240,19 @@ pub fn controller_mcp_sanitize_text(text: &str) -> String {
 #[doc(hidden)]
 pub fn controller_mcp_archive_guard(session: &WorkersSession) -> Result<(), String> {
     controller_mcp::archive_guard(session)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_live_worker_guard(session: &WorkersSession) -> Result<(), String> {
+    controller_mcp::live_worker_guard(session)
+}
+
+#[doc(hidden)]
+pub fn controller_mcp_replacement_session_id(
+    before: &[String],
+    after: &[String],
+) -> Option<String> {
+    controller_mcp::replacement_session_id(before, after)
 }
 
 /// Make the current Comet executable the Unpeel launcher when no explicit
@@ -764,6 +782,12 @@ pub struct WorkersSession {
     pub worktree_branch: Option<String>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    /// When this Worker last showed real activity: the newest of the host's
+    /// parsed-screen change stamp and the durable last-hook event. Unlike
+    /// `updated_at_unix_ms` it does not move with the host heartbeat or an
+    /// identical TUI repaint, which is what makes it the idle clock for
+    /// hibernation. `None` means "no evidence" and protects the Worker.
+    pub idle_since_unix_ms: Option<u64>,
     pub total_tokens: Option<u64>,
     pub model_usage: Vec<WorkersModelTokenUsage>,
     pub capabilities: WorkersSessionCapabilities,
@@ -2459,6 +2483,9 @@ impl From<SessionWire> for WorkersSession {
             worktree_branch: value.worktree_branch,
             created_at_unix_ms: value.created_at_unix_ms,
             updated_at_unix_ms: value.updated_at_unix_ms,
+            // Local to the frontier: the activity bridge fills it from disk
+            // after the bootstrap decodes, so there is no new Host wire field.
+            idle_since_unix_ms: None,
             total_tokens: value.total_tokens,
             model_usage: value.model_usage,
             capabilities: WorkersSessionCapabilities {
@@ -2700,6 +2727,64 @@ fn apply_runtime_capabilities(sessions: &mut [WorkersSession]) {
             .capabilities
             .contains(&RuntimeCapability::NotifyWhenDone);
     }
+}
+
+/// Which live Workers should be hibernated (stopped and archived) right now,
+/// oldest idle first. Pure: it decides from the bootstrap snapshot the panel
+/// already holds, so the policy is testable without a UI or a host.
+///
+/// A Worker is only eligible when it is live, idle, unpinned, not selected,
+/// not mid-launch, and its command names a runtime with a resume recipe —
+/// which is also what excludes terminal sessions, whose shell has none.
+/// Hibernating a Worker that cannot resume would throw the conversation away.
+pub fn hibernation_candidates<'a>(
+    sessions: &'a [WorkersSession],
+    settings: &WorkersResourceSettings,
+    selected_session_id: Option<&str>,
+    now_unix_ms: u64,
+) -> Vec<&'a WorkersSession> {
+    if !settings.hibernation_enabled {
+        return Vec::new();
+    }
+    let mut eligible = sessions
+        .iter()
+        .filter_map(|session| {
+            let idle_since = session.idle_since_unix_ms?;
+            (session.is_live()
+                && !session.archived
+                && session.activity == "idle"
+                && !session.pinned
+                && !session.runtime_launch_pending
+                && selected_session_id != Some(session.id.as_str())
+                && unpeel_core::resume::can_resume(&session.command))
+            .then_some((session, idle_since))
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    let deadline_ms = u64::from(settings.hibernate_after_idle_minutes) * 60_000;
+    let (past_deadline, survivors): (Vec<_>, Vec<_>) = eligible
+        .into_iter()
+        .partition(|(_, idle_since)| now_unix_ms.saturating_sub(*idle_since) >= deadline_ms);
+    let mut candidates = past_deadline
+        .into_iter()
+        .map(|(session, _)| session)
+        .collect::<Vec<_>>();
+    // Over the cap, the oldest idle Workers make room for the newest ones,
+    // which are the likeliest to be picked up again.
+    let over_the_cap = survivors
+        .len()
+        .saturating_sub(usize::from(settings.max_live_idle_workers));
+    candidates.extend(
+        survivors
+            .into_iter()
+            .take(over_the_cap)
+            .map(|(session, _)| session),
+    );
+    candidates
 }
 
 fn set_notify_when_done_overlay(session_id: &str, enabled: bool) -> Result<(), WorkersError> {
@@ -3021,6 +3106,7 @@ mod runtime_capability_tests {
             worktree_branch: None,
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
+            idle_since_unix_ms: None,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
@@ -3532,6 +3618,129 @@ mod worktree_setup_wiring_tests {
         assert_eq!(
             registered.get("parent_project_id").and_then(Value::as_str),
             Some("comet-parent")
+        );
+    }
+}
+
+#[cfg(test)]
+mod hibernation_tests {
+    use super::{
+        WorkersResourceSettings, WorkersSession, WorkersSessionCapabilities, hibernation_candidates,
+    };
+
+    const MINUTE_MS: u64 = 60_000;
+    const NOW: u64 = 100_000 * MINUTE_MS;
+
+    fn settings() -> WorkersResourceSettings {
+        WorkersResourceSettings {
+            hibernation_enabled: true,
+            hibernate_after_idle_minutes: 15,
+            max_live_idle_workers: 12,
+            ..WorkersResourceSettings::default()
+        }
+    }
+
+    fn worker(id: &str, idle_minutes: u64) -> WorkersSession {
+        WorkersSession {
+            id: id.to_owned(),
+            project_id: "project-1".to_owned(),
+            title: id.to_owned(),
+            command: "omp".to_owned(),
+            state: "running".to_owned(),
+            activity: "idle".to_owned(),
+            unread: false,
+            pinned: false,
+            archived: false,
+            provider_id: None,
+            active_runtime_id: Some("omp".to_owned()),
+            runtime_launch_pending: false,
+            runtime_generation: 1,
+            notify_when_done: false,
+            terminal_background_hex: None,
+            worktree_branch: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: NOW,
+            idle_since_unix_ms: Some(NOW - idle_minutes * MINUTE_MS),
+            total_tokens: None,
+            model_usage: Vec::new(),
+            capabilities: WorkersSessionCapabilities::default(),
+        }
+    }
+
+    fn ids(sessions: &[WorkersSession], selected: Option<&str>) -> Vec<String> {
+        hibernation_candidates(sessions, &settings(), selected, NOW)
+            .into_iter()
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn hibernation_is_off_by_default_and_never_runs_while_disabled() {
+        let sessions = vec![worker("idle-for-a-day", 24 * 60)];
+        let off = WorkersResourceSettings {
+            max_live_idle_workers: 1,
+            ..WorkersResourceSettings::default()
+        };
+        assert!(!off.hibernation_enabled);
+        assert!(hibernation_candidates(&sessions, &off, None, NOW).is_empty());
+    }
+
+    #[test]
+    fn only_workers_past_the_idle_deadline_are_hibernated() {
+        let sessions = vec![worker("past", 16), worker("within", 14)];
+        assert_eq!(ids(&sessions, None), vec!["past".to_owned()]);
+    }
+
+    #[test]
+    fn a_worker_with_no_idle_evidence_is_protected() {
+        let mut session = worker("legacy-manifest", 24 * 60);
+        session.idle_since_unix_ms = None;
+        assert!(ids(&[session], None).is_empty());
+    }
+
+    #[test]
+    fn working_blocked_pinned_selected_and_launching_workers_are_protected() {
+        let mut working = worker("working", 60);
+        working.activity = "working".into();
+        let mut blocked = worker("blocked", 60);
+        blocked.activity = "blocked".into();
+        let mut pinned = worker("pinned", 60);
+        pinned.pinned = true;
+        let mut launching = worker("launching", 60);
+        launching.runtime_launch_pending = true;
+        let mut archived = worker("archived", 60);
+        archived.archived = true;
+        let mut exited = worker("exited", 60);
+        exited.state = "exited".into();
+        let selected = worker("selected", 60);
+        let sessions = vec![
+            working, blocked, pinned, launching, archived, exited, selected,
+        ];
+
+        assert!(ids(&sessions, Some("selected")).is_empty());
+    }
+
+    #[test]
+    fn terminals_and_runtimes_without_a_resume_recipe_are_never_hibernated() {
+        let mut terminal = worker("terminal", 24 * 60);
+        terminal.command = "bash".into();
+        terminal.active_runtime_id = None;
+        let mut unknown = worker("unknown-agent", 24 * 60);
+        unknown.command = "some-agent --yolo".into();
+
+        assert!(ids(&[terminal, unknown], None).is_empty());
+    }
+
+    #[test]
+    fn over_the_cap_the_oldest_idle_workers_are_hibernated_first() {
+        let sessions = (0..14)
+            .map(|index: u64| worker(&format!("worker-{index:02}"), 14 - index))
+            .collect::<Vec<_>>();
+
+        // Nobody is past the 15 min deadline; only the two oldest go.
+        assert_eq!(
+            ids(&sessions, None),
+            vec!["worker-00".to_owned(), "worker-01".to_owned()]
         );
     }
 }

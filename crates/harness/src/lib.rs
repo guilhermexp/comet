@@ -161,6 +161,14 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+/// MCP client deadline handed to native orchestrator runtimes (Claude via
+/// `MCP_TOOL_TIMEOUT`, Codex via `tool_timeout_sec`) when the Workers controller
+/// is mounted: the controller's `wait_for_status` ceiling plus transport slack.
+/// Pinned to `zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS + 60` by
+/// test rather than by dependency, so the harness keeps no production link to
+/// the workers crate.
+pub const WORKERS_CLIENT_DEADLINE_SECONDS: u64 = 4 * 60 * 60 + 60;
+
 pub mod acp;
 pub(crate) mod adapter_install;
 pub mod claude;
