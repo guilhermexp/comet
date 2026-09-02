@@ -18,7 +18,7 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - Handler é async e não bloqueia: enumerar path, ler arquivo e afins vão pra `spawn_blocking`.
 - No IPC local, `ProtocolError::HandshakeIncomplete` significa que o peer TCP saiu antes do upgrade e fica em debug; handshakes completos inválidos, `Origin` de browser e demais falhas continuam em warning.
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.
-- `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded). Cursors e watermarks de Trajectory utilizam a tupla completa `(source_seq, sub_seq)` para garantir desambiguação exata.
+- `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded — ausentes de `forwardable`/`is_stream_method`, e `targetDeviceId` não-nulo é rejeitado em vez de cair no handler local). `TrajectoryCursor` é `(source_seq, sub_seq, rev)`: a tupla de posição desambigua o terminal Interrupted legado que compartilha `source_seq` com o prefixo em `sub_seq = u32::MAX`, e `rev` é a revisão de commit do store — sem ela, resume por posição perde a substituição in-place de partial→final. `rev` é `#[serde(default)]` e `0` significa "sem conhecimento de revisão"; `Ord` continua position-first, com `rev` só como desempate.
 
 ## Work Guidance
 
