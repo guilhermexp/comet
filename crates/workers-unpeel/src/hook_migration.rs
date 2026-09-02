@@ -66,7 +66,6 @@ fn install_comet_managed_hooks() -> Result<(), String> {
         .map_err(|error| format!("Failed to create Comet hook root: {error}"))?;
     let runtimes = unpeel_core::runtime_catalog::builtin_runtime_catalog()
         .current_platform_descriptors()
-        .into_iter()
         .filter_map(|runtime| {
             let alias = runtime.detection.command_aliases.first()?;
             unpeel_core::integrations::has_runtime_support_installer(alias)

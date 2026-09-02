@@ -892,7 +892,7 @@ impl Theme {
             appearance: Appearance::Dark,
             variant_id: "zeron-dark".into(),
             family_id: "zeron".into(),
-            accent_selection: AccentSelection::Preset(accent_color.into()),
+            accent_selection: AccentSelection::Preset(accent_color),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
@@ -968,7 +968,7 @@ impl Theme {
             appearance: Appearance::Light,
             variant_id: "zeron-light".into(),
             family_id: "zeron".into(),
-            accent_selection: AccentSelection::Preset(accent_color.into()),
+            accent_selection: AccentSelection::Preset(accent_color),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
@@ -1087,7 +1087,7 @@ impl Theme {
         let appearance = variant.appearance;
         let accent_color = match accent_selection {
             AccentSelection::ThemeDefault => AccentColor::Zeron,
-            AccentSelection::Preset(preset) => preset.into(),
+            AccentSelection::Preset(preset) => preset,
         };
         let mut theme = Self::for_preferences(appearance, accent_color);
         let colors = &variant.colors;
