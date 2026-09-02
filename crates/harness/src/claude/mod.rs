@@ -292,7 +292,13 @@ impl ClaudeHarness {
         if let Some(config) = claude_workers_mcp_config(request) {
             cmd.args(["--mcp-config", &config]);
             // The Workers wait is orchestrator-sized (up to hours); Claude's MCP
-            // client must not expire it first.
+            // client must not expire it first. Scope tradeoff: `MCP_TOOL_TIMEOUT`
+            // is process-wide in Claude Code, so it raises the deadline of EVERY
+            // MCP server mounted in this session (the user's own included) —
+            // Codex's `tool_timeout_sec` is per server. A third-party MCP tool
+            // that hangs therefore holds the turn for this deadline instead of
+            // the client default. The Claude CLI exposes no per-server knob
+            // today, and expiring the Workers wait is the worse failure.
             cmd.env(
                 "MCP_TOOL_TIMEOUT",
                 (crate::WORKERS_CLIENT_DEADLINE_SECONDS * 1000).to_string(),
