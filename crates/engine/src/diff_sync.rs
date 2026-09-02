@@ -40,7 +40,6 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +47,9 @@ use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
+use crate::process::{
+    LONG_GIT_TIMEOUT, ProcessRequest, ProcessRunError, ProcessRunner, system_runner,
+};
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
 
@@ -763,57 +765,58 @@ struct Capture {
     truncated: bool,
 }
 
-/// Run git capturing stdout under a hard byte ceiling — the child is killed once
-/// the cap is hit, so an arbitrarily large repository diff never buffers fully.
+/// Run git capturing stdout under a hard byte ceiling — [`ProcessRunner`]
+/// kills the child once the cap is hit, so an arbitrarily large repository
+/// diff never buffers fully. A non-zero exit is only an error when the output
+/// was NOT truncated: the kill itself is what made the child fail.
 ///
-/// Reads through `take(cap + 1)` straight into `out` instead of a stack chunk:
-/// any buffer alive across the `.await` lands *inside this future*, and a debug
-/// build then reserves that much stack in every frame the future is built in —
-/// including the ~100-arm `EngineRpc::handle` match, whose unoptimized frame
-/// gives each arm its own slot. A 64KiB chunk here cost 128KiB of `capture_diff`
-/// frame plus hundreds of KiB across the handler and overflowed the 2MiB tokio
-/// worker stack (crash: `tokio-rt-worker has overflowed its stack`).
-async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
-    // One byte past the cap distinguishes "exactly full" from "more to come".
-    let mut out: Vec<u8> = Vec::new();
-    (&mut stdout)
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut out)
+/// Nothing bulk lives in this future: the runner is `dyn`, so its reads (and
+/// their buffers) sit behind a boxed future instead of inside every frame that
+/// builds this one — including the ~100-arm `EngineRpc::handle` match, whose
+/// unoptimized frame gives each arm its own slot. A 64KiB chunk here once cost
+/// 128KiB of `capture_diff` frame plus hundreds of KiB across the handler and
+/// overflowed the 2MiB tokio worker stack (crash: `tokio-rt-worker has
+/// overflowed its stack`).
+async fn capture_git(
+    runner: &dyn ProcessRunner,
+    cwd: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<Capture, EngineError> {
+    let mut full_args = vec!["-C".to_string(), cwd.to_string_lossy().into_owned()];
+    full_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    let output = runner
+        .run(ProcessRequest {
+            program: "git".into(),
+            args: full_args,
+            cwd: Some(cwd.to_path_buf()),
+            env: Vec::new(),
+            timeout: LONG_GIT_TIMEOUT,
+            output_limit: max_bytes,
+        })
         .await
-        .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
-    let truncated = out.len() > max_bytes;
-    if truncated {
-        out.truncate(max_bytes);
-        let _ = child.start_kill();
-    }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
-    if !output.status.success() && !truncated {
+        .map_err(|error| {
+            EngineError::Other(match error {
+                ProcessRunError::Spawn(kind) => format!("git spawn failed: {kind}"),
+                ProcessRunError::Timeout => format!(
+                    "git capture timed out after {}s",
+                    LONG_GIT_TIMEOUT.as_secs()
+                ),
+                ProcessRunError::Io => "git read failed".to_string(),
+            })
+        })?;
+    if !output.success && !output.stdout_truncated {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr.trim();
         return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
+            "git exited non-zero".to_string()
         } else {
             format!("git: {message}")
         }));
     }
     Ok(Capture {
-        stdout: out,
-        truncated,
+        stdout: output.stdout,
+        truncated: output.stdout_truncated,
     })
 }
 
@@ -992,7 +995,13 @@ async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, Engin
 
 async fn read_git_source(root: &Path, revision: &str, path: &Path) -> Result<Capture, EngineError> {
     let spec = format!("{revision}:{}", path.to_string_lossy());
-    capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await
+    capture_git(
+        system_runner(),
+        root,
+        &["cat-file", "blob", &spec],
+        MAX_DIFF_SOURCE_BYTES,
+    )
+    .await
 }
 
 /// Read the exact old/new documents for one file in a previously captured diff.
@@ -1065,10 +1074,15 @@ pub(crate) async fn read_diff_file_text_at(
 /// against Git's canonical empty tree.
 pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
     let parent_spec = format!("{sha}^");
-    let parent = capture_git(root, &["rev-parse", "--verify", &parent_spec], 256)
-        .await
-        .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
-        .unwrap_or_default();
+    let parent = capture_git(
+        system_runner(),
+        root,
+        &["rev-parse", "--verify", &parent_spec],
+        256,
+    )
+    .await
+    .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
+    .unwrap_or_default();
     if parent.is_empty() {
         EMPTY_TREE_SHA.to_string()
     } else {
@@ -1077,10 +1091,15 @@ pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
 }
 
 pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
-        .await
-        .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
-        .unwrap_or_default();
+    let head = capture_git(
+        system_runner(),
+        root,
+        &["rev-parse", "--verify", "HEAD"],
+        256,
+    )
+    .await
+    .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
+    .unwrap_or_default();
     Ok(if head.is_empty() {
         EMPTY_TREE_SHA.into()
     } else {
@@ -1106,10 +1125,15 @@ pub async fn capture_diff_against(
     root: &Path,
     base_override: Option<&str>,
 ) -> Result<DiffSnapshot, EngineError> {
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
-        .await
-        .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
-        .unwrap_or_default();
+    let head = capture_git(
+        repos.runner(),
+        root,
+        &["rev-parse", "--verify", "HEAD"],
+        256,
+    )
+    .await
+    .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
+    .unwrap_or_default();
     let base: &str = match base_override {
         Some(base) => base,
         None if head.is_empty() => EMPTY_TREE_SHA,
@@ -1121,18 +1145,21 @@ pub async fn capture_diff_against(
         .unwrap_or_else(|_| "HEAD".into());
 
     let names = capture_git(
+        repos.runner(),
         root,
         &["diff", "--name-status", "-z", "--find-renames", base, "--"],
         2 * 1024 * 1024,
     )
     .await?;
     let nums = capture_git(
+        repos.runner(),
         root,
         &["diff", "--numstat", "-z", "--find-renames", base, "--"],
         2 * 1024 * 1024,
     )
     .await?;
     let tracked = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1149,6 +1176,7 @@ pub async fn capture_diff_against(
     // Untracked listing via porcelain status; `--no-optional-locks` keeps this
     // read-only (a status-triggered index refresh would re-kick our own watcher).
     let status = capture_git(
+        repos.runner(),
         root,
         &["--no-optional-locks", "status", "--porcelain", "-z"],
         2 * 1024 * 1024,
@@ -1274,6 +1302,7 @@ pub async fn capture_commit_diff(
         .await
         .unwrap_or_else(|_| "HEAD".into());
     let names = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1288,6 +1317,7 @@ pub async fn capture_commit_diff(
     )
     .await?;
     let nums = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1302,6 +1332,7 @@ pub async fn capture_commit_diff(
     )
     .await?;
     let tracked = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1354,7 +1385,13 @@ pub async fn capture_commit_diff(
 /// `git merge-base <base_ref> HEAD` — the diff base for "Branch changes".
 /// Errors when the ref is unknown or the histories are unrelated.
 pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineError> {
-    let capture = capture_git(root, &["merge-base", base_ref, "HEAD"], 256).await?;
+    let capture = capture_git(
+        system_runner(),
+        root,
+        &["merge-base", base_ref, "HEAD"],
+        256,
+    )
+    .await?;
     let sha = String::from_utf8_lossy(&capture.stdout).trim().to_string();
     if sha.is_empty() {
         return Err(EngineError::Other(format!("no merge base with {base_ref}")));
@@ -1416,16 +1453,22 @@ pub async fn capture_turn_diff(
     turn_tree: &str,
 ) -> Result<DiffSnapshot, EngineError> {
     let current = snapshot_tree(root).await?;
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
-        .await
-        .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
-        .unwrap_or_default();
+    let head = capture_git(
+        repos.runner(),
+        root,
+        &["rev-parse", "--verify", "HEAD"],
+        256,
+    )
+    .await
+    .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
+    .unwrap_or_default();
     let branch = repos
         .current_branch(root)
         .await
         .unwrap_or_else(|_| "HEAD".into());
 
     let names = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1440,6 +1483,7 @@ pub async fn capture_turn_diff(
     )
     .await?;
     let nums = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1454,6 +1498,7 @@ pub async fn capture_turn_diff(
     )
     .await?;
     let tracked = capture_git(
+        repos.runner(),
         root,
         &[
             "diff",
@@ -1763,7 +1808,12 @@ mod future_size_tests {
         for (name, size) in [
             (
                 "capture_git",
-                std::mem::size_of_val(&super::capture_git(&root, &["status"], 1024)),
+                std::mem::size_of_val(&super::capture_git(
+                    crate::process::system_runner(),
+                    &root,
+                    &["status"],
+                    1024,
+                )),
             ),
             (
                 "capture_diff_against",
