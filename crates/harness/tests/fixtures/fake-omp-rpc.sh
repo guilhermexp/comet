@@ -248,8 +248,13 @@ while IFS= read -r line; do
       respond "$line" "{\"delegationId\":\"$delegation_id\"}"
       ;;
     live_append_session_context)
-      has "$line" '"text":"Session status: Working"' || fail_stage live_session_context 53
-      respond "$line" '{"accepted":true}'
+      if [ "$scenario" = "live-basic-only" ]; then
+        has "$line" '"text":"Session status: Working"' || fail_stage live_session_context 53
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"live_append_session_context\",\"success\":false,\"error\":\"OMP does not support session context\"}"
+      else
+        has "$line" '"text":"Session status: Working"' || fail_stage live_session_context 53
+        respond "$line" '{"accepted":true}'
+      fi
       ;;
     live_stop)
       respond "$line" '{"active":false}'

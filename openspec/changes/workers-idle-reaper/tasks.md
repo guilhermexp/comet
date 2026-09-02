@@ -29,6 +29,22 @@
 - [x] 3.2 Implementar `restart_worker` e o guard em `send_text`/`send_keys`
   em `controller_mcp.rs`; atualizar o `help` das tools.
 
+## 3b. Portões de evidência (review pré-merge)
+
+- [x] 3b.1 Expor `hook_confirmed_idle` na máquina de estados vendorizada
+  (`third_party/unpeel/crates/unpeel-tui/src/activity.rs`): `Stop`
+  confirma, o sweep de `HOOK_IDLE_TIMEOUT` não; teste com sweep e com Stop.
+- [x] 3b.2 Adicionar `idle_confirmed_by_hook` e `resumable_conversation` ao
+  `WorkersSession`, preenchidos pelo `activity_bridge` (o segundo por
+  `unpeel_core::resume::resumed` sobre o marker de provider e o comando);
+  testes de sonda com marker, com `--session-dir` e com terminal.
+- [x] 3b.3 Exigir as duas evidências em `hibernation_candidates`; regressões
+  para idle varrido e para conversa não retomável.
+- [x] 3b.4 Adicionar `confirmed_hibernation_candidates` (segunda passada por
+  interseção) e passar o `hibernate_idle_workers` da UI a rebuscar o
+  bootstrap dentro da task antes de arquivar; regressões de Worker que
+  voltou a trabalhar e de não-ampliação da primeira decisão.
+
 ## 4. Closeout
 
 - [x] 4.1 DOX pass: `crates/ui/AGENTS.md` (workers: política de hibernação e

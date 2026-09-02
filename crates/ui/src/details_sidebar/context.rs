@@ -208,6 +208,8 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),

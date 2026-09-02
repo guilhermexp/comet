@@ -69,6 +69,67 @@ Test: unit — política de hibernação com capability `restart` ausente.
   restart
 - **THEN** ele não é hibernado, para não descartar uma conversa irrecuperável
 
+### Requirement: Hibernação exige evidência positiva, nunca ausência de sinal
+
+O sistema MUST hibernar um Worker somente quando duas evidências positivas
+existirem para ele: o fim do turno CONFIRMADO pelo hook do próprio runtime, e
+a certeza de que relançar retomaria a conversa. Ociosidade inferida de tela
+parada e a mera existência de receita de resume no runtime NÃO satisfazem
+nenhuma das duas.
+
+#### Scenario: Ociosidade inferida de tela parada
+Test: unit — política de hibernação com idle não confirmado por hook.
+
+- **WHEN** um Worker `omp` está há mais tempo que o prazo com a tela parada,
+  sem que o runtime tenha reportado fim de turno
+- **THEN** ele não é hibernado, porque tela parada é também o que um
+  subprocesso longo e silencioso ou uma chamada de provider travada produzem
+- **AND** o relógio de ociosidade desse caso aponta para o INÍCIO do turno,
+  então o prazo já nasce estourado
+
+#### Scenario: Fim de turno confirmado pelo runtime
+Test: unit — máquina de estados de atividade com `Stop` e com sweep.
+
+- **WHEN** o runtime reporta fim de turno por hook
+- **THEN** a ociosidade passa a contar como confirmada
+- **AND** um novo início de turno revoga essa confirmação
+
+#### Scenario: Conversa sem nada para retomar
+Test: unit — política de hibernação com conversa não retomável.
+
+- **WHEN** um Worker da família pi ocioso além do prazo não tem id de conversa
+  de provider capturado nem diretório de sessão pinado
+- **THEN** ele não é hibernado, porque o relançamento seria um agente limpo e
+  a conversa desapareceria do ponto de vista do Comet
+
+#### Scenario: Evidência de retomada vem da receita do runtime
+Test: unit — sonda de conversa retomável no `activity_bridge`.
+
+- **WHEN** existe id de conversa de provider capturado, ou o comando fixa
+  diretório de sessão gerenciado
+- **THEN** a conversa é considerada retomável
+- **AND** uma sessão de terminal nunca é
+
+### Requirement: A decisão de hibernar é reconfirmada antes de executar
+
+O sistema MUST reavaliar a política sobre um snapshot fresco antes de parar
+cada Worker, e MUST parar somente os Workers presentes nas duas avaliações.
+
+#### Scenario: Worker recebe trabalho entre a decisão e a execução
+Test: unit — segunda passada da política sobre snapshot fresco.
+
+- **WHEN** um Worker era candidato no snapshot do painel e, no snapshot
+  fresco, voltou a trabalhar
+- **THEN** ele não é parado
+- **AND** os demais candidatos seguem sendo parados
+
+#### Scenario: A segunda passada não amplia a primeira
+Test: unit — segunda passada da política sobre snapshot fresco.
+
+- **WHEN** o snapshot fresco contém um Worker elegível que não estava na
+  primeira decisão
+- **THEN** ele não é parado neste ciclo
+
 ### Requirement: Teto de Workers ociosos vivos
 
 Com hibernação ligada, quando o número de Workers `running` em `idle` e

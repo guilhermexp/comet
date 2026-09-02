@@ -111,6 +111,7 @@ impl ActivityBridge {
             }
             let session_dir = unpeel_core::session_host::session_dir(&session.id);
             session.idle_since_unix_ms = idle_since_unix_ms(&session.id, &manifest);
+            session.resumable_conversation = resumable_conversation(&session.id, &manifest);
             session.updated_at_unix_ms = latest_activity_timestamp(
                 session.updated_at_unix_ms,
                 file_modified_unix_ms(&session_dir.join("output.bin")),
@@ -136,6 +137,11 @@ impl ActivityBridge {
                 },
                 now,
             );
+            // Read AFTER `derive_activity`, which is what runs the sweep for
+            // this tick: a Stop-confirmed idle and a swept idle are the same
+            // `HookState::Idle`, and only the former may be acted on
+            // destructively (see `WorkersSession::idle_confirmed_by_hook`).
+            session.idle_confirmed_by_hook = engine.hook_confirmed_idle(&session.id);
             if let Some(derived) = derived {
                 session.activity =
                     merge_derived_activity(&session.activity, session.unread, derived).to_owned();
@@ -204,6 +210,25 @@ fn idle_since_unix_ms(
             session_id,
             &manifest.session.command,
         ))
+}
+
+/// Whether relaunching this Worker would really resume its conversation.
+///
+/// Asked of the runtime's own recipe rather than guessed from the command:
+/// `resumed` returns the command untouched when it has nothing to resume
+/// from, which is how a pi-family session with no captured provider id and no
+/// pinned session dir looks. `can_resume` cannot answer this — it only proves
+/// a recipe exists for the runtime.
+fn resumable_conversation(
+    session_id: &str,
+    manifest: &unpeel_core::session_host::HostedSessionManifest,
+) -> bool {
+    let command = manifest.session.command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    let (provider_session_id, _) = unpeel_core::session_ops::provider_session_marker(session_id);
+    unpeel_core::resume::resumed(command, provider_session_id.as_deref()).trim() != command
 }
 
 impl Drop for ActivityBridge {
@@ -782,6 +807,81 @@ mod tests {
         assert!(
             after_hook > 1_000,
             "a real lifecycle event must advance the idle clock, got {after_hook}"
+        );
+    }
+
+    #[test]
+    fn a_pi_family_worker_is_only_resumable_once_there_is_something_to_resume_from() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary Unpeel home");
+        let _home = UnpeelHomeGuard::set(home.path(), home.path());
+        std::fs::create_dir_all(home.path().join("app-sessions/worker-1"))
+            .expect("worker session directory");
+        let manifest = omp_manifest("worker-1");
+
+        assert!(
+            !resumable_conversation("worker-1", &manifest),
+            "a bare `omp` command with no captured conversation relaunches clean"
+        );
+
+        unpeel_core::session_ops::set_provider_session("worker-1", Some("omp-provider-1"), None)
+            .expect("capture the provider conversation");
+
+        assert!(resumable_conversation("worker-1", &manifest));
+    }
+
+    #[test]
+    fn a_pinned_session_dir_alone_makes_the_conversation_resumable() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary Unpeel home");
+        let _home = UnpeelHomeGuard::set(home.path(), home.path());
+        std::fs::create_dir_all(home.path().join("app-sessions/worker-1"))
+            .expect("worker session directory");
+        let mut manifest = omp_manifest("worker-1");
+        manifest.session.command = "omp --session-dir '/tmp/pi-sessions/worker-1'".into();
+
+        assert!(resumable_conversation("worker-1", &manifest));
+    }
+
+    #[test]
+    fn a_terminal_conversation_is_never_resumable() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary Unpeel home");
+        let _home = UnpeelHomeGuard::set(home.path(), home.path());
+        let mut manifest = omp_manifest("worker-1");
+        manifest.session.command = "bash".into();
+
+        assert!(!resumable_conversation("worker-1", &manifest));
+    }
+
+    #[test]
+    fn only_a_stop_hook_confirms_idleness_the_sweep_does_not() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("worker-1", "Start", None, t0);
+        engine.note_output_and_sweep("worker-1", 1, true, false, t0);
+
+        // Screen frozen past the sweep timeout: the state machine reports idle
+        // even though the turn never ended.
+        let swept_at = t0 + upstream_activity::HOOK_IDLE_TIMEOUT + Duration::from_secs(1);
+        engine.note_output_and_sweep("worker-1", 1, true, false, swept_at);
+        assert_eq!(
+            engine.hook_owned_state("worker-1"),
+            Some(HookState::Idle),
+            "the sweep is what this finding is about"
+        );
+        assert!(
+            !engine.hook_confirmed_idle("worker-1"),
+            "a frozen screen is not an end of turn"
+        );
+
+        engine.apply_hook_event("worker-1", "Stop", None, swept_at);
+        assert!(engine.hook_confirmed_idle("worker-1"));
+
+        engine.apply_hook_event("worker-1", "UserPromptSubmit", None, swept_at);
+        assert!(
+            !engine.hook_confirmed_idle("worker-1"),
+            "a new turn revokes the confirmation"
         );
     }
 

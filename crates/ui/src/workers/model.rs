@@ -13,7 +13,8 @@ use zeron_workers_unpeel::{
     WorkersResourceSettings, WorkersSession, WorkersSessionCommand, WorkersSessionSort,
     WorkersSettingsSnapshot, WorkersTranscriptSettings, WorkersWorktreeResult,
     ack_worker_parent_notification, build_worker_parent_notification_prompt,
-    hibernation_candidates, pending_worker_parent_notifications, worker_parent_links,
+    confirmed_hibernation_candidates, hibernation_candidates, pending_worker_parent_notifications,
+    worker_parent_links,
 };
 
 use crate::state::AppState;
@@ -828,27 +829,52 @@ impl WorkersModel {
     /// their welcome. Fire-and-forget on purpose: the next refresh sees the
     /// result on disk and retries whatever failed, so there is no local
     /// "already tried" state to drift from the host.
+    ///
+    /// The decision is taken twice: once on the snapshot the panel holds and
+    /// again on a fresh bootstrap inside the task, because `Archive` stops a
+    /// live session without looking at activity and the gap between the two
+    /// is wide enough for a `send_text` to land (see
+    /// `confirmed_hibernation_candidates`).
     fn hibernate_idle_workers(&mut self, cx: &mut Context<Self>) {
         let (Some(snapshot), Some(settings)) = (self.snapshot.as_ref(), self.settings.as_ref())
         else {
             return;
         };
-        let candidates = hibernation_candidates(
+        let candidate_ids = hibernation_candidates(
             &snapshot.sessions,
             &settings.resources,
             self.selected_session_id.as_deref(),
             Self::unix_time_ms(),
         )
         .into_iter()
-        .cloned()
+        .map(|session| session.id.clone())
         .collect::<Vec<_>>();
-        if candidates.is_empty() {
+        if candidate_ids.is_empty() {
             return;
         }
         let client = self.client.clone();
+        let resources = settings.resources.clone();
+        let selected = self.selected_session_id.clone();
         cx.background_executor()
             .spawn(async move {
-                for session in candidates {
+                let fresh = match client.bootstrap() {
+                    Ok(bootstrap) => bootstrap.sessions,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not re-check idle workers before hibernating");
+                        return;
+                    }
+                };
+                let confirmed = confirmed_hibernation_candidates(
+                    &candidate_ids,
+                    &fresh,
+                    &resources,
+                    selected.as_deref(),
+                    Self::unix_time_ms(),
+                )
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+                for session in confirmed {
                     let idle_minutes = session
                         .idle_since_unix_ms
                         .map(|idle_since| Self::unix_time_ms().saturating_sub(idle_since) / 60_000);
@@ -2068,6 +2094,8 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),

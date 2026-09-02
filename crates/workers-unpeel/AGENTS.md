@@ -138,6 +138,32 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   exclui sessões de terminal, cujo shell não tem receita de resume, e é o que
   impede jogar fora uma conversa irrecuperável. Hibernar `omp`/`prime-agent` só
   ficou seguro depois da receita de resume da família pi, acima.
+- **Hibernar exige evidência positiva; ausência de sinal protege.** `idle` no
+  wire não basta e `can_resume` não basta. `hibernation_candidates` exige
+  também `idle_confirmed_by_hook` e `resumable_conversation`, os dois
+  preenchidos pelo `activity_bridge`:
+  - `idle_confirmed_by_hook` vem de `ActivityEngine::hook_confirmed_idle`
+    (`stopped_at` presente), e é lido DEPOIS de `derive_activity`, que é quem
+    roda o sweep do tick. Sem isso o `HookState::Idle` do sweep
+    (`HOOK_IDLE_TIMEOUT`, 5 min sem mudança de tela) entrava na política com
+    relógio datado do `agent_start` — prazo estourado por construção — e o
+    `Archive` matava turno em andamento de `omp` dentro de subprocesso longo
+    e silencioso. Sweep e Stop são o MESMO estado em `hook_owned_state`: só
+    `hook_confirmed_idle` os separa.
+  - `resumable_conversation` pergunta à receita do runtime
+    (`resume::resumed` != comando) em vez de adivinhar do comando: para a
+    família pi a receita devolve o comando intacto sem id de provider
+    capturado e sem `--session-dir`, que é exatamente a forma das sessões
+    legadas há muito ociosas que a feature existe para reclamar — hiberná-las
+    reiniciaria limpo e sumiria com a conversa.
+  Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
+  quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
+- **A decisão de hibernar é tomada duas vezes.** `confirmed_hibernation_candidates`
+  reavalia a política sobre um bootstrap fresco e arquiva só a interseção. O
+  `Archive` para uma sessão viva sem olhar atividade, e entre decidir e
+  executar cabe um `send_text`: o snapshot do painel pode ter sido decodificado
+  antes do host estampar `screen_changed_at` e antes do hook `agent_start`
+  chegar. A segunda passada nunca amplia a primeira.
 - **`send_text` num Worker morto é entrada perdida, não erro do host.**
   `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
   esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
@@ -300,7 +326,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 6 de hibernação), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (14 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (19 + 10 de hibernação, incluindo portões de evidência e segunda passada), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (18 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

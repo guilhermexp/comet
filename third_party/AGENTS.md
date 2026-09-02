@@ -51,6 +51,14 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   sejam dependências binárias intencionais já documentadas.
 - Mudanças em `third_party/unpeel` precisam provar o consumidor real com
   `cargo test -p zeron-workers-unpeel`.
+- **A máquina de estados de atividade é lida por dois consumidores, e o sweep
+  não é fim de turno.** `unpeel-tui/src/activity.rs` é incluída por `#[path]`
+  no `activity_bridge` do Comet, então acessor novo se acrescenta AQUI, nunca
+  numa cópia local. `hook_owned_state` devolve `Idle` tanto para um
+  `Stop`/`StopFailure` real quanto para o sweep de `HOOK_IDLE_TIMEOUT` (5 min
+  sem mudança de tela); `hook_confirmed_idle` (patch local) separa os dois por
+  `stopped_at`, porque consumidor que age de forma destrutiva sobre ociosidade
+  — a hibernação de Workers — mataria turno em andamento com o primeiro.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são

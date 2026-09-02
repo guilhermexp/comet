@@ -237,6 +237,21 @@ impl ActivityEngine {
         entry.state
     }
 
+    /// Whether the current hook-owned `Idle` was CONFIRMED by the runtime's
+    /// own `Stop`/`StopFailure`, as opposed to inferred by the
+    /// [`HOOK_IDLE_TIMEOUT`] sweep in [`Self::note_output_and_sweep`].
+    ///
+    /// The two are indistinguishable in [`Self::hook_owned_state`] and mean
+    /// opposite things to a consumer that acts destructively on idleness: a
+    /// swept `Idle` only says "the screen has not changed for five minutes",
+    /// which is also what a long silent subprocess or a stalled provider call
+    /// looks like mid-turn. Only `stopped_at` proves the turn ended.
+    pub fn hook_confirmed_idle(&self, session_id: &str) -> bool {
+        self.entries.get(session_id).is_some_and(|entry| {
+            entry.hook_seen && entry.state == Some(HookState::Idle) && entry.stopped_at.is_some()
+        })
+    }
+
     pub fn runtime_launch_generation(&self, session_id: &str) -> Option<u64> {
         self.entries
             .get(session_id)
