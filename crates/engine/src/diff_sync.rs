@@ -1506,6 +1506,158 @@ pub async fn capture_turn_diff(
     })
 }
 
+// ---------------------------------------------------------------------------
+// One-shot capture scopes (the Changes pane's mode selector)
+// ---------------------------------------------------------------------------
+
+/// Which scope a one-shot capture is asked for. The wire carries a `mode`
+/// string plus three optional fields side by side; exactly one of them belongs
+/// to each mode, and an unknown `mode` (including the empty default) is the
+/// plain working tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DiffMode {
+    WorkingTree,
+    Branch { base_ref: String },
+    Commit { sha: String },
+    Turn { chat_id: String },
+}
+
+impl DiffMode {
+    /// The wire triple → mode, with the same error strings the handlers emit.
+    pub(crate) fn parse(
+        mode: &str,
+        base_ref: Option<&str>,
+        commit_sha: Option<&str>,
+        chat_id: Option<&str>,
+    ) -> Result<Self, String> {
+        match mode {
+            "branch" => Ok(Self::Branch {
+                base_ref: base_ref
+                    .ok_or_else(|| "baseRef required".to_string())?
+                    .to_string(),
+            }),
+            "commit" => Ok(Self::Commit {
+                sha: commit_sha
+                    .ok_or_else(|| "commitSha required".to_string())?
+                    .to_string(),
+            }),
+            "turn" => Ok(Self::Turn {
+                chat_id: chat_id
+                    .ok_or_else(|| "chatId required".to_string())?
+                    .to_string(),
+            }),
+            _ => Ok(Self::WorkingTree),
+        }
+    }
+}
+
+/// The turn-start tree recorded for `chat_id`, rejected when it belongs to a
+/// different checkout than the one being captured.
+fn turn_tree(
+    diff_sync: &CheckoutDiffSync,
+    root: &Path,
+    chat_id: &str,
+) -> Result<String, EngineError> {
+    diff_sync
+        .turn_snapshot(chat_id)
+        .filter(|snapshot| snapshot.root == root)
+        .map(|snapshot| snapshot.tree)
+        .ok_or_else(|| EngineError::Other("no turn recorded".into()))
+}
+
+/// Capture one scope. `branch` diffs the working tree against
+/// merge-base(baseRef, HEAD); `commit` diffs one commit against its parent;
+/// `turn` diffs the turn-start tree snapshot against the current tree;
+/// working tree is the plain capture.
+pub(crate) async fn capture_for_mode(
+    repos: &Repos,
+    diff_sync: &CheckoutDiffSync,
+    root: &Path,
+    mode: &DiffMode,
+) -> Result<DiffSnapshot, EngineError> {
+    match mode {
+        DiffMode::Branch { base_ref } => {
+            let base = merge_base(root, base_ref).await?;
+            capture_diff_against(repos, root, Some(&base)).await
+        }
+        DiffMode::Commit { sha } => capture_commit_diff(repos, root, sha).await,
+        DiffMode::Turn { chat_id } => {
+            let tree = turn_tree(diff_sync, root, chat_id)?;
+            capture_turn_diff(repos, root, &tree).await
+        }
+        DiffMode::WorkingTree => capture_diff(repos, root).await,
+    }
+}
+
+/// [`capture_for_mode`] plus the revisions the snapshot was taken between:
+/// the old side, and the committed new side when the mode has one (only
+/// `commit` does — every other scope's new side is the live working tree).
+/// Reading one file's two documents needs those, and resolving the base here
+/// keeps it to a single git spawn per capture.
+pub(crate) async fn capture_with_base_for_mode(
+    repos: &Repos,
+    diff_sync: &CheckoutDiffSync,
+    root: &Path,
+    mode: &DiffMode,
+) -> Result<(DiffSnapshot, String, Option<String>), EngineError> {
+    let (base, target) = match mode {
+        DiffMode::Branch { base_ref } => (Box::pin(merge_base(root, base_ref)).await?, None),
+        DiffMode::Commit { sha } => (
+            Box::pin(commit_diff_base(root, sha)).await,
+            Some(sha.clone()),
+        ),
+        DiffMode::Turn { chat_id } => (turn_tree(diff_sync, root, chat_id)?, None),
+        DiffMode::WorkingTree => (Box::pin(working_diff_base(root)).await?, None),
+    };
+    let snapshot = Box::pin(recapture_for_mode(repos, root, mode, &base)).await?;
+    Ok((snapshot, base, target))
+}
+
+/// Re-run a mode's capture against an already-resolved base — the staleness
+/// recheck after reading a file's text. Never resolves the base again, so the
+/// second capture compares against exactly the same revision as the first.
+pub(crate) async fn recapture_for_mode(
+    repos: &Repos,
+    root: &Path,
+    mode: &DiffMode,
+    base: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    match mode {
+        DiffMode::Branch { .. } => Box::pin(capture_diff_against(repos, root, Some(base))).await,
+        DiffMode::Commit { sha } => Box::pin(capture_commit_diff(repos, root, sha)).await,
+        DiffMode::Turn { .. } => Box::pin(capture_turn_diff(repos, root, base)).await,
+        DiffMode::WorkingTree => Box::pin(capture_diff(repos, root)).await,
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::DiffMode;
+
+    #[test]
+    fn diff_mode_parse_requires_the_field_of_its_mode() {
+        assert_eq!(
+            DiffMode::parse("branch", None, None, None).unwrap_err(),
+            "baseRef required"
+        );
+        assert_eq!(
+            DiffMode::parse("commit", None, None, None).unwrap_err(),
+            "commitSha required"
+        );
+        assert_eq!(
+            DiffMode::parse("turn", None, None, None).unwrap_err(),
+            "chatId required"
+        );
+        assert!(matches!(
+            DiffMode::parse("", None, None, None),
+            Ok(DiffMode::WorkingTree)
+        ));
+        assert!(
+            matches!(DiffMode::parse("branch", Some("main"), None, None), Ok(DiffMode::Branch { base_ref }) if base_ref == "main")
+        );
+    }
+}
+
 #[cfg(test)]
 mod watch_budget_tests {
     use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
