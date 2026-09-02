@@ -30,7 +30,12 @@ fn fresh(command: &str) -> String {
     join(strip_resume_flags(tokenize(command), RESUME_FLAGS))
 }
 
-pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh);
+fn embedded_conversation_id(command: &str) -> Option<String> {
+    id_in_command(&tokenize(command), ID_FLAGS)
+}
+
+pub(super) const ADAPTER: ResumeAdapter =
+    ResumeAdapter::new(resumed, fresh).with_embedded_conversation_id(embedded_conversation_id);
 
 #[cfg(test)]
 mod tests {

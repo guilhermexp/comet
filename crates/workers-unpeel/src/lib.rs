@@ -797,12 +797,13 @@ pub struct WorkersSession {
     /// destructively kills work in flight.
     pub idle_confirmed_by_hook: bool,
     /// Whether relaunching this Worker would really resume ITS conversation:
-    /// the runtime recipe rewrites the command AND the rewrite is pinned to
-    /// this Worker by a captured provider conversation id or a managed
-    /// session dir fixed in the command. A recipe that only falls back to the
-    /// newest conversation of the directory (`codex resume --last`, `gemini
-    /// --resume latest`) is false, because it could resume another Worker's
-    /// conversation from the same cwd — worse than not hibernating.
+    /// direct evidence of this Worker's identity — a captured provider
+    /// conversation id in the marker, a managed session dir fixed in the
+    /// command, or an explicit conversation id already in the command. A
+    /// recipe that only falls back to the newest conversation of the
+    /// directory (`codex resume --last`, `gemini --resume latest`) is false,
+    /// because it could resume another Worker's conversation from the same
+    /// cwd — worse than not hibernating.
     pub resumable_conversation: bool,
     pub total_tokens: Option<u64>,
     pub model_usage: Vec<WorkersModelTokenUsage>,
@@ -2767,10 +2768,11 @@ fn apply_runtime_capabilities(sessions: &mut [WorkersSession]) {
 ///   sweep fires, and `Archive` would stop work in flight.
 /// - `resumable_conversation`: relaunching would really resume THIS Worker's
 ///   conversation. `can_resume` only proves the runtime HAS a recipe; the bit
-///   also needs a captured provider id or a managed session dir, so a
-///   pi-family legacy session with neither (the long-idle shape this policy
-///   is meant to reclaim) and a `codex`/`gemini` session whose recipe would
-///   resume "the newest of the directory" both stay protected.
+///   needs direct identity evidence (captured provider id, managed session
+///   dir, or explicit conversation id in the command), so a pi-family legacy
+///   session with none (the long-idle shape this policy is meant to reclaim)
+///   and a `codex`/`gemini` session whose recipe would resume "the newest of
+///   the directory" both stay protected.
 pub fn hibernation_candidates<'a>(
     sessions: &'a [WorkersSession],
     settings: &WorkersResourceSettings,

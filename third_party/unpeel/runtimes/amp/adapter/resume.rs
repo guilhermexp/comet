@@ -59,7 +59,12 @@ fn fresh(command: &str) -> String {
     join(strip_continue(tokenize(command)))
 }
 
-pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh);
+fn embedded_conversation_id(command: &str) -> Option<String> {
+    embedded_continue_id(&tokenize(command))
+}
+
+pub(super) const ADAPTER: ResumeAdapter =
+    ResumeAdapter::new(resumed, fresh).with_embedded_conversation_id(embedded_conversation_id);
 
 #[cfg(test)]
 mod tests {

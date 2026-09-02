@@ -62,7 +62,12 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   re-arme de `Busy` por crescimento de saída após um `Stop` desconfiado
   (`distrust_stops_while_output_grows`, codex) limpa `stopped_at` como
   `Start`/`UserPromptSubmit`: turno vivo de novo não tem fim confirmado, e
-  o sweep seguinte precisa voltar a ler como não confirmado.
+  o sweep seguinte precisa voltar a ler como não confirmado. A limpeza de
+  atenção pelo app (`clear_attention_unconfirmed`, patch local) leva a `Idle`
+  sem gravar `stopped_at`, porque um clique não é o runtime dizendo que o
+  turno acabou. `ResumeAdapter::embedded_conversation_id` (patch local, um
+  callback por runtime) expõe o id de conversa que o comando já fixa, para a
+  sonda de retomada do Comet não depender de comparar receitas.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são

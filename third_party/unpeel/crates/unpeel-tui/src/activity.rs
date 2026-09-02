@@ -237,6 +237,19 @@ impl ActivityEngine {
         entry.state
     }
 
+    /// A user-driven "clear attention" (the app's menu item): leaves
+    /// `Attention` for `Idle` WITHOUT recording a stop, because a click is
+    /// not the runtime saying the turn ended. Only a hook `Stop`/`StopFailure`
+    /// feeds [`Self::hook_confirmed_idle`].
+    pub fn clear_attention_unconfirmed(&mut self, session_id: &str, now: SystemTime) {
+        let entry = self.entries.entry(session_id.to_string()).or_default();
+        entry.hook_seen = true;
+        entry.last_hook_at = Some(now);
+        entry.state = Some(HookState::Idle);
+        entry.deadline_at = None;
+        entry.stopped_at = None;
+    }
+
     /// Whether the current hook-owned `Idle` was CONFIRMED by the runtime's
     /// own `Stop`/`StopFailure`, as opposed to inferred by the
     /// [`HOOK_IDLE_TIMEOUT`] sweep in [`Self::note_output_and_sweep`].

@@ -150,16 +150,23 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
     `Archive` matava turno em andamento de `omp` dentro de subprocesso longo
     e silencioso. Sweep e Stop são o MESMO estado em `hook_owned_state`: só
     `hook_confirmed_idle` os separa.
-  - `resumable_conversation` exige identidade DESTE Worker além da receita
-    reescrever o comando (`resume::resumed` != comando): id de conversa de
-    provider capturado no marker, ou diretório de sessão gerenciado
-    (`resume::managed_storage_path` sob `unpeel_home`) fixado no comando.
-    Receita que retoma "a mais recente do diretório" sem nenhuma das duas
-    (`codex resume --last`, `gemini --resume latest`) não qualifica: dois
-    Workers no mesmo cwd retomariam a conversa um do outro, o que é pior do
-    que não hibernar. Para a família pi a receita já devolve o comando
-    intacto sem essas evidências, que é a forma das sessões legadas há muito
-    ociosas — hiberná-las reiniciaria limpo e sumiria com a conversa.
+  - `resumable_conversation` é evidência de identidade DESTE Worker,
+    verificada diretamente e nunca por comparação de strings (as receitas são
+    idempotentes sobre o próprio output, então `resumed != comando` dava
+    falso para todo Worker já retomado uma vez): id de conversa de provider
+    capturado no marker, OU diretório de sessão gerenciado
+    (`resume::managed_storage_path` sob `unpeel_home`) fixado no comando, OU
+    id explícito de conversa já no comando
+    (`resume::embedded_conversation_id`, callback por adapter). Receita que
+    só sabe retomar "a mais recente do diretório" sem nenhuma das três
+    (`codex resume --last`, `gemini --resume latest`, `--continue` solto) não
+    qualifica: dois Workers no mesmo cwd retomariam a conversa um do outro,
+    o que é pior do que não hibernar. Para a família pi essa é a forma das
+    sessões legadas há muito ociosas — hiberná-las reiniciaria limpo e
+    sumiria com a conversa.
+  - `ClearAttention` do menu não é fim de turno: o bridge chama
+    `ActivityEngine::clear_attention_unconfirmed`, que leva a `Idle` sem
+    gravar `stopped_at`. Só `Stop`/`StopFailure` de hook real confirmam.
   Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
   quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
 - **A decisão de hibernar é tomada duas vezes.** `confirmed_hibernation_candidates`

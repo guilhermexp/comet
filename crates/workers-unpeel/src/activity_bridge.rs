@@ -151,7 +151,7 @@ impl ActivityBridge {
 
     pub(crate) fn clear_attention(&self, session_id: &str) {
         let mut engine = self.engine.lock().unwrap_or_else(|lock| lock.into_inner());
-        engine.apply_hook_event(session_id, "Stop", None, SystemTime::now());
+        engine.clear_attention_unconfirmed(session_id, SystemTime::now());
         self.change_epoch.fetch_add(1, Ordering::Release);
     }
 }
@@ -212,33 +212,32 @@ fn idle_since_unix_ms(
         ))
 }
 
-/// Whether relaunching this Worker would really resume ITS conversation.
-///
-/// Two things must hold. The runtime's recipe must rewrite the command
-/// (`can_resume` only proves a recipe exists), and the rewrite must be pinned
-/// to this Worker by evidence on disk: a provider conversation id captured in
-/// the marker, or a managed session dir fixed in the command. A recipe that
-/// falls back to "the newest conversation of the directory" (`codex resume
-/// --last`, `gemini --resume latest`) with neither does not qualify — two
-/// Workers in the same cwd would resume each other's conversation, which is
-/// worse than not hibernating.
+/// Whether relaunching this Worker would really resume ITS conversation:
+/// a fact about this Worker's identity, checked directly, never inferred from
+/// how the recipe rewrites a string. One of three pieces of evidence must
+/// exist: a provider conversation id captured in the marker, a managed
+/// session dir fixed in the command (pi family), or an explicit conversation
+/// id already in the command (`codex resume <id>`, `--resume <id>`). A recipe
+/// that only knows "the newest conversation of the directory" (`codex resume
+/// --last`, `gemini --resume latest`, bare `--continue`) with none of these
+/// does not qualify — two Workers in the same cwd would resume each other's
+/// conversation, which is worse than not hibernating.
 fn resumable_conversation(
     session_id: &str,
     manifest: &unpeel_core::session_host::HostedSessionManifest,
 ) -> bool {
     let command = manifest.session.command.trim();
-    if command.is_empty() {
+    if command.is_empty() || !unpeel_core::resume::can_resume(command) {
         return false;
     }
     let (provider_session_id, _) = unpeel_core::session_ops::provider_session_marker(session_id);
-    let pinned_to_this_worker = provider_session_id.is_some()
+    provider_session_id.is_some()
         || unpeel_core::resume::managed_storage_path(
             command,
             &unpeel_core::app_paths::unpeel_home(),
         )
-        .is_some();
-    pinned_to_this_worker
-        && unpeel_core::resume::resumed(command, provider_session_id.as_deref()).trim() != command
+        .is_some()
+        || unpeel_core::resume::embedded_conversation_id(command).is_some()
 }
 
 impl Drop for ActivityBridge {
@@ -861,6 +860,35 @@ mod tests {
     }
 
     #[test]
+    fn an_already_resumed_command_keeps_its_worker_evidence() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary Unpeel home");
+        let _home = UnpeelHomeGuard::set(home.path(), home.path());
+        std::fs::create_dir_all(home.path().join("app-sessions/worker-1"))
+            .expect("worker session directory");
+        let mut manifest = omp_manifest("worker-1");
+        let managed = home.path().join("pi-sessions/worker-1");
+        manifest.session.command = format!("omp --session-dir '{}' --continue", managed.display());
+        assert!(
+            resumable_conversation("worker-1", &manifest),
+            "the recipe is idempotent on its own output; the managed dir is still the evidence"
+        );
+
+        manifest.session.command = "codex resume 't1' --full-auto".into();
+        assert!(
+            resumable_conversation("worker-1", &manifest),
+            "an explicit resume target in the command is evidence of THIS Worker"
+        );
+
+        manifest.session.command = "codex resume --last --full-auto".into();
+        assert!(!resumable_conversation("worker-1", &manifest));
+        manifest.session.command = "gemini --resume latest".into();
+        assert!(!resumable_conversation("worker-1", &manifest));
+        manifest.session.command = "omp --continue".into();
+        assert!(!resumable_conversation("worker-1", &manifest));
+    }
+
+    #[test]
     fn a_newest_of_the_directory_recipe_needs_a_captured_id_to_be_resumable() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir().expect("temporary Unpeel home");
@@ -921,6 +949,33 @@ mod tests {
             !engine.hook_confirmed_idle("worker-1"),
             "a new turn revokes the confirmation"
         );
+    }
+
+    #[test]
+    fn clearing_attention_from_the_menu_is_not_a_confirmed_end_of_turn() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("grok-1", "UserPromptSubmit", None, t0);
+        engine.apply_hook_event(
+            "grok-1",
+            "PermissionRequest",
+            None,
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(
+            engine.hook_owned_state("grok-1"),
+            Some(HookState::Attention)
+        );
+
+        engine.clear_attention_unconfirmed("grok-1", t0 + Duration::from_secs(10));
+        assert_eq!(engine.hook_owned_state("grok-1"), Some(HookState::Idle));
+        assert!(
+            !engine.hook_confirmed_idle("grok-1"),
+            "a click in Comet is not the runtime saying the turn ended"
+        );
+
+        engine.apply_hook_event("grok-1", "Stop", None, t0 + Duration::from_secs(20));
+        assert!(engine.hook_confirmed_idle("grok-1"));
     }
 
     #[test]
