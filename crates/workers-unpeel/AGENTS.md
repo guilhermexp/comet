@@ -144,7 +144,14 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   preenchidos pelo `activity_bridge`:
   - `idle_confirmed_by_hook` vem de `ActivityEngine::hook_confirmed_idle`
     (`stopped_at` presente), e é lido DEPOIS de `derive_activity`, que é quem
-    roda o sweep do tick. Sem isso o `HookState::Idle` do sweep
+    roda o sweep do tick. A confirmação é perecível: só sobrevive enquanto
+    NADA acontece. Crescimento do sinal de atividade depois da graça de
+    re-arme (`STOP_REARM_GRACE`, 5 s) limpa `stopped_at` para qualquer
+    runtime, porque codex, cursor-agent, gemini, amp e opencode só postam
+    `Stop` e não têm evento de início de turno para revogar a confirmação
+    quando o orquestrador manda texto; o estado visível pode seguir `Idle`,
+    mas sem confirmação. Sinal parado mantém a confirmação através de
+    quantos sweeps forem, e um `Stop` posterior reconfirma. Sem isso o `HookState::Idle` do sweep
     (`HOOK_IDLE_TIMEOUT`, 5 min sem mudança de tela) entrava na política com
     relógio datado do `agent_start` — prazo estourado por construção — e o
     `Archive` matava turno em andamento de `omp` dentro de subprocesso longo

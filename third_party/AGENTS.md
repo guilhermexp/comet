@@ -62,7 +62,10 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   re-arme de `Busy` por crescimento de saída após um `Stop` desconfiado
   (`distrust_stops_while_output_grows`, codex) limpa `stopped_at` como
   `Start`/`UserPromptSubmit`: turno vivo de novo não tem fim confirmado, e
-  o sweep seguinte precisa voltar a ler como não confirmado. A limpeza de
+  o sweep seguinte precisa voltar a ler como não confirmado. Para qualquer
+  runtime, crescimento do sinal em `Idle` depois de `STOP_REARM_GRACE` limpa
+  `stopped_at` mesmo sem re-armar `Busy`, porque runtime que só posta `Stop`
+  não tem hook de início para revogar a confirmação no turno seguinte. A limpeza de
   atenção pelo app (`clear_attention_unconfirmed`, patch local) leva a `Idle`
   sem gravar `stopped_at`, porque um clique não é o runtime dizendo que o
   turno acabou. `ResumeAdapter::embedded_conversation_id` (patch local, um

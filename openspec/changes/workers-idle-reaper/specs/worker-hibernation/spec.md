@@ -97,6 +97,9 @@ Test: unit — máquina de estados de atividade com `Stop` e com sweep.
   crescente também perde a confirmação, mesmo que a tela pare depois
 - **AND** limpar a atenção pelo menu do app leva a `idle` sem confirmar fim
   de turno; só um `Stop` de hook posterior confirma
+- **AND** saída que volta a crescer depois de um `Stop`, sem nenhum hook de
+  início de turno, também revoga a confirmação até o próximo `Stop`; sinal
+  parado a mantém através de qualquer número de sweeps
 
 #### Scenario: Conversa sem nada para retomar
 Test: unit — política de hibernação com conversa não retomável.

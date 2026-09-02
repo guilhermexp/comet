@@ -258,7 +258,10 @@ impl ActivityEngine {
     /// opposite things to a consumer that acts destructively on idleness: a
     /// swept `Idle` only says "the screen has not changed for five minutes",
     /// which is also what a long silent subprocess or a stalled provider call
-    /// looks like mid-turn. Only `stopped_at` proves the turn ended.
+    /// looks like mid-turn. Only `stopped_at` proves the turn ended, and the
+    /// proof is perishable: output growth past the stop-rearm grace clears it
+    /// for every runtime, because tools whose hook only posts `Stop` have no
+    /// turn-start event to revoke it when the next turn begins.
     pub fn hook_confirmed_idle(&self, session_id: &str) -> bool {
         self.entries.get(session_id).is_some_and(|entry| {
             entry.hook_seen && entry.state == Some(HookState::Idle) && entry.stopped_at.is_some()
@@ -335,12 +338,14 @@ impl ActivityEngine {
                     entry.deadline_at = None;
                 }
             }
-            Some(HookState::Idle) if distrust_stops && grew => {
+            Some(HookState::Idle) if grew => {
                 if let Some(stopped_at) = entry.stopped_at {
                     let since_stop = now.duration_since(stopped_at).unwrap_or_default();
-                    if since_stop >= STOP_REARM_GRACE && since_stop <= STOP_REARM_WINDOW {
-                        entry.state = Some(HookState::Busy);
-                        entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
+                    if since_stop >= STOP_REARM_GRACE {
+                        if distrust_stops && since_stop <= STOP_REARM_WINDOW {
+                            entry.state = Some(HookState::Busy);
+                            entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
+                        }
                         entry.stopped_at = None;
                     }
                 }

@@ -43,6 +43,9 @@
 - [x] 3b.2c `ClearAttention` chama `clear_attention_unconfirmed` na máquina
   vendorizada (Idle sem `stopped_at`); regressão PermissionRequest →
   clear → não confirmado → Stop confirma.
+- [x] 3b.2d Crescimento de sinal em `Idle` após a graça de re-arme limpa
+  `stopped_at` para qualquer runtime; regressões Stop → texto do
+  orquestrador → sweep → Stop, e Worker parado através de vários sweeps.
 - [x] 3b.2b Re-arme de `Busy` após `Stop` desconfiado limpa `stopped_at` na
   máquina de estados vendorizada; regressão com a sequência
   UserPromptSubmit → Stop → saída na janela de re-arme → sweep.

@@ -979,6 +979,50 @@ mod tests {
     }
 
     #[test]
+    fn output_growth_after_a_stop_revokes_the_confirmation_until_the_next_stop() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("cursor-1", "Stop", None, t0);
+        engine.note_output_and_sweep("cursor-1", 1, true, false, t0 + Duration::from_secs(1));
+        assert!(engine.hook_confirmed_idle("cursor-1"));
+
+        // The orchestrator sends text five minutes later; cursor-agent's hook
+        // only posts Stop, so nothing revokes the old confirmation but growth.
+        let typed_at = t0 + Duration::from_secs(300);
+        engine.note_output_and_sweep("cursor-1", 2, true, false, typed_at);
+        assert_eq!(engine.hook_owned_state("cursor-1"), Some(HookState::Idle));
+        assert!(
+            !engine.hook_confirmed_idle("cursor-1"),
+            "a new turn without a start hook must still kill the stale Stop"
+        );
+
+        let swept_at = typed_at + upstream_activity::HOOK_IDLE_TIMEOUT + Duration::from_secs(1);
+        engine.note_output_and_sweep("cursor-1", 2, true, false, swept_at);
+        assert!(!engine.hook_confirmed_idle("cursor-1"));
+
+        engine.apply_hook_event("cursor-1", "Stop", None, swept_at);
+        assert!(engine.hook_confirmed_idle("cursor-1"));
+    }
+
+    #[test]
+    fn a_genuinely_stopped_worker_keeps_its_confirmation_across_sweeps() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("cursor-1", "Stop", None, t0);
+        engine.note_output_and_sweep("cursor-1", 1, true, false, t0 + Duration::from_secs(1));
+        // The turn's trailing render lands inside the grace and is not a new turn.
+        engine.note_output_and_sweep("cursor-1", 2, true, false, t0 + Duration::from_secs(2));
+        for tick in 1..=6 {
+            let at = t0 + upstream_activity::HOOK_IDLE_TIMEOUT * tick;
+            engine.note_output_and_sweep("cursor-1", 2, true, false, at);
+            assert!(
+                engine.hook_confirmed_idle("cursor-1"),
+                "an unchanged signal must not erode the confirmation (tick {tick})"
+            );
+        }
+    }
+
+    #[test]
     fn a_distrusted_stop_rearmed_by_output_no_longer_confirms_idleness() {
         let mut engine = ActivityEngine::default();
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
