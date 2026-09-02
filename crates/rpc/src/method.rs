@@ -193,7 +193,8 @@ rpc_methods! {
     LOCAL_IMPORT_STATUS / LocalImportStatus = "LocalImportStatus" { params: serde_json::Value, reply: serde_json::Value },
     /// One-time local→synced profile import: run it (stream of progress items).
     IMPORT_LOCAL_WORKSPACE / ImportLocalWorkspace = "ImportLocalWorkspace" { params: serde_json::Value, reply: serde_json::Value },
-    // Repos / worktrees / folders (ControlRpc, relay-forwardable).
+    // Repos / worktrees / folders (ControlRpc, relay-forwardable — device-local
+    // filesystem state).
     LIST_REPOS / ListRepos = "ListRepos" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     ADD_REPO / AddRepo = "AddRepo" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     CLONE_REPO / CloneRepo = "CloneRepo" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
@@ -211,7 +212,8 @@ rpc_methods! {
     SEARCH_FILES / SearchFiles = "SearchFiles" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 120 },
     DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
-    // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
+    // Terminals (ControlRpc, relay-forwardable — a terminal lives on the chat's
+    // host device; SubscribeTerminal streams).
     OPEN_TERMINAL / OpenTerminal = "OpenTerminal" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     SUBSCRIBE_TERMINAL / SubscribeTerminal = "SubscribeTerminal" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, stream: true },
     WRITE_TERMINAL / WriteTerminal = "WriteTerminal" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
