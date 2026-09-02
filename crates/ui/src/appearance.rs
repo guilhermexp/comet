@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use zeron_theme::{AccentSelection, SurfacePreference, ThemeSelection};
 
 use crate::settings::{self, SavePolicy};
-use crate::theme::{Appearance, Theme};
+use crate::theme::{Appearance, Theme, appearance_from_window};
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -84,7 +84,7 @@ pub fn init(
     surface: SurfacePreference,
     cx: &mut App,
 ) {
-    let system = Appearance::from_window(cx.window_appearance());
+    let system = appearance_from_window(cx.window_appearance());
     tracing::debug!(?mode, ?system, "appearance: initial");
     cx.set_global(AppearanceState {
         mode,
@@ -212,9 +212,9 @@ pub fn observe_window(window: &mut Window, cx: &mut App) -> Subscription {
     // wrong the app paints the wrong palette until some unrelated event happens to
     // fire the appearance notification, which reads as "it booted dark and fixed
     // itself when I clicked something". The window knows for certain, so ask it.
-    sync(Appearance::from_window(window.appearance()), cx);
+    sync(appearance_from_window(window.appearance()), cx);
     window.observe_window_appearance(|window, cx| {
-        sync(Appearance::from_window(window.appearance()), cx);
+        sync(appearance_from_window(window.appearance()), cx);
     })
 }
 

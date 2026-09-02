@@ -14,7 +14,7 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -198,6 +198,7 @@ pub use omp::OmpHarness;
 pub mod opencode;
 mod partial_tool_input;
 pub mod shell_env;
+pub(crate) mod workers_mcp;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
@@ -238,6 +239,32 @@ pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
         }
     }
     dirs
+}
+
+/// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
+pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(shell_path) = crate::shell_env::login_shell_path() {
+        candidates.extend(
+            std::env::split_paths(shell_path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe)),
+        );
+    }
+    candidates.extend(extra);
+    candidates.extend(
+        crate::node_version_manager_bins()
+            .into_iter()
+            .map(|d| d.join(exe)),
+    );
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Add the login shell's PATH to a child process while preserving the PATH of

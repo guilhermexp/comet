@@ -415,7 +415,7 @@ impl ProjectsPage {
             ),
         ];
         let mut page = Self {
-            client: LocalWorkersClient::new(),
+            client: crate::workers::client::shared(),
             rows: Vec::new(),
             selected: None,
             search,

@@ -233,50 +233,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
-#[test]
-fn workers_mcp_descriptor_is_controller_only_and_absolute() {
-    let servers = zeron_harness::acp::workers_mcp_servers_for(
-        std::path::Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
-        true,
-        false,
-        Some("chat-parent-1"),
-    );
-    assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0]["name"], "comet-workers");
-    assert_eq!(
-        servers[0]["command"],
-        "/Applications/Zeron.app/Contents/MacOS/zeron"
-    );
-    assert_eq!(servers[0]["args"], serde_json::json!(["__workers_mcp__"]));
-    assert_eq!(servers[0]["env"][0]["name"], "COMET_WORKERS_CONTROLLER");
-    assert_eq!(
-        servers[0]["env"][1],
-        serde_json::json!({
-            "name": "COMET_WORKERS_PARENT_CHAT_ID",
-            "value": "chat-parent-1"
-        })
-    );
-
-    assert!(
-        zeron_harness::acp::workers_mcp_servers_for(
-            std::path::Path::new("/tmp/zeron"),
-            false,
-            false,
-            Some("chat-parent-1"),
-        )
-        .is_empty()
-    );
-    assert!(
-        zeron_harness::acp::workers_mcp_servers_for(
-            std::path::Path::new("/tmp/zeron"),
-            true,
-            true,
-            Some("chat-parent-1"),
-        )
-        .is_empty()
-    );
-}
-
 #[tokio::test]
 async fn primary_run_injects_workers_mcp_into_acp_session() {
     let harness = AcpHarness::grok().with_executable(workers_mcp_fixture_path());

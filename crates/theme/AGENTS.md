@@ -16,6 +16,7 @@ Modelo source-neutral de temas, registro built-in, biblioteca device-local de te
 - A preferência de superfície é política device-local separada do tema e do accent.
 - Importação linked preserva a origem e pode ser recarregada; copy instala snapshot independente.
 - Tema inválido ou incompleto falha fechado e não substitui o último registro válido.
+- `AccentPreset` é o único enum de accent do app (a ui o reexporta como `AccentColor`). Os aliases serde `violet`/`indigo`/`red`/`purple` → `Zeron` e `teal` → `Cyan` são compatibilidade de dado em disco: sem eles um `ui-settings.json` antigo falha a leitura na abertura do app. Renomear variante exige alias novo, nunca troca seca.
 
 ## Work Guidance
 

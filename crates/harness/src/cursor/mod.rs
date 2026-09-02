@@ -198,7 +198,7 @@ impl Harness for CursorHarness {
     /// install zeron performs on demand).
     fn installed(&self) -> bool {
         self.executable.is_some()
-            || crate::acp::find_on_paths("cursor-agent", cursor_cli_paths()).is_some()
+            || crate::find_on_paths("cursor-agent", cursor_cli_paths()).is_some()
     }
     /// Done is the SDK run's terminal result, for every turn shape.
     fn deterministic_turn_end(&self) -> bool {

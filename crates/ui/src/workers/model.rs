@@ -391,7 +391,7 @@ pub struct WorkersModel {
 
 impl WorkersModel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let client = LocalWorkersClient::new();
+        let client = crate::workers::client::shared();
         let poll_client = client.clone();
         let poll_task = cx.spawn(async move |this, cx| {
             let mut observed_epoch = poll_client.activity_epoch();

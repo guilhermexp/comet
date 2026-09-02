@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::sanitize_diagnostic;
 use crate::HarnessError;
-use crate::acp::workers_mcp_servers_for;
 use crate::jsonrpc::{Incoming, RpcClient};
+use crate::workers_mcp;
 
 pub struct WorkersBridgeOptions {
     pub enabled: bool,
@@ -57,32 +57,20 @@ impl WorkersBridge {
         if !options.enabled {
             return Ok(None);
         }
-        let rows = workers_mcp_servers_for(
+        let server = workers_mcp::resolve_for(
             &options.executable,
             true,
             false,
             options.parent_chat_id.as_deref(),
-        );
-        let server = rows.first().ok_or_else(|| {
+        )
+        .ok_or_else(|| {
             HarnessError::Protocol("Workers controller sidecar is unavailable".into())
         })?;
-        let executable = server
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| HarnessError::Protocol("Workers sidecar has no command".into()))?;
-        let mut command = Command::new(executable);
-        if let Some(args) = server.get("args").and_then(Value::as_array) {
-            command.args(args.iter().filter_map(Value::as_str));
-        }
-        if let Some(environment) = server.get("env").and_then(Value::as_array) {
-            for row in environment {
-                if let (Some(name), Some(value)) = (
-                    row.get("name").and_then(Value::as_str),
-                    row.get("value").and_then(Value::as_str),
-                ) {
-                    command.env(name, value);
-                }
-            }
+        let executable = server.command.to_string_lossy().into_owned();
+        let mut command = Command::new(&executable);
+        command.args(&server.args);
+        for (name, value) in &server.env {
+            command.env(name, value);
         }
         command
             .stdin(Stdio::piped())
