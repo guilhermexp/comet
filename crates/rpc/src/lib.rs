@@ -263,15 +263,23 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
 // Trajectory Wire Types
 // ---------------------------------------------------------------------------
 
-/// Full `(source_seq, sub_seq)` watermark/cursor for Trajectory watch and paging.
+/// Full `(source_seq, sub_seq)` position plus store revision for Trajectory watch and paging.
 ///
 /// Critical invariant: `source_seq` alone is insufficient because legacy Interrupted records
 /// can share `source_seq` with a prefix record at `sub_seq = u32::MAX`.
+///
+/// `rev` is the store's monotonic per-commit revision observed by the holder of this cursor.
+/// Position alone cannot express an in-place replacement (a partial record finalized under the
+/// same `(source_seq, sub_seq)`), so resume asks for "everything past this position OR written
+/// after this revision". `rev == 0` means "no revision knowledge" and disables that clause.
+/// Ordering stays position-first: `rev` only breaks ties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrajectoryCursor {
     pub source_seq: u64,
     pub sub_seq: u32,
+    #[serde(default)]
+    pub rev: u64,
 }
 
 impl TrajectoryCursor {
@@ -279,7 +287,13 @@ impl TrajectoryCursor {
         Self {
             source_seq,
             sub_seq,
+            rev: 0,
         }
+    }
+
+    /// Same position, carrying the store revision the holder has already observed.
+    pub const fn with_rev(self, rev: u64) -> Self {
+        Self { rev, ..self }
     }
 }
 
@@ -738,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trajectory_cursor_ordering_and_serialization() {
+    fn test_trajectory_cursor_ordering_revision_and_legacy_serialization() {
         let c1 = TrajectoryCursor::new(1, 0);
         let c2 = TrajectoryCursor::new(1, 1);
         let c3 = TrajectoryCursor::new(2, 0);
@@ -746,12 +760,17 @@ mod tests {
 
         assert!(c1 < c2);
         assert!(c2 < c4);
-        assert!(c4 < c3);
+        assert!(c4.with_rev(u64::MAX) < c3);
+        assert!(c2.with_rev(1) < c2.with_rev(2));
 
-        let json = serde_json::to_string(&c2).unwrap();
-        assert_eq!(json, r#"{"sourceSeq":1,"subSeq":1}"#);
+        let json = serde_json::to_string(&c2.with_rev(7)).unwrap();
+        assert_eq!(json, r#"{"sourceSeq":1,"subSeq":1,"rev":7}"#);
         let parsed: TrajectoryCursor = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, c2);
+        assert_eq!(parsed, c2.with_rev(7));
+
+        let legacy: TrajectoryCursor =
+            serde_json::from_str(r#"{"sourceSeq":1,"subSeq":1}"#).unwrap();
+        assert_eq!(legacy, c2);
     }
 
     #[test]
@@ -761,7 +780,7 @@ mod tests {
             .with_limit(100);
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains(r#""chatId":"chat-123""#));
-        assert!(json.contains(r#""afterCursor":{"sourceSeq":5,"subSeq":2}"#));
+        assert!(json.contains(r#""afterCursor":{"sourceSeq":5,"subSeq":2,"rev":0}"#));
         assert!(json.contains(r#""limit":100"#));
 
         let parsed: WatchTrajectoryParams = serde_json::from_str(&json).unwrap();

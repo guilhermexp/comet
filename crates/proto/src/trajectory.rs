@@ -55,7 +55,7 @@ pub enum TrajectoryRawField {
 pub const CURRENT_RAW_SOURCE_VERSION: u32 = 1;
 
 fn default_raw_source_version() -> u32 {
-    CURRENT_RAW_SOURCE_VERSION
+    1
 }
 
 /// Opaque source reference to the underlying local Run Journal entry.
@@ -112,6 +112,8 @@ pub enum TrajectoryLane {
     Input,
     Model,
     Tools,
+    #[serde(other)]
+    Unknown,
 }
 
 impl TrajectoryLane {
@@ -120,13 +122,18 @@ impl TrajectoryLane {
             Self::Input => "input",
             Self::Model => "model",
             Self::Tools => "tools",
+            Self::Unknown => "unknown",
         }
     }
 }
 
 /// Semantic classification of a Trajectory record.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TrajectoryRecordKind {
     SessionStarted,
     UserMessage,
@@ -191,6 +198,8 @@ pub enum TrajectoryStatus {
     Interrupted,
     Unsettled,
     Degraded,
+    #[serde(other)]
+    Unknown,
 }
 
 impl TrajectoryStatus {
@@ -200,16 +209,6 @@ impl TrajectoryStatus {
 
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Error | Self::Interrupted)
-    }
-}
-
-/// Compute effective status giving error state precedence without losing
-/// the record's semantic lane or classification.
-pub fn effective_status(base: TrajectoryStatus, is_error: bool) -> TrajectoryStatus {
-    if is_error {
-        TrajectoryStatus::Error
-    } else {
-        base
     }
 }
 
@@ -293,34 +292,32 @@ impl TrajectoryTiming {
 /// Returns `None` when timing is absent, sequence-only, or unavailable. Missing timing
 /// must NEVER be formatted as "0ms" or an estimated value.
 pub fn format_duration(timing: Option<&TrajectoryTiming>) -> Option<String> {
-    let t = timing?;
-    if t.mode == TrajectoryTimingMode::SequenceOnly {
-        return None;
-    }
-    let ms = t.effective_duration_ms()?;
+    let ms = timing?.effective_duration_ms()?;
     Some(format_duration_ms(ms))
 }
 
 /// Helper for raw millisecond values.
 pub fn format_duration_ms(ms: u64) -> String {
     if ms < 1_000 {
-        format!("{}ms", ms)
-    } else if ms < 60_000 {
-        let secs = ms as f64 / 1000.0;
-        format!("{:.2}s", secs)
+        return format!("{ms}ms");
+    }
+
+    let tenths = (ms + 50) / 100;
+    if tenths < 600 {
+        if tenths.is_multiple_of(10) {
+            format!("{}s", tenths / 10)
+        } else {
+            format!("{}.{}s", tenths / 10, tenths % 10)
+        }
     } else {
-        let mins = ms / 60_000;
-        let rem_secs = (ms % 60_000) / 1000;
-        format!("{}m {}s", mins, rem_secs)
+        let rounded_secs = (ms + 500) / 1_000;
+        format!("{}m {}s", rounded_secs / 60, rounded_secs % 60)
     }
 }
 
 /// Format duration or return a fixed unavailable placeholder ("—").
 pub fn format_duration_or_unavailable(timing: Option<&TrajectoryTiming>) -> String {
-    match format_duration(timing) {
-        Some(d) => d,
-        None => "—".to_string(),
-    }
+    format_duration(timing).unwrap_or_else(|| "—".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +372,214 @@ pub struct TrajectoryUsage {
 pub const DEFAULT_PREVIEW_BYTE_CAP: usize = 1_024;
 pub const MAX_SUMMARY_LEN: usize = 256;
 
+const REDACTED: &str = "[REDACTED]";
+
+fn is_secret_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn has_token_boundary(bytes: &[u8], start: usize) -> bool {
+    start == 0 || !bytes[start - 1].is_ascii_alphanumeric()
+}
+
+fn starts_with_ignore_ascii_case(bytes: &[u8], start: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(start..start.saturating_add(needle.len()))
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+}
+
+fn secret_value_end(bytes: &[u8], start: usize, end_at_line: bool) -> usize {
+    if let Some(quote @ (b'\'' | b'"')) = bytes.get(start).copied() {
+        return bytes[start + 1..]
+            .iter()
+            .position(|byte| *byte == quote)
+            .map_or(bytes.len(), |offset| start + offset + 2);
+    }
+
+    bytes[start..]
+        .iter()
+        .position(|byte| {
+            if end_at_line {
+                matches!(byte, b'\r' | b'\n' | b'\'' | b'"')
+            } else {
+                byte.is_ascii_whitespace() || matches!(byte, b'&' | b';' | b',' | b'\'' | b'"')
+            }
+        })
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    index
+}
+
+/// Range of a `<key><separator><value>` secret, or `None` when the shape does not match.
+fn separated_secret_range(
+    bytes: &[u8],
+    start: usize,
+    key: &[u8],
+    separator: u8,
+    end_at_line: bool,
+) -> Option<(usize, usize)> {
+    if !starts_with_ignore_ascii_case(bytes, start, key) {
+        return None;
+    }
+    let mut separator_at = start + key.len();
+    if bytes.get(separator_at).is_some_and(|quote| {
+        matches!(quote, b'\'' | b'"')
+            && start.checked_sub(1).and_then(|index| bytes.get(index)) == Some(quote)
+    }) {
+        separator_at += 1;
+    }
+    let separator_at = skip_ascii_whitespace(bytes, separator_at);
+    if bytes.get(separator_at) != Some(&separator) {
+        return None;
+    }
+    let value_start = skip_ascii_whitespace(bytes, separator_at + 1);
+    if value_start >= bytes.len() {
+        return None;
+    }
+    Some((
+        value_start,
+        secret_value_end(bytes, value_start, end_at_line),
+    ))
+}
+
+fn labeled_secret_range(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if !has_token_boundary(bytes, start) {
+        return None;
+    }
+
+    if let Some(range) = separated_secret_range(bytes, start, b"authorization", b':', true) {
+        return Some(range);
+    }
+
+    if starts_with_ignore_ascii_case(bytes, start, b"bearer") {
+        let after_keyword = start + "bearer".len();
+        if bytes
+            .get(after_keyword)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            let value_start = skip_ascii_whitespace(bytes, after_keyword);
+            if value_start < bytes.len() {
+                return Some((value_start, secret_value_end(bytes, value_start, false)));
+            }
+        }
+    }
+
+    for key in [
+        b"password".as_slice(),
+        b"token",
+        b"apikey",
+        b"api_key",
+        b"api-key",
+    ] {
+        for separator in [b'=', b':'] {
+            if let Some(range) = separated_secret_range(bytes, start, key, separator, false) {
+                return Some(range);
+            }
+        }
+    }
+
+    None
+}
+
+/// End of the run of secret-shaped characters starting at `from`.
+fn secret_run_end(bytes: &[u8], from: usize) -> usize {
+    from + bytes[from..]
+        .iter()
+        .take_while(|byte| is_secret_char(**byte))
+        .count()
+}
+
+fn token_secret_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if !has_token_boundary(bytes, start) {
+        return None;
+    }
+
+    let github_prefix = [b"ghp_".as_slice(), b"gho_", b"github_pat_", b"sk-"]
+        .into_iter()
+        .find(|prefix| bytes[start..].starts_with(prefix));
+    if let Some(prefix) = github_prefix {
+        let value_start = start + prefix.len();
+        let end = secret_run_end(bytes, value_start);
+        return (end > value_start).then_some(end);
+    }
+
+    let is_slack_prefix = bytes.get(start..start + 5).is_some_and(|candidate| {
+        candidate.starts_with(b"xox")
+            && matches!(candidate[3], b'a' | b'b' | b'p' | b'r' | b's')
+            && candidate[4] == b'-'
+    });
+    if is_slack_prefix {
+        let value_start = start + 5;
+        let end = secret_run_end(bytes, value_start);
+        return (end > value_start).then_some(end);
+    }
+
+    if bytes[start..].starts_with(b"AKIA") {
+        let end = start
+            + bytes[start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                .count();
+        if end - start >= 20 {
+            return Some(end);
+        }
+    }
+
+    let opaque_end = secret_run_end(bytes, start);
+    (opaque_end - start >= 32).then_some(opaque_end)
+}
+
+fn redact_secrets(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut redacted = String::with_capacity(text.len());
+    let mut copy_from = 0;
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        let range = labeled_secret_range(bytes, cursor)
+            .or_else(|| token_secret_end(bytes, cursor).map(|end| (cursor, end)));
+        if let Some((secret_start, secret_end)) = range {
+            redacted.push_str(&text[copy_from..secret_start]);
+            redacted.push_str(REDACTED);
+            cursor = secret_end;
+            copy_from = secret_end;
+        } else {
+            cursor += text[cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    redacted.push_str(&text[copy_from..]);
+    redacted
+}
+
+fn sanitized_summary(text: &str) -> String {
+    truncate_summary(&redact_secrets(text))
+}
+
+fn sanitized_preview(text: &str, byte_cap: usize) -> String {
+    truncate_preview(&redact_secrets(text), byte_cap)
+}
+
+fn tool_input_metadata(input: Option<&serde_json::Value>) -> String {
+    let byte_count = input.map_or(0, |value| value.to_string().len());
+    let mut keys = input
+        .and_then(serde_json::Value::as_object)
+        .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    let names = if keys.is_empty() {
+        "none".to_string()
+    } else {
+        keys.join(", ")
+    };
+    format!("args: {names} ({byte_count} bytes)")
+}
+
 /// Bounded string truncation preserving UTF-8 boundaries.
 pub fn truncate_preview(text: &str, byte_cap: usize) -> String {
     if text.len() <= byte_cap {
@@ -403,22 +608,12 @@ pub fn truncate_summary(text: &str) -> String {
 
 /// Sanitize prompt or message text for preview.
 pub fn sanitize_prompt_preview(text: &str, byte_cap: usize) -> (String, Option<String>) {
-    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let summary = if single.len() > MAX_SUMMARY_LEN {
-        let mut end = MAX_SUMMARY_LEN;
-        while end > 0 && !single.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &single[..end])
-    } else {
-        single
-    };
-    let preview = if text.len() > byte_cap {
-        Some(truncate_preview(text, byte_cap))
-    } else {
-        Some(text.to_string())
-    };
-    (summary, preview)
+    let redacted = redact_secrets(text);
+    let single_line = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    (
+        truncate_summary(&single_line),
+        Some(truncate_preview(&redacted, byte_cap)),
+    )
 }
 
 /// Derive safe summary and bounded preview from a `ToolCall`.
@@ -427,95 +622,86 @@ pub fn sanitize_tool_call(
     byte_cap: usize,
 ) -> (String, Option<String>, Option<String>) {
     match call {
-        ToolCall::Exec { command } => {
-            let summary = truncate_summary(&format!("$ {}", command));
-            let bounded = truncate_preview(command, byte_cap);
-            (summary, Some(bounded), Some("command: string".to_string()))
-        }
-        ToolCall::ReadFile { path } => {
-            let summary = truncate_summary(&format!("Read {}", path));
-            (
-                summary,
-                Some(path.clone()),
-                Some("path: string".to_string()),
-            )
-        }
+        ToolCall::Exec { command } => (
+            sanitized_summary(&format!("$ {command}")),
+            Some(sanitized_preview(command, byte_cap)),
+            Some("command: string".to_string()),
+        ),
+        ToolCall::ReadFile { path } => (
+            sanitized_summary(&format!("Read {path}")),
+            Some(sanitized_preview(path, byte_cap)),
+            Some("path: string".to_string()),
+        ),
         ToolCall::WriteFile { path, content } => {
-            let summary = truncate_summary(&format!("Write {}", path));
-            let len = content.as_ref().map(|c| c.len()).unwrap_or(0);
-            let bounded = format!("Path: {}\nBytes: {}", path, len);
+            let text = format!(
+                "Path: {path}\nBytes: {}",
+                content.as_ref().map_or(0, String::len)
+            );
             (
-                summary,
-                Some(bounded),
+                sanitized_summary(&format!("Write {path}")),
+                Some(sanitized_preview(&text, byte_cap)),
                 Some("path: string, content: string".to_string()),
             )
         }
-        ToolCall::EditFile { path, .. } => {
-            let summary = truncate_summary(&format!("Edit {}", path));
-            let bounded = format!("Path: {}", path);
-            (
-                summary,
-                Some(bounded),
-                Some("path: string, edits: string".to_string()),
-            )
-        }
-        ToolCall::ApplyPatch { path } => {
-            let summary = truncate_summary(&format!("Patch {}", path.as_deref().unwrap_or("")));
-            (summary, path.clone(), Some("path: string".to_string()))
-        }
-        ToolCall::WebFetch { url, .. } => {
-            let summary = truncate_summary(&format!("Fetch {}", url));
-            (summary, Some(url.clone()), Some("url: string".to_string()))
-        }
-        ToolCall::WebSearch { query } => {
-            let summary = truncate_summary(&format!("Search \"{}\"", query));
-            (
-                summary,
-                Some(query.clone()),
-                Some("query: string".to_string()),
-            )
-        }
-        ToolCall::Search { pattern, path } => {
-            let summary = truncate_summary(&format!("Search \"{}\"", pattern));
-            let bounded = format!("Pattern: {}\nPath: {:?}", pattern, path);
-            (
-                summary,
-                Some(bounded),
-                Some("pattern: string, path: string".to_string()),
-            )
-        }
-        ToolCall::Glob { pattern } => {
-            let summary = truncate_summary(&format!("Glob {}", pattern));
-            (
-                summary,
-                Some(pattern.clone()),
-                Some("pattern: string".to_string()),
-            )
-        }
-        ToolCall::Todo { items } => {
-            let summary = truncate_summary(&format!("Todo ({} items)", items.len()));
-            (summary, None, Some("items: array".to_string()))
-        }
+        ToolCall::EditFile { path, .. } => (
+            sanitized_summary(&format!("Edit {path}")),
+            Some(sanitized_preview(&format!("Path: {path}"), byte_cap)),
+            Some("path: string, edits: string".to_string()),
+        ),
+        ToolCall::ApplyPatch { path } => (
+            sanitized_summary(&format!("Patch {}", path.as_deref().unwrap_or(""))),
+            path.as_deref()
+                .map(|path| sanitized_preview(path, byte_cap)),
+            Some("path: string".to_string()),
+        ),
+        ToolCall::WebFetch { url, .. } => (
+            sanitized_summary(&format!("Fetch {url}")),
+            Some(sanitized_preview(url, byte_cap)),
+            Some("url: string".to_string()),
+        ),
+        ToolCall::WebSearch { query } => (
+            sanitized_summary(&format!("Search \"{query}\"")),
+            Some(sanitized_preview(query, byte_cap)),
+            Some("query: string".to_string()),
+        ),
+        ToolCall::Search { pattern, path } => (
+            sanitized_summary(&format!("Search \"{pattern}\"")),
+            Some(sanitized_preview(
+                &format!("Pattern: {pattern}\nPath: {path:?}"),
+                byte_cap,
+            )),
+            Some("pattern: string, path: string".to_string()),
+        ),
+        ToolCall::Glob { pattern } => (
+            sanitized_summary(&format!("Glob {pattern}")),
+            Some(sanitized_preview(pattern, byte_cap)),
+            Some("pattern: string".to_string()),
+        ),
+        ToolCall::Todo { items } => (
+            sanitized_summary(&format!("Todo ({} items)", items.len())),
+            None,
+            Some("items: array".to_string()),
+        ),
         ToolCall::Mcp {
             server,
             tool,
             input,
-        } => {
-            let summary = truncate_summary(&format!("MCP {}/{}", server, tool));
-            let input_str = input.as_ref().map(|v| v.to_string()).unwrap_or_default();
-            let bounded = truncate_preview(&input_str, byte_cap);
-            (
-                summary,
-                Some(bounded),
-                Some(format!("{}: {}", server, tool)),
-            )
-        }
-        ToolCall::Unknown { name, input } => {
-            let summary = truncate_summary(&format!("Tool {}", name));
-            let input_str = input.as_ref().map(|v| v.to_string()).unwrap_or_default();
-            let bounded = truncate_preview(&input_str, byte_cap);
-            (summary, Some(bounded), Some(format!("tool: {}", name)))
-        }
+        } => (
+            sanitized_summary(&format!("MCP {server}/{tool}")),
+            Some(sanitized_preview(
+                &tool_input_metadata(input.as_ref()),
+                byte_cap,
+            )),
+            Some(redact_secrets(&format!("{server}: {tool}"))),
+        ),
+        ToolCall::Unknown { name, input } => (
+            sanitized_summary(&format!("Tool {name}")),
+            Some(sanitized_preview(
+                &tool_input_metadata(input.as_ref()),
+                byte_cap,
+            )),
+            Some(redact_secrets(&format!("tool: {name}"))),
+        ),
     }
 }
 
@@ -530,53 +716,56 @@ pub fn sanitize_tool_result(
     is_error: bool,
     _byte_cap: usize,
 ) -> (String, Option<String>, Option<i32>) {
-    let exit_code = execution.and_then(|e| e.exit_code);
+    let exit_code = execution.and_then(|meta| meta.exit_code);
+
     let summary = if is_error {
-        if let Some(code) = exit_code {
-            format!("Failed (exit code {})", code)
-        } else {
-            "Failed".to_string()
+        match exit_code {
+            Some(code) => format!("Failed (exit code {code})"),
+            None => "Failed".to_string(),
         }
-    } else if let Some(d) = diff {
-        format!("Diff on {}", d.path)
+    } else if let Some(diff) = diff {
+        format!("Diff on {}", diff.path)
     } else if let Some(code) = exit_code {
-        format!("Completed (exit code {})", code)
-    } else if let Some(out) = output {
-        format!("Completed ({} bytes)", out.len())
+        format!("Completed (exit code {code})")
+    } else if let Some(output) = output {
+        format!("Completed ({} bytes)", output.len())
     } else {
         "Completed".to_string()
     };
 
-    let preview = if let Some(d) = diff {
+    let preview = if let Some(diff) = diff {
         Some(format!(
             "Diff on {}:\n+{} lines, -{} lines",
-            d.path,
-            d.new_text.lines().count(),
-            d.old_text
+            diff.path,
+            diff.new_text.lines().count(),
+            diff.old_text
                 .as_deref()
-                .map(|s| s.lines().count())
-                .unwrap_or(0)
+                .map_or(0, |text| text.lines().count())
         ))
     } else if is_error {
         Some(format!(
             "Tool execution failed{}",
             exit_code
-                .map(|c| format!(" (exit code {})", c))
+                .map(|code| format!(" (exit code {code})"))
                 .unwrap_or_default()
         ))
     } else {
-        output.map(|out| {
+        output.map(|output| {
             format!(
                 "Output: {} bytes{}",
-                out.len(),
+                output.len(),
                 exit_code
-                    .map(|c| format!(", exit code {}", c))
+                    .map(|code| format!(", exit code {code}"))
                     .unwrap_or_default()
             )
         })
     };
 
-    (summary, preview, exit_code)
+    (
+        sanitized_summary(&summary),
+        preview.map(|preview| sanitized_preview(&preview, _byte_cap)),
+        exit_code,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +813,15 @@ impl TrajectoryRecord {
     pub fn key(&self) -> String {
         self.id.key()
     }
+
+    /// Derived read-model status with a failed result taking precedence.
+    pub fn effective_status(&self) -> TrajectoryStatus {
+        if self.result.as_ref().is_some_and(|result| result.is_error) {
+            TrajectoryStatus::Error
+        } else {
+            self.status
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +863,69 @@ pub struct TrajectoryRun {
     pub turns: Vec<TrajectoryTurn>,
 }
 
+fn status_precedence(status: TrajectoryStatus) -> u8 {
+    match status {
+        TrajectoryStatus::Error => 6,
+        TrajectoryStatus::Interrupted => 5,
+        TrajectoryStatus::Unsettled => 4,
+        TrajectoryStatus::Running => 3,
+        TrajectoryStatus::Degraded => 2,
+        TrajectoryStatus::Completed => 1,
+        TrajectoryStatus::Unknown => 0,
+    }
+}
+
+fn fold_status(
+    current: TrajectoryStatus,
+    incoming: TrajectoryStatus,
+    kind: &TrajectoryRecordKind,
+) -> TrajectoryStatus {
+    if matches!(kind, TrajectoryRecordKind::Done)
+        && incoming == TrajectoryStatus::Completed
+        && current == TrajectoryStatus::Running
+    {
+        return TrajectoryStatus::Completed;
+    }
+
+    if status_precedence(incoming) > status_precedence(current) {
+        incoming
+    } else {
+        current
+    }
+}
+
+fn aggregate_run_timing(run: &TrajectoryRun) -> Option<TrajectoryTiming> {
+    let mut first_start = None;
+    let mut last_end = None;
+
+    for record in run
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.steps)
+        .flat_map(|step| &step.records)
+    {
+        let Some(timing) = &record.timing else {
+            continue;
+        };
+        if timing.mode == TrajectoryTimingMode::SequenceOnly {
+            return None;
+        }
+        if first_start.is_none() {
+            first_start = timing.started_at;
+        }
+        if timing.ended_at.is_some() {
+            last_end = timing.ended_at;
+        }
+    }
+
+    Some(TrajectoryTiming::recorded(
+        Some(first_start?),
+        Some(last_end?),
+        None,
+        None,
+    ))
+}
+
 /// Pure projection: group a flat slice of ordered records into runs, turns, and steps.
 pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
     let mut runs: Vec<TrajectoryRun> = Vec::new();
@@ -674,7 +935,8 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
         let run_idx = if let Some(pos) = runs.iter().position(|r| r.run_id == record.run_id) {
             pos
         } else {
-            let label = if record.run_id.starts_with("legacy") {
+            let is_legacy = record.run_id.starts_with("legacy");
+            let label = if is_legacy {
                 "Legacy Run".to_string()
             } else {
                 format!("Run {}", runs.len() + 1)
@@ -683,22 +945,17 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
                 run_id: record.run_id.clone(),
                 chat_id: record.chat_id.clone(),
                 label,
-                is_legacy: record.run_id.starts_with("legacy"),
-                status: record.status,
-                timing: record.timing.clone(),
+                is_legacy,
+                status: record.effective_status(),
+                timing: None,
                 turns: Vec::new(),
             });
             runs.len() - 1
         };
 
         let run = &mut runs[run_idx];
-        if record.status == TrajectoryStatus::Error {
-            run.status = TrajectoryStatus::Error;
-        } else if record.status == TrajectoryStatus::Interrupted
-            && run.status != TrajectoryStatus::Error
-        {
-            run.status = TrajectoryStatus::Interrupted;
-        }
+        let effective_status = record.effective_status();
+        run.status = fold_status(run.status, effective_status, &record.kind);
         let turn_id = record
             .turn_id
             .clone()
@@ -709,20 +966,14 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
             run.turns.push(TrajectoryTurn {
                 turn_id: turn_id.clone(),
                 run_id: record.run_id.clone(),
-                status: record.status,
+                status: effective_status,
                 steps: Vec::new(),
             });
             run.turns.len() - 1
         };
 
         let turn = &mut run.turns[turn_idx];
-        if record.status == TrajectoryStatus::Error {
-            turn.status = TrajectoryStatus::Error;
-        } else if record.status == TrajectoryStatus::Interrupted
-            && turn.status != TrajectoryStatus::Error
-        {
-            turn.status = TrajectoryStatus::Interrupted;
-        }
+        turn.status = fold_status(turn.status, effective_status, &record.kind);
         let step_id = record
             .step_id
             .clone()
@@ -733,21 +984,19 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
             turn.steps.push(TrajectoryStep {
                 step_id: step_id.clone(),
                 assistant_message_id: None,
-                status: record.status,
+                status: effective_status,
                 records: Vec::new(),
             });
             turn.steps.len() - 1
         };
 
         let step = &mut turn.steps[step_idx];
-        if record.status == TrajectoryStatus::Error {
-            step.status = TrajectoryStatus::Error;
-        } else if record.status == TrajectoryStatus::Interrupted
-            && step.status != TrajectoryStatus::Error
-        {
-            step.status = TrajectoryStatus::Interrupted;
-        }
+        step.status = fold_status(step.status, effective_status, &record.kind);
         step.records.push(record.clone());
+    }
+
+    for run in &mut runs {
+        run.timing = aggregate_run_timing(run);
     }
 
     runs
@@ -759,11 +1008,14 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
 
 /// Reconcile a single delta record into an existing ordered record list.
 ///
-/// Replaces any existing record with the same `TrajectoryRecordId` (e.g. coalescing
-/// streaming partials into final updates) or inserts in monotonic `(source_seq, sub_seq)` order.
+/// `records` must already be sorted in monotonic `(source_seq, sub_seq)` order.
+/// Replaces an existing partial with the same `TrajectoryRecordId` or inserts at
+/// the sorted position. A re-delivered partial never replaces a stored final.
 pub fn reconcile_record(records: &mut Vec<TrajectoryRecord>, delta: TrajectoryRecord) {
     if let Some(pos) = records.iter().position(|r| r.id == delta.id) {
-        records[pos] = delta;
+        if records[pos].is_partial || !delta.is_partial {
+            records[pos] = delta;
+        }
     } else {
         let insert_pos = records
             .binary_search_by_key(&(delta.source_seq, delta.sub_seq), |r| {
@@ -808,6 +1060,36 @@ pub struct TrajectoryDegradedInterval {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn test_record(
+        source_seq: u64,
+        kind: TrajectoryRecordKind,
+        status: TrajectoryStatus,
+    ) -> TrajectoryRecord {
+        TrajectoryRecord {
+            id: TrajectoryRecordId::new("run-1", source_seq, 0),
+            chat_id: "chat-1".into(),
+            run_id: "run-1".into(),
+            source_seq,
+            sub_seq: 0,
+            lane: kind.default_lane(),
+            kind,
+            status,
+            is_partial: false,
+            title: "Test".into(),
+            summary: "Test record".into(),
+            turn_id: Some("turn-1".into()),
+            step_id: Some("step-1".into()),
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: None,
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        }
+    }
 
     #[test]
     fn test_lane_classification() {
@@ -890,51 +1172,86 @@ mod tests {
     }
 
     #[test]
-    fn test_error_status_precedence() {
-        // Scenario 2: Give error status precedence over the semantic color without losing the original kind.
-        let status = effective_status(TrajectoryStatus::Completed, true);
-        assert_eq!(status, TrajectoryStatus::Error);
+    fn result_error_overrides_completed_status_in_record_and_groups() {
+        let mut record = test_record(
+            1,
+            TrajectoryRecordKind::ToolResult {
+                tool_name: "bash".into(),
+            },
+            TrajectoryStatus::Completed,
+        );
+        record.result = Some(TrajectoryResultPreview {
+            summary: "Failed".into(),
+            sanitized_text: None,
+            is_error: true,
+            exit_code: Some(1),
+            raw_ref: None,
+        });
 
-        let status_ok = effective_status(TrajectoryStatus::Completed, false);
-        assert_eq!(status_ok, TrajectoryStatus::Completed);
-
-        let kind = TrajectoryRecordKind::ToolResult {
-            tool_name: "bash".into(),
-        };
-        assert_eq!(kind.default_lane(), TrajectoryLane::Tools);
+        assert_eq!(record.effective_status(), TrajectoryStatus::Error);
+        let groups = group_records(&[record]);
+        assert_eq!(groups[0].status, TrajectoryStatus::Error);
+        assert_eq!(groups[0].turns[0].status, TrajectoryStatus::Error);
+        assert_eq!(groups[0].turns[0].steps[0].status, TrajectoryStatus::Error);
     }
 
     #[test]
-    fn test_correlate_tool_call_and_result() {
-        // Scenario 3: Correlate tool call and result by stable call identity across interleaved calls.
-        let call_id_1 = "call-1";
-        let call_id_2 = "call-2";
+    fn interleaved_tool_calls_and_results_remain_correlated_when_grouped() {
+        let mut call_1 = test_record(
+            1,
+            TrajectoryRecordKind::ToolCall {
+                tool_name: "read".into(),
+            },
+            TrajectoryStatus::Completed,
+        );
+        call_1.call_id = Some("call-1".into());
+        let mut call_2 = test_record(
+            2,
+            TrajectoryRecordKind::ToolCall {
+                tool_name: "exec".into(),
+            },
+            TrajectoryStatus::Completed,
+        );
+        call_2.call_id = Some("call-2".into());
+        let mut result_1 = test_record(
+            3,
+            TrajectoryRecordKind::ToolResult {
+                tool_name: "read".into(),
+            },
+            TrajectoryStatus::Completed,
+        );
+        result_1.call_id = Some("call-1".into());
+        let mut result_2 = test_record(
+            4,
+            TrajectoryRecordKind::ToolResult {
+                tool_name: "exec".into(),
+            },
+            TrajectoryStatus::Completed,
+        );
+        result_2.call_id = Some("call-2".into());
 
-        let raw_ref_1 = TrajectoryRawRef::new(
-            "chat-1",
-            10,
-            None,
-            Some(call_id_1.to_string()),
-            TrajectoryRawField::Payload,
+        let groups = group_records(&[call_1, call_2, result_1, result_2]);
+        let records = &groups[0].turns[0].steps[0].records;
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("call-1"),
+                Some("call-2"),
+                Some("call-1"),
+                Some("call-2")
+            ]
         );
-        let raw_ref_2 = TrajectoryRawRef::new(
-            "chat-1",
-            11,
-            None,
-            Some(call_id_2.to_string()),
-            TrajectoryRawField::Payload,
-        );
-        let raw_res_1 = TrajectoryRawRef::new(
-            "chat-1",
-            12,
-            None,
-            Some(call_id_1.to_string()),
-            TrajectoryRawField::Result,
-        );
-
-        assert_eq!(raw_ref_1.call_id.as_deref(), Some(call_id_1));
-        assert_eq!(raw_res_1.call_id.as_deref(), Some(call_id_1));
-        assert_ne!(raw_ref_2.call_id.as_deref(), Some(call_id_1));
+        assert!(matches!(
+            records[0].kind,
+            TrajectoryRecordKind::ToolCall { .. }
+        ));
+        assert!(matches!(
+            records[2].kind,
+            TrajectoryRecordKind::ToolResult { .. }
+        ));
     }
 
     #[test]
@@ -1061,6 +1378,89 @@ mod tests {
     }
 
     #[test]
+    fn done_record_completes_a_run_that_started_running() {
+        let running = test_record(
+            1,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Running,
+        );
+        let done = test_record(2, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+
+        let groups = group_records(&[running, done]);
+        assert_eq!(groups[0].status, TrajectoryStatus::Completed);
+        assert_eq!(groups[0].turns[0].status, TrajectoryStatus::Completed);
+        assert_eq!(
+            groups[0].turns[0].steps[0].status,
+            TrajectoryStatus::Completed
+        );
+    }
+
+    #[test]
+    fn group_status_fold_obeys_full_precedence() {
+        let precedence_pairs = [
+            (TrajectoryStatus::Completed, TrajectoryStatus::Degraded),
+            (TrajectoryStatus::Degraded, TrajectoryStatus::Running),
+            (TrajectoryStatus::Running, TrajectoryStatus::Unsettled),
+            (TrajectoryStatus::Unsettled, TrajectoryStatus::Interrupted),
+            (TrajectoryStatus::Interrupted, TrajectoryStatus::Error),
+        ];
+
+        for (lower, higher) in precedence_pairs {
+            for statuses in [[lower, higher], [higher, lower]] {
+                let records = [
+                    test_record(1, TrajectoryRecordKind::AssistantMessage, statuses[0]),
+                    test_record(2, TrajectoryRecordKind::AssistantMessage, statuses[1]),
+                ];
+                let groups = group_records(&records);
+                assert_eq!(groups[0].status, higher);
+                assert_eq!(groups[0].turns[0].status, higher);
+                assert_eq!(groups[0].turns[0].steps[0].status, higher);
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_only_member_prevents_group_recorded_duration() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 2).unwrap();
+        let mut first = test_record(
+            1,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        first.timing = Some(TrajectoryTiming::recorded(
+            Some(start),
+            Some(end),
+            Some(2_000),
+            None,
+        ));
+        let mut second = test_record(2, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+        second.timing = Some(TrajectoryTiming::sequence_only());
+
+        assert_eq!(group_records(&[first, second])[0].timing, None);
+    }
+
+    #[test]
+    fn group_timing_uses_first_start_and_last_end_only() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 3).unwrap();
+        let mut first = test_record(
+            1,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        first.timing = Some(TrajectoryTiming::recorded(Some(start), None, None, None));
+        let mut last = test_record(2, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+        last.timing = Some(TrajectoryTiming::recorded(None, Some(end), None, None));
+
+        let timing = group_records(&[first, last])[0].timing.clone().unwrap();
+        assert_eq!(timing.started_at, Some(start));
+        assert_eq!(timing.ended_at, Some(end));
+        assert_eq!(timing.duration_ms, None);
+        assert_eq!(timing.effective_duration_ms(), Some(3_000));
+    }
+
+    #[test]
     fn test_timing_sequence_only_vs_recorded() {
         // Scenario 5: Project a record with no timestamp as sequence-only; formatting returns unavailable rather than 0 ms.
         let seq_timing = TrajectoryTiming::sequence_only();
@@ -1069,14 +1469,16 @@ mod tests {
         assert_eq!(format_duration_or_unavailable(None), "—");
 
         let rec_timing = TrajectoryTiming::recorded(None, None, Some(1500), None);
-        assert_eq!(format_duration(Some(&rec_timing)), Some("1.50s".into()));
-        assert_eq!(format_duration_or_unavailable(Some(&rec_timing)), "1.50s");
+        assert_eq!(format_duration(Some(&rec_timing)), Some("1.5s".into()));
+        assert_eq!(format_duration_or_unavailable(Some(&rec_timing)), "1.5s");
 
         let start = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 2).unwrap();
         let calc_timing = TrajectoryTiming::recorded(Some(start), Some(end), None, None);
-        assert_eq!(format_duration(Some(&calc_timing)), Some("2.00s".into()));
-        assert_eq!(format_duration_or_unavailable(Some(&calc_timing)), "2.00s");
+        assert_eq!(format_duration(Some(&calc_timing)), Some("2s".into()));
+        assert_eq!(format_duration_or_unavailable(Some(&calc_timing)), "2s");
+        assert_eq!(format_duration_ms(59_999), "1m 0s");
+        assert_eq!(format_duration_ms(192_000), "3m 12s");
     }
 
     #[test]
@@ -1144,35 +1546,26 @@ mod tests {
     }
 
     #[test]
-    fn test_idempotent_deltas() {
-        // Scenario 7: Apply the same delta twice and keep one record.
-        let mut records = Vec::new();
-        let record = TrajectoryRecord {
-            id: TrajectoryRecordId::new("run-1", 1, 0),
-            chat_id: "chat-1".into(),
-            run_id: "run-1".into(),
-            source_seq: 1,
-            sub_seq: 0,
-            lane: TrajectoryLane::Input,
-            kind: TrajectoryRecordKind::UserMessage,
-            status: TrajectoryStatus::Completed,
-            is_partial: false,
-            title: "User".into(),
-            summary: "Hello".into(),
-            turn_id: None,
-            step_id: None,
-            call_id: None,
-            parent_tool_use_id: None,
-            timing: None,
-            usage: None,
-            payload: None,
-            result: None,
-            error_message: None,
-            is_degraded: false,
-        };
+    fn late_partial_cannot_clobber_an_existing_final_record() {
+        let mut final_record = test_record(
+            1,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        final_record.summary = "Final".into();
 
-        apply_deltas(&mut records, vec![record.clone(), record]);
+        let mut late_partial = final_record.clone();
+        late_partial.status = TrajectoryStatus::Running;
+        late_partial.is_partial = true;
+        late_partial.summary = "Late partial".into();
+
+        let mut records = vec![final_record];
+        apply_deltas(&mut records, [late_partial]);
+
         assert_eq!(records.len(), 1);
+        assert!(!records[0].is_partial);
+        assert_eq!(records[0].summary, "Final");
+        assert_eq!(records[0].status, TrajectoryStatus::Completed);
     }
 
     #[test]
@@ -1216,6 +1609,140 @@ mod tests {
         assert_eq!(err_exit, Some(1));
         assert!(!err_sum.contains("ghp_"));
         assert!(!err_prev.as_ref().unwrap().contains("ghp_"));
+    }
+
+    #[test]
+    fn sanitization_redacts_secret_shapes_and_hides_mcp_inputs() {
+        let secret_shapes = [
+            "ghp_short",
+            "gho_short",
+            "github_pat_short",
+            "sk-short",
+            "xoxb-short",
+            "AKIA1234567890ABCDEF",
+            "Bearer short",
+            "Authorization: short",
+            "password=short",
+            "token=short",
+            "api_key=short",
+            "api-key=short",
+            "apikey=short",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+        ];
+        for secret in secret_shapes {
+            let call = ToolCall::Exec {
+                command: format!("echo {secret}"),
+            };
+            let (summary, preview, _) = sanitize_tool_call(&call, 1_024);
+            assert!(!summary.contains(secret), "summary leaked {secret}");
+            assert!(
+                !preview.as_deref().unwrap().contains(secret),
+                "preview leaked {secret}"
+            );
+        }
+
+        let authorization = ToolCall::Exec {
+            command: "curl -H 'Authorization: Basic short-credential'".into(),
+        };
+        let (summary, preview, _) = sanitize_tool_call(&authorization, 1_024);
+        assert!(!summary.contains("short-credential"));
+        assert!(!preview.as_deref().unwrap().contains("short-credential"));
+
+        for (assignment, secret) in [
+            ("curl --password=hunter2", "hunter2"),
+            ("run --token=short-token", "short-token"),
+            ("curl -H 'X-Api-Key: abc123'", "abc123"),
+            (r#"send '{"password":"json-secret"}'"#, "json-secret"),
+        ] {
+            let call = ToolCall::Exec {
+                command: assignment.into(),
+            };
+            let (summary, preview, _) = sanitize_tool_call(&call, 1_024);
+            assert!(!summary.contains(secret), "summary leaked {secret}");
+            assert!(
+                !preview.as_deref().unwrap().contains(secret),
+                "preview leaked {secret}"
+            );
+        }
+
+        let prompt = "Use ghp_prompt-secret with Authorization: Bearer sk-prompt-secret";
+        let (summary, preview) = sanitize_prompt_preview(prompt, 1_024);
+        assert!(!summary.contains("ghp_prompt-secret"));
+        assert!(!summary.contains("sk-prompt-secret"));
+        assert!(!preview.as_deref().unwrap().contains("ghp_prompt-secret"));
+        assert!(!preview.as_deref().unwrap().contains("sk-prompt-secret"));
+
+        let mcp_input = serde_json::json!({
+            "token": "ghp_mcp-secret",
+            "path": "/tmp/input",
+            "recursive": true
+        });
+        let input_bytes = mcp_input.to_string().len();
+        let mcp = ToolCall::Mcp {
+            server: "filesystem".into(),
+            tool: "read".into(),
+            input: Some(mcp_input),
+        };
+        let (summary, preview, schema) = sanitize_tool_call(&mcp, 1_024);
+        assert!(!summary.contains("ghp_mcp-secret"));
+        assert_eq!(
+            preview.as_deref(),
+            Some(format!("args: path, recursive, token ({input_bytes} bytes)").as_str())
+        );
+        assert!(!preview.as_deref().unwrap().contains("ghp_mcp-secret"));
+        assert!(!schema.as_deref().unwrap().contains("ghp_mcp-secret"));
+
+        let unknown = ToolCall::Unknown {
+            name: "custom".into(),
+            input: Some(serde_json::json!({
+                "authorization": "Bearer sk-unknown-secret"
+            })),
+        };
+        let (summary, preview, schema) = sanitize_tool_call(&unknown, 1_024);
+        assert!(!summary.contains("sk-unknown-secret"));
+        assert!(!preview.as_deref().unwrap().contains("sk-unknown-secret"));
+        assert!(!schema.as_deref().unwrap().contains("sk-unknown-secret"));
+        assert!(
+            preview
+                .as_deref()
+                .unwrap()
+                .starts_with("args: authorization (")
+        );
+    }
+
+    #[test]
+    fn trajectory_wire_values_are_forward_tolerant_and_camel_case() {
+        let kind = serde_json::to_value(TrajectoryRecordKind::ToolCall {
+            tool_name: "bash".into(),
+        })
+        .unwrap();
+        assert_eq!(kind["toolName"], "bash");
+        assert!(kind.get("tool_name").is_none());
+
+        assert_eq!(
+            serde_json::from_str::<TrajectoryLane>("\"futureLane\"").unwrap(),
+            TrajectoryLane::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<TrajectoryStatus>("\"futureStatus\"").unwrap(),
+            TrajectoryStatus::Unknown
+        );
+        assert_eq!(
+            serde_json::to_string(&TrajectoryLane::Tools).unwrap(),
+            "\"tools\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TrajectoryStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+
+        let raw_ref: TrajectoryRawRef = serde_json::from_value(serde_json::json!({
+            "chatId": "chat-1",
+            "sourceSeq": 1,
+            "field": "payload"
+        }))
+        .unwrap();
+        assert_eq!(raw_ref.source_version, 1);
     }
 
     #[test]

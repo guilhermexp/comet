@@ -502,6 +502,9 @@ impl EngineCore {
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
+        if let Err(err) = self.trajectory.sync_flush() {
+            tracing::warn!(error = %err, "trajectory writer flush failed during shutdown");
+        }
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
@@ -1412,5 +1415,70 @@ mod tests {
             },
         );
         assert!(seq > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_trajectory_shutdown_flushes_queued_records() {
+        let temp = TempDir::new().unwrap();
+        let profile = EngineProfile::development(temp.path(), "dev_org", "dev_user");
+        let store_root = profile.store_root().to_path_buf();
+        let lock = InstanceLock::acquire(profile.device_root()).unwrap();
+        let engine = Arc::new(
+            EngineCore::assemble_with_profile_locked(
+                profile,
+                Arc::new(HarnessRegistry::new()),
+                HarnessId::Mock,
+                None,
+                lock,
+            )
+            .unwrap(),
+        );
+
+        let db_path = store_root.join("trajectory.sqlite3");
+        let lock_conn = rusqlite::Connection::open(&db_path).unwrap();
+        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        engine
+            .trajectory
+            .try_enqueue(zeron_proto::trajectory::TrajectoryRecord {
+                id: zeron_proto::trajectory::TrajectoryRecordId::new("run", 1, 0),
+                chat_id: "chat-shutdown".into(),
+                run_id: "run".into(),
+                source_seq: 1,
+                sub_seq: 0,
+                lane: zeron_proto::trajectory::TrajectoryLane::Input,
+                kind: zeron_proto::trajectory::TrajectoryRecordKind::UserMessage,
+                status: zeron_proto::trajectory::TrajectoryStatus::Completed,
+                is_partial: false,
+                title: "Prompt".into(),
+                summary: "Persist me".into(),
+                turn_id: None,
+                step_id: None,
+                call_id: None,
+                parent_tool_use_id: None,
+                timing: None,
+                usage: None,
+                payload: None,
+                result: None,
+                error_message: None,
+                is_degraded: false,
+            })
+            .unwrap();
+
+        let shutdown = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.shutdown().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait for the trajectory writer queue"
+        );
+
+        lock_conn.execute_batch("COMMIT").unwrap();
+        shutdown.await.unwrap();
+        drop(engine);
+
+        let reopened = TrajectoryStore::open(&store_root).unwrap();
+        assert_eq!(reopened.list_all_records("chat-shutdown").unwrap().len(), 1);
     }
 }

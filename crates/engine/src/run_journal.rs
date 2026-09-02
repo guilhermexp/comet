@@ -465,27 +465,11 @@ impl RunJournal {
             }
 
             if parsed.seq > source_seq {
-                return Ok(TrajectoryRawRevealResult::unavailable(
-                    field,
-                    TrajectoryUnavailableReason::NotFound,
-                    Some("Event sequence not found in journal".into()),
-                ));
+                return Ok(scan_missed_sequence(field, had_corrupt_line));
             }
         }
 
-        if had_corrupt_line {
-            return Ok(TrajectoryRawRevealResult::unavailable(
-                field,
-                TrajectoryUnavailableReason::SourceCorrupt,
-                Some("Journal file contains corrupt line".into()),
-            ));
-        }
-
-        Ok(TrajectoryRawRevealResult::unavailable(
-            field,
-            TrajectoryUnavailableReason::NotFound,
-            Some("Event sequence not found in journal".into()),
-        ))
+        Ok(scan_missed_sequence(field, had_corrupt_line))
     }
 
     fn file_tool_input_scoped_impl(
@@ -742,6 +726,45 @@ fn cap_reveal_text(mut text: String) -> String {
     text
 }
 
+fn mismatched_call_id(
+    field: TrajectoryRawField,
+    expected_id: &str,
+    journal_id: &str,
+) -> TrajectoryRawRevealResult {
+    tracing::debug!(
+        expected_call_id = expected_id,
+        journal_call_id = journal_id,
+        "journal: raw reveal call id mismatch"
+    );
+    TrajectoryRawRevealResult::unavailable(
+        field,
+        TrajectoryUnavailableReason::MismatchedReference,
+        Some("Raw reference does not match the journal event".into()),
+    )
+}
+
+/// The scan passed `source_seq` (or ran out of lines) without matching. A corrupt line in the
+/// scanned prefix means the record may well have been there but was unreadable, which the client
+/// must be able to distinguish from a genuinely absent sequence.
+fn scan_missed_sequence(
+    field: TrajectoryRawField,
+    had_corrupt_line: bool,
+) -> TrajectoryRawRevealResult {
+    if had_corrupt_line {
+        TrajectoryRawRevealResult::unavailable(
+            field,
+            TrajectoryUnavailableReason::SourceCorrupt,
+            Some("Journal file contains corrupt line".into()),
+        )
+    } else {
+        TrajectoryRawRevealResult::unavailable(
+            field,
+            TrajectoryUnavailableReason::NotFound,
+            Some("Event sequence not found in journal".into()),
+        )
+    }
+}
+
 fn extract_raw_payload(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryRawRevealResult {
     match event {
         AgentEvent::SessionStarted {
@@ -778,16 +801,10 @@ fn extract_raw_payload(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryR
             cap_reveal_text(text.clone()),
         ),
         AgentEvent::ToolCall { id, call } => {
-            if let Some(expected_id) = call_id {
-                if id != expected_id {
-                    return TrajectoryRawRevealResult::unavailable(
-                        TrajectoryRawField::Payload,
-                        TrajectoryUnavailableReason::MismatchedReference,
-                        Some(format!(
-                            "Call id mismatch: expected {expected_id}, found {id}"
-                        )),
-                    );
-                }
+            if let Some(expected_id) = call_id
+                && id != expected_id
+            {
+                return mismatched_call_id(TrajectoryRawField::Payload, expected_id, id);
             }
             let raw_text = match call {
                 ToolCall::WriteFile {
@@ -817,16 +834,10 @@ fn extract_raw_payload(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryR
             )
         }
         AgentEvent::ToolCallPreview { id, call } => {
-            if let Some(expected_id) = call_id {
-                if id != expected_id {
-                    return TrajectoryRawRevealResult::unavailable(
-                        TrajectoryRawField::Payload,
-                        TrajectoryUnavailableReason::MismatchedReference,
-                        Some(format!(
-                            "Call id mismatch: expected {expected_id}, found {id}"
-                        )),
-                    );
-                }
+            if let Some(expected_id) = call_id
+                && id != expected_id
+            {
+                return mismatched_call_id(TrajectoryRawField::Payload, expected_id, id);
             }
             TrajectoryRawRevealResult::available(
                 TrajectoryRawField::Payload,
@@ -863,16 +874,10 @@ fn extract_raw_result(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryRa
             is_error: _,
             ..
         } => {
-            if let Some(expected_id) = call_id {
-                if id != expected_id {
-                    return TrajectoryRawRevealResult::unavailable(
-                        TrajectoryRawField::Result,
-                        TrajectoryUnavailableReason::MismatchedReference,
-                        Some(format!(
-                            "Call id mismatch: expected {expected_id}, found {id}"
-                        )),
-                    );
-                }
+            if let Some(expected_id) = call_id
+                && id != expected_id
+            {
+                return mismatched_call_id(TrajectoryRawField::Result, expected_id, id);
             }
             if let Some(diff) = diff {
                 let diff_text =
@@ -1531,5 +1536,92 @@ mod tests {
         assert_eq!(snapshot, None, "must not fabricate the older body");
         assert!(stats.oversized_line);
         assert!(stats.max_buffer_bytes <= MAX_REVERSE_SCAN_LINE_BYTES + REVERSE_SCAN_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn raw_reveal_mismatched_call_id_does_not_disclose_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let cases = [
+            (
+                "tool-call",
+                AgentEvent::ToolCall {
+                    id: "journal-secret-call-id".into(),
+                    call: ToolCall::Exec {
+                        command: "true".into(),
+                    },
+                },
+                TrajectoryRawField::Payload,
+            ),
+            (
+                "tool-preview",
+                AgentEvent::ToolCallPreview {
+                    id: "journal-secret-preview-id".into(),
+                    call: ToolCall::Exec {
+                        command: "true".into(),
+                    },
+                },
+                TrajectoryRawField::Payload,
+            ),
+            (
+                "tool-result",
+                AgentEvent::ToolResult {
+                    id: "journal-secret-result-id".into(),
+                    is_error: false,
+                    output: Some("ok".into()),
+                    diff: None,
+                    execution: None,
+                },
+                TrajectoryRawField::Result,
+            ),
+        ];
+
+        for (chat_id, event, field) in cases {
+            let seq = journal.append(chat_id, &event).unwrap();
+            let result = journal
+                .raw_reveal(chat_id, seq, None, Some("client-call-id"), field)
+                .unwrap();
+            match result {
+                TrajectoryRawRevealResult::Unavailable {
+                    reason, message, ..
+                } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::MismatchedReference);
+                    assert_eq!(
+                        message.as_deref(),
+                        Some("Raw reference does not match the journal event")
+                    );
+                    let message = message.unwrap();
+                    assert!(!message.contains("client-call-id"));
+                    assert!(!message.contains("journal-secret"));
+                }
+                other => panic!("expected mismatched reference, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn raw_reveal_corrupt_prefix_precedes_sequence_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let valid_line = serde_json::to_vec(&JournalLine {
+            seq: 2,
+            event: text("later"),
+        })
+        .unwrap();
+        let mut contents = b"{malformed}\n".to_vec();
+        contents.extend_from_slice(&valid_line);
+        contents.push(b'\n');
+        std::fs::write(journal.path_for("chat"), contents).unwrap();
+
+        let result = journal
+            .raw_reveal("chat", 1, None, None, TrajectoryRawField::Payload)
+            .unwrap();
+        assert!(matches!(
+            result,
+            TrajectoryRawRevealResult::Unavailable {
+                reason: TrajectoryUnavailableReason::SourceCorrupt,
+                ..
+            }
+        ));
     }
 }
