@@ -26,6 +26,7 @@ pub mod instance_lock;
 pub(crate) mod kimi_usage;
 pub mod live_voice;
 pub mod local_import;
+pub(crate) mod process;
 pub mod profile;
 mod provider_usage_archive;
 pub mod registry;
