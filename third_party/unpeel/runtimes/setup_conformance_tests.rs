@@ -1333,8 +1333,13 @@ mod tests {
         assert!(super::CODEX_WRAPPER_SCRIPT.contains("UNPEEL_REAL_CODEX_BIN"));
         assert!(super::CODEX_WRAPPER_SCRIPT.contains("UNPEEL_ORIGINAL_PATH"));
         assert!(super::CODEX_WRAPPER_SCRIPT.contains("[ \"$REAL_BIN\" -ef \"$0\" ]"));
-        assert!(super::CODEX_WRAPPER_SCRIPT
-            .contains("notify=[\\\"bash\\\",\\\"$UNPEEL_CODEX_NOTIFY_PATH\\\"]"));
+        // The interpreter is named absolutely (`${BASH:-/bin/bash}`) since
+        // 6067d9ad: Codex spawns notify with its own environment and a PATH
+        // lookup dies there as an unattributable 127.
+        assert!(super::CODEX_WRAPPER_SCRIPT.contains("UNPEEL_NOTIFY_BASH=\"${BASH:-/bin/bash}\""));
+        assert!(super::CODEX_WRAPPER_SCRIPT.contains(
+            "notify=[\\\"$UNPEEL_NOTIFY_BASH\\\",\\\"$UNPEEL_CODEX_NOTIFY_PATH\\\"]"
+        ));
     }
 
     #[test]

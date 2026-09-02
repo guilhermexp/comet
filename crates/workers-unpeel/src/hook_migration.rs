@@ -40,10 +40,16 @@ pub(crate) fn is_comet_application_process() -> bool {
         .is_some_and(|name| name == "zeron")
 }
 
+/// Install every runtime's Comet-managed hooks.
+///
+/// One runtime's failure must not skip the runtimes behind it in the catalog:
+/// the loop is the only installer, so an early `?` used to leave every later
+/// runtime hookless while the user saw the ones ahead of it working.
 fn install_comet_managed_hooks() -> Result<(), String> {
     std::fs::create_dir_all(unpeel_core::app_paths::app_hooks_root())
         .map_err(|error| format!("Failed to create Comet hook root: {error}"))?;
     let mut installed = HashSet::new();
+    let mut failures = Vec::new();
     for runtime in
         unpeel_core::runtime_catalog::builtin_runtime_catalog().current_platform_descriptors()
     {
@@ -55,14 +61,17 @@ fn install_comet_managed_hooks() -> Result<(), String> {
         {
             continue;
         }
-        unpeel_core::integrations::install_runtime_support(alias).map_err(|error| {
-            format!(
+        if let Err(error) = unpeel_core::integrations::install_runtime_support(alias) {
+            failures.push(format!(
                 "Failed to install Comet hooks for runtime {} ({alias}): {error}",
                 runtime.id
-            )
-        })?;
+            ));
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(failures.join("; "))
 }
 
 /// Restore the upstream-owned launch assets when any is missing.
@@ -189,25 +198,35 @@ fn prune_legacy_hook_root(legacy_root: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// A provider config is stale when it still points at a managed hook under the
+/// legacy root or under a throwaway root (demo/test homes).
+///
+/// The throwaway-root probe is per line, because a config command is one line
+/// in every provider format we write. Whole-file matching made any unrelated
+/// tool's temp-path hook (an orchestrator wrapper in `~/.codex/hooks.json`)
+/// look like our own stale asset and blocked the migration for good.
 fn config_has_stale_managed_hook(raw: &str, legacy_root: &str) -> bool {
     if raw.contains(legacy_root) || raw.contains("/.unpeel/hooks/") {
         return true;
     }
-    let temporary_root =
-        raw.contains("/tmp/") || raw.contains("/private/tmp/") || raw.contains("/var/folders/");
-    temporary_root
-        && [
-            "claude-hooks.sh",
-            "codex-notify-hook.sh",
-            "notify-hook.sh",
-            "kimi-hook.sh",
-            "gemini-hook.sh",
-            "grok-hook.sh",
-            "cursor-hook.sh",
-            "kiro-hook.sh",
-            "copilot-hook.sh",
-            "cline-hook.sh",
-        ]
-        .iter()
-        .any(|name| raw.contains(name))
+    raw.lines().any(|line| {
+        let temporary_root = line.contains("/tmp/")
+            || line.contains("/private/tmp/")
+            || line.contains("/var/folders/");
+        temporary_root
+            && [
+                "claude-hooks.sh",
+                "codex-notify-hook.sh",
+                "notify-hook.sh",
+                "kimi-hook.sh",
+                "gemini-hook.sh",
+                "grok-hook.sh",
+                "cursor-hook.sh",
+                "kiro-hook.sh",
+                "copilot-hook.sh",
+                "cline-hook.sh",
+            ]
+            .iter()
+            .any(|name| line.contains(name))
+    })
 }

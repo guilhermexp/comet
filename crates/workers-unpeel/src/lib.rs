@@ -3117,6 +3117,7 @@ mod runtime_capability_tests {
     fn completion_notifications_follow_the_pinned_runtime_catalog() {
         let mut sessions = vec![
             session("claude"),
+            session("agy"),
             session("pi"),
             session("omp"),
             session("prime-agent"),
@@ -3128,6 +3129,7 @@ mod runtime_capability_tests {
         assert!(!sessions[1].capabilities.notify_when_done);
         assert!(sessions[2].capabilities.notify_when_done);
         assert!(sessions[3].capabilities.notify_when_done);
+        assert!(sessions[4].capabilities.notify_when_done);
     }
 }
 

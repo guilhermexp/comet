@@ -1084,19 +1084,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut engine = ActivityEngine::default();
         let now = SystemTime::now();
+        // `agy` is output-driven by descriptor; `pi` now ships the pi-family
+        // lifecycle extension and is hook-owned.
         assert_eq!(
-            derive_activity(&mut engine, input("s1", "pi", directory.path(), 1), now),
+            derive_activity(&mut engine, input("s1", "agy", directory.path(), 1), now),
             None
         );
         assert_eq!(
-            derive_activity(&mut engine, input("s1", "pi", directory.path(), 2), now),
+            derive_activity(&mut engine, input("s1", "agy", directory.path(), 2), now),
             None
         );
     }
 
     #[test]
     fn pi_family_workers_stop_spinning_immediately_after_agent_end() {
-        for command in ["omp", "prime-agent"] {
+        for command in ["pi", "omp", "prime-agent"] {
             let directory = tempfile::tempdir().unwrap();
             let mut engine = ActivityEngine::default();
             let now = SystemTime::now();

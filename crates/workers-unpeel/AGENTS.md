@@ -21,7 +21,7 @@ internal host modes (`__session_host__` et al.).
 | `session_event_journal.rs` | Session output/event journaling |
 | `parent_notifications.rs` | Worker→parent task notifications (register/begin/confirm/ack/cancel, completion evidence) |
 | `workspace_trust.rs` | Workspace trust decisions |
-| `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()`, then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
+| `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
 | `tests/` | Integration tests per surface |
 
@@ -245,6 +245,30 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   a trace breadcrumb instead of failing the turn when no interpreter exists.
   Codex hooks deliver their payload on **stdin** (`argc=0`, measured), so any
   new hook asset that reads `$1` must keep the `cat` fallback.
+- **Os três CLIs da família pi são hook-owned, `pi` inclusive.** `pi`, `omp` e
+  `prime-agent` aceitam `-e/--extension` e rodam a mesma API de extensão
+  (`agent_start`/`agent_end`), então os três recebem
+  `runtimes/_shared/pi-family/assets/lifecycle-extension.js` e declaram
+  `lifecycle_hooks` + `notify_when_done`. O append idempotente do flag mora em
+  `setup::with_lifecycle_extension`; o gate de alias fica no adapter de cada
+  runtime, porque `pi` tem resume/context próprios e não inclui o `mod.rs`
+  compartilhado. Runtime sem hooks no catálogo hoje é o `agy` — é ele que os
+  testes usam para exercitar o ramo hookless de `derive_activity`.
+- **Reinstalação limpa de CLI é o caso normal, não a exceção.** Apagar
+  `~/.unpeel` (ou a poda do root legado) some com o diretório onde a extensão
+  de lifecycle é escrita, e `write_file_atomic` falhava com `No such file or
+  directory`: medido em 2026-09-01, `Failed to install Comet hooks for runtime
+  sh.omp.cli (omp)` no `trace.log`. Duas regras saíram disso: o writer cria o
+  diretório pai (como `write_executable_script` sempre fez), e
+  `install_comet_managed_hooks` acumula falhas em vez de sair no primeiro `?`
+  — o loop é o único instalador, então abortar nele deixava todo runtime
+  atrás do que falhou (ordem do catálogo) sem hooks, com o usuário vendo
+  "todos os outros funcionam".
+- **Hook alheio sob `/tmp` não é asset nosso.** `config_has_stale_managed_hook`
+  casa root temporário e nome de hook gerenciado **na mesma linha**: o teste
+  por arquivo inteiro fazia um wrapper de outra ferramenta em
+  `~/.codex/hooks.json` (`/private/tmp/orchestrator-…`) parecer asset stale e
+  bloqueava a migração para sempre.
 
 ## Work Guidance
 
@@ -281,7 +305,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
-| `tests/hook_migration.rs` (5) | integration | `--test hook_migration` |
+| `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
 
 ## Child DOX Index
 
