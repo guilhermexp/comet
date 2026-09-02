@@ -129,9 +129,13 @@ Test: unit — sonda de conversa retomável no `activity_bridge`.
 ### Requirement: A decisão de hibernar é reconfirmada antes de executar
 
 O sistema MUST reavaliar a política sobre um snapshot fresco separado antes de
-parar cada Worker, MUST parar somente os Workers presentes nas duas avaliações,
-e MUST comparar no boundary de lifecycle um token da atividade observada antes
-de executar Stop+Archive. Mudança do token MUST rejeitar a ação sem enviar Stop.
+parar cada Worker, MUST reler a seleção atual depois desse snapshot, e MUST
+parar somente os Workers presentes nas duas avaliações e ainda não
+selecionados. O Session Host MUST comparar, sob sua fronteira serializada de
+atividade, um token que cubra input, output, hook, tela, geração e incarnação
+antes de executar Stop; mudança do token ou output pendente MUST rejeitar a
+ação sem enviar Stop. Archive MUST ser gravado somente depois de o Host
+publicar `exited`.
 
 #### Scenario: Worker recebe trabalho entre a decisão e a execução
 Test: unit — segunda passada da política sobre snapshot fresco.
@@ -139,15 +143,22 @@ Test: unit — segunda passada da política sobre snapshot fresco.
 - **WHEN** um Worker era candidato no snapshot do painel e, no snapshot
   fresco, voltou a trabalhar
 - **THEN** ele não é parado
-- **AND** os demais candidatos seguem sendo parados
+- **AND** os demais candidatos seguem sendo avaliados
 
-#### Scenario: Worker recebe input depois da confirmação fresca
-Test: integration — input e hibernação automática no mesmo boundary de lifecycle.
+#### Scenario: Worker recebe input ou output depois da confirmação fresca
+Test: integration — protocolo real do Session Host em `agent_restart_process`.
 
-- **WHEN** um `send_text` é aceito depois de capturado o token da confirmação
-  fresca e antes da execução da hibernação
-- **THEN** o token diverge e nenhum Stop é enviado
-- **AND** o Worker não recebe o marker de Archive
+- **WHEN** input direto ou output do runtime ocorre depois de capturado o token
+  da confirmação fresca e antes da execução da hibernação
+- **THEN** a revisão do Host diverge e nenhum Stop é enviado
+- **AND** o Worker permanece `running` e não recebe marker de Archive
+
+#### Scenario: Usuário seleciona Worker durante o lote
+Test: unit — política de hibernação com a seleção corrente.
+
+- **WHEN** um Worker era candidato, mas passa a ser a sessão selecionada antes
+  da avaliação individual
+- **THEN** a seleção relida o exclui e nenhum comando de hibernação é enviado
 
 #### Scenario: A segunda passada não amplia a primeira
 Test: unit — segunda passada da política sobre snapshot fresco.

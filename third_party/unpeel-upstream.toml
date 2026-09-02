@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "274b64966708d205fbfec648ce2edceb3a898340"
+vendored_tree = "1d03bbdc561ef782d023cae7a833f219e1931077"
 vendored_from = "working-tree"
 local_modifications_count = 29
 local_patch_available = false

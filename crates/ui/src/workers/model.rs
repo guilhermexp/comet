@@ -831,10 +831,9 @@ impl WorkersModel {
     /// "already tried" state to drift from the host.
     ///
     /// The decision is taken twice: once on the snapshot the panel holds and
-    /// again on a fresh bootstrap inside the task, because `Archive` stops a
-    /// live session without looking at activity and the gap between the two
-    /// is wide enough for a `send_text` to land (see
-    /// `confirmed_hibernation_candidates`).
+    /// again on a fresh bootstrap per candidate. The current selection is read
+    /// after that bootstrap, then the Host compares its activity token before
+    /// accepting the conditional stop (see `confirmed_hibernation_candidates`).
     fn hibernate_idle_workers(&mut self, cx: &mut Context<Self>) {
         let (Some(snapshot), Some(settings)) = (self.snapshot.as_ref(), self.settings.as_ref())
         else {
@@ -854,59 +853,74 @@ impl WorkersModel {
         }
         let client = self.client.clone();
         let resources = settings.resources.clone();
-        let selected = self.selected_session_id.clone();
-        cx.background_executor()
-            .spawn(async move {
-                for candidate_id in candidate_ids {
-                    let fresh = match client.bootstrap() {
-                        Ok(bootstrap) => bootstrap.sessions,
-                        Err(error) => {
-                            tracing::warn!(%error, session_id = %candidate_id, "could not re-check idle worker before hibernating");
-                            continue;
-                        }
-                    };
-                    let previous = [candidate_id];
-                    let Some(session) = confirmed_hibernation_candidates(
-                        &previous,
-                        &fresh,
-                        &resources,
-                        selected.as_deref(),
-                        Self::unix_time_ms(),
-                    )
-                    .into_iter()
-                    .next()
-                    .cloned()
-                    else {
+        cx.spawn(async move |this, cx| {
+            for candidate_id in candidate_ids {
+                let bootstrap_client = client.clone();
+                let fresh = match cx
+                    .background_executor()
+                    .spawn(async move { bootstrap_client.bootstrap() })
+                    .await
+                {
+                    Ok(bootstrap) => bootstrap.sessions,
+                    Err(error) => {
+                        tracing::warn!(%error, session_id = %candidate_id, "could not re-check idle worker before hibernating");
                         continue;
-                    };
-                    let Some(expected_activity_token) = session.hibernation_activity_token.clone()
-                    else {
-                        continue;
-                    };
-                    let idle_minutes = session
-                        .idle_since_unix_ms
-                        .map(|idle_since| Self::unix_time_ms().saturating_sub(idle_since) / 60_000);
-                    match client.session_command(
-                        &session,
-                        WorkersSessionCommand::Hibernate {
-                            expected_activity_token,
-                        },
-                    ) {
-                        Ok(_) => tracing::info!(
-                            session_id = %session.id,
-                            title = %session.title,
-                            idle_minutes,
-                            "hibernated idle worker"
-                        ),
-                        Err(error) => tracing::warn!(
-                            %error,
-                            session_id = %session.id,
-                            "could not hibernate idle worker"
-                        ),
                     }
+                };
+                let selected = match this.update(cx, |model, _| model.selected_session_id.clone()) {
+                    Ok(selected) => selected,
+                    Err(_) => return,
+                };
+                let previous = [candidate_id];
+                let Some(session) = confirmed_hibernation_candidates(
+                    &previous,
+                    &fresh,
+                    &resources,
+                    selected.as_deref(),
+                    Self::unix_time_ms(),
+                )
+                .into_iter()
+                .next()
+                .cloned()
+                else {
+                    continue;
+                };
+                let Some(expected_activity_token) = session.hibernation_activity_token.clone()
+                else {
+                    continue;
+                };
+                let idle_minutes = session
+                    .idle_since_unix_ms
+                    .map(|idle_since| Self::unix_time_ms().saturating_sub(idle_since) / 60_000);
+                let command_client = client.clone();
+                let command_session = session.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        command_client.session_command(
+                            &command_session,
+                            WorkersSessionCommand::Hibernate {
+                                expected_activity_token,
+                            },
+                        )
+                    })
+                    .await;
+                match result {
+                    Ok(_) => tracing::info!(
+                        session_id = %session.id,
+                        title = %session.title,
+                        idle_minutes,
+                        "hibernated idle worker"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        session_id = %session.id,
+                        "could not hibernate idle worker"
+                    ),
                 }
-            })
-            .detach();
+            }
+        })
+        .detach();
     }
 
     fn dispatch_parent_notifications(

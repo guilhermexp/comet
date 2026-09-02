@@ -165,7 +165,7 @@ fn stop_session_unlocked(session_id: &str) -> Result<(), String> {
     ))
 }
 
-pub fn hibernation_activity_token(session_id: &str) -> Option<String> {
+fn persisted_hibernation_activity_token(session_id: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let manifest = load_manifest(session_id)?;
@@ -198,6 +198,34 @@ pub fn hibernation_activity_token(session_id: &str) -> Option<String> {
         }
     }
     Some(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn host_hibernation_activity_token(
+    session_id: &str,
+    activity_revision: u64,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let persisted = persisted_hibernation_activity_token(session_id)?;
+    let mut digest = Sha256::new();
+    digest.update(persisted);
+    digest.update(activity_revision.to_le_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+pub fn hibernation_activity_token(session_id: &str) -> Option<String> {
+    let response = socket_command(
+        session_id,
+        serde_json::json!({ "type": "hibernation_token" }),
+    )
+    .ok()?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    response
+        .get("activity_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn write_input_activity_marker_unlocked(session_id: &str) -> Result<(), String> {
@@ -271,12 +299,26 @@ pub fn archive_session_if_activity_matches(
     expected_activity_token: &str,
 ) -> Result<(), String> {
     let _lifecycle_lock = lock_session_lifecycle(session_id)?;
-    if hibernation_activity_token(session_id).as_deref() != Some(expected_activity_token) {
+    let response = socket_command(
+        session_id,
+        serde_json::json!({
+            "type": "hibernate",
+            "expected_activity_token": expected_activity_token,
+        }),
+    )?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("session host rejected hibernation")
+            .to_owned());
+    }
+    if !wait_for_exited_manifest(session_id, STOP_WAIT) {
         return Err(format!(
-            "session {session_id} activity changed after hibernation confirmation"
+            "session {session_id} host did not publish an exited manifest within {}ms",
+            STOP_WAIT.as_millis()
         ));
     }
-    stop_session_unlocked(session_id)?;
     archive_session_unlocked(session_id)
 }
 

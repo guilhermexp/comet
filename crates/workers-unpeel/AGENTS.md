@@ -178,14 +178,17 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
     gravar `stopped_at`. Só `Stop`/`StopFailure` de hook real confirmam.
   Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
   quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
-- **A decisão de hibernar é tomada por Worker e confirmada no boundary de lifecycle.**
+- **A decisão de hibernar é tomada por Worker e confirmada no Host.**
   `confirmed_hibernation_candidates` reavalia cada candidato sobre um bootstrap
-  próprio imediatamente antes da ação e nunca amplia a primeira passada. O
-  comando automático usa `Hibernate`, não o `Archive` manual: carrega um token
-  opaco da geração/incarnação e dos sinais de atividade, e
-  `archive_session_if_activity_matches` compara-o sob o mesmo lifecycle lock que
-  serializa `send_text` antes de Stop+Archive. Mudança de input, hook, tela,
-  geração ou Host rejeita a hibernação sem enviar Stop.
+  próprio imediatamente antes da ação e nunca amplia a primeira passada; a UI
+  também relê a seleção atual depois desse bootstrap. O comando automático usa
+  `Hibernate`, não o `Archive` manual. Hosts no protocolo 5 mintam um token
+  opaco da geração/incarnação, hook/tela e de uma revisão em memória que avança
+  sincronicamente para `Write`, `StreamInput` e cada leitura de output. O Host
+  compara sob o mesmo lock, recusa output pendente e só então aceita o Stop;
+  `session_ops` mantém o lifecycle lock até o manifest `exited` e só depois
+  grava Archive. Mudança de input, output, hook, tela, geração, Host ou seleção
+  protege o Worker. `Archive` manual continua incondicional.
 - **`send_text` num Worker morto é entrada perdida, não erro do host.**
   `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
   esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
@@ -353,7 +356,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
-| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (5), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
+| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
 
 ## Child DOX Index

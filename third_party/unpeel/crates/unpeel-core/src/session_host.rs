@@ -33,7 +33,9 @@ pub const SESSION_HOST_RESUME_AGENT_PROTOCOL_VERSION: u32 = 3;
 /// makes surviving pre-retention hosts eligible for the normal Reload Terminal
 /// recommendation instead of letting their output logs grow forever.
 pub const SESSION_HOST_BOUNDED_JOURNAL_PROTOCOL_VERSION: u32 = 4;
-const SESSION_HOST_PROTOCOL_VERSION: u32 = SESSION_HOST_BOUNDED_JOURNAL_PROTOCOL_VERSION;
+/// First hosted-PTY protocol with Host-serialized automatic hibernation.
+pub const SESSION_HOST_HIBERNATION_PROTOCOL_VERSION: u32 = 5;
+const SESSION_HOST_PROTOCOL_VERSION: u32 = SESSION_HOST_HIBERNATION_PROTOCOL_VERSION;
 const DEFAULT_OUTPUT_READ_BYTES: usize = 128 * 1024;
 const DEFAULT_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 /// Terminal output is a recovery/replay journal, not permanent transcript
@@ -527,6 +529,13 @@ pub enum SessionHostCommand {
     ResumeAgent {
         expected_generation: u64,
     },
+    /// Return a Host-owned token covering persisted lifecycle evidence and
+    /// every input/output event already observed by this Host incarnation.
+    HibernationToken,
+    /// Stop only when no Host-observed activity occurred after confirmation.
+    Hibernate {
+        expected_activity_token: String,
+    },
     Kill,
 }
 
@@ -536,6 +545,8 @@ pub struct SessionHostResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport: Option<TerminalViewportSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,6 +673,19 @@ fn wait_for_pty_output(fd: Option<std::os::unix::io::RawFd>, running: &AtomicBoo
             return false;
         }
     }
+}
+
+#[cfg(unix)]
+fn pty_has_pending_output(fd: Option<std::os::unix::io::RawFd>) -> bool {
+    let Some(fd) = fd else {
+        return true;
+    };
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    (unsafe { libc::poll(&mut descriptor, 1, 0) }) != 0
 }
 
 #[cfg(unix)]
@@ -4760,6 +4784,11 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         // authority. Ordinary PTY writes take this lock too, preventing input
         // from being interleaved between stop, shell recovery, and relaunch.
         let agent_restart_lock = Arc::new(Mutex::new(()));
+        // The Host is the only boundary that sees direct socket input and PTY
+        // output synchronously. Hibernation takes this lock to compare one
+        // revision and stop without racing either path.
+        let activity_lock = Arc::new(Mutex::new(()));
+        let activity_revision = Arc::new(AtomicU64::new(0));
         let runtime_generation = Arc::new(AtomicU64::new(0));
         let pending_runtime_generation =
             Arc::new(AtomicU64::new(if launches_resume_agent_runtime {
@@ -5059,6 +5088,8 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         let running_for_listener = Arc::clone(&running);
         let broadcaster_for_listener = Arc::clone(&broadcaster);
         let restart_lock_for_listener = Arc::clone(&agent_restart_lock);
+        let activity_lock_for_listener = Arc::clone(&activity_lock);
+        let activity_revision_for_listener = Arc::clone(&activity_revision);
         let runtime_generation_for_listener = Arc::clone(&runtime_generation);
         let pending_runtime_generation_for_listener = Arc::clone(&pending_runtime_generation);
         let session_id = launch.session.id.clone();
@@ -5086,6 +5117,8 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                         let title_done = Arc::clone(&title_done);
                         let has_been_written_to = Arc::clone(&input_written_for_listener);
                         let agent_restart_lock = Arc::clone(&restart_lock_for_listener);
+                        let activity_lock = Arc::clone(&activity_lock_for_listener);
+                        let activity_revision = Arc::clone(&activity_revision_for_listener);
                         let runtime_generation = Arc::clone(&runtime_generation_for_listener);
                         let pending_runtime_generation =
                             Arc::clone(&pending_runtime_generation_for_listener);
@@ -5101,6 +5134,9 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                                 &title_done,
                                 &has_been_written_to,
                                 &agent_restart_lock,
+                                &activity_lock,
+                                &activity_revision,
+                                reader_fd,
                                 &runtime_generation,
                                 &pending_runtime_generation,
                             );
@@ -5136,9 +5172,14 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             if !wait_for_pty_output(reader_fd, &running) {
                 break;
             }
+            let activity_guard = activity_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    activity_revision.fetch_add(1, Ordering::AcqRel);
+                    drop(activity_guard);
                     // Answer terminal queries at the host and excise them from
                     // the stream: DA1 always (fish blocks seconds on the DA1
                     // reply before any surface can attach), and the wider
@@ -7140,6 +7181,9 @@ fn handle_client(
     title_done: &Arc<AtomicBool>,
     has_been_written_to: &Arc<AtomicBool>,
     agent_restart_lock: &Arc<Mutex<()>>,
+    activity_lock: &Arc<Mutex<()>>,
+    activity_revision: &Arc<AtomicU64>,
+    reader_fd: Option<std::os::unix::io::RawFd>,
     runtime_generation: &Arc<AtomicU64>,
     pending_runtime_generation: &Arc<AtomicU64>,
 ) -> Result<(), String> {
@@ -7210,6 +7254,10 @@ fn handle_client(
                 let _restart_guard = agent_restart_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _activity_guard = activity_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                activity_revision.fetch_add(1, Ordering::AcqRel);
                 let mut guard = runtime.lock().unwrap();
                 guard
                     .writer
@@ -7233,6 +7281,7 @@ fn handle_client(
                     ok: false,
                     error: Some(error.to_string()),
                     viewport: None,
+                    activity_token: None,
                 },
                 Ok(write_id) => {
                     // Serialize idempotency check → PTY write → history
@@ -7244,10 +7293,14 @@ fn handle_client(
                         let _restart_guard = agent_restart_lock
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let _activity_guard = activity_lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let mut guard = runtime.lock().unwrap();
                         if write_id.is_some_and(|id| guard.recent_write_ids.contains(id)) {
                             false
                         } else {
+                            activity_revision.fetch_add(1, Ordering::AcqRel);
                             guard
                                 .writer
                                 .write_all(data.as_bytes())
@@ -7278,11 +7331,13 @@ fn handle_client(
                             ok: true,
                             error: None,
                             viewport: None,
+                            activity_token: None,
                         },
                         Err(error) => SessionHostResponse {
                             ok: false,
                             error: Some(error),
                             viewport: None,
+                            activity_token: None,
                         },
                     }
                 }
@@ -7312,12 +7367,14 @@ fn handle_client(
                 ok: true,
                 error: None,
                 viewport: None,
+                activity_token: None,
             }
         }
         SessionHostCommand::Ping => SessionHostResponse {
             ok: true,
             error: None,
             viewport: None,
+            activity_token: None,
         },
         SessionHostCommand::RestartAgent {
             expected_generation,
@@ -7326,16 +7383,30 @@ fn handle_client(
             expected_generation,
         } => {
             let result = match agent_restart_lock.try_lock() {
-                Ok(_restart_guard) => resume_agent_in_place(
-                    session_id,
-                    runtime,
-                    broadcaster,
-                    runtime_generation,
-                    pending_runtime_generation,
-                    expected_generation,
-                ),
+                Ok(_restart_guard) => {
+                    {
+                        let _activity_guard = activity_lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        activity_revision.fetch_add(1, Ordering::AcqRel);
+                    }
+                    resume_agent_in_place(
+                        session_id,
+                        runtime,
+                        broadcaster,
+                        runtime_generation,
+                        pending_runtime_generation,
+                        expected_generation,
+                    )
+                }
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                     let _restart_guard = poisoned.into_inner();
+                    {
+                        let _activity_guard = activity_lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        activity_revision.fetch_add(1, Ordering::AcqRel);
+                    }
                     resume_agent_in_place(
                         session_id,
                         runtime,
@@ -7354,11 +7425,13 @@ fn handle_client(
                     ok: true,
                     error: None,
                     viewport: None,
+                    activity_token: None,
                 },
                 Err(error) => SessionHostResponse {
                     ok: false,
                     error: Some(error),
                     viewport: None,
+                    activity_token: None,
                 },
             }
         }
@@ -7383,6 +7456,61 @@ fn handle_client(
                 ok: true,
                 error: None,
                 viewport: Some(snapshot),
+                activity_token: None,
+            }
+        }
+        SessionHostCommand::HibernationToken => {
+            let _activity_guard = activity_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let activity_token = crate::session_ops::host_hibernation_activity_token(
+                session_id,
+                activity_revision.load(Ordering::Acquire),
+            );
+            SessionHostResponse {
+                ok: activity_token.is_some(),
+                error: activity_token
+                    .is_none()
+                    .then(|| format!("session {session_id} has no hibernation evidence")),
+                viewport: None,
+                activity_token,
+            }
+        }
+        SessionHostCommand::Hibernate {
+            expected_activity_token,
+        } => {
+            let _restart_guard = agent_restart_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _activity_guard = activity_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = (!pty_has_pending_output(reader_fd))
+                .then(|| {
+                    crate::session_ops::host_hibernation_activity_token(
+                        session_id,
+                        activity_revision.load(Ordering::Acquire),
+                    )
+                })
+                .flatten();
+            if current.as_deref() != Some(expected_activity_token.as_str()) {
+                SessionHostResponse {
+                    ok: false,
+                    error: Some(format!(
+                        "session {session_id} activity changed after hibernation confirmation"
+                    )),
+                    viewport: None,
+                    activity_token: None,
+                }
+            } else {
+                terminate_hosted_runtime(&mut runtime.lock().unwrap());
+                running.store(false, Ordering::Relaxed);
+                SessionHostResponse {
+                    ok: true,
+                    error: None,
+                    viewport: None,
+                    activity_token: None,
+                }
             }
         }
         SessionHostCommand::StreamOutput { .. } => unreachable!(),
@@ -7406,6 +7534,7 @@ fn handle_client(
                 ok: true,
                 error: None,
                 viewport: None,
+                activity_token: None,
             }
         }
     };

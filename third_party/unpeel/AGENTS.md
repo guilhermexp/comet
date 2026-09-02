@@ -526,12 +526,14 @@ once the runtime returns to its shell); add new "should restart" cases through
 that API, never a second banner
 path.
 
-Controller input and automatic hibernation share the per-Session lifecycle
-lock. Each accepted Controller write publishes a unique activity revision
-before entering the PTY. Automatic Stop+Archive compares a fresh opaque token
-covering that revision, hook, parsed screen, runtime generation, and Host
-incarnation under the same lock; divergence sends no Kill. Manual Archive
-keeps its existing unconditional lifecycle semantics.
+Controller input, direct Host input/output and automatic hibernation meet at
+the Session Host. Protocol 5 mints an opaque token from the Host's in-memory
+activity revision plus persisted hook, parsed screen, runtime generation, and
+Host incarnation. `Write`, `StreamInput`, and every PTY read advance the
+revision under the same lock that `Hibernate` uses to compare the token;
+already-pending output rejects the action before Kill. `session_ops` holds the
+per-Session lifecycle lock until the Host publishes `exited`, then writes the
+Archive marker. Manual Archive keeps its existing unconditional semantics.
 
 ## Git Worktrees
 

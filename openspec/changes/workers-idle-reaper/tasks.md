@@ -14,7 +14,7 @@
 ## 2. Disparo no painel
 
 - [x] 2.1 Chamar a política em `WorkersModel::refresh` após o bootstrap e
-  emitir `WorkersSessionCommand::Archive` para cada candidato, com log
+  emitir `WorkersSessionCommand::Hibernate` para cada candidato, com log
   `info` por Worker hibernado e sem estado local de retentativa.
 - [x] 2.2 Expor toggle, minutos e teto na seção Resources de
   `crates/ui/src/workers/settings.rs`, persistindo via o snapshot existente.
@@ -62,6 +62,12 @@
   Stop nem marker de Archive.
 - [x] 3b.6 Restringir `--session-dir` ao caminho canônico exato deste Worker;
   regressões para shared, outro Worker, ancestor, descendant e traversal.
+- [x] 3b.7 Mover a comparação final para o Session Host: protocolo 5 com revisão
+  em memória avançada por `Write`, `StreamInput` e output, recusa de output
+  pendente e Stop condicional; integrações de processo para input e output
+  depois da captura do token.
+- [x] 3b.8 Reler `selected_session_id` depois do bootstrap de cada candidato,
+  imediatamente antes de despachar `Hibernate`.
 
 ## 4. Closeout
 

@@ -1,10 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
-use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
@@ -80,83 +76,6 @@ fn session() -> WorkersSession {
         model_usage: Vec::new(),
         capabilities: WorkersSessionCapabilities::default(),
     }
-}
-
-#[test]
-fn activity_after_confirmation_prevents_hibernation_stop_and_archive()
--> Result<(), Box<dyn std::error::Error>> {
-    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
-    let (home, _guard) = isolated_home()?;
-    write_manifest("session-1", "codex", true);
-    let manifest_path = unpeel_core::session_host::manifest_path("session-1");
-    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    manifest["state"] = serde_json::json!("running");
-    manifest["runtime_launch_generation"] = serde_json::json!(1);
-    manifest["runtime_launched_at"] = serde_json::json!(1);
-    manifest["screen_changed_at"] = serde_json::json!(1);
-    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
-
-    let client = LocalWorkersClient::new();
-    let expected = client
-        .capture_hibernation_activity_token("session-1")
-        .expect("running Worker activity token");
-    let commands = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&commands);
-    let socket = unpeel_core::session_host::socket_path("session-1");
-    let listener = UnixListener::bind(&socket)?;
-    listener.set_nonblocking(true)?;
-    let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut line = String::new();
-                    BufReader::new(stream.try_clone().expect("clone fake host stream"))
-                        .read_line(&mut line)
-                        .expect("read fake host command");
-                    let command: serde_json::Value =
-                        serde_json::from_str(line.trim()).expect("host command json");
-                    observed
-                        .lock()
-                        .expect("command capture")
-                        .push(command["type"].as_str().unwrap_or_default().to_owned());
-                    stream
-                        .write_all(b"{\"ok\":true,\"error\":null}\n")
-                        .expect("answer fake host command");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("fake host accept failed: {error}"),
-            }
-        }
-    });
-
-    client.write("session-1", "new work\r")?;
-    let mut worker = session();
-    worker.state = "running".into();
-    let error = client
-        .session_command(
-            &worker,
-            WorkersSessionCommand::Hibernate {
-                expected_activity_token: expected,
-            },
-        )
-        .expect_err("new activity must invalidate automatic hibernation");
-    assert!(matches!(error, WorkersError::State(message) if message.contains("activity changed")));
-    assert!(
-        !home
-            .path()
-            .join("app-sessions/session-1/archived.json")
-            .exists()
-    );
-
-    server.join().expect("fake host thread");
-    assert_eq!(
-        commands.lock().expect("command capture").as_slice(),
-        ["write"]
-    );
-    Ok(())
 }
 
 #[test]

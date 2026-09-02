@@ -142,11 +142,16 @@ impl ActivityBridge {
             // `HookState::Idle`, and only the former may be acted on
             // destructively (see `WorkersSession::idle_confirmed_by_hook`).
             session.idle_confirmed_by_hook = engine.hook_confirmed_idle(&session.id);
-            session.hibernation_activity_token =
-                unpeel_core::session_ops::hibernation_activity_token(&session.id);
             if let Some(derived) = derived {
                 session.activity =
                     merge_derived_activity(&session.activity, session.unread, derived).to_owned();
+            }
+            if session.idle_confirmed_by_hook
+                && session.resumable_conversation
+                && session.activity == "idle"
+            {
+                session.hibernation_activity_token =
+                    unpeel_core::session_ops::hibernation_activity_token(&session.id);
             }
         }
     }

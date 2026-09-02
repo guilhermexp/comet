@@ -1495,3 +1495,103 @@ fn missing_initial_runtime_clears_pending_on_definitive_wrapper_completion() {
     stop_and_reap(&home, session_id, &mut host);
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+fn hibernation_rejects_runtime_output_after_confirmation() {
+    let home = temp_home("hibernate-output");
+    fs::create_dir_all(&home).unwrap();
+    let emitter = home.join("emit-when-released");
+    write_executable(
+        &emitter,
+        b"#!/bin/bash\nwhile [ ! -f \"$UNPEEL_HOME/release-output\" ]; do sleep 0.01; done\nprintf 'late output\\n'\nexec /bin/sleep 300\n",
+    );
+
+    let session_id = "hibernate-output-session";
+    let launch = write_launch(&home, session_id, &emitter.to_string_lossy());
+    let mut host = spawn_host(&home, &launch, None);
+    let socket = home
+        .join("app-sessions")
+        .join(session_id)
+        .join("session.sock");
+    assert!(wait_until(Duration::from_secs(5), || socket.exists()));
+
+    let confirmed = socket_command(&home, session_id, json!({ "type": "hibernation_token" }));
+    assert_eq!(confirmed["ok"], true, "token response: {confirmed}");
+    let token = confirmed["activity_token"].as_str().unwrap().to_owned();
+
+    fs::write(home.join("release-output"), b"go").unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let current = socket_command(&home, session_id, json!({ "type": "hibernation_token" }));
+        current["activity_token"].as_str() != Some(token.as_str())
+    }));
+
+    let stale = socket_command(
+        &home,
+        session_id,
+        json!({
+            "type": "hibernate",
+            "expected_activity_token": token,
+        }),
+    );
+    assert_eq!(stale["ok"], false, "stale response: {stale}");
+    assert!(host.try_wait().unwrap().is_none(), "Host must remain live");
+
+    assert!(!home
+        .join("app-sessions")
+        .join(session_id)
+        .join("archived.json")
+        .exists());
+    stop_and_reap(&home, session_id, &mut host);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn hibernation_rejects_host_input_after_confirmation() {
+    let home = temp_home("hibernate-input");
+    fs::create_dir_all(&home).unwrap();
+    let sleeper = home.join("silent-sleeper");
+    write_executable(&sleeper, b"#!/bin/bash\nstty -echo\nexec /bin/sleep 300\n");
+
+    let session_id = "hibernate-input-session";
+    let launch = write_launch(&home, session_id, &sleeper.to_string_lossy());
+    let mut host = spawn_host(&home, &launch, None);
+    let socket = home
+        .join("app-sessions")
+        .join(session_id)
+        .join("session.sock");
+    assert!(wait_until(Duration::from_secs(5), || socket.exists()));
+
+    let confirmed = socket_command(&home, session_id, json!({ "type": "hibernation_token" }));
+    assert_eq!(confirmed["ok"], true, "token response: {confirmed}");
+    let token = confirmed["activity_token"].as_str().unwrap().to_owned();
+
+    let written = socket_command(
+        &home,
+        session_id,
+        json!({
+            "type": "write",
+            "data": "x",
+            "write_id": null,
+        }),
+    );
+    assert_eq!(written["ok"], true, "write response: {written}");
+
+    let stale = socket_command(
+        &home,
+        session_id,
+        json!({
+            "type": "hibernate",
+            "expected_activity_token": token,
+        }),
+    );
+    assert_eq!(stale["ok"], false, "stale response: {stale}");
+    assert!(host.try_wait().unwrap().is_none(), "Host must remain live");
+    assert!(!home
+        .join("app-sessions")
+        .join(session_id)
+        .join("archived.json")
+        .exists());
+
+    stop_and_reap(&home, session_id, &mut host);
+    let _ = fs::remove_dir_all(home);
+}

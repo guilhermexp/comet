@@ -71,12 +71,13 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   turno acabou. `ResumeAdapter::embedded_conversation_id` (patch local, um
   callback por runtime) expõe o id de conversa que o comando já fixa, para a
   sonda de retomada do Comet não depender de comparar receitas.
-- **Input de Controller e hibernação compartilham o lifecycle lock.**
-  `session_ops::write_session_input` publica uma revisão de atividade antes da
-  escrita no PTY. A hibernação automática compara um token opaco que inclui
-  essa revisão, hook, tela, geração e incarnação sob o mesmo lock antes de
-  Stop+Archive; divergência não envia Kill. O Archive manual permanece sem
-  precondição.
+- **Atividade e hibernação automática se encontram no Session Host.**
+  O protocolo 5 minta um token com a revisão em memória do Host mais hook,
+  tela, geração e incarnação persistidos. `Write`, `StreamInput` e cada leitura
+  do PTY avançam a revisão sob o mesmo lock usado por `Hibernate`; output já
+  pendente também rejeita a ação antes do Kill. `session_ops` segura o
+  lifecycle lock, espera o manifest `exited` e só então grava Archive. O
+  Archive manual permanece sem precondição.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são
@@ -127,6 +128,7 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `bun run --cwd "$PWD/third_party/unpeel" validate:runtimes` · `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
+| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (14) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 
