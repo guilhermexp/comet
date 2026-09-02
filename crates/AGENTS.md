@@ -16,6 +16,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 - `edition = "2024"` em todas.
 - Runtime async é **tokio** em todo lugar; a UI faz a ponte por `gpui_tokio` (`Tokio::spawn` vira `Task` do gpui). A UI nunca bloqueia na engine.
 - Bloquear dentro de contexto async é bug, não estilo — já custou findings de review (`rpc.rs`, `repos.rs`).
+- Live Voice é lifecycle da `engine`; a `ui` só projeta e controla, e navegação de Chat nunca manda stop. Em `Working`/`AwaitingInput`, a elegibilidade exige suporte OMP a contexto operacional silencioso; em `Idle`, um handle OMP estacionado permanece elegível com Live básico.
 
 ## Work Guidance
 

@@ -162,7 +162,9 @@ pub fn unavailable_message(reason: LiveVoiceUnavailableReason) -> &'static str {
         LiveVoiceUnavailableReason::RemoteChat => "Open this Chat on its host device",
         LiveVoiceUnavailableReason::NonOmp => "Live Voice is available for OMP Chats",
         LiveVoiceUnavailableReason::Archived => "Unarchive this Chat to use Live Voice",
-        LiveVoiceUnavailableReason::ActiveRun => "Stop the coding run before starting Live Voice",
+        LiveVoiceUnavailableReason::ActiveRun => {
+            "Update Comet on the Chat host to use Live Voice during active work"
+        }
         LiveVoiceUnavailableReason::UnsupportedOmp => "Update OMP to use Live Voice",
         LiveVoiceUnavailableReason::AnotherLiveCall => "End the active Live Voice call first",
     }
@@ -310,7 +312,7 @@ mod tests {
             ),
             (
                 LiveVoiceUnavailableReason::ActiveRun,
-                "Stop the coding run before starting Live Voice",
+                "Update Comet on the Chat host to use Live Voice during active work",
             ),
             (
                 LiveVoiceUnavailableReason::UnsupportedOmp,

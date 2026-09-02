@@ -74,6 +74,20 @@ pub struct LiveVoiceRequest {
     pub resume: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveVoiceSupport {
+    pub available: bool,
+    pub session_context: bool,
+}
+
+impl LiveVoiceSupport {
+    /// Live Voice needs the base capability; starting on top of an already
+    /// active run additionally needs the operational-context capability.
+    pub fn usable(&self, active_run: bool) -> bool {
+        self.available && (!active_run || self.session_context)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveVoiceContextKind {
     Progress,
@@ -86,6 +100,9 @@ pub enum LiveVoiceControl {
     AppendContext {
         delegation_id: String,
         kind: LiveVoiceContextKind,
+        text: String,
+    },
+    AppendSessionContext {
         text: String,
     },
     Stop,
@@ -135,8 +152,8 @@ pub trait Harness: Send + Sync {
     fn deterministic_turn_end(&self) -> bool {
         false
     }
-    async fn probe_live_voice(&self, _cwd: &Path) -> Result<bool, HarnessError> {
-        Ok(false)
+    async fn probe_live_voice(&self, _cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
+        Ok(LiveVoiceSupport::default())
     }
     async fn start_live_voice(
         &self,
@@ -440,7 +457,10 @@ mod tests {
     #[tokio::test]
     async fn live_voice_defaults_are_unsupported_without_changing_run() {
         let harness = UnsupportedLiveHarness;
-        assert!(!harness.probe_live_voice(Path::new(".")).await.unwrap());
+        assert_eq!(
+            harness.probe_live_voice(Path::new(".")).await.unwrap(),
+            LiveVoiceSupport::default()
+        );
 
         let error = match harness
             .start_live_voice(LiveVoiceRequest {

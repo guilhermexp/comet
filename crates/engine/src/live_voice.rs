@@ -3,8 +3,10 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use zeron_harness::{CancellationToken, LiveVoiceControl, LiveVoiceEvent};
-use zeron_proto::{AgentEvent, DoneStatus, LiveVoicePhase, LiveVoiceState};
+use zeron_proto::view::tool_presentation;
+use zeron_proto::{AgentEvent, DoneStatus, LiveVoicePhase, LiveVoiceState, SessionStatus};
 
 use crate::{EngineError, new_id};
 
@@ -73,16 +75,170 @@ impl BackendSpeechAccumulator {
     }
 }
 
-fn push_bounded(target: &mut String, value: &str) {
+pub(crate) struct LiveOperationalContext {
+    status: SessionStatus,
+    visible_text: String,
+    active_tool: Option<(String, &'static str)>,
+    visible_error: Option<String>,
+}
+
+impl LiveOperationalContext {
+    pub(crate) fn new(status: SessionStatus, visible_text: &str) -> Self {
+        let mut bounded_text = String::new();
+        push_bounded(&mut bounded_text, visible_text);
+        Self {
+            status,
+            visible_text: bounded_text,
+            active_tool: None,
+            visible_error: None,
+        }
+    }
+
+    /// Latest-value status transition; reports whether it actually moved.
+    fn set_status(&mut self, next: SessionStatus) -> bool {
+        let changed = self.status != next;
+        self.status = next;
+        changed
+    }
+
+    pub(crate) fn observe(&mut self, event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::SessionStarted { .. } => {
+                let had_tool = self.active_tool.take().is_some();
+                let had_error = self.visible_error.take().is_some();
+                self.set_status(SessionStatus::Working) || had_tool || had_error
+            }
+            AgentEvent::TextDelta { text } => push_bounded(&mut self.visible_text, text),
+            AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
+                let label = tool_presentation(call, false, false).label;
+                let next = (id.clone(), label);
+                if self.active_tool.as_ref() == Some(&next) {
+                    false
+                } else {
+                    self.active_tool = Some(next);
+                    true
+                }
+            }
+            AgentEvent::ToolResult { id, is_error, .. } => {
+                let cleared = self
+                    .active_tool
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| active_id == id);
+                if cleared {
+                    self.active_tool = None;
+                }
+                let next_error = is_error.then(|| "The current tool failed.".to_owned());
+                let error_changed = self.visible_error != next_error;
+                self.visible_error = next_error;
+                cleared || error_changed
+            }
+            AgentEvent::InputRequested { .. } => self.set_status(SessionStatus::AwaitingInput),
+            AgentEvent::InputResolved { .. } | AgentEvent::Steered { .. } => {
+                self.set_status(SessionStatus::Working)
+            }
+            AgentEvent::Error { message } => {
+                let next = truncate_live_text(message.trim().to_owned());
+                if self.visible_error.as_deref() == Some(next.as_str()) {
+                    false
+                } else {
+                    self.visible_error = Some(next);
+                    true
+                }
+            }
+            AgentEvent::Done {
+                status,
+                result,
+                error,
+                ..
+            } => {
+                let next_status = if *status == DoneStatus::Errored {
+                    SessionStatus::Errored
+                } else {
+                    SessionStatus::Idle
+                };
+                let next_error = if *status == DoneStatus::Errored {
+                    non_empty(error)
+                        .or_else(|| non_empty(result))
+                        .or_else(|| Some("The coding run failed without an error message.".into()))
+                } else {
+                    None
+                };
+                let changed = self.status != next_status
+                    || self.active_tool.is_some()
+                    || self.visible_error != next_error;
+                self.status = next_status;
+                self.active_tool = None;
+                self.visible_error = next_error;
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut output = format!("Session status: {}", session_status_label(self.status));
+        if let Some((_, label)) = self.active_tool.as_ref() {
+            output.push_str("\nCurrent action: ");
+            output.push_str(label);
+        }
+        let visible_text = self.visible_text.trim();
+        if !visible_text.is_empty() {
+            output.push_str("\nVisible assistant update: ");
+            output.push_str(visible_text);
+        }
+        if let Some(error) = self
+            .visible_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            output.push_str("\nVisible error: ");
+            output.push_str(error);
+        }
+        truncate_live_text(output)
+    }
+}
+
+pub(crate) fn latest_visible_assistant_text(entries: &[SessionMessageEntry]) -> String {
+    let mut text = String::new();
+    for entry in entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.role == MessageRole::Assistant)
+    {
+        text.clear();
+        for part in &entry.parts {
+            if let MessagePart::Text { text: value, .. } = part {
+                push_bounded(&mut text, value);
+            }
+        }
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    text
+}
+
+fn session_status_label(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "Idle",
+        SessionStatus::Working => "Working",
+        SessionStatus::AwaitingInput => "AwaitingInput",
+        SessionStatus::Errored => "Errored",
+    }
+}
+
+fn push_bounded(target: &mut String, value: &str) -> bool {
     let remaining = MAX_LIVE_TEXT_BYTES.saturating_sub(target.len());
     if remaining == 0 {
-        return;
+        return false;
     }
     let mut boundary = remaining.min(value.len());
     while !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
     target.push_str(&value[..boundary]);
+    boundary != 0
 }
 
 fn take_trimmed(value: &mut String) -> Option<String> {
@@ -295,6 +451,22 @@ impl LiveVoiceCoordinator {
         true
     }
 
+    pub(crate) async fn append_session_context(&self, call_id: &str, text: String) -> bool {
+        let controls = lock(&self.inner.active)
+            .as_ref()
+            .filter(|active| active.call_id == call_id)
+            .and_then(|active| active.controls.clone());
+        let Some(controls) = controls else {
+            return false;
+        };
+        controls
+            .send(LiveVoiceControl::AppendSessionContext {
+                text: truncate_live_text(text),
+            })
+            .await
+            .is_ok()
+    }
+
     pub(crate) fn complete_delegation(&self, call_id: &str, delegation_id: &str) {
         let mut active = lock(&self.inner.active);
         let Some(active) = active.as_mut().filter(|active| {
@@ -437,16 +609,11 @@ impl LiveVoiceCoordinator {
     }
 
     pub(crate) fn fail(&self, call_id: &str, message: &str) {
-        let mut active = lock(&self.inner.active);
-        if !active
-            .as_ref()
-            .is_some_and(|active| active.call_id == call_id)
-        {
+        let mut guard = lock(&self.inner.active);
+        let Some(active) = guard.take_if(|active| active.call_id == call_id) else {
             return;
-        }
-        if let Some(active) = active.take() {
-            active.cancellation.cancel();
-        }
+        };
+        active.cancellation.cancel();
         let mut state = self.inner.state.borrow().clone();
         state.phase = LiveVoicePhase::Error;
         state.input_level = 0.0;
@@ -456,16 +623,11 @@ impl LiveVoiceCoordinator {
     }
 
     fn finish(&self, call_id: &str) {
-        let mut active = lock(&self.inner.active);
-        if !active
-            .as_ref()
-            .is_some_and(|active| active.call_id == call_id)
-        {
+        let mut guard = lock(&self.inner.active);
+        let Some(active) = guard.take_if(|active| active.call_id == call_id) else {
             return;
-        }
-        if let Some(active) = active.take() {
-            active.cancellation.cancel();
-        }
+        };
+        active.cancellation.cancel();
         self.inner.state.send_replace(LiveVoiceState::default());
     }
 
@@ -505,14 +667,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
+    use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
     use zeron_harness::{
         Harness, HarnessError, LiveVoiceControl, LiveVoiceEvent, LiveVoiceHandle, LiveVoiceRequest,
-        RunControls,
+        LiveVoiceSupport, RunControls,
     };
     use zeron_proto::{
         AgentEvent, ChatConfig, DoneStatus, HarnessId, LiveVoicePhase, LiveVoiceRole,
         LiveVoiceTranscript, LiveVoiceUnavailableReason, Model, ReasoningLevel, RunRequest,
-        SandboxLevel, SteeringMode,
+        SandboxLevel, SessionStatus, SteeringMode, ToolCall,
     };
 
     #[test]
@@ -597,6 +760,130 @@ mod tests {
                 "The coding run completed without a final text response.".into()
             )
         );
+    }
+
+    #[test]
+    fn live_operational_context_exposes_only_visible_status_text_and_tool_label() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "Already visible");
+        assert!(context.observe(&AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: ToolCall::Exec {
+                command: "secret command".into(),
+            },
+        }));
+        assert!(context.observe(&AgentEvent::TextDelta {
+            text: " Tests are running.".into(),
+        }));
+
+        let rendered = context.render();
+        assert!(rendered.contains("Session status: Working"));
+        assert!(rendered.contains("Current action: Running command"));
+        assert!(rendered.contains("Visible assistant update: Already visible Tests are running."));
+        assert!(!rendered.contains("secret command"));
+    }
+
+    #[test]
+    fn live_operational_context_excludes_reasoning_and_tool_payloads() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "");
+        assert!(!context.observe(&AgentEvent::ReasoningDelta {
+            text: "private reasoning".into(),
+        }));
+        assert!(context.observe(&AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: ToolCall::Exec {
+                command: "private command".into(),
+            },
+        }));
+        assert!(context.observe(&AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            is_error: true,
+            output: Some("private output".into()),
+            diff: None,
+            execution: None,
+        }));
+
+        let rendered = context.render();
+        assert!(rendered.contains("Visible error: The current tool failed."));
+        assert!(!rendered.contains("private reasoning"));
+        assert!(!rendered.contains("private command"));
+        assert!(!rendered.contains("private output"));
+    }
+
+    #[test]
+    fn live_operational_context_tracks_input_and_terminal_state_without_question_payloads() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "");
+        assert!(context.observe(&AgentEvent::InputRequested {
+            request_id: "input-1".into(),
+            questions: Vec::new(),
+        }));
+        assert_eq!(context.render(), "Session status: AwaitingInput");
+        assert!(context.observe(&AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("visible failure".into()),
+            session_id: None,
+        }));
+        assert_eq!(
+            context.render(),
+            "Session status: Errored\nVisible error: visible failure"
+        );
+    }
+
+    #[test]
+    fn latest_live_assistant_text_excludes_non_text_transcript_parts() {
+        let entries = vec![
+            SessionMessageEntry {
+                id: "user".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "user-text".into(),
+                    text: "user prompt".into(),
+                }],
+                created_at: 1,
+                device_id: "device".into(),
+                status: None,
+                duration_ms: None,
+                continuation_of: None,
+            },
+            SessionMessageEntry {
+                id: "assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning {
+                        id: "reasoning".into(),
+                        text: "private reasoning".into(),
+                        completed: false,
+                        duration_ms: None,
+                    },
+                    MessagePart::Text {
+                        id: "answer".into(),
+                        text: "Visible answer".into(),
+                    },
+                ],
+                created_at: 2,
+                device_id: "device".into(),
+                status: None,
+                duration_ms: None,
+                continuation_of: None,
+            },
+            SessionMessageEntry {
+                id: "assistant-protected".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Reasoning {
+                    id: "newer-reasoning".into(),
+                    text: "newer private reasoning".into(),
+                    completed: false,
+                    duration_ms: None,
+                }],
+                created_at: 3,
+                device_id: "device".into(),
+                status: None,
+                duration_ms: None,
+                continuation_of: None,
+            },
+        ];
+
+        assert_eq!(latest_visible_assistant_text(&entries), "Visible answer");
     }
 
     #[test]
@@ -720,6 +1007,7 @@ mod tests {
     #[derive(Default)]
     struct FakeLiveHarness {
         supported: std::sync::atomic::AtomicBool,
+        session_context_supported: std::sync::atomic::AtomicBool,
         controls: Arc<Mutex<Vec<LiveVoiceControl>>>,
         live_requests: Mutex<Vec<LiveVoiceRequest>>,
         run_requests: Mutex<Vec<RunRequest>>,
@@ -729,6 +1017,7 @@ mod tests {
         fn supported() -> Self {
             Self {
                 supported: std::sync::atomic::AtomicBool::new(true),
+                session_context_supported: std::sync::atomic::AtomicBool::new(true),
                 controls: Arc::new(Mutex::new(Vec::new())),
                 live_requests: Mutex::new(Vec::new()),
                 run_requests: Mutex::new(Vec::new()),
@@ -737,6 +1026,11 @@ mod tests {
 
         fn set_supported(&self, supported: bool) {
             self.supported
+                .store(supported, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_session_context_supported(&self, supported: bool) {
+            self.session_context_supported
                 .store(supported, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -767,8 +1061,17 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn probe_live_voice(&self, _cwd: &std::path::Path) -> Result<bool, HarnessError> {
-            Ok(self.supported.load(std::sync::atomic::Ordering::SeqCst))
+        async fn probe_live_voice(
+            &self,
+            _cwd: &std::path::Path,
+        ) -> Result<LiveVoiceSupport, HarnessError> {
+            let available = self.supported.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(LiveVoiceSupport {
+                available,
+                session_context: self
+                    .session_context_supported
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            })
         }
 
         async fn start_live_voice(
@@ -814,6 +1117,7 @@ mod tests {
                             };
                             let _ = event_tx.send(Ok(LiveVoiceEvent::Phase(phase))).await;
                         }
+                        LiveVoiceControl::AppendSessionContext { .. } => {}
                         LiveVoiceControl::Stop => {
                             let _ = event_tx
                                 .send(Ok(LiveVoiceEvent::Ended { error: None }))
@@ -839,6 +1143,7 @@ mod tests {
             request: RunRequest,
             controls: RunControls,
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let await_input = request.prompt == "await-input";
             lock(&self.run_requests).push(request);
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
@@ -852,7 +1157,22 @@ mod tests {
                         assistant_message_id: "assistant-1".into(),
                     }))
                     .await;
-                controls.interrupt.cancelled().await;
+                if await_input {
+                    let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
+                        id: "q1".into(),
+                        header: "Pick".into(),
+                        question: "Private question?".into(),
+                        options: vec!["a".into(), "b".into()],
+                        multi_select: false,
+                    }]);
+                    tokio::pin!(answers);
+                    tokio::select! {
+                        _ = &mut answers => {}
+                        _ = controls.interrupt.cancelled() => {}
+                    }
+                } else {
+                    controls.interrupt.cancelled().await;
+                }
                 let _ = tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Interrupted,
@@ -911,6 +1231,18 @@ mod tests {
         .unwrap();
     }
 
+    /// Polls a condition on the same 5ms/1s budget every operational-context
+    /// assertion in this module needs.
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
     #[tokio::test]
     async fn live_voice_preconditions_and_transient_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
@@ -934,6 +1266,7 @@ mod tests {
             ),
             ("archived", local_device.as_str(), Some(omp_config())),
             ("active", local_device.as_str(), Some(omp_config())),
+            ("awaiting", local_device.as_str(), Some(omp_config())),
             ("live-a", local_device.as_str(), Some(omp_config())),
             ("live-b", local_device.as_str(), Some(omp_config())),
         ] {
@@ -977,15 +1310,93 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            core.sessions
+                .probe_live_voice("active")
+                .await
+                .unwrap()
+                .available
+        );
+        core.sessions.start_live_voice("active").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        wait_until("Working operational context", || {
+            lock(&harness.controls).iter().any(|control| {
+                matches!(
+                    control,
+                    LiveVoiceControl::AppendSessionContext { text }
+                        if text.contains("Session status: Working")
+                )
+            })
+        })
+        .await;
+        assert_eq!(
+            lock(&harness.run_requests)
+                .iter()
+                .filter(|request| request.prompt == "busy")
+                .count(),
+            1
+        );
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+        assert_eq!(
+            core.sessions.session_status("active").unwrap().status,
+            SessionStatus::Working
+        );
+        harness.set_session_context_supported(false);
         assert_eq!(
             core.sessions
                 .probe_live_voice("active")
                 .await
                 .unwrap()
                 .reason,
-            Some(LiveVoiceUnavailableReason::ActiveRun)
+            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
         );
         core.sessions.interrupt("active").await.unwrap();
+        assert!(
+            core.sessions
+                .probe_live_voice("active")
+                .await
+                .unwrap()
+                .available
+        );
+        core.sessions.start_live_voice("active").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+        harness.set_session_context_supported(true);
+
+        let mut awaiting_request = run_request();
+        awaiting_request.prompt = "await-input".into();
+        core.sessions
+            .dispatch(
+                "awaiting",
+                HarnessId::Omp,
+                awaiting_request,
+                Some("awaiting-1".into()),
+            )
+            .await
+            .unwrap();
+        wait_until("awaiting-input run status", || {
+            core.sessions
+                .session_status("awaiting")
+                .is_some_and(|session| session.status == SessionStatus::AwaitingInput)
+        })
+        .await;
+        core.sessions.start_live_voice("awaiting").await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Listening).await;
+        wait_until("AwaitingInput operational context", || {
+            lock(&harness.controls).iter().any(|control| {
+                matches!(
+                    control,
+                    LiveVoiceControl::AppendSessionContext { text }
+                        if text == "Session status: AwaitingInput"
+                )
+            })
+        })
+        .await;
+        core.sessions.stop_live_voice().await.unwrap();
+        wait_for_phase(&core.sessions, LiveVoicePhase::Idle).await;
+        core.sessions.interrupt("awaiting").await.unwrap();
 
         harness.set_supported(false);
         assert_eq!(
@@ -1022,7 +1433,22 @@ mod tests {
         assert_eq!(doc.doc().read_commands().unwrap(), commands_before);
         assert_eq!(
             lock(&harness.controls).as_slice(),
-            [LiveVoiceControl::SetMuted(true), LiveVoiceControl::Stop]
+            [
+                LiveVoiceControl::AppendSessionContext {
+                    text: "Session status: Working".into(),
+                },
+                LiveVoiceControl::Stop,
+                LiveVoiceControl::Stop,
+                LiveVoiceControl::AppendSessionContext {
+                    text: "Session status: AwaitingInput".into(),
+                },
+                LiveVoiceControl::Stop,
+                LiveVoiceControl::AppendSessionContext {
+                    text: "Session status: Idle".into(),
+                },
+                LiveVoiceControl::SetMuted(true),
+                LiveVoiceControl::Stop,
+            ]
         );
         core.sessions.shutdown().await;
     }

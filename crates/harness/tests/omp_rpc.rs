@@ -9,7 +9,8 @@ use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
     ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command, live_mute_command,
-    live_start_command, live_stop_command, parse_frame, parse_live_event, sanitize_diagnostic,
+    live_session_context_command, live_start_command, live_stop_command, parse_frame,
+    parse_live_event, sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
@@ -298,9 +299,17 @@ fn omp_live_protocol_encodes_exact_commands() {
             "text":"Fixed"
         })
     );
+    assert_eq!(
+        live_session_context_command("Session status: Working").unwrap(),
+        json!({
+            "type":"live_append_session_context",
+            "text":"Session status: Working"
+        })
+    );
     assert_eq!(live_stop_command(), json!({"type":"live_stop"}));
     assert!(live_context_command("", LiveVoiceContextKind::Progress, "work").is_err());
     assert!(live_context_command("del-1", LiveVoiceContextKind::Progress, " ").is_err());
+    assert!(live_session_context_command(" ").is_err());
 }
 
 async fn assert_process_reaped(pid: u32) {
@@ -342,7 +351,9 @@ async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
         .with_env(env)
         .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
 
-    assert!(harness.probe_live_voice(temp.path()).await.unwrap());
+    let support = harness.probe_live_voice(temp.path()).await.unwrap();
+    assert!(support.available);
+    assert!(support.session_context);
     let pid = std::fs::read_to_string(pid_file)
         .unwrap()
         .trim()
@@ -412,6 +423,12 @@ async fn omp_live_frontend_resumes_session_and_reuses_one_child_for_serial_deleg
         }
     );
 
+    controls
+        .send(LiveVoiceControl::AppendSessionContext {
+            text: "Session status: Working".into(),
+        })
+        .await
+        .unwrap();
     controls
         .send(LiveVoiceControl::SetMuted(true))
         .await

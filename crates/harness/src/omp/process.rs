@@ -100,6 +100,7 @@ struct Inner {
 pub struct OmpCapabilities {
     pub chunked_frames: bool,
     pub live_voice: bool,
+    pub live_voice_session_context: bool,
 }
 
 pub struct OmpProcess {
@@ -575,6 +576,16 @@ where
     }
 }
 
+/// A capability the ready frame advertises as the exact numeric version 1.
+/// Anything else — absent, `true`, a newer version — is unsupported here.
+fn numeric_capability(ready: &Value, name: &str) -> bool {
+    ready
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get(name))
+        .and_then(Value::as_u64)
+        == Some(1)
+}
+
 /// The ready frame advertises additive capabilities. Protocol v2 enables
 /// chunked frames; Live Voice is supported only by the exact numeric version 1.
 fn parse_capabilities(ready: &Value) -> OmpCapabilities {
@@ -583,11 +594,8 @@ fn parse_capabilities(ready: &Value) -> OmpCapabilities {
             .get("supportedProtocolVersions")
             .and_then(Value::as_array)
             .is_some_and(|versions| versions.iter().any(|version| version.as_u64() == Some(2))),
-        live_voice: ready
-            .get("capabilities")
-            .and_then(|capabilities| capabilities.get("liveVoice"))
-            .and_then(Value::as_u64)
-            == Some(1),
+        live_voice: numeric_capability(ready, "liveVoice"),
+        live_voice_session_context: numeric_capability(ready, "liveVoiceSessionContext"),
     }
 }
 
@@ -670,6 +678,26 @@ mod tests {
             json!({ "capabilities": { "liveVoice": 2 } }),
         ] {
             assert!(!parse_capabilities(&unsupported).live_voice);
+        }
+    }
+
+    #[test]
+    fn omp_live_session_context_requires_independent_numeric_capability() {
+        let supported = parse_capabilities(&json!({
+            "capabilities": {
+                "liveVoice": 1,
+                "liveVoiceSessionContext": 1
+            }
+        }));
+        assert!(supported.live_voice);
+        assert!(supported.live_voice_session_context);
+
+        for unsupported in [
+            json!({ "capabilities": { "liveVoice": 1 } }),
+            json!({ "capabilities": { "liveVoice": 1, "liveVoiceSessionContext": true } }),
+            json!({ "capabilities": { "liveVoice": 1, "liveVoiceSessionContext": 2 } }),
+        ] {
+            assert!(!parse_capabilities(&unsupported).live_voice_session_context);
         }
     }
     #[test]

@@ -116,8 +116,10 @@ fi
 
 if [ "$scenario" = "no-live-capability" ]; then
   emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
-else
+elif [ "$scenario" = "live-basic-only" ]; then
   emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"capabilities":{"liveVoice":1}}'
+else
+  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"capabilities":{"liveVoice":1,"liveVoiceSessionContext":1}}'
 fi
 
 if [ "$scenario" = "oversized-no-newline" ]; then
@@ -244,6 +246,10 @@ while IFS= read -r line; do
         fi
       fi
       respond "$line" "{\"delegationId\":\"$delegation_id\"}"
+      ;;
+    live_append_session_context)
+      has "$line" '"text":"Session status: Working"' || fail_stage live_session_context 53
+      respond "$line" '{"accepted":true}'
       ;;
     live_stop)
       respond "$line" '{"active":false}'
