@@ -977,13 +977,10 @@ fn write_session(body: &Value) -> Result<Value, ControllerApiError> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty() && id.len() <= 128)
         .map(str::to_owned);
-    terminal_effect_dispatch_result(session_host::send_command_with_timeout(
+    terminal_effect_dispatch_result(session_ops::write_session_input(
         &session_id,
-        &SessionHostCommand::Write {
-            data: data.to_owned(),
-            write_id,
-            task_episode_receipt: None,
-        },
+        data.to_owned(),
+        write_id,
         SESSION_COMMAND_TIMEOUT,
     ))
 }

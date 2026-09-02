@@ -1,7 +1,7 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "a2f518e7b6f5a200de490a2dbac9811876e03499"
+vendored_tree = "274b64966708d205fbfec648ce2edceb3a898340"
 vendored_from = "working-tree"
-local_modifications_count = 28
+local_modifications_count = 29
 local_patch_available = false
 license = "MIT"

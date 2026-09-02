@@ -98,8 +98,9 @@ Test: unit — máquina de estados de atividade com `Stop` e com sweep.
 - **AND** limpar a atenção pelo menu do app leva a `idle` sem confirmar fim
   de turno; só um `Stop` de hook posterior confirma
 - **AND** saída que volta a crescer depois de um `Stop`, sem nenhum hook de
-  início de turno, também revoga a confirmação até o próximo `Stop`; sinal
-  parado a mantém através de qualquer número de sweeps
+  início de turno, também revoga imediatamente a confirmação, inclusive dentro
+  da graça e depois da janela de re-arme, até o próximo `Stop`; sinal parado a
+  mantém através de qualquer número de sweeps
 
 #### Scenario: Conversa sem nada para retomar
 Test: unit — política de hibernação com conversa não retomável.
@@ -117,6 +118,9 @@ Test: unit — sonda de conversa retomável no `activity_bridge`.
   conversa (`codex resume <id>`, `--resume <id>`)
 - **THEN** a conversa é considerada retomável, inclusive na forma já
   reescrita que um Worker acordado de hibernação carrega
+- **AND** um `--session-dir` só qualifica quando seu caminho canônico é
+  exatamente `<unpeel_home>/pi-sessions/<session_id>`; diretório compartilhado,
+  de outro Worker, ancestral, descendente ou com travessia não qualifica
 - **AND** uma receita que só retomaria a conversa mais recente do diretório
   (`codex resume --last`, `gemini --resume latest`) sem nenhuma das três
   evidências não é, porque poderia retomar a conversa de outro Worker
@@ -124,8 +128,10 @@ Test: unit — sonda de conversa retomável no `activity_bridge`.
 
 ### Requirement: A decisão de hibernar é reconfirmada antes de executar
 
-O sistema MUST reavaliar a política sobre um snapshot fresco antes de parar
-cada Worker, e MUST parar somente os Workers presentes nas duas avaliações.
+O sistema MUST reavaliar a política sobre um snapshot fresco separado antes de
+parar cada Worker, MUST parar somente os Workers presentes nas duas avaliações,
+e MUST comparar no boundary de lifecycle um token da atividade observada antes
+de executar Stop+Archive. Mudança do token MUST rejeitar a ação sem enviar Stop.
 
 #### Scenario: Worker recebe trabalho entre a decisão e a execução
 Test: unit — segunda passada da política sobre snapshot fresco.
@@ -134,6 +140,14 @@ Test: unit — segunda passada da política sobre snapshot fresco.
   fresco, voltou a trabalhar
 - **THEN** ele não é parado
 - **AND** os demais candidatos seguem sendo parados
+
+#### Scenario: Worker recebe input depois da confirmação fresca
+Test: integration — input e hibernação automática no mesmo boundary de lifecycle.
+
+- **WHEN** um `send_text` é aceito depois de capturado o token da confirmação
+  fresca e antes da execução da hibernação
+- **THEN** o token diverge e nenhum Stop é enviado
+- **AND** o Worker não recebe o marker de Archive
 
 #### Scenario: A segunda passada não amplia a primeira
 Test: unit — segunda passada da política sobre snapshot fresco.

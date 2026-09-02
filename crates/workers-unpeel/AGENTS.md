@@ -145,8 +145,9 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   - `idle_confirmed_by_hook` vem de `ActivityEngine::hook_confirmed_idle`
     (`stopped_at` presente), e é lido DEPOIS de `derive_activity`, que é quem
     roda o sweep do tick. A confirmação é perecível: só sobrevive enquanto
-    NADA acontece. Crescimento do sinal de atividade depois da graça de
-    re-arme (`STOP_REARM_GRACE`, 5 s) limpa `stopped_at` para qualquer
+    NADA acontece. Qualquer crescimento do sinal de atividade em `Idle`
+    limpa `stopped_at` antes de considerar a graça de
+    re-arme (`STOP_REARM_GRACE`, 5 s) para qualquer
     runtime, porque codex, cursor-agent, gemini, amp e opencode só postam
     `Stop` e não têm evento de início de turno para revogar a confirmação
     quando o orquestrador manda texto; o estado visível pode seguir `Idle`,
@@ -162,7 +163,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
     idempotentes sobre o próprio output, então `resumed != comando` dava
     falso para todo Worker já retomado uma vez): id de conversa de provider
     capturado no marker, OU diretório de sessão gerenciado
-    (`resume::managed_storage_path` sob `unpeel_home`) fixado no comando, OU
+    (`resume::managed_storage_path`) fixado exatamente no diretório canônico
+    `<unpeel_home>/pi-sessions/<session_id>` deste Worker, OU
     id explícito de conversa já no comando
     (`resume::embedded_conversation_id`, callback por adapter). Receita que
     só sabe retomar "a mais recente do diretório" sem nenhuma das três
@@ -176,12 +178,14 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
     gravar `stopped_at`. Só `Stop`/`StopFailure` de hook real confirmam.
   Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
   quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
-- **A decisão de hibernar é tomada duas vezes.** `confirmed_hibernation_candidates`
-  reavalia a política sobre um bootstrap fresco e arquiva só a interseção. O
-  `Archive` para uma sessão viva sem olhar atividade, e entre decidir e
-  executar cabe um `send_text`: o snapshot do painel pode ter sido decodificado
-  antes do host estampar `screen_changed_at` e antes do hook `agent_start`
-  chegar. A segunda passada nunca amplia a primeira.
+- **A decisão de hibernar é tomada por Worker e confirmada no boundary de lifecycle.**
+  `confirmed_hibernation_candidates` reavalia cada candidato sobre um bootstrap
+  próprio imediatamente antes da ação e nunca amplia a primeira passada. O
+  comando automático usa `Hibernate`, não o `Archive` manual: carrega um token
+  opaco da geração/incarnação e dos sinais de atividade, e
+  `archive_session_if_activity_matches` compara-o sob o mesmo lifecycle lock que
+  serializa `send_text` antes de Stop+Archive. Mudança de input, hook, tela,
+  geração ou Host rejeita a hibernação sem enviar Stop.
 - **`send_text` num Worker morto é entrada perdida, não erro do host.**
   `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
   esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
@@ -344,12 +348,12 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 10 de hibernação, incluindo portões de evidência e segunda passada), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (18 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (19 + 10 de hibernação, incluindo portões de evidência e segunda passada), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
-| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
+| `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (5), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |
 | `tests/hook_migration.rs` (6) | integration | `--test hook_migration` |
 
 ## Child DOX Index

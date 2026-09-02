@@ -63,14 +63,20 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   (`distrust_stops_while_output_grows`, codex) limpa `stopped_at` como
   `Start`/`UserPromptSubmit`: turno vivo de novo não tem fim confirmado, e
   o sweep seguinte precisa voltar a ler como não confirmado. Para qualquer
-  runtime, crescimento do sinal em `Idle` depois de `STOP_REARM_GRACE` limpa
-  `stopped_at` mesmo sem re-armar `Busy`, porque runtime que só posta `Stop`
+  runtime, qualquer crescimento do sinal em `Idle` limpa `stopped_at`; a
+  `STOP_REARM_GRACE` decide apenas se `Busy` também será re-armado. Runtime que só posta `Stop`
   não tem hook de início para revogar a confirmação no turno seguinte. A limpeza de
   atenção pelo app (`clear_attention_unconfirmed`, patch local) leva a `Idle`
   sem gravar `stopped_at`, porque um clique não é o runtime dizendo que o
   turno acabou. `ResumeAdapter::embedded_conversation_id` (patch local, um
   callback por runtime) expõe o id de conversa que o comando já fixa, para a
   sonda de retomada do Comet não depender de comparar receitas.
+- **Input de Controller e hibernação compartilham o lifecycle lock.**
+  `session_ops::write_session_input` publica uma revisão de atividade antes da
+  escrita no PTY. A hibernação automática compara um token opaco que inclui
+  essa revisão, hook, tela, geração e incarnação sob o mesmo lock antes de
+  Stop+Archive; divergência não envia Kill. O Archive manual permanece sem
+  precondição.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são

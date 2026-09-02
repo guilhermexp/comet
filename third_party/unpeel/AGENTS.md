@@ -526,6 +526,13 @@ once the runtime returns to its shell); add new "should restart" cases through
 that API, never a second banner
 path.
 
+Controller input and automatic hibernation share the per-Session lifecycle
+lock. Each accepted Controller write publishes a unique activity revision
+before entering the PTY. Automatic Stop+Archive compares a fresh opaque token
+covering that revision, hook, parsed screen, runtime generation, and Host
+incarnation under the same lock; divergence sends no Kill. Manual Archive
+keeps its existing unconditional lifecycle semantics.
+
 ## Git Worktrees
 
 Full detail: `docs/agents/worktrees.md`.

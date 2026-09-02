@@ -43,9 +43,10 @@
 - [x] 3b.2c `ClearAttention` chama `clear_attention_unconfirmed` na máquina
   vendorizada (Idle sem `stopped_at`); regressão PermissionRequest →
   clear → não confirmado → Stop confirma.
-- [x] 3b.2d Crescimento de sinal em `Idle` após a graça de re-arme limpa
-  `stopped_at` para qualquer runtime; regressões Stop → texto do
-  orquestrador → sweep → Stop, e Worker parado através de vários sweeps.
+- [x] 3b.2d Qualquer crescimento de sinal em `Idle` limpa `stopped_at` antes
+  da decisão de re-arme; regressões dentro da graça, depois da janela,
+  Stop → texto do orquestrador → sweep → Stop, e sinal parado através de
+  vários sweeps.
 - [x] 3b.2b Re-arme de `Busy` após `Stop` desconfiado limpa `stopped_at` na
   máquina de estados vendorizada; regressão com a sequência
   UserPromptSubmit → Stop → saída na janela de re-arme → sweep.
@@ -55,6 +56,12 @@
   interseção) e passar o `hibernate_idle_workers` da UI a rebuscar o
   bootstrap dentro da task antes de arquivar; regressões de Worker que
   voltou a trabalhar e de não-ampliação da primeira decisão.
+- [x] 3b.5 Rebuscar e reavaliar cada candidato imediatamente antes da própria
+  ação; serializar input e hibernação no lifecycle lock e exigir token opaco
+  inalterado antes de Stop+Archive; regressão com `send_text` concorrente sem
+  Stop nem marker de Archive.
+- [x] 3b.6 Restringir `--session-dir` ao caminho canônico exato deste Worker;
+  regressões para shared, outro Worker, ancestor, descendant e traversal.
 
 ## 4. Closeout
 

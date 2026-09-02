@@ -142,6 +142,8 @@ impl ActivityBridge {
             // `HookState::Idle`, and only the former may be acted on
             // destructively (see `WorkersSession::idle_confirmed_by_hook`).
             session.idle_confirmed_by_hook = engine.hook_confirmed_idle(&session.id);
+            session.hibernation_activity_token =
+                unpeel_core::session_ops::hibernation_activity_token(&session.id);
             if let Some(derived) = derived {
                 session.activity =
                     merge_derived_activity(&session.activity, session.unread, derived).to_owned();
@@ -231,12 +233,21 @@ fn resumable_conversation(
         return false;
     }
     let (provider_session_id, _) = unpeel_core::session_ops::provider_session_marker(session_id);
-    provider_session_id.is_some()
-        || unpeel_core::resume::managed_storage_path(
-            command,
-            &unpeel_core::app_paths::unpeel_home(),
+    let unpeel_home = unpeel_core::app_paths::unpeel_home();
+    let managed_root = unpeel_home.join("pi-sessions").canonicalize().ok();
+    let managed_worker_directory = unpeel_core::resume::managed_storage_path(command, &unpeel_home)
+        .and_then(|path| path.canonicalize().ok())
+        .zip(
+            unpeel_home
+                .join("pi-sessions")
+                .join(session_id)
+                .canonicalize()
+                .ok(),
         )
-        .is_some()
+        .zip(managed_root)
+        .is_some_and(|((actual, expected), root)| actual == expected && actual.starts_with(root));
+    provider_session_id.is_some()
+        || managed_worker_directory
         || unpeel_core::resume::embedded_conversation_id(command).is_some()
 }
 
@@ -848,9 +859,37 @@ mod tests {
             .expect("worker session directory");
         let mut manifest = omp_manifest("worker-1");
         let managed = home.path().join("pi-sessions/worker-1");
+        std::fs::create_dir_all(&managed).expect("managed Worker directory");
         manifest.session.command = format!("omp --session-dir '{}'", managed.display());
 
         assert!(resumable_conversation("worker-1", &manifest));
+
+        let shared = home.path().join("shared");
+        std::fs::create_dir_all(&shared).expect("shared directory");
+        manifest.session.command = format!("omp --session-dir '{}'", shared.display());
+        assert!(!resumable_conversation("worker-1", &manifest));
+
+        let other_worker = home.path().join("pi-sessions/worker-2");
+        std::fs::create_dir_all(&other_worker).expect("other Worker directory");
+        manifest.session.command = format!("omp --session-dir '{}'", other_worker.display());
+        assert!(!resumable_conversation("worker-1", &manifest));
+
+        manifest.session.command = format!(
+            "omp --session-dir '{}'",
+            home.path().join("pi-sessions").display()
+        );
+        assert!(!resumable_conversation("worker-1", &manifest));
+
+        let descendant = managed.join("nested");
+        std::fs::create_dir_all(&descendant).expect("managed descendant");
+        manifest.session.command = format!("omp --session-dir '{}'", descendant.display());
+        assert!(!resumable_conversation("worker-1", &manifest));
+
+        manifest.session.command = format!(
+            "omp --session-dir '{}/pi-sessions/worker-2/../worker-1'",
+            home.path().display()
+        );
+        assert!(!resumable_conversation("worker-1", &manifest));
 
         manifest.session.command = "omp --session-dir '/tmp/shared-pi-sessions'".into();
         assert!(
@@ -868,6 +907,7 @@ mod tests {
             .expect("worker session directory");
         let mut manifest = omp_manifest("worker-1");
         let managed = home.path().join("pi-sessions/worker-1");
+        std::fs::create_dir_all(&managed).expect("managed Worker directory");
         manifest.session.command = format!("omp --session-dir '{}' --continue", managed.display());
         assert!(
             resumable_conversation("worker-1", &manifest),
@@ -1005,16 +1045,24 @@ mod tests {
     }
 
     #[test]
-    fn a_genuinely_stopped_worker_keeps_its_confirmation_across_sweeps() {
+    fn output_growth_inside_the_grace_revokes_idle_confirmation() {
         let mut engine = ActivityEngine::default();
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         engine.apply_hook_event("cursor-1", "Stop", None, t0);
         engine.note_output_and_sweep("cursor-1", 1, true, false, t0 + Duration::from_secs(1));
-        // The turn's trailing render lands inside the grace and is not a new turn.
         engine.note_output_and_sweep("cursor-1", 2, true, false, t0 + Duration::from_secs(2));
+        assert!(!engine.hook_confirmed_idle("cursor-1"));
+    }
+
+    #[test]
+    fn an_unchanged_signal_keeps_idle_confirmation_across_sweeps() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("cursor-1", "Stop", None, t0);
+        engine.note_output_and_sweep("cursor-1", 1, true, false, t0 + Duration::from_secs(1));
         for tick in 1..=6 {
             let at = t0 + upstream_activity::HOOK_IDLE_TIMEOUT * tick;
-            engine.note_output_and_sweep("cursor-1", 2, true, false, at);
+            engine.note_output_and_sweep("cursor-1", 1, true, false, at);
             assert!(
                 engine.hook_confirmed_idle("cursor-1"),
                 "an unchanged signal must not erode the confirmation (tick {tick})"

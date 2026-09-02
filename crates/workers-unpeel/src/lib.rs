@@ -805,6 +805,7 @@ pub struct WorkersSession {
     /// because it could resume another Worker's conversation from the same
     /// cwd — worse than not hibernating.
     pub resumable_conversation: bool,
+    pub hibernation_activity_token: Option<String>,
     pub total_tokens: Option<u64>,
     pub model_usage: Vec<WorkersModelTokenUsage>,
     pub capabilities: WorkersSessionCapabilities,
@@ -965,6 +966,7 @@ pub enum WorkersSessionCommand {
     AppendSystemContext { text: String },
     SetNotifyWhenDone { enabled: bool },
     Archive,
+    Hibernate { expected_activity_token: String },
     Restore,
     RestoreAndResume,
     Remove,
@@ -1131,6 +1133,10 @@ impl LocalWorkersClient {
     /// The UI can refresh immediately without inferring activity from time.
     pub fn activity_epoch(&self) -> u64 {
         self.activity.change_epoch()
+    }
+
+    pub fn capture_hibernation_activity_token(&self, session_id: &str) -> Option<String> {
+        unpeel_core::session_ops::hibernation_activity_token(session_id)
     }
 
     pub fn resource_snapshot(
@@ -2109,6 +2115,16 @@ impl LocalWorkersClient {
                 )?;
                 Ok(None)
             }
+            WorkersSessionCommand::Hibernate {
+                expected_activity_token,
+            } => {
+                unpeel_core::session_ops::archive_session_if_activity_matches(
+                    session_id,
+                    &expected_activity_token,
+                )
+                .map_err(WorkersError::State)?;
+                Ok(None)
+            }
             WorkersSessionCommand::Restore => {
                 self.set_session_organization(
                     session_id,
@@ -2506,6 +2522,7 @@ impl From<SessionWire> for WorkersSession {
             idle_since_unix_ms: None,
             idle_confirmed_by_hook: false,
             resumable_conversation: false,
+            hibernation_activity_token: None,
             total_tokens: value.total_tokens,
             model_usage: value.model_usage,
             capabilities: WorkersSessionCapabilities {
@@ -3175,6 +3192,7 @@ mod runtime_capability_tests {
             idle_since_unix_ms: None,
             idle_confirmed_by_hook: false,
             resumable_conversation: false,
+            hibernation_activity_token: None,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
@@ -3734,6 +3752,7 @@ mod hibernation_tests {
             idle_since_unix_ms: Some(NOW - idle_minutes * MINUTE_MS),
             idle_confirmed_by_hook: true,
             resumable_conversation: true,
+            hibernation_activity_token: Some("activity-token".into()),
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),

@@ -857,28 +857,41 @@ impl WorkersModel {
         let selected = self.selected_session_id.clone();
         cx.background_executor()
             .spawn(async move {
-                let fresh = match client.bootstrap() {
-                    Ok(bootstrap) => bootstrap.sessions,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not re-check idle workers before hibernating");
-                        return;
-                    }
-                };
-                let confirmed = confirmed_hibernation_candidates(
-                    &candidate_ids,
-                    &fresh,
-                    &resources,
-                    selected.as_deref(),
-                    Self::unix_time_ms(),
-                )
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-                for session in confirmed {
+                for candidate_id in candidate_ids {
+                    let fresh = match client.bootstrap() {
+                        Ok(bootstrap) => bootstrap.sessions,
+                        Err(error) => {
+                            tracing::warn!(%error, session_id = %candidate_id, "could not re-check idle worker before hibernating");
+                            continue;
+                        }
+                    };
+                    let previous = [candidate_id];
+                    let Some(session) = confirmed_hibernation_candidates(
+                        &previous,
+                        &fresh,
+                        &resources,
+                        selected.as_deref(),
+                        Self::unix_time_ms(),
+                    )
+                    .into_iter()
+                    .next()
+                    .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(expected_activity_token) = session.hibernation_activity_token.clone()
+                    else {
+                        continue;
+                    };
                     let idle_minutes = session
                         .idle_since_unix_ms
                         .map(|idle_since| Self::unix_time_ms().saturating_sub(idle_since) / 60_000);
-                    match client.session_command(&session, WorkersSessionCommand::Archive) {
+                    match client.session_command(
+                        &session,
+                        WorkersSessionCommand::Hibernate {
+                            expected_activity_token,
+                        },
+                    ) {
                         Ok(_) => tracing::info!(
                             session_id = %session.id,
                             title = %session.title,
@@ -2096,6 +2109,7 @@ mod tests {
             idle_since_unix_ms: None,
             idle_confirmed_by_hook: false,
             resumable_conversation: false,
+            hibernation_activity_token: None,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),
