@@ -775,3 +775,51 @@ async fn zombie_relay_path_trips_the_echo_deadline() {
     // Restore the production clocks for the rest of the process's tests.
     zeron_rpc::device_room::set_client_liveness_for_tests(Duration::ZERO, Duration::ZERO);
 }
+
+#[tokio::test]
+async fn relay_ingress_rejects_local_only_trajectory_methods() {
+    let relay = FakeRelay::start().await;
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
+    relay.wait_host_connected().await;
+
+    let links = cache(&relay.edge_url());
+    let client = links
+        .client("dev-a")
+        .await
+        .expect("connects to host-a over relay");
+
+    // Attempting to call RevealTrajectoryRaw without targetDeviceId over peer relay must be rejected:
+    let raw_err = client
+        .call(
+            methods::REVEAL_TRAJECTORY_RAW,
+            serde_json::json!({
+                "chatId": "chat-secret",
+                "sourceSeq": 1,
+                "field": "payload"
+            }),
+        )
+        .await
+        .expect_err("RevealTrajectoryRaw must be rejected on relay ingress");
+    let raw_msg = raw_err.to_string();
+    assert!(
+        raw_msg.contains("local-only"),
+        "expected local-only error, got: {raw_msg}"
+    );
+
+    // Attempting to call WatchTrajectory without targetDeviceId over peer relay must be rejected:
+    let watch_err = client
+        .call(
+            methods::WATCH_TRAJECTORY,
+            serde_json::json!({
+                "chatId": "chat-secret"
+            }),
+        )
+        .await
+        .expect_err("WatchTrajectory must be rejected on relay ingress");
+    let watch_msg = watch_err.to_string();
+    assert!(
+        watch_msg.contains("local-only"),
+        "expected local-only error, got: {watch_msg}"
+    );
+}

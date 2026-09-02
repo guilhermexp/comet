@@ -575,12 +575,7 @@ impl WorkspaceHost {
     /// pre-heal, offline at boot), and "row absent locally" on such a view
     /// is not evidence of deletion.
     pub fn registry_synced(&self) -> bool {
-        if self.inner.config.edge.is_none() {
-            return true;
-        }
-        lock(&self.inner.room)
-            .as_ref()
-            .is_some_and(|room| room.stats().synced)
+        self.inner.registry_synced()
     }
 
     /// Probe the registry room's liveness NOW (window-focus sweep). Probes are
@@ -1143,6 +1138,14 @@ impl WorkspaceHostInner {
     fn bump_changed(&self) {
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
     }
+    pub fn registry_synced(&self) -> bool {
+        if self.config.edge.is_none() {
+            return true;
+        }
+        lock(&self.room)
+            .as_ref()
+            .is_some_and(|room| room.stats().synced)
+    }
 
     fn publish(&self) {
         match lock(&self.reg).read_all() {
@@ -1157,7 +1160,11 @@ impl WorkspaceHostInner {
                 self.devices_tx.send_replace(state.devices);
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
-                if live_set.is_empty() {
+                if !self.registry_synced() {
+                    tracing::debug!(
+                        "trajectory: retention skipped (registry not yet synced this boot)"
+                    );
+                } else if live_set.is_empty() {
                     tracing::warn!("skipping trajectory retention for an empty registry snapshot");
                 } else if let Some(store) = lock(&self.trajectory).clone()
                     && !store.is_degraded()
@@ -1462,6 +1469,7 @@ async fn trajectory_retention_task(retention: Arc<Mutex<TrajectoryRetentionState
         let (generation, store, live_ids) = {
             let mut state = lock(&retention);
             let Some(request) = state.pending.take() else {
+                state.active = None;
                 state.worker_running = false;
                 return;
             };
@@ -1472,11 +1480,19 @@ async fn trajectory_retention_task(retention: Arc<Mutex<TrajectoryRetentionState
             (generation, store, live_ids)
         };
 
+        let obsolete = {
+            let state = lock(&retention);
+            state.generation != generation || state.pending.is_some()
+        };
+        if obsolete {
+            continue;
+        }
+
         let result = store.retain_chats_only(&live_ids).await;
         let mut state = lock(&retention);
         let active = state.active.take();
         match result {
-            Ok(_) if state.generation == generation => {
+            Ok(_) if state.generation == generation && state.pending.is_none() => {
                 state.last_applied = active.map(|request| request.live_ids);
             }
             Ok(_) => {}
@@ -2326,17 +2342,11 @@ mod tests {
             .unwrap();
 
         // Set a broken trajectory store whose writer channel is closed
+        let mut broken_traj_store =
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap();
         let (closed_tx, _) = std::sync::mpsc::sync_channel(1);
-        let (events_tx, _) = tokio::sync::broadcast::channel(1);
-        let broken_traj_store = std::sync::Arc::new(crate::trajectory_store::TrajectoryStore {
-            db_path: dir.path().join("trajectory.sqlite3"),
-            journals_dir: dir.path().join("journals"),
-            writer_tx: closed_tx,
-            in_memory_degraded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            degraded_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            events_tx,
-        });
-        host.set_trajectory_store(broken_traj_store);
+        broken_traj_store.writer_tx = closed_tx;
+        host.set_trajectory_store(std::sync::Arc::new(broken_traj_store));
 
         // Publish fails to retain in broken store -> the applied set must NOT be committed.
         host.inner.publish();
@@ -2368,5 +2378,195 @@ mod tests {
             "successful retry must commit the applied live set"
         );
         assert!(retained_after_success.unwrap().contains("chat_retry"));
+    }
+    struct DummyToken;
+    #[async_trait::async_trait]
+    impl zeron_rpc::TokenSource for DummyToken {
+        async fn token(&self) -> Option<String> {
+            Some("dummy".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_unsynced_registry_skips_retention_until_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let traj_store = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap(),
+        );
+
+        // Seed trajectory store with a record for chat-unsynced-keep
+        traj_store
+            .try_enqueue(trajectory_test_record("chat-unsynced-keep"))
+            .unwrap();
+        traj_store.flush().await.unwrap();
+        assert_eq!(
+            traj_store
+                .list_all_records("chat-unsynced-keep")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Open host with edge configured (unsynced registry at boot)
+        let host = super::WorkspaceHost::open(
+            store.clone(),
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: Some(crate::doc_host::EdgeConfig::new(
+                    "http://127.0.0.1:9",
+                    std::sync::Arc::new(DummyToken),
+                )),
+            },
+        )
+        .unwrap();
+        host.set_trajectory_store(traj_store.clone());
+
+        // Local registry has chat-other, but chat-unsynced-keep is missing (gapped view)
+        host.create_chat("chat-other", None, Some("dev-1"), None, None)
+            .unwrap();
+
+        assert!(
+            !host.registry_synced(),
+            "host with edge but no connected synced room must report registry_synced() == false"
+        );
+
+        // Publish from gapped unsynced registry
+        host.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        traj_store.flush().await.unwrap();
+
+        // chat-unsynced-keep must NOT have been pruned
+        assert_eq!(
+            traj_store
+                .list_all_records("chat-unsynced-keep")
+                .unwrap()
+                .len(),
+            1,
+            "unsynced registry view must never delete trajectory records of absent chats"
+        );
+        let last_applied = super::lock(&host.inner.trajectory_retention)
+            .last_applied
+            .clone();
+        assert!(
+            last_applied.is_none(),
+            "retention must not run or mark applied when registry is unsynced"
+        );
+
+        // Now open local-only host (simulates synced truth where edge is None or synced)
+        let host_synced = super::WorkspaceHost::open(
+            store,
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host_synced.set_trajectory_store(traj_store.clone());
+        assert!(host_synced.registry_synced());
+        host_synced
+            .create_chat("chat-other", None, Some("dev-1"), None, None)
+            .unwrap();
+
+        // Publish with synced authoritative truth
+        host_synced.inner.publish();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        traj_store.flush().await.unwrap();
+
+        // Now retention ran and pruned absent chat-unsynced-keep
+        assert_eq!(
+            traj_store
+                .list_all_records("chat-unsynced-keep")
+                .unwrap()
+                .len(),
+            0,
+            "retention must prune absent chats once registry is synced"
+        );
+        let last_applied_synced = super::lock(&host_synced.inner.trajectory_retention)
+            .last_applied
+            .clone();
+        assert!(last_applied_synced.is_some());
+        assert!(last_applied_synced.unwrap().contains("chat-other"));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_workspace_host_obsolete_retention_request_replaced_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let traj_store = std::sync::Arc::new(
+            crate::trajectory_store::TrajectoryStore::open(dir.path()).unwrap(),
+        );
+
+        let host = super::WorkspaceHost::open(
+            store,
+            super::WorkspaceHostConfig {
+                device_id: "dev-1".into(),
+                device_name: "MacBook".into(),
+                platform: "macos".into(),
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.set_trajectory_store(traj_store.clone());
+
+        // Seed trajectory store with records for chat-old and chat-new
+        traj_store
+            .try_enqueue(trajectory_test_record("chat-old"))
+            .unwrap();
+        traj_store
+            .try_enqueue(trajectory_test_record("chat-new"))
+            .unwrap();
+        traj_store.flush().await.unwrap();
+
+        let stale_set: super::RetainedChatIds = ["chat-old".to_string()].into();
+        let current_set: super::RetainedChatIds =
+            ["chat-old".to_string(), "chat-new".to_string()].into();
+
+        // Setup retention state:
+        // - active has the stale snapshot (only chat-old)
+        // - pending has the newer snapshot (chat-old + chat-new)
+        {
+            let mut retention = super::lock(&host.inner.trajectory_retention);
+            let generation = retention.generation;
+            retention.active = Some(super::TrajectoryRetentionRequest {
+                generation,
+                store: traj_store.clone(),
+                live_ids: stale_set,
+            });
+            retention.pending = Some(super::TrajectoryRetentionRequest {
+                generation,
+                store: traj_store.clone(),
+                live_ids: current_set.clone(),
+            });
+            retention.worker_running = false;
+        }
+
+        // Spawn the worker task directly
+        let retention = host.inner.trajectory_retention.clone();
+        let task = tokio::spawn(super::trajectory_retention_task(retention));
+        task.await.unwrap();
+        traj_store.flush().await.unwrap();
+
+        // chat-new must NOT have been deleted because the obsolete active request was discarded
+        assert_eq!(
+            traj_store.list_all_records("chat-new").unwrap().len(),
+            1,
+            "obsolete retention request must be aborted before dispatch, preserving newly added chat"
+        );
+        assert_eq!(traj_store.list_all_records("chat-old").unwrap().len(), 1);
+        let last_applied = super::lock(&host.inner.trajectory_retention)
+            .last_applied
+            .clone();
+        assert_eq!(last_applied, Some(current_set));
     }
 }

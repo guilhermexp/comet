@@ -215,6 +215,17 @@ impl RunJournal {
         call_id: Option<&str>,
         field: TrajectoryRawField,
     ) -> Result<TrajectoryRawRevealResult, JournalError> {
+        // B3: Refuse resolution if the chat_id is not canonically representable in journal storage.
+        // Non-injective sanitization (e.g. "a/b" -> "a_b") aliasing a shadow Chat's journal must
+        // never disclose raw journal content from another Chat.
+        if sanitize_id(chat_id) != chat_id {
+            return Ok(TrajectoryRawRevealResult::unavailable(
+                field,
+                TrajectoryUnavailableReason::NotFound,
+                Some("Chat ID is not canonically representable in journal storage".into()),
+            ));
+        }
+
         let path = self.path_for(chat_id);
         if !path.exists() {
             return Ok(TrajectoryRawRevealResult::unavailable(
@@ -236,46 +247,39 @@ impl RunJournal {
             Err(e) => return Err(e.into()),
         };
 
-        use std::io::BufRead;
         let mut reader = std::io::BufReader::new(file);
         let mut line_buf = Vec::new();
         let mut had_corrupt_line = false;
+        let mut lines_scanned = 0usize;
+        let mut remaining_bytes_budget = MAX_RAW_REVEAL_SCAN_BYTES;
 
         loop {
-            line_buf.clear();
-            let mut total_read = 0;
-            let mut found_newline = false;
-            while total_read <= MAX_REVERSE_SCAN_LINE_BYTES {
-                let available = match reader.fill_buf() {
-                    Ok(b) => b,
-                    Err(e) => return Err(e.into()),
-                };
-                if available.is_empty() {
-                    break;
-                }
-                if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-                    line_buf.extend_from_slice(&available[..pos]);
-                    reader.consume(pos + 1);
-                    found_newline = true;
-                    break;
-                } else {
-                    let len = available.len();
-                    line_buf.extend_from_slice(available);
-                    reader.consume(len);
-                    total_read += len;
-                }
-            }
-
-            if line_buf.len() > MAX_REVERSE_SCAN_LINE_BYTES {
+            lines_scanned += 1;
+            if lines_scanned > MAX_RAW_REVEAL_SCAN_LINES {
                 return Ok(TrajectoryRawRevealResult::unavailable(
                     field,
                     TrajectoryUnavailableReason::SourceOversized,
-                    Some("Journal source line exceeds maximum scan line size".into()),
+                    Some("Journal scan line budget exceeded".into()),
                 ));
             }
 
-            if line_buf.is_empty() && !found_newline {
-                break;
+            match read_bounded_line(
+                &mut reader,
+                &mut line_buf,
+                MAX_REVERSE_SCAN_LINE_BYTES,
+                &mut remaining_bytes_budget,
+            )? {
+                BoundedLineRead::BudgetExceeded | BoundedLineRead::Oversized => {
+                    return Ok(TrajectoryRawRevealResult::unavailable(
+                        field,
+                        TrajectoryUnavailableReason::SourceOversized,
+                        Some("Journal source line or scan budget exceeds limits".into()),
+                    ));
+                }
+                BoundedLineRead::Eof => {
+                    break;
+                }
+                BoundedLineRead::Line => {}
             }
 
             if line_buf.iter().all(u8::is_ascii_whitespace) {
@@ -321,143 +325,193 @@ impl RunJournal {
                 };
 
                 match field {
-                    TrajectoryRawField::Payload => match event {
-                        AgentEvent::TextDelta { text } => {
-                            let mut accumulated = text;
-                            let mut expected_seq = source_seq + 1;
-                            loop {
-                                line_buf.clear();
-                                let mut line_read = 0;
-                                let mut line_has_newline = false;
-                                while line_read <= MAX_REVERSE_SCAN_LINE_BYTES {
-                                    let available = match reader.fill_buf() {
-                                        Ok(b) => b,
-                                        Err(e) => return Err(e.into()),
-                                    };
-                                    if available.is_empty() {
-                                        break;
+                    TrajectoryRawField::Payload => {
+                        match event {
+                            AgentEvent::TextDelta { text } => {
+                                let mut accumulated = text;
+                                let mut expected_seq = source_seq + 1;
+                                loop {
+                                    lines_scanned += 1;
+                                    if lines_scanned > MAX_RAW_REVEAL_SCAN_LINES {
+                                        return Ok(TrajectoryRawRevealResult::unavailable(
+                                        field,
+                                        TrajectoryUnavailableReason::SourceOversized,
+                                        Some("Journal scan line budget exceeded during coalescing".into()),
+                                    ));
                                     }
-                                    if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-                                        line_buf.extend_from_slice(&available[..pos]);
-                                        reader.consume(pos + 1);
-                                        line_has_newline = true;
-                                        break;
-                                    } else {
-                                        let len = available.len();
-                                        line_buf.extend_from_slice(available);
-                                        reader.consume(len);
-                                        line_read += len;
-                                    }
-                                }
-                                if line_buf.is_empty() && !line_has_newline {
-                                    break;
-                                }
-                                if line_buf.iter().all(u8::is_ascii_whitespace) {
-                                    continue;
-                                }
-                                let next_parsed: JournalLine =
-                                    match serde_json::from_slice(&line_buf) {
-                                        Ok(p) => p,
-                                        Err(_) => break,
-                                    };
-                                if next_parsed.seq != expected_seq {
-                                    break;
-                                }
-                                let next_event = match (parent_tool_use_id, next_parsed.event) {
-                                    (None, AgentEvent::Subagent { .. }) => break,
-                                    (None, event) => event,
-                                    (Some(scope), event) => {
-                                        match event_in_subagent_scope(event, scope) {
-                                            Some(ev) => ev,
-                                            None => break,
+
+                                    match read_bounded_line(
+                                        &mut reader,
+                                        &mut line_buf,
+                                        MAX_REVERSE_SCAN_LINE_BYTES,
+                                        &mut remaining_bytes_budget,
+                                    )? {
+                                        BoundedLineRead::BudgetExceeded
+                                        | BoundedLineRead::Oversized => {
+                                            return Ok(TrajectoryRawRevealResult::unavailable(
+                                            field,
+                                            TrajectoryUnavailableReason::SourceOversized,
+                                            Some("Continuation line exceeds maximum line size or budget".into()),
+                                        ));
                                         }
-                                    }
-                                };
-                                if let AgentEvent::TextDelta { text: next_text } = next_event {
-                                    accumulated.push_str(&next_text);
-                                    expected_seq += 1;
-                                    if accumulated.len() >= MAX_RAW_REVEAL_BYTES {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
-                            return Ok(TrajectoryRawRevealResult::available(
-                                TrajectoryRawField::Payload,
-                                cap_reveal_text(accumulated),
-                            ));
-                        }
-                        AgentEvent::ReasoningDelta { text } => {
-                            let mut accumulated = text;
-                            let mut expected_seq = source_seq + 1;
-                            loop {
-                                line_buf.clear();
-                                let mut line_read = 0;
-                                let mut line_has_newline = false;
-                                while line_read <= MAX_REVERSE_SCAN_LINE_BYTES {
-                                    let available = match reader.fill_buf() {
-                                        Ok(b) => b,
-                                        Err(e) => return Err(e.into()),
-                                    };
-                                    if available.is_empty() {
-                                        break;
-                                    }
-                                    if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-                                        line_buf.extend_from_slice(&available[..pos]);
-                                        reader.consume(pos + 1);
-                                        line_has_newline = true;
-                                        break;
-                                    } else {
-                                        let len = available.len();
-                                        line_buf.extend_from_slice(available);
-                                        reader.consume(len);
-                                        line_read += len;
-                                    }
-                                }
-                                if line_buf.is_empty() && !line_has_newline {
-                                    break;
-                                }
-                                if line_buf.iter().all(u8::is_ascii_whitespace) {
-                                    continue;
-                                }
-                                let next_parsed: JournalLine =
-                                    match serde_json::from_slice(&line_buf) {
-                                        Ok(p) => p,
-                                        Err(_) => break,
-                                    };
-                                if next_parsed.seq != expected_seq {
-                                    break;
-                                }
-                                let next_event = match (parent_tool_use_id, next_parsed.event) {
-                                    (None, AgentEvent::Subagent { .. }) => break,
-                                    (None, event) => event,
-                                    (Some(scope), event) => {
-                                        match event_in_subagent_scope(event, scope) {
-                                            Some(ev) => ev,
-                                            None => break,
+                                        BoundedLineRead::Eof => {
+                                            break;
                                         }
+                                        BoundedLineRead::Line => {}
                                     }
-                                };
-                                if let AgentEvent::ReasoningDelta { text: next_text } = next_event {
-                                    accumulated.push_str(&next_text);
-                                    expected_seq += 1;
-                                    if accumulated.len() >= MAX_RAW_REVEAL_BYTES {
+
+                                    if line_buf.iter().all(u8::is_ascii_whitespace) {
+                                        continue;
+                                    }
+
+                                    let next_parsed: JournalLine =
+                                        match serde_json::from_slice(&line_buf) {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                return Ok(TrajectoryRawRevealResult::unavailable(
+                                                    field,
+                                                    TrajectoryUnavailableReason::SourceCorrupt,
+                                                    Some(
+                                                        "Malformed continuation line in journal"
+                                                            .into(),
+                                                    ),
+                                                ));
+                                            }
+                                        };
+
+                                    if next_parsed.seq != expected_seq {
+                                        return Ok(TrajectoryRawRevealResult::unavailable(
+                                            field,
+                                            TrajectoryUnavailableReason::SourceCorrupt,
+                                            Some(format!(
+                                                "Sequence gap in text delta continuation: expected {expected_seq}, got {}",
+                                                next_parsed.seq
+                                            )),
+                                        ));
+                                    }
+
+                                    let next_event = match (parent_tool_use_id, next_parsed.event) {
+                                        (None, AgentEvent::Subagent { .. }) => break,
+                                        (None, event) => event,
+                                        (Some(scope), event) => {
+                                            match event_in_subagent_scope(event, scope) {
+                                                Some(ev) => ev,
+                                                None => break,
+                                            }
+                                        }
+                                    };
+                                    if let AgentEvent::TextDelta { text: next_text } = next_event {
+                                        accumulated.push_str(&next_text);
+                                        expected_seq += 1;
+                                        if accumulated.len() >= MAX_RAW_REVEAL_BYTES {
+                                            break;
+                                        }
+                                    } else {
+                                        // Legitimate completion of TextDelta sequence
                                         break;
                                     }
-                                } else {
-                                    break;
                                 }
+                                return Ok(TrajectoryRawRevealResult::available(
+                                    TrajectoryRawField::Payload,
+                                    cap_reveal_text(accumulated),
+                                ));
                             }
-                            return Ok(TrajectoryRawRevealResult::available(
-                                TrajectoryRawField::Payload,
-                                cap_reveal_text(accumulated),
-                            ));
+                            AgentEvent::ReasoningDelta { text } => {
+                                let mut accumulated = text;
+                                let mut expected_seq = source_seq + 1;
+                                loop {
+                                    lines_scanned += 1;
+                                    if lines_scanned > MAX_RAW_REVEAL_SCAN_LINES {
+                                        return Ok(TrajectoryRawRevealResult::unavailable(
+                                        field,
+                                        TrajectoryUnavailableReason::SourceOversized,
+                                        Some("Journal scan line budget exceeded during coalescing".into()),
+                                    ));
+                                    }
+
+                                    match read_bounded_line(
+                                        &mut reader,
+                                        &mut line_buf,
+                                        MAX_REVERSE_SCAN_LINE_BYTES,
+                                        &mut remaining_bytes_budget,
+                                    )? {
+                                        BoundedLineRead::BudgetExceeded
+                                        | BoundedLineRead::Oversized => {
+                                            return Ok(TrajectoryRawRevealResult::unavailable(
+                                            field,
+                                            TrajectoryUnavailableReason::SourceOversized,
+                                            Some("Continuation line exceeds maximum line size or budget".into()),
+                                        ));
+                                        }
+                                        BoundedLineRead::Eof => {
+                                            break;
+                                        }
+                                        BoundedLineRead::Line => {}
+                                    }
+
+                                    if line_buf.iter().all(u8::is_ascii_whitespace) {
+                                        continue;
+                                    }
+
+                                    let next_parsed: JournalLine =
+                                        match serde_json::from_slice(&line_buf) {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                return Ok(TrajectoryRawRevealResult::unavailable(
+                                                    field,
+                                                    TrajectoryUnavailableReason::SourceCorrupt,
+                                                    Some(
+                                                        "Malformed continuation line in journal"
+                                                            .into(),
+                                                    ),
+                                                ));
+                                            }
+                                        };
+
+                                    if next_parsed.seq != expected_seq {
+                                        return Ok(TrajectoryRawRevealResult::unavailable(
+                                            field,
+                                            TrajectoryUnavailableReason::SourceCorrupt,
+                                            Some(format!(
+                                                "Sequence gap in reasoning delta continuation: expected {expected_seq}, got {}",
+                                                next_parsed.seq
+                                            )),
+                                        ));
+                                    }
+
+                                    let next_event = match (parent_tool_use_id, next_parsed.event) {
+                                        (None, AgentEvent::Subagent { .. }) => break,
+                                        (None, event) => event,
+                                        (Some(scope), event) => {
+                                            match event_in_subagent_scope(event, scope) {
+                                                Some(ev) => ev,
+                                                None => break,
+                                            }
+                                        }
+                                    };
+                                    if let AgentEvent::ReasoningDelta { text: next_text } =
+                                        next_event
+                                    {
+                                        accumulated.push_str(&next_text);
+                                        expected_seq += 1;
+                                        if accumulated.len() >= MAX_RAW_REVEAL_BYTES {
+                                            break;
+                                        }
+                                    } else {
+                                        // Legitimate completion of ReasoningDelta sequence
+                                        break;
+                                    }
+                                }
+                                return Ok(TrajectoryRawRevealResult::available(
+                                    TrajectoryRawField::Payload,
+                                    cap_reveal_text(accumulated),
+                                ));
+                            }
+                            _ => {
+                                return Ok(extract_raw_payload(&event, call_id));
+                            }
                         }
-                        _ => {
-                            return Ok(extract_raw_payload(&event, call_id));
-                        }
-                    },
+                    }
                     TrajectoryRawField::Result => {
                         return Ok(extract_raw_result(&event, call_id));
                     }
@@ -648,6 +702,90 @@ const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 /// Supports the 1 MiB historical response even under worst-case `\u00XX`
 /// JSON escaping, while placing an absolute ceiling on reverse-scan carry.
 const MAX_REVERSE_SCAN_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RAW_REVEAL_SCAN_LINES: usize = 10_000;
+const MAX_RAW_REVEAL_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+enum BoundedLineRead {
+    Line,
+    Oversized,
+    BudgetExceeded,
+    Eof,
+}
+
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line_buf: &mut Vec<u8>,
+    max_line_bytes: usize,
+    remaining_bytes_budget: &mut u64,
+) -> Result<BoundedLineRead, std::io::Error> {
+    line_buf.clear();
+    let mut total_read = 0;
+    let mut found_newline = false;
+
+    while total_read <= max_line_bytes {
+        if *remaining_bytes_budget == 0 {
+            return Ok(BoundedLineRead::BudgetExceeded);
+        }
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let chunk_len = pos;
+            if line_buf.len().saturating_add(chunk_len) > max_line_bytes {
+                reader.consume(pos + 1);
+                *remaining_bytes_budget = remaining_bytes_budget.saturating_sub((pos + 1) as u64);
+                return Ok(BoundedLineRead::Oversized);
+            }
+            if (chunk_len as u64) > *remaining_bytes_budget {
+                return Ok(BoundedLineRead::BudgetExceeded);
+            }
+            line_buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            *remaining_bytes_budget = remaining_bytes_budget.saturating_sub((pos + 1) as u64);
+            found_newline = true;
+            break;
+        } else {
+            let len = available.len();
+            if line_buf.len().saturating_add(len) > max_line_bytes {
+                reader.consume(len);
+                *remaining_bytes_budget = remaining_bytes_budget.saturating_sub(len as u64);
+                loop {
+                    let next = reader.fill_buf()?;
+                    if next.is_empty() {
+                        break;
+                    }
+                    if let Some(pos) = next.iter().position(|&b| b == b'\n') {
+                        reader.consume(pos + 1);
+                        *remaining_bytes_budget =
+                            remaining_bytes_budget.saturating_sub((pos + 1) as u64);
+                        break;
+                    }
+                    let next_len = next.len();
+                    reader.consume(next_len);
+                    *remaining_bytes_budget =
+                        remaining_bytes_budget.saturating_sub(next_len as u64);
+                }
+                return Ok(BoundedLineRead::Oversized);
+            }
+            if (len as u64) > *remaining_bytes_budget {
+                return Ok(BoundedLineRead::BudgetExceeded);
+            }
+            line_buf.extend_from_slice(available);
+            reader.consume(len);
+            *remaining_bytes_budget = remaining_bytes_budget.saturating_sub(len as u64);
+            total_read += len;
+        }
+    }
+
+    if line_buf.len() > max_line_bytes {
+        return Ok(BoundedLineRead::Oversized);
+    }
+    if line_buf.is_empty() && !found_newline {
+        return Ok(BoundedLineRead::Eof);
+    }
+    Ok(BoundedLineRead::Line)
+}
 
 fn scan_lines_reverse_until(
     path: &Path,
@@ -1623,5 +1761,176 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_trajectory_raw_reveal_non_canonical_chat_id_rejected_as_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        // Append an event to the canonical chat "chat_aliased"
+        let seq = journal
+            .append("chat_aliased", &text("secret content"))
+            .unwrap();
+        assert_eq!(seq, 1);
+
+        // Attempting to reveal via non-canonical chat "chat/aliased" (which would sanitize to "chat_aliased")
+        // must be rejected with typed Unavailable (NotFound) rather than leaking "chat_aliased" data.
+        let result = journal
+            .raw_reveal("chat/aliased", 1, None, None, TrajectoryRawField::Payload)
+            .unwrap();
+        match result {
+            TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+            }
+            other => panic!("expected typed Unavailable for non-canonical chat_id, got: {other:?}"),
+        }
+
+        // Canonical reveal succeeds normally:
+        let canon_result = journal
+            .raw_reveal("chat_aliased", 1, None, None, TrajectoryRawField::Payload)
+            .unwrap();
+        match canon_result {
+            TrajectoryRawRevealResult::Available { text, .. } => {
+                assert_eq!(text, "secret content");
+            }
+            other => panic!("expected Available for canonical chat_id, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trajectory_raw_reveal_corrupted_continuation_returns_typed_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        let path = journal.path_for("chat_corrupt_cont");
+        let line1 = serde_json::to_vec(&JournalLine {
+            seq: 1,
+            event: text("part1"),
+        })
+        .unwrap();
+        let mut contents = line1;
+        contents.push(b'\n');
+        contents.extend_from_slice(b"{\"seq\":2,\"event\":{broken_json\n");
+        std::fs::write(&path, contents).unwrap();
+
+        let result = journal
+            .raw_reveal(
+                "chat_corrupt_cont",
+                1,
+                None,
+                None,
+                TrajectoryRawField::Payload,
+            )
+            .unwrap();
+        match result {
+            TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                assert_eq!(reason, TrajectoryUnavailableReason::SourceCorrupt);
+            }
+            other => panic!("expected SourceCorrupt, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trajectory_raw_reveal_oversized_continuation_returns_typed_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        let path = journal.path_for("chat_oversized_cont");
+        let line1 = serde_json::to_vec(&JournalLine {
+            seq: 1,
+            event: text("part1"),
+        })
+        .unwrap();
+        let mut contents = line1;
+        contents.push(b'\n');
+        contents.extend_from_slice(b"{\"seq\":2,\"event\":{\"kind\":\"textDelta\",\"text\":\"");
+        contents.extend_from_slice(&vec![b'x'; MAX_REVERSE_SCAN_LINE_BYTES + 10]);
+        contents.extend_from_slice(b"\"}}\n");
+        std::fs::write(&path, contents).unwrap();
+
+        let result = journal
+            .raw_reveal(
+                "chat_oversized_cont",
+                1,
+                None,
+                None,
+                TrajectoryRawField::Payload,
+            )
+            .unwrap();
+        match result {
+            TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                assert_eq!(reason, TrajectoryUnavailableReason::SourceOversized);
+            }
+            other => panic!("expected SourceOversized, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trajectory_raw_reveal_sequence_gap_continuation_returns_typed_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        let path = journal.path_for("chat_gap_cont");
+        let line1 = serde_json::to_vec(&JournalLine {
+            seq: 1,
+            event: text("part1"),
+        })
+        .unwrap();
+        let line3 = serde_json::to_vec(&JournalLine {
+            seq: 3, // gap: seq 2 is missing!
+            event: text("part2"),
+        })
+        .unwrap();
+        let mut contents = line1;
+        contents.push(b'\n');
+        contents.extend_from_slice(&line3);
+        contents.push(b'\n');
+        std::fs::write(&path, contents).unwrap();
+
+        let result = journal
+            .raw_reveal("chat_gap_cont", 1, None, None, TrajectoryRawField::Payload)
+            .unwrap();
+        match result {
+            TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                assert_eq!(reason, TrajectoryUnavailableReason::SourceCorrupt);
+            }
+            other => panic!("expected SourceCorrupt on sequence gap, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trajectory_raw_reveal_scan_line_budget_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let path = journal.path_for("chat_huge_budget");
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(&path).unwrap();
+        for seq in 1..=(MAX_RAW_REVEAL_SCAN_LINES + 50) {
+            writeln!(
+                file,
+                "{{\"seq\":{seq},\"event\":{{\"kind\":\"textDelta\",\"text\":\"t\"}}}}"
+            )
+            .unwrap();
+        }
+        file.flush().unwrap();
+
+        // Looking for seq (MAX_RAW_REVEAL_SCAN_LINES + 40) must hit line budget exhaustion and return SourceOversized:
+        let result = journal
+            .raw_reveal(
+                "chat_huge_budget",
+                (MAX_RAW_REVEAL_SCAN_LINES + 40) as u64,
+                None,
+                None,
+                TrajectoryRawField::Payload,
+            )
+            .unwrap();
+        match result {
+            TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                assert_eq!(reason, TrajectoryUnavailableReason::SourceOversized);
+            }
+            other => panic!("expected SourceOversized when exceeding line budget, got: {other:?}"),
+        }
     }
 }

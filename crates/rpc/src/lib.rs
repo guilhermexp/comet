@@ -177,6 +177,23 @@ pub mod methods {
     pub const WATCH_TRAJECTORY: &str = "WatchTrajectory";
     /// Device-local unary lookup to reveal one raw field from Run Journal.
     pub const REVEAL_TRAJECTORY_RAW: &str = "RevealTrajectoryRaw";
+
+    /// Whether an RPC method is strictly device-local (IPC local only;
+    /// rejected at relay ingress on peer virtual connections and non-forwardable).
+    pub fn is_local_only(method: &str) -> bool {
+        matches!(
+            method,
+            WATCH_TRAJECTORY
+                | REVEAL_TRAJECTORY_RAW
+                | PROBE_LIVE_VOICE
+                | START_LIVE_VOICE
+                | SET_LIVE_VOICE_MUTED
+                | STOP_LIVE_VOICE
+                | WATCH_LIVE_VOICE
+                | LOCAL_DEVICE
+                | STOP_ENGINE
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -576,7 +593,12 @@ mod tests {
             method: &str,
             _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
-            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                && method != methods::WATCH_TRAJECTORY
+            {
+                if method == "Echo" {
+                    return Ok(RpcReply::Value(_params));
+                }
                 return Err(RpcError::UnknownMethod(method.into()));
             }
             let guard = DropSignal(self.dropped.lock().unwrap().take());
@@ -740,12 +762,25 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_stream_receiver_cancels_server_side() {
-        let client = memory_client(Arc::new(TestService));
-        let items = client
-            .subscribe("Never", serde_json::Value::Null)
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let client = memory_client(service);
+        let subscription = client
+            .subscribe_checked(
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+                serde_json::Value::Null,
+            )
             .await
-            .unwrap();
-        drop(items);
+            .expect("subscribe_checked");
+        drop(subscription);
+
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx).await;
+        assert!(
+            dropped.is_ok(),
+            "dropping stream subscription must cancel and tear down server task"
+        );
         // The next unary call still works — the dead stream didn't wedge the connection.
         let echoed = client.call("Echo", serde_json::json!(2)).await.unwrap();
         assert_eq!(echoed, serde_json::json!(2));
@@ -916,5 +951,12 @@ mod tests {
     fn test_trajectory_rpc_methods_local_only() {
         assert_eq!(methods::WATCH_TRAJECTORY, "WatchTrajectory");
         assert_eq!(methods::REVEAL_TRAJECTORY_RAW, "RevealTrajectoryRaw");
+        assert!(methods::is_local_only(methods::WATCH_TRAJECTORY));
+        assert!(methods::is_local_only(methods::REVEAL_TRAJECTORY_RAW));
+        assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
+        assert!(methods::is_local_only(methods::LOCAL_DEVICE));
+        assert!(methods::is_local_only(methods::STOP_ENGINE));
+        assert!(!methods::is_local_only(methods::LIST_HARNESSES));
+        assert!(!methods::is_local_only(methods::FETCH_TOOL_INPUT));
     }
 }

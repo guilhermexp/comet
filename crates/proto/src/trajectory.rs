@@ -128,12 +128,7 @@ impl TrajectoryLane {
 }
 
 /// Semantic classification of a Trajectory record.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TrajectoryRecordKind {
     SessionStarted,
     UserMessage,
@@ -153,6 +148,136 @@ pub enum TrajectoryRecordKind {
     Interrupted,
     Degraded,
     Custom { name: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum KnownTrajectoryRecordKind {
+    SessionStarted,
+    UserMessage,
+    InputRequested,
+    InputResolved,
+    Steered,
+    ContextUsage,
+    AvailableCommands,
+    AssistantMessage,
+    Reasoning,
+    WorkflowTask,
+    ToolCall { tool_name: String },
+    ToolResult { tool_name: String },
+    ToolDiff { tool_name: String },
+    Error,
+    Done,
+    Interrupted,
+    Degraded,
+}
+
+#[derive(Deserialize)]
+struct RawKindFallback {
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TrajectoryRecordKindDe {
+    Known(KnownTrajectoryRecordKind),
+    Custom(RawKindFallback),
+}
+
+impl Serialize for TrajectoryRecordKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::SessionStarted => KnownTrajectoryRecordKind::SessionStarted.serialize(serializer),
+            Self::UserMessage => KnownTrajectoryRecordKind::UserMessage.serialize(serializer),
+            Self::InputRequested => KnownTrajectoryRecordKind::InputRequested.serialize(serializer),
+            Self::InputResolved => KnownTrajectoryRecordKind::InputResolved.serialize(serializer),
+            Self::Steered => KnownTrajectoryRecordKind::Steered.serialize(serializer),
+            Self::ContextUsage => KnownTrajectoryRecordKind::ContextUsage.serialize(serializer),
+            Self::AvailableCommands => {
+                KnownTrajectoryRecordKind::AvailableCommands.serialize(serializer)
+            }
+            Self::AssistantMessage => {
+                KnownTrajectoryRecordKind::AssistantMessage.serialize(serializer)
+            }
+            Self::Reasoning => KnownTrajectoryRecordKind::Reasoning.serialize(serializer),
+            Self::WorkflowTask => KnownTrajectoryRecordKind::WorkflowTask.serialize(serializer),
+            Self::ToolCall { tool_name } => KnownTrajectoryRecordKind::ToolCall {
+                tool_name: tool_name.clone(),
+            }
+            .serialize(serializer),
+            Self::ToolResult { tool_name } => KnownTrajectoryRecordKind::ToolResult {
+                tool_name: tool_name.clone(),
+            }
+            .serialize(serializer),
+            Self::ToolDiff { tool_name } => KnownTrajectoryRecordKind::ToolDiff {
+                tool_name: tool_name.clone(),
+            }
+            .serialize(serializer),
+            Self::Error => KnownTrajectoryRecordKind::Error.serialize(serializer),
+            Self::Done => KnownTrajectoryRecordKind::Done.serialize(serializer),
+            Self::Interrupted => KnownTrajectoryRecordKind::Interrupted.serialize(serializer),
+            Self::Degraded => KnownTrajectoryRecordKind::Degraded.serialize(serializer),
+            Self::Custom { name } => {
+                #[derive(Serialize)]
+                struct CustomKindSer<'a> {
+                    kind: &'a str,
+                }
+                CustomKindSer {
+                    kind: name.as_str(),
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TrajectoryRecordKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let helper = TrajectoryRecordKindDe::deserialize(deserializer)?;
+        Ok(match helper {
+            TrajectoryRecordKindDe::Known(known) => match known {
+                KnownTrajectoryRecordKind::SessionStarted => Self::SessionStarted,
+                KnownTrajectoryRecordKind::UserMessage => Self::UserMessage,
+                KnownTrajectoryRecordKind::InputRequested => Self::InputRequested,
+                KnownTrajectoryRecordKind::InputResolved => Self::InputResolved,
+                KnownTrajectoryRecordKind::Steered => Self::Steered,
+                KnownTrajectoryRecordKind::ContextUsage => Self::ContextUsage,
+                KnownTrajectoryRecordKind::AvailableCommands => Self::AvailableCommands,
+                KnownTrajectoryRecordKind::AssistantMessage => Self::AssistantMessage,
+                KnownTrajectoryRecordKind::Reasoning => Self::Reasoning,
+                KnownTrajectoryRecordKind::WorkflowTask => Self::WorkflowTask,
+                KnownTrajectoryRecordKind::ToolCall { tool_name } => Self::ToolCall { tool_name },
+                KnownTrajectoryRecordKind::ToolResult { tool_name } => {
+                    Self::ToolResult { tool_name }
+                }
+                KnownTrajectoryRecordKind::ToolDiff { tool_name } => Self::ToolDiff { tool_name },
+                KnownTrajectoryRecordKind::Error => Self::Error,
+                KnownTrajectoryRecordKind::Done => Self::Done,
+                KnownTrajectoryRecordKind::Interrupted => Self::Interrupted,
+                KnownTrajectoryRecordKind::Degraded => Self::Degraded,
+            },
+            TrajectoryRecordKindDe::Custom(fallback) => {
+                let name = if fallback.kind == "custom" && fallback.name.is_some() {
+                    fallback.name.unwrap()
+                } else {
+                    fallback.kind
+                };
+                Self::Custom { name }
+            }
+        })
+    }
 }
 
 impl TrajectoryRecordKind {
@@ -534,7 +659,154 @@ fn token_secret_end(bytes: &[u8], start: usize) -> Option<usize> {
     (opaque_end - start >= 32).then_some(opaque_end)
 }
 
+fn is_sensitive_query_key(key: &str) -> bool {
+    const SENSITIVE_KEYS: &[&str] = &[
+        "key",
+        "sig",
+        "signature",
+        "secret",
+        "code",
+        "token",
+        "apikey",
+        "api_key",
+        "api-key",
+        "auth",
+        "authorization",
+        "access_token",
+        "password",
+        "pwd",
+        "credential",
+        "credentials",
+        "session",
+        "jwt",
+        "private_key",
+    ];
+    SENSITIVE_KEYS
+        .iter()
+        .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+}
+
+fn sanitize_url_str(url_str: &str) -> String {
+    let (scheme, rest) = if let Some(rest) = url_str.strip_prefix("https://") {
+        ("https://", rest)
+    } else if let Some(rest) = url_str.strip_prefix("http://") {
+        ("http://", rest)
+    } else if let Some(rest) = url_str.strip_prefix("wss://") {
+        ("wss://", rest)
+    } else if let Some(rest) = url_str.strip_prefix("ws://") {
+        ("ws://", rest)
+    } else if let Some(rest) = url_str.strip_prefix("ftp://") {
+        ("ftp://", rest)
+    } else {
+        return url_str.to_string();
+    };
+
+    let (before_query, query_and_frag) = match rest.find('?') {
+        Some(idx) => (&rest[..idx], Some(&rest[idx + 1..])),
+        None => (rest, None),
+    };
+
+    let authority_end = before_query.find('/').unwrap_or(before_query.len());
+    let authority = &before_query[..authority_end];
+    let path_and_rest = &before_query[authority_end..];
+
+    let sanitized_authority = if let Some(at_idx) = authority.find('@') {
+        &authority[at_idx + 1..]
+    } else {
+        authority
+    };
+
+    let mut result = String::with_capacity(url_str.len());
+    result.push_str(scheme);
+    result.push_str(sanitized_authority);
+    result.push_str(path_and_rest);
+
+    if let Some(q_and_f) = query_and_frag {
+        result.push('?');
+        let (query, fragment) = match q_and_f.find('#') {
+            Some(f_idx) => (&q_and_f[..f_idx], Some(&q_and_f[f_idx..])),
+            None => (q_and_f, None),
+        };
+
+        let mut first = true;
+        for param in query.split('&') {
+            if !first {
+                result.push('&');
+            }
+            first = false;
+
+            if let Some((k, _v)) = param.split_once('=') {
+                if is_sensitive_query_key(k) {
+                    result.push_str(k);
+                    result.push('=');
+                    result.push_str(REDACTED);
+                } else {
+                    result.push_str(param);
+                }
+            } else if is_sensitive_query_key(param) {
+                result.push_str(param);
+                result.push('=');
+                result.push_str(REDACTED);
+            } else {
+                result.push_str(param);
+            }
+        }
+
+        if let Some(frag) = fragment {
+            result.push('#');
+            result.push_str(frag);
+        }
+    }
+
+    result
+}
+
+fn redact_urls(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let schemes = ["https://", "http://", "wss://", "ws://", "ftp://"];
+
+    while cursor < bytes.len() {
+        let matched_scheme = schemes.iter().find(|scheme| {
+            text[cursor..].starts_with(*scheme)
+                && (cursor == 0 || !bytes[cursor - 1].is_ascii_alphanumeric())
+        });
+
+        if let Some(scheme) = matched_scheme {
+            let start = cursor;
+            let mut end = start + scheme.len();
+            while end < bytes.len() {
+                let b = bytes[end];
+                if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'`') {
+                    break;
+                }
+                end += 1;
+            }
+
+            while end > start + scheme.len()
+                && matches!(bytes[end - 1], b'.' | b',' | b';' | b')' | b']')
+            {
+                end -= 1;
+            }
+
+            let url_candidate = &text[start..end];
+            let sanitized = sanitize_url_str(url_candidate);
+            result.push_str(&sanitized);
+            cursor = end;
+        } else {
+            let ch = text[cursor..].chars().next().unwrap();
+            result.push(ch);
+            cursor += ch.len_utf8();
+        }
+    }
+
+    result
+}
+
 fn redact_secrets(text: &str) -> String {
+    let url_sanitized = redact_urls(text);
+    let text = &url_sanitized;
     let bytes = text.as_bytes();
     let mut redacted = String::with_capacity(text.len());
     let mut copy_from = 0;
@@ -566,7 +838,6 @@ fn sanitized_preview(text: &str, byte_cap: usize) -> String {
 }
 
 fn tool_input_metadata(input: Option<&serde_json::Value>) -> String {
-    let byte_count = input.map_or(0, |value| value.to_string().len());
     let mut keys = input
         .and_then(serde_json::Value::as_object)
         .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
@@ -577,7 +848,12 @@ fn tool_input_metadata(input: Option<&serde_json::Value>) -> String {
     } else {
         keys.join(", ")
     };
-    format!("args: {names} ({byte_count} bytes)")
+    if let Some(value) = input {
+        let byte_count = value.to_string().len();
+        format!("args: {names} ({byte_count} bytes)")
+    } else {
+        format!("args: {names} (size unavailable)")
+    }
 }
 
 /// Bounded string truncation preserving UTF-8 boundaries.
@@ -633,10 +909,11 @@ pub fn sanitize_tool_call(
             Some("path: string".to_string()),
         ),
         ToolCall::WriteFile { path, content } => {
-            let text = format!(
-                "Path: {path}\nBytes: {}",
-                content.as_ref().map_or(0, String::len)
-            );
+            let text = if let Some(content) = content.as_ref() {
+                format!("Path: {path}\nBytes: {}", content.len())
+            } else {
+                format!("Path: {path}\nBytes: unavailable")
+            };
             (
                 sanitized_summary(&format!("Write {path}")),
                 Some(sanitized_preview(&text, byte_cap)),
@@ -733,7 +1010,14 @@ pub fn sanitize_tool_result(
         "Completed".to_string()
     };
 
-    let preview = if let Some(diff) = diff {
+    let preview = if is_error {
+        Some(format!(
+            "Tool execution failed{}",
+            exit_code
+                .map(|code| format!(" (exit code {code})"))
+                .unwrap_or_default()
+        ))
+    } else if let Some(diff) = diff {
         Some(format!(
             "Diff on {}:\n+{} lines, -{} lines",
             diff.path,
@@ -741,13 +1025,6 @@ pub fn sanitize_tool_result(
             diff.old_text
                 .as_deref()
                 .map_or(0, |text| text.lines().count())
-        ))
-    } else if is_error {
-        Some(format!(
-            "Tool execution failed{}",
-            exit_code
-                .map(|code| format!(" (exit code {code})"))
-                .unwrap_or_default()
         ))
     } else {
         output.map(|output| {
@@ -760,7 +1037,6 @@ pub fn sanitize_tool_result(
             )
         })
     };
-
     (
         sanitized_summary(&summary),
         preview.map(|preview| sanitized_preview(&preview, _byte_cap)),
@@ -895,6 +1171,10 @@ fn fold_status(
 }
 
 fn aggregate_run_timing(run: &TrajectoryRun) -> Option<TrajectoryTiming> {
+    if !run.status.is_terminal() {
+        return None;
+    }
+
     let mut first_start = None;
     let mut last_end = None;
 
@@ -905,16 +1185,17 @@ fn aggregate_run_timing(run: &TrajectoryRun) -> Option<TrajectoryTiming> {
         .flat_map(|step| &step.records)
     {
         let Some(timing) = &record.timing else {
-            continue;
+            return None;
         };
         if timing.mode == TrajectoryTimingMode::SequenceOnly {
             return None;
         }
-        if first_start.is_none() {
-            first_start = timing.started_at;
+        if let Some(started) = timing.started_at {
+            first_start =
+                Some(first_start.map_or(started, |prev: DateTime<Utc>| prev.min(started)));
         }
-        if timing.ended_at.is_some() {
-            last_end = timing.ended_at;
+        if let Some(ended) = timing.ended_at {
+            last_end = Some(last_end.map_or(ended, |prev: DateTime<Utc>| prev.max(ended)));
         }
     }
 
@@ -939,7 +1220,8 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
             let label = if is_legacy {
                 "Legacy Run".to_string()
             } else {
-                format!("Run {}", runs.len() + 1)
+                let non_legacy_count = runs.iter().filter(|r| !r.is_legacy).count();
+                format!("Run {}", non_legacy_count + 1)
             };
             runs.push(TrajectoryRun {
                 run_id: record.run_id.clone(),
@@ -1008,7 +1290,7 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
 
 /// Reconcile a single delta record into an existing ordered record list.
 ///
-/// `records` must already be sorted in monotonic `(source_seq, sub_seq)` order.
+/// `records` must already be sorted in monotonic `TrajectoryRecordId` (`(run_id, source_seq, sub_seq)`) order.
 /// Replaces an existing partial with the same `TrajectoryRecordId` or inserts at
 /// the sorted position. A re-delivered partial never replaces a stored final.
 pub fn reconcile_record(records: &mut Vec<TrajectoryRecord>, delta: TrajectoryRecord) {
@@ -1018,9 +1300,7 @@ pub fn reconcile_record(records: &mut Vec<TrajectoryRecord>, delta: TrajectoryRe
         }
     } else {
         let insert_pos = records
-            .binary_search_by_key(&(delta.source_seq, delta.sub_seq), |r| {
-                (r.source_seq, r.sub_seq)
-            })
+            .binary_search_by_key(&&delta.id, |r| &r.id)
             .unwrap_or_else(|pos| pos);
         records.insert(insert_pos, delta);
     }
@@ -1779,5 +2059,374 @@ mod tests {
         let (summary, _, _) = sanitize_tool_call(&search_call, 1024);
         assert!(summary.ends_with('…'));
         assert!(summary.len() <= MAX_SUMMARY_LEN + '…'.len_utf8() + 4);
+    }
+
+    #[test]
+    fn test_trajectory_timing_non_terminal_run_with_settled_tools_produces_no_duration() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 2).unwrap();
+
+        let mut call = test_record(
+            1,
+            TrajectoryRecordKind::ToolCall {
+                tool_name: "bash".into(),
+            },
+            TrajectoryStatus::Running,
+        );
+        call.timing = Some(TrajectoryTiming::recorded(Some(start), None, None, None));
+
+        let mut result = test_record(
+            2,
+            TrajectoryRecordKind::ToolResult {
+                tool_name: "bash".into(),
+            },
+            TrajectoryStatus::Running,
+        );
+        result.timing = Some(TrajectoryTiming::recorded(None, Some(end), None, None));
+
+        let groups = group_records(&[call, result]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, TrajectoryStatus::Running);
+        assert_eq!(
+            groups[0].timing, None,
+            "non-terminal run must NOT produce an aggregate duration even if a tool settled"
+        );
+    }
+
+    #[test]
+    fn test_trajectory_timing_missing_timing_degrades_to_sequence_only_instead_of_stronger_claim() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let mid = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 1).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 3).unwrap();
+
+        let mut r1 = test_record(
+            1,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        r1.timing = Some(TrajectoryTiming::recorded(
+            Some(start),
+            Some(mid),
+            None,
+            None,
+        ));
+
+        let mut r2 = test_record(
+            2,
+            TrajectoryRecordKind::Reasoning,
+            TrajectoryStatus::Completed,
+        );
+        r2.timing = None; // Missing timing must degrade aggregate, not be silently skipped
+
+        let mut r3 = test_record(3, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+        r3.timing = Some(TrajectoryTiming::recorded(Some(mid), Some(end), None, None));
+
+        let groups = group_records(&[r1, r2, r3]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, TrajectoryStatus::Completed);
+        assert_eq!(
+            groups[0].timing, None,
+            "a member record with timing == None must degrade run timing to None"
+        );
+    }
+
+    #[test]
+    fn test_trajectory_timing_aggregate_uses_max_ended_at() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 1).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 2).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 5).unwrap();
+
+        let mut r1 = test_record(
+            1,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        r1.timing = Some(TrajectoryTiming::recorded(Some(t0), Some(t1), None, None));
+
+        let mut r2_tool_long = test_record(
+            2,
+            TrajectoryRecordKind::ToolResult {
+                tool_name: "background_job".into(),
+            },
+            TrajectoryStatus::Completed,
+        );
+        r2_tool_long.timing = Some(TrajectoryTiming::recorded(Some(t1), Some(t3), None, None));
+
+        let mut r3_done = test_record(3, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+        r3_done.timing = Some(TrajectoryTiming::recorded(Some(t2), Some(t2), None, None));
+
+        let groups = group_records(&[r1, r2_tool_long, r3_done]);
+        let timing = groups[0].timing.as_ref().expect("timing present");
+        assert_eq!(timing.started_at, Some(t0));
+        assert_eq!(
+            timing.ended_at,
+            Some(t3),
+            "aggregate ended_at must be the MAX ended_at among records, not the last seen"
+        );
+        assert_eq!(timing.effective_duration_ms(), Some(5_000));
+    }
+
+    #[test]
+    fn test_trajectory_record_kind_unknown_kind_deserializes_to_custom() {
+        // Unknown kind from a newer build degrades gracefully to Custom { name }
+        let json_from_newer_build = serde_json::json!({
+            "kind": "deepSearchTask",
+            "searchQuery": "quantum computing",
+            "subAgents": 3
+        });
+        let deserialized: TrajectoryRecordKind =
+            serde_json::from_value(json_from_newer_build).expect("deserialization must succeed");
+        assert_eq!(
+            deserialized,
+            TrajectoryRecordKind::Custom {
+                name: "deepSearchTask".to_string()
+            }
+        );
+        assert_eq!(deserialized.default_lane(), TrajectoryLane::Model);
+
+        // Round-trip of Custom variant
+        let custom = TrajectoryRecordKind::Custom {
+            name: "futureProtocolKind".to_string(),
+        };
+        let serialized = serde_json::to_string(&custom).expect("serialize custom");
+        assert_eq!(serialized, "{\"kind\":\"futureProtocolKind\"}");
+        let roundtrip: TrajectoryRecordKind =
+            serde_json::from_str(&serialized).expect("deserialize roundtrip");
+        assert_eq!(roundtrip, custom);
+
+        // Explicit { "kind": "custom", "name": "foo" } format also supported
+        let explicit_custom = serde_json::json!({
+            "kind": "custom",
+            "name": "legacyFormatKind"
+        });
+        let from_explicit: TrajectoryRecordKind =
+            serde_json::from_value(explicit_custom).expect("deserialize explicit custom");
+        assert_eq!(
+            from_explicit,
+            TrajectoryRecordKind::Custom {
+                name: "legacyFormatKind".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_trajectory_reconcile_shuffled_multirun_batch_insertion_and_idempotence() {
+        let r1_1 = test_record(
+            1,
+            TrajectoryRecordKind::UserMessage,
+            TrajectoryStatus::Completed,
+        );
+        let mut r1_2 = test_record(
+            2,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        r1_2.id = TrajectoryRecordId::new("run-1", 2, 0);
+        r1_2.source_seq = 2;
+        let mut r1_5 = test_record(5, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+        r1_5.id = TrajectoryRecordId::new("run-1", 5, 0);
+        r1_5.source_seq = 5;
+
+        let mut r2_1 = test_record(
+            1,
+            TrajectoryRecordKind::UserMessage,
+            TrajectoryStatus::Completed,
+        );
+        r2_1.id = TrajectoryRecordId::new("run-2", 1, 0);
+        r2_1.run_id = "run-2".into();
+        r2_1.source_seq = 1;
+        let mut r2_2 = test_record(
+            2,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+        );
+        r2_2.id = TrajectoryRecordId::new("run-2", 2, 0);
+        r2_2.run_id = "run-2".into();
+        r2_2.source_seq = 2;
+        let mut r2_5 = test_record(5, TrajectoryRecordKind::Done, TrajectoryStatus::Completed);
+        r2_5.id = TrajectoryRecordId::new("run-2", 5, 0);
+        r2_5.run_id = "run-2".into();
+        r2_5.source_seq = 5;
+
+        let expected_ordered_ids = vec![
+            TrajectoryRecordId::new("run-1", 1, 0),
+            TrajectoryRecordId::new("run-1", 2, 0),
+            TrajectoryRecordId::new("run-1", 5, 0),
+            TrajectoryRecordId::new("run-2", 1, 0),
+            TrajectoryRecordId::new("run-2", 2, 0),
+            TrajectoryRecordId::new("run-2", 5, 0),
+        ];
+
+        // Shuffled batch interleaving runs and sequences
+        let shuffled = vec![
+            r2_5.clone(),
+            r1_2.clone(),
+            r2_1.clone(),
+            r1_5.clone(),
+            r2_2.clone(),
+            r1_1.clone(),
+        ];
+
+        let mut records = Vec::new();
+
+        // First pass: insertion branch for all items
+        apply_deltas(&mut records, shuffled.clone());
+        let pass1_ids: Vec<_> = records.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            pass1_ids, expected_ordered_ids,
+            "first pass must insert records in strictly monotonic TrajectoryRecordId order"
+        );
+
+        // Second pass: idempotence check
+        apply_deltas(&mut records, shuffled);
+        let pass2_ids: Vec<_> = records.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            pass2_ids, expected_ordered_ids,
+            "second pass must be strictly idempotent with no duplicates or reordering"
+        );
+    }
+
+    #[test]
+    fn test_trajectory_group_records_legacy_and_native_run_numbering() {
+        let mut r_leg = test_record(
+            1,
+            TrajectoryRecordKind::UserMessage,
+            TrajectoryStatus::Completed,
+        );
+        r_leg.id = TrajectoryRecordId::new("legacy-session-001", 1, 0);
+        r_leg.run_id = "legacy-session-001".into();
+
+        let mut r1 = test_record(
+            1,
+            TrajectoryRecordKind::UserMessage,
+            TrajectoryStatus::Completed,
+        );
+        r1.id = TrajectoryRecordId::new("run-native-1", 1, 0);
+        r1.run_id = "run-native-1".into();
+
+        let mut r2 = test_record(
+            1,
+            TrajectoryRecordKind::UserMessage,
+            TrajectoryStatus::Completed,
+        );
+        r2.id = TrajectoryRecordId::new("run-native-2", 1, 0);
+        r2.run_id = "run-native-2".into();
+
+        let groups = group_records(&[r_leg, r1, r2]);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].label, "Legacy Run");
+        assert_eq!(groups[0].is_legacy, true);
+        assert_eq!(groups[1].label, "Run 1");
+        assert_eq!(groups[1].is_legacy, false);
+        assert_eq!(groups[2].label, "Run 2");
+        assert_eq!(groups[2].is_legacy, false);
+    }
+
+    #[test]
+    fn test_trajectory_sanitize_unavailable_sizes_do_not_fabricate_zero_bytes() {
+        let write_none = ToolCall::WriteFile {
+            path: "/path/to/file.txt".into(),
+            content: None,
+        };
+        let (summary, preview, _) = sanitize_tool_call(&write_none, 1024);
+        assert_eq!(summary, "Write /path/to/file.txt");
+        let prev = preview.expect("preview present");
+        assert!(prev.contains("Bytes: unavailable"));
+        assert!(!prev.contains("Bytes: 0"));
+
+        let write_empty = ToolCall::WriteFile {
+            path: "/path/to/empty.txt".into(),
+            content: Some(String::new()),
+        };
+        let (_, preview_empty, _) = sanitize_tool_call(&write_empty, 1024);
+        assert!(preview_empty.expect("preview present").contains("Bytes: 0"));
+
+        let mcp_none = ToolCall::Mcp {
+            server: "git".into(),
+            tool: "status".into(),
+            input: None,
+        };
+        let (_, mcp_prev, _) = sanitize_tool_call(&mcp_none, 1024);
+        assert_eq!(mcp_prev.as_deref(), Some("args: none (size unavailable)"));
+
+        let unknown_none = ToolCall::Unknown {
+            name: "custom_op".into(),
+            input: None,
+        };
+        let (_, unk_prev, _) = sanitize_tool_call(&unknown_none, 1024);
+        assert_eq!(unk_prev.as_deref(), Some("args: none (size unavailable)"));
+    }
+
+    #[test]
+    fn test_trajectory_sanitize_url_userinfo_and_query_credentials_redacted() {
+        let web_fetch = ToolCall::WebFetch {
+            url: "https://user:s3cret@host.com/p?key=abc123&sig=deadbeef&page=1".into(),
+            prompt: None,
+        };
+        let (summary, preview, _) = sanitize_tool_call(&web_fetch, 1024);
+        assert!(!summary.contains("user:s3cret"));
+        assert!(!summary.contains("abc123"));
+        assert!(!summary.contains("deadbeef"));
+        assert!(summary.contains("https://host.com/p?key=[REDACTED]&sig=[REDACTED]&page=1"));
+
+        let prev = preview.expect("preview present");
+        assert!(!prev.contains("user:s3cret"));
+        assert!(!prev.contains("abc123"));
+        assert!(!prev.contains("deadbeef"));
+        assert!(prev.contains("https://host.com/p?key=[REDACTED]&sig=[REDACTED]&page=1"));
+
+        let exec_cmd = ToolCall::Exec {
+            command: "curl -X GET 'https://admin:pwd999@api.example.com/v1/auth?token=secrettoken&code=456&mode=fast'".into(),
+        };
+        let (exec_sum, exec_prev, _) = sanitize_tool_call(&exec_cmd, 1024);
+        assert!(!exec_sum.contains("admin:pwd999"));
+        assert!(!exec_sum.contains("secrettoken"));
+        assert!(!exec_sum.contains("456"));
+        assert!(exec_sum.contains("token=[REDACTED]"));
+        assert!(exec_sum.contains("code=[REDACTED]"));
+        assert!(exec_sum.contains("mode=fast"));
+
+        let exec_p = exec_prev.expect("preview present");
+        assert!(!exec_p.contains("admin:pwd999"));
+        assert!(!exec_p.contains("secrettoken"));
+        assert!(!exec_p.contains("456"));
+    }
+
+    #[test]
+    fn test_trajectory_sanitize_tool_result_error_precedence_over_diff() {
+        let diff = ToolDiff {
+            path: "src/main.rs".into(),
+            old_text: Some("fn old() {}".into()),
+            new_text: "fn new() {}".into(),
+        };
+        let meta = ToolExecutionMeta {
+            exit_code: Some(1),
+            duration_ms: None,
+        };
+
+        // When is_error = true, error summary and preview must take precedence over diff
+        let (summary, preview, exit_code) = sanitize_tool_result(
+            Some("compilation failed"),
+            Some(&diff),
+            Some(&meta),
+            true,
+            500,
+        );
+
+        assert_eq!(summary, "Failed (exit code 1)");
+        assert_eq!(
+            preview.as_deref(),
+            Some("Tool execution failed (exit code 1)")
+        );
+        assert_eq!(exit_code, Some(1));
+        assert!(!preview.as_deref().unwrap().contains("Diff on src/main.rs"));
+
+        // When is_error = false, diff is displayed normally
+        let (ok_sum, ok_prev, ok_exit) =
+            sanitize_tool_result(Some("ok"), Some(&diff), Some(&meta), false, 500);
+        assert_eq!(ok_sum, "Diff on src/main.rs");
+        assert!(ok_prev.as_deref().unwrap().contains("Diff on src/main.rs"));
+        assert_eq!(ok_exit, Some(1));
     }
 }

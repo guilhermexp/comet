@@ -10,7 +10,7 @@
 //! - Queue saturation or transaction failure records explicit degraded intervals rather than failing.
 //! - Stores only sanitized representations and opaque Run Journal references; never duplicate raw bodies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -191,9 +191,10 @@ pub struct TrajectoryStore {
     pub(crate) db_path: PathBuf,
     pub(crate) journals_dir: PathBuf,
     pub(crate) writer_tx: SyncSender<WriterCommand>,
-    pub(crate) in_memory_degraded: Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
+    pub(crate) in_memory_degraded: Arc<Mutex<VecDeque<TrajectoryDegradedInterval>>>,
     pub(crate) degraded_reason: Arc<Mutex<Option<String>>>,
     pub(crate) events_tx: broadcast::Sender<TrajectoryStoreEvent>,
+    pub(crate) legacy_importing: Arc<Mutex<HashSet<String>>>,
 }
 
 impl TrajectoryStore {
@@ -216,8 +217,11 @@ impl TrajectoryStore {
         let (events_tx, _) = broadcast::channel(2048);
         let writer_events_tx = events_tx.clone();
         let writer_db_path = db_path.clone();
-        let in_memory_degraded = Arc::new(Mutex::new(Vec::new()));
+        let in_memory_degraded = Arc::new(Mutex::new(VecDeque::new()));
         let writer_in_mem = in_memory_degraded.clone();
+        let degraded_reason = Arc::new(Mutex::new(None));
+        let writer_degraded_reason = degraded_reason.clone();
+        let legacy_importing = Arc::new(Mutex::new(HashSet::new()));
         std::thread::Builder::new()
             .name("trajectory-writer".into())
             .spawn(move || {
@@ -225,12 +229,20 @@ impl TrajectoryStore {
                     Ok(c) => c,
                     Err(err) => {
                         tracing::error!(error = %err, "failed to open trajectory writer connection");
+                        *writer_degraded_reason.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("failed to open writer connection: {err}"));
                         return;
                     }
                 };
-                let _ = conn.pragma_update(None, "journal_mode", "WAL");
-                let _ = conn.pragma_update(None, "synchronous", "NORMAL");
-                let _ = conn.busy_timeout(Duration::from_secs(5));
+                if let Err(err) = conn.pragma_update(None, "journal_mode", "WAL") {
+                    tracing::error!(error = %err, "failed to set WAL journal_mode on writer");
+                }
+                if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                    tracing::error!(error = %err, "failed to set synchronous NORMAL on writer");
+                }
+                if let Err(err) = conn.busy_timeout(Duration::from_secs(5)) {
+                    tracing::error!(error = %err, "failed to set busy_timeout on writer");
+                }
                 let mut next_rev = match conn.query_row(
                     "SELECT COALESCE(MAX(rev), 0) + 1 FROM trajectory_records",
                     [],
@@ -240,13 +252,19 @@ impl TrajectoryStore {
                     Ok(_) => 1,
                     Err(err) => {
                         tracing::error!(error = %err, "failed to seed trajectory writer revision");
+                        *writer_degraded_reason.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("failed to seed revision: {err}"));
                         return;
                     }
                 };
 
-
+                let mut degraded_persist_failed = false;
                 while let Ok(cmd) = writer_rx.recv() {
-                    persist_pending_degraded(&mut conn, &writer_in_mem);
+                    if !degraded_persist_failed {
+                        if !persist_pending_degraded(&mut conn, &writer_in_mem) {
+                            degraded_persist_failed = true;
+                        }
+                    }
                     match cmd {
                         WriterCommand::WriteRecords(mut records) => {
                             // Drain any immediately available batched records.
@@ -254,13 +272,16 @@ impl TrajectoryStore {
                                 match next {
                                     WriterCommand::WriteRecords(more) => records.extend(more),
                                     other => {
-                                        flush_batch_to_writer(
+                                        let ok = flush_batch_to_writer(
                                             &mut conn,
                                             &records,
                                             &writer_in_mem,
                                             &writer_events_tx,
                                             &mut next_rev,
                                         );
+                                        if ok {
+                                            degraded_persist_failed = false;
+                                        }
                                         records.clear();
                                         handle_writer_command(
                                             &mut conn,
@@ -274,13 +295,16 @@ impl TrajectoryStore {
                                 }
                             }
                             if !records.is_empty() {
-                                flush_batch_to_writer(
+                                let ok = flush_batch_to_writer(
                                     &mut conn,
                                     &records,
                                     &writer_in_mem,
                                     &writer_events_tx,
                                     &mut next_rev,
                                 );
+                                if ok {
+                                    degraded_persist_failed = false;
+                                }
                             }
                         }
                         other => {
@@ -293,9 +317,8 @@ impl TrajectoryStore {
                             );
                         }
                     }
-                    persist_pending_degraded(&mut conn, &writer_in_mem);
                 }
-                persist_pending_degraded(&mut conn, &writer_in_mem);
+                let _ = persist_pending_degraded(&mut conn, &writer_in_mem);
             })
             .map_err(|e| TrajectoryStoreError::Other(e.to_string()))?;
 
@@ -304,8 +327,9 @@ impl TrajectoryStore {
             journals_dir,
             writer_tx,
             in_memory_degraded,
-            degraded_reason: Arc::new(Mutex::new(None)),
+            degraded_reason,
             events_tx,
+            legacy_importing,
         })
     }
 
@@ -319,12 +343,13 @@ impl TrajectoryStore {
             db_path,
             journals_dir,
             writer_tx,
-            in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
+            in_memory_degraded: Arc::new(Mutex::new(VecDeque::new())),
             degraded_reason: Arc::new(Mutex::new(Some(reason.into()))),
             events_tx,
+            legacy_importing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
-    /// True if this store is running in degraded mode due to initialization failure.
+    /// True if this store is running in degraded mode due to initialization failure or writer termination.
     pub fn is_degraded(&self) -> bool {
         self.degraded_reason
             .lock()
@@ -388,6 +413,36 @@ impl TrajectoryStore {
         if self.has_legacy_import(chat_id).unwrap_or(false) {
             return Ok(());
         }
+        {
+            let mut importing = self
+                .legacy_importing
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if importing.contains(chat_id) {
+                drop(importing);
+                let _ = self.sync_flush();
+                return Ok(());
+            }
+            importing.insert(chat_id.to_string());
+        }
+        struct LegacyImportGuard {
+            chat_id: String,
+            importing: Arc<Mutex<HashSet<String>>>,
+        }
+        impl Drop for LegacyImportGuard {
+            fn drop(&mut self) {
+                let mut importing = self
+                    .importing
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                importing.remove(&self.chat_id);
+            }
+        }
+        let _guard = LegacyImportGuard {
+            chat_id: chat_id.to_string(),
+            importing: self.legacy_importing.clone(),
+        };
+
         // Synchronize with writer so any already enqueued native records are committed
         let _ = self.sync_flush();
         if self.has_legacy_import(chat_id).unwrap_or(false) {
@@ -400,12 +455,12 @@ impl TrajectoryStore {
         Ok(())
     }
 
-    fn record_degraded_in_memory(&self, degraded: TrajectoryDegradedInterval) {
+    pub fn record_degraded_in_memory(&self, degraded: TrajectoryDegradedInterval) {
         let mut in_mem = self
             .in_memory_degraded
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(existing) = in_mem.last_mut() {
+        for existing in in_mem.iter_mut().rev() {
             if existing.chat_id == degraded.chat_id
                 && existing.run_id == degraded.run_id
                 && existing.reason == degraded.reason
@@ -414,13 +469,33 @@ impl TrajectoryStore {
             {
                 existing.from_seq = existing.from_seq.min(degraded.from_seq);
                 existing.to_seq = existing.to_seq.max(degraded.to_seq);
+                existing.recorded_at = existing.recorded_at.max(degraded.recorded_at);
                 return;
             }
         }
-        if in_mem.len() == MAX_IN_MEMORY_DEGRADED_INTERVALS {
-            in_mem.remove(0);
+        if in_mem.len() >= MAX_IN_MEMORY_DEGRADED_INTERVALS {
+            in_mem.pop_front();
         }
-        in_mem.push(degraded);
+        in_mem.push_back(degraded);
+    }
+
+    pub fn record_degraded_interval(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+        from_seq: u64,
+        to_seq: u64,
+        reason: impl Into<String>,
+    ) -> Result<(), TrajectoryStoreError> {
+        self.record_degraded_in_memory(TrajectoryDegradedInterval {
+            chat_id: chat_id.to_string(),
+            run_id: run_id.to_string(),
+            from_seq,
+            to_seq,
+            reason: reason.into(),
+            recorded_at: Utc::now(),
+        });
+        Ok(())
     }
 
     /// Enqueue a captured record nonblockingly.
@@ -436,7 +511,7 @@ impl TrajectoryStore {
         {
             let degraded = TrajectoryDegradedInterval {
                 chat_id: record.chat_id.clone(),
-                run_id: record.run_id.clone(),
+                run_id: record.run_id,
                 from_seq: record.source_seq,
                 to_seq: record.source_seq,
                 reason: format!("Store degraded: {}", reason),
@@ -444,7 +519,7 @@ impl TrajectoryStore {
             };
             self.record_degraded_in_memory(degraded.clone());
             let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                chat_id: record.chat_id.clone(),
+                chat_id: degraded.chat_id.clone(),
                 interval: degraded,
             });
             return Err(TrajectoryStoreError::Other(format!(
@@ -454,45 +529,68 @@ impl TrajectoryStore {
         }
         match self
             .writer_tx
-            .try_send(WriterCommand::WriteRecords(vec![record.clone()]))
+            .try_send(WriterCommand::WriteRecords(vec![record]))
         {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                tracing::warn!(
-                    chat = %record.chat_id,
-                    run = %record.run_id,
-                    seq = record.source_seq,
-                    "trajectory capture queue saturated; recording degraded interval"
-                );
-                let degraded = TrajectoryDegradedInterval {
-                    chat_id: record.chat_id.clone(),
-                    run_id: record.run_id.clone(),
-                    from_seq: record.source_seq,
-                    to_seq: record.source_seq,
-                    reason: "Queue saturated".into(),
-                    recorded_at: Utc::now(),
-                };
-                self.record_degraded_in_memory(degraded.clone());
-                let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                    chat_id: record.chat_id.clone(),
-                    interval: degraded,
-                });
+            Err(TrySendError::Full(WriterCommand::WriteRecords(mut recs))) => {
+                if let Some(record) = recs.pop() {
+                    tracing::warn!(
+                        chat = %record.chat_id,
+                        run = %record.run_id,
+                        seq = record.source_seq,
+                        "trajectory capture queue saturated; recording degraded interval"
+                    );
+                    let degraded = TrajectoryDegradedInterval {
+                        chat_id: record.chat_id.clone(),
+                        run_id: record.run_id,
+                        from_seq: record.source_seq,
+                        to_seq: record.source_seq,
+                        reason: "Queue saturated".into(),
+                        recorded_at: Utc::now(),
+                    };
+                    self.record_degraded_in_memory(degraded.clone());
+                    let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                        chat_id: degraded.chat_id.clone(),
+                        interval: degraded,
+                    });
+                }
                 Err(TrajectoryStoreError::QueueFull)
             }
+            Err(TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
+            Err(TrySendError::Disconnected(WriterCommand::WriteRecords(mut recs))) => {
+                let mut reason_guard = self
+                    .degraded_reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if reason_guard.is_none() {
+                    *reason_guard = Some("Writer channel closed".into());
+                }
+                drop(reason_guard);
+                if let Some(record) = recs.pop() {
+                    let degraded = TrajectoryDegradedInterval {
+                        chat_id: record.chat_id.clone(),
+                        run_id: record.run_id,
+                        from_seq: record.source_seq,
+                        to_seq: record.source_seq,
+                        reason: "Writer channel closed".into(),
+                        recorded_at: Utc::now(),
+                    };
+                    self.record_degraded_in_memory(degraded.clone());
+                    let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                        chat_id: degraded.chat_id.clone(),
+                        interval: degraded,
+                    });
+                }
+                Err(TrajectoryStoreError::ChannelClosed)
+            }
             Err(TrySendError::Disconnected(_)) => {
-                let degraded = TrajectoryDegradedInterval {
-                    chat_id: record.chat_id.clone(),
-                    run_id: record.run_id.clone(),
-                    from_seq: record.source_seq,
-                    to_seq: record.source_seq,
-                    reason: "Writer channel closed".into(),
-                    recorded_at: Utc::now(),
-                };
-                self.record_degraded_in_memory(degraded.clone());
-                let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                    chat_id: record.chat_id.clone(),
-                    interval: degraded,
-                });
+                let mut reason_guard = self
+                    .degraded_reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if reason_guard.is_none() {
+                    *reason_guard = Some("Writer channel closed".into());
+                }
                 Err(TrajectoryStoreError::ChannelClosed)
             }
         }
@@ -558,7 +656,43 @@ impl TrajectoryStore {
                 Err(TrajectoryStoreError::QueueFull)
             }
             Err(TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(TrajectoryStoreError::ChannelClosed),
+            Err(TrySendError::Disconnected(WriterCommand::WriteRecords(recs))) => {
+                let mut reason_guard = self
+                    .degraded_reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if reason_guard.is_none() {
+                    *reason_guard = Some("Writer channel closed".into());
+                }
+                drop(reason_guard);
+                if let Some(first) = recs.first() {
+                    let last = recs.last().unwrap_or(first);
+                    let degraded = TrajectoryDegradedInterval {
+                        chat_id: first.chat_id.clone(),
+                        run_id: first.run_id.clone(),
+                        from_seq: first.source_seq,
+                        to_seq: last.source_seq,
+                        reason: "Writer channel closed".into(),
+                        recorded_at: Utc::now(),
+                    };
+                    self.record_degraded_in_memory(degraded.clone());
+                    let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+                        chat_id: first.chat_id.clone(),
+                        interval: degraded,
+                    });
+                }
+                Err(TrajectoryStoreError::ChannelClosed)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                let mut reason_guard = self
+                    .degraded_reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if reason_guard.is_none() {
+                    *reason_guard = Some("Writer channel closed".into());
+                }
+                Err(TrajectoryStoreError::ChannelClosed)
+            }
         }
     }
     /// Flush the background writer queue and await completion.
@@ -613,21 +747,31 @@ impl TrajectoryStore {
         let _ = self.ensure_legacy_imported(chat_id);
         let conn = self.reader()?;
         let from = from_seq.unwrap_or(0);
-        let lim = limit.unwrap_or(10_000) as i64;
 
-        let mut stmt = conn.prepare(
-            "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
-                    title, summary, turn_id, step_id, call_id, parent_tool_use_id,
-                    timing, usage, payload, result, error_message, is_degraded
-             FROM trajectory_records
-             WHERE chat_id = ?1 AND source_seq >= ?2
-             ORDER BY source_seq ASC, sub_seq ASC
-             LIMIT ?3",
-        )?;
-
-        let rows = stmt
-            .query_map(params![chat_id, from as i64, lim], row_to_record)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = if let Some(lim) = limit {
+            let mut stmt = conn.prepare(
+                "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                        title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                        timing, usage, payload, result, error_message, is_degraded
+                 FROM trajectory_records
+                 WHERE chat_id = ?1 AND source_seq >= ?2
+                 ORDER BY source_seq ASC, sub_seq ASC
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(params![chat_id, from as i64, lim as i64], row_to_record)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                        title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                        timing, usage, payload, result, error_message, is_degraded
+                 FROM trajectory_records
+                 WHERE chat_id = ?1 AND source_seq >= ?2
+                 ORDER BY source_seq ASC, sub_seq ASC",
+            )?;
+            stmt.query_map(params![chat_id, from as i64], row_to_record)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
 
         Ok(rows)
     }
@@ -652,10 +796,9 @@ impl TrajectoryStore {
         }
         let _ = self.ensure_legacy_imported(chat_id);
         let conn = self.reader()?;
-        let lim = limit.unwrap_or(10_000) as i64;
 
-        let rows = match after_cursor {
-            Some(cursor) => {
+        let rows = match (after_cursor, limit) {
+            (Some(cursor), Some(lim)) => {
                 let mut stmt = conn.prepare(
                     "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
                             title, summary, turn_id, step_id, call_id, parent_tool_use_id,
@@ -674,13 +817,36 @@ impl TrajectoryStore {
                         cursor.source_seq as i64,
                         cursor.sub_seq as i64,
                         cursor.rev as i64,
-                        lim
+                        lim as i64
                     ],
                     row_to_record,
                 )?
                 .collect::<Result<Vec<_>, _>>()?
             }
-            None => {
+            (Some(cursor), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                            title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                            timing, usage, payload, result, error_message, is_degraded
+                     FROM trajectory_records
+                     WHERE chat_id = ?1
+                       AND (source_seq > ?2
+                            OR (source_seq = ?2 AND sub_seq > ?3)
+                            OR (?4 > 0 AND rev > ?4))
+                     ORDER BY source_seq ASC, sub_seq ASC",
+                )?;
+                stmt.query_map(
+                    params![
+                        chat_id,
+                        cursor.source_seq as i64,
+                        cursor.sub_seq as i64,
+                        cursor.rev as i64,
+                    ],
+                    row_to_record,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+            }
+            (None, Some(lim)) => {
                 let mut stmt = conn.prepare(
                     "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
                             title, summary, turn_id, step_id, call_id, parent_tool_use_id,
@@ -690,7 +856,19 @@ impl TrajectoryStore {
                      ORDER BY source_seq ASC, sub_seq ASC
                      LIMIT ?2",
                 )?;
-                stmt.query_map(params![chat_id, lim], row_to_record)?
+                stmt.query_map(params![chat_id, lim as i64], row_to_record)?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                            title, summary, turn_id, step_id, call_id, parent_tool_use_id,
+                            timing, usage, payload, result, error_message, is_degraded
+                     FROM trajectory_records
+                     WHERE chat_id = ?1
+                     ORDER BY source_seq ASC, sub_seq ASC",
+                )?;
+                stmt.query_map(params![chat_id], row_to_record)?
                     .collect::<Result<Vec<_>, _>>()?
             }
         };
@@ -930,29 +1108,31 @@ impl TrajectoryStore {
         Ok(false)
     }
 
-    /// Fetch degraded intervals for `chat_id`.
+    /// Fetch degraded intervals for `chat_id` with optional limit.
+    pub fn get_degraded_intervals_with_limit(
+        &self,
+        chat_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TrajectoryDegradedInterval>, TrajectoryStoreError> {
+        let conn = self.reader().ok();
+        self.fetch_degraded_intervals(conn.as_ref(), chat_id, limit)
+    }
+
+    /// Fetch all degraded intervals for `chat_id`.
     pub fn get_degraded_intervals(
         &self,
         chat_id: &str,
     ) -> Result<Vec<TrajectoryDegradedInterval>, TrajectoryStoreError> {
+        self.get_degraded_intervals_with_limit(chat_id, None)
+    }
+
+    fn fetch_degraded_intervals(
+        &self,
+        conn: Option<&Connection>,
+        chat_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TrajectoryDegradedInterval>, TrajectoryStoreError> {
         let mut intervals = Vec::new();
-
-        if let Some(reason) = self
-            .degraded_reason
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
-            intervals.push(TrajectoryDegradedInterval {
-                chat_id: chat_id.to_string(),
-                run_id: "init".to_string(),
-                from_seq: 0,
-                to_seq: 0,
-                reason: format!("Store initialization failed: {}", reason),
-                recorded_at: Utc::now(),
-            });
-        }
-
         // In-memory degraded intervals
         {
             let in_mem = self
@@ -966,43 +1146,78 @@ impl TrajectoryStore {
             }
         }
 
-        // Persisted degraded intervals from SQLite (if reader succeeds)
-        if let Ok(conn) = self.reader() {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT chat_id, run_id, from_seq, to_seq, reason, recorded_at
-                 FROM trajectory_degraded_intervals
-                 WHERE chat_id = ?1
-                 ORDER BY from_seq ASC",
-            ) {
-                if let Ok(rows) = stmt.query_map(params![chat_id], |row| {
-                    let ms: i64 = row.get(5)?;
-                    Ok(TrajectoryDegradedInterval {
-                        chat_id: row.get(0)?,
-                        run_id: row.get(1)?,
-                        from_seq: row.get::<_, i64>(2)? as u64,
-                        to_seq: row.get::<_, i64>(3)? as u64,
-                        reason: row.get(4)?,
-                        recorded_at: Utc
-                            .timestamp_millis_opt(ms)
-                            .single()
-                            .unwrap_or_else(Utc::now),
-                    })
+        // Persisted degraded intervals from SQLite
+        if let Some(conn) = conn {
+            let mut stmt = match limit {
+                Some(_) => conn.prepare(
+                    "SELECT chat_id, run_id, from_seq, to_seq, reason, recorded_at
+                     FROM trajectory_degraded_intervals
+                     WHERE chat_id = ?1
+                     ORDER BY from_seq DESC
+                     LIMIT ?2",
+                )?,
+                None => conn.prepare(
+                    "SELECT chat_id, run_id, from_seq, to_seq, reason, recorded_at
+                     FROM trajectory_degraded_intervals
+                     WHERE chat_id = ?1
+                     ORDER BY from_seq ASC",
+                )?,
+            };
+
+            let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<TrajectoryDegradedInterval> {
+                let ms: i64 = row.get(5)?;
+                Ok(TrajectoryDegradedInterval {
+                    chat_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    from_seq: row.get::<_, i64>(2)? as u64,
+                    to_seq: row.get::<_, i64>(3)? as u64,
+                    reason: row.get(4)?,
+                    recorded_at: Utc
+                        .timestamp_millis_opt(ms)
+                        .single()
+                        .unwrap_or_else(Utc::now),
+                })
+            };
+            let rows = match limit {
+                Some(lim) => stmt.query_map(params![chat_id, lim as i64], row_mapper)?,
+                None => stmt.query_map(params![chat_id], row_mapper)?,
+            };
+
+            for r in rows.flatten() {
+                if !intervals.iter().any(|existing| {
+                    existing.run_id == r.run_id
+                        && existing.from_seq == r.from_seq
+                        && existing.to_seq == r.to_seq
+                        && existing.reason == r.reason
                 }) {
-                    for r in rows.flatten() {
-                        if !intervals.iter().any(|existing| {
-                            existing.run_id == r.run_id
-                                && existing.from_seq == r.from_seq
-                                && existing.to_seq == r.to_seq
-                                && existing.reason == r.reason
-                        }) {
-                            intervals.push(r);
-                        }
-                    }
+                    intervals.push(r);
                 }
             }
         }
 
         intervals.sort_by_key(|i| i.from_seq);
+        if let Some(lim) = limit {
+            if intervals.len() > lim {
+                intervals.truncate(lim);
+            }
+        }
+        if intervals.is_empty() {
+            if let Some(reason) = self
+                .degraded_reason
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                intervals.push(TrajectoryDegradedInterval {
+                    chat_id: chat_id.to_string(),
+                    run_id: "init".to_string(),
+                    from_seq: 0,
+                    to_seq: 0,
+                    reason: format!("Store initialization failed: {}", reason),
+                    recorded_at: Utc::now(),
+                });
+            }
+        }
         Ok(intervals)
     }
 
@@ -1023,22 +1238,29 @@ impl TrajectoryStore {
         }
         let _ = self.ensure_legacy_imported(chat_id);
         let conn = self.reader()?;
-        let record_count: i64 = conn.query_row(
+        let tx = conn.unchecked_transaction()?;
+        let record_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM trajectory_records WHERE chat_id = ?1",
             params![chat_id],
             |r| r.get(0),
         )?;
-        let run_count: i64 = conn.query_row(
+        let run_count: i64 = tx.query_row(
             "SELECT COUNT(DISTINCT run_id) FROM trajectory_records WHERE chat_id = ?1",
             params![chat_id],
             |r| r.get(0),
         )?;
-        let degraded_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM trajectory_degraded_intervals WHERE chat_id = ?1",
-            params![chat_id],
-            |r| r.get(0),
-        )?;
-        let last_watermark = self.get_watermark(chat_id)?;
+        let last_watermark: Option<u64> = tx
+            .query_row(
+                "SELECT last_source_seq FROM trajectory_watermarks WHERE chat_id = ?1",
+                params![chat_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|s| s as u64);
+
+        let degraded_intervals = self.fetch_degraded_intervals(Some(&tx), chat_id, None)?;
+        let degraded_count = degraded_intervals.len();
+
         let db_size_bytes = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
 
         Ok(TrajectoryDiagnostics {
@@ -1046,7 +1268,7 @@ impl TrajectoryStore {
             record_count: record_count as usize,
             run_count: run_count as usize,
             last_watermark,
-            degraded_count: degraded_count as usize,
+            degraded_count,
             db_size_bytes,
         })
     }
@@ -1544,7 +1766,7 @@ fn flush_legacy_chunks(
 // ---------------------------------------------------------------------------
 
 fn discard_persisted_degraded(
-    current: &mut Vec<TrajectoryDegradedInterval>,
+    current: &mut VecDeque<TrajectoryDegradedInterval>,
     persisted: &[TrajectoryDegradedInterval],
 ) {
     for saved in persisted {
@@ -1587,33 +1809,83 @@ fn discard_persisted_degraded(
 
 fn persist_pending_degraded(
     conn: &mut Connection,
-    in_mem: &Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
-) {
-    let pending = in_mem
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
+    in_mem: &Arc<Mutex<VecDeque<TrajectoryDegradedInterval>>>,
+) -> bool {
+    let pending: Vec<TrajectoryDegradedInterval> = {
+        let in_mem_lock = in_mem.lock().unwrap_or_else(|error| error.into_inner());
+        in_mem_lock.iter().cloned().collect()
+    };
     if pending.is_empty() {
-        return;
+        return true;
     }
 
     let result = (|| -> Result<(), rusqlite::Error> {
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
+            let mut find_stmt = tx.prepare_cached(
+                "SELECT id, from_seq, to_seq, recorded_at FROM trajectory_degraded_intervals
+                 WHERE chat_id = ?1 AND run_id = ?2 AND reason = ?3
+                   AND to_seq >= ?4 - 1 AND from_seq <= ?5 + 1
+                 ORDER BY from_seq ASC",
+            )?;
+            let mut update_stmt = tx.prepare_cached(
+                "UPDATE trajectory_degraded_intervals
+                 SET from_seq = ?1, to_seq = ?2, recorded_at = ?3
+                 WHERE id = ?4",
+            )?;
+            let mut delete_stmt =
+                tx.prepare_cached("DELETE FROM trajectory_degraded_intervals WHERE id = ?1")?;
+            let mut insert_stmt = tx.prepare_cached(
                 "INSERT INTO trajectory_degraded_intervals
                     (chat_id, run_id, from_seq, to_seq, reason, recorded_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
+
             for interval in &pending {
-                stmt.execute(params![
-                    interval.chat_id,
-                    interval.run_id,
-                    interval.from_seq as i64,
-                    interval.to_seq as i64,
-                    interval.reason,
-                    interval.recorded_at.timestamp_millis(),
-                ])?;
+                let from_val = interval.from_seq as i64;
+                let to_val = interval.to_seq as i64;
+                let rec_ms = interval.recorded_at.timestamp_millis();
+
+                let overlapping: Vec<(i64, i64, i64, i64)> = find_stmt
+                    .query_map(
+                        params![
+                            interval.chat_id,
+                            interval.run_id,
+                            interval.reason,
+                            from_val,
+                            to_val
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                if overlapping.is_empty() {
+                    insert_stmt.execute(params![
+                        interval.chat_id,
+                        interval.run_id,
+                        from_val,
+                        to_val,
+                        interval.reason,
+                        rec_ms,
+                    ])?;
+                } else {
+                    let mut merged_from = from_val;
+                    let mut merged_to = to_val;
+                    let mut merged_rec = rec_ms;
+                    let primary_id = overlapping[0].0;
+
+                    for (_, f, t, r) in &overlapping {
+                        merged_from = merged_from.min(*f);
+                        merged_to = merged_to.max(*t);
+                        merged_rec = merged_rec.max(*r);
+                    }
+
+                    update_stmt.execute(params![merged_from, merged_to, merged_rec, primary_id])?;
+
+                    for (id, _, _, _) in &overlapping[1..] {
+                        delete_stmt.execute(params![id])?;
+                    }
+                }
             }
         }
         tx.commit()
@@ -1623,9 +1895,11 @@ fn persist_pending_degraded(
         Ok(()) => {
             let mut current = in_mem.lock().unwrap_or_else(|error| error.into_inner());
             discard_persisted_degraded(&mut current, &pending);
+            true
         }
         Err(error) => {
             tracing::error!(%error, "failed to persist trajectory degraded intervals");
+            false
         }
     }
 }
@@ -1633,12 +1907,12 @@ fn persist_pending_degraded(
 fn flush_batch_to_writer(
     conn: &mut Connection,
     records: &[TrajectoryRecord],
-    in_mem: &Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
+    in_mem: &Arc<Mutex<VecDeque<TrajectoryDegradedInterval>>>,
     events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
     next_rev: &mut u64,
-) {
+) -> bool {
     if records.is_empty() {
-        return;
+        return true;
     }
     let rev = *next_rev;
     if let Err(err) = write_records_tx(conn, records, rev) {
@@ -1662,10 +1936,10 @@ fn flush_batch_to_writer(
                     recorded_at: Utc::now(),
                 };
                 let mut pending = in_mem.lock().unwrap_or_else(|error| error.into_inner());
-                if pending.len() == MAX_IN_MEMORY_DEGRADED_INTERVALS {
-                    pending.remove(0);
+                if pending.len() >= MAX_IN_MEMORY_DEGRADED_INTERVALS {
+                    pending.pop_front();
                 }
-                pending.push(degraded.clone());
+                pending.push_back(degraded.clone());
                 drop(pending);
                 let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
                     chat_id: degraded.chat_id.clone(),
@@ -1673,40 +1947,42 @@ fn flush_batch_to_writer(
                 });
             }
         }
-        return;
+        return false;
     }
 
     *next_rev = next_rev.saturating_add(1);
-    let mut by_chat: HashMap<String, Vec<TrajectoryRecord>> = HashMap::new();
-    for record in records {
-        by_chat
-            .entry(record.chat_id.clone())
-            .or_default()
-            .push(record.clone());
+    if events_tx.receiver_count() > 0 {
+        let mut by_chat: HashMap<String, Vec<TrajectoryRecord>> = HashMap::new();
+        for record in records {
+            by_chat
+                .entry(record.chat_id.clone())
+                .or_default()
+                .push(record.clone());
+        }
+        for (chat_id, chat_records) in by_chat {
+            let max_cursor = chat_records
+                .iter()
+                .map(|record| (record.source_seq, record.sub_seq))
+                .max()
+                .unwrap_or((0, 0));
+            let _ = events_tx.send(TrajectoryStoreEvent::RecordsCommitted {
+                chat_id,
+                records: Arc::new(chat_records),
+                watermark: max_cursor,
+                rev,
+            });
+        }
     }
-    for (chat_id, chat_records) in by_chat {
-        let max_cursor = chat_records
-            .iter()
-            .map(|record| (record.source_seq, record.sub_seq))
-            .max()
-            .unwrap_or((0, 0));
-        let _ = events_tx.send(TrajectoryStoreEvent::RecordsCommitted {
-            chat_id,
-            records: Arc::new(chat_records),
-            watermark: max_cursor,
-            rev,
-        });
-    }
+    true
 }
 
 fn handle_writer_command(
     conn: &mut Connection,
     cmd: WriterCommand,
-    in_mem: &Arc<Mutex<Vec<TrajectoryDegradedInterval>>>,
+    in_mem: &Arc<Mutex<VecDeque<TrajectoryDegradedInterval>>>,
     events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
     next_rev: &mut u64,
 ) {
-    persist_pending_degraded(conn, in_mem);
     match cmd {
         WriterCommand::WriteRecords(records) => {
             flush_batch_to_writer(conn, &records, in_mem, events_tx, next_rev);
@@ -1729,6 +2005,7 @@ fn handle_writer_command(
             }
         }
         WriterCommand::Flush(reply) => {
+            let _ = persist_pending_degraded(conn, in_mem);
             reply.send(());
         }
         WriterCommand::ImportLegacy {
@@ -1743,17 +2020,19 @@ fn handle_writer_command(
                 if !records.is_empty() {
                     write_records_tx(conn, &records, rev)?;
                     *next_rev = next_rev.saturating_add(1);
-                    let max_cursor = records
-                        .iter()
-                        .map(|record| (record.source_seq, record.sub_seq))
-                        .max()
-                        .unwrap_or((0, 0));
-                    let _ = events_tx.send(TrajectoryStoreEvent::RecordsCommitted {
-                        chat_id: chat_id.clone(),
-                        records: Arc::new(records),
-                        watermark: max_cursor,
-                        rev,
-                    });
+                    if events_tx.receiver_count() > 0 {
+                        let max_cursor = records
+                            .iter()
+                            .map(|record| (record.source_seq, record.sub_seq))
+                            .max()
+                            .unwrap_or((0, 0));
+                        let _ = events_tx.send(TrajectoryStoreEvent::RecordsCommitted {
+                            chat_id: chat_id.clone(),
+                            records: Arc::new(records),
+                            watermark: max_cursor,
+                            rev,
+                        });
+                    }
                 }
                 if let Some(fingerprint) = fingerprint {
                     record_legacy_import_tx(conn, &chat_id, &fingerprint, imported_records)?;
@@ -1768,31 +2047,36 @@ fn handle_writer_command(
 }
 
 fn retain_chats_tx(
-    conn: &Connection,
+    conn: &mut Connection,
     live_ids: &[String],
     events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
 ) -> Result<usize, TrajectoryStoreError> {
     let live_ids: HashSet<&str> = live_ids.iter().map(String::as_str).collect();
-    let mut stmt = conn.prepare(
-        "SELECT chat_id FROM trajectory_records
-         UNION SELECT chat_id FROM trajectory_watermarks
-         UNION SELECT chat_id FROM trajectory_legacy_imports
-         UNION SELECT chat_id FROM trajectory_runs
-         UNION SELECT chat_id FROM trajectory_degraded_intervals",
-    )?;
-    let all_chats = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let tx = conn.transaction()?;
+    let all_chats = {
+        let mut stmt = tx.prepare(
+            "SELECT chat_id FROM trajectory_records
+             UNION SELECT chat_id FROM trajectory_watermarks
+             UNION SELECT chat_id FROM trajectory_legacy_imports
+             UNION SELECT chat_id FROM trajectory_runs
+             UNION SELECT chat_id FROM trajectory_degraded_intervals",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
-    let mut total_deleted = 0;
+    let mut deleted = Vec::new();
     for chat_id in all_chats {
         if !live_ids.contains(chat_id.as_str()) {
-            delete_chat_tx(conn, &chat_id)?;
-            let _ = events_tx.send(TrajectoryStoreEvent::ChatDeleted {
-                chat_id: chat_id.clone(),
-            });
-            total_deleted += 1;
+            delete_chat_in_tx(&tx, &chat_id)?;
+            deleted.push(chat_id);
         }
+    }
+    tx.commit()?;
+
+    let total_deleted = deleted.len();
+    for chat_id in deleted {
+        let _ = events_tx.send(TrajectoryStoreEvent::ChatDeleted { chat_id });
     }
     Ok(total_deleted)
 }
@@ -1839,7 +2123,7 @@ fn write_records_tx(
         )?;
         for record in records {
             let kind_json = serde_json::to_string(&record.kind)?;
-            let status = format!("{:?}", record.status);
+            let status = serde_json::to_string(&record.status)?;
             let timing = record
                 .timing
                 .as_ref()
@@ -1951,7 +2235,7 @@ fn record_legacy_import_tx(
     Ok(())
 }
 
-fn delete_chat_tx(conn: &Connection, chat_id: &str) -> Result<(), TrajectoryStoreError> {
+fn delete_chat_in_tx(conn: &Connection, chat_id: &str) -> Result<(), TrajectoryStoreError> {
     conn.execute(
         "DELETE FROM trajectory_records WHERE chat_id = ?1",
         params![chat_id],
@@ -1972,6 +2256,13 @@ fn delete_chat_tx(conn: &Connection, chat_id: &str) -> Result<(), TrajectoryStor
         "DELETE FROM trajectory_legacy_imports WHERE chat_id = ?1",
         params![chat_id],
     )?;
+    Ok(())
+}
+
+fn delete_chat_tx(conn: &mut Connection, chat_id: &str) -> Result<(), TrajectoryStoreError> {
+    let tx = conn.transaction()?;
+    delete_chat_in_tx(&tx, chat_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2506,15 +2797,16 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrajectoryRecord> 
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
-    let status = match status_str.as_str() {
-        "Running" => TrajectoryStatus::Running,
-        "Completed" => TrajectoryStatus::Completed,
-        "Error" => TrajectoryStatus::Error,
-        "Interrupted" => TrajectoryStatus::Interrupted,
-        "Unsettled" => TrajectoryStatus::Unsettled,
-        "Degraded" => TrajectoryStatus::Degraded,
-        _ => TrajectoryStatus::Unknown,
-    };
+    let status: TrajectoryStatus =
+        serde_json::from_str(&status_str).unwrap_or_else(|_| match status_str.as_str() {
+            "Running" | "\"running\"" => TrajectoryStatus::Running,
+            "Completed" | "\"completed\"" => TrajectoryStatus::Completed,
+            "Error" | "\"error\"" => TrajectoryStatus::Error,
+            "Interrupted" | "\"interrupted\"" => TrajectoryStatus::Interrupted,
+            "Unsettled" | "\"unsettled\"" => TrajectoryStatus::Unsettled,
+            "Degraded" | "\"degraded\"" => TrajectoryStatus::Degraded,
+            _ => TrajectoryStatus::Unknown,
+        });
 
     let timing = timing_json
         .as_deref()
@@ -2749,9 +3041,10 @@ mod tests {
             db_path: store.db_path.clone(),
             journals_dir: temp.path().join("journals"),
             writer_tx: closed_tx,
-            in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
+            in_memory_degraded: Arc::new(Mutex::new(VecDeque::new())),
             degraded_reason: Arc::new(Mutex::new(None)),
             events_tx,
+            legacy_importing: Arc::new(Mutex::new(HashSet::new())),
         };
 
         let rec = sample_record("chat_fail", "r1", 100, 0);
@@ -2827,9 +3120,10 @@ mod tests {
             db_path: temp.path().join("trajectory.sqlite3"),
             journals_dir: temp.path().join("journals"),
             writer_tx,
-            in_memory_degraded: Arc::new(Mutex::new(Vec::new())),
+            in_memory_degraded: Arc::new(Mutex::new(VecDeque::new())),
             degraded_reason: Arc::new(Mutex::new(None)),
             events_tx,
+            legacy_importing: Arc::new(Mutex::new(HashSet::new())),
         };
 
         // Fill the 1-capacity queue
@@ -4066,12 +4360,328 @@ mod tests {
             reason: "Queue saturated".into(),
             recorded_at,
         };
-        let mut current = vec![TrajectoryDegradedInterval {
+        let mut current = VecDeque::from([TrajectoryDegradedInterval {
             to_seq: 6,
             ..persisted.clone()
-        }];
+        }]);
         discard_persisted_degraded(&mut current, &[persisted]);
         assert_eq!(current.len(), 1);
         assert_eq!((current[0].from_seq, current[0].to_seq), (6, 6));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_diagnostics_reports_in_memory_degraded_and_watermark_consistency()
+     {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Enqueue one valid record
+        let record = sample_record("diag_chat", "r1", 1, 0);
+        store.try_enqueue(record).unwrap();
+        store.flush().await.unwrap();
+
+        // Record an in-memory degraded interval (simulating queue saturation without SQLite persistence yet)
+        store.record_degraded_in_memory(TrajectoryDegradedInterval {
+            chat_id: "diag_chat".into(),
+            run_id: "r1".into(),
+            from_seq: 2,
+            to_seq: 5,
+            reason: "Queue saturated".into(),
+            recorded_at: Utc::now(),
+        });
+
+        let diag = store.diagnostics("diag_chat").unwrap();
+        assert_eq!(diag.record_count, 1);
+        assert_eq!(diag.run_count, 1);
+        assert_eq!(diag.last_watermark, Some(1));
+        assert_eq!(
+            diag.degraded_count, 1,
+            "diagnostics must include in-memory degraded intervals"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_writer_failure_observable_degraded_state() {
+        let temp = TempDir::new().unwrap();
+        let (closed_tx, _) = sync_channel(1);
+        let (events_tx, _) = broadcast::channel(1);
+        let broken_store = TrajectoryStore {
+            db_path: temp.path().join("trajectory.sqlite3"),
+            journals_dir: temp.path().join("journals"),
+            writer_tx: closed_tx,
+            in_memory_degraded: Arc::new(Mutex::new(VecDeque::new())),
+            degraded_reason: Arc::new(Mutex::new(None)),
+            events_tx,
+            legacy_importing: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        let rec = sample_record("obs_chat", "r1", 1, 0);
+        let res = broken_store.try_enqueue(rec);
+        assert!(matches!(res, Err(TrajectoryStoreError::ChannelClosed)));
+
+        // Store is observably degraded now
+        assert!(
+            broken_store.is_degraded(),
+            "store must report is_degraded == true after writer disconnect"
+        );
+        let diag = broken_store.diagnostics("obs_chat").unwrap();
+        assert_eq!(diag.degraded_count, 1);
+        assert_eq!(diag.record_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_try_enqueue_does_not_clone_on_success_and_broadcast_zero_subscribers()
+     {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // 0 subscribers -> enqueue and flush should succeed without cloning/broadcasting errors
+        assert_eq!(store.events_tx.receiver_count(), 0);
+        let rec = sample_record("bench_chat", "r1", 1, 0);
+        store.try_enqueue(rec).unwrap();
+        store.flush().await.unwrap();
+
+        let records = store.list_all_records("bench_chat").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_seq, 1);
+
+        // With subscriber -> receives event
+        let mut sub = store.subscribe_events();
+        assert_eq!(store.events_tx.receiver_count(), 1);
+        let rec2 = sample_record("bench_chat", "r1", 2, 0);
+        store.try_enqueue(rec2).unwrap();
+        store.flush().await.unwrap();
+
+        let event = sub.recv().await.unwrap();
+        match event {
+            TrajectoryStoreEvent::RecordsCommitted {
+                chat_id,
+                records,
+                watermark,
+                rev,
+            } => {
+                assert_eq!(chat_id, "bench_chat");
+                assert_eq!(records.len(), 1);
+                assert_eq!(watermark, (2, 0));
+                assert!(rev >= 2);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_interleaved_saturation_coalescing_and_queue_bounds() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Interleave sequence intervals for two chats
+        for seq in 1..=5 {
+            store.record_degraded_in_memory(TrajectoryDegradedInterval {
+                chat_id: "chat_A".into(),
+                run_id: "r1".into(),
+                from_seq: seq,
+                to_seq: seq,
+                reason: "Queue saturated".into(),
+                recorded_at: Utc::now(),
+            });
+            store.record_degraded_in_memory(TrajectoryDegradedInterval {
+                chat_id: "chat_B".into(),
+                run_id: "r1".into(),
+                from_seq: seq,
+                to_seq: seq,
+                reason: "Queue saturated".into(),
+                recorded_at: Utc::now(),
+            });
+        }
+
+        let intervals_a = store.get_degraded_intervals("chat_A").unwrap();
+        assert_eq!(intervals_a.len(), 1);
+        assert_eq!((intervals_a[0].from_seq, intervals_a[0].to_seq), (1, 5));
+
+        let intervals_b = store.get_degraded_intervals("chat_B").unwrap();
+        assert_eq!(intervals_b.len(), 1);
+        assert_eq!((intervals_b[0].from_seq, intervals_b[0].to_seq), (1, 5));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_degraded_intervals_coalesce_on_insert_and_limit() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Record discrete degraded intervals
+        store.record_degraded_in_memory(TrajectoryDegradedInterval {
+            chat_id: "c_limit".into(),
+            run_id: "r1".into(),
+            from_seq: 1,
+            to_seq: 3,
+            reason: "gap1".into(),
+            recorded_at: Utc::now(),
+        });
+        store.record_degraded_in_memory(TrajectoryDegradedInterval {
+            chat_id: "c_limit".into(),
+            run_id: "r1".into(),
+            from_seq: 10,
+            to_seq: 15,
+            reason: "gap2".into(),
+            recorded_at: Utc::now(),
+        });
+
+        // Flush to SQLite
+        store.sync_flush().unwrap();
+
+        // Persisted rows check
+        let all = store.get_degraded_intervals("c_limit").unwrap();
+        assert_eq!(all.len(), 2);
+
+        // With limit
+        let limited = store
+            .get_degraded_intervals_with_limit("c_limit", Some(1))
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+
+        // Coalesce insert on SQLite
+        store.record_degraded_in_memory(TrajectoryDegradedInterval {
+            chat_id: "c_limit".into(),
+            run_id: "r1".into(),
+            from_seq: 4,
+            to_seq: 5,
+            reason: "gap1".into(),
+            recorded_at: Utc::now(),
+        });
+        store.sync_flush().unwrap();
+
+        let after_coalesce = store.get_degraded_intervals("c_limit").unwrap();
+        assert_eq!(after_coalesce.len(), 2);
+        assert_eq!(
+            (after_coalesce[0].from_seq, after_coalesce[0].to_seq),
+            (1, 5)
+        );
+    }
+
+    #[test]
+    fn test_trajectory_store_pragmas_journal_mode_wal() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+        let conn = store.reader().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+
+        let sync_mode: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        // NORMAL synchronous is 1
+        assert_eq!(sync_mode, 1);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_stream_snapshot_pages_point_in_time_isolation() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Seed 2 initial records
+        store
+            .try_enqueue_batch(vec![
+                sample_record("snap_iso", "r1", 1, 0),
+                sample_record("snap_iso", "r1", 2, 0),
+            ])
+            .unwrap();
+        store.flush().await.unwrap();
+
+        let mut pages_seen = Vec::new();
+        let store_clone = store.clone();
+
+        store
+            .stream_snapshot_pages("snap_iso", None, 1, |page, _cursor, has_more| {
+                pages_seen.push(page);
+                // Concurrently enqueue and commit new records during snapshot iteration!
+                if pages_seen.len() == 1 {
+                    store_clone
+                        .try_enqueue_batch(vec![
+                            sample_record("snap_iso", "r1", 3, 0),
+                            sample_record("snap_iso", "r1", 4, 0),
+                        ])
+                        .unwrap();
+                    store_clone.sync_flush().unwrap();
+                }
+                has_more
+            })
+            .unwrap();
+
+        // Snapshot pages must see strictly records 1 and 2, isolated from concurrent commits 3 and 4
+        assert_eq!(pages_seen.len(), 2);
+        assert_eq!(pages_seen[0].len(), 1);
+        assert_eq!(pages_seen[0][0].source_seq, 1);
+        assert_eq!(pages_seen[1].len(), 1);
+        assert_eq!(pages_seen[1][0].source_seq, 2);
+
+        // But list_all_records afterwards sees all 4 records
+        let all = store.list_all_records("snap_iso").unwrap();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_upgrade_schema_v1_to_v2_retains_records_and_seeds_rev() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("trajectory.sqlite3");
+
+        // Manually build a v1 database before opening TrajectoryStore
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (1, ?1)",
+                params![Utc::now().timestamp_millis()],
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+
+            // Insert a v1 record (no rev column in v1 table)
+            let kind_json = serde_json::to_string(&TrajectoryRecordKind::SessionStarted).unwrap();
+            let status_json = serde_json::to_string(&TrajectoryStatus::Running).unwrap();
+            conn.execute(
+                "INSERT INTO trajectory_records (
+                    chat_id, run_id, source_seq, sub_seq, lane, kind, status, is_partial,
+                    title, summary, created_at
+                 ) VALUES ('up_chat', 'r1', 1, 0, 'input', ?1, ?2, 0, 'Title', 'Summary', 1000)",
+                params![kind_json, status_json],
+            )
+            .unwrap();
+        }
+
+        // Open store -> runs migration v2 (ALTER TABLE ADD COLUMN rev ...)
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+
+        // Old record is readable with rev = 0
+        let records = store.list_all_records("up_chat").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_seq, 1);
+
+        // Enqueue a new record -> writer assigns monotonic revision >= 1
+        let rec2 = sample_record("up_chat", "r1", 2, 0);
+        store.try_enqueue(rec2).unwrap();
+        store.flush().await.unwrap();
+
+        let updated_records = store.list_all_records("up_chat").unwrap();
+        assert_eq!(updated_records.len(), 2);
+        assert_eq!(updated_records[1].source_seq, 2);
+
+        // Verify rev in SQLite
+        let conn = store.reader().unwrap();
+        let rev2: i64 = conn
+            .query_row(
+                "SELECT rev FROM trajectory_records WHERE chat_id = 'up_chat' AND source_seq = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rev2 >= 1, "expected seeded next_rev >= 1, got {rev2}");
     }
 }

@@ -55,7 +55,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
@@ -461,6 +461,7 @@ pub struct EngineRpc {
     trajectory: Option<Arc<TrajectoryStore>>,
     run_journal: Option<Arc<RunJournal>>,
     engine_info: EngineInfo,
+    reveal_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl EngineRpc {
@@ -500,6 +501,7 @@ impl EngineRpc {
             trajectory: None,
             run_journal: None,
             engine_info,
+            reveal_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RAW_REVEALS)),
         }
     }
 
@@ -1088,26 +1090,74 @@ fn doc_messages_stream(
 }
 
 const TRAJECTORY_SNAPSHOT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const TRAJECTORY_STREAM_CHANNEL_CAP: usize = 256;
+const RESERVED_CONTROL_SLOTS: usize = 1;
+const MAX_CONCURRENT_RAW_REVEALS: usize = 4;
+const RAW_REVEAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn watch_trajectory_stream(
     store: Arc<TrajectoryStore>,
+    workspace: Option<WorkspaceHost>,
+    local_device_id: Option<String>,
     chat_id: String,
     after_cursor: Option<TrajectoryCursor>,
     limit: Option<usize>,
 ) -> BoxStream<'static, serde_json::Value> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
+    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(TRAJECTORY_STREAM_CHANNEL_CAP);
     let page_size = limit
         .map(|l| l.clamp(1, zeron_rpc::MAX_TRAJECTORY_PAGE_SIZE))
         .unwrap_or(zeron_rpc::DEFAULT_TRAJECTORY_PAGE_SIZE);
 
     tokio::spawn(async move {
+        // M-race: Subscribe to events FIRST before checking authoritative state
         let mut events_rx = store.subscribe_events();
+
+        // Recheck authoritative chat state within the task to eliminate race windows
+        if let Some(ws) = workspace {
+            let local_device = local_device_id.unwrap_or_default();
+            match ws.chat(&chat_id) {
+                Ok(Some(chat)) => {
+                    if !local_device.is_empty() && chat.device_id != local_device {
+                        let term = TrajectoryWatchItem::Terminal {
+                            reason: TrajectoryTerminalReason::StoreUnavailable,
+                            message: Some("Chat belongs to another device".into()),
+                        };
+                        if let Ok(val) = serde_json::to_value(&term) {
+                            let _ = tx.send(val).await;
+                        }
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let term = TrajectoryWatchItem::Terminal {
+                        reason: TrajectoryTerminalReason::ChatDeleted,
+                        message: Some("Chat not found".into()),
+                    };
+                    if let Ok(val) = serde_json::to_value(&term) {
+                        let _ = tx.send(val).await;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    let term = TrajectoryWatchItem::Terminal {
+                        reason: TrajectoryTerminalReason::StoreUnavailable,
+                        message: Some(e.to_string()),
+                    };
+                    if let Ok(val) = serde_json::to_value(&term) {
+                        let _ = tx.send(val).await;
+                    }
+                    return;
+                }
+            }
+        }
+
         let store_clone = store.clone();
         let chat_id_for_snap = chat_id.clone();
         let tx_for_snap = tx.clone();
         let runtime = tokio::runtime::Handle::current();
         let snapshot_res = tokio::task::spawn_blocking(move || {
-            let degraded = store_clone.get_degraded_intervals(&chat_id_for_snap)?;
+            let degraded = store_clone
+                .get_degraded_intervals_with_limit(&chat_id_for_snap, Some(page_size))?;
             let mut is_first_page = true;
             let mut final_watermark = after_cursor;
             let mut send_timed_out = false;
@@ -1132,22 +1182,42 @@ fn watch_trajectory_stream(
                     let Ok(value) = serde_json::to_value(&snap_item) else {
                         return false;
                     };
-                    let backlogged = match tx_for_snap.try_send(value) {
-                        Ok(()) => return true,
-                        Err(TrySendError::Closed(_)) => return false,
-                        Err(TrySendError::Full(value)) => value,
-                    };
-                    // Consumer is behind: block this snapshot thread briefly rather than
-                    // drop a page, and give up if it stays stalled.
-                    match runtime.block_on(
-                        tx_for_snap.send_timeout(backlogged, TRAJECTORY_SNAPSHOT_SEND_TIMEOUT),
-                    ) {
-                        Ok(()) => true,
-                        Err(SendTimeoutError::Closed(_)) => false,
-                        Err(SendTimeoutError::Timeout(_)) => {
-                            send_timed_out = true;
-                            false
+
+                    // M7: Reserve control slots in channel for guaranteed ResyncRequired delivery
+                    let mut value_to_send = value;
+                    if tx_for_snap.capacity() > RESERVED_CONTROL_SLOTS {
+                        match tx_for_snap.try_send(value_to_send) {
+                            Ok(()) => return true,
+                            Err(TrySendError::Closed(_)) => return false,
+                            Err(TrySendError::Full(v)) => {
+                                value_to_send = v;
+                            }
                         }
+                    }
+
+                    // Consumer is behind: wait bounded time for data capacity without eating the reserved control slot
+                    let wait_start = std::time::Instant::now();
+                    let mut sent = false;
+                    while wait_start.elapsed() < TRAJECTORY_SNAPSHOT_SEND_TIMEOUT {
+                        runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(10)));
+                        if tx_for_snap.capacity() > RESERVED_CONTROL_SLOTS {
+                            match tx_for_snap.try_send(value_to_send) {
+                                Ok(()) => {
+                                    sent = true;
+                                    break;
+                                }
+                                Err(TrySendError::Closed(_)) => return false,
+                                Err(TrySendError::Full(v)) => {
+                                    value_to_send = v;
+                                }
+                            }
+                        }
+                    }
+                    if !sent {
+                        send_timed_out = true;
+                        false
+                    } else {
+                        true
                     }
                 },
             )?;
@@ -1192,9 +1262,8 @@ fn watch_trajectory_stream(
                 reason: "Snapshot delivery timed out; resubscribe required".into(),
             };
             if let Ok(value) = serde_json::to_value(&item) {
-                let _ = tx
-                    .send_timeout(value, TRAJECTORY_SNAPSHOT_SEND_TIMEOUT)
-                    .await;
+                // M7: Guaranteed delivery into the reserved control slot:
+                let _ = tx.try_send(value);
             }
             return;
         }
@@ -1413,17 +1482,14 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-        if params
-            .get("targetDeviceId")
-            .is_some_and(|value| !value.is_null())
-            && matches!(
-                method,
-                methods::WATCH_TRAJECTORY | methods::REVEAL_TRAJECTORY_RAW
-            )
+        if methods::is_local_only(method)
+            && params
+                .get("targetDeviceId")
+                .is_some_and(|value| !value.is_null())
         {
-            return Err(RpcError::BadParams(
-                "Trajectory RPC methods are local-only".into(),
-            ));
+            return Err(RpcError::BadParams(format!(
+                "method '{method}' is local-only"
+            )));
         }
 
         // Device-addressed routing: forward calls that target another device over its
@@ -2292,36 +2358,6 @@ impl RpcService for EngineRpc {
             }
             methods::WATCH_TRAJECTORY => {
                 let p: WatchTrajectoryParams = parse_params(params)?;
-                let chat = self
-                    .workspace
-                    .chat(&p.chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-
-                let local_device = self.doc_host.device_id();
-                if let Some(c) = &chat {
-                    if c.device_id != local_device {
-                        let term = TrajectoryWatchItem::Terminal {
-                            reason: TrajectoryTerminalReason::StoreUnavailable,
-                            message: Some("Chat belongs to another device".into()),
-                        };
-                        let val = serde_json::to_value(&term)
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        return Ok(RpcReply::Stream(
-                            futures::stream::once(async move { val }).boxed(),
-                        ));
-                    }
-                } else {
-                    let term = TrajectoryWatchItem::Terminal {
-                        reason: TrajectoryTerminalReason::ChatDeleted,
-                        message: Some("Chat not found".into()),
-                    };
-                    let val =
-                        serde_json::to_value(&term).map_err(|e| RpcError::Failed(e.to_string()))?;
-                    return Ok(RpcReply::Stream(
-                        futures::stream::once(async move { val }).boxed(),
-                    ));
-                }
-
                 let Some(store) = self.trajectory_store() else {
                     let term = TrajectoryWatchItem::Terminal {
                         reason: TrajectoryTerminalReason::StoreUnavailable,
@@ -2334,7 +2370,14 @@ impl RpcService for EngineRpc {
                     ));
                 };
 
-                let stream = watch_trajectory_stream(store, p.chat_id, p.after_cursor, p.limit);
+                let stream = watch_trajectory_stream(
+                    store,
+                    Some(self.workspace.clone()),
+                    Some(self.doc_host.device_id().to_string()),
+                    p.chat_id,
+                    p.after_cursor,
+                    p.limit,
+                );
                 Ok(RpcReply::Stream(stream))
             }
             methods::REVEAL_TRAJECTORY_RAW => {
@@ -2390,6 +2433,36 @@ impl RpcService for EngineRpc {
                     return RpcReply::value(&result);
                 };
 
+                // M3-transport: Acquire permit from bounded concurrency semaphore with deadline
+                let start_time = std::time::Instant::now();
+                let permit = match tokio::time::timeout(
+                    RAW_REVEAL_TIMEOUT,
+                    self.reveal_semaphore.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        let result = TrajectoryRawRevealResult::unavailable(
+                            p.field,
+                            TrajectoryUnavailableReason::StoreUnavailable,
+                            Some("Semaphore closed".into()),
+                        );
+                        return RpcReply::value(&result);
+                    }
+                    Err(_) => {
+                        let result = TrajectoryRawRevealResult::unavailable(
+                            p.field,
+                            TrajectoryUnavailableReason::StoreUnavailable,
+                            Some(
+                                "Too many concurrent raw reveal requests; acquisition timed out"
+                                    .into(),
+                            ),
+                        );
+                        return RpcReply::value(&result);
+                    }
+                };
+
                 let raw_ref = p.to_raw_ref();
                 let chat_id = p.chat_id.clone();
                 let source_seq = p.source_seq;
@@ -2398,6 +2471,7 @@ impl RpcService for EngineRpc {
                 let field = p.field;
 
                 let reveal_task = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     let is_attached = match store.validate_raw_ref(&raw_ref) {
                         Ok(is_attached) => is_attached,
                         Err(error) => {
@@ -2444,17 +2518,22 @@ impl RpcService for EngineRpc {
                         ),
                     }
                 });
-                let reveal_res = match reveal_task.await {
-                    Ok(result) => result,
-                    Err(error) => reveal_unavailable(
+                let remaining = RAW_REVEAL_TIMEOUT.saturating_sub(start_time.elapsed());
+                let reveal_res = match tokio::time::timeout(remaining, reveal_task).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => reveal_unavailable(
                         field,
                         TrajectoryUnavailableReason::StoreUnavailable,
                         "Raw reveal unavailable",
                         &error,
                         "blocking task failed",
                     ),
+                    Err(_) => TrajectoryRawRevealResult::unavailable(
+                        field,
+                        TrajectoryUnavailableReason::StoreUnavailable,
+                        Some("Raw reveal timed out".into()),
+                    ),
                 };
-
                 RpcReply::value(&reveal_res)
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
@@ -2765,7 +2844,8 @@ mod tests {
         store.try_enqueue(partial).unwrap();
         store.sync_flush().unwrap();
 
-        let mut stream = watch_trajectory_stream(store.clone(), chat_id.into(), None, None);
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, None);
         let snapshot: TrajectoryWatchItem =
             serde_json::from_value(stream.next().await.expect("snapshot item")).unwrap();
         let snapshot_watermark = match snapshot {
@@ -2811,8 +2891,14 @@ mod tests {
         };
         drop(stream);
 
-        let mut resumed =
-            watch_trajectory_stream(store, chat_id.into(), Some(snapshot_watermark), None);
+        let mut resumed = watch_trajectory_stream(
+            store,
+            None,
+            None,
+            chat_id.into(),
+            Some(snapshot_watermark),
+            None,
+        );
         let resumed_item: TrajectoryWatchItem =
             serde_json::from_value(resumed.next().await.expect("resumed snapshot")).unwrap();
         match resumed_item {
@@ -2852,7 +2938,8 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("blocking worker occupied");
 
-            let mut stream = watch_trajectory_stream(store.clone(), chat_id.into(), None, Some(1));
+            let mut stream =
+                watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(1));
             tokio::task::yield_now().await;
 
             store
@@ -2905,9 +2992,9 @@ mod tests {
             .unwrap();
         store.sync_flush().unwrap();
 
-        let mut stream = watch_trajectory_stream(store, chat_id.into(), None, Some(1));
+        let mut stream = watch_trajectory_stream(store, None, None, chat_id.into(), None, Some(1));
         tokio::time::sleep(
-            TRAJECTORY_SNAPSHOT_SEND_TIMEOUT + std::time::Duration::from_millis(250),
+            TRAJECTORY_SNAPSHOT_SEND_TIMEOUT * 2 + std::time::Duration::from_millis(500),
         )
         .await;
 
@@ -2941,7 +3028,8 @@ mod tests {
         store.sync_flush().unwrap();
 
         // Request limit = 2 on 5 historical records
-        let mut stream = watch_trajectory_stream(store.clone(), chat_id.into(), None, Some(2));
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(2));
 
         // Frame 1: 2 records, has_more: true, watermark (2, 0)
         let f1_val = stream.next().await.expect("frame 1");
@@ -3031,7 +3119,8 @@ mod tests {
         store.sync_flush().unwrap();
 
         // Start stream with page_size = 2
-        let mut stream = watch_trajectory_stream(store.clone(), chat_id.into(), None, Some(2));
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(2));
 
         // Read Frame 1 (records 1 and 2)
         let _f1 = stream.next().await.expect("frame 1");
@@ -3101,6 +3190,8 @@ mod tests {
         // Reconnect after cursor (1, 0) -> should receive (1, 1) and (2, 0) in snapshot
         let mut stream = watch_trajectory_stream(
             store.clone(),
+            None,
+            None,
             chat_id.into(),
             Some(TrajectoryCursor::new(1, 0)),
             None,
@@ -3181,7 +3272,7 @@ mod tests {
         store.try_enqueue(r1).unwrap();
         store.sync_flush().unwrap();
 
-        let stream = watch_trajectory_stream(store.clone(), chat_id.into(), None, None);
+        let stream = watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, None);
         // Explicitly drop stream to simulate client cancellation / closing surface
         drop(stream);
 
@@ -3206,7 +3297,8 @@ mod tests {
         store.try_enqueue(r1).unwrap();
         store.sync_flush().unwrap();
 
-        let mut stream = watch_trajectory_stream(store.clone(), chat_id.into(), None, None);
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, None);
         let _snap = stream.next().await.expect("snapshot");
 
         // Delete chat
@@ -3231,7 +3323,8 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let deg_store = Arc::new(TrajectoryStore::degraded(temp.path(), "disk failure"));
 
-        let mut stream = watch_trajectory_stream(deg_store, "chat_deg".into(), None, None);
+        let mut stream =
+            watch_trajectory_stream(deg_store, None, None, "chat_deg".into(), None, None);
         let snap_val = stream.next().await.expect("snapshot");
         let snap_item: TrajectoryWatchItem = serde_json::from_value(snap_val).unwrap();
         match snap_item {
@@ -3277,6 +3370,137 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_trajectory_watch_degraded_intervals_respects_page_size() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(TrajectoryStore::open(temp.path()).unwrap());
+        let chat_id = "chat_deg_page_size";
+
+        // Record 5 distinct degraded intervals
+        for i in 1..=5 {
+            store.record_degraded_in_memory(TrajectoryDegradedInterval {
+                chat_id: chat_id.into(),
+                run_id: format!("run{i}"),
+                from_seq: i * 10,
+                to_seq: i * 10 + 5,
+                reason: format!("disk error {i}"),
+                recorded_at: chrono::Utc::now(),
+            });
+        }
+
+        // Watch with limit = Some(2)
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(2));
+        let snap_val = stream.next().await.expect("snapshot");
+        let snap_item: TrajectoryWatchItem = serde_json::from_value(snap_val).unwrap();
+        match snap_item {
+            TrajectoryWatchItem::Snapshot { degraded, .. } => {
+                assert_eq!(
+                    degraded.len(),
+                    2,
+                    "Snapshot frame must limit degraded intervals to page_size"
+                );
+            }
+            other => panic!("expected Snapshot, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_deletion_race_terminates_immediately() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+
+        let chat_id = "chat_race_delete";
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        // Concurrently delete chat right as watch is requested
+        core.workspace.delete_chat(chat_id).unwrap();
+
+        let reply = rpc
+            .handle(
+                methods::WATCH_TRAJECTORY,
+                serde_json::json!({
+                    "chatId": chat_id,
+                }),
+            )
+            .await
+            .unwrap();
+
+        match reply {
+            RpcReply::Stream(mut stream) => {
+                let val = stream.next().await.unwrap();
+                let item: TrajectoryWatchItem = serde_json::from_value(val).unwrap();
+                match item {
+                    TrajectoryWatchItem::Terminal { reason, .. } => {
+                        assert_eq!(reason, TrajectoryTerminalReason::ChatDeleted);
+                    }
+                    other => panic!("expected Terminal(ChatDeleted), got {:?}", other),
+                }
+                assert!(
+                    stream.next().await.is_none(),
+                    "stream must terminate immediately"
+                );
+            }
+            _ => panic!("expected stream reply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_raw_reveal_concurrency_limit_and_timeout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_concurrency_reveal";
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        // Exhaust permits in the semaphore
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_RAW_REVEALS {
+            if let Ok(permit) = rpc.reveal_semaphore.clone().try_acquire_owned() {
+                permits.push(permit);
+            }
+        }
+        assert_eq!(permits.len(), MAX_CONCURRENT_RAW_REVEALS);
+
+        // Release a permit shortly after to prove concurrency queueing works under bound
+        let release_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(permits);
+        });
+
+        // Request while semaphore was saturated -> waits for permit and finishes cleanly
+        let reply = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": 1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        release_task.await.unwrap();
+
+        match reply {
+            RpcReply::Value(val) => {
+                let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+                // Journal entry not found -> NotFound, but executed cleanly through the semaphore
+                match res {
+                    TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                        assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                    }
+                    other => panic!("expected NotFound unavailable, got {:?}", other),
+                }
+            }
+            _ => panic!("expected value reply"),
+        }
+    }
     #[tokio::test]
     async fn test_trajectory_reveal_ownership_and_local_only() {
         let temp = tempfile::TempDir::new().unwrap();

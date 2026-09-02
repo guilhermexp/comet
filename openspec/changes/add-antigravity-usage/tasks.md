@@ -4,7 +4,7 @@
 
 | Fase | U-IDs | Seções | Depends on | Audit state | Audited commit | Entrega | UAT mode |
 |---|---|---|---|---|---|---|---|
-| F1 | A1-A6 | §1-§4 | — | pending | — | Antigravity managed quota end-to-end | human-driven |
+| F1 | A1-A6 | §1-§4 | — | implemented | — | Antigravity managed quota end-to-end | human-driven |
 | F2 | A7 | §5 | F1 | pending | — | Antigravity managed account in Settings -> Accounts | human-driven |
 
 ## 1. Wire Types and Identity
