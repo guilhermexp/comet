@@ -981,7 +981,8 @@ fn write_session(body: &Value) -> Result<Value, ControllerApiError> {
         &session_id,
         data.to_owned(),
         write_id,
-        SESSION_COMMAND_TIMEOUT,
+        None,
+        Some(SESSION_COMMAND_TIMEOUT),
     ))
 }
 

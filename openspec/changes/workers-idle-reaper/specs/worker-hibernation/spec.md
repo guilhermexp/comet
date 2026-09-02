@@ -134,8 +134,11 @@ parar somente os Workers presentes nas duas avaliações e ainda não
 selecionados. O Session Host MUST comparar, sob sua fronteira serializada de
 atividade, um token que cubra input, output, hook, tela, geração e incarnação
 antes de executar Stop; mudança do token ou output pendente MUST rejeitar a
-ação sem enviar Stop. Archive MUST ser gravado somente depois de o Host
-publicar `exited`.
+ação sem enviar Stop. O Host MUST recusar mintar o token enquanto a última
+atividade que observou ainda estiver dentro da janela de persistência, e o
+token MUST ser capturado antes do snapshot fresco que decide. Todo input de
+cliente MUST mover o relógio de ociosidade. Archive MUST ser gravado somente
+depois de o Host publicar `exited`.
 
 #### Scenario: Worker recebe trabalho entre a decisão e a execução
 Test: unit — segunda passada da política sobre snapshot fresco.
@@ -153,12 +156,35 @@ Test: integration — protocolo real do Session Host em `agent_restart_process`.
 - **THEN** a revisão do Host diverge e nenhum Stop é enviado
 - **AND** o Worker permanece `running` e não recebe marker de Archive
 
+#### Scenario: Worker recebe input pouco antes da captura do token
+Test: integration — protocolo real do Session Host em `agent_restart_process`.
+
+- **WHEN** input direto chega e o token é pedido antes de a janela de
+  quietude expirar
+- **THEN** o Host recusa mintar, e nenhum Stop é possível com um token antigo
+- **AND** passada a janela, o token mintado difere do anterior
+
+#### Scenario: Nada mudou entre a confirmação e a execução
+Test: integration — protocolo real do Session Host em `agent_restart_process`.
+
+- **WHEN** o token capturado é apresentado sem input, output, hook ou
+  mudança de tela desde a captura
+- **THEN** o Host aceita, para o runtime e publica o manifest `exited`
+
 #### Scenario: Usuário seleciona Worker durante o lote
-Test: unit — política de hibernação com a seleção corrente.
+Test: unit — laço por candidato com seleção relida entre candidatos.
 
 - **WHEN** um Worker era candidato, mas passa a ser a sessão selecionada antes
   da avaliação individual
-- **THEN** a seleção relida o exclui e nenhum comando de hibernação é enviado
+- **THEN** a seleção relida depois do recheck desse candidato o exclui e nenhum
+  comando de hibernação é enviado para ele
+- **AND** os candidatos anteriores já confirmados não são afetados
+
+#### Scenario: Host recusa confirmar um candidato
+Test: unit — laço por candidato com token ausente.
+
+- **WHEN** o Host não minta token para um candidato
+- **THEN** ele é pulado sem Stop e os demais seguem sendo avaliados
 
 #### Scenario: A segunda passada não amplia a primeira
 Test: unit — segunda passada da política sobre snapshot fresco.

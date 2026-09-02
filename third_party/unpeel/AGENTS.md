@@ -530,10 +530,15 @@ Controller input, direct Host input/output and automatic hibernation meet at
 the Session Host. Protocol 5 mints an opaque token from the Host's in-memory
 activity revision plus persisted hook, parsed screen, runtime generation, and
 Host incarnation. `Write`, `StreamInput`, and every PTY read advance the
-revision under the same lock that `Hibernate` uses to compare the token;
-already-pending output rejects the action before Kill. `session_ops` holds the
-per-Session lifecycle lock until the Host publishes `exited`, then writes the
-Archive marker. Manual Archive keeps its existing unconditional semantics.
+revision under the same lock that `Hibernate` uses to compare the token, and
+the Host refuses to mint or hibernate while the last activity is inside
+`HIBERNATION_QUIET_WINDOW_MS`, the ceiling on how long an observed activity
+takes to reach its persisted trace; already-pending output rejects the action
+before Kill. Every client input path goes through
+`session_ops::write_session_input` (input marker + lifecycle lock).
+`session_ops` holds the per-Session lifecycle lock until the Host publishes
+`exited`, then writes the Archive marker. Manual Archive keeps its existing
+unconditional semantics.
 
 ## Git Worktrees
 

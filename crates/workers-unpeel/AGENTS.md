@@ -179,16 +179,27 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
   quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
 - **A decisão de hibernar é tomada por Worker e confirmada no Host.**
-  `confirmed_hibernation_candidates` reavalia cada candidato sobre um bootstrap
-  próprio imediatamente antes da ação e nunca amplia a primeira passada; a UI
-  também relê a seleção atual depois desse bootstrap. O comando automático usa
-  `Hibernate`, não o `Archive` manual. Hosts no protocolo 5 mintam um token
-  opaco da geração/incarnação, hook/tela e de uma revisão em memória que avança
-  sincronicamente para `Write`, `StreamInput` e cada leitura de output. O Host
-  compara sob o mesmo lock, recusa output pendente e só então aceita o Stop;
-  `session_ops` mantém o lifecycle lock até o manifest `exited` e só depois
-  grava Archive. Mudança de input, output, hook, tela, geração, Host ou seleção
-  protege o Worker. `Archive` manual continua incondicional.
+  `hibernate_confirmed_candidates` é o laço por candidato, puro para ser
+  testável sem gpui, e a ordem é o contrato: mintar o token do Host PRIMEIRO,
+  depois bootstrap fresco, depois reler a seleção, depois
+  `confirmed_hibernation_candidates` (que nunca amplia a primeira passada) e só
+  então `Hibernate`, não o `Archive` manual. O token não mora no
+  `WorkersSession` nem é mintado no `enrich` (uma ida ao socket por Worker a
+  cada bootstrap): só `capture_hibernation_activity_token` no caminho por
+  candidato. Hosts no protocolo 5 mintam um token opaco da geração/incarnação,
+  hook/tela/marker de input e de uma revisão em memória que avança
+  sincronicamente para `Write`, `StreamInput`, resume e cada leitura de output —
+  e recusam mintar enquanto a última atividade estiver dentro de
+  `HIBERNATION_QUIET_WINDOW_MS` (5 s, acima do scan + coalescing da tela). É a
+  janela que fecha a corrida: atividade depois do mint diverge o token, dentro
+  da janela impede o mint, e mais antiga já está persistida e visível ao
+  bootstrap que decide. O Host compara sob o mesmo lock, recusa output pendente
+  e só então aceita o Stop; `session_ops` mantém o lifecycle lock até o manifest
+  `exited` e só depois grava Archive. Todo input de cliente (controller API,
+  `send_text`/`send_keys` do MCP, remoto, `session_input`) passa por
+  `session_ops::write_session_input`, que grava o marker de atividade e segura o
+  mesmo lifecycle lock. Mudança de input, output, hook, tela, geração, Host ou
+  seleção protege o Worker. `Archive` manual continua incondicional.
 - **`send_text` num Worker morto é entrada perdida, não erro do host.**
   `live_worker_guard` barra `send_text`/`send_keys` em qualquer sessão que não
   esteja `running` e nomeia `restart_worker` na mensagem, porque a hibernação
@@ -351,7 +362,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (19 + 10 de hibernação, incluindo portões de evidência e segunda passada), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

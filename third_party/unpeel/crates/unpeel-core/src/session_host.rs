@@ -36,6 +36,13 @@ pub const SESSION_HOST_BOUNDED_JOURNAL_PROTOCOL_VERSION: u32 = 4;
 /// First hosted-PTY protocol with Host-serialized automatic hibernation.
 pub const SESSION_HOST_HIBERNATION_PROTOCOL_VERSION: u32 = 5;
 const SESSION_HOST_PROTOCOL_VERSION: u32 = SESSION_HOST_HIBERNATION_PROTOCOL_VERSION;
+/// Upper bound between an activity this Host observed and its persisted trace
+/// (`SESSION_MENU_SCAN_INTERVAL_MS` scan + `SCREEN_STAMP_COALESCE_MS`
+/// coalescing for the screen stamp, hook and input markers written by
+/// clients). A hibernation token minted inside this window would cover
+/// activity the caller's evaluation could not have seen yet, so the Host
+/// refuses to mint one until the session has been quiet for this long.
+pub const HIBERNATION_QUIET_WINDOW_MS: u64 = 5_000;
 const DEFAULT_OUTPUT_READ_BYTES: usize = 128 * 1024;
 const DEFAULT_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 /// Terminal output is a recovery/replay journal, not permanent transcript
@@ -686,6 +693,53 @@ fn pty_has_pending_output(fd: Option<std::os::unix::io::RawFd>) -> bool {
         revents: 0,
     };
     (unsafe { libc::poll(&mut descriptor, 1, 0) }) != 0
+}
+
+/// Every input, output, and runtime lifecycle event the Host observes, counted
+/// synchronously under one lock so `Hibernate` can compare a revision that
+/// nothing can advance behind its back.
+struct HostActivity {
+    lock: Mutex<()>,
+    revision: AtomicU64,
+    changed_at_ms: AtomicU64,
+    started: Instant,
+}
+
+impl HostActivity {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            revision: AtomicU64::new(0),
+            changed_at_ms: AtomicU64::new(0),
+            started: Instant::now(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Caller holds `lock`.
+    fn touch(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        self.changed_at_ms
+            .store(self.elapsed_ms().max(1), Ordering::Release);
+    }
+
+    /// Caller holds `lock`. `None` while the last activity is still inside
+    /// `HIBERNATION_QUIET_WINDOW_MS`.
+    fn quiet_revision(&self) -> Option<u64> {
+        let changed_at = self.changed_at_ms.load(Ordering::Acquire);
+        (changed_at == 0
+            || self.elapsed_ms().saturating_sub(changed_at) >= HIBERNATION_QUIET_WINDOW_MS)
+            .then(|| self.revision.load(Ordering::Acquire))
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
 }
 
 #[cfg(unix)]
@@ -4787,8 +4841,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         // The Host is the only boundary that sees direct socket input and PTY
         // output synchronously. Hibernation takes this lock to compare one
         // revision and stop without racing either path.
-        let activity_lock = Arc::new(Mutex::new(()));
-        let activity_revision = Arc::new(AtomicU64::new(0));
+        let host_activity = Arc::new(HostActivity::new());
         let runtime_generation = Arc::new(AtomicU64::new(0));
         let pending_runtime_generation =
             Arc::new(AtomicU64::new(if launches_resume_agent_runtime {
@@ -5088,8 +5141,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
         let running_for_listener = Arc::clone(&running);
         let broadcaster_for_listener = Arc::clone(&broadcaster);
         let restart_lock_for_listener = Arc::clone(&agent_restart_lock);
-        let activity_lock_for_listener = Arc::clone(&activity_lock);
-        let activity_revision_for_listener = Arc::clone(&activity_revision);
+        let host_activity_for_listener = Arc::clone(&host_activity);
         let runtime_generation_for_listener = Arc::clone(&runtime_generation);
         let pending_runtime_generation_for_listener = Arc::clone(&pending_runtime_generation);
         let session_id = launch.session.id.clone();
@@ -5117,8 +5169,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                         let title_done = Arc::clone(&title_done);
                         let has_been_written_to = Arc::clone(&input_written_for_listener);
                         let agent_restart_lock = Arc::clone(&restart_lock_for_listener);
-                        let activity_lock = Arc::clone(&activity_lock_for_listener);
-                        let activity_revision = Arc::clone(&activity_revision_for_listener);
+                        let host_activity = Arc::clone(&host_activity_for_listener);
                         let runtime_generation = Arc::clone(&runtime_generation_for_listener);
                         let pending_runtime_generation =
                             Arc::clone(&pending_runtime_generation_for_listener);
@@ -5134,8 +5185,7 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
                                 &title_done,
                                 &has_been_written_to,
                                 &agent_restart_lock,
-                                &activity_lock,
-                                &activity_revision,
+                                &host_activity,
                                 reader_fd,
                                 &runtime_generation,
                                 &pending_runtime_generation,
@@ -5172,13 +5222,11 @@ fn run_host(mut launch: SessionHostLaunch) -> Result<(), String> {
             if !wait_for_pty_output(reader_fd, &running) {
                 break;
             }
-            let activity_guard = activity_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let activity_guard = host_activity.lock();
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    activity_revision.fetch_add(1, Ordering::AcqRel);
+                    host_activity.touch();
                     drop(activity_guard);
                     // Answer terminal queries at the host and excise them from
                     // the stream: DA1 always (fish blocks seconds on the DA1
@@ -7181,8 +7229,7 @@ fn handle_client(
     title_done: &Arc<AtomicBool>,
     has_been_written_to: &Arc<AtomicBool>,
     agent_restart_lock: &Arc<Mutex<()>>,
-    activity_lock: &Arc<Mutex<()>>,
-    activity_revision: &Arc<AtomicU64>,
+    host_activity: &Arc<HostActivity>,
     reader_fd: Option<std::os::unix::io::RawFd>,
     runtime_generation: &Arc<AtomicU64>,
     pending_runtime_generation: &Arc<AtomicU64>,
@@ -7254,10 +7301,8 @@ fn handle_client(
                 let _restart_guard = agent_restart_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let _activity_guard = activity_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                activity_revision.fetch_add(1, Ordering::AcqRel);
+                let _activity_guard = host_activity.lock();
+                host_activity.touch();
                 let mut guard = runtime.lock().unwrap();
                 guard
                     .writer
@@ -7293,14 +7338,12 @@ fn handle_client(
                         let _restart_guard = agent_restart_lock
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let _activity_guard = activity_lock
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let _activity_guard = host_activity.lock();
                         let mut guard = runtime.lock().unwrap();
                         if write_id.is_some_and(|id| guard.recent_write_ids.contains(id)) {
                             false
                         } else {
-                            activity_revision.fetch_add(1, Ordering::AcqRel);
+                            host_activity.touch();
                             guard
                                 .writer
                                 .write_all(data.as_bytes())
@@ -7385,10 +7428,8 @@ fn handle_client(
             let result = match agent_restart_lock.try_lock() {
                 Ok(_restart_guard) => {
                     {
-                        let _activity_guard = activity_lock
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        activity_revision.fetch_add(1, Ordering::AcqRel);
+                        let _activity_guard = host_activity.lock();
+                        host_activity.touch();
                     }
                     resume_agent_in_place(
                         session_id,
@@ -7402,10 +7443,8 @@ fn handle_client(
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                     let _restart_guard = poisoned.into_inner();
                     {
-                        let _activity_guard = activity_lock
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        activity_revision.fetch_add(1, Ordering::AcqRel);
+                        let _activity_guard = host_activity.lock();
+                        host_activity.touch();
                     }
                     resume_agent_in_place(
                         session_id,
@@ -7460,18 +7499,17 @@ fn handle_client(
             }
         }
         SessionHostCommand::HibernationToken => {
-            let _activity_guard = activity_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let activity_token = crate::session_ops::host_hibernation_activity_token(
-                session_id,
-                activity_revision.load(Ordering::Acquire),
-            );
+            let _activity_guard = host_activity.lock();
+            let activity_token = host_activity.quiet_revision().and_then(|revision| {
+                crate::session_ops::host_hibernation_activity_token(session_id, revision)
+            });
             SessionHostResponse {
                 ok: activity_token.is_some(),
-                error: activity_token
-                    .is_none()
-                    .then(|| format!("session {session_id} has no hibernation evidence")),
+                error: activity_token.is_none().then(|| {
+                    format!(
+                        "session {session_id} has no hibernation evidence or saw activity within {HIBERNATION_QUIET_WINDOW_MS}ms"
+                    )
+                }),
                 viewport: None,
                 activity_token,
             }
@@ -7482,17 +7520,13 @@ fn handle_client(
             let _restart_guard = agent_restart_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _activity_guard = activity_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _activity_guard = host_activity.lock();
             let current = (!pty_has_pending_output(reader_fd))
-                .then(|| {
-                    crate::session_ops::host_hibernation_activity_token(
-                        session_id,
-                        activity_revision.load(Ordering::Acquire),
-                    )
-                })
-                .flatten();
+                .then(|| host_activity.quiet_revision())
+                .flatten()
+                .and_then(|revision| {
+                    crate::session_ops::host_hibernation_activity_token(session_id, revision)
+                });
             if current.as_deref() != Some(expected_activity_token.as_str()) {
                 SessionHostResponse {
                     ok: false,

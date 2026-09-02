@@ -146,13 +146,6 @@ impl ActivityBridge {
                 session.activity =
                     merge_derived_activity(&session.activity, session.unread, derived).to_owned();
             }
-            if session.idle_confirmed_by_hook
-                && session.resumable_conversation
-                && session.activity == "idle"
-            {
-                session.hibernation_activity_token =
-                    unpeel_core::session_ops::hibernation_activity_token(&session.id);
-            }
         }
     }
 

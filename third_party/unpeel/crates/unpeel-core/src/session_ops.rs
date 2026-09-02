@@ -243,11 +243,16 @@ fn write_input_activity_marker_unlocked(session_id: &str) -> Result<(), String> 
     std::fs::rename(&temporary, dir.join(INPUT_ACTIVITY_MARKER)).map_err(|error| error.to_string())
 }
 
+/// The single client entry for typing into a hosted session: controller API,
+/// Sessions MCP, secure remote input, and typed Host actions all land here so
+/// every input path moves the idle clock (`INPUT_ACTIVITY_MARKER`) and is
+/// serialized with lifecycle operations on the same lease.
 pub fn write_session_input(
     session_id: &str,
     data: String,
     write_id: Option<String>,
-    timeout: Duration,
+    task_episode_receipt: Option<u64>,
+    timeout: Option<Duration>,
 ) -> Result<(), String> {
     let _lifecycle_lock = lock_session_lifecycle(session_id)?;
     let manifest = manifest(session_id)?;
@@ -255,15 +260,17 @@ pub fn write_session_input(
         return Err(format!("session {session_id} is not running"));
     }
     write_input_activity_marker_unlocked(session_id)?;
-    crate::session_host::send_command_with_timeout(
-        session_id,
-        &SessionHostCommand::Write {
-            data,
-            write_id,
-            task_episode_receipt: None,
-        },
-        timeout,
-    )
+    let command = SessionHostCommand::Write {
+        data,
+        write_id,
+        task_episode_receipt,
+    };
+    match timeout {
+        Some(timeout) => {
+            crate::session_host::send_command_with_timeout(session_id, &command, timeout)
+        }
+        None => crate::session_host::send_command(session_id, &command),
+    }
 }
 
 fn wait_for_exited_manifest(session_id: &str, timeout: Duration) -> bool {

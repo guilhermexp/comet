@@ -68,6 +68,12 @@
   depois da captura do token.
 - [x] 3b.8 Reler `selected_session_id` depois do bootstrap de cada candidato,
   imediatamente antes de despachar `Hibernate`.
+- [x] 3b.9 Janela de quietude no Host (`HIBERNATION_QUIET_WINDOW_MS`): recusar
+  token/hibernação com atividade recente; mintar o token por candidato antes do
+  bootstrap fresco (`hibernate_confirmed_candidates`, laço puro com regressão
+  de seleção entre candidatos); rotear todo input de cliente por
+  `write_session_input`; integração do caminho aceito e do token recusado logo
+  após input.
 
 ## 4. Closeout
 

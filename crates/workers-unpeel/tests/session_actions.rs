@@ -71,7 +71,6 @@ fn session() -> WorkersSession {
         idle_since_unix_ms: None,
         idle_confirmed_by_hook: false,
         resumable_conversation: false,
-        hibernation_activity_token: None,
         total_tokens: None,
         model_usage: Vec::new(),
         capabilities: WorkersSessionCapabilities::default(),
