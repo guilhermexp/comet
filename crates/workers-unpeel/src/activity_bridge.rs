@@ -212,13 +212,16 @@ fn idle_since_unix_ms(
         ))
 }
 
-/// Whether relaunching this Worker would really resume its conversation.
+/// Whether relaunching this Worker would really resume ITS conversation.
 ///
-/// Asked of the runtime's own recipe rather than guessed from the command:
-/// `resumed` returns the command untouched when it has nothing to resume
-/// from, which is how a pi-family session with no captured provider id and no
-/// pinned session dir looks. `can_resume` cannot answer this — it only proves
-/// a recipe exists for the runtime.
+/// Two things must hold. The runtime's recipe must rewrite the command
+/// (`can_resume` only proves a recipe exists), and the rewrite must be pinned
+/// to this Worker by evidence on disk: a provider conversation id captured in
+/// the marker, or a managed session dir fixed in the command. A recipe that
+/// falls back to "the newest conversation of the directory" (`codex resume
+/// --last`, `gemini --resume latest`) with neither does not qualify — two
+/// Workers in the same cwd would resume each other's conversation, which is
+/// worse than not hibernating.
 fn resumable_conversation(
     session_id: &str,
     manifest: &unpeel_core::session_host::HostedSessionManifest,
@@ -228,7 +231,14 @@ fn resumable_conversation(
         return false;
     }
     let (provider_session_id, _) = unpeel_core::session_ops::provider_session_marker(session_id);
-    unpeel_core::resume::resumed(command, provider_session_id.as_deref()).trim() != command
+    let pinned_to_this_worker = provider_session_id.is_some()
+        || unpeel_core::resume::managed_storage_path(
+            command,
+            &unpeel_core::app_paths::unpeel_home(),
+        )
+        .is_some();
+    pinned_to_this_worker
+        && unpeel_core::resume::resumed(command, provider_session_id.as_deref()).trim() != command
 }
 
 impl Drop for ActivityBridge {
@@ -831,14 +841,42 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_session_dir_alone_makes_the_conversation_resumable() {
+    fn a_managed_session_dir_alone_makes_the_conversation_resumable() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir().expect("temporary Unpeel home");
         let _home = UnpeelHomeGuard::set(home.path(), home.path());
         std::fs::create_dir_all(home.path().join("app-sessions/worker-1"))
             .expect("worker session directory");
         let mut manifest = omp_manifest("worker-1");
-        manifest.session.command = "omp --session-dir '/tmp/pi-sessions/worker-1'".into();
+        let managed = home.path().join("pi-sessions/worker-1");
+        manifest.session.command = format!("omp --session-dir '{}'", managed.display());
+
+        assert!(resumable_conversation("worker-1", &manifest));
+
+        manifest.session.command = "omp --session-dir '/tmp/shared-pi-sessions'".into();
+        assert!(
+            !resumable_conversation("worker-1", &manifest),
+            "a session dir outside the managed root is not evidence of THIS Worker"
+        );
+    }
+
+    #[test]
+    fn a_newest_of_the_directory_recipe_needs_a_captured_id_to_be_resumable() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().expect("temporary Unpeel home");
+        let _home = UnpeelHomeGuard::set(home.path(), home.path());
+        std::fs::create_dir_all(home.path().join("app-sessions/worker-1"))
+            .expect("worker session directory");
+        let mut manifest = omp_manifest("worker-1");
+        manifest.session.command = "codex --full-auto".into();
+
+        assert!(
+            !resumable_conversation("worker-1", &manifest),
+            "`codex resume --last` resumes whichever Worker last wrote to the cwd"
+        );
+
+        unpeel_core::session_ops::set_provider_session("worker-1", Some("codex-thread-1"), None)
+            .expect("capture the provider conversation");
 
         assert!(resumable_conversation("worker-1", &manifest));
     }
@@ -883,6 +921,37 @@ mod tests {
             !engine.hook_confirmed_idle("worker-1"),
             "a new turn revokes the confirmation"
         );
+    }
+
+    #[test]
+    fn a_distrusted_stop_rearmed_by_output_no_longer_confirms_idleness() {
+        let mut engine = ActivityEngine::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        engine.apply_hook_event("codex-1", "UserPromptSubmit", None, t0);
+        engine.note_output_and_sweep("codex-1", 1, true, true, t0);
+
+        // codex fires Stop mid-turn.
+        let stopped_at = t0 + Duration::from_secs(30);
+        engine.apply_hook_event("codex-1", "Stop", None, stopped_at);
+        assert!(engine.hook_confirmed_idle("codex-1"));
+
+        // Output keeps growing inside the re-arm window: the turn is alive.
+        let rearmed_at = stopped_at + Duration::from_secs(10);
+        engine.note_output_and_sweep("codex-1", 2, true, true, rearmed_at);
+        assert_eq!(engine.hook_owned_state("codex-1"), Some(HookState::Busy));
+        assert!(!engine.hook_confirmed_idle("codex-1"));
+
+        // Then a long silent subprocess until the sweep gives up.
+        let swept_at = rearmed_at + upstream_activity::HOOK_IDLE_TIMEOUT + Duration::from_secs(1);
+        engine.note_output_and_sweep("codex-1", 2, true, true, swept_at);
+        assert_eq!(engine.hook_owned_state("codex-1"), Some(HookState::Idle));
+        assert!(
+            !engine.hook_confirmed_idle("codex-1"),
+            "the pre-re-arm Stop is no proof the re-armed turn ended"
+        );
+
+        engine.apply_hook_event("codex-1", "Stop", None, swept_at);
+        assert!(engine.hook_confirmed_idle("codex-1"));
     }
 
     #[test]

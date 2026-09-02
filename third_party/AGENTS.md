@@ -58,7 +58,11 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   `Stop`/`StopFailure` real quanto para o sweep de `HOOK_IDLE_TIMEOUT` (5 min
   sem mudança de tela); `hook_confirmed_idle` (patch local) separa os dois por
   `stopped_at`, porque consumidor que age de forma destrutiva sobre ociosidade
-  — a hibernação de Workers — mataria turno em andamento com o primeiro.
+  — a hibernação de Workers — mataria turno em andamento com o primeiro. O
+  re-arme de `Busy` por crescimento de saída após um `Stop` desconfiado
+  (`distrust_stops_while_output_grows`, codex) limpa `stopped_at` como
+  `Start`/`UserPromptSubmit`: turno vivo de novo não tem fim confirmado, e
+  o sweep seguinte precisa voltar a ler como não confirmado.
 - **Os dois relógios do caminho de output andam juntos.**
   `SESSION_OUTPUT_BATCH_FLUSH_MS` (session_host, escrita no journal) e
   `OUTPUT_WAIT_POLL_MS` (controller_host, long-poll do `/mobile/output`) são

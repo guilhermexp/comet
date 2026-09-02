@@ -35,9 +35,14 @@
   (`third_party/unpeel/crates/unpeel-tui/src/activity.rs`): `Stop`
   confirma, o sweep de `HOOK_IDLE_TIMEOUT` não; teste com sweep e com Stop.
 - [x] 3b.2 Adicionar `idle_confirmed_by_hook` e `resumable_conversation` ao
-  `WorkersSession`, preenchidos pelo `activity_bridge` (o segundo por
-  `unpeel_core::resume::resumed` sobre o marker de provider e o comando);
-  testes de sonda com marker, com `--session-dir` e com terminal.
+  `WorkersSession`, preenchidos pelo `activity_bridge` (o segundo exige
+  marker de provider ou `--session-dir` gerenciado além de
+  `unpeel_core::resume::resumed` reescrever o comando); testes de sonda com
+  marker, com `--session-dir` gerenciado e não gerenciado, com `codex` sem e
+  com marker, e com terminal.
+- [x] 3b.2b Re-arme de `Busy` após `Stop` desconfiado limpa `stopped_at` na
+  máquina de estados vendorizada; regressão com a sequência
+  UserPromptSubmit → Stop → saída na janela de re-arme → sweep.
 - [x] 3b.3 Exigir as duas evidências em `hibernation_candidates`; regressões
   para idle varrido e para conversa não retomável.
 - [x] 3b.4 Adicionar `confirmed_hibernation_candidates` (segunda passada por

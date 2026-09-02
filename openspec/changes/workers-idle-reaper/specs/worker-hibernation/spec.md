@@ -93,6 +93,8 @@ Test: unit — máquina de estados de atividade com `Stop` e com sweep.
 - **WHEN** o runtime reporta fim de turno por hook
 - **THEN** a ociosidade passa a contar como confirmada
 - **AND** um novo início de turno revoga essa confirmação
+- **AND** um `Stop` desconfiado que é re-armado para `working` por saída
+  crescente também perde a confirmação, mesmo que a tela pare depois
 
 #### Scenario: Conversa sem nada para retomar
 Test: unit — política de hibernação com conversa não retomável.
@@ -108,6 +110,9 @@ Test: unit — sonda de conversa retomável no `activity_bridge`.
 - **WHEN** existe id de conversa de provider capturado, ou o comando fixa
   diretório de sessão gerenciado
 - **THEN** a conversa é considerada retomável
+- **AND** uma receita que só retomaria a conversa mais recente do diretório
+  (`codex resume --last`, `gemini --resume latest`) sem nenhuma das duas
+  evidências não é, porque poderia retomar a conversa de outro Worker
 - **AND** uma sessão de terminal nunca é
 
 ### Requirement: A decisão de hibernar é reconfirmada antes de executar

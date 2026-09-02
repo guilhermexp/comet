@@ -328,6 +328,7 @@ impl ActivityEngine {
                     if since_stop >= STOP_REARM_GRACE && since_stop <= STOP_REARM_WINDOW {
                         entry.state = Some(HookState::Busy);
                         entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
+                        entry.stopped_at = None;
                     }
                 }
             }

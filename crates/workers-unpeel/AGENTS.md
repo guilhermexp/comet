@@ -150,12 +150,16 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
     `Archive` matava turno em andamento de `omp` dentro de subprocesso longo
     e silencioso. Sweep e Stop são o MESMO estado em `hook_owned_state`: só
     `hook_confirmed_idle` os separa.
-  - `resumable_conversation` pergunta à receita do runtime
-    (`resume::resumed` != comando) em vez de adivinhar do comando: para a
-    família pi a receita devolve o comando intacto sem id de provider
-    capturado e sem `--session-dir`, que é exatamente a forma das sessões
-    legadas há muito ociosas que a feature existe para reclamar — hiberná-las
-    reiniciaria limpo e sumiria com a conversa.
+  - `resumable_conversation` exige identidade DESTE Worker além da receita
+    reescrever o comando (`resume::resumed` != comando): id de conversa de
+    provider capturado no marker, ou diretório de sessão gerenciado
+    (`resume::managed_storage_path` sob `unpeel_home`) fixado no comando.
+    Receita que retoma "a mais recente do diretório" sem nenhuma das duas
+    (`codex resume --last`, `gemini --resume latest`) não qualifica: dois
+    Workers no mesmo cwd retomariam a conversa um do outro, o que é pior do
+    que não hibernar. Para a família pi a receita já devolve o comando
+    intacto sem essas evidências, que é a forma das sessões legadas há muito
+    ociosas — hiberná-las reiniciaria limpo e sumiria com a conversa.
   Os dois campos são device-local: `From<SessionWire>` nasce com `false` e
   quem não passa pelo bridge (sessão não-`running`) nunca é candidato.
 - **A decisão de hibernar é tomada duas vezes.** `confirmed_hibernation_candidates`
