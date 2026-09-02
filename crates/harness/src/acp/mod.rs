@@ -49,44 +49,9 @@ use zeron_proto::{
     RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-const WORKERS_MCP_ARG: &str = "__workers_mcp__";
-
-#[doc(hidden)]
-pub fn workers_mcp_servers_for(
-    executable: &std::path::Path,
-    enabled: bool,
-    disabled_by_environment: bool,
-    parent_chat_id: Option<&str>,
-) -> Vec<Value> {
-    if !enabled || disabled_by_environment || !executable.is_absolute() {
-        return Vec::new();
-    }
-    let mut env = vec![json!({ "name": "COMET_WORKERS_CONTROLLER", "value": "1" })];
-    if let Some(parent_chat_id) = parent_chat_id.filter(|value| !value.trim().is_empty()) {
-        env.push(json!({
-            "name": "COMET_WORKERS_PARENT_CHAT_ID",
-            "value": parent_chat_id
-        }));
-    }
-    vec![json!({
-        "type": "stdio",
-        "name": "comet-workers",
-        "command": executable.to_string_lossy(),
-        "args": [WORKERS_MCP_ARG],
-        "env": env
-    })]
-}
-
 fn workers_mcp_servers(enabled: bool, parent_chat_id: Option<&str>) -> Vec<Value> {
-    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
-        .ok()
-        .is_some_and(|value| value == "1");
-    let executable = std::env::var_os("ZERON_WORKERS_MCP_BIN")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok());
-    executable
-        .as_deref()
-        .map(|executable| workers_mcp_servers_for(executable, enabled, disabled, parent_chat_id))
+    crate::workers_mcp::resolve(enabled, parent_chat_id)
+        .map(|server| vec![server.acp_value()])
         .unwrap_or_default()
 }
 

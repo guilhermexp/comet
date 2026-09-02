@@ -181,6 +181,7 @@ pub use omp::OmpHarness;
 pub mod opencode;
 mod partial_tool_input;
 pub mod shell_env;
+pub(crate) mod workers_mcp;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell

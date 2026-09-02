@@ -107,61 +107,13 @@ fn resolve_codex_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-fn codex_workers_mcp_overrides_for(
-    executable: &std::path::Path,
-    request: &RunRequest,
-    disabled_by_environment: bool,
-) -> Vec<String> {
-    let Some(server) = crate::acp::workers_mcp_servers_for(
-        executable,
+fn codex_workers_mcp_overrides(request: &RunRequest) -> Vec<String> {
+    crate::workers_mcp::resolve(
         request.enable_workers_mcp,
-        disabled_by_environment,
         request.workers_parent_chat_id.as_deref(),
     )
-    .into_iter()
-    .next() else {
-        return Vec::new();
-    };
-    let Some(command) = server.get("command").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let mut overrides = vec![format!(
-        "mcp_servers.comet-workers.command={}",
-        serde_json::to_string(command).expect("string serialization cannot fail")
-    )];
-    if let Some(args) = server.get("args") {
-        overrides.push(format!("mcp_servers.comet-workers.args={args}"));
-    }
-    // The Workers wait is orchestrator-sized (up to hours); Codex's MCP client
-    // must not expire it first.
-    overrides.push(format!(
-        "mcp_servers.comet-workers.tool_timeout_sec={}",
-        crate::WORKERS_CLIENT_DEADLINE_SECONDS
-    ));
-    if let Some(environment) = server.get("env").and_then(Value::as_array) {
-        overrides.extend(environment.iter().filter_map(|row| {
-            let name = row.get("name")?.as_str()?;
-            let value = row.get("value")?.as_str()?;
-            Some(format!(
-                "mcp_servers.comet-workers.env.{name}={}",
-                serde_json::to_string(value).expect("string serialization cannot fail")
-            ))
-        }));
-    }
-    overrides
-}
-
-fn codex_workers_mcp_overrides(request: &RunRequest) -> Vec<String> {
-    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
-        .ok()
-        .is_some_and(|value| value == "1");
-    let Some(executable) = std::env::var_os("ZERON_WORKERS_MCP_BIN")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-    else {
-        return Vec::new();
-    };
-    codex_workers_mcp_overrides_for(&executable, request, disabled)
+    .map(|server| server.codex_overrides())
+    .unwrap_or_default()
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -1588,11 +1540,15 @@ mod tests {
 
     #[test]
     fn native_workers_mcp_overrides_mount_the_controller_without_persistence() {
-        let overrides = codex_workers_mcp_overrides_for(
+        let request = workers_request(true);
+        let overrides = crate::workers_mcp::resolve_for(
             Path::new("/absolute/zeron"),
-            &workers_request(true),
+            request.enable_workers_mcp,
             false,
-        );
+            request.workers_parent_chat_id.as_deref(),
+        )
+        .expect("Workers controller")
+        .codex_overrides();
         assert!(
             overrides
                 .iter()
@@ -1617,13 +1573,15 @@ mod tests {
         assert!(overrides.iter().any(|value| {
             value == "mcp_servers.comet-workers.env.COMET_WORKERS_PARENT_CHAT_ID=\"parent-chat\""
         }));
+        let disabled = workers_request(false);
         assert!(
-            codex_workers_mcp_overrides_for(
+            crate::workers_mcp::resolve_for(
                 Path::new("/absolute/zeron"),
-                &workers_request(false),
+                disabled.enable_workers_mcp,
                 false,
+                disabled.workers_parent_chat_id.as_deref(),
             )
-            .is_empty()
+            .is_none()
         );
     }
 
