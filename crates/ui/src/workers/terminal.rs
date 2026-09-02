@@ -742,7 +742,7 @@ impl WorkersTerminal {
             }
         });
         Self {
-            client: LocalWorkersClient::new(),
+            client: crate::workers::client::shared(),
             session_id: None,
             terminals: RetainedWorkerTerminals::default(),
             generation: 0,
