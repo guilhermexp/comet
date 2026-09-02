@@ -24,14 +24,30 @@ pub(crate) enum BackendSpeechUpdate {
     Final(String),
 }
 
+/// Speech for one delegation. Stays disarmed until the event that opens the
+/// delegated turn (`Steered` on the steer path, `SessionStarted` on the
+/// new-turn fallback): anything before it, including the in-flight turn's
+/// `Done`, belongs to a previous turn and is not this delegation's result.
 #[derive(Default)]
 pub(crate) struct BackendSpeechAccumulator {
+    armed: bool,
     current: String,
     last_segment: Option<String>,
 }
 
 impl BackendSpeechAccumulator {
     pub(crate) fn observe(&mut self, event: &AgentEvent) -> BackendSpeechUpdate {
+        if !self.armed {
+            if matches!(
+                event,
+                AgentEvent::Steered { .. } | AgentEvent::SessionStarted { .. }
+            ) {
+                self.armed = true;
+                self.current.clear();
+                self.last_segment = None;
+            }
+            return BackendSpeechUpdate::None;
+        }
         match event {
             AgentEvent::TextDelta { text } => {
                 push_bounded(&mut self.current, text);
@@ -101,14 +117,26 @@ impl LiveOperationalContext {
         changed
     }
 
+    /// Turn boundary: the visible text describes the current turn only.
+    fn clear_visible_text(&mut self) -> bool {
+        let had_text = !self.visible_text.trim().is_empty();
+        self.visible_text.clear();
+        had_text
+    }
+
     pub(crate) fn observe(&mut self, event: &AgentEvent) -> bool {
         match event {
             AgentEvent::SessionStarted { .. } => {
                 let had_tool = self.active_tool.take().is_some();
                 let had_error = self.visible_error.take().is_some();
-                self.set_status(SessionStatus::Working) || had_tool || had_error
+                let had_text = self.clear_visible_text();
+                self.set_status(SessionStatus::Working) || had_tool || had_error || had_text
             }
-            AgentEvent::TextDelta { text } => push_bounded(&mut self.visible_text, text),
+            AgentEvent::TextDelta { text } => {
+                push_bounded(&mut self.visible_text, text);
+                false
+            }
+            AgentEvent::AssistantMessageCompleted { .. } => !self.visible_text.trim().is_empty(),
             AgentEvent::ToolCall { id, call } | AgentEvent::ToolCallPreview { id, call } => {
                 let label = tool_presentation(call, false, false).label;
                 let next = (id.clone(), label);
@@ -133,8 +161,10 @@ impl LiveOperationalContext {
                 cleared || error_changed
             }
             AgentEvent::InputRequested { .. } => self.set_status(SessionStatus::AwaitingInput),
-            AgentEvent::InputResolved { .. } | AgentEvent::Steered { .. } => {
-                self.set_status(SessionStatus::Working)
+            AgentEvent::InputResolved { .. } => self.set_status(SessionStatus::Working),
+            AgentEvent::Steered { .. } => {
+                let had_text = self.clear_visible_text();
+                self.set_status(SessionStatus::Working) || had_text
             }
             AgentEvent::Error { message } => {
                 let next = truncate_live_text(message.trim().to_owned());
@@ -604,6 +634,7 @@ impl LiveVoiceCoordinator {
             active.cancellation.cancel();
             let _ = task.await;
         }
+        active.cancellation.cancel();
         self.inner.state.send_replace(LiveVoiceState::default());
         send_result
     }
@@ -678,9 +709,95 @@ mod tests {
         SandboxLevel, SessionStatus, SteeringMode, ToolCall,
     };
 
+    fn steered() -> AgentEvent {
+        AgentEvent::Steered {
+            assistant_message_id: Some("active-assistant".into()),
+            next_assistant_message_id: Some("steered-assistant".into()),
+        }
+    }
+
+    fn armed_accumulator() -> BackendSpeechAccumulator {
+        let mut speech = BackendSpeechAccumulator::default();
+        assert_eq!(speech.observe(&steered()), BackendSpeechUpdate::None);
+        speech
+    }
+
+    #[test]
+    fn live_voice_delegation_speech_ignores_the_turn_that_finishes_before_the_steer() {
+        let mut speech = BackendSpeechAccumulator::default();
+        assert_eq!(
+            speech.observe(&AgentEvent::TextDelta {
+                text: "previous turn text".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "previous-assistant".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("previous turn result".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(speech.observe(&steered()), BackendSpeechUpdate::None);
+        assert_eq!(
+            speech.observe(&AgentEvent::TextDelta {
+                text: "delegated answer".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            speech.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("delegated answer".into())
+        );
+
+        let mut fallback = BackendSpeechAccumulator::default();
+        assert_eq!(
+            fallback.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("previous turn result".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            fallback.observe(&AgentEvent::SessionStarted {
+                harness: HarnessId::Omp,
+                model: "omp-default".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "session".into(),
+                assistant_message_id: "assistant".into(),
+            }),
+            BackendSpeechUpdate::None
+        );
+        assert_eq!(
+            fallback.observe(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("fallback result".into()),
+                error: None,
+                session_id: None,
+            }),
+            BackendSpeechUpdate::Final("fallback result".into())
+        );
+    }
+
     #[test]
     fn live_voice_delegation_speech_accumulator_uses_only_visible_backend_text() {
-        let mut speech = BackendSpeechAccumulator::default();
+        let mut speech = armed_accumulator();
         assert_eq!(
             speech.observe(&AgentEvent::ReasoningDelta {
                 text: "private reasoning".into(),
@@ -723,7 +840,7 @@ mod tests {
             BackendSpeechUpdate::Final("Inspecting".into())
         );
 
-        let mut result_wins = BackendSpeechAccumulator::default();
+        let mut result_wins = armed_accumulator();
         result_wins.observe(&AgentEvent::TextDelta {
             text: "fallback".into(),
         });
@@ -737,7 +854,7 @@ mod tests {
             BackendSpeechUpdate::Final("final result".into())
         );
 
-        let mut errored = BackendSpeechAccumulator::default();
+        let mut errored = armed_accumulator();
         assert_eq!(
             errored.observe(&AgentEvent::Done {
                 status: DoneStatus::Errored,
@@ -748,7 +865,7 @@ mod tests {
             BackendSpeechUpdate::Final("actual backend error".into())
         );
 
-        let mut empty = BackendSpeechAccumulator::default();
+        let mut empty = armed_accumulator();
         assert_eq!(
             empty.observe(&AgentEvent::Done {
                 status: DoneStatus::Completed,
@@ -771,8 +888,11 @@ mod tests {
                 command: "secret command".into(),
             },
         }));
-        assert!(context.observe(&AgentEvent::TextDelta {
+        assert!(!context.observe(&AgentEvent::TextDelta {
             text: " Tests are running.".into(),
+        }));
+        assert!(context.observe(&AgentEvent::AssistantMessageCompleted {
+            assistant_message_id: "assistant-1".into(),
         }));
 
         let rendered = context.render();
@@ -780,6 +900,32 @@ mod tests {
         assert!(rendered.contains("Current action: Running command"));
         assert!(rendered.contains("Visible assistant update: Already visible Tests are running."));
         assert!(!rendered.contains("secret command"));
+    }
+
+    #[test]
+    fn live_operational_context_resets_visible_text_at_turn_boundaries() {
+        let mut context = LiveOperationalContext::new(SessionStatus::Working, "Previous turn");
+        assert!(context.observe(&steered()));
+        assert_eq!(context.render(), "Session status: Working");
+        assert!(!context.observe(&AgentEvent::TextDelta {
+            text: "Current turn".into(),
+        }));
+        assert!(context.observe(&AgentEvent::AssistantMessageCompleted {
+            assistant_message_id: "assistant-1".into(),
+        }));
+        assert_eq!(
+            context.render(),
+            "Session status: Working\nVisible assistant update: Current turn"
+        );
+        assert!(context.observe(&AgentEvent::SessionStarted {
+            harness: HarnessId::Omp,
+            model: "omp-default".into(),
+            tools: Vec::new(),
+            cwd: "/tmp".into(),
+            session_id: "session".into(),
+            assistant_message_id: "assistant-2".into(),
+        }));
+        assert_eq!(context.render(), "Session status: Working");
     }
 
     #[test]
@@ -971,6 +1117,8 @@ mod tests {
             .unwrap();
         let call_id = coordinator.reserve("chat-1").unwrap();
         assert!(coordinator.attach_controls(&call_id, controls));
+        let cancellation = coordinator.cancellation(&call_id).unwrap();
+        let child = cancellation.child_token();
         state.borrow_and_update();
 
         let stopping = {
@@ -986,6 +1134,8 @@ mod tests {
         assert_eq!(received.recv().await, Some(LiveVoiceControl::Stop));
         stopping.await.unwrap().unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
+        assert!(cancellation.is_cancelled());
+        assert!(child.is_cancelled());
         coordinator.stop().await.unwrap();
         assert_eq!(state.borrow().phase, LiveVoicePhase::Idle);
     }

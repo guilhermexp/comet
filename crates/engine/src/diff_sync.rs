@@ -783,16 +783,15 @@ async fn capture_git(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Capture, EngineError> {
-    let mut full_args = vec!["-C".to_string(), cwd.to_string_lossy().into_owned()];
-    full_args.extend(args.iter().map(|arg| (*arg).to_string()));
     let output = runner
         .run(ProcessRequest {
             program: "git".into(),
-            args: full_args,
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
             cwd: Some(cwd.to_path_buf()),
             env: Vec::new(),
             timeout: LONG_GIT_TIMEOUT,
             output_limit: max_bytes,
+            kill_on_drop: true,
         })
         .await
         .map_err(|error| {

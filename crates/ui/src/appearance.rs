@@ -97,7 +97,7 @@ pub fn init(
     let appearance = resolve(mode, system);
     Theme::install_selection(
         appearance,
-        themes.variant_id(model_appearance(appearance)),
+        themes.variant_id(appearance),
         accent,
         surface,
         cx,
@@ -153,12 +153,10 @@ pub fn set_theme(appearance: Appearance, variant_id: impl Into<String>, cx: &mut
     }
     let variant_id = variant_id.into();
     let state = cx.global_mut::<AppearanceState>();
-    if state.themes.variant_id(model_appearance(appearance)) == variant_id {
+    if state.themes.variant_id(appearance) == variant_id {
         return;
     }
-    state
-        .themes
-        .set_variant(model_appearance(appearance), variant_id);
+    state.themes.set_variant(appearance, variant_id);
     let themes = state.themes.clone();
     apply(cx);
     settings::update(SavePolicy::Immediate, cx, |settings| {
@@ -244,7 +242,7 @@ pub fn apply(cx: &mut App) {
     let wanted = resolve(state.mode, state.system);
     let accent = state.accent;
     let surface = state.surface;
-    let variant_id = state.themes.variant_id(model_appearance(wanted)).to_owned();
+    let variant_id = state.themes.variant_id(wanted).to_owned();
     let changed = !cx.try_global::<Theme>().is_some_and(|theme| {
         theme.appearance == wanted
             && theme.variant_id.as_ref() == variant_id
@@ -276,17 +274,10 @@ pub fn apply_registry_change(cx: &mut App) {
     let wanted = resolve(state.mode, state.system);
     let accent = state.accent;
     let surface = state.surface;
-    let variant_id = state.themes.variant_id(model_appearance(wanted)).to_owned();
+    let variant_id = state.themes.variant_id(wanted).to_owned();
     Theme::reinstall_selection(wanted, &variant_id, accent, surface, cx);
     cx.refresh_windows();
     reapply_window_background(cx);
-}
-
-fn model_appearance(appearance: Appearance) -> zeron_theme::Appearance {
-    match appearance {
-        Appearance::Dark => zeron_theme::Appearance::Dark,
-        Appearance::Light => zeron_theme::Appearance::Light,
-    }
 }
 
 /// Tell AppKit which appearance the app's windows use, so the chrome *it*

@@ -8,7 +8,8 @@ use std::sync::OnceLock;
 /// and reads the pi-family lifecycle extension at `<unpeel_home>/hooks`, while
 /// every Comet-managed hook script lives under `app_hooks_root()`. Deleting the
 /// legacy root wholesale therefore strips a live launch dependency: pi-family
-/// runtimes (`omp`) are started with `--extension <that path>`, and a missing
+/// runtimes (`pi`, `omp`, `prime-agent`) are started with `--extension <that
+/// path>`, and a missing
 /// file makes the runtime load no extension at all, so the session never emits
 /// Start/Stop/PermissionRequest and its activity stays pinned at `idle` while
 /// the PTY streams. Vendored code is read-only here, so the migration keeps
@@ -17,9 +18,9 @@ const UPSTREAM_OWNED_LEGACY_ASSETS: &[&str] = &["pi-family-lifecycle-extension.j
 
 pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
     static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-    INSTALL_RESULT
+    let installed = INSTALL_RESULT
         .get_or_init(install_comet_managed_hooks)
-        .clone()?;
+        .clone();
 
     let legacy_root = unpeel_core::app_paths::unpeel_home().join("hooks");
     let has_live_sessions = unpeel_core::session_host::list_manifests()
@@ -30,7 +31,7 @@ pub(crate) fn ensure_managed_hook_migration() -> Result<(), String> {
         &managed_provider_config_paths(),
         has_live_sessions,
     )?;
-    Ok(())
+    installed
 }
 
 pub(crate) fn is_comet_application_process() -> bool {

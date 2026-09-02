@@ -1463,17 +1463,13 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
     )
     .as_secs();
 
-    // The per-call transport deadline must strictly exceed the requested wait,
-    // with at least a 60s margin for IPC round-trip and process scheduling —
-    // for any wait the orchestrator can request, up to the controller ceiling.
-    assert!(
-        at_ceiling > max_timeout_seconds,
-        "transport deadline ({at_ceiling}s) must strictly exceed the requested wait ({max_timeout_seconds}s)"
-    );
-    assert!(
-        at_ceiling - max_timeout_seconds >= 60,
-        "transport deadline must keep a 60s margin over the requested wait, got {}s",
-        at_ceiling - max_timeout_seconds
+    // The per-call transport deadline is the requested wait plus a fixed 60s
+    // margin for IPC round-trip and process scheduling, at the controller
+    // ceiling the orchestrator can request.
+    assert_eq!(
+        at_ceiling,
+        max_timeout_seconds + 60,
+        "transport deadline at the controller ceiling is the wait plus a 60s margin"
     );
     assert_eq!(
         zeron_harness::omp::workers_bridge::call_timeout_for(

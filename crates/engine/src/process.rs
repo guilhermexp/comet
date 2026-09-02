@@ -43,6 +43,10 @@ pub(crate) struct ProcessRequest {
     /// Hard ceiling on captured stdout. Crossing it truncates the capture and
     /// kills the child.
     pub(crate) output_limit: usize,
+    /// Kill the child when the calling future is dropped (RPC cancel, closed
+    /// connection). Right for captures whose output nobody will read; wrong
+    /// for git that mutates the repository, which must run to completion.
+    pub(crate) kill_on_drop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +92,7 @@ impl ProcessRunner for SystemProcessRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(request.kill_on_drop);
         let mut child = command
             .spawn()
             .map_err(|error| ProcessRunError::Spawn(error.kind()))?;
@@ -183,6 +187,7 @@ mod tests {
             env: Vec::new(),
             timeout: Duration::from_secs(30),
             output_limit,
+            kill_on_drop: true,
         }
     }
 

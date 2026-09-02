@@ -85,7 +85,7 @@ where
     // EOF flips only the first so pending waits exit; only a client
     // cancellation suppresses the response.
     let in_flight: InFlight = Arc::default();
-    let mut threads = Vec::new();
+    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|error| error.to_string())?;
         if line.trim().is_empty() {
@@ -119,6 +119,7 @@ where
         let writer = Arc::clone(&writer);
         let handler = Arc::clone(&handler);
         let in_flight = Arc::clone(&in_flight);
+        threads.retain(|thread| !thread.is_finished());
         threads.push(std::thread::spawn(move || {
             let response = handler(request, &cancel);
             if let Some(key) = &key {

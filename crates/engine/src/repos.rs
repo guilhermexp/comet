@@ -219,6 +219,7 @@ impl Repos {
                 env: Vec::new(),
                 timeout: LONG_GIT_TIMEOUT,
                 output_limit: GIT_OUTPUT_LIMIT,
+                kill_on_drop: false,
             })
             .await
             .map_err(|error| {

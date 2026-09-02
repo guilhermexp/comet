@@ -21,7 +21,9 @@ pub trait RpcMethod {
     const NAME: &'static str;
     /// Whether the device room may relay this call to `targetDeviceId`.
     const FORWARDABLE: bool;
-    /// Whether the reply is a stream of items instead of a single value.
+    /// Whether the relay proxies the reply as a stream of items. Local-only
+    /// watch methods stream on the wire too but are never forwarded, so they
+    /// stay `false`: this flag drives relay routing, not reply shape.
     const STREAM: bool;
     /// Reply deadline for a relay-forwarded unary call.
     const DEADLINE: Duration;
@@ -38,7 +40,8 @@ pub struct MethodInfo {
     pub name: &'static str,
     /// Whether the device room may relay this call to `targetDeviceId`.
     pub forwardable: bool,
-    /// Whether the reply is a stream of items instead of a single value.
+    /// Whether the relay proxies the reply as a stream of items (see
+    /// [`RpcMethod::STREAM`]); implies `forwardable`.
     pub stream: bool,
     /// Reply deadline for a relay-forwarded unary call.
     pub deadline: Duration,

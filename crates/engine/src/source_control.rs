@@ -218,6 +218,7 @@ impl GitHubCli {
             env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
             timeout: GITHUB_TIMEOUT,
             output_limit: GITHUB_OUTPUT_LIMIT,
+            kill_on_drop: true,
         };
         let output = self.runner.run(request).await.map_err(classify_run_error)?;
         // Truncation is checked first: crossing the output ceiling kills the
@@ -257,6 +258,7 @@ impl GitHubCli {
             env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
             timeout: GITHUB_TIMEOUT,
             output_limit: GITHUB_OUTPUT_LIMIT,
+            kill_on_drop: true,
         };
         let output = self.runner.run(request).await.ok()?;
         if !output.success || output.stdout_truncated {
@@ -591,6 +593,7 @@ impl GitCheckoutInspector {
                 env: Vec::new(),
                 timeout: GIT_TIMEOUT,
                 output_limit: GIT_OUTPUT_LIMIT,
+                kill_on_drop: true,
             })
             .await
             .ok()?;
