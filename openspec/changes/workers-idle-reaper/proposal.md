@@ -48,8 +48,11 @@ Nenhuma.
   `crates/workers-unpeel/src/controller_mcp.rs` (`restart_worker`, erro em
   Worker hibernado), `crates/workers-unpeel/src/lib.rs` (política pura de
   hibernação, testável sem UI).
-- Nenhuma mudança de wire, CRDT, edge ou protocolo do Host: usa
-  `WorkersSessionCommand::Archive` e `SessionAction::Restart` já existentes.
+- Sem mudança de CRDT nem de edge. O wire local ganha
+  `WorkersSessionCommand::Hibernate { expected_activity_token }` e o Host sobe
+  ao protocolo 5 (token de atividade e Stop condicional); o relançamento usa
+  `SessionAction::Restart` já existente. Contrato em
+  `specs/worker-hibernation/spec.md`.
 - Depende de `pi-family-resume-adapter` para que `omp`/`prime-agent` voltem
   com contexto; em runtimes sem capability `restart`, o Worker não é
   hibernado.
