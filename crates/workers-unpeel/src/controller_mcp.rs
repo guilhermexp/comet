@@ -521,8 +521,19 @@ fn dispatch_action(
         }
         "list_presets" => {
             let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
+            // Preference order, not storage order. The star (quick_launch) wins,
+            // then drag order — the same rule the UI applies when it picks a
+            // preset for the user (ui/src/shell/tabs.rs). Carrying it in the
+            // position means the first entry already answers "which preset",
+            // with no extra field or sentence spent saying so.
+            let mut presets = bootstrap
+                .presets
+                .into_iter()
+                .filter(|preset| preset.enabled)
+                .collect::<Vec<_>>();
+            presets.sort_by_key(|preset| !preset.quick_launch);
             Ok(json!({
-                "presets": bootstrap.presets.into_iter().filter(|preset| preset.enabled).map(|preset| json!({
+                "presets": presets.into_iter().map(|preset| json!({
                     "id": preset.id,
                     "label": preset.label,
                     "command": preset.command,
