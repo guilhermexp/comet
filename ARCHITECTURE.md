@@ -141,8 +141,8 @@ zeron/
     harness/        zeron-harness         # Harness trait + claude-code (stream-json subprocess),
                                           # codex (app-server JSON-RPC), opencode, omp, mock; steering mailbox,
                                           # requestInput, models/reasoning/options catalogs
-    engine/         zeron-engine          # sessions engine (pub/sub, run journal, recovery, stall
-                                          # watchdog), trajectory store (SQLite WAL), doc host + command executor, repos/worktrees,
+    engine/         zeron-engine          # sessions engine (pub/sub, run journal, recovery, idle
+                                          # reaper), trajectory store (SQLite WAL), doc host + command executor, repos/worktrees,
                                           # checkout-diff sync, terminals (portable-pty), uploads,
                                           # agent accounts (cred swap), auth (WorkOS via edge),
                                           # device-room host/peers, identity
@@ -234,7 +234,8 @@ feature spec `docs/research/feature-inventory.md` §1.
 Direct ports of zeron behaviors (spec: feature-inventory §3):
 - **Sessions engine**: per-session broadcast hub; on-disk run journal (resumable `seq` replay,
   crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; idle
-  reaper; 10min stall watchdog); recovery stamps `aborted`. Trajectory store (`crates/engine/src/trajectory_store.rs`)
+  reaper, 30min `SESSION_IDLE`; the 10min stall watchdog was deliberately not ported — see the
+  module doc in `crates/engine/src/sessions.rs`); recovery stamps `aborted`. Trajectory store (`crates/engine/src/trajectory_store.rs`)
   persists sanitized timeline records into device-local SQLite WAL with bounded background writer, exposed via
   `WatchTrajectory` and `RevealTrajectoryRaw` RPCs (`crates/rpc/src/method.rs`).
 - **Doc host**: per-chat handle (join room, VV backfill, write user entries + stream assistant
