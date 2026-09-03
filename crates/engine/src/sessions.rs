@@ -3362,9 +3362,8 @@ mod tests {
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     use zeron_proto::trajectory::*;
     use zeron_proto::{
-        AgentEvent, Chat, ChatConfig, ContextUsage, ConversationSourceContext, DoneStatus,
-        HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus, ToolCall,
-        WorkflowTaskStatus, WorkflowTaskUpdate,
+        AgentEvent, ContextUsage, DoneStatus, HarnessId, RunRequest, SandboxLevel, Session,
+        SessionStatus, ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
     };
     #[test]
     fn journal_policy_skips_transient_preview_but_keeps_authoritative_file_call() {

@@ -560,6 +560,13 @@ flowchart TD
           <div class="card-foot">UI: <code>changes.rs</code> · Engine: <code>diff_sync.rs</code></div>
         </article>
         <article class="ve-card">
+          <div class="card-kicker">Execução</div>
+          <h3>Chat Trajectory preview</h3>
+          <p>Superfície analítica para inspeção cronológica e técnica da execução do agente no Chat ativo.</p>
+          <ul><li>Timeline com 3 lanes fixas (Input, Model, Tools) em modos Sequence e Recorded.</li><li>Ledger virtualizado com altura fixa de linha (26px), busca com dimming e foco de range.</li><li>Inspector de 5 abas (Summary, Payload, Result, Schema, Timing) com distinção de valores Unavailable e Unsettled.</li><li>Raw Reveal sob demanda local no dispositivo para campos truncados/referenciados.</li><li>Seguimento live-edge com contagem de pendências e layout responsivo Split/NarrowDetail.</li></ul>
+          <div class="card-foot">UI: <code>crates/ui/src/trajectory/</code> · RPC: <code>WatchTrajectory</code>, <code>RevealTrajectoryRaw</code></div>
+        </article>
+        <article class="ve-card">
           <div class="card-kicker">Preferências</div>
           <h3>Configurações</h3>
           <p>Quatro páginas nativas de administração.</p>
@@ -633,6 +640,7 @@ flowchart TD
             <tr><td>13</td><td>iOS</td><td>SwiftUI</td><td><span class="status partial">PARCIAL</span></td><td>Projeto e implementação existem; build bloqueado localmente porque só Command Line Tools está ativo, sem Xcode completo.</td></tr>
             <tr><td>14</td><td>Sync multi-device</td><td>Engine / edge</td><td><span class="status partial">PARCIAL</span></td><td>CRDT, relay e e2e smoke documentados; execução atual é demo offline de um único host.</td></tr>
             <tr><td>15</td><td>Auth, edge, R2 e update</td><td>Cloudflare / WorkOS</td><td><span class="status partial">PARCIAL</span></td><td>Rotas e handlers existem; produção e aplicação de update não foram acionadas nesta sessão.</td></tr>
+            <tr><td>16</td><td>Chat Trajectory preview</td><td>Desktop / UI / RPC</td><td><span class="status partial">PARCIAL</span></td><td>Modelo puro, timeline, ledger virtualizado, inspector e view com 39 testes unitários; validação visual em execução headed pendente.</td></tr>
           </tbody>
         </table>
       </div></div>
@@ -659,6 +667,7 @@ mindmap
       Terminal PTY — FONTE
       Diff viewer — FONTE
       Anexos — FONTE
+      Trajectory preview — PARCIAL
     Viewports
       Desktop gpui — PARCIAL
       TUI ratatui — FONTE
@@ -755,7 +764,7 @@ flowchart TD
       <div class="sec-head"><span class="sec-num">08</span><h2>Evidências e rastreabilidade</h2></div>
       <div class="evidence-grid">
         <article class="ve-card"><div class="card-kicker">Runtime</div><h3>Observado</h3><ul><li>Desktop e headless ativos no processo <code>comet-dev</code>.</li><li>RPC <code>LocalDevice</code> respondeu.</li><li><code>ListHarnesses</code> expôs Mock, Claude Code e Codex.</li><li><code>ListModels</code> respondeu para Claude e Codex.</li><li><code>ListAgentAccounts</code> detectou ambos os providers; dados pessoais omitidos deste documento.</li><li><code>ListFolders</code> e <code>WatchSpaces</code> responderam.</li></ul></article>
-        <article class="ve-card"><div class="card-kicker">Fonte</div><h3>Arquivos principais</h3><ul><li><code>ARCHITECTURE.md</code></li><li><code>docs/PARITY.md</code></li><li><code>docs/research/feature-inventory.md</code></li><li><code>crates/ui/src</code></li><li><code>crates/engine/src</code></li><li><code>crates/rpc/src/lib.rs</code></li><li><code>crates/harness/src</code></li><li><code>apps/ios/README.md</code></li><li><code>edge/src/index.ts</code></li></ul></article>
+        <article class="ve-card"><div class="card-kicker">Fonte</div><h3>Arquivos principais</h3><ul><li><code>ARCHITECTURE.md</code></li><li><code>docs/PARITY.md</code></li><li><code>docs/research/feature-inventory.md</code></li><li><code>crates/ui/src</code></li><li><code>crates/ui/src/trajectory</code></li><li><code>crates/engine/src</code></li><li><code>crates/rpc/src/lib.rs</code></li><li><code>crates/harness/src</code></li><li><code>apps/ios/README.md</code></li><li><code>edge/src/index.ts</code></li></ul></article>
         <article class="ve-card"><div class="card-kicker">Limite de validação</div><h3>Não observado</h3><p>A UI gpui executada como binário cru não apareceu como aplicativo targetable no runtime de Accessibility; por isso os estados visuais foram confirmados por fonte e pelo screenshot versionado, não por automação de clique. Nenhum dado do usuário foi mutado.</p></article>
         <article class="ve-card"><div class="card-kicker">Conflito documental</div><h3>Fonte mais nova vence</h3><p><code>ARCHITECTURE.md</code> e <code>docs/PARITY.md</code> ainda descrevem mobile como fora de escopo, mas <code>apps/ios</code> contém um projeto SwiftUI completo e README próprio. Este baseline registra o iOS como existente, com validação pendente.</p></article>
       </div>

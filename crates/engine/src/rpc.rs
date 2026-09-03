@@ -4162,7 +4162,11 @@ mod tests {
         conn.execute("DROP TABLE trajectory_records", []).unwrap();
         drop(conn);
 
-        store.try_enqueue_batch(vec![r_a1, r_b1]).unwrap();
+        // Fail-open: whether the writer already observed the broken schema
+        // (enqueue rejected, store marked degraded) or not (rejected later at
+        // commit time), capture never propagates the failure — and BOTH chats
+        // in the batch must still be accounted as degraded.
+        let _ = store.try_enqueue_batch(vec![r_a1, r_b1]);
 
         // Must receive DegradedRecorded for both chat_a and chat_b
         let mut degraded_chats = std::collections::HashSet::new();

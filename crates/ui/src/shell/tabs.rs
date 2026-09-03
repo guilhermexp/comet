@@ -250,6 +250,11 @@ impl Shell {
         // conversation title. A content-sized cluster needs no geometry: the
         // row's own right padding already ends at the chat column's edge.
         let changes_trailing: Option<gpui::AnyElement> = if changes_active && !on_canvas {
+            let capabilities = titlebar_capabilities(
+                SidebarMode::Orchestrator,
+                !self.active_chat.is_empty(),
+                false,
+            );
             Some(
                 div()
                     .flex_none()
@@ -258,6 +263,9 @@ impl Shell {
                     .items_center()
                     .gap(px(6.0))
                     .child(self.render_orchestrator_capture_button(&theme, cx))
+                    .when(capabilities.trajectory, |el| {
+                        el.child(self.render_orchestrator_trajectory_button(&theme, cx))
+                    })
                     .when(!details_open && self.details_context(cx).is_some(), |el| {
                         el.child(self.render_details_sidebar_button(
                             "orchestrator-toggle-details-sidebar-with-panel",
@@ -294,6 +302,9 @@ impl Shell {
                     .gap(px(6.0))
                     .when(capabilities.capture, |el| {
                         el.child(self.render_orchestrator_capture_button(&theme, cx))
+                    })
+                    .when(capabilities.trajectory, |el| {
+                        el.child(self.render_orchestrator_trajectory_button(&theme, cx))
                     })
                     .when(!details_open && self.details_context(cx).is_some(), |el| {
                         el.child(self.render_details_sidebar_button(
