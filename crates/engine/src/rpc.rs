@@ -4171,10 +4171,10 @@ mod tests {
         let mut degraded_chats = std::collections::HashSet::new();
         let timeout = std::time::Instant::now();
         while degraded_chats.len() < 2 && timeout.elapsed() < std::time::Duration::from_secs(3) {
-            if let Ok(event) = events_rx.try_recv() {
-                if let TrajectoryStoreEvent::DegradedRecorded { chat_id, .. } = event {
-                    degraded_chats.insert(chat_id);
-                }
+            if let Ok(event) = events_rx.try_recv()
+                && let TrajectoryStoreEvent::DegradedRecorded { chat_id, .. } = event
+            {
+                degraded_chats.insert(chat_id);
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

@@ -81,10 +81,10 @@ pub fn lane_layout(model: &TrajectoryViewModel) -> LaneLayout {
 
     let mut layout = LaneLayout::default();
 
-    if model.duration_mode() == DurationMode::Recorded {
-        if let Some(recorded_layout) = compute_recorded_layout(&records) {
-            return recorded_layout;
-        }
+    if model.duration_mode() == DurationMode::Recorded
+        && let Some(recorded_layout) = compute_recorded_layout(&records)
+    {
+        return recorded_layout;
     }
 
     // Sequence Mode or Fallback: equal widths

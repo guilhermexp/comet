@@ -269,10 +269,9 @@ impl<'de> Deserialize<'de> for TrajectoryRecordKind {
                 KnownTrajectoryRecordKind::Degraded => Self::Degraded,
             },
             TrajectoryRecordKindDe::Custom(fallback) => {
-                let name = if fallback.kind == "custom" && fallback.name.is_some() {
-                    fallback.name.unwrap()
-                } else {
-                    fallback.kind
+                let name = match fallback.name {
+                    Some(name) if fallback.kind == "custom" => name,
+                    _ => fallback.kind,
                 };
                 Self::Custom { name }
             }
@@ -601,7 +600,7 @@ fn labeled_secret_range(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
         b"api_key",
         b"api-key",
     ] {
-        for separator in [b'=', b':'] {
+        for separator in *b"=:" {
             if let Some(range) = separated_secret_range(bytes, start, key, separator, false) {
                 return Some(range);
             }
@@ -2043,9 +2042,18 @@ mod tests {
         let text = format!("{filler}{token} tail");
         let (summary, preview) = sanitize_prompt_preview(&text, 1024);
         let preview = preview.unwrap();
-        assert!(preview.ends_with("(truncated)"), "cap not applied: {preview:?}");
-        assert!(!preview.contains(&token[..14]), "preview leaked {preview:?}");
-        assert!(!summary.contains(&token[..14]), "summary leaked {summary:?}");
+        assert!(
+            preview.ends_with("(truncated)"),
+            "cap not applied: {preview:?}"
+        );
+        assert!(
+            !preview.contains(&token[..14]),
+            "preview leaked {preview:?}"
+        );
+        assert!(
+            !summary.contains(&token[..14]),
+            "summary leaked {summary:?}"
+        );
     }
 
     #[test]
@@ -2339,11 +2347,11 @@ mod tests {
         let groups = group_records(&[r_leg, r1, r2]);
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0].label, "Legacy Run");
-        assert_eq!(groups[0].is_legacy, true);
+        assert!(groups[0].is_legacy);
         assert_eq!(groups[1].label, "Run 1");
-        assert_eq!(groups[1].is_legacy, false);
+        assert!(!groups[1].is_legacy);
         assert_eq!(groups[2].label, "Run 2");
-        assert_eq!(groups[2].is_legacy, false);
+        assert!(!groups[2].is_legacy);
     }
 
     #[test]

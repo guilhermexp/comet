@@ -274,11 +274,10 @@ impl TrajectoryStore {
 
                 let mut degraded_persist_failed = false;
                 while let Ok(cmd) = writer_rx.recv() {
-                    if !degraded_persist_failed {
-                        if !persist_pending_degraded(&mut conn, &writer_in_mem) {
+                    if !degraded_persist_failed
+                        && !persist_pending_degraded(&mut conn, &writer_in_mem) {
                             degraded_persist_failed = true;
                         }
-                    }
                     match cmd {
                         WriterCommand::WriteRecords(mut records) => {
                             // Drain any immediately available batched records.
@@ -924,43 +923,35 @@ impl TrajectoryStore {
             let (p_json, r_json) = row?;
             match raw_ref.field {
                 zeron_proto::trajectory::TrajectoryRawField::Payload => {
-                    if let Some(json_str) = p_json {
-                        if let Ok(p) = serde_json::from_str::<
+                    if let Some(json_str) = p_json
+                        && let Ok(p) = serde_json::from_str::<
                             zeron_proto::trajectory::TrajectoryPayloadPreview,
                         >(&json_str)
-                        {
-                            if let Some(r_ref) = p.raw_ref {
-                                if r_ref.chat_id == raw_ref.chat_id
-                                    && r_ref.source_seq == raw_ref.source_seq
-                                    && r_ref.parent_tool_use_id == raw_ref.parent_tool_use_id
-                                    && r_ref.call_id == raw_ref.call_id
-                                    && r_ref.field == raw_ref.field
-                                    && r_ref.source_version == raw_ref.source_version
-                                {
-                                    return Ok(true);
-                                }
-                            }
-                        }
+                        && let Some(r_ref) = p.raw_ref
+                        && r_ref.chat_id == raw_ref.chat_id
+                        && r_ref.source_seq == raw_ref.source_seq
+                        && r_ref.parent_tool_use_id == raw_ref.parent_tool_use_id
+                        && r_ref.call_id == raw_ref.call_id
+                        && r_ref.field == raw_ref.field
+                        && r_ref.source_version == raw_ref.source_version
+                    {
+                        return Ok(true);
                     }
                 }
                 zeron_proto::trajectory::TrajectoryRawField::Result => {
-                    if let Some(json_str) = r_json {
-                        if let Ok(r) = serde_json::from_str::<
+                    if let Some(json_str) = r_json
+                        && let Ok(r) = serde_json::from_str::<
                             zeron_proto::trajectory::TrajectoryResultPreview,
                         >(&json_str)
-                        {
-                            if let Some(r_ref) = r.raw_ref {
-                                if r_ref.chat_id == raw_ref.chat_id
-                                    && r_ref.source_seq == raw_ref.source_seq
-                                    && r_ref.parent_tool_use_id == raw_ref.parent_tool_use_id
-                                    && r_ref.call_id == raw_ref.call_id
-                                    && r_ref.field == raw_ref.field
-                                    && r_ref.source_version == raw_ref.source_version
-                                {
-                                    return Ok(true);
-                                }
-                            }
-                        }
+                        && let Some(r_ref) = r.raw_ref
+                        && r_ref.chat_id == raw_ref.chat_id
+                        && r_ref.source_seq == raw_ref.source_seq
+                        && r_ref.parent_tool_use_id == raw_ref.parent_tool_use_id
+                        && r_ref.call_id == raw_ref.call_id
+                        && r_ref.field == raw_ref.field
+                        && r_ref.source_version == raw_ref.source_version
+                    {
+                        return Ok(true);
                     }
                 }
             }
@@ -1056,27 +1047,26 @@ impl TrajectoryStore {
         }
 
         intervals.sort_by_key(|i| i.from_seq);
-        if let Some(lim) = limit {
-            if intervals.len() > lim {
-                intervals.truncate(lim);
-            }
+        if let Some(lim) = limit
+            && intervals.len() > lim
+        {
+            intervals.truncate(lim);
         }
-        if intervals.is_empty() {
-            if let Some(reason) = self
+        if intervals.is_empty()
+            && let Some(reason) = self
                 .degraded_reason
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .as_ref()
-            {
-                intervals.push(TrajectoryDegradedInterval {
-                    chat_id: chat_id.to_string(),
-                    run_id: "init".to_string(),
-                    from_seq: 0,
-                    to_seq: 0,
-                    reason: format!("Store initialization failed: {}", reason),
-                    recorded_at: Utc::now(),
-                });
-            }
+        {
+            intervals.push(TrajectoryDegradedInterval {
+                chat_id: chat_id.to_string(),
+                run_id: "init".to_string(),
+                from_seq: 0,
+                to_seq: 0,
+                reason: format!("Store initialization failed: {}", reason),
+                recorded_at: Utc::now(),
+            });
         }
         Ok(intervals)
     }
@@ -1283,95 +1273,93 @@ impl TrajectoryStore {
 
         let flush_text = |records: &mut Vec<TrajectoryRecord>,
                           current: &mut Option<(u64, String)>| {
-            if let Some((first_seq, text)) = current.take() {
-                if !text.is_empty() {
-                    let (sum, _prev) =
-                        zeron_proto::trajectory::sanitize_prompt_preview(&text, 1024);
-                    let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(&run_id, first_seq, 0),
-                        chat_id: chat_id.to_string(),
-                        run_id: run_id.clone(),
-                        source_seq: first_seq,
-                        sub_seq: 0,
-                        lane: TrajectoryLane::Model,
-                        kind: TrajectoryRecordKind::AssistantMessage,
-                        status: TrajectoryStatus::Completed,
-                        is_partial: false,
-                        title: "Assistant".into(),
-                        summary: sum,
-                        turn_id: None,
-                        step_id: None,
-                        call_id: None,
-                        parent_tool_use_id: None,
-                        timing: Some(TrajectoryTiming::sequence_only()),
-                        usage: None,
-                        payload: Some(TrajectoryPayloadPreview {
-                            summary: "Response completed".to_string(),
-                            sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
-                                &text, 1024,
-                            )),
-                            schema_info: None,
-                            raw_ref: Some(TrajectoryRawRef::new(
-                                chat_id,
-                                first_seq,
-                                None,
-                                None,
-                                TrajectoryRawField::Payload,
-                            )),
-                        }),
-                        result: None,
-                        error_message: None,
-                        is_degraded: false,
-                    };
-                    records.push(rec);
-                }
+            if let Some((first_seq, text)) = current.take()
+                && !text.is_empty()
+            {
+                let (sum, _prev) = zeron_proto::trajectory::sanitize_prompt_preview(&text, 1024);
+                let rec = TrajectoryRecord {
+                    id: TrajectoryRecordId::new(&run_id, first_seq, 0),
+                    chat_id: chat_id.to_string(),
+                    run_id: run_id.clone(),
+                    source_seq: first_seq,
+                    sub_seq: 0,
+                    lane: TrajectoryLane::Model,
+                    kind: TrajectoryRecordKind::AssistantMessage,
+                    status: TrajectoryStatus::Completed,
+                    is_partial: false,
+                    title: "Assistant".into(),
+                    summary: sum,
+                    turn_id: None,
+                    step_id: None,
+                    call_id: None,
+                    parent_tool_use_id: None,
+                    timing: Some(TrajectoryTiming::sequence_only()),
+                    usage: None,
+                    payload: Some(TrajectoryPayloadPreview {
+                        summary: "Response completed".to_string(),
+                        sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
+                            &text, 1024,
+                        )),
+                        schema_info: None,
+                        raw_ref: Some(TrajectoryRawRef::new(
+                            chat_id,
+                            first_seq,
+                            None,
+                            None,
+                            TrajectoryRawField::Payload,
+                        )),
+                    }),
+                    result: None,
+                    error_message: None,
+                    is_degraded: false,
+                };
+                records.push(rec);
             }
         };
 
         let flush_reasoning = |records: &mut Vec<TrajectoryRecord>,
                                current: &mut Option<(u64, String)>| {
-            if let Some((first_seq, text)) = current.take() {
-                if !text.is_empty() {
-                    let (sum, _prev) =
-                        zeron_proto::trajectory::sanitize_prompt_preview(&text, 1024);
-                    let rec = TrajectoryRecord {
-                        id: TrajectoryRecordId::new(&run_id, first_seq, 1),
-                        chat_id: chat_id.to_string(),
-                        run_id: run_id.clone(),
-                        source_seq: first_seq,
-                        sub_seq: 1,
-                        lane: TrajectoryLane::Model,
-                        kind: TrajectoryRecordKind::Reasoning,
-                        status: TrajectoryStatus::Completed,
-                        is_partial: false,
-                        title: "Reasoning".into(),
-                        summary: sum,
-                        turn_id: None,
-                        step_id: None,
-                        call_id: None,
-                        parent_tool_use_id: None,
-                        timing: Some(TrajectoryTiming::sequence_only()),
-                        usage: None,
-                        payload: Some(TrajectoryPayloadPreview {
-                            summary: "Reasoning completed".to_string(),
-                            sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
-                                &text, 1024,
-                            )),
-                            schema_info: None,
-                            raw_ref: Some(TrajectoryRawRef::new(
-                                chat_id,
-                                first_seq,
-                                None,
-                                None,
-                                TrajectoryRawField::Payload,
-                            )),
-                        }),
-                        result: None,
-                        error_message: None,
-                        is_degraded: false,
-                    };
-                    records.push(rec);
-                }
+            if let Some((first_seq, text)) = current.take()
+                && !text.is_empty()
+            {
+                let (sum, _prev) = zeron_proto::trajectory::sanitize_prompt_preview(&text, 1024);
+                let rec = TrajectoryRecord {
+                    id: TrajectoryRecordId::new(&run_id, first_seq, 1),
+                    chat_id: chat_id.to_string(),
+                    run_id: run_id.clone(),
+                    source_seq: first_seq,
+                    sub_seq: 1,
+                    lane: TrajectoryLane::Model,
+                    kind: TrajectoryRecordKind::Reasoning,
+                    status: TrajectoryStatus::Completed,
+                    is_partial: false,
+                    title: "Reasoning".into(),
+                    summary: sum,
+                    turn_id: None,
+                    step_id: None,
+                    call_id: None,
+                    parent_tool_use_id: None,
+                    timing: Some(TrajectoryTiming::sequence_only()),
+                    usage: None,
+                    payload: Some(TrajectoryPayloadPreview {
+                        summary: "Reasoning completed".to_string(),
+                        sanitized_text: Some(zeron_proto::trajectory::truncate_preview(
+                            &text, 1024,
+                        )),
+                        schema_info: None,
+                        raw_ref: Some(TrajectoryRawRef::new(
+                            chat_id,
+                            first_seq,
+                            None,
+                            None,
+                            TrajectoryRawField::Payload,
+                        )),
+                    }),
+                    result: None,
+                    error_message: None,
+                    is_degraded: false,
+                };
+                records.push(rec);
             }
         };
 
@@ -2732,7 +2720,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrajectoryRecord> 
     })?;
 
     let status: TrajectoryStatus =
-        serde_json::from_str(&status_str).unwrap_or_else(|_| match status_str.as_str() {
+        serde_json::from_str(&status_str).unwrap_or(match status_str.as_str() {
             "Running" | "\"running\"" => TrajectoryStatus::Running,
             "Completed" | "\"completed\"" => TrajectoryStatus::Completed,
             "Error" | "\"error\"" => TrajectoryStatus::Error,
@@ -3278,7 +3266,7 @@ mod tests {
         let store = TrajectoryStore::open(temp.path()).unwrap();
         let journal_path = temp.path().join("legacy_chat.jsonl");
 
-        let lines = vec![
+        let lines = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
             r#"{"seq":2,"event":{"type":"userMessage","text":"Hello legacy"}}"#,
             r#"{"seq":3,"event":{"type":"done","status":"completed","result":"ok"}}"#,
@@ -3352,7 +3340,7 @@ mod tests {
         let store = TrajectoryStore::open(temp.path()).unwrap();
         let journal_path = temp.path().join("interrupted_chat.jsonl");
 
-        let lines = vec![
+        let lines = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
             r#"{"seq":2,"event":{"type":"toolCall","id":"c_unsettled","call":{"kind":"exec","command":"sleep 100"}}}"#,
             // No ToolResult and No Done event!
@@ -3384,7 +3372,7 @@ mod tests {
 
         // Write legacy journal directly to the standard journals directory
         let journal_path = journals_dir.join("chat_lazy.jsonl");
-        let lines = vec![
+        let lines = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
             r#"{"seq":2,"event":{"type":"userMessage","text":"Hello lazy legacy"}}"#,
             r#"{"seq":3,"event":{"type":"done","status":"completed","result":"ok"}}"#,
@@ -3612,7 +3600,7 @@ mod tests {
         let journal_path = journals_dir.join("chat_unsettled_native.jsonl");
 
         // Legacy prefix with seq 1..2: unmatched ToolCall and no Done event
-        let lines = vec![
+        let lines = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
             r#"{"seq":2,"event":{"type":"toolCall","id":"c_unsettled_pre","call":{"kind":"exec","command":"sleep 100"}}}"#,
         ];
@@ -3697,7 +3685,7 @@ mod tests {
         fs::create_dir_all(&journals_dir).unwrap();
         let journal_path = journals_dir.join("chat_race.jsonl");
 
-        let lines = vec![
+        let lines = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"mock-model","cwd":"/work","sessionId":"s1","assistantMessageId":"m1"}}"#,
             r#"{"seq":2,"event":{"type":"userMessage","text":"Hello live"}}"#,
             r#"{"seq":3,"event":{"type":"done","status":"completed","result":"ok"}}"#,
@@ -3742,7 +3730,7 @@ mod tests {
         fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
 
         // Initial legacy journal with 2 events (no Done yet)
-        let lines1 = vec![
+        let lines1 = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
             r#"{"seq":2,"event":{"type":"userMessage","text":"First line"}}"#,
         ];
@@ -3765,7 +3753,7 @@ mod tests {
         assert_eq!(import_count, 1);
 
         // Now simulate journal file growth on disk (new lines appended, file len/mtime changed)
-        let lines2 = vec![
+        let lines2 = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
             r#"{"seq":2,"event":{"type":"userMessage","text":"First line"}}"#,
             r#"{"seq":3,"event":{"type":"userMessage","text":"Appended line"}}"#,
@@ -3849,7 +3837,7 @@ mod tests {
         let store = TrajectoryStore::open(temp.path()).unwrap();
         let journal_path = temp.path().join("deltas_chat.jsonl");
 
-        let lines = vec![
+        let lines = [
             r#"{"seq":1,"event":{"type":"sessionStarted","harness":"mock","model":"m","cwd":"/","sessionId":"s","assistantMessageId":"m"}}"#,
             r#"{"seq":2,"event":{"type":"userMessage","text":"Explain rust"}}"#,
             r#"{"seq":3,"event":{"type":"reasoningDelta","text":"Thinking about "}}"#,

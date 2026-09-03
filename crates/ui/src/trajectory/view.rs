@@ -55,7 +55,7 @@ pub fn next_watch_params(
 
     let mut params = WatchTrajectoryParams::new(chat_id);
     if let Some(cursor) = model.watermark() {
-        params = params.with_cursor(cursor.clone());
+        params = params.with_cursor(*cursor);
     }
     Some(params)
 }
@@ -427,13 +427,12 @@ impl TrajectoryView {
                 .await;
             let state = map_reveal_result(result);
             let _ = this.update(cx, |view, cx| {
-                if let Some(record) = view.model.selected_record() {
-                    if let Some(active_params) = reveal_params(&chat_id, record, field) {
-                        if active_params == expected_params {
-                            view.model.set_reveal(field, state);
-                            cx.notify();
-                        }
-                    }
+                if let Some(record) = view.model.selected_record()
+                    && let Some(active_params) = reveal_params(&chat_id, record, field)
+                    && active_params == expected_params
+                {
+                    view.model.set_reveal(field, state);
+                    cx.notify();
                 }
             });
         });
@@ -467,14 +466,14 @@ impl Render for TrajectoryView {
         let on_action = {
             let this = this.clone();
             move |action, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.handle_action(action, cx));
+                this.update(cx, |view, cx| view.handle_action(action, cx));
             }
         };
 
         let on_select_tab = {
             let this = this.clone();
             move |tab, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| {
+                this.update(cx, |view, cx| {
                     view.inspector_tab = tab;
                     cx.notify();
                 });
@@ -484,21 +483,21 @@ impl Render for TrajectoryView {
         let on_reveal = {
             let this = this.clone();
             move |field, params, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.start_reveal(field, params, cx));
+                this.update(cx, |view, cx| view.start_reveal(field, params, cx));
             }
         };
 
         let on_clear_reveal = {
             let this = this.clone();
             move |field, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.clear_reveal(field, cx));
+                this.update(cx, |view, cx| view.clear_reveal(field, cx));
             }
         };
 
         let on_back = {
             let this = this.clone();
             move |cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.exit_narrow_detail(cx));
+                this.update(cx, |view, cx| view.exit_narrow_detail(cx));
             }
         };
 
@@ -508,21 +507,21 @@ impl Render for TrajectoryView {
         let on_select_row = {
             let this = this.clone();
             move |row_id: RowId, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.select_row(&row_id, cx));
+                this.update(cx, |view, cx| view.select_row(&row_id, cx));
             }
         };
 
         let on_select_record = {
             let this = this.clone();
             move |record_id: TrajectoryRecordId, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.select_record(&record_id, cx));
+                this.update(cx, |view, cx| view.select_record(&record_id, cx));
             }
         };
 
         let on_toggle_fold = {
             let this = this.clone();
             move |row_id: RowId, cx: &mut App| {
-                let _ = this.update(cx, |view, cx| view.toggle_fold(&row_id, cx));
+                this.update(cx, |view, cx| view.toggle_fold(&row_id, cx));
             }
         };
 
@@ -792,7 +791,7 @@ mod tests {
 
         model.apply_watch_item(TrajectoryWatchItem::Snapshot {
             records: vec![rec],
-            watermark: Some(cursor.clone()),
+            watermark: Some(cursor),
             degraded: Vec::new(),
             has_more: false,
         });

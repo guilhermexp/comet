@@ -507,8 +507,8 @@ fn responsive_right_column_widths(
     details_open: bool,
     requested_details: f32,
 ) -> (f32, f32) {
-    let right = right_open.then_some(requested_right).unwrap_or(0.0);
-    let details = details_open.then_some(requested_details).unwrap_or(0.0);
+    let right = if right_open { requested_right } else { 0.0 };
+    let details = if details_open { requested_details } else { 0.0 };
     let requested_total = right + details;
     let budget =
         (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN - RESPONSIVE_COLUMN_GUTTER).max(0.0);
@@ -8375,10 +8375,11 @@ impl Shell {
     fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let details_now = self
-            .details_sidebar_open(cx)
-            .then(|| self.eval_tween(self.details_tween, self.details_target(cx)))
-            .unwrap_or(0.0);
+        let details_now = if self.details_sidebar_open(cx) {
+            self.eval_tween(self.details_tween, self.details_target(cx))
+        } else {
+            0.0
+        };
         let from_main = conversation_width(self.viewport_width, sidebar_now, from + details_now);
         self.right_pane_expanded = !self.right_pane_expanded;
         let to = self.right_target(cx);

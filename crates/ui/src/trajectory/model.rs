@@ -622,10 +622,10 @@ impl TrajectoryViewModel {
         if record.summary.to_lowercase().contains(&q) {
             return true;
         }
-        if let Some(err) = &record.error_message {
-            if err.to_lowercase().contains(&q) {
-                return true;
-            }
+        if let Some(err) = &record.error_message
+            && err.to_lowercase().contains(&q)
+        {
+            return true;
         }
         if record.lane.as_str().to_lowercase().contains(&q) {
             return true;
@@ -638,10 +638,8 @@ impl TrajectoryViewModel {
                     return true;
                 }
             }
-            TrajectoryRecordKind::Custom { name } => {
-                if name.to_lowercase().contains(&q) {
-                    return true;
-                }
+            TrajectoryRecordKind::Custom { name } if name.to_lowercase().contains(&q) => {
+                return true;
             }
             _ => {}
         }

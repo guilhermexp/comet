@@ -202,10 +202,10 @@ impl BoundedTombstones {
     fn insert(&mut self, chat_id: String) {
         if self.set.insert(chat_id.clone()) {
             self.queue.push_back(chat_id);
-            if self.queue.len() > self.capacity {
-                if let Some(oldest) = self.queue.pop_front() {
-                    self.set.remove(&oldest);
-                }
+            if self.queue.len() > self.capacity
+                && let Some(oldest) = self.queue.pop_front()
+            {
+                self.set.remove(&oldest);
             }
         }
     }

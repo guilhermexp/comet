@@ -415,8 +415,8 @@
     </header>
 
     <div class="kpis" aria-label="Resumo">
-      <div class="kpi"><div class="value">15</div><div class="label">Áreas funcionais inventariadas</div></div>
-      <div class="kpi"><div class="value">2</div><div class="label">Validadas em runtime nesta sessão</div></div>
+      <div class="kpi"><div class="value">16</div><div class="label">Áreas funcionais inventariadas</div></div>
+      <div class="kpi"><div class="value">3</div><div class="label">Validadas em runtime nesta sessão</div></div>
       <div class="kpi"><div class="value">13</div><div class="label">Confirmadas por fonte, sem fluxo completo</div></div>
       <div class="kpi"><div class="value">0</div><div class="label">Bloqueios P0 encontrados</div></div>
     </div>
@@ -640,7 +640,7 @@ flowchart TD
             <tr><td>13</td><td>iOS</td><td>SwiftUI</td><td><span class="status partial">PARCIAL</span></td><td>Projeto e implementação existem; build bloqueado localmente porque só Command Line Tools está ativo, sem Xcode completo.</td></tr>
             <tr><td>14</td><td>Sync multi-device</td><td>Engine / edge</td><td><span class="status partial">PARCIAL</span></td><td>CRDT, relay e e2e smoke documentados; execução atual é demo offline de um único host.</td></tr>
             <tr><td>15</td><td>Auth, edge, R2 e update</td><td>Cloudflare / WorkOS</td><td><span class="status partial">PARCIAL</span></td><td>Rotas e handlers existem; produção e aplicação de update não foram acionadas nesta sessão.</td></tr>
-            <tr><td>16</td><td>Chat Trajectory preview</td><td>Desktop / UI / RPC</td><td><span class="status partial">PARCIAL</span></td><td>Modelo puro, timeline, ledger virtualizado, inspector e view com 39 testes unitários; validação visual em execução headed pendente.</td></tr>
+            <tr><td>16</td><td>Chat Trajectory preview</td><td>Desktop / UI / RPC</td><td><span class="status ok">OK</span></td><td>Modelo puro, timeline, ledger virtualizado, inspector e view com testes unitários por módulo; duas passagens nativas (<code>cargo run -p zeron</code>, perfil real e engine mock) registradas em <code>openspec/changes/archive/2026-09-03-add-chat-trajectory-preview/tasks.md</code>.</td></tr>
           </tbody>
         </table>
       </div></div>
@@ -667,7 +667,7 @@ mindmap
       Terminal PTY — FONTE
       Diff viewer — FONTE
       Anexos — FONTE
-      Trajectory preview — PARCIAL
+      Trajectory preview — OK
     Viewports
       Desktop gpui — PARCIAL
       TUI ratatui — FONTE

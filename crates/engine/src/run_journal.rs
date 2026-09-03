@@ -1006,11 +1006,7 @@ fn extract_raw_payload(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryR
 fn extract_raw_result(event: &AgentEvent, call_id: Option<&str>) -> TrajectoryRawRevealResult {
     match event {
         AgentEvent::ToolResult {
-            id,
-            output,
-            diff,
-            is_error: _,
-            ..
+            id, output, diff, ..
         } => {
             if let Some(expected_id) = call_id
                 && id != expected_id

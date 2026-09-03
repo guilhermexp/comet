@@ -1384,7 +1384,7 @@ mod tests {
 
         // Pre-create a corrupted trajectory.sqlite3 that causes open/migration to fail
         let store_root = profile.store_root();
-        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(store_root).unwrap();
         std::fs::write(
             store_root.join("trajectory.sqlite3"),
             b"CORRUPTED_NON_SQLITE_HEADER",

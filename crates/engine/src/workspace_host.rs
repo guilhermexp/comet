@@ -1075,13 +1075,11 @@ impl WorkspaceHost {
     /// doc remains untouched.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
         let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
-        if deleted {
-            if let Some(traj) = lock(&self.inner.trajectory).clone() {
-                let cid = chat_id.to_string();
-                tokio::spawn(async move {
-                    let _ = traj.delete_chat(&cid).await;
-                });
-            }
+        if deleted && let Some(traj) = lock(&self.inner.trajectory).clone() {
+            let cid = chat_id.to_string();
+            tokio::spawn(async move {
+                let _ = traj.delete_chat(&cid).await;
+            });
         }
         Ok(deleted)
     }
