@@ -1259,9 +1259,9 @@ fn tool_definition() -> Value {
             "required": ["action"],
             "properties": {
                 "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
-                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter. list_presets rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite)." },
+                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter." },
                 "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
-                "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
+                "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Its rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite). Exactly one of preset_id or command." },
                 "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
                 "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker, archive_worker and restart_worker." },
                 "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
