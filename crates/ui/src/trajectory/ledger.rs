@@ -99,6 +99,28 @@ pub fn live_edge_scroll_target(
     }
 }
 
+/// Whether the ledger viewport sits away from the bottom of the list.
+///
+/// Read from the scroll handle rather than from a wheel handler: position is
+/// the actual signal, so this covers wheel, trackpad, drag, and keyboard
+/// scrolling in one place instead of one gesture.
+///
+/// `offset_y` is <= 0 and grows negative downward; `max_offset_y` is the total
+/// scrollable height. The tolerance absorbs the sub-row rounding that a
+/// programmatic `scroll_to_item` leaves behind, so following the live edge is
+/// not mistaken for the user having scrolled away from it.
+pub fn is_away_from_live_edge(
+    offset_y: gpui::Pixels,
+    max_offset_y: gpui::Pixels,
+    tolerance: gpui::Pixels,
+) -> bool {
+    if max_offset_y <= gpui::px(0.0) {
+        // Nothing to scroll: the whole list fits, so the live edge is visible.
+        return false;
+    }
+    -offset_y < max_offset_y - tolerance
+}
+
 /// Render the virtualized ledger list using GPUI's uniform_list.
 pub fn render_ledger<S, F>(
     model: &TrajectoryViewModel,
@@ -188,7 +210,14 @@ where
         });
 
     if is_selected {
-        row_div = row_div.bg(theme.element_active);
+        // Accent wash, not a neutral one. In light appearance the neutral
+        // candidates land at 1.13:1 (`glass_selected_bg`) and 1.16:1
+        // (`element_active`) against the white ledger background — measured in
+        // the native light pass, and in a list this dense that is not enough to
+        // tell which row the inspector is describing. The accent wash carries a
+        // hue shift on top of the luminance step, so selection survives both
+        // appearances.
+        row_div = row_div.bg(theme.accent_wash);
     } else {
         row_div = row_div.hover(|s| s.bg(theme.element_hover));
     }
@@ -451,5 +480,36 @@ mod tests {
         model.set_following_live(false);
         assert!(!should_follow_live_edge(&model));
         assert_eq!(live_edge_scroll_target(&rows, false, viewport), None);
+    }
+
+    /// The gap the native pass exposed: `following_live` never went false, so
+    /// an arriving record kept yanking the viewport and the toolbar never
+    /// offered a way back. Scroll position is the signal.
+    #[test]
+    fn test_trajectory_ledger_away_from_live_edge_detection() {
+        let row = gpui::px(28.0);
+        let tolerance = row * 2.0;
+
+        // Parked at the bottom: offset consumes the whole scrollable height.
+        assert!(!is_away_from_live_edge(-row * 20.0, row * 20.0, tolerance));
+
+        // Sub-row rounding left behind by a programmatic scroll_to_item must
+        // NOT read as the user having scrolled away.
+        assert!(!is_away_from_live_edge(
+            -row * 20.0 + gpui::px(9.0),
+            row * 20.0,
+            tolerance
+        ));
+
+        // Scrolled back by more than the tolerance: away from the live edge.
+        assert!(is_away_from_live_edge(-row * 15.0, row * 20.0, tolerance));
+
+        // A list shorter than the viewport has no scroll range; the live edge
+        // is on screen by construction and must never suspend following.
+        assert!(!is_away_from_live_edge(
+            gpui::px(0.0),
+            gpui::px(0.0),
+            tolerance
+        ));
     }
 }

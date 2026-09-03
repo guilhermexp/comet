@@ -28,9 +28,9 @@ fn knob_with(umbrella: Option<&str>, value: Option<String>) -> Option<String> {
 use chrono::Utc;
 use gpui::Context;
 use zeron_proto::trajectory::{
-    TrajectoryLane, TrajectoryPayloadPreview, TrajectoryRawField, TrajectoryRawRef,
-    TrajectoryRecord, TrajectoryRecordId, TrajectoryRecordKind, TrajectoryResultPreview,
-    TrajectoryStatus, TrajectoryTiming,
+    TrajectoryDegradedInterval, TrajectoryLane, TrajectoryPayloadPreview, TrajectoryRawField,
+    TrajectoryRawRef, TrajectoryRecord, TrajectoryRecordId, TrajectoryRecordKind,
+    TrajectoryResultPreview, TrajectoryStatus, TrajectoryTiming,
 };
 use zeron_rpc::{TrajectoryCursor, TrajectoryUnavailableReason, TrajectoryWatchItem};
 
@@ -47,6 +47,10 @@ pub enum TrajectoryCaptureFixture {
     ToolError,
     RawSanitizedVsUnavailable,
     NarrowDetail,
+    LivePartial,
+    DegradedStorage,
+    MultiChat,
+    ThemeStates,
 }
 
 pub fn trajectory_fixture_from_str(s: &str) -> Option<TrajectoryCaptureFixture> {
@@ -65,6 +69,12 @@ pub fn trajectory_fixture_from_str(s: &str) -> Option<TrajectoryCaptureFixture> 
         "narrow" | "narrow-detail" | "narrow_detail" => {
             Some(TrajectoryCaptureFixture::NarrowDetail)
         }
+        "live-partial" | "live_partial" | "partial" => Some(TrajectoryCaptureFixture::LivePartial),
+        "degraded" | "degraded-storage" | "degraded_storage" => {
+            Some(TrajectoryCaptureFixture::DegradedStorage)
+        }
+        "multi-chat" | "multi_chat" => Some(TrajectoryCaptureFixture::MultiChat),
+        "theme" | "theme-states" | "theme_states" => Some(TrajectoryCaptureFixture::ThemeStates),
         _ => None,
     }
 }
@@ -637,6 +647,364 @@ pub fn apply_trajectory_fixture(
             });
             Some(selected_id)
         }
+        TrajectoryCaptureFixture::LivePartial => {
+            let now = Utc::now();
+            let rec1 = make_fixture_record(
+                chat_id,
+                "run_live",
+                1,
+                0,
+                TrajectoryLane::Input,
+                TrajectoryRecordKind::UserMessage,
+                TrajectoryStatus::Completed,
+                "Live User Prompt",
+                "Stream the token response",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(10)),
+                    Some(now - chrono::Duration::seconds(9)),
+                    Some(1000),
+                    None,
+                )),
+            );
+            let mut rec2_partial = make_fixture_record(
+                chat_id,
+                "run_live",
+                2,
+                0,
+                TrajectoryLane::Model,
+                TrajectoryRecordKind::AssistantMessage,
+                TrajectoryStatus::Running,
+                "Assistant (streaming)",
+                "Generating partial response...",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(8)),
+                    None,
+                    None,
+                    None,
+                )),
+            );
+            rec2_partial.is_partial = true;
+            rec2_partial.payload = Some(TrajectoryPayloadPreview {
+                summary: "Generating partial response...".into(),
+                sanitized_text: Some("Partial tokens received so far...".into()),
+                schema_info: None,
+                raw_ref: None,
+            });
+
+            let mut rec2_final = make_fixture_record(
+                chat_id,
+                "run_live",
+                2,
+                0,
+                TrajectoryLane::Model,
+                TrajectoryRecordKind::AssistantMessage,
+                TrajectoryStatus::Completed,
+                "Assistant Response",
+                "Completed streamed response",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(8)),
+                    Some(now - chrono::Duration::seconds(5)),
+                    Some(3000),
+                    Some(200),
+                )),
+            );
+            rec2_final.is_partial = false;
+            rec2_final.result = Some(TrajectoryResultPreview {
+                summary: "Stream completed".into(),
+                sanitized_text: Some("Full streamed response text.".into()),
+                is_error: false,
+                exit_code: Some(0),
+                raw_ref: None,
+            });
+
+            let selected_id = rec2_final.id.clone();
+            model.apply_watch_item(TrajectoryWatchItem::Snapshot {
+                records: vec![rec1, rec2_partial],
+                watermark: Some(TrajectoryCursor::new(2, 0)),
+                degraded: vec![],
+                has_more: false,
+            });
+            model.apply_watch_item(TrajectoryWatchItem::Deltas {
+                records: vec![rec2_final],
+                watermark: Some(TrajectoryCursor::new(2, 0)),
+            });
+            Some(selected_id)
+        }
+        TrajectoryCaptureFixture::DegradedStorage => {
+            let now = Utc::now();
+            let rec1 = make_fixture_record(
+                chat_id,
+                "run_deg",
+                1,
+                0,
+                TrajectoryLane::Input,
+                TrajectoryRecordKind::UserMessage,
+                TrajectoryStatus::Completed,
+                "User Prompt",
+                "Generate full architectural report",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(30)),
+                    Some(now - chrono::Duration::seconds(29)),
+                    Some(1000),
+                    None,
+                )),
+            );
+            let mut rec2 = make_fixture_record(
+                chat_id,
+                "run_deg",
+                6,
+                0,
+                TrajectoryLane::Model,
+                TrajectoryRecordKind::AssistantMessage,
+                TrajectoryStatus::Completed,
+                "Assistant Response",
+                "Here is the final summary report after degraded processing steps...",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(10)),
+                    Some(now - chrono::Duration::seconds(5)),
+                    Some(5000),
+                    Some(200),
+                )),
+            );
+            rec2.is_degraded = true;
+
+            let degraded_interval = TrajectoryDegradedInterval {
+                chat_id: chat_id.to_string(),
+                run_id: "run_deg".to_string(),
+                from_seq: 2,
+                to_seq: 5,
+                reason: "Storage gap: journal events seq 2..=5 pruned during retention pass"
+                    .to_string(),
+                recorded_at: now - chrono::Duration::seconds(20),
+            };
+
+            let selected_id = rec1.id.clone();
+            let records = vec![rec1, rec2];
+            model.apply_watch_item(TrajectoryWatchItem::Snapshot {
+                records,
+                watermark: Some(TrajectoryCursor::new(6, 0)),
+                degraded: vec![degraded_interval],
+                has_more: false,
+            });
+            Some(selected_id)
+        }
+        TrajectoryCaptureFixture::MultiChat => {
+            let now = Utc::now();
+            let run_id = format!("run_{chat_id}");
+            let rec1 = make_fixture_record(
+                chat_id,
+                &run_id,
+                1,
+                0,
+                TrajectoryLane::Input,
+                TrajectoryRecordKind::UserMessage,
+                TrajectoryStatus::Completed,
+                "Chat Prompt",
+                &format!("Task in {chat_id}"),
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(15)),
+                    Some(now - chrono::Duration::seconds(14)),
+                    Some(1000),
+                    None,
+                )),
+            );
+            let mut rec2 = make_fixture_record(
+                chat_id,
+                &run_id,
+                2,
+                0,
+                TrajectoryLane::Tools,
+                TrajectoryRecordKind::ToolCall {
+                    tool_name: "run_query".into(),
+                },
+                TrajectoryStatus::Completed,
+                "run_query",
+                &format!("run_query(target: \"{chat_id}\")"),
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(12)),
+                    Some(now - chrono::Duration::seconds(11)),
+                    Some(1000),
+                    None,
+                )),
+            );
+            rec2.call_id = Some(format!("call_{chat_id}_1"));
+            let mut rec3 = make_fixture_record(
+                chat_id,
+                &run_id,
+                2,
+                1,
+                TrajectoryLane::Tools,
+                TrajectoryRecordKind::ToolResult {
+                    tool_name: "run_query".into(),
+                },
+                TrajectoryStatus::Completed,
+                "run_query result",
+                &format!("Result for {chat_id}"),
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(11)),
+                    Some(now - chrono::Duration::seconds(10)),
+                    Some(1000),
+                    None,
+                )),
+            );
+            rec3.call_id = Some(format!("call_{chat_id}_1"));
+            let rec4 = make_fixture_record(
+                chat_id,
+                &run_id,
+                3,
+                0,
+                TrajectoryLane::Model,
+                TrajectoryRecordKind::AssistantMessage,
+                TrajectoryStatus::Completed,
+                "Chat Response",
+                &format!("Completed task in {chat_id}"),
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(8)),
+                    Some(now - chrono::Duration::seconds(5)),
+                    Some(3000),
+                    Some(100),
+                )),
+            );
+
+            let selected_id = rec2.id.clone();
+            let records = vec![rec1, rec2, rec3, rec4];
+            model.apply_watch_item(TrajectoryWatchItem::Snapshot {
+                records,
+                watermark: Some(TrajectoryCursor::new(3, 0)),
+                degraded: vec![],
+                has_more: false,
+            });
+            Some(selected_id)
+        }
+        TrajectoryCaptureFixture::ThemeStates => {
+            let now = Utc::now();
+            let rec1 = make_fixture_record(
+                chat_id,
+                "run_theme",
+                1,
+                0,
+                TrajectoryLane::Input,
+                TrajectoryRecordKind::UserMessage,
+                TrajectoryStatus::Completed,
+                "Theme Audit Prompt",
+                "Theme visual state verification prompt",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(20)),
+                    Some(now - chrono::Duration::seconds(19)),
+                    Some(1000),
+                    None,
+                )),
+            );
+
+            let mut rec2_selected = make_fixture_record(
+                chat_id,
+                "run_theme",
+                2,
+                0,
+                TrajectoryLane::Tools,
+                TrajectoryRecordKind::ToolCall {
+                    tool_name: "inspect_theme".into(),
+                },
+                TrajectoryStatus::Completed,
+                "inspect_theme",
+                "inspect_theme(tokens: [selection, error, unavailable, unsettled, dimmed])",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(18)),
+                    Some(now - chrono::Duration::seconds(16)),
+                    Some(2000),
+                    None,
+                )),
+            );
+            rec2_selected.call_id = Some("call_theme_1".into());
+            rec2_selected.payload = Some(TrajectoryPayloadPreview {
+                summary: "inspect_theme tokens".into(),
+                sanitized_text: Some("{\"audit\": \"theme_states\"}".into()),
+                schema_info: Some("ThemeAuditParams".into()),
+                raw_ref: Some(TrajectoryRawRef::new(
+                    chat_id,
+                    2,
+                    None,
+                    Some("call_theme_1".into()),
+                    TrajectoryRawField::Payload,
+                )),
+            });
+
+            let mut rec3_error = make_fixture_record(
+                chat_id,
+                "run_theme",
+                2,
+                1,
+                TrajectoryLane::Tools,
+                TrajectoryRecordKind::ToolResult {
+                    tool_name: "render_palette".into(),
+                },
+                TrajectoryStatus::Error,
+                "render_palette error",
+                "Error 500: simulated error state for visual audit",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(16)),
+                    Some(now - chrono::Duration::seconds(15)),
+                    Some(1000),
+                    None,
+                )),
+            );
+            rec3_error.call_id = Some("call_theme_1".into());
+            rec3_error.result = Some(TrajectoryResultPreview {
+                summary: "Simulated error".into(),
+                sanitized_text: Some("Error: failed to render palette".into()),
+                is_error: true,
+                exit_code: Some(1),
+                raw_ref: Some(TrajectoryRawRef::new(
+                    chat_id,
+                    2,
+                    None,
+                    Some("call_theme_1".into()),
+                    TrajectoryRawField::Result,
+                )),
+            });
+            rec3_error.error_message = Some("Visual error token validation".into());
+
+            let mut rec4_unsettled = make_fixture_record(
+                chat_id,
+                "run_theme",
+                3,
+                0,
+                TrajectoryLane::Model,
+                TrajectoryRecordKind::Reasoning,
+                TrajectoryStatus::Unsettled,
+                "reconcile_state",
+                "In-flight reasoning step awaiting convergence",
+                Some(TrajectoryTiming::recorded(
+                    Some(now - chrono::Duration::seconds(14)),
+                    None,
+                    None,
+                    None,
+                )),
+            );
+            rec4_unsettled.payload = None;
+
+            let selected_id = rec2_selected.id.clone();
+            let records = vec![rec1, rec2_selected, rec3_error, rec4_unsettled];
+            model.apply_watch_item(TrajectoryWatchItem::Snapshot {
+                records,
+                watermark: Some(TrajectoryCursor::new(3, 0)),
+                degraded: vec![],
+                has_more: false,
+            });
+            model.select_record(&selected_id);
+            model.set_reveal(
+                TrajectoryRawField::Payload,
+                RevealState::Revealed(
+                    "{\"audit\": \"theme_states\", \"status\": \"revealed_ok\"}".into(),
+                ),
+            );
+            model.set_reveal(
+                TrajectoryRawField::Result,
+                RevealState::Unavailable(TrajectoryUnavailableReason::StoreUnavailable),
+            );
+            model.set_search("inspect_theme");
+            Some(selected_id)
+        }
     }
 }
 
@@ -651,7 +1019,10 @@ pub fn seed_trajectory_fixture(
     if let Some(id) = &selected_id {
         view.select_record(id, cx);
     }
-    if fixture == TrajectoryCaptureFixture::RawSanitizedVsUnavailable {
+    if matches!(
+        fixture,
+        TrajectoryCaptureFixture::RawSanitizedVsUnavailable | TrajectoryCaptureFixture::ThemeStates
+    ) {
         view.model_mut().set_reveal(
             TrajectoryRawField::Payload,
             RevealState::Revealed(
@@ -662,6 +1033,9 @@ pub fn seed_trajectory_fixture(
             TrajectoryRawField::Result,
             RevealState::Unavailable(TrajectoryUnavailableReason::StoreUnavailable),
         );
+    }
+    if fixture == TrajectoryCaptureFixture::ThemeStates {
+        view.model_mut().set_search("inspect_theme");
     }
 }
 
@@ -711,6 +1085,14 @@ mod tests {
             "tool-error",
             "raw-sanitized",
             "narrow",
+            "live-partial",
+            "live_partial",
+            "degraded",
+            "degraded-storage",
+            "multi-chat",
+            "multi_chat",
+            "theme",
+            "theme-states",
         ] {
             assert_eq!(
                 trajectory_fixture_with(None, Some(value.to_string())),
@@ -842,5 +1224,202 @@ mod tests {
         );
         assert!(selected.is_some());
         assert_eq!(model.rows().len(), 7);
+    }
+
+    #[test]
+    fn test_trajectory_capture_live_partial_replacement() {
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("live-partial".to_string())),
+            Some(TrajectoryCaptureFixture::LivePartial)
+        );
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("live_partial".to_string())),
+            Some(TrajectoryCaptureFixture::LivePartial)
+        );
+        let mut model = TrajectoryViewModel::new("chat-test-live");
+        let selected = apply_trajectory_fixture(
+            &mut model,
+            "chat-test-live",
+            TrajectoryCaptureFixture::LivePartial,
+        );
+        assert!(selected.is_some());
+        let sel_id = selected.unwrap();
+        let rec = model.record(&sel_id).expect("record exists");
+        assert!(!rec.is_partial);
+        assert_eq!(rec.status, TrajectoryStatus::Completed);
+        assert_eq!(rec.summary, "Completed streamed response");
+
+        // Prove replacement instead of duplication: exactly 1 event row for this record ID
+        let event_rows: Vec<_> = model
+            .rows()
+            .iter()
+            .filter(|r| r.record.as_ref() == Some(&sel_id))
+            .collect();
+        assert_eq!(event_rows.len(), 1);
+        assert_eq!(event_rows[0].label, "Assistant Response");
+        assert_eq!(event_rows[0].status, Some(TrajectoryStatus::Completed));
+    }
+
+    #[test]
+    fn test_trajectory_capture_degraded_storage() {
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("degraded".to_string())),
+            Some(TrajectoryCaptureFixture::DegradedStorage)
+        );
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("degraded-storage".to_string())),
+            Some(TrajectoryCaptureFixture::DegradedStorage)
+        );
+        let mut model = TrajectoryViewModel::new("chat-test-degraded");
+        let selected = apply_trajectory_fixture(
+            &mut model,
+            "chat-test-degraded",
+            TrajectoryCaptureFixture::DegradedStorage,
+        );
+        assert!(selected.is_some());
+        assert_eq!(
+            model.status(),
+            &crate::trajectory::model::TrajectoryViewStatus::Degraded
+        );
+        assert_eq!(model.degraded_intervals().len(), 1);
+        let interval = &model.degraded_intervals()[0];
+        assert_eq!(interval.from_seq, 2);
+        assert_eq!(interval.to_seq, 5);
+        assert!(interval.reason.contains("Storage gap"));
+
+        // Records show explicit gap between seq 1 and seq 6
+        assert!(
+            model
+                .record(&TrajectoryRecordId::new("run_deg", 1, 0))
+                .is_some()
+        );
+        assert!(
+            model
+                .record(&TrajectoryRecordId::new("run_deg", 6, 0))
+                .is_some()
+        );
+        assert!(
+            model
+                .record(&TrajectoryRecordId::new("run_deg", 2, 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_trajectory_capture_multi_chat_isolation() {
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("multi-chat".to_string())),
+            Some(TrajectoryCaptureFixture::MultiChat)
+        );
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("multi_chat".to_string())),
+            Some(TrajectoryCaptureFixture::MultiChat)
+        );
+        let mut model_a = TrajectoryViewModel::new("chat-alpha");
+        let mut model_b = TrajectoryViewModel::new("chat-beta");
+
+        let sel_a = apply_trajectory_fixture(
+            &mut model_a,
+            "chat-alpha",
+            TrajectoryCaptureFixture::MultiChat,
+        );
+        let sel_b = apply_trajectory_fixture(
+            &mut model_b,
+            "chat-beta",
+            TrajectoryCaptureFixture::MultiChat,
+        );
+
+        assert!(sel_a.is_some());
+        assert!(sel_b.is_some());
+        assert_eq!(sel_a.unwrap().run_id, "run_chat-alpha");
+        assert_eq!(sel_b.unwrap().run_id, "run_chat-beta");
+
+        assert_eq!(model_a.chat_id(), "chat-alpha");
+        assert_eq!(model_b.chat_id(), "chat-beta");
+
+        for row in model_a.rows() {
+            if let Some(record_id) = &row.record {
+                let rec = model_a.record(record_id).expect("record in model A");
+                assert_eq!(rec.chat_id, "chat-alpha");
+                assert!(model_b.record(record_id).is_none());
+            }
+        }
+
+        for row in model_b.rows() {
+            if let Some(record_id) = &row.record {
+                let rec = model_b.record(record_id).expect("record in model B");
+                assert_eq!(rec.chat_id, "chat-beta");
+                assert!(model_a.record(record_id).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_trajectory_capture_theme_states() {
+        use crate::trajectory::{SummaryValue, summary_fields};
+
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("theme".to_string())),
+            Some(TrajectoryCaptureFixture::ThemeStates)
+        );
+        assert_eq!(
+            trajectory_fixture_with(Some("1"), Some("theme-states".to_string())),
+            Some(TrajectoryCaptureFixture::ThemeStates)
+        );
+
+        let mut model = TrajectoryViewModel::new("chat-test-theme");
+        let selected = apply_trajectory_fixture(
+            &mut model,
+            "chat-test-theme",
+            TrajectoryCaptureFixture::ThemeStates,
+        );
+        assert!(selected.is_some());
+        let sel_id = selected.unwrap();
+
+        // 1. Error row
+        let error_row = model
+            .rows()
+            .iter()
+            .find(|r| r.is_error && r.status == Some(TrajectoryStatus::Error));
+        assert!(error_row.is_some(), "error row must be present");
+
+        // 2. Selected row
+        assert_eq!(
+            model.selected_row(),
+            Some(&crate::trajectory::RowId::from_record_id(&sel_id))
+        );
+        let sel_rec = model.selected_record().expect("selected record exists");
+
+        // 3. Unavailable value
+        assert!(matches!(
+            model.reveal_state(TrajectoryRawField::Result),
+            RevealState::Unavailable(_)
+        ));
+        let sel_summary = summary_fields(sel_rec);
+        assert!(
+            sel_summary
+                .iter()
+                .any(|f| matches!(f.value, SummaryValue::Unavailable)),
+            "selected record must have Unavailable summary fields (e.g. usage/tokens/error)"
+        );
+
+        // 4. Unsettled value
+        let unsettled_rec = model
+            .record(&TrajectoryRecordId::new("run_theme", 3, 0))
+            .expect("unsettled record exists");
+        assert_eq!(unsettled_rec.status, TrajectoryStatus::Unsettled);
+        let unsettled_summary = summary_fields(unsettled_rec);
+        assert!(
+            unsettled_summary
+                .iter()
+                .any(|f| matches!(f.value, SummaryValue::Unsettled)),
+            "unsettled record must produce Unsettled summary value"
+        );
+
+        // 5. Dimmed span / row from search filtering
+        let dimmed_rows: Vec<_> = model.rows().iter().filter(|r| r.dimmed).collect();
+        let non_dimmed_rows: Vec<_> = model.rows().iter().filter(|r| !r.dimmed).collect();
+        assert!(!dimmed_rows.is_empty(), "dimmed rows must exist");
+        assert!(!non_dimmed_rows.is_empty(), "non-dimmed rows must exist");
     }
 }

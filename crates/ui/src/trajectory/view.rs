@@ -23,7 +23,7 @@ use crate::{
     theme::Theme,
     trajectory::{
         inspector::{InspectorTab, TrajectoryLayout, layout_mode, render_inspector, reveal_params},
-        ledger::{render_ledger, should_follow_live_edge},
+        ledger::{ROW_HEIGHT, is_away_from_live_edge, render_ledger, should_follow_live_edge},
         model::{RevealState, RowId, TrajectoryViewModel, TrajectoryViewStatus},
         timeline::render_timeline,
         toolbar::{ToolbarAction, handle_toolbar_action, render_toolbar},
@@ -471,6 +471,34 @@ impl Render for TrajectoryView {
                 let _ = this.update(cx, |view, cx| view.toggle_fold(&row_id, cx));
             }
         };
+
+        // Reading back through history suspends live following, so an arriving
+        // record cannot yank the viewport off what the user is reading. The
+        // model then stops moving the anchor and starts counting pending rows,
+        // which is what makes the toolbar offer "Follow Live" — the only way
+        // back, never re-armed silently here.
+        if self.model.following_live() {
+            let scroll = {
+                let state = self.scroll_handle.0.borrow();
+                // A queued `scroll_to_item` has not been applied yet, so the
+                // offset still describes where the list WAS. Judging position
+                // now reads our own catch-up jump as the user scrolling away
+                // and suspends following one frame after it was restored.
+                if state.deferred_scroll_to_item.is_some() {
+                    None
+                } else {
+                    Some((
+                        state.base_handle.offset().y,
+                        state.base_handle.max_offset().y,
+                    ))
+                }
+            };
+            if let Some((offset_y, max_offset_y)) = scroll {
+                if is_away_from_live_edge(offset_y, max_offset_y, ROW_HEIGHT * 2.0) {
+                    self.model.set_following_live(false);
+                }
+            }
+        }
 
         let is_empty = self.model.rows().is_empty();
         let status = self.model.status().clone();

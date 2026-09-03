@@ -22,12 +22,15 @@ Dona da projeção e apresentação visual do fluxo de trajetória (`TrajectoryV
 - **Layout responsivo com breakpoint `TRAJECTORY_SPLIT_THRESHOLD` (`px(600.0)`)**: contêineres $\ge 600\text{px}$ renderizam `TrajectoryLayout::Split` (ledger e inspector em colunas lado a lado); contêineres $< 600\text{px}$ alternam para `TrajectoryLayout::NarrowDetail` (visão exclusiva do inspector com botão de retorno).
 - **Busca por texto aplica dimming sem filtrar linhas**: itens não correspondentes recebem `dimmed: true`, mantendo a continuidade e o contexto estrutural/cronológico intactos no ledger.
 - **Folds independentes para Turns e Calls**: colapso de turnos e chamadas de ferramentas operam de forma desacoplada; overrides manuais do usuário por linha (`fold_overrides`) têm precedência sobre os toggles globais da toolbar.
-- **Seguimento de live-edge com contagem de pendências**: quando o usuário rola para trás, o seguimento automático pausa e novos registros incrementam `pending_live`; o botão "Follow live" ou a rolagem até o final restabelece o ancoramento na borda viva.
+- **Seguimento de live-edge com contagem de pendências**: quando o usuário rola para trás, o seguimento automático pausa e novos registros incrementam `pending_live`. O rearme é **só** a ação explícita "Follow Live" na toolbar — rolar de volta até o fim não rearma sozinho, porque um rearme implícito voltaria a arrastar o viewport de quem só estava conferindo o fim da lista.
+- **A suspensão do live-edge é derivada da posição do scroll, não de um gesto**: `is_away_from_live_edge` compara `offset`/`max_offset` do `UniformListScrollHandle` (tolerância de 2 linhas para absorver arredondamento), o que cobre roda, trackpad, arraste e teclado num único ponto. A checagem é **ignorada** enquanto `deferred_scroll_to_item` está pendente: nesse frame o offset ainda descreve onde a lista *estava*, e julgar a posição ali faz o próprio salto de catch-up parecer rolagem do usuário.
+- **A linha selecionada do ledger usa `theme.accent_wash`, não um token neutro**: no tema claro os neutros (`element_active` 1.16:1, `glass_selected_bg` 1.13:1) somem contra o fundo branco numa lista tão densa; o wash de accent carrega deslocamento de matiz além do de luminância e sobrevive aos dois temas.
 
 ## Work Guidance
 
 - Toda lógica de projeção, geometria, hit-testing, resolução de scroll e transição de estados deve residir em funções puras com cobertura de testes unitários em seus respectivos módulos (`model.rs`, `timeline.rs`, `ledger.rs`, `inspector.rs`, `toolbar.rs`, `view.rs`).
 - Componentes GPUI de render (`render_timeline`, `render_ledger`, `render_inspector`, `render_toolbar`, `TrajectoryView::render`) não possuem harness de teste automatizado headless; sua validação é visual via `scripts/dev-demo.sh` ou execução headed no app real.
+- Função pura testada **não** é feature entregue: as duas passagens nativas encontraram cinco defeitos que a suíte não pegava — ledger e timeline sem `on_click`, callback capturando `cx.to_async()` e abortando com `RefCell already borrowed`, id estourando o painel, seleção invisível no tema claro, e `set_following_live(false)` sem nenhum chamador de produção. Ao mexer aqui, rodar o app de verdade e clicar no que mudou.
 - Todo elemento interativo com foco deve manter `.id()`, `.role()` e `aria_label` adequados.
 
 ## Verification
