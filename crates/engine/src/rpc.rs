@@ -44,9 +44,9 @@
 //! the [`LinkCache`] — the remote engine sees its own id and handles locally, so the
 //! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
 //! piping items. To make another method device-addressable, nothing per-method is needed
-//! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
-//! handlers stay transport-agnostic. Currently routed: `ListHarnesses`, `ListModels`,
-//! `QueueCommand`, and `WatchDocMessages`.
+//! beyond `forwardable: true` (and `stream: true` if it streams) on its entry in
+//! `zeron_rpc::method::rpc_methods!`; handlers stay transport-agnostic. Currently
+//! routed: `ListHarnesses`, `ListModels`, `QueueCommand`, and `WatchDocMessages`.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -63,7 +63,8 @@ use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
 use zeron_rpc::{
     LinkCache, RevealTrajectoryRawParams, RpcError, RpcReply, RpcService, TrajectoryCursor,
     TrajectoryRawField, TrajectoryRawRevealResult, TrajectoryTerminalReason,
-    TrajectoryUnavailableReason, TrajectoryWatchItem, WatchTrajectoryParams, methods, parse_params,
+    TrajectoryUnavailableReason, TrajectoryWatchItem, WatchTrajectoryParams, info, methods,
+    parse_params,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -753,13 +754,16 @@ impl EngineRpc {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcReply, RpcError> {
+        let Some(info) = info(method) else {
+            return Err(RpcError::UnknownMethod(method.to_string()));
+        };
         let Some(links) = &self.links else {
             return Err(RpcError::Failed(format!(
                 "cannot reach device {target}: remote routing unavailable (offline)"
             )));
         };
         let client = links.client(target).await?;
-        if is_stream_method(method) {
+        if info.stream {
             // Streams are unbounded by design (a quiet WATCH_* is healthy);
             // only unary calls below get the reply deadline.
             if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
@@ -794,7 +798,7 @@ impl EngineRpc {
             });
             return Ok(RpcReply::Stream(stream.boxed()));
         }
-        let deadline = forward_deadline(method);
+        let deadline = info.deadline;
         match tokio::time::timeout(deadline, client.call(method, params)).await {
             Ok(Ok(value)) => Ok(RpcReply::Value(value)),
             Ok(Err(err)) => {
@@ -941,101 +945,10 @@ impl EngineRpc {
     }
 }
 
-/// Reply deadline for a relay-forwarded unary call. The relay is WebSocket
-/// frames through a DO: a dropped frame (host socket replaced mid-call, DO
-/// restart) loses the reply SILENTLY — the DO's auto-pong keeps the client
-/// socket looking healthy — and an unbounded await wedged callers forever
-/// (the composer's permanent "Sending…", 2026-08-18). Network-bound git and
-/// update methods get a long leash; worktree creation checks out a full tree;
-/// everything else is interactive and must fail fast.
-fn forward_deadline(method: &str) -> std::time::Duration {
-    use std::time::Duration;
-    match method {
-        methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
-            Duration::from_secs(15 * 60)
-        }
-        methods::CREATE_WORKTREE => Duration::from_secs(120),
-        methods::FETCH_TOOL_INPUT => Duration::from_secs(20),
-        _ => Duration::from_secs(30),
-    }
-}
-
 /// An RPC rejection is scoped to the requested capability. Only a broken
 /// transport means the shared device link itself cannot carry other calls.
 fn should_invalidate_link(error: &RpcError) -> bool {
     matches!(error, RpcError::Closed | RpcError::Transport(_))
-}
-
-/// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
-/// list (plus [`is_stream_method`] for streams) to make more of the surface
-/// device-addressable — the handlers themselves need no changes.
-fn forwardable(method: &str) -> bool {
-    matches!(
-        method,
-        methods::LIST_HARNESSES
-            | methods::SET_HARNESS_ENABLED
-            | methods::LIST_MODELS
-            | methods::LIST_COMMANDS
-            | methods::QUEUE_COMMAND
-            | methods::QUEUE_WORKER_NOTIFICATION
-            | methods::WATCH_DOC_MESSAGES
-            // Repos/worktrees/folders are device-local filesystem state.
-            | methods::LIST_REPOS
-            | methods::ADD_REPO
-            | methods::CLONE_REPO
-            | methods::CREATE_REPO
-            | methods::LIST_BRANCHES
-            | methods::LIST_REFS
-            | methods::LIST_GIT_HISTORY
-            | methods::FETCH_ALL
-            | methods::SWITCH_REF
-            | methods::LIST_FOLDERS
-            | methods::LIST_DRIVES
-            | methods::SEARCH_FILES
-            | methods::CREATE_WORKTREE
-            | methods::DELETE_WORKTREE
-            // Checkout diffs are produced on the device holding the checkout.
-            | methods::WATCH_CHECKOUT_DIFFS
-            | methods::WATCH_CHECKOUT_CHANGE_REQUEST
-            | methods::GET_CHECKOUT_DIFF
-            | methods::GET_CHECKOUT_FILE_DIFF_TEXT
-            // Terminals live on the chat's host device.
-            | methods::OPEN_TERMINAL
-            | methods::SUBSCRIBE_TERMINAL
-            | methods::WRITE_TERMINAL
-            | methods::RESIZE_TERMINAL
-            | methods::CLOSE_TERMINAL
-            // Agent accounts are per-device CLI logins (the device switcher
-            // retargets which device's logins are shown).
-            | methods::LIST_AGENT_ACCOUNTS
-            | methods::ACTIVATE_AGENT_ACCOUNT
-            | methods::FORGET_AGENT_ACCOUNT
-            | methods::START_AGENT_LOGIN
-            | methods::COMPLETE_AGENT_LOGIN
-            | methods::POLL_AGENT_LOGIN
-            | methods::CANCEL_AGENT_LOGIN
-            // Uploads/attachments target the chat's host device (the agent reads
-            // the committed file from that device's disk).
-            | methods::UPLOAD_CHUNK
-            | methods::UPLOAD_COMMIT
-            | methods::READ_ATTACHMENT_CHUNK
-            | methods::FETCH_TOOL_INPUT
-            // Updates report/apply on the device whose binary they concern.
-            | methods::UPDATE_STATUS
-            | methods::APPLY_UPDATE
-    )
-}
-
-/// Forwardable methods whose reply is a stream (proxied item-by-item).
-fn is_stream_method(method: &str) -> bool {
-    matches!(
-        method,
-        methods::WATCH_DOC_MESSAGES
-            | methods::SUBSCRIBE_TERMINAL
-            | methods::WATCH_CHECKOUT_DIFFS
-            | methods::WATCH_CHECKOUT_CHANGE_REQUEST
-            | methods::UPDATE_STATUS
-    )
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1393,6 +1306,12 @@ impl AuthRpc {
         Self { auth }
     }
 
+    /// Which methods this SERVICE answers — routing between `AuthRpc` and
+    /// `EngineRpc`, not an attribute of the method. It stays a list here
+    /// (rather than moving into `zeron_rpc::method`) because the registry
+    /// describes the wire contract of a method, while this describes which
+    /// half of the engine is allowed to serve it before identity-scoped
+    /// stores exist.
     pub fn handles(method: &str) -> bool {
         matches!(
             method,
@@ -1494,7 +1413,7 @@ impl RpcService for EngineRpc {
 
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
-        if forwardable(method)
+        if info(method).is_some_and(|i| i.forwardable)
             && let Some(target) = params.get("targetDeviceId").and_then(|v| v.as_str())
             && target != self.doc_host.device_id()
         {
@@ -1784,10 +1703,8 @@ impl RpcService for EngineRpc {
                     .filter_map(|status| async move { serde_json::to_value(status).ok() });
                 Ok(RpcReply::Stream(stream.boxed()))
             }
-            // One-shot scoped capture for the Changes pane: `branch` diffs the
-            // working tree against merge-base(baseRef, HEAD); `turn` diffs the
-            // turn-start tree snapshot against the current tree; anything else
-            // is the plain working-tree capture.
+            // One-shot scoped capture for the Changes pane; the scopes live in
+            // `diff_sync::DiffMode`.
             methods::GET_CHECKOUT_DIFF => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
@@ -1806,41 +1723,17 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let root = identity.root.as_path();
-                let snapshot = match p.mode.as_str() {
-                    "branch" => {
-                        let base_ref = p
-                            .base_ref
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
-                        let base = crate::diff_sync::merge_base(root, base_ref)
-                            .await
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base)).await
-                    }
-                    // One commit's own changes (History → per-commit tab):
-                    // parent (or the empty tree) vs the commit itself.
-                    "commit" => {
-                        let sha = p
-                            .commit_sha
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
-                        crate::diff_sync::capture_commit_diff(&self.repos, root, sha).await
-                    }
-                    "turn" => {
-                        let chat_id = p
-                            .chat_id
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
-                        let snapshot = self
-                            .diff_sync
-                            .turn_snapshot(chat_id)
-                            .filter(|s| s.root == identity.root)
-                            .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                        crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree).await
-                    }
-                    _ => crate::diff_sync::capture_diff(&self.repos, root).await,
-                }
-                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let mode = crate::diff_sync::DiffMode::parse(
+                    &p.mode,
+                    p.base_ref.as_deref(),
+                    p.commit_sha.as_deref(),
+                    p.chat_id.as_deref(),
+                )
+                .map_err(RpcError::Failed)?;
+                let snapshot =
+                    crate::diff_sync::capture_for_mode(&self.repos, &self.diff_sync, root, &mode)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&zeron_proto::CheckoutDiff {
                     checkout_id: identity.id,
                     device_id: self.doc_host.device_id().to_string(),
@@ -1868,70 +1761,22 @@ impl RpcService for EngineRpc {
                         return Err(RpcError::Failed("checkoutId does not match cwd".into()));
                     }
                     let root = identity.root.as_path();
-                    let (snapshot, base, target) = match p.mode.as_str() {
-                        "branch" => {
-                            let base_ref = p
-                                .base_ref
-                                .as_deref()
-                                .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
-                            let base = Box::pin(crate::diff_sync::merge_base(root, base_ref))
-                                .await
-                                .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            let snapshot = Box::pin(crate::diff_sync::capture_diff_against(
-                                &self.repos,
-                                root,
-                                Some(&base),
-                            ))
-                            .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, base, None)
-                        }
-                        "commit" => {
-                            let sha = p
-                                .commit_sha
-                                .as_deref()
-                                .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
-                            let base =
-                                Box::pin(crate::diff_sync::commit_diff_base(root, sha)).await;
-                            let snapshot = Box::pin(crate::diff_sync::capture_commit_diff(
-                                &self.repos,
-                                root,
-                                sha,
-                            ))
-                            .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, base, Some(sha.to_string()))
-                        }
-                        "turn" => {
-                            let chat_id = p
-                                .chat_id
-                                .as_deref()
-                                .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
-                            let turn = self
-                                .diff_sync
-                                .turn_snapshot(chat_id)
-                                .filter(|snapshot| snapshot.root == identity.root)
-                                .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                            let snapshot = Box::pin(crate::diff_sync::capture_turn_diff(
-                                &self.repos,
-                                root,
-                                &turn.tree,
-                            ))
-                            .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, turn.tree, None)
-                        }
-                        _ => {
-                            let base = Box::pin(crate::diff_sync::working_diff_base(root))
-                                .await
-                                .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            let snapshot =
-                                Box::pin(crate::diff_sync::capture_diff(&self.repos, root))
-                                    .await
-                                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, base, None)
-                        }
-                    };
+                    let mode = crate::diff_sync::DiffMode::parse(
+                        &p.mode,
+                        p.base_ref.as_deref(),
+                        p.commit_sha.as_deref(),
+                        p.chat_id.as_deref(),
+                    )
+                    .map_err(RpcError::Failed)?;
+                    let (snapshot, base, target) =
+                        Box::pin(crate::diff_sync::capture_with_base_for_mode(
+                            &self.repos,
+                            &self.diff_sync,
+                            root,
+                            &mode,
+                        ))
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
                     let stale = || zeron_proto::CheckoutFileDiffText {
                         diff_checksum: p.diff_checksum.clone(),
                         old_text: None,
@@ -1960,37 +1805,13 @@ impl RpcService for EngineRpc {
                     ))
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    let current = match p.mode.as_str() {
-                        "branch" => {
-                            Box::pin(crate::diff_sync::capture_diff_against(
-                                &self.repos,
-                                root,
-                                Some(&base),
-                            ))
-                            .await
-                        }
-                        "turn" => {
-                            Box::pin(crate::diff_sync::capture_turn_diff(
-                                &self.repos,
-                                root,
-                                &base,
-                            ))
-                            .await
-                        }
-                        "commit" => {
-                            let sha = p
-                                .commit_sha
-                                .as_deref()
-                                .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
-                            Box::pin(crate::diff_sync::capture_commit_diff(
-                                &self.repos,
-                                root,
-                                sha,
-                            ))
-                            .await
-                        }
-                        _ => Box::pin(crate::diff_sync::capture_diff(&self.repos, root)).await,
-                    }
+                    let current = Box::pin(crate::diff_sync::recapture_for_mode(
+                        &self.repos,
+                        root,
+                        &mode,
+                        &base,
+                    ))
+                    .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                     if current.checksum != p.diff_checksum {
                         return RpcReply::value(&stale());
@@ -2560,55 +2381,49 @@ mod tests {
         assert_eq!(p.harness, HarnessId::ClaudeCode);
     }
 
+    /// Registry-backed view of what the forward guard in
+    /// [`RpcService::handle`] reads.
+    fn is_forwardable(method: &str) -> bool {
+        info(method)
+            .unwrap_or_else(|| panic!("{method} missing from the rpc registry"))
+            .forwardable
+    }
+
     #[test]
     fn local_device_is_not_forwardable() {
-        assert!(!forwardable(methods::LOCAL_DEVICE));
-        assert!(!forwardable(methods::ENGINE_INFO));
-        assert!(!forwardable(methods::ENGINE_READY));
-        assert!(forwardable(methods::QUEUE_COMMAND));
-        assert!(forwardable(methods::QUEUE_WORKER_NOTIFICATION));
-        assert!(forwardable(methods::SEARCH_FILES));
-        assert!(forwardable(methods::FETCH_ALL));
-        assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
-        assert!(forwardable(methods::FETCH_TOOL_INPUT));
-        assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(!is_forwardable(methods::LOCAL_DEVICE));
+        assert!(!is_forwardable(methods::ENGINE_INFO));
+        assert!(!is_forwardable(methods::ENGINE_READY));
+        assert!(is_forwardable(methods::QUEUE_COMMAND));
+        assert!(is_forwardable(methods::QUEUE_WORKER_NOTIFICATION));
+        assert!(is_forwardable(methods::SEARCH_FILES));
+        assert!(is_forwardable(methods::FETCH_ALL));
+        assert!(is_forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(is_forwardable(methods::FETCH_TOOL_INPUT));
+        assert!(info(methods::WATCH_CHECKOUT_CHANGE_REQUEST).unwrap().stream);
     }
 
     #[test]
     fn live_voice_rpc_methods_are_local_only() {
-        assert!(!forwardable(methods::PROBE_LIVE_VOICE));
-        assert!(!forwardable(methods::START_LIVE_VOICE));
-        assert!(!forwardable(methods::SET_LIVE_VOICE_MUTED));
-        assert!(!forwardable(methods::STOP_LIVE_VOICE));
-        assert!(!forwardable(methods::WATCH_LIVE_VOICE));
+        assert!(!is_forwardable(methods::PROBE_LIVE_VOICE));
+        assert!(!is_forwardable(methods::START_LIVE_VOICE));
+        assert!(!is_forwardable(methods::SET_LIVE_VOICE_MUTED));
+        assert!(!is_forwardable(methods::STOP_LIVE_VOICE));
+        assert!(!is_forwardable(methods::WATCH_LIVE_VOICE));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —
     /// interactive calls fail fast, network-bound git/update calls get the
     /// long leash, and nothing awaits forever (the "Sending…" wedge).
     #[test]
-    fn forward_deadlines_are_tiered_and_bounded() {
+    fn relay_reply_deadlines_are_tiered_and_bounded() {
         use std::time::Duration;
-        assert_eq!(
-            forward_deadline(methods::CREATE_WORKTREE),
-            Duration::from_secs(120)
-        );
-        assert_eq!(
-            forward_deadline(methods::CLONE_REPO),
-            Duration::from_secs(15 * 60)
-        );
-        assert_eq!(
-            forward_deadline(methods::LIST_BRANCHES),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            forward_deadline(methods::QUEUE_COMMAND),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            forward_deadline(methods::FETCH_TOOL_INPUT),
-            Duration::from_secs(20)
-        );
+        let deadline = |m: &str| info(m).unwrap().deadline;
+        assert_eq!(deadline(methods::CREATE_WORKTREE), Duration::from_secs(120));
+        assert_eq!(deadline(methods::CLONE_REPO), Duration::from_secs(15 * 60));
+        assert_eq!(deadline(methods::LIST_BRANCHES), Duration::from_secs(30));
+        assert_eq!(deadline(methods::QUEUE_COMMAND), Duration::from_secs(30));
+        assert_eq!(deadline(methods::FETCH_TOOL_INPUT), Duration::from_secs(20));
     }
 
     #[test]
@@ -2776,10 +2591,13 @@ mod tests {
 
     #[test]
     fn test_trajectory_rpc_methods_are_absent_from_forwardable_stream_sets() {
-        assert!(!forwardable(methods::WATCH_TRAJECTORY));
-        assert!(!forwardable(methods::REVEAL_TRAJECTORY_RAW));
-        assert!(!is_stream_method(methods::WATCH_TRAJECTORY));
-        assert!(!is_stream_method(methods::REVEAL_TRAJECTORY_RAW));
+        for method in [methods::WATCH_TRAJECTORY, methods::REVEAL_TRAJECTORY_RAW] {
+            let entry =
+                info(method).unwrap_or_else(|| panic!("{method} missing from the rpc registry"));
+            assert!(!entry.forwardable, "{method} must never be forwarded");
+            assert!(!entry.stream, "{method} must never be relay-proxied");
+            assert!(entry.local_only, "{method} must be device-local");
+        }
     }
 
     #[tokio::test]

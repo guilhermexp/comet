@@ -1340,20 +1340,6 @@ impl AppState {
             .collect()
     }
 
-    /// The chat a jump shortcut opens: the row at `slot` (zero-based) of the
-    /// sidebar's active list. A slot past the end of a short list opens
-    /// nothing. Pure.
-    pub fn jump_target(
-        &self,
-        now: DateTime<Utc>,
-        space_filter: Option<&str>,
-        slot: usize,
-    ) -> Option<String> {
-        self.sidebar_chats(now, space_filter)
-            .get(slot)
-            .map(|(_, chat)| chat.id.clone())
-    }
-
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
@@ -1733,13 +1719,6 @@ impl AppState {
         self.deep_link_notice.take()
     }
 
-    fn live_voice_stops_for_chat_selection(
-        live_voice: &LiveVoiceState,
-        next_chat_id: Option<&str>,
-    ) -> bool {
-        live_voice.phase != LiveVoicePhase::Idle && live_voice.chat_id.as_deref() != next_chat_id
-    }
-
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
@@ -1751,9 +1730,6 @@ impl AppState {
                 self.mark_chat_seen(&id, cx);
             }
             return;
-        }
-        if Self::live_voice_stops_for_chat_selection(&self.live_voice, chat_id.as_deref()) {
-            self.stop_live_voice(cx);
         }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
@@ -3268,40 +3244,6 @@ mod tests {
     }
 
     #[test]
-    fn jump_slots_count_the_rows_the_sidebar_draws() {
-        let now = Utc::now();
-        let mut state = AppState::new();
-        let mut in_space = chat("a", 0, Some(3));
-        in_space.space_id = Some("s1".into());
-        let mut other_space = chat("b", 1, Some(2));
-        other_space.space_id = Some("s2".into());
-        let mut archived = chat("gone", 2, Some(1));
-        archived.space_id = Some("s1".into());
-        archived.archived = true;
-        state.apply_spaces(vec![
-            space("s1", "d1", "/tmp/s1", 0),
-            space("s2", "d1", "/tmp/s2", 1),
-        ]);
-        state.apply_chats(vec![in_space, other_space, archived]);
-
-        let order: Vec<&str> = state
-            .sidebar_chats(now, None)
-            .iter()
-            .map(|(_, c)| c.id.as_str())
-            .collect();
-        assert_eq!(state.jump_target(now, None, 0).as_deref(), Some(order[0]));
-        assert_eq!(state.jump_target(now, None, 1).as_deref(), Some(order[1]));
-        // The archived row is not in the active list, so no slot reaches it.
-        assert_eq!(order.len(), 2);
-        assert_eq!(state.jump_target(now, None, 2), None);
-        assert_eq!(state.jump_target(now, None, 8), None);
-
-        // A project filter renumbers: slot 1 counts the visible rows only.
-        assert_eq!(state.jump_target(now, Some("s2"), 0).as_deref(), Some("b"));
-        assert_eq!(state.jump_target(now, Some("s2"), 1), None);
-    }
-
-    #[test]
     fn archive_shortcut_only_targets_an_open_active_chat() {
         let mut state = AppState::new();
         let mut archived = chat("a", 0, None);
@@ -3315,29 +3257,6 @@ mod tests {
         // An already archived chat stays put — the shortcut never unarchives.
         state.selected_chat = Some("a".into());
         assert_eq!(state.archivable_selected_chat(), None);
-    }
-
-    #[test]
-    fn selecting_the_live_chat_does_not_stop_its_call() {
-        let live = LiveVoiceState {
-            chat_id: Some("voice-chat".into()),
-            phase: LiveVoicePhase::Connecting,
-            ..LiveVoiceState::default()
-        };
-
-        assert!(!AppState::live_voice_stops_for_chat_selection(
-            &live,
-            Some("voice-chat")
-        ));
-        assert!(AppState::live_voice_stops_for_chat_selection(
-            &live,
-            Some("other-chat")
-        ));
-        assert!(AppState::live_voice_stops_for_chat_selection(&live, None));
-        assert!(!AppState::live_voice_stops_for_chat_selection(
-            &LiveVoiceState::default(),
-            Some("other-chat")
-        ));
     }
 
     #[test]

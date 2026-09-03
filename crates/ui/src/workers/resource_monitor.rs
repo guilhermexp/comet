@@ -263,7 +263,7 @@ impl WorkersResourceMonitor {
             }
         });
         let mut monitor = Self {
-            client: LocalWorkersClient::new(),
+            client: crate::workers::client::shared(),
             model,
             snapshot: None,
             settings: WorkersResourceSettings::default(),

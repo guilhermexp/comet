@@ -85,7 +85,7 @@ where
     // EOF flips only the first so pending waits exit; only a client
     // cancellation suppresses the response.
     let in_flight: InFlight = Arc::default();
-    let mut threads = Vec::new();
+    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|error| error.to_string())?;
         if line.trim().is_empty() {
@@ -119,6 +119,7 @@ where
         let writer = Arc::clone(&writer);
         let handler = Arc::clone(&handler);
         let in_flight = Arc::clone(&in_flight);
+        threads.retain(|thread| !thread.is_finished());
         threads.push(std::thread::spawn(move || {
             let response = handler(request, &cancel);
             if let Some(key) = &key {
@@ -520,8 +521,19 @@ fn dispatch_action(
         }
         "list_presets" => {
             let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
+            // Preference order, not storage order. The star (quick_launch) wins,
+            // then drag order — the same rule the UI applies when it picks a
+            // preset for the user (ui/src/shell/tabs.rs). Carrying it in the
+            // position means the first entry already answers "which preset",
+            // with no extra field or sentence spent saying so.
+            let mut presets = bootstrap
+                .presets
+                .into_iter()
+                .filter(|preset| preset.enabled)
+                .collect::<Vec<_>>();
+            presets.sort_by_key(|preset| !preset.quick_launch);
             Ok(json!({
-                "presets": bootstrap.presets.into_iter().filter(|preset| preset.enabled).map(|preset| json!({
+                "presets": presets.into_iter().map(|preset| json!({
                     "id": preset.id,
                     "label": preset.label,
                     "command": preset.command,

@@ -102,10 +102,15 @@ fn failure_markers(command: &str) -> Option<Vec<String>> {
     ])
 }
 
+fn embedded_conversation_id(command: &str) -> Option<String> {
+    id_in_command(&tokenize(command), ID_FLAGS)
+}
+
 pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh)
     .with_new_launch_preparation(prepare_new_launch)
     .with_fork(forked)
-    .with_failure_markers(failure_markers);
+    .with_failure_markers(failure_markers)
+    .with_embedded_conversation_id(embedded_conversation_id);
 
 #[cfg(test)]
 mod tests {

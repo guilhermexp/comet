@@ -5,14 +5,14 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::process::{ProcessRequest, ProcessRunError, ProcessRunner, SystemProcessRunner};
 
 use zeron_proto::{ChangeRequestState, ChangeRequestSummary};
 
@@ -214,17 +214,21 @@ impl GitHubCli {
                 "--json".into(),
                 GITHUB_JSON_FIELDS.into(),
             ],
-            cwd: source.checkout_root.clone(),
+            cwd: Some(source.checkout_root.clone()),
             env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
             timeout: GITHUB_TIMEOUT,
             output_limit: GITHUB_OUTPUT_LIMIT,
+            kill_on_drop: true,
         };
         let output = self.runner.run(request).await.map_err(classify_run_error)?;
-        if !output.success {
-            return Err(classify_github_failure(&output.stderr));
-        }
+        // Truncation is checked first: crossing the output ceiling kills the
+        // child, so an oversized reply also reports a failed exit status —
+        // and it is a decode problem, not a GitHub one.
         if output.stdout_truncated {
             return Err(ChangeRequestError::Decode);
+        }
+        if !output.success {
+            return Err(classify_github_failure(&output.stderr));
         }
         serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)
     }
@@ -250,10 +254,11 @@ impl GitHubCli {
                 "--json".into(),
                 "defaultBranchRef".into(),
             ],
-            cwd: source.checkout_root.clone(),
+            cwd: Some(source.checkout_root.clone()),
             env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
             timeout: GITHUB_TIMEOUT,
             output_limit: GITHUB_OUTPUT_LIMIT,
+            kill_on_drop: true,
         };
         let output = self.runner.run(request).await.ok()?;
         if !output.success || output.stdout_truncated {
@@ -584,10 +589,11 @@ impl GitCheckoutInspector {
             .run(ProcessRequest {
                 program: "git".into(),
                 args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-                cwd: cwd.to_owned(),
+                cwd: Some(cwd.to_owned()),
                 env: Vec::new(),
                 timeout: GIT_TIMEOUT,
                 output_limit: GIT_OUTPUT_LIMIT,
+                kill_on_drop: true,
             })
             .await
             .ok()?;
@@ -750,105 +756,6 @@ fn classify_run_error(error: ProcessRunError) -> ChangeRequestError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcessRequest {
-    program: String,
-    args: Vec<String>,
-    cwd: PathBuf,
-    env: Vec<(String, String)>,
-    timeout: Duration,
-    output_limit: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcessOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    stdout_truncated: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessRunError {
-    Spawn(io::ErrorKind),
-    Timeout,
-    Io,
-}
-
-#[async_trait]
-trait ProcessRunner: Send + Sync {
-    async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError>;
-}
-
-struct SystemProcessRunner;
-
-#[async_trait]
-impl ProcessRunner for SystemProcessRunner {
-    async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
-        let mut command = tokio::process::Command::new(&request.program);
-        if request.program == "gh" {
-            zeron_harness::compose_login_shell_path(&mut command);
-        }
-        command
-            .args(&request.args)
-            .current_dir(&request.cwd)
-            .envs(request.env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|error| ProcessRunError::Spawn(error.kind()))?;
-        let stdout = child.stdout.take().ok_or(ProcessRunError::Io)?;
-        let stderr = child.stderr.take().ok_or(ProcessRunError::Io)?;
-        let completed = tokio::time::timeout(request.timeout, async {
-            tokio::try_join!(
-                child.wait(),
-                read_capped(stdout, request.output_limit),
-                read_capped(stderr, request.output_limit),
-            )
-        })
-        .await;
-
-        let (status, (stdout, stdout_truncated), (stderr, _stderr_truncated)) = match completed {
-            Ok(Ok(output)) => output,
-            Ok(Err(_)) => return Err(ProcessRunError::Io),
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(ProcessRunError::Timeout);
-            }
-        };
-        Ok(ProcessOutput {
-            success: status.success(),
-            stdout,
-            stderr,
-            stdout_truncated,
-        })
-    }
-}
-
-async fn read_capped(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> io::Result<(Vec<u8>, bool)> {
-    let mut output = Vec::with_capacity(limit.min(16 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut truncated = false;
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        let remaining = limit.saturating_sub(output.len());
-        let keep = read.min(remaining);
-        output.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < read;
-    }
-    Ok((output, truncated))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -856,6 +763,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::process::ProcessOutput;
 
     #[derive(Default)]
     struct FakeProcessRunner {
@@ -1001,7 +909,7 @@ mod tests {
         let requests = runner.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].program, "gh");
-        assert_eq!(requests[0].cwd, Path::new("/checkout"));
+        assert_eq!(requests[0].cwd.as_deref(), Some(Path::new("/checkout")));
         assert_eq!(
             requests[0].args,
             [
@@ -1492,7 +1400,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         assert_eq!(source.branch.owner.as_deref(), Some("contributor"));
         assert_eq!(source.default_branch.as_deref(), Some("main"));
         let requests = runner.requests();
-        assert_eq!(requests[0].cwd, Path::new("/nested/path"));
+        assert_eq!(requests[0].cwd.as_deref(), Some(Path::new("/nested/path")));
         assert_eq!(requests[0].args, ["rev-parse", "--show-toplevel"]);
         assert_eq!(requests[4].args, ["remote", "get-url", "--push", "fork"]);
     }

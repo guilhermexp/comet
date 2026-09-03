@@ -36,13 +36,16 @@ use zeron_harness::{
 };
 use zeron_proto::trajectory::*;
 use zeron_proto::{
-    AgentEvent, Chat, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
+    AgentEvent, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
     LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion, WorkflowTaskStatus, WorkflowTaskUpdate,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
-use crate::live_voice::{BackendSpeechAccumulator, BackendSpeechUpdate, LiveVoiceCoordinator};
+use crate::live_voice::{
+    BackendSpeechAccumulator, BackendSpeechUpdate, LiveOperationalContext, LiveVoiceCoordinator,
+    latest_visible_assistant_text,
+};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::trajectory_store::{TrajectoryStore, TrajectoryStoreEvent};
@@ -271,7 +274,7 @@ fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String 
             "Live Voice is unavailable for archived Chats".into()
         }
         LiveVoiceUnavailableReason::ActiveRun => {
-            "Stop the active run before starting Live Voice".into()
+            "Live Voice during active work requires a newer Comet host".into()
         }
         LiveVoiceUnavailableReason::UnsupportedOmp => {
             "Installed OMP does not support Live Voice; update OMP".into()
@@ -280,40 +283,6 @@ fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String 
             "Another Live Voice call is already active on this device".into()
         }
     }
-}
-
-fn live_delegation_run_request(chat: &Chat, prompt: String) -> Result<RunRequest, EngineError> {
-    if prompt.trim().is_empty() {
-        return Err(EngineError::Other(
-            "Live Voice delegation request is empty".into(),
-        ));
-    }
-    let config = chat
-        .config
-        .as_ref()
-        .ok_or_else(|| EngineError::Other("OMP Chat has no run configuration".into()))?;
-    let cwd = chat
-        .source_context
-        .as_ref()
-        .map(|context| context.cwd.clone())
-        .or_else(|| chat.cwd.clone())
-        .filter(|cwd| !cwd.trim().is_empty())
-        .ok_or_else(|| EngineError::Other("Chat has no working directory".into()))?;
-    Ok(RunRequest {
-        prompt,
-        harness: Some(HarnessId::Omp),
-        model: config.model.clone(),
-        reasoning: config.reasoning,
-        model_options: config.model_options.clone(),
-        cwd,
-        sandbox: config.sandbox,
-        auto_approve: false,
-        enable_workers_mcp: true,
-        workers_parent_chat_id: None,
-        resume: None,
-        attachments: Vec::new(),
-        worktree: None,
-    })
 }
 
 #[derive(Clone)]
@@ -468,8 +437,10 @@ impl SessionsEngine {
                 reason: Some(reason),
             });
         }
+        let active = self.is_active_session(chat_id);
         let harness = self.inner.registry.resolve(HarnessId::Omp)?;
-        let available = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
+        let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
+        let available = support.usable(active);
         Ok(LiveVoiceAvailability {
             available,
             reason: (!available).then_some(LiveVoiceUnavailableReason::UnsupportedOmp),
@@ -496,7 +467,7 @@ impl SessionsEngine {
                 return Err(error.into());
             }
         };
-        if !supported {
+        if !supported.usable(self.is_active_session(chat_id)) {
             let message =
                 live_voice_unavailable_message(LiveVoiceUnavailableReason::UnsupportedOmp);
             self.inner.live_voice.fail(&call_id, &message);
@@ -505,6 +476,17 @@ impl SessionsEngine {
         if !self.inner.live_voice.matches(&call_id) {
             return Err(EngineError::Other("Live Voice start was cancelled".into()));
         }
+        let operational_context = if supported.session_context {
+            match self.live_operational_context(chat_id) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    self.inner.live_voice.fail(&call_id, &error.to_string());
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let resume = self.inner.resume_for(chat_id, &cwd);
         let handle = match harness
             .start_live_voice(LiveVoiceRequest {
@@ -521,7 +503,7 @@ impl SessionsEngine {
         };
         self.inner
             .remember_harness_session(chat_id, &handle.session_id, &cwd);
-        if let Err(handle) = self.attach_live_handle(&call_id, handle) {
+        if let Err(handle) = self.attach_live_handle(&call_id, handle, operational_context) {
             let _ = handle.controls.send(LiveVoiceControl::Stop).await;
             return Err(EngineError::Other("Live Voice start was cancelled".into()));
         }
@@ -560,6 +542,7 @@ impl SessionsEngine {
         &self,
         call_id: &str,
         mut handle: LiveVoiceHandle,
+        operational_context: Option<(LiveOperationalContext, broadcast::Receiver<JournaledEvent>)>,
     ) -> Result<(), LiveVoiceHandle> {
         if !self
             .inner
@@ -571,6 +554,14 @@ impl SessionsEngine {
         let Some(cancellation) = self.inner.live_voice.cancellation(call_id) else {
             return Err(handle);
         };
+        if let Some((context, receiver)) = operational_context {
+            self.spawn_live_context_observer(
+                call_id.to_owned(),
+                cancellation.clone(),
+                context,
+                receiver,
+            );
+        }
         let sessions = self.clone();
         let task_call_id = call_id.to_owned();
         let coordinator = self.inner.live_voice.clone();
@@ -618,6 +609,90 @@ impl SessionsEngine {
         Ok(())
     }
 
+    fn is_active_session(&self, chat_id: &str) -> bool {
+        lock(&self.inner.statuses)
+            .get(chat_id)
+            .is_some_and(|session| {
+                matches!(
+                    session.status,
+                    SessionStatus::Working | SessionStatus::AwaitingInput
+                )
+            })
+    }
+
+    fn live_operational_context(
+        &self,
+        chat_id: &str,
+    ) -> Result<(LiveOperationalContext, broadcast::Receiver<JournaledEvent>), EngineError> {
+        let (_, receiver) = self.subscribe(chat_id, u64::MAX)?;
+        let entries = self.doc_handle(chat_id)?.doc().read_entries()?;
+        let visible_text = latest_visible_assistant_text(&entries);
+        let status = self
+            .session_status(chat_id)
+            .map_or(SessionStatus::Idle, |session| session.status);
+        Ok((LiveOperationalContext::new(status, &visible_text), receiver))
+    }
+
+    fn spawn_live_context_observer(
+        &self,
+        call_id: String,
+        cancellation: CancellationToken,
+        mut context: LiveOperationalContext,
+        mut events: broadcast::Receiver<JournaledEvent>,
+    ) {
+        let (context_tx, mut context_rx) = watch::channel(context.render());
+        let producer_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                let flush_due = async {
+                    match context.next_flush_at() {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let event = tokio::select! {
+                    _ = producer_cancellation.cancelled() => return,
+                    _ = flush_due => {
+                        if context.flush_at(std::time::Instant::now()) {
+                            context_tx.send_replace(context.render());
+                        }
+                        continue;
+                    }
+                    event = events.recv() => match event {
+                        Ok(event) => event.event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                };
+                if context.observe(&event) {
+                    context_tx.send_replace(context.render());
+                }
+            }
+        });
+
+        let coordinator = self.inner.live_voice.clone();
+        tokio::spawn(async move {
+            loop {
+                let text = context_rx.borrow_and_update().clone();
+                let sent = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    sent = coordinator.append_session_context(&call_id, text) => sent,
+                };
+                if !sent {
+                    return;
+                }
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    changed = context_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     async fn handle_live_delegation(
         &self,
         call_id: &str,
@@ -636,15 +711,12 @@ impl SessionsEngine {
             .live_voice
             .active_chat_id()
             .ok_or_else(|| EngineError::Other("Live Voice call is no longer active".into()))?;
+        if request.trim().is_empty() {
+            return Err(EngineError::Other(
+                "Live Voice delegation request is empty".into(),
+            ));
+        }
         let (_, receiver) = self.subscribe(&chat_id, u64::MAX)?;
-        let workspace = self
-            .inner
-            .workspace()
-            .ok_or_else(|| EngineError::Other("workspace is unavailable".into()))?;
-        let chat = workspace
-            .chat(&chat_id)?
-            .ok_or_else(|| EngineError::Other(format!("no such chat: {chat_id}")))?;
-        let run_request = live_delegation_run_request(&chat, request)?;
         let host = self
             .inner
             .doc_host()
@@ -652,9 +724,9 @@ impl SessionsEngine {
         host.queue_command_with_id(
             &chat_id,
             ownership.command_id.clone(),
-            SessionCommandPayload::Run {
-                request: run_request,
-                message_id: ownership.message_id,
+            SessionCommandPayload::Steer {
+                prompt: request,
+                message_id: Some(ownership.message_id),
             },
         )?;
         self.spawn_live_backend_observer(
@@ -738,8 +810,6 @@ impl SessionsEngine {
             Some(LiveVoiceUnavailableReason::NonOmp)
         } else if chat.archived {
             Some(LiveVoiceUnavailableReason::Archived)
-        } else if self.has_live_run(chat_id) {
-            Some(LiveVoiceUnavailableReason::ActiveRun)
         } else if self.inner.live_voice.is_active() {
             Some(LiveVoiceUnavailableReason::AnotherLiveCall)
         } else {
@@ -3283,8 +3353,8 @@ mod tests {
     use super::{
         HarnessRegistry, PendingInput, RunJournal, RuntimeConfig, SessionsEngine, SubagentSink,
         apply_context_usage_to_session, apply_run_error_to_session, finish_segment,
-        live_delegation_run_request, resolve_pending_question, segment_duration_ms,
-        should_journal_event, subagent_doc_id, workflow_tasks_from_entries,
+        resolve_pending_question, segment_duration_ms, should_journal_event, subagent_doc_id,
+        workflow_tasks_from_entries,
     };
     use crate::trajectory_store::TrajectoryStore;
     use chrono::Utc;
@@ -3296,60 +3366,6 @@ mod tests {
         HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus, ToolCall,
         WorkflowTaskStatus, WorkflowTaskUpdate,
     };
-    #[test]
-    fn live_voice_delegation_run_request_uses_authoritative_chat_configuration() {
-        let mut model_options = serde_json::Map::new();
-        model_options.insert("temperature".into(), serde_json::json!(0.2));
-        let chat = Chat {
-            id: "chat-live".into(),
-            device_id: "device".into(),
-            title: None,
-            archived: false,
-            cwd: Some("/chat-cwd".into()),
-            branch: None,
-            checkout_id: Some("checkout".into()),
-            source_context: Some(ConversationSourceContext {
-                checkout_id: "checkout".into(),
-                repo_root: "/repo".into(),
-                cwd: "/source-cwd".into(),
-                branch: "main".into(),
-                head_sha: Some("abc123".into()),
-                observed_at: Utc::now(),
-            }),
-            config: Some(ChatConfig {
-                harness: HarnessId::Omp,
-                model: Some("model-live".into()),
-                reasoning: Some(ReasoningLevel::High),
-                model_options: model_options.clone(),
-                sandbox: SandboxLevel::ReadOnly,
-            }),
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: Some(2),
-        };
-
-        let request =
-            live_delegation_run_request(&chat, "delegate this".into()).expect("valid request");
-        assert_eq!(request.prompt, "delegate this");
-        assert_eq!(request.harness, Some(HarnessId::Omp));
-        assert_eq!(request.model.as_deref(), Some("model-live"));
-        assert_eq!(request.reasoning, Some(ReasoningLevel::High));
-        assert_eq!(request.model_options, model_options);
-        assert_eq!(request.cwd, "/source-cwd");
-        assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
-        assert!(!request.auto_approve);
-        assert!(request.enable_workers_mcp);
-        assert!(request.workers_parent_chat_id.is_none());
-        assert!(request.resume.is_none());
-        assert!(request.attachments.is_empty());
-        assert!(request.worktree.is_none());
-    }
-
     #[test]
     fn journal_policy_skips_transient_preview_but_keeps_authoritative_file_call() {
         let dir = tempfile::tempdir().unwrap();

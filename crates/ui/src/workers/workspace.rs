@@ -2022,7 +2022,7 @@ impl WorkersContent {
         entries: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        let client = zeron_workers_unpeel::LocalWorkersClient::new();
+        let client = crate::workers::client::shared();
         self.transcript_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()

@@ -74,33 +74,14 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     } else {
         "claude"
     };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
+    let mut extra = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
+        extra.push(home.join(".claude").join("local").join("claude"));
+        extra.push(home.join(".local").join("bin").join("claude"));
     }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    extra.push(PathBuf::from("/usr/local/bin/claude"));
+    crate::find_on_paths(exe, extra)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -124,59 +105,12 @@ fn claude_context_window(request: &RunRequest) -> u64 {
     }
 }
 
-fn claude_workers_mcp_config_for(
-    executable: &std::path::Path,
-    request: &RunRequest,
-    disabled_by_environment: bool,
-) -> Option<String> {
-    let server = crate::acp::workers_mcp_servers_for(
-        executable,
+fn claude_workers_mcp_config(request: &RunRequest) -> Option<String> {
+    crate::workers_mcp::resolve(
         request.enable_workers_mcp,
-        disabled_by_environment,
         request.workers_parent_chat_id.as_deref(),
     )
-    .into_iter()
-    .next()?;
-    let name = server.get("name")?.as_str()?;
-    let command = server.get("command")?.clone();
-    let args = server
-        .get("args")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-    let env = server
-        .get("env")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            Some((
-                row.get("name")?.as_str()?.to_owned(),
-                row.get("value")?.clone(),
-            ))
-        })
-        .collect::<serde_json::Map<_, _>>();
-    Some(
-        serde_json::json!({
-            "mcpServers": {
-                name: {
-                    "command": command,
-                    "args": args,
-                    "env": env,
-                }
-            }
-        })
-        .to_string(),
-    )
-}
-
-fn claude_workers_mcp_config(request: &RunRequest) -> Option<String> {
-    let disabled = std::env::var("ZERON_DISABLE_WORKERS_MCP")
-        .ok()
-        .is_some_and(|value| value == "1");
-    let executable = std::env::var_os("ZERON_WORKERS_MCP_BIN")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())?;
-    claude_workers_mcp_config_for(&executable, request, disabled)
+    .map(|server| server.claude_config_json())
 }
 
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
@@ -292,7 +226,13 @@ impl ClaudeHarness {
         if let Some(config) = claude_workers_mcp_config(request) {
             cmd.args(["--mcp-config", &config]);
             // The Workers wait is orchestrator-sized (up to hours); Claude's MCP
-            // client must not expire it first.
+            // client must not expire it first. Scope tradeoff: `MCP_TOOL_TIMEOUT`
+            // is process-wide in Claude Code, so it raises the deadline of EVERY
+            // MCP server mounted in this session (the user's own included) —
+            // Codex's `tool_timeout_sec` is per server. A third-party MCP tool
+            // that hangs therefore holds the turn for this deadline instead of
+            // the client default. The Claude CLI exposes no per-server knob
+            // today, and expiring the Workers wait is the worse failure.
             cmd.env(
                 "MCP_TOOL_TIMEOUT",
                 (crate::WORKERS_CLIENT_DEADLINE_SECONDS * 1000).to_string(),
@@ -970,12 +910,15 @@ mod tests {
 
     #[test]
     fn native_workers_mcp_config_mounts_the_controller_without_persistence() {
-        let config = claude_workers_mcp_config_for(
+        let request = workers_request(true);
+        let config = crate::workers_mcp::resolve_for(
             Path::new("/absolute/zeron"),
-            &workers_request(true),
+            request.enable_workers_mcp,
             false,
+            request.workers_parent_chat_id.as_deref(),
         )
-        .expect("Workers config");
+        .expect("Workers config")
+        .claude_config_json();
         let config: Value = serde_json::from_str(&config).expect("valid JSON");
         assert_eq!(
             config["mcpServers"]["comet-workers"]["command"],
@@ -993,11 +936,13 @@ mod tests {
             config["mcpServers"]["comet-workers"]["env"]["COMET_WORKERS_PARENT_CHAT_ID"],
             "parent-chat"
         );
+        let disabled = workers_request(false);
         assert!(
-            claude_workers_mcp_config_for(
+            crate::workers_mcp::resolve_for(
                 Path::new("/absolute/zeron"),
-                &workers_request(false),
+                disabled.enable_workers_mcp,
                 false,
+                disabled.workers_parent_chat_id.as_deref(),
             )
             .is_none()
         );

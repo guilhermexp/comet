@@ -13,7 +13,8 @@ use zeron_workers_unpeel::{
     WorkersResourceSettings, WorkersSession, WorkersSessionCommand, WorkersSessionSort,
     WorkersSettingsSnapshot, WorkersTranscriptSettings, WorkersWorktreeResult,
     ack_worker_parent_notification, build_worker_parent_notification_prompt,
-    hibernation_candidates, pending_worker_parent_notifications, worker_parent_links,
+    hibernate_confirmed_candidates, hibernation_candidates, pending_worker_parent_notifications,
+    worker_parent_links,
 };
 
 use crate::state::AppState;
@@ -391,7 +392,7 @@ pub struct WorkersModel {
 
 impl WorkersModel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let client = LocalWorkersClient::new();
+        let client = crate::workers::client::shared();
         let poll_client = client.clone();
         let poll_task = cx.spawn(async move |this, cx| {
             let mut observed_epoch = poll_client.activity_epoch();
@@ -828,31 +829,69 @@ impl WorkersModel {
     /// their welcome. Fire-and-forget on purpose: the next refresh sees the
     /// result on disk and retries whatever failed, so there is no local
     /// "already tried" state to drift from the host.
+    ///
+    /// The decision is taken twice: once on the snapshot the panel holds and
+    /// again per candidate, on a Host token minted first and a fresh bootstrap
+    /// taken after it. The current selection is read after that bootstrap,
+    /// then the Host compares its activity token before accepting the
+    /// conditional stop (see `hibernate_confirmed_candidates`).
     fn hibernate_idle_workers(&mut self, cx: &mut Context<Self>) {
         let (Some(snapshot), Some(settings)) = (self.snapshot.as_ref(), self.settings.as_ref())
         else {
             return;
         };
-        let candidates = hibernation_candidates(
+        let candidate_ids = hibernation_candidates(
             &snapshot.sessions,
             &settings.resources,
             self.selected_session_id.as_deref(),
             Self::unix_time_ms(),
         )
         .into_iter()
-        .cloned()
+        .map(|session| session.id.clone())
         .collect::<Vec<_>>();
-        if candidates.is_empty() {
+        if candidate_ids.is_empty() {
             return;
         }
         let client = self.client.clone();
-        cx.background_executor()
-            .spawn(async move {
-                for session in candidates {
-                    let idle_minutes = session
-                        .idle_since_unix_ms
-                        .map(|idle_since| Self::unix_time_ms().saturating_sub(idle_since) / 60_000);
-                    match client.session_command(&session, WorkersSessionCommand::Archive) {
+        let resources = settings.resources.clone();
+        cx.spawn(async move |this, cx| {
+            let background = cx.background_executor().clone();
+            let recheck_client = client.clone();
+            let recheck_executor = background.clone();
+            let recheck = move |candidate_id: &str| {
+                let client = recheck_client.clone();
+                let candidate_id = candidate_id.to_owned();
+                recheck_executor.spawn(async move {
+                    let Some(token) = client.capture_hibernation_activity_token(&candidate_id)
+                    else {
+                        tracing::debug!(session_id = %candidate_id, "host declined to confirm idle worker for hibernation");
+                        return None;
+                    };
+                    match client.bootstrap() {
+                        Ok(bootstrap) => Some((token, bootstrap.sessions)),
+                        Err(error) => {
+                            tracing::warn!(%error, session_id = %candidate_id, "could not re-check idle worker before hibernating");
+                            None
+                        }
+                    }
+                })
+            };
+            let selected_session_id = move || {
+                this.update(cx, |model, _| model.selected_session_id.clone())
+                    .ok()
+            };
+            let hibernate = move |session: WorkersSession, expected_activity_token: String| {
+                let client = client.clone();
+                background.spawn(async move {
+                    let idle_minutes = session.idle_since_unix_ms.map(|idle_since| {
+                        Self::unix_time_ms().saturating_sub(idle_since) / 60_000
+                    });
+                    match client.session_command(
+                        &session,
+                        WorkersSessionCommand::Hibernate {
+                            expected_activity_token,
+                        },
+                    ) {
                         Ok(_) => tracing::info!(
                             session_id = %session.id,
                             title = %session.title,
@@ -865,9 +904,18 @@ impl WorkersModel {
                             "could not hibernate idle worker"
                         ),
                     }
-                }
-            })
-            .detach();
+                })
+            };
+            hibernate_confirmed_candidates(
+                candidate_ids,
+                &resources,
+                recheck,
+                selected_session_id,
+                hibernate,
+            )
+            .await;
+        })
+        .detach();
     }
 
     fn dispatch_parent_notifications(
@@ -2068,6 +2116,8 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: WorkersSessionCapabilities::default(),

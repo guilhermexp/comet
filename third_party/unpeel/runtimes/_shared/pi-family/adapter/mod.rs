@@ -20,14 +20,7 @@ pub(crate) fn startup_command(command: &str) -> String {
     if !head.eq_ignore_ascii_case("omp") && !head.eq_ignore_ascii_case("prime-agent") {
         return trimmed.to_string();
     }
-
-    let path = setup::lifecycle_extension_path();
-    let raw_path = path.to_string_lossy();
-    let quoted_path = shared::shell_quote(&raw_path);
-    if trimmed.contains(raw_path.as_ref()) || trimmed.contains(&quoted_path) {
-        return trimmed.to_string();
-    }
-    format!("{trimmed} --extension {quoted_path}")
+    setup::with_lifecycle_extension(trimmed)
 }
 
 fn prepare_startup_command(command: &str, _options: RuntimeLaunchOptions) -> String {

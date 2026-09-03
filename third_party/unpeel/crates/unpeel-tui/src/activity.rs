@@ -48,9 +48,9 @@ struct Entry {
     last_signal: Option<u64>,
     /// Non-hook heuristic: when the activity signal last changed.
     last_output_change: Option<SystemTime>,
-    /// When the latest Stop/StopFailure landed; the stop-distrust guard only
-    /// re-arms busy inside [grace, window] after this instant.
+    /// When the latest Stop/StopFailure still confirms the idle state.
     stopped_at: Option<SystemTime>,
+    stop_rearm_at: Option<SystemTime>,
     /// Timestamp of the newest live/durable hook folded into this entry.
     /// Lets a hook from the new generation win a rescan race with the
     /// manifest generation update instead of being cleared as stale.
@@ -144,16 +144,19 @@ impl ActivityEngine {
                 entry.state = Some(HookState::Busy);
                 entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
                 entry.stopped_at = None;
+                entry.stop_rearm_at = None;
             }
             "Stop" | "StopFailure" => {
                 entry.state = Some(HookState::Idle);
                 entry.deadline_at = None;
                 entry.stopped_at = Some(now);
+                entry.stop_rearm_at = Some(now);
             }
             "PermissionRequest" => {
                 entry.state = Some(HookState::Attention);
                 entry.deadline_at = None;
                 entry.stopped_at = None;
+                entry.stop_rearm_at = None;
                 // Re-baseline output tracking so the answer's redraw counts
                 // as fresh growth.
                 entry.last_signal = None;
@@ -237,6 +240,38 @@ impl ActivityEngine {
         entry.state
     }
 
+    /// A user-driven "clear attention" (the app's menu item): leaves
+    /// `Attention` for `Idle` WITHOUT recording a stop, because a click is
+    /// not the runtime saying the turn ended. Only a hook `Stop`/`StopFailure`
+    /// feeds [`Self::hook_confirmed_idle`].
+    pub fn clear_attention_unconfirmed(&mut self, session_id: &str, now: SystemTime) {
+        let entry = self.entries.entry(session_id.to_string()).or_default();
+        entry.hook_seen = true;
+        entry.last_hook_at = Some(now);
+        entry.state = Some(HookState::Idle);
+        entry.deadline_at = None;
+        entry.stopped_at = None;
+        entry.stop_rearm_at = None;
+    }
+
+    /// Whether the current hook-owned `Idle` was CONFIRMED by the runtime's
+    /// own `Stop`/`StopFailure`, as opposed to inferred by the
+    /// [`HOOK_IDLE_TIMEOUT`] sweep in [`Self::note_output_and_sweep`].
+    ///
+    /// The two are indistinguishable in [`Self::hook_owned_state`] and mean
+    /// opposite things to a consumer that acts destructively on idleness: a
+    /// swept `Idle` only says "the screen has not changed for five minutes",
+    /// which is also what a long silent subprocess or a stalled provider call
+    /// looks like mid-turn. Only `stopped_at` proves the turn ended, and the
+    /// proof is perishable: any output growth clears it for every runtime,
+    /// because tools whose hook only posts `Stop` have no
+    /// turn-start event to revoke it when the next turn begins.
+    pub fn hook_confirmed_idle(&self, session_id: &str) -> bool {
+        self.entries.get(session_id).is_some_and(|entry| {
+            entry.hook_seen && entry.state == Some(HookState::Idle) && entry.stopped_at.is_some()
+        })
+    }
+
     pub fn runtime_launch_generation(&self, session_id: &str) -> Option<u64> {
         self.entries
             .get(session_id)
@@ -307,12 +342,19 @@ impl ActivityEngine {
                     entry.deadline_at = None;
                 }
             }
-            Some(HookState::Idle) if distrust_stops && grew => {
-                if let Some(stopped_at) = entry.stopped_at {
+            Some(HookState::Idle) if grew => {
+                entry.stopped_at = None;
+                if let Some(stopped_at) = entry.stop_rearm_at {
                     let since_stop = now.duration_since(stopped_at).unwrap_or_default();
-                    if since_stop >= STOP_REARM_GRACE && since_stop <= STOP_REARM_WINDOW {
+                    if since_stop >= STOP_REARM_GRACE
+                        && distrust_stops
+                        && since_stop <= STOP_REARM_WINDOW
+                    {
                         entry.state = Some(HookState::Busy);
                         entry.deadline_at = Some(now + HOOK_IDLE_TIMEOUT);
+                        entry.stop_rearm_at = None;
+                    } else if !distrust_stops || since_stop > STOP_REARM_WINDOW {
+                        entry.stop_rearm_at = None;
                     }
                 }
             }

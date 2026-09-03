@@ -9,7 +9,8 @@ use zeron_harness::omp::normalize::{AgentEndDisposition, OmpNormalizer};
 use zeron_harness::omp::process::{OmpLaunch, OmpProcess};
 use zeron_harness::omp::protocol::{
     ChunkAssembler, MAX_INBOUND_BYTES, MAX_OUTBOUND_BYTES, live_context_command, live_mute_command,
-    live_start_command, live_stop_command, parse_frame, parse_live_event, sanitize_diagnostic,
+    live_session_context_command, live_start_command, live_stop_command, parse_frame,
+    parse_live_event, sanitize_diagnostic,
 };
 use zeron_harness::omp::workers_bridge::{WorkersBridge, WorkersBridgeOptions};
 use zeron_harness::omp::{discover_commands_with_launch, discover_models_with_launch};
@@ -298,9 +299,17 @@ fn omp_live_protocol_encodes_exact_commands() {
             "text":"Fixed"
         })
     );
+    assert_eq!(
+        live_session_context_command("Session status: Working").unwrap(),
+        json!({
+            "type":"live_append_session_context",
+            "text":"Session status: Working"
+        })
+    );
     assert_eq!(live_stop_command(), json!({"type":"live_stop"}));
     assert!(live_context_command("", LiveVoiceContextKind::Progress, "work").is_err());
     assert!(live_context_command("del-1", LiveVoiceContextKind::Progress, " ").is_err());
+    assert!(live_session_context_command(" ").is_err());
 }
 
 async fn assert_process_reaped(pid: u32) {
@@ -342,13 +351,62 @@ async fn omp_live_frontend_probe_is_ephemeral_and_reaped() {
         .with_env(env)
         .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
 
-    assert!(harness.probe_live_voice(temp.path()).await.unwrap());
+    let support = harness.probe_live_voice(temp.path()).await.unwrap();
+    assert!(support.available);
+    assert!(support.session_context);
     let pid = std::fs::read_to_string(pid_file)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
     assert_process_reaped(pid).await;
+}
+
+#[tokio::test]
+async fn older_omp_keeps_idle_live_available_but_rejects_session_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let harness = fake_harness("live-basic-only");
+
+    let support = harness.probe_live_voice(temp.path()).await.unwrap();
+    assert!(support.available);
+    assert!(!support.session_context);
+    assert!(support.usable(false));
+    assert!(!support.usable(true));
+
+    let handle = harness
+        .start_live_voice(LiveVoiceRequest {
+            cwd: temp.path().to_string_lossy().into_owned(),
+            resume: None,
+        })
+        .await
+        .unwrap();
+    let controls = handle.controls;
+    let mut events = handle.events;
+    assert_eq!(
+        next_live_event(&mut events).await,
+        LiveVoiceEvent::Phase(LiveVoicePhase::Connecting)
+    );
+    for _ in 0..4 {
+        next_live_event(&mut events).await;
+    }
+
+    controls
+        .send(LiveVoiceControl::AppendSessionContext {
+            text: "Session status: Working".into(),
+        })
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), events.next())
+        .await
+        .expect("session-context rejection timed out")
+        .expect("Live event stream ended without rejecting session context")
+        .expect_err("an older OMP must reject unsupported session context");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support session context"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -412,6 +470,12 @@ async fn omp_live_frontend_resumes_session_and_reuses_one_child_for_serial_deleg
         }
     );
 
+    controls
+        .send(LiveVoiceControl::AppendSessionContext {
+            text: "Session status: Working".into(),
+        })
+        .await
+        .unwrap();
     controls
         .send(LiveVoiceControl::SetMuted(true))
         .await
@@ -1446,17 +1510,13 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
     )
     .as_secs();
 
-    // The per-call transport deadline must strictly exceed the requested wait,
-    // with at least a 60s margin for IPC round-trip and process scheduling —
-    // for any wait the orchestrator can request, up to the controller ceiling.
-    assert!(
-        at_ceiling > max_timeout_seconds,
-        "transport deadline ({at_ceiling}s) must strictly exceed the requested wait ({max_timeout_seconds}s)"
-    );
-    assert!(
-        at_ceiling - max_timeout_seconds >= 60,
-        "transport deadline must keep a 60s margin over the requested wait, got {}s",
-        at_ceiling - max_timeout_seconds
+    // The per-call transport deadline is the requested wait plus a fixed 60s
+    // margin for IPC round-trip and process scheduling, at the controller
+    // ceiling the orchestrator can request.
+    assert_eq!(
+        at_ceiling,
+        max_timeout_seconds + 60,
+        "transport deadline at the controller ceiling is the wait plus a 60s margin"
     );
     assert_eq!(
         zeron_harness::omp::workers_bridge::call_timeout_for(

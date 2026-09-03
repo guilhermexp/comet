@@ -36,125 +36,81 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use comet_syntax::HighlightKind;
 use gpui::{App, Global, Hsla, SharedString, hsla};
-use serde::{Deserialize, Serialize};
 use zeron_theme::{
-    AccentPreset, AccentSelection, Color as ModelColor, SurfacePreference, SurfaceTreatment,
-    ThemeRegistry, ThemeVariant,
+    AccentSelection, Color as ModelColor, SurfacePreference, SurfaceTreatment, ThemeRegistry,
+    ThemeVariant,
 };
 
-/// User-selectable accent family. A choice is one color identity, not a
-/// miniature multi-hue theme: every interactive accent role stays on the same
-/// authored hue in both appearances.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AccentColor {
-    /// The exact upstream Zeron indigo.
-    #[default]
-    #[serde(alias = "violet", alias = "indigo", alias = "red", alias = "purple")]
-    Zeron,
-    Orange,
-    Amber,
-    Green,
-    #[serde(alias = "teal")]
-    Cyan,
-    Blue,
-    Pink,
-}
+/// User-selectable accent family and the appearance being painted both live in
+/// [`zeron_theme`]: one model, one serde shape, no translation at the seam.
+/// A choice is one color identity, not a miniature multi-hue theme: every
+/// interactive accent role stays on the same authored hue in both appearances.
+pub use zeron_theme::{AccentPreset as AccentColor, Appearance};
 
-impl AccentColor {
-    pub const ALL: [Self; 7] = [
-        Self::Zeron,
-        Self::Orange,
-        Self::Amber,
-        Self::Green,
-        Self::Cyan,
-        Self::Blue,
-        Self::Pink,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Zeron => "Zeron",
-            Self::Orange => "Orange",
-            Self::Amber => "Amber",
-            Self::Green => "Green",
-            Self::Cyan => "Cyan",
-            Self::Blue => "Blue",
-            Self::Pink => "Pink",
+fn accent_tokens(accent: AccentColor, appearance: Appearance) -> AccentTokens {
+    // These are deliberately authored pairs. Runtime contrast correction
+    // used to gamut-clip OKLCH into sRGB and then mutate HSL lightness,
+    // producing different chroma and apparent hues across light/dark.
+    let (primary, strong) = match (accent, appearance) {
+        (AccentColor::Zeron, Appearance::Dark) => {
+            (oklch(0.673, 0.182, 276.935), oklch(0.585, 0.233, 277.117))
         }
-    }
-
-    fn tokens(self, appearance: Appearance) -> AccentTokens {
-        // These are deliberately authored pairs. Runtime contrast correction
-        // used to gamut-clip OKLCH into sRGB and then mutate HSL lightness,
-        // producing different chroma and apparent hues across light/dark.
-        let (primary, strong) = match (self, appearance) {
-            (Self::Zeron, Appearance::Dark) => {
-                (oklch(0.673, 0.182, 276.935), oklch(0.585, 0.233, 277.117))
-            }
-            (Self::Zeron, Appearance::Light) => {
-                (oklch(0.511, 0.262, 276.966), oklch(0.511, 0.262, 276.966))
-            }
-            (Self::Orange, Appearance::Dark) => (oklch(0.75, 0.18, 55.0), oklch(0.54, 0.19, 55.0)),
-            (Self::Orange, Appearance::Light) => (oklch(0.50, 0.19, 55.0), oklch(0.50, 0.19, 55.0)),
-            (Self::Amber, Appearance::Dark) => (oklch(0.80, 0.17, 84.0), oklch(0.52, 0.14, 84.0)),
-            (Self::Amber, Appearance::Light) => (oklch(0.48, 0.14, 84.0), oklch(0.48, 0.14, 84.0)),
-            (Self::Green, Appearance::Dark) => (oklch(0.75, 0.17, 150.0), oklch(0.50, 0.15, 150.0)),
-            (Self::Green, Appearance::Light) => {
-                (oklch(0.46, 0.14, 150.0), oklch(0.46, 0.14, 150.0))
-            }
-            (Self::Cyan, Appearance::Dark) => (oklch(0.76, 0.13, 205.0), oklch(0.49, 0.12, 205.0)),
-            (Self::Cyan, Appearance::Light) => (oklch(0.45, 0.11, 205.0), oklch(0.45, 0.11, 205.0)),
-            (Self::Blue, Appearance::Dark) => (oklch(0.70, 0.17, 255.0), oklch(0.50, 0.20, 255.0)),
-            (Self::Blue, Appearance::Light) => (oklch(0.47, 0.21, 255.0), oklch(0.47, 0.21, 255.0)),
-            (Self::Pink, Appearance::Dark) => (oklch(0.72, 0.18, 350.0), oklch(0.51, 0.20, 350.0)),
-            (Self::Pink, Appearance::Light) => (oklch(0.48, 0.20, 350.0), oklch(0.48, 0.20, 350.0)),
-        };
-        AccentTokens {
-            primary,
-            strong,
-            wash: match appearance {
-                Appearance::Dark => strong.opacity(0.45),
-                Appearance::Light => primary.opacity(0.10),
-            },
-            selection: primary.opacity(if appearance.is_dark() { 0.35 } else { 0.24 }),
-            caret: primary,
-            code_text: primary,
-            code_wash: primary.opacity(match appearance {
-                Appearance::Dark => 0.12,
-                Appearance::Light => 0.10,
-            }),
-            activity: primary,
-            glyph: GlyphPalette::for_accent(primary, strong, appearance),
+        (AccentColor::Zeron, Appearance::Light) => {
+            (oklch(0.511, 0.262, 276.966), oklch(0.511, 0.262, 276.966))
         }
-    }
-}
-
-impl From<AccentColor> for AccentPreset {
-    fn from(value: AccentColor) -> Self {
-        match value {
-            AccentColor::Zeron => Self::Zeron,
-            AccentColor::Orange => Self::Orange,
-            AccentColor::Amber => Self::Amber,
-            AccentColor::Green => Self::Green,
-            AccentColor::Cyan => Self::Cyan,
-            AccentColor::Blue => Self::Blue,
-            AccentColor::Pink => Self::Pink,
+        (AccentColor::Orange, Appearance::Dark) => {
+            (oklch(0.75, 0.18, 55.0), oklch(0.54, 0.19, 55.0))
         }
-    }
-}
-
-impl From<AccentPreset> for AccentColor {
-    fn from(value: AccentPreset) -> Self {
-        match value {
-            AccentPreset::Zeron => Self::Zeron,
-            AccentPreset::Orange => Self::Orange,
-            AccentPreset::Amber => Self::Amber,
-            AccentPreset::Green => Self::Green,
-            AccentPreset::Cyan => Self::Cyan,
-            AccentPreset::Blue => Self::Blue,
-            AccentPreset::Pink => Self::Pink,
+        (AccentColor::Orange, Appearance::Light) => {
+            (oklch(0.50, 0.19, 55.0), oklch(0.50, 0.19, 55.0))
         }
+        (AccentColor::Amber, Appearance::Dark) => {
+            (oklch(0.80, 0.17, 84.0), oklch(0.52, 0.14, 84.0))
+        }
+        (AccentColor::Amber, Appearance::Light) => {
+            (oklch(0.48, 0.14, 84.0), oklch(0.48, 0.14, 84.0))
+        }
+        (AccentColor::Green, Appearance::Dark) => {
+            (oklch(0.75, 0.17, 150.0), oklch(0.50, 0.15, 150.0))
+        }
+        (AccentColor::Green, Appearance::Light) => {
+            (oklch(0.46, 0.14, 150.0), oklch(0.46, 0.14, 150.0))
+        }
+        (AccentColor::Cyan, Appearance::Dark) => {
+            (oklch(0.76, 0.13, 205.0), oklch(0.49, 0.12, 205.0))
+        }
+        (AccentColor::Cyan, Appearance::Light) => {
+            (oklch(0.45, 0.11, 205.0), oklch(0.45, 0.11, 205.0))
+        }
+        (AccentColor::Blue, Appearance::Dark) => {
+            (oklch(0.70, 0.17, 255.0), oklch(0.50, 0.20, 255.0))
+        }
+        (AccentColor::Blue, Appearance::Light) => {
+            (oklch(0.47, 0.21, 255.0), oklch(0.47, 0.21, 255.0))
+        }
+        (AccentColor::Pink, Appearance::Dark) => {
+            (oklch(0.72, 0.18, 350.0), oklch(0.51, 0.20, 350.0))
+        }
+        (AccentColor::Pink, Appearance::Light) => {
+            (oklch(0.48, 0.20, 350.0), oklch(0.48, 0.20, 350.0))
+        }
+    };
+    AccentTokens {
+        primary,
+        strong,
+        wash: match appearance {
+            Appearance::Dark => strong.opacity(0.45),
+            Appearance::Light => primary.opacity(0.10),
+        },
+        selection: primary.opacity(if appearance.is_dark() { 0.35 } else { 0.24 }),
+        caret: primary,
+        code_text: primary,
+        code_wash: primary.opacity(match appearance {
+            Appearance::Dark => 0.12,
+            Appearance::Light => 0.10,
+        }),
+        activity: primary,
+        glyph: GlyphPalette::for_accent(primary, strong, appearance),
     }
 }
 
@@ -208,31 +164,13 @@ struct AccentTokens {
     glyph: GlyphPalette,
 }
 
-/// Which appearance the app is painting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Appearance {
-    #[default]
-    Dark,
-    Light,
-}
-
-impl Appearance {
-    pub fn is_dark(self) -> bool {
-        matches!(self, Self::Dark)
-    }
-
-    pub fn is_light(self) -> bool {
-        matches!(self, Self::Light)
-    }
-
-    /// Map a gpui window appearance onto ours (both vibrant variants are just
-    /// the blurred flavour of the same tone).
-    pub fn from_window(appearance: gpui::WindowAppearance) -> Self {
-        use gpui::WindowAppearance::*;
-        match appearance {
-            Light | VibrantLight => Self::Light,
-            Dark | VibrantDark => Self::Dark,
-        }
+/// Map a gpui window appearance onto ours (both vibrant variants are just
+/// the blurred flavour of the same tone).
+pub fn appearance_from_window(appearance: gpui::WindowAppearance) -> Appearance {
+    use gpui::WindowAppearance::*;
+    match appearance {
+        Light | VibrantLight => Appearance::Light,
+        Dark | VibrantDark => Appearance::Dark,
     }
 }
 
@@ -271,13 +209,6 @@ pub fn theme_generation() -> u32 {
 /// Invalidate caches that bake resolved palette or typography styles.
 pub(crate) fn bump_style_generation() {
     THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
-}
-
-fn model_appearance(appearance: zeron_theme::Appearance) -> Appearance {
-    match appearance {
-        zeron_theme::Appearance::Dark => Appearance::Dark,
-        zeron_theme::Appearance::Light => Appearance::Light,
-    }
 }
 
 fn model_color(color: ModelColor) -> Hsla {
@@ -956,12 +887,12 @@ impl Theme {
     }
 
     pub fn dark_with_accent(accent_color: AccentColor) -> Self {
-        let accent = accent_color.tokens(Appearance::Dark);
+        let accent = accent_tokens(accent_color, Appearance::Dark);
         Self {
             appearance: Appearance::Dark,
             variant_id: "zeron-dark".into(),
             family_id: "zeron".into(),
-            accent_selection: AccentSelection::Preset(accent_color.into()),
+            accent_selection: AccentSelection::Preset(accent_color),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
@@ -1032,12 +963,12 @@ impl Theme {
     }
 
     pub fn light_with_accent(accent_color: AccentColor) -> Self {
-        let accent = accent_color.tokens(Appearance::Light);
+        let accent = accent_tokens(accent_color, Appearance::Light);
         Self {
             appearance: Appearance::Light,
             variant_id: "zeron-light".into(),
             family_id: "zeron".into(),
-            accent_selection: AccentSelection::Preset(accent_color.into()),
+            accent_selection: AccentSelection::Preset(accent_color),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
@@ -1142,7 +1073,7 @@ impl Theme {
         };
         let variant = registry
             .variant(variant_id)
-            .filter(|variant| model_appearance(variant.appearance) == appearance)
+            .filter(|variant| variant.appearance == appearance)
             .or_else(|| registry.variant(fallback_id))
             .expect("the built-in registry contains both Zeron appearances");
         Self::from_variant(variant, accent_selection, surface_preference)
@@ -1153,10 +1084,10 @@ impl Theme {
         accent_selection: AccentSelection,
         surface_preference: SurfacePreference,
     ) -> Self {
-        let appearance = model_appearance(variant.appearance);
+        let appearance = variant.appearance;
         let accent_color = match accent_selection {
             AccentSelection::ThemeDefault => AccentColor::Zeron,
-            AccentSelection::Preset(preset) => preset.into(),
+            AccentSelection::Preset(preset) => preset,
         };
         let mut theme = Self::for_preferences(appearance, accent_color);
         let colors = &variant.colors;
@@ -1846,7 +1777,7 @@ mod tests {
     fn forced_frost_preserves_shell_text_contrast_for_every_builtin() {
         let registry = ThemeRegistry::builtin();
         for variant in registry.families.iter().flat_map(|family| &family.variants) {
-            let appearance = model_appearance(variant.appearance);
+            let appearance = variant.appearance;
             let theme = Theme::from_variant(
                 variant,
                 AccentSelection::ThemeDefault,
@@ -2512,10 +2443,10 @@ mod tests {
     #[test]
     fn window_appearance_maps_onto_ours() {
         use gpui::WindowAppearance as W;
-        assert_eq!(Appearance::from_window(W::Light), Appearance::Light);
-        assert_eq!(Appearance::from_window(W::VibrantLight), Appearance::Light);
-        assert_eq!(Appearance::from_window(W::Dark), Appearance::Dark);
-        assert_eq!(Appearance::from_window(W::VibrantDark), Appearance::Dark);
+        assert_eq!(appearance_from_window(W::Light), Appearance::Light);
+        assert_eq!(appearance_from_window(W::VibrantLight), Appearance::Light);
+        assert_eq!(appearance_from_window(W::Dark), Appearance::Dark);
+        assert_eq!(appearance_from_window(W::VibrantDark), Appearance::Dark);
     }
 
     #[test]

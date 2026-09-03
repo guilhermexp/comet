@@ -5,7 +5,6 @@
 //! Host actions such as screenshot requests. UI clients send semantic actions;
 //! they never construct terminal escape sequences themselves.
 
-use crate::session_host::{self, SessionHostCommand};
 use std::thread;
 use std::time::Duration;
 
@@ -44,15 +43,13 @@ fn write_to_session(
     write_id: Option<String>,
     task_episode_receipt: Option<u64>,
 ) -> Result<(), String> {
-    let command = SessionHostCommand::Write {
-        data: data.to_string(),
+    crate::session_ops::write_session_input(
+        session_id,
+        data.to_string(),
         write_id,
         task_episode_receipt,
-    };
-    match timeout {
-        Some(timeout) => session_host::send_command_with_timeout(session_id, &command, timeout),
-        None => session_host::send_command(session_id, &command),
-    }
+        timeout,
+    )
 }
 
 /// Deliver already-sanitized text through the terminal prompt recipe.

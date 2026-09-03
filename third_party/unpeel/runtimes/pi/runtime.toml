@@ -7,7 +7,13 @@ adapter = "builtin:pi"
 legacy_order = 5
 platforms = ["macos", "linux"]
 supports_quick_launch = true
-capabilities = ["resume", "restart_agent", "append_system_context"]
+capabilities = [
+  "lifecycle_hooks",
+  "notify_when_done",
+  "resume",
+  "restart_agent",
+  "append_system_context",
+]
 
 [display]
 tint = "#7C95FF"
@@ -27,10 +33,10 @@ process_aliases = ["pi"]
 script_path_signatures = []
 
 [lifecycle]
-source = "output"
-authority = "none"
-fallback = "output"
-completion_reliable = false
+source = "hooks"
+authority = "partial"
+fallback = "none"
+completion_reliable = true
 attention_reliable = false
 
 [[usage.stores]]

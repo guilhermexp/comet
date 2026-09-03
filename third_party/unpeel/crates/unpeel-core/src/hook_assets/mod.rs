@@ -63,11 +63,23 @@ pub(crate) fn read_mergeable_json_object(
 /// same directory, then rename over the target. Prevents a concurrent reader
 /// (or a concurrent Unpeel host spawning another session) from observing a torn
 /// half-written settings file.
+///
+/// The parent directory is created first, like `write_executable_script`: a
+/// managed asset whose root was wiped (a clean CLI reinstall, a pruned
+/// `~/.unpeel/hooks`) would otherwise fail the whole install with a bare
+/// `No such file or directory` and leave that runtime hookless.
 pub(crate) fn write_file_atomic(path: &Path, contents: &str, label: &str) -> Result<(), String> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unpeel-settings");
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create dir {} for {label}: {e}", parent.display()))?;
+    }
     let tmp = path.with_file_name(format!(".{file_name}.unpeel-tmp.{}", std::process::id()));
     fs::write(&tmp, contents).map_err(|e| format!("Failed to write {label}: {e}"))?;
     if let Err(e) = fs::rename(&tmp, path) {
@@ -499,6 +511,24 @@ pub(crate) use crate::integrations::{
     muse::setup::{muse_plugin_manifest_json, MUSE_HOOK_SCRIPT},
     opencode::setup::OPENCODE_PLUGIN_SCRIPT,
 };
+
+#[cfg(test)]
+mod write_file_atomic_tests {
+    use super::write_file_atomic;
+
+    #[test]
+    fn a_wiped_asset_root_is_recreated_instead_of_failing_the_install() {
+        let directory = tempfile::tempdir().expect("temporary asset root");
+        let path = directory.path().join("hooks").join("extension.js");
+
+        write_file_atomic(&path, "// lifecycle\n", "test asset").expect("write into a missing dir");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("installed asset"),
+            "// lifecycle\n"
+        );
+    }
+}
 
 #[cfg(test)]
 include!(concat!(

@@ -54,7 +54,13 @@ fn forked(command: &str, provider_session_id: Option<&str>) -> Option<String> {
     })
 }
 
-pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh).with_fork(forked);
+fn embedded_conversation_id(command: &str) -> Option<String> {
+    embedded_resume_id(&tokenize(command))
+}
+
+pub(super) const ADAPTER: ResumeAdapter = ResumeAdapter::new(resumed, fresh)
+    .with_fork(forked)
+    .with_embedded_conversation_id(embedded_conversation_id);
 
 #[cfg(test)]
 mod tests {

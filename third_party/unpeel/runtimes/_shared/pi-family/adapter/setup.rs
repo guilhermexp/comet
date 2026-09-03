@@ -15,6 +15,23 @@ pub(crate) fn lifecycle_extension_path() -> PathBuf {
         .join("pi-family-lifecycle-extension.js")
 }
 
+/// Append `--extension <lifecycle extension>` exactly once.
+///
+/// Every pi-family CLI (`pi`, `omp`, `prime-agent`) takes `-e/--extension` and
+/// runs the same extension API (`agent_start`/`agent_end`), so the Start/Stop
+/// transport is identical for all three; only the alias gate differs, and that
+/// stays with each runtime's own adapter.
+pub(crate) fn with_lifecycle_extension(command: &str) -> String {
+    let trimmed = command.trim();
+    let path = lifecycle_extension_path();
+    let raw_path = path.to_string_lossy();
+    let quoted_path = crate::integrations::shared::shell_quote(&raw_path);
+    if trimmed.contains(raw_path.as_ref()) || trimmed.contains(&quoted_path) {
+        return trimmed.to_string();
+    }
+    format!("{trimmed} --extension {quoted_path}")
+}
+
 fn render_lifecycle_extension(notify_path: &std::path::Path) -> Result<String, String> {
     let notify_path_json = serde_json::to_string(&notify_path.to_string_lossy())
         .map_err(|error| format!("Failed to encode lifecycle hook path: {error}"))?;

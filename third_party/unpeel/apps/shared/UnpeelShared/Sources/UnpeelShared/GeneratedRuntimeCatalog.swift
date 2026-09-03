@@ -333,15 +333,15 @@ public enum UnpeelRuntimeCatalog {
             commandAliases: ["pi"],
             processAliases: ["pi"],
             searchPathSuffixes: [],
-            lifecycleSource: "output",
-            lifecycleAuthority: "none",
-            lifecycleFallback: "output",
-            completionReliable: false,
+            lifecycleSource: "hooks",
+            lifecycleAuthority: "partial",
+            lifecycleFallback: "none",
+            completionReliable: true,
             attentionReliable: false,
             anchorStartEventToOutput: true,
             attentionClearsOnOutput: true,
             distrustStopsWhileOutputGrows: false,
-            capabilities: [.resume, .restartAgent, .appendSystemContext],
+            capabilities: [.lifecycleHooks, .notifyWhenDone, .resume, .restartAgent, .appendSystemContext],
             usageStores: [
                 UnpeelRuntimeUsageStore(
                     root: ".pi/agent/sessions",
@@ -719,7 +719,7 @@ public enum UnpeelRuntimeCatalog {
             anchorStartEventToOutput: true,
             attentionClearsOnOutput: true,
             distrustStopsWhileOutputGrows: false,
-            capabilities: [.lifecycleHooks, .notifyWhenDone],
+            capabilities: [.lifecycleHooks, .notifyWhenDone, .resume, .restartAgent],
             usageStores: [
             ],
             suggestedPresets: [
@@ -760,7 +760,7 @@ public enum UnpeelRuntimeCatalog {
             anchorStartEventToOutput: true,
             attentionClearsOnOutput: true,
             distrustStopsWhileOutputGrows: false,
-            capabilities: [.lifecycleHooks, .notifyWhenDone],
+            capabilities: [.lifecycleHooks, .notifyWhenDone, .resume, .restartAgent],
             usageStores: [
             ],
             suggestedPresets: [
