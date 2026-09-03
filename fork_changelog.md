@@ -9,6 +9,39 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-09-03 — PR #7: Chat Trajectory Preview (commit `c99834d8`)
+
+- Integrated `feat/chat-trajectory-preview` (PR #7) to provide a local analytical and inspection surface for agent execution trajectories.
+- Added GPUI `TrajectoryView` with 3-lane Timeline (Input, Model, Tools), virtualized Ledger with fixed row height (`px(26.0)`), 5-tab Inspector with safe on-demand `Raw Reveal`, and Toolbar with Follow Live edge tracking.
+- Implemented device-local fail-open Trajectory store (`zeron-engine::trajectory_store`) backed by SQLite and in-memory `TrajectoryDegradedInterval` tracking for loss and saturation accounting.
+- Added RPC streaming watch (`watch_trajectory`) and safe raw reveal (`reveal_trajectory_raw`) endpoints with isolated paging.
+- Key commits: `c99834d8`, `034550e4`, `5c235421`, `d2aba708`, `49ed099d`, `34ddda4a`, `28f87870`, `31c01a6b`, `60b4f739`, `d800cec0`, `5f497887`, `c50d4ec5`, `ad903d87`, `96b936ac`, `630aa8e3`.
+
+## 2026-09-02 — PR #6: Worker Hibernation Safety (commit `f3c04cea`)
+
+- Integrated `fix/hibernation-safety-and-review-followups` (PR #6) to harden automatic Worker idle hibernation.
+- Added host quiet window, per-candidate token verification, serialized hibernation with host activity, and per-Worker resume evidence checks.
+- Output growth after Stop revokes idle confirmation; unconfirmed clear-attention resets safely.
+- Ordered `list_presets` by favorite status.
+- Key commits: `f3c04cea`, `836f4884`, `bc7287d9`, `def9439b`, `03e52fde`, `2e1dc338`, `4c1814c8`, `effa8580`, `99f40583`, `01f73d02`.
+
+## 2026-09-02 — PR #5: Pi Hooks, Live Voice & Engine/RPC Refactors (commit `e30c9bb7`)
+
+- Integrated `ship/pi-hooks-live-voice-deepen-ac` (PR #5) expanding agent capabilities and internal architecture.
+- Added Live Voice calls during active runs belonging to the engine host, surviving chat switching/loss of focus, with macOS microphone permissions and durable voice delegations (`Steer`).
+- Implemented Pi runtime lifecycle hooks and resume support for the pi family (`omp`, `prime-agent`).
+- Refactored Engine and RPC layers (Phases A/C): unified typed RPC method registry, `ProcessRunner` for Git operations, diff mode dispatch centralized in `diff_sync`, and shared `LocalWorkersClient`.
+- Key commits: `e30c9bb7`, `32d7abc2`, `8069018c`, `15419a44`, `2c1d35e7`, `6db25829`, `5b6b57f6`, `54dd16aa`, `8831b726`, `ce49988d`, `6b69cf18`, `2a54debc`, `fb54ff49`, `651a7906`, `3d356eab`, `8c49035a`, `379bf60a`, `dee13cd8`, `4f370691`, `e37b38b4`, `29a62025`, `848c0a7d`, `da9cb7ae`, `26efdbc8`, `f635c186`, `2c7e645e`, `01cd79dd`, `c2105161`, `a3f7de8d`, `df604426`, `251fedb2`, `0a8f6306`, `23d2ebdd`, `5e4bad60`.
+
+## 2026-09-01 — PR #4: Workspace & Worker Visibility, Antigravity & macOS Dev Workflow (commit `1e746584`)
+
+- Integrated `fix/dev-workflow-macos` (PR #4) enhancing UI visibility and developer environment.
+- Added Worked Projects widget to Workspace details card and listed CLI Workers in Chat Transcript Export.
+- Exposed Antigravity Account Pool in Accounts settings with fail-soft Keychain precedence and file fallback.
+- Made default development workflow macOS-compatible and elevated Worker timeouts (`wait_for_status` to 600s, bridge timeout to 900s).
+- Added token usage display for Workers and hardened OMP telemetry binding.
+- Key commits: `1e746584`, `8bda413c`, `b6c39f71`, `570183c6`, `36a9242d`, `d696ca6d`, `3bb13599`, `4783878b`, `f00b89a9`, `fc4f0c52`, `4a6a4b95`, `43855542`, `5180c17e`, `1b89ca85`, `4670a4cb`, `ba5f6c62`, `8467a283`, `6e90cac8`, `a57484d1`, `0c50bf1b`, `a2d6990e`, `cc87fc2f`, `17cb34ef`.
+
 ## 2026-08-30 — upstream `v0.2.29` reconciled
 
 - Retained branch/worktree: `chore/upstream-sync-v0.2.29` in `comet-upstream-v0.2.29`.

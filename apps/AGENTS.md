@@ -30,7 +30,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 |---|---|---|
 | `zeron/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p zeron` |
 | Fluxo headed/headless real | e2e | `scripts/e2e-smoke.sh` · `scripts/dev-demo.sh` |
-| `ios/**` | none — sem suite; validação manual no Xcode | Xcode |
+| `ios/**` (`apps/ios/ZeronTests/`) | unit / integration (XCTest: tracking de PRs/checkout, RPC/stream de device relay, gates de versão/resiliência de rede, wire layout de chat frames, merge/conformance de registry e persistência/HLC de RegistryDoc) | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` ou Product → Test no Xcode |
 
 ## Child DOX Index
 

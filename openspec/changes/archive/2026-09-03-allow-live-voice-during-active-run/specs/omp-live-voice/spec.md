@@ -1,10 +1,4 @@
-# omp-live-voice Specification
-
-## Purpose
-
-Realtime bidirectional voice interaction for local Oh My Pi (OMP) coding sessions in Comet, supporting transient voice discussion, contextual progress observation, and voice-confirmed steering during active runs.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Local OMP Live availability
 
@@ -46,19 +40,6 @@ The system SHALL offer Live Voice when an existing selected Chat is hosted on th
 - **THEN** start SHALL fail with actionable OMP update guidance
 - **AND** start SHALL NOT mutate the Chat
 
-### Requirement: Live can create the first Chat
-
-The system SHALL allow Live Voice to be the first action in a new-Chat draft by materializing an ordinary Chat with the selected target, Checkout, and OMP configuration before starting Live.
-
-#### Scenario: New Chat starts with voice
-- **Test:** UI unit + UI integration
-
-- **WHEN** the new-Chat canvas targets the current device and selects OMP
-- **THEN** the microphone action SHALL be visible and enabled without a prior text prompt
-- **AND** invoking it SHALL create a normal Chat, start Live, and select that Chat only after start succeeds
-- **AND** a failed creation or Live start SHALL remove the untouched empty Chat and preserve the user's current surface
-- **AND** later text runs SHALL resume the OMP session created by Live
-
 ### Requirement: Media remains inside OMP
 
 The system SHALL transport only control, phase, level, transient voice transcript, delegation, operational-context, and terminal frames between Comet and the Live child. Operational context SHALL contain only bounded display-safe Session status, visible assistant text, visible action labels, input-wait state, and visible errors; it SHALL exclude audio, reasoning deltas, raw Run Journal data, and protected tool payloads or results.
@@ -76,24 +57,6 @@ The system SHALL transport only control, phase, level, transient voice transcrip
 - **THEN** context updates SHALL NOT initiate speech, delegation, or a durable Chat entry
 - **AND** protected stream content SHALL NOT enter the Live context frame
 - **AND** context delivery SHALL NOT backpressure or alter the coding run
-
-### Requirement: Live shares the Chat OMP session
-
-The system SHALL start Live Voice with the Chat's stored OMP session identity when one exists and SHALL persist the effective OMP session identity when Live creates the first session for a Chat.
-
-#### Scenario: Existing OMP session is resumed
-- **Test:** harness integration + engine integration
-
-- **WHEN** Live starts for a Chat with a stored OMP session in the same Checkout
-- **THEN** the Live child SHALL switch to that session before `live_start`
-- **AND** subsequent text runs SHALL resume the same identity
-
-#### Scenario: Live creates the first OMP session
-- **Test:** harness integration + engine integration
-
-- **WHEN** Live starts for an eligible Chat without a stored OMP session
-- **THEN** OMP SHALL create a normal session
-- **AND** Comet SHALL persist its non-empty identity before exposing Live as active
 
 ### Requirement: Delegations use the durable run path
 
@@ -129,44 +92,7 @@ The system SHALL convert one Live delegation into one idempotent durable user in
 - **THEN** exactly one user entry and one execution path SHALL be durable
 - **AND** spoken paraphrases SHALL remain transient
 
-### Requirement: Competing commands stop Live
-
-The system SHALL stop an active Live frontend before executing any durable command other than the exact command owned by its active delegation.
-
-#### Scenario: Text command arrives while Live is active
-- **Test:** engine integration
-
-- **WHEN** the host executor receives a different command ID
-- **THEN** Live SHALL release microphone and playback before that command executes
-
-### Requirement: Device-local lifecycle
-
-The system SHALL keep Live operations local to the host engine. Chat selection changes, clearing the selected Chat surface, window focus loss, and minimization SHALL NOT release the Live child. The system SHALL release the Live child on explicit End, Escape while controlling the active Live Chat, a competing durable command, engine shutdown, transport failure, or app quit.
-
-#### Scenario: Navigation during delegated work
-- **Test:** UI unit + engine e2e
-
-- **WHEN** the user selects another Chat or leaves the Chat surface while a Live delegation is running
-- **THEN** the Live call SHALL remain active on its originating Chat
-- **AND** delegated progress and final speakable context SHALL continue through the host engine
-- **AND** returning to the originating Chat SHALL show the current Live state
-
-#### Scenario: Repeated stop
-- **Test:** engine unit
-
-- **WHEN** stop is called after Live has already ended
-- **THEN** it SHALL succeed without spawning work or emitting duplicate terminal state
-
-### Requirement: macOS microphone declaration
-
-The packaged macOS application SHALL declare a microphone purpose string and SHALL be smoke-tested from a signed Finder-launched app.
-
-#### Scenario: Packaged permission grant
-- **Test:** manual packaged smoke
-
-- **WHEN** a user starts Live from the signed app for the first time
-- **THEN** macOS SHALL present an attributable microphone permission flow
-- **AND** successful grant SHALL allow OMP capture
+## ADDED Requirements
 
 ### Requirement: Live observes active Session progress without acting
 

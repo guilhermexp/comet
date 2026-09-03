@@ -95,7 +95,37 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 - **Imagem inline é a imagem, sem moldura**: sem card, sem borda, sem barra de nome — só o `img`, com **altura absoluta** (`INLINE_IMAGE_HEIGHT`) e largura AUTO, porque é a única combinação que o gpui deriva do ratio intrínseco (`Img::request_layout`); largura em porcentagem deixaria a altura no natural e voltaria a letterboxar. A altura fixa é o que mantém a row analítica pro virtualizador, então o estado `Reloading` ocupa a mesma caixa.
 - **GPUI Dev Inspector é exclusivo de development builds (`debug_assertions`)**: `inspector.rs` é gateado sob `#[cfg(debug_assertions)]`, ativado por atalho `cmd-alt-i` (registrado em `shell::apply_keymap`) ou menu `Developer -> Toggle GPUI Inspector`. O renderer monta um painel com botão de picking (`inspector.start_picking()`), exibição de `source_location` (`file:line`), `instance_id` e cópia para clipboard, mais os estados dos elementos inspecionados (`inspector.render_inspector_states`). Compilação em release exclui completamente o módulo e suas chamadas sem qualquer overhead.
 - **Worked Projects no card Workspace é uma projeção pura do transcript**: `details_sidebar/worked_projects.rs` deriva somente de `&[SessionMessageEntry]`, `&[WorkersProject]`, do checkout do chat e de `home_dir`. Casamento filtra grupos organizacionais (`!is_group`), calcula Leaf Roots sobre todos os projetos registrados antes de excluir o own checkout, ignora caminhos relativos, expande `~/` com home dir e respeita fronteira de componente (`/a/kanna` não casa raiz `/a/kanwas`). O bloco só aparece em `DetailsMode::Orchestrator` com contagem > 0, empilha sem gap vertical e o resultado é memoizado em `DetailsSidebarState` por (context key, transcript length, total de parts, fingerprint de projetos). O total de parts não é redundante: `TranscriptFrame::Delta` faz upsert da MESMA entry por id, então `transcript.len()` não muda enquanto uma nova part `ReadFile`/`Exec` entra — sem essa dimensão o card congela pelo turno inteiro.
-- **Chat Trajectory Preview (`trajectory/`) é surface de inspeção analítica e técnica no pane direito**: `TrajectoryView` é dona do próprio watch task (`subscribe_checked`) e retoma histórico/live por watermark (`TrajectoryCursor`); estados terminais (`ChatDeleted`, `StoreUnavailable`) selam o stream e impedem reabertura. `AppState` apenas expõe o handle da engine para emissão de RPCs (`WatchTrajectory`, `RevealTrajectoryRaw`) e nunca retém estado de surface fechada. Raw Reveal (`RevealState`) é estritamente efêmero no dispositivo local e nunca persiste nem sincroniza; troca de seleção ou fechamento limpa o estado. `ROW_HEIGHT` no ledger é fixo (`px(26.0)`) e nenhum estado altera a altura da linha. Dado ausente renderiza como `Unavailable` ou `Unsettled`, nunca como zero ou string vazia sintetizada. Timeline usa 3 lanes fixas (`Input`, `Model`, `Tools`) com geometria pura, e o layout responsivo comuta entre `Split` e `NarrowDetail` em `TRAJECTORY_SPLIT_THRESHOLD = px(600.0)` sem perder a seleção.
+- **Chat Trajectory Preview (`trajectory/`) é surface de inspeção analítica e técnica no pane direito**: `TrajectoryView` é dona do próprio watch task (`subscribe_checked`) e retoma histórico/live por watermark (`TrajectoryCursor`); estados terminais (`ChatDeleted`, `StoreUnavailable`) selam o stream e impedem reabertura. `AppState` apenas expõe o handle da engine para emissão de RPCs (`WatchTrajectory`, `RevealTrajectoryRaw`) e nunca retém estado de surface fechada. Raw Reveal (`RevealState`) é estritamente efêmero no dispositivo local e nunca persiste nem sincroniza; troca de seleção ou fechamento limpa o estado. `ROW_HEIGHT` no ledger é fixo (`px(26.0)`) e nenhum estado altera a altura da linha. Dado ausente renderiza como `Unavailable` ou `Unsettled`, nunca como zero ou vazio fabricado.
+- **Settings → Projects mostra o LEDGER, nao o working set.** A sidebar de
+  Workers lista `projects[]`, que `remove_project` poda junto com as sessoes;
+  esta pagina lista `zeron_workers_unpeel::project_ledger`, que sobrevive a
+  poda. Uma linha so do ledger nao tem `project_id`: renomear, "Fill with AI" e
+  "Run Auto Doc" ficam indisponiveis nela porque nao ha o que lancar. O
+  "Forget" do Danger Zone apaga metadado e NAO toca em sessao — e o verbo
+  oposto do "Remove project" do menu de contexto da sidebar. Grupos
+  organizacionais compartilham o path do pai e ficam fora; worktrees de path
+  próprio continuam. A lista rola no próprio pane.
+- **Git so roda para o projeto SELECIONADO.** `status` e os dois commits
+  ancora custam processos; a listagem nunca os chama. E `RepositoryState` tem
+  um quarto estado que o reference nao tem — `FolderMissing` — porque o ledger
+  guarda projetos cuja pasta o usuario pode ter movido: sem ele, uma pasta
+  apagada leria como "nao e repo" e ganharia um Initialize Git que falharia.
+  Link de repository preserva `GitRemote.host`; nunca reconstrói tudo em
+  `github.com`.
+- **Config/Worktree são editor, não resumo.** Target suportado + listas shared,
+  Unix e Windows normalizam linhas vazias/comentários e só gravam quando o
+  conteúdo ou target mudou. Saves são serializados; enquanto um está em voo,
+  a fila preserva o draft mais novo por projeto e só avança o baseline depois
+  da persistência correspondente. Ícone usa SHA-256 do path, é carregado fora
+  do render e reset/forget só podem remover filho direto do diretório app-owned.
+- **Falha de setup e sucesso parcial visível.** O worktree criado continua
+  selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
+  ao refresh seguinte e nenhum Worker é lançado automaticamente nele.
+- **Settings → Accounts renderiza provedores na ordem fixa Claude, Codex, Kimi,
+  Antigravity, Cursor.** Contas gerenciadas (Kimi Code, Antigravity) chegam da
+  engine `active: true, switchable: false`; a linha não expõe Add account,
+  Switch nem Forget, e a autenticação permanece nos CLIs. O empty state das
+  duas compartilha a cópia de assinatura gerenciada não detectada.
 
 ## Work Guidance
 
@@ -142,35 +172,4 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 Subárvores com doc próprio: [`src/trajectory/AGENTS.md`](src/trajectory/AGENTS.md) (surface de preview analítico da trajetória de Chat, timeline, ledger virtualizado e inspector com raw reveal efêmero).
 
-Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`. Os módulos-raiz `chat_export.rs`, `composer.rs`, `markdown_decor.rs` e `inspector.rs` (dev-only) também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.
-
-- **Settings → Projects mostra o LEDGER, nao o working set.** A sidebar de
-  Workers lista `projects[]`, que `remove_project` poda junto com as sessoes;
-  esta pagina lista `zeron_workers_unpeel::project_ledger`, que sobrevive a
-  poda. Uma linha so do ledger nao tem `project_id`: renomear, "Fill with AI" e
-  "Run Auto Doc" ficam indisponiveis nela porque nao ha o que lancar. O
-  "Forget" do Danger Zone apaga metadado e NAO toca em sessao — e o verbo
-  oposto do "Remove project" do menu de contexto da sidebar. Grupos
-  organizacionais compartilham o path do pai e ficam fora; worktrees de path
-  próprio continuam. A lista rola no próprio pane.
-- **Git so roda para o projeto SELECIONADO.** `status` e os dois commits
-  ancora custam processos; a listagem nunca os chama. E `RepositoryState` tem
-  um quarto estado que o reference nao tem — `FolderMissing` — porque o ledger
-  guarda projetos cuja pasta o usuario pode ter movido: sem ele, uma pasta
-  apagada leria como "nao e repo" e ganharia um Initialize Git que falharia.
-  Link de repository preserva `GitRemote.host`; nunca reconstrói tudo em
-  `github.com`.
-- **Config/Worktree são editor, não resumo.** Target suportado + listas shared,
-  Unix e Windows normalizam linhas vazias/comentários e só gravam quando o
-  conteúdo ou target mudou. Saves são serializados; enquanto um está em voo,
-  a fila preserva o draft mais novo por projeto e só avança o baseline depois
-  da persistência correspondente. Ícone usa SHA-256 do path, é carregado fora
-  do render e reset/forget só podem remover filho direto do diretório app-owned.
-- **Falha de setup e sucesso parcial visível.** O worktree criado continua
-  selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
-  ao refresh seguinte e nenhum Worker é lançado automaticamente nele.
-- **Settings → Accounts renderiza provedores na ordem fixa Claude, Codex, Kimi,
-  Antigravity, Cursor.** Contas gerenciadas (Kimi Code, Antigravity) chegam da
-  engine `active: true, switchable: false`; a linha não expõe Add account,
-  Switch nem Forget, e a autenticação permanece nos CLIs. O empty state das
-  duas compartilha a cópia de assinatura gerenciada não detectada.
+Subárvores sem doc próprio (ainda não têm regra local além da desta pasta): `shell/` (spaces, tabs), `terminal/` (emulator, panel, view), `settings/`, `markdown/`, `workers/` (model, client compartilhado, terminal de polling/journal, menus de sessão/projeto/workspace, menu bar status item e monitor de recursos — interface com `crates/workers-unpeel`). Os módulos-raiz `chat_export.rs`, `composer.rs`, `markdown_decor.rs` e `inspector.rs` (dev-only) também permanecem governados por este doc. Adensar aqui quando alguma subárvore ganhar contrato próprio.

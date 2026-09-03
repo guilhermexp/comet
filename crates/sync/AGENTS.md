@@ -18,7 +18,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 
 ## Work Guidance
 
-- Bug de "device sumiu" / "não converge": comece pelo `edge_convergence.rs`, que roda contra o edge real, antes de suspeitar do schema.
+- Bug de "device sumiu" / "não converge": comece pelo `tests/registry_edge.rs`, que roda contra o edge real, antes de suspeitar do schema.
 
 ## Verification
 

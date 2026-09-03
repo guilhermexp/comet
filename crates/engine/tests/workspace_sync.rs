@@ -5,7 +5,7 @@
 //! updates (`export(updates)`) between the two engines' workspace docs on a timer,
 //! which is exactly what `RoomClient` + the SessionRoom DO do over the wire. A live
 //! variant against a real edge runs behind `#[ignore]` (ZERON_EDGE_WS, like
-//! zeron-sync's edge_convergence test).
+//! zeron-sync's `registry_edge` test in `crates/sync/tests/registry_edge.rs`).
 
 use std::sync::Arc;
 use std::time::Duration;

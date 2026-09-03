@@ -46,7 +46,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `zeron login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `zeron login` first"; `zeron daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
-| 3.2 Sessions engine | partial | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS. Gaps: idle reaper + 10-min stall watchdog for persistent harness sessions. |
+| 3.2 Sessions engine | done | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS, idle reaper for parked persistent sessions (`SESSION_IDLE` 30 min, `crates/engine/src/sessions.rs`). The 10-min stall watchdog was deliberately not ported (rejected in review, see the module doc in `sessions.rs`): a live child is the working signal and every dying path carries its own visible error. Worker hibernation (`hibernation_candidates` / `idle_since_unix_ms`, `crates/workers-unpeel/src/lib.rs`, spec `worker-hibernation`) is a separate capability, not the session reaper. |
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
@@ -62,6 +62,8 @@ not built yet).
 | Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
+| OpenCode adapter | done | `crates/harness/src/opencode/`, HTTP/SSE server protocol, model discovery, turn-boundary steering. |
+| OMP adapter & Live Voice | done | `crates/harness/src/omp/`, native driver over `omp --mode rpc-ui`, live voice audio/context streaming, subagent mapping. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema
@@ -95,18 +97,19 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | Token-usage display dropped | done | No WatchUsage, no doc `tokens`, no profile heatmap; rate-limit meters + Usage AgentEvent passthrough kept as specified. |
+| Worker model/token usage (Workers widget) | done | Separate feature, spec `workers-widget-model-usage`: per-worker `total_tokens` + `model_usage` from provider telemetry (`update_provider_telemetry`, `crates/workers-unpeel/src/activity_bridge.rs:510`), presented in the details sidebar (`crates/ui/src/details_sidebar/view.rs:1455` gates the collapsible row, `:1607` renders per-model totals). Not the Chat token-usage display above. |
 
 ## Deferred (cross-cutting)
 
-- **Mobile app** — out of scope for the native rewrite so far.
+- **Mobile app** — native companion exists in `apps/ios/` (SwiftUI + Loro CRDT doc synchronization + `ChatRoomClient` / `DocDisk` / `ZeronTests/`). Build/smoke verification on current workstation pending full Xcode environment.
 - **E2EE** — transport is TLS + WorkOS bearers; end-to-end encryption of doc
   contents not designed.
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
-- **Engine hardening**: single-instance lock, parent-PID watchdog, crash
-  shield, idle reaper / stall watchdog, boot warm-open of recent chats.
+- **Engine hardening**: parent-PID watchdog, crash shield, boot warm-open of
+  recent chats.
 
 ## Summary
 
-Table rows above: **42 done · 6 partial**, plus the cross-cutting deferrals
+Table rows above: **49 done · 5 partial** (the `done (changed shape)` row counts as done), plus the cross-cutting deferrals
 (mobile, E2EE, macOS packaging execution, engine hardening) — the last
 overlaps the named gaps in the partial rows.
