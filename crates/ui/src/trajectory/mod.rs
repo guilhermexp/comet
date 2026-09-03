@@ -9,14 +9,11 @@ pub use inspector::{
     InspectorTab, SummaryField, SummaryValue, TRAJECTORY_SPLIT_THRESHOLD, TrajectoryLayout,
     available_tabs, layout_mode, render_inspector, reveal_params, summary_fields,
 };
-pub use ledger::{
-    LedgerViewport, ROW_HEIGHT, anchor_after_prepend, live_edge_scroll_target, render_ledger,
-    scroll_target_for_row, should_follow_live_edge,
-};
+pub use ledger::{ROW_HEIGHT, is_away_from_live_edge, keep_following_live, render_ledger};
 pub use model::{
     DurationMode, LedgerRow, LedgerRowKind, RevealState, RowId, TrajectoryViewModel,
     TrajectoryViewStatus,
 };
-pub use timeline::{LANES, LaneLayout, LaneSpan, lane_layout, render_timeline, span_at_fraction};
+pub use timeline::{LANES, LaneLayout, LaneSpan, lane_layout, render_timeline};
 pub use toolbar::{ToolbarAction, handle_toolbar_action, render_toolbar};
 pub use view::TrajectoryView;

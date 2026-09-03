@@ -329,13 +329,17 @@ impl SessionsEngine {
         let weak = Arc::downgrade(&self.inner);
         let mut rx = store.subscribe_events();
         tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                if let TrajectoryStoreEvent::ChatDeleted { chat_id } = event {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.tombstone_chat(&chat_id);
-                    } else {
-                        break;
+            loop {
+                match rx.recv().await {
+                    Ok(TrajectoryStoreEvent::ChatDeleted { chat_id }) => {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.tombstone_chat(&chat_id);
+                        } else {
+                            break;
+                        }
                     }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -1718,9 +1722,8 @@ impl Inner {
         }
         let inf = lock(&self.in_flight_reasoning).remove(chat_id);
         if let Some(inf) = inf {
-            let bounded = zeron_proto::trajectory::truncate_preview(&inf.text, 1024);
             let (summary, sanitized_text) =
-                zeron_proto::trajectory::sanitize_prompt_preview(&bounded, 1024);
+                zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024);
             let rec = TrajectoryRecord {
                 id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 1),
                 chat_id: chat_id.to_string(),
@@ -1771,9 +1774,8 @@ impl Inner {
         }
         let inf = lock(&self.in_flight_text).remove(chat_id);
         if let Some(inf) = inf {
-            let bounded = zeron_proto::trajectory::truncate_preview(&inf.text, 1024);
             let (summary, sanitized_text) =
-                zeron_proto::trajectory::sanitize_prompt_preview(&bounded, 1024);
+                zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024);
             let rec = TrajectoryRecord {
                 id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 0),
                 chat_id: chat_id.to_string(),
@@ -1854,16 +1856,10 @@ impl Inner {
                     .expect("in-flight text inserted above");
                 if entry.text.len() < PREVIEW_CAP {
                     entry.text.push_str(text);
-                    if entry.text.len() > PREVIEW_CAP {
-                        entry.text =
-                            zeron_proto::trajectory::truncate_preview(&entry.text, PREVIEW_CAP);
-                    }
                 }
                 if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
-                    let bounded =
-                        zeron_proto::trajectory::truncate_preview(&entry.text, PREVIEW_CAP);
                     let (summary, sanitized_text) =
-                        zeron_proto::trajectory::sanitize_prompt_preview(&bounded, PREVIEW_CAP);
+                        zeron_proto::trajectory::sanitize_prompt_preview(&entry.text, PREVIEW_CAP);
                     let rec = TrajectoryRecord {
                         id: TrajectoryRecordId::new(&entry.run_id, entry.start_seq, 0),
                         chat_id: chat_id.to_string(),
@@ -1933,16 +1929,10 @@ impl Inner {
                     .expect("in-flight reasoning inserted above");
                 if entry.text.len() < PREVIEW_CAP {
                     entry.text.push_str(text);
-                    if entry.text.len() > PREVIEW_CAP {
-                        entry.text =
-                            zeron_proto::trajectory::truncate_preview(&entry.text, PREVIEW_CAP);
-                    }
                 }
                 if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
-                    let bounded =
-                        zeron_proto::trajectory::truncate_preview(&entry.text, PREVIEW_CAP);
                     let (summary, sanitized_text) =
-                        zeron_proto::trajectory::sanitize_prompt_preview(&bounded, PREVIEW_CAP);
+                        zeron_proto::trajectory::sanitize_prompt_preview(&entry.text, PREVIEW_CAP);
                     let rec = TrajectoryRecord {
                         id: TrajectoryRecordId::new(&entry.run_id, entry.start_seq, 1),
                         chat_id: chat_id.to_string(),

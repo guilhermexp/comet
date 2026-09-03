@@ -23,7 +23,7 @@ use crate::{
     theme::Theme,
     trajectory::{
         inspector::{InspectorTab, TrajectoryLayout, layout_mode, render_inspector, reveal_params},
-        ledger::{ROW_HEIGHT, is_away_from_live_edge, render_ledger, should_follow_live_edge},
+        ledger::{ROW_HEIGHT, keep_following_live, render_ledger},
         model::{RevealState, RowId, TrajectoryViewModel, TrajectoryViewStatus},
         timeline::render_timeline,
         toolbar::{ToolbarAction, handle_toolbar_action, render_toolbar},
@@ -113,15 +113,17 @@ pub struct TrajectoryView {
     inspector_tab: InspectorTab,
     reveal_tasks: HashMap<TrajectoryRawField, Task<()>>,
     error: Option<SharedString>,
-    started: bool,
+    live_jump_from: Option<Pixels>,
     last_width: Option<Pixels>,
     narrow_inspecting: bool,
 }
 
 impl TrajectoryView {
     /// `state` is the global `Entity<AppState>` (source of `EngineHandle`).
-    pub fn new(state: Entity<AppState>, chat_id: String, cx: &mut Context<Self>) -> Self {
-        let mut view = Self {
+    /// Lazy: no RPC until [`TrajectoryView::ensure_watch`] runs, so a capture
+    /// fixture can seed the model without an engine stream feeding it.
+    pub fn new(state: Entity<AppState>, chat_id: String) -> Self {
+        Self {
             state,
             chat_id: chat_id.clone(),
             model: TrajectoryViewModel::new(chat_id),
@@ -130,12 +132,10 @@ impl TrajectoryView {
             inspector_tab: InspectorTab::Summary,
             reveal_tasks: HashMap::new(),
             error: None,
-            started: false,
+            live_jump_from: None,
             last_width: None,
             narrow_inspecting: false,
-        };
-        view.ensure_watch(cx);
-        view
+        }
     }
 
     pub fn chat_id(&self) -> &str {
@@ -161,19 +161,27 @@ impl TrajectoryView {
     /// Ensure the watch subscription is running. Called by the shell when
     /// the surface becomes active or when engine boots.
     pub fn ensure_watch(&mut self, cx: &mut Context<Self>) {
-        if self.started && self.watch_task.is_some() {
+        if self.watch_task.is_some() {
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.started = true;
-        self.watch_task = Some(Self::spawn_watch(engine, self.chat_id.clone(), cx));
+        self.watch_task = Some(Self::spawn_watch(self.chat_id.clone(), cx));
     }
 
-    fn spawn_watch(engine: EngineHandle, chat_id: String, cx: &mut Context<Self>) -> Task<()> {
+    /// The engine handle is re-read on every (re)connect: after a sign-out /
+    /// sign-in the shell replaces the runtime, and a handle pinned at spawn
+    /// time would keep dialing the dead client forever.
+    fn spawn_watch(chat_id: String, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
+                let engine: Option<EngineHandle> =
+                    match this.read_with(cx, |view, cx| view.state.read(cx).engine().cloned()) {
+                        Ok(engine) => engine,
+                        Err(_) => return,
+                    };
+                let Some(engine) = engine else {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    continue;
+                };
                 let params_opt =
                     this.read_with(cx, |view, _| next_watch_params(&chat_id, &view.model));
                 let params = match params_opt {
@@ -202,25 +210,21 @@ impl TrajectoryView {
                         while let Some(value) = sub.recv().await {
                             let item_res: Result<TrajectoryWatchItem, _> =
                                 serde_json::from_value(value);
-                            let is_terminal = match &item_res {
-                                Ok(TrajectoryWatchItem::Terminal { .. }) => true,
-                                _ => false,
-                            };
+                            // Both seal this stream: a resync must reopen
+                            // without a cursor, and continuing on the same
+                            // stream would let the next delta re-arm a
+                            // watermark that skips the lagged records forever.
+                            let ends_stream = matches!(
+                                item_res,
+                                Ok(TrajectoryWatchItem::Terminal { .. })
+                                    | Ok(TrajectoryWatchItem::ResyncRequired { .. })
+                            );
 
                             let alive = this.update(cx, |view, cx| {
                                 match item_res {
                                     Ok(item) => {
                                         view.model.apply_watch_item(item);
-                                        if should_follow_live_edge(&view.model) {
-                                            if let Some(last_idx) =
-                                                view.model.rows().len().checked_sub(1)
-                                            {
-                                                view.scroll_handle.scroll_to_item(
-                                                    last_idx,
-                                                    ScrollStrategy::Nearest,
-                                                );
-                                            }
-                                        }
+                                        view.follow_live_edge();
                                     }
                                     Err(err) => {
                                         view.error =
@@ -233,9 +237,8 @@ impl TrajectoryView {
                                 return;
                             }
 
-                            if is_terminal {
-                                // Stop loop immediately on terminal watch item
-                                return;
+                            if ends_stream {
+                                break;
                             }
                         }
 
@@ -282,6 +285,52 @@ impl TrajectoryView {
         })
     }
 
+    /// Keep or suspend live following for an arriving record, decided here in
+    /// the stream task rather than at render time: judged before the catch-up
+    /// scroll is queued, a stream faster than the frame rate cannot hide the
+    /// user's scroll-back behind a perpetually pending jump. Suspension also
+    /// drops any jump still queued so it cannot yank the viewport afterwards.
+    /// Only the toolbar's explicit "Follow Live" re-arms.
+    fn follow_live_edge(&mut self) {
+        if !self.model.following_live() {
+            return;
+        }
+        let (offset_y, max_offset_y, jump_pending) = {
+            let state = self.scroll_handle.0.borrow();
+            (
+                state.base_handle.offset().y,
+                state.base_handle.max_offset().y,
+                state.deferred_scroll_to_item.is_some(),
+            )
+        };
+        if !jump_pending {
+            self.live_jump_from = None;
+        }
+        if keep_following_live(
+            offset_y,
+            max_offset_y,
+            self.live_jump_from,
+            ROW_HEIGHT * 2.0,
+        ) {
+            self.scroll_to_live_edge();
+        } else {
+            self.model.set_following_live(false);
+            self.live_jump_from = None;
+            self.scroll_handle.0.borrow_mut().deferred_scroll_to_item = None;
+        }
+    }
+
+    fn scroll_to_live_edge(&mut self) {
+        let Some(last_idx) = self.model.rows().len().checked_sub(1) else {
+            return;
+        };
+        if self.live_jump_from.is_none() {
+            self.live_jump_from = Some(self.scroll_handle.0.borrow().base_handle.offset().y);
+        }
+        self.scroll_handle
+            .scroll_to_item(last_idx, ScrollStrategy::Nearest);
+    }
+
     /// Select a row in the ledger and synchronize timeline and inspector.
     pub fn select_row(&mut self, id: &RowId, cx: &mut Context<Self>) {
         self.reveal_tasks.clear();
@@ -325,10 +374,8 @@ impl TrajectoryView {
         let is_follow_live = matches!(action, ToolbarAction::FollowLive);
         handle_toolbar_action(&mut self.model, action);
         if is_follow_live {
-            if let Some(last_idx) = self.model.rows().len().checked_sub(1) {
-                self.scroll_handle
-                    .scroll_to_item(last_idx, ScrollStrategy::Nearest);
-            }
+            self.live_jump_from = None;
+            self.scroll_to_live_edge();
         }
         cx.notify();
     }
@@ -471,34 +518,6 @@ impl Render for TrajectoryView {
                 let _ = this.update(cx, |view, cx| view.toggle_fold(&row_id, cx));
             }
         };
-
-        // Reading back through history suspends live following, so an arriving
-        // record cannot yank the viewport off what the user is reading. The
-        // model then stops moving the anchor and starts counting pending rows,
-        // which is what makes the toolbar offer "Follow Live" — the only way
-        // back, never re-armed silently here.
-        if self.model.following_live() {
-            let scroll = {
-                let state = self.scroll_handle.0.borrow();
-                // A queued `scroll_to_item` has not been applied yet, so the
-                // offset still describes where the list WAS. Judging position
-                // now reads our own catch-up jump as the user scrolling away
-                // and suspends following one frame after it was restored.
-                if state.deferred_scroll_to_item.is_some() {
-                    None
-                } else {
-                    Some((
-                        state.base_handle.offset().y,
-                        state.base_handle.max_offset().y,
-                    ))
-                }
-            };
-            if let Some((offset_y, max_offset_y)) = scroll {
-                if is_away_from_live_edge(offset_y, max_offset_y, ROW_HEIGHT * 2.0) {
-                    self.model.set_following_live(false);
-                }
-            }
-        }
 
         let is_empty = self.model.rows().is_empty();
         let status = self.model.status().clone();

@@ -3101,9 +3101,12 @@ impl Shell {
             || {
                 let fixture = crate::capture::trajectory_capture_fixture();
                 cx.new(move |cx| {
-                    let mut view = TrajectoryView::new(state, cid, cx);
-                    if let Some(fixture) = fixture {
-                        crate::capture::seed_trajectory_fixture(&mut view, fixture, cx);
+                    let mut view = TrajectoryView::new(state, cid);
+                    match fixture {
+                        Some(fixture) => {
+                            crate::capture::seed_trajectory_fixture(&mut view, fixture, cx)
+                        }
+                        None => view.ensure_watch(cx),
                     }
                     view
                 })
@@ -10417,25 +10420,6 @@ mod tests {
         let next = remove_right_surface(&mut tabs, trajectory);
         assert_eq!(next, terminal);
         assert_eq!(tabs, vec![terminal, diff]);
-    }
-
-    #[test]
-    fn test_trajectory_shell_titlebar_button_active_indication() {
-        // The trajectory button is active when the right pane is open and resolved active surface is Trajectory
-        let pane_open = true;
-        let active_surface = RightSurface::Trajectory(1);
-        let is_active = pane_open && matches!(active_surface, RightSurface::Trajectory(_));
-        assert!(is_active);
-
-        // When pane is closed, active is false even if last active surface was Trajectory
-        let pane_closed = false;
-        let is_active_closed = pane_closed && matches!(active_surface, RightSurface::Trajectory(_));
-        assert!(!is_active_closed);
-
-        // When diff is active, trajectory button is inactive
-        let diff_surface = RightSurface::Diff(2);
-        let is_diff_active = pane_open && matches!(diff_surface, RightSurface::Trajectory(_));
-        assert!(!is_diff_active);
     }
 
     #[test]

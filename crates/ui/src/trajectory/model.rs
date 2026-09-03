@@ -9,7 +9,7 @@ use gpui::SharedString;
 use zeron_proto::trajectory::{
     TrajectoryDegradedInterval, TrajectoryLane, TrajectoryRawField, TrajectoryRecord,
     TrajectoryRecordId, TrajectoryRecordKind, TrajectoryRun, TrajectoryStatus, TrajectoryStep,
-    TrajectoryTurn, apply_deltas, group_records,
+    TrajectoryTurn, apply_deltas, group_records, stream_order_key,
 };
 use zeron_rpc::{
     TrajectoryCursor, TrajectoryTerminalReason, TrajectoryUnavailableReason, TrajectoryWatchItem,
@@ -151,7 +151,6 @@ pub struct TrajectoryViewModel {
     duration_mode: DurationMode,
     following_live: bool,
     pending_live: usize,
-    anchor: Option<RowId>,
     payload_reveal: RevealState,
     result_reveal: RevealState,
 }
@@ -176,7 +175,6 @@ impl TrajectoryViewModel {
             duration_mode: DurationMode::Sequence,
             following_live: true,
             pending_live: 0,
-            anchor: None,
             payload_reveal: RevealState::Hidden,
             result_reveal: RevealState::Hidden,
         }
@@ -228,11 +226,11 @@ impl TrajectoryViewModel {
                     return;
                 }
 
-                if !self.following_live {
-                    self.pending_live += records.len();
-                }
-
+                let before = self.records.len();
                 apply_deltas(&mut self.records, records);
+                if !self.following_live {
+                    self.pending_live += self.records.len() - before;
+                }
 
                 if watermark.is_some() {
                     self.watermark = watermark;
@@ -301,7 +299,10 @@ impl TrajectoryViewModel {
     }
 
     pub fn record(&self, id: &TrajectoryRecordId) -> Option<&TrajectoryRecord> {
-        let idx = self.records.binary_search_by_key(&id, |r| &r.id).ok()?;
+        let idx = self
+            .records
+            .binary_search_by_key(&stream_order_key(id), |r| stream_order_key(&r.id))
+            .ok()?;
         self.records.get(idx)
     }
 
@@ -434,18 +435,6 @@ impl TrajectoryViewModel {
 
     pub fn pending_live(&self) -> usize {
         self.pending_live
-    }
-
-    // -----------------------------------------------------------------------
-    // Viewport Anchor
-    // -----------------------------------------------------------------------
-
-    pub fn anchor(&self) -> Option<&RowId> {
-        self.anchor.as_ref()
-    }
-
-    pub fn set_anchor(&mut self, id: Option<RowId>) {
-        self.anchor = id;
     }
 
     // -----------------------------------------------------------------------
@@ -1463,7 +1452,8 @@ mod tests {
         );
     }
 
-    // 8. Live edge: with following_live == false, new delta increments pending_live() and does NOT move anchor;
+    // 8. Live edge: with following_live == false, new delta increments pending_live()
+    // by the rows actually added (re-delivered partials do not count);
     // set_following_live(true) resets the counter
     #[test]
     fn test_trajectory_model_live_edge_following_and_pending_counter() {
@@ -1489,8 +1479,6 @@ mod tests {
         assert_eq!(model.pending_live(), 0);
 
         // User scrolls away from live edge
-        let anchor_id = RowId::from_record_id(&rec1.id);
-        model.set_anchor(Some(anchor_id.clone()));
         model.set_following_live(false);
         assert!(!model.following_live());
 
@@ -1515,21 +1503,21 @@ mod tests {
             "Tool 1",
             "Msg 3",
         );
+        let mut partial = rec2.clone();
+        partial.is_partial = true;
         model.apply_watch_item(TrajectoryWatchItem::Deltas {
-            records: vec![rec2, rec3],
+            records: vec![partial.clone(), rec3],
+            watermark: Some(TrajectoryCursor::new(3, 0)),
+        });
+        model.apply_watch_item(TrajectoryWatchItem::Deltas {
+            records: vec![partial, rec2],
             watermark: Some(TrajectoryCursor::new(3, 0)),
         });
 
-        // pending_live must increment and anchor must NOT move
         assert_eq!(
             model.pending_live(),
             2,
-            "Pending live counter must increment when not following live"
-        );
-        assert_eq!(
-            model.anchor(),
-            Some(&anchor_id),
-            "Viewport anchor must not move when not following live"
+            "Pending live counter must count new rows only, not re-delivered or settled partials"
         );
 
         // Resume following live edge
@@ -1542,9 +1530,10 @@ mod tests {
         );
     }
 
-    // 9. Historical prepend: inserting older records preserves anchor() and relative row resolution
+    // 9. Historical prepend: inserting older records keeps the selected record resolvable
+    // and shifts its row index by the prepended rows
     #[test]
-    fn test_trajectory_model_historical_prepend_preserves_anchor() {
+    fn test_trajectory_model_historical_prepend_shifts_row_index() {
         let mut model = TrajectoryViewModel::new("test_chat");
 
         // Model starts with records 10, 11, 12
@@ -1584,8 +1573,6 @@ mod tests {
         });
 
         let anchor_id = RowId::from_record_id(&rec11.id);
-        model.set_anchor(Some(anchor_id.clone()));
-
         let initial_index = model.row_index(&anchor_id).unwrap();
 
         // Historical prepend: older records 1, 2, 3 arrive
@@ -1612,13 +1599,6 @@ mod tests {
             watermark: None,
         });
 
-        // Anchor identity must remain the exact same RowId
-        assert_eq!(
-            model.anchor(),
-            Some(&anchor_id),
-            "Anchor identity must be preserved across historical prepend"
-        );
-
         // The anchored record must still be resolved
         assert!(model.record(&rec11.id).is_some());
 
@@ -1628,6 +1608,55 @@ mod tests {
             new_index > initial_index,
             "Row index of anchored record must reflect prepended rows"
         );
+    }
+
+    // Runs are presented in arrival order (journal sequence), never in the
+    // lexical order of their ids: a later run with a smaller UUID must still be
+    // "Run 2" and sit at the live edge.
+    #[test]
+    fn test_trajectory_model_runs_follow_journal_sequence_not_run_id() {
+        let mut model = TrajectoryViewModel::new("test_chat");
+        let older = make_test_record(
+            "f0a1-older",
+            1,
+            0,
+            TrajectoryLane::Input,
+            TrajectoryRecordKind::UserMessage,
+            "User",
+            "first",
+        );
+        let newer = make_test_record(
+            "3b7c-newer",
+            2,
+            0,
+            TrajectoryLane::Input,
+            TrajectoryRecordKind::UserMessage,
+            "User",
+            "second",
+        );
+        model.apply_watch_item(TrajectoryWatchItem::Snapshot {
+            records: vec![newer.clone(), older.clone()],
+            watermark: None,
+            degraded: vec![],
+            has_more: false,
+        });
+
+        let labels: Vec<(&str, &str)> = model
+            .runs()
+            .iter()
+            .map(|run| (run.run_id.as_str(), run.label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![("f0a1-older", "Run 1"), ("3b7c-newer", "Run 2")]
+        );
+        assert_eq!(
+            model.rows().last().and_then(|row| row.record.as_ref()),
+            Some(&newer.id),
+            "the live edge must be the most recent record"
+        );
+        assert!(model.record(&older.id).is_some());
+        assert!(model.record(&newer.id).is_some());
     }
 
     // 10. Ephemeral raw reveal: clear_reveal() on selected record change; reveal state is never persistent

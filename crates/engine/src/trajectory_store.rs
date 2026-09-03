@@ -474,23 +474,11 @@ impl TrajectoryStore {
             .in_memory_degraded
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for existing in in_mem.iter_mut().rev() {
-            if existing.chat_id == degraded.chat_id
-                && existing.run_id == degraded.run_id
-                && existing.reason == degraded.reason
-                && existing.to_seq.saturating_add(1) >= degraded.from_seq
-                && degraded.to_seq.saturating_add(1) >= existing.from_seq
-            {
-                existing.from_seq = existing.from_seq.min(degraded.from_seq);
-                existing.to_seq = existing.to_seq.max(degraded.to_seq);
-                existing.recorded_at = existing.recorded_at.max(degraded.recorded_at);
-                return;
-            }
-        }
-        if in_mem.len() >= MAX_IN_MEMORY_DEGRADED_INTERVALS {
-            in_mem.pop_front();
-        }
-        in_mem.push_back(degraded);
+        merge_degraded_in_memory(&mut in_mem, degraded);
+    }
+
+    fn emit_degraded(&self, intervals: Vec<TrajectoryDegradedInterval>) {
+        record_degraded_intervals(&self.in_memory_degraded, &self.events_tx, intervals);
     }
 
     pub fn record_degraded_interval(
@@ -517,140 +505,10 @@ impl TrajectoryStore {
     /// If the queue is saturated or the store is degraded, this method records a degraded interval rather than
     /// blocking synchronous publication.
     pub fn try_enqueue(&self, record: TrajectoryRecord) -> Result<(), TrajectoryStoreError> {
-        if let Some(reason) = self
-            .degraded_reason
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
-            let degraded = TrajectoryDegradedInterval {
-                chat_id: record.chat_id.clone(),
-                run_id: record.run_id,
-                from_seq: record.source_seq,
-                to_seq: record.source_seq,
-                reason: format!("Store degraded: {}", reason),
-                recorded_at: Utc::now(),
-            };
-            self.record_degraded_in_memory(degraded.clone());
-            let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                chat_id: degraded.chat_id.clone(),
-                interval: degraded,
-            });
-            return Err(TrajectoryStoreError::Other(format!(
-                "store degraded: {}",
-                reason
-            )));
-        }
-        match self
-            .writer_tx
-            .try_send(WriterCommand::WriteRecords(vec![record]))
-        {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(WriterCommand::WriteRecords(mut recs))) => {
-                if let Some(record) = recs.pop() {
-                    tracing::warn!(
-                        chat = %record.chat_id,
-                        run = %record.run_id,
-                        seq = record.source_seq,
-                        "trajectory capture queue saturated; recording degraded interval"
-                    );
-                    let degraded = TrajectoryDegradedInterval {
-                        chat_id: record.chat_id.clone(),
-                        run_id: record.run_id,
-                        from_seq: record.source_seq,
-                        to_seq: record.source_seq,
-                        reason: "Queue saturated".into(),
-                        recorded_at: Utc::now(),
-                    };
-                    self.record_degraded_in_memory(degraded.clone());
-                    let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                        chat_id: degraded.chat_id.clone(),
-                        interval: degraded,
-                    });
-                }
-                Err(TrajectoryStoreError::QueueFull)
-            }
-            Err(TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
-            Err(TrySendError::Disconnected(WriterCommand::WriteRecords(mut recs))) => {
-                let mut reason_guard = self
-                    .degraded_reason
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if reason_guard.is_none() {
-                    *reason_guard = Some("Writer channel closed".into());
-                }
-                drop(reason_guard);
-                if let Some(record) = recs.pop() {
-                    let degraded = TrajectoryDegradedInterval {
-                        chat_id: record.chat_id.clone(),
-                        run_id: record.run_id,
-                        from_seq: record.source_seq,
-                        to_seq: record.source_seq,
-                        reason: "Writer channel closed".into(),
-                        recorded_at: Utc::now(),
-                    };
-                    self.record_degraded_in_memory(degraded.clone());
-                    let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                        chat_id: degraded.chat_id.clone(),
-                        interval: degraded,
-                    });
-                }
-                Err(TrajectoryStoreError::ChannelClosed)
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                let mut reason_guard = self
-                    .degraded_reason
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if reason_guard.is_none() {
-                    *reason_guard = Some("Writer channel closed".into());
-                }
-                Err(TrajectoryStoreError::ChannelClosed)
-            }
-        }
+        self.try_enqueue_batch(vec![record])
     }
 
     /// Enqueue a batch of records nonblockingly.
-    /// Record one degraded interval PER (chat, run) present in a rejected
-    /// batch. A batch spans several Chats, so accounting only the first
-    /// record's Chat silently loses the evidence for every other Chat in it —
-    /// exactly the false "complete history" this store must never report.
-    fn record_degraded_batch(&self, records: &[TrajectoryRecord], reason: &str) {
-        let mut groups: Vec<(String, String, u64, u64)> = Vec::new();
-        for record in records {
-            match groups
-                .iter_mut()
-                .find(|(chat, run, _, _)| chat == &record.chat_id && run == &record.run_id)
-            {
-                Some((_, _, from, to)) => {
-                    *from = (*from).min(record.source_seq);
-                    *to = (*to).max(record.source_seq);
-                }
-                None => groups.push((
-                    record.chat_id.clone(),
-                    record.run_id.clone(),
-                    record.source_seq,
-                    record.source_seq,
-                )),
-            }
-        }
-        for (chat_id, run_id, from_seq, to_seq) in groups {
-            let degraded = TrajectoryDegradedInterval {
-                chat_id: chat_id.clone(),
-                run_id,
-                from_seq,
-                to_seq,
-                reason: reason.to_string(),
-                recorded_at: Utc::now(),
-            };
-            self.record_degraded_in_memory(degraded.clone());
-            let _ = self.events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                chat_id,
-                interval: degraded,
-            });
-        }
-    }
-
     pub fn try_enqueue_batch(
         &self,
         records: Vec<TrajectoryRecord>,
@@ -664,34 +522,35 @@ impl TrajectoryStore {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
         {
-            self.record_degraded_batch(&records, &format!("Store degraded: {}", reason));
+            self.emit_degraded(degraded_intervals_by_run(
+                &records,
+                &format!("Store degraded: {}", reason),
+            ));
             return Err(TrajectoryStoreError::Other(format!(
                 "store degraded: {}",
                 reason
             )));
         }
+        let on_writer_death = degraded_intervals_by_run(&records, "Writer channel closed");
         match self
             .writer_tx
             .try_send(WriterCommand::WriteRecords(records))
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if self.is_degraded() {
+                    self.emit_degraded(on_writer_death);
+                }
+                Ok(())
+            }
             Err(TrySendError::Full(WriterCommand::WriteRecords(recs))) => {
-                self.record_degraded_batch(&recs, "Queue saturated during batch");
+                tracing::warn!(
+                    count = recs.len(),
+                    "trajectory capture queue saturated; recording degraded intervals"
+                );
+                self.emit_degraded(degraded_intervals_by_run(&recs, "Queue saturated"));
                 Err(TrajectoryStoreError::QueueFull)
             }
             Err(TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
-            Err(TrySendError::Disconnected(WriterCommand::WriteRecords(recs))) => {
-                let mut reason_guard = self
-                    .degraded_reason
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if reason_guard.is_none() {
-                    *reason_guard = Some("Writer channel closed".into());
-                }
-                drop(reason_guard);
-                self.record_degraded_batch(&recs, "Writer channel closed");
-                Err(TrajectoryStoreError::ChannelClosed)
-            }
             Err(TrySendError::Disconnected(_)) => {
                 let mut reason_guard = self
                     .degraded_reason
@@ -700,6 +559,8 @@ impl TrajectoryStore {
                 if reason_guard.is_none() {
                     *reason_guard = Some("Writer channel closed".into());
                 }
+                drop(reason_guard);
+                self.emit_degraded(on_writer_death);
                 Err(TrajectoryStoreError::ChannelClosed)
             }
         }
@@ -1925,40 +1786,85 @@ fn drain_queue_as_degraded(
     reason: &str,
 ) {
     while let Ok(cmd) = writer_rx.try_recv() {
-        let records = match cmd {
-            WriterCommand::WriteRecords(records) => records,
-            _ => continue,
-        };
-        let mut by_chat: std::collections::HashMap<(String, String), (u64, u64)> =
-            std::collections::HashMap::new();
-        for record in &records {
-            let entry = by_chat
-                .entry((record.chat_id.clone(), record.run_id.clone()))
-                .or_insert((record.source_seq, record.source_seq));
-            entry.0 = entry.0.min(record.source_seq);
-            entry.1 = entry.1.max(record.source_seq);
+        if let WriterCommand::WriteRecords(records) = cmd {
+            record_degraded_intervals(
+                in_mem,
+                events_tx,
+                degraded_intervals_by_run(&records, reason),
+            );
         }
-        for ((chat_id, run_id), (from_seq, to_seq)) in by_chat {
-            let degraded = TrajectoryDegradedInterval {
-                chat_id: chat_id.clone(),
-                run_id,
-                from_seq,
-                to_seq,
-                reason: reason.to_string(),
-                recorded_at: Utc::now(),
-            };
-            {
-                let mut pending = in_mem.lock().unwrap_or_else(|error| error.into_inner());
-                if pending.len() >= MAX_IN_MEMORY_DEGRADED_INTERVALS {
-                    pending.pop_front();
-                }
-                pending.push_back(degraded.clone());
+    }
+}
+
+/// One degraded interval per (Chat, run) in `records`, spanning the min..max
+/// `source_seq` seen. Every rejection path — enqueue, writer death, durable
+/// write failure — accounts through here, so no Chat or run in a batch is
+/// ever silently reported as complete.
+fn degraded_intervals_by_run(
+    records: &[TrajectoryRecord],
+    reason: &str,
+) -> Vec<TrajectoryDegradedInterval> {
+    let now = Utc::now();
+    let mut groups: Vec<TrajectoryDegradedInterval> = Vec::new();
+    for record in records {
+        match groups
+            .iter_mut()
+            .find(|g| g.chat_id == record.chat_id && g.run_id == record.run_id)
+        {
+            Some(group) => {
+                group.from_seq = group.from_seq.min(record.source_seq);
+                group.to_seq = group.to_seq.max(record.source_seq);
             }
-            let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                chat_id,
-                interval: degraded,
-            });
+            None => groups.push(TrajectoryDegradedInterval {
+                chat_id: record.chat_id.clone(),
+                run_id: record.run_id.clone(),
+                from_seq: record.source_seq,
+                to_seq: record.source_seq,
+                reason: reason.to_string(),
+                recorded_at: now,
+            }),
         }
+    }
+    groups
+}
+
+fn merge_degraded_in_memory(
+    in_mem: &mut VecDeque<TrajectoryDegradedInterval>,
+    degraded: TrajectoryDegradedInterval,
+) {
+    for existing in in_mem.iter_mut().rev() {
+        if existing.chat_id == degraded.chat_id
+            && existing.run_id == degraded.run_id
+            && existing.reason == degraded.reason
+            && existing.to_seq.saturating_add(1) >= degraded.from_seq
+            && degraded.to_seq.saturating_add(1) >= existing.from_seq
+        {
+            existing.from_seq = existing.from_seq.min(degraded.from_seq);
+            existing.to_seq = existing.to_seq.max(degraded.to_seq);
+            existing.recorded_at = existing.recorded_at.max(degraded.recorded_at);
+            return;
+        }
+    }
+    if in_mem.len() >= MAX_IN_MEMORY_DEGRADED_INTERVALS {
+        in_mem.pop_front();
+    }
+    in_mem.push_back(degraded);
+}
+
+fn record_degraded_intervals(
+    in_mem: &Mutex<VecDeque<TrajectoryDegradedInterval>>,
+    events_tx: &broadcast::Sender<TrajectoryStoreEvent>,
+    intervals: Vec<TrajectoryDegradedInterval>,
+) {
+    for degraded in intervals {
+        {
+            let mut pending = in_mem.lock().unwrap_or_else(|error| error.into_inner());
+            merge_degraded_in_memory(&mut pending, degraded.clone());
+        }
+        let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
+            chat_id: degraded.chat_id.clone(),
+            interval: degraded,
+        });
     }
 }
 
@@ -1975,36 +1881,11 @@ fn flush_batch_to_writer(
     let rev = *next_rev;
     if let Err(err) = write_records_tx(conn, records, rev) {
         tracing::error!(error = %err, "trajectory writer batch failed; recording degraded interval");
-        let mut by_chat: HashMap<String, Vec<&TrajectoryRecord>> = HashMap::new();
-        for record in records {
-            by_chat
-                .entry(record.chat_id.clone())
-                .or_default()
-                .push(record);
-        }
-        for (chat_id, chat_records) in by_chat {
-            if let Some(first) = chat_records.first() {
-                let last = chat_records.last().unwrap_or(first);
-                let degraded = TrajectoryDegradedInterval {
-                    chat_id: chat_id.clone(),
-                    run_id: first.run_id.clone(),
-                    from_seq: first.source_seq,
-                    to_seq: last.source_seq,
-                    reason: format!("Durable write failed: {}", err),
-                    recorded_at: Utc::now(),
-                };
-                let mut pending = in_mem.lock().unwrap_or_else(|error| error.into_inner());
-                if pending.len() >= MAX_IN_MEMORY_DEGRADED_INTERVALS {
-                    pending.pop_front();
-                }
-                pending.push_back(degraded.clone());
-                drop(pending);
-                let _ = events_tx.send(TrajectoryStoreEvent::DegradedRecorded {
-                    chat_id: degraded.chat_id.clone(),
-                    interval: degraded,
-                });
-            }
-        }
+        record_degraded_intervals(
+            in_mem,
+            events_tx,
+            degraded_intervals_by_run(records, &format!("Durable write failed: {}", err)),
+        );
         return false;
     }
 
@@ -2627,34 +2508,37 @@ pub fn project_event_to_record(
             error_message: None,
             is_degraded: false,
         }),
-        AgentEvent::Error { message } => Some(TrajectoryRecord {
-            id: TrajectoryRecordId::new(run_id, seq, 0),
-            chat_id: chat_id.to_string(),
-            run_id: run_id.to_string(),
-            source_seq: seq,
-            sub_seq: 0,
-            lane: TrajectoryLane::Model,
-            kind: TrajectoryRecordKind::Error,
-            status: TrajectoryStatus::Error,
-            is_partial: false,
-            title: "Error".into(),
-            summary: message.clone(),
-            turn_id: None,
-            step_id: None,
-            call_id: None,
-            parent_tool_use_id,
-            timing: Some(TrajectoryTiming::recorded(
-                Some(Utc::now()),
-                None,
-                None,
-                None,
-            )),
-            usage: None,
-            payload: None,
-            result: None,
-            error_message: Some(message.clone()),
-            is_degraded: false,
-        }),
+        AgentEvent::Error { message } => {
+            let (summary, error_message) = sanitize_prompt_preview(message, 1024);
+            Some(TrajectoryRecord {
+                id: TrajectoryRecordId::new(run_id, seq, 0),
+                chat_id: chat_id.to_string(),
+                run_id: run_id.to_string(),
+                source_seq: seq,
+                sub_seq: 0,
+                lane: TrajectoryLane::Model,
+                kind: TrajectoryRecordKind::Error,
+                status: TrajectoryStatus::Error,
+                is_partial: false,
+                title: "Error".into(),
+                summary,
+                turn_id: None,
+                step_id: None,
+                call_id: None,
+                parent_tool_use_id,
+                timing: Some(TrajectoryTiming::recorded(
+                    Some(Utc::now()),
+                    None,
+                    None,
+                    None,
+                )),
+                usage: None,
+                payload: None,
+                result: None,
+                error_message,
+                is_degraded: false,
+            })
+        }
         AgentEvent::InputRequested {
             request_id,
             questions,
@@ -2769,11 +2653,11 @@ pub fn project_event_to_record(
             },
             is_partial: false,
             title: format!("Done ({:?})", status),
-            summary: result
-                .as_deref()
-                .or(error.as_deref())
-                .unwrap_or("Done")
-                .to_string(),
+            summary: sanitize_prompt_preview(
+                result.as_deref().or(error.as_deref()).unwrap_or("Done"),
+                1024,
+            )
+            .0,
             turn_id: None,
             step_id: None,
             call_id: None,
@@ -2787,7 +2671,9 @@ pub fn project_event_to_record(
             usage: None,
             payload: None,
             result: None,
-            error_message: error.clone(),
+            error_message: error
+                .as_deref()
+                .and_then(|error| sanitize_prompt_preview(error, 1024).1),
             is_degraded: false,
         }),
         AgentEvent::Subagent {
@@ -3274,6 +3160,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_durable_write_failure_accounts_every_run() {
+        let temp = TempDir::new().unwrap();
+        let store = TrajectoryStore::open(temp.path()).unwrap();
+        {
+            let conn = Connection::open(&store.db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER test_fail_write_records BEFORE INSERT ON trajectory_records
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced sqlite durable write failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let chat = "chat_durable_multi_run";
+        store
+            .try_enqueue_batch(vec![
+                sample_record(chat, "run_1", 12, 0),
+                sample_record(chat, "run_2", 13, 0),
+                sample_record(chat, "run_1", 10, 0),
+                sample_record(chat, "run_2", 11, 0),
+            ])
+            .unwrap();
+        store.flush().await.unwrap();
+
+        let mut intervals: Vec<(String, u64, u64)> = store
+            .get_degraded_intervals(chat)
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.run_id, i.from_seq, i.to_seq))
+            .collect();
+        intervals.sort();
+        assert_eq!(
+            intervals,
+            vec![("run_1".to_string(), 10, 12), ("run_2".to_string(), 11, 13)],
+            "every run in a failed batch must get its own min..max interval"
+        );
+    }
+
+    #[test]
+    fn test_trajectory_error_and_done_records_are_redacted() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let message = format!("401 from https://api.example.com/v1?key={secret}");
+
+        let error_record = project_event_to_record(
+            "chat",
+            "run",
+            1,
+            &AgentEvent::Error {
+                message: message.clone(),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!error_record.summary.contains(secret));
+        assert!(
+            !error_record
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains(secret)
+        );
+
+        let done_record = project_event_to_record(
+            "chat",
+            "run",
+            2,
+            &AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: Some(message.clone()),
+                error: Some(message),
+                session_id: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!done_record.summary.contains(secret));
+        assert!(
+            !done_record
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains(secret)
+        );
     }
 
     #[tokio::test]

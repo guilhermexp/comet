@@ -1257,11 +1257,10 @@ fn watch_trajectory_stream(
                             let item = TrajectoryWatchItem::ResyncRequired {
                                 reason: format!("Watch stream lagged by {skipped} broadcast events"),
                             };
-                            if let Ok(value) = serde_json::to_value(&item)
-                                && tx.send(value).await.is_err()
-                            {
-                                break;
+                            if let Ok(value) = serde_json::to_value(&item) {
+                                let _ = tx.send(value).await;
                             }
+                            break;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;

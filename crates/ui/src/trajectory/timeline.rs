@@ -8,12 +8,16 @@
 //!
 //! All geometric calculations are pure and deterministic: no I/O, no database access.
 
+use std::collections::HashSet;
+
+use chrono::{DateTime, Utc};
 use gpui::{
     AnyElement, App, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px,
 };
 use zeron_proto::trajectory::{
-    TrajectoryLane, TrajectoryRecord, TrajectoryRecordId, TrajectoryStatus, TrajectoryTimingMode,
+    TrajectoryLane, TrajectoryRecord, TrajectoryRecordId, TrajectoryStatus, TrajectoryTiming,
+    TrajectoryTimingMode,
 };
 
 use super::model::{DurationMode, TrajectoryViewModel};
@@ -108,6 +112,22 @@ pub fn lane_layout(model: &TrajectoryViewModel) -> LaneLayout {
     layout
 }
 
+/// End instant of a recorded span. `None` when a corrupt `duration_ms` would
+/// overflow the clock, so the caller falls back to sequence layout instead of
+/// panicking mid-render.
+fn span_end(timing: &TrajectoryTiming, started_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Some(ended_at) = timing.ended_at {
+        return Some(ended_at);
+    }
+    match timing.effective_duration_ms() {
+        Some(ms) => {
+            let delta = chrono::TimeDelta::try_milliseconds(i64::try_from(ms).ok()?)?;
+            started_at.checked_add_signed(delta)
+        }
+        None => Some(started_at),
+    }
+}
+
 fn compute_recorded_layout(records: &[&TrajectoryRecord]) -> Option<LaneLayout> {
     // Validate all records have recorded timing with valid started_at
     for (i, record) in records.iter().enumerate() {
@@ -116,14 +136,7 @@ fn compute_recorded_layout(records: &[&TrajectoryRecord]) -> Option<LaneLayout> 
             return None;
         }
         let started_at = timing.started_at?;
-        let end_time = timing
-            .ended_at
-            .or_else(|| {
-                timing
-                    .effective_duration_ms()
-                    .map(|ms| started_at + chrono::Duration::milliseconds(ms as i64))
-            })
-            .unwrap_or(started_at);
+        let end_time = span_end(timing, started_at)?;
 
         if end_time < started_at {
             return None;
@@ -143,14 +156,7 @@ fn compute_recorded_layout(records: &[&TrajectoryRecord]) -> Option<LaneLayout> 
     for record in records {
         let timing = record.timing.as_ref()?;
         let started_at = timing.started_at?;
-        let end_time = timing
-            .ended_at
-            .or_else(|| {
-                timing
-                    .effective_duration_ms()
-                    .map(|ms| started_at + chrono::Duration::milliseconds(ms as i64))
-            })
-            .unwrap_or(started_at);
+        let end_time = span_end(timing, started_at)?;
         if end_time > max_end {
             max_end = end_time;
         }
@@ -186,14 +192,7 @@ fn compute_recorded_layout(records: &[&TrajectoryRecord]) -> Option<LaneLayout> 
     for record in records {
         let timing = record.timing.as_ref()?;
         let started_at = timing.started_at?;
-        let end_time = timing
-            .ended_at
-            .or_else(|| {
-                timing
-                    .effective_duration_ms()
-                    .map(|ms| started_at + chrono::Duration::milliseconds(ms as i64))
-            })
-            .unwrap_or(started_at);
+        let end_time = span_end(timing, started_at)?;
 
         let offset_ms = (started_at - min_start).num_milliseconds().max(0) as f32;
         let duration_ms = (end_time - started_at).num_milliseconds().max(0) as f32;
@@ -225,22 +224,6 @@ fn compute_recorded_layout(records: &[&TrajectoryRecord]) -> Option<LaneLayout> 
     Some(layout)
 }
 
-/// Hit-test which span within a lane contains the given horizontal fraction [0.0..=1.0].
-pub fn span_at_fraction(
-    layout: &LaneLayout,
-    lane: TrajectoryLane,
-    fraction: f32,
-) -> Option<&LaneSpan> {
-    if !(0.0..=1.0).contains(&fraction) {
-        return None;
-    }
-    let spans = layout.spans_for_lane(lane);
-    spans.iter().find(|span| {
-        let end_fraction = span.start_fraction + span.width_fraction;
-        fraction >= (span.start_fraction - 1e-4) && fraction <= (end_fraction + 1e-4)
-    })
-}
-
 /// Render the pure timeline lanes in GPUI.
 pub fn render_timeline<S>(model: &TrajectoryViewModel, theme: &Theme, on_select: S) -> AnyElement
 where
@@ -261,6 +244,12 @@ where
         .border_color(theme.border);
 
     let selected_record_id = model.selected_record().map(|r| &r.id);
+    let dimmed: HashSet<&TrajectoryRecordId> = model
+        .rows()
+        .iter()
+        .filter(|row| row.dimmed)
+        .filter_map(|row| row.record.as_ref())
+        .collect();
 
     for lane in LANES {
         let spans = layout.spans_for_lane(lane);
@@ -284,12 +273,7 @@ where
 
         for span in spans {
             let is_selected = selected_record_id == Some(&span.record);
-            let is_dimmed = model
-                .rows()
-                .iter()
-                .find(|r| r.record.as_ref() == Some(&span.record))
-                .map(|r| r.dimmed)
-                .unwrap_or(false);
+            let is_dimmed = dimmed.contains(&span.record);
 
             let span_bg = if span.is_error {
                 theme.danger
@@ -703,42 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trajectory_timeline_span_hit_testing() {
-        let mut layout = LaneLayout::default();
-        layout.push_span(
-            TrajectoryLane::Model,
-            LaneSpan {
-                record: TrajectoryRecordId::new("run-1", 1, 0),
-                start_fraction: 0.2,
-                width_fraction: 0.3, // covers 0.2 .. 0.5
-                status: TrajectoryStatus::Completed,
-                is_error: false,
-                measured: true,
-            },
-        );
-
-        assert!(span_at_fraction(&layout, TrajectoryLane::Model, 0.1).is_none());
-        assert_eq!(
-            span_at_fraction(&layout, TrajectoryLane::Model, 0.25)
-                .unwrap()
-                .record
-                .source_seq,
-            1
-        );
-        assert_eq!(
-            span_at_fraction(&layout, TrajectoryLane::Model, 0.5)
-                .unwrap()
-                .record
-                .source_seq,
-            1
-        );
-        assert!(span_at_fraction(&layout, TrajectoryLane::Model, 0.6).is_none());
-        assert!(span_at_fraction(&layout, TrajectoryLane::Input, 0.25).is_none());
-        assert!(span_at_fraction(&layout, TrajectoryLane::Model, -0.1).is_none());
-        assert!(span_at_fraction(&layout, TrajectoryLane::Model, 1.2).is_none());
-    }
-
-    #[test]
     fn test_trajectory_timeline_no_zero_width_for_single_record() {
         let mut model = TrajectoryViewModel::new("chat-1");
         model.apply_watch_item(TrajectoryWatchItem::Snapshot {
@@ -760,5 +708,57 @@ mod tests {
         let span = &layout.spans_for_lane(TrajectoryLane::Input)[0];
         assert_eq!(span.start_fraction, 0.0);
         assert_eq!(span.width_fraction, 1.0);
+    }
+
+    /// A corrupt `duration_ms` must degrade to sequence layout, never panic
+    /// the render with a clock overflow.
+    #[test]
+    fn test_trajectory_timeline_recorded_mode_overflowing_duration_falls_back() {
+        let mut model = TrajectoryViewModel::new("chat-1");
+        model.set_duration_mode(DurationMode::Recorded);
+        let start = Utc::now();
+        let mut corrupt = make_test_record(
+            1,
+            0,
+            TrajectoryLane::Input,
+            TrajectoryRecordKind::UserMessage,
+            TrajectoryStatus::Completed,
+            false,
+            Some(TrajectoryTiming::recorded(
+                Some(start),
+                None,
+                Some(u64::MAX),
+                None,
+            )),
+        );
+        corrupt.timing.as_mut().unwrap().ended_at = None;
+        let sane = make_test_record(
+            2,
+            0,
+            TrajectoryLane::Model,
+            TrajectoryRecordKind::AssistantMessage,
+            TrajectoryStatus::Completed,
+            false,
+            Some(TrajectoryTiming::recorded(
+                Some(start + chrono::TimeDelta::seconds(1)),
+                Some(start + chrono::TimeDelta::seconds(2)),
+                None,
+                None,
+            )),
+        );
+        model.apply_watch_item(TrajectoryWatchItem::Snapshot {
+            records: vec![corrupt, sane],
+            watermark: None,
+            degraded: Vec::new(),
+            has_more: false,
+        });
+
+        let layout = lane_layout(&model);
+        let span = &layout.spans_for_lane(TrajectoryLane::Input)[0];
+        assert!(
+            !span.measured,
+            "overflowing duration must fall back to sequence layout"
+        );
+        assert_eq!(span.width_fraction, 0.5);
     }
 }

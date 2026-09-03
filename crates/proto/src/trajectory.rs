@@ -1288,21 +1288,27 @@ pub fn group_records(records: &[TrajectoryRecord]) -> Vec<TrajectoryRun> {
 // Reconciliation, Partial-to-Final & Idempotent Deltas
 // ---------------------------------------------------------------------------
 
+/// Chronological key for a record within one Chat: `source_seq` is the Chat's
+/// run-journal sequence, monotonic across runs, so it orders runs by arrival
+/// rather than by the lexical accident of their ids.
+pub fn stream_order_key(id: &TrajectoryRecordId) -> (u64, u32, &str) {
+    (id.source_seq, id.sub_seq, id.run_id.as_str())
+}
+
 /// Reconcile a single delta record into an existing ordered record list.
 ///
-/// `records` must already be sorted in monotonic `TrajectoryRecordId` (`(run_id, source_seq, sub_seq)`) order.
+/// `records` must already be sorted by [`stream_order_key`], the same
+/// `(source_seq, sub_seq)` order the store serves snapshots in.
 /// Replaces an existing partial with the same `TrajectoryRecordId` or inserts at
 /// the sorted position. A re-delivered partial never replaces a stored final.
 pub fn reconcile_record(records: &mut Vec<TrajectoryRecord>, delta: TrajectoryRecord) {
-    if let Some(pos) = records.iter().position(|r| r.id == delta.id) {
-        if records[pos].is_partial || !delta.is_partial {
-            records[pos] = delta;
+    match records.binary_search_by_key(&stream_order_key(&delta.id), |r| stream_order_key(&r.id)) {
+        Ok(pos) => {
+            if records[pos].is_partial || !delta.is_partial {
+                records[pos] = delta;
+            }
         }
-    } else {
-        let insert_pos = records
-            .binary_search_by_key(&&delta.id, |r| &r.id)
-            .unwrap_or_else(|pos| pos);
-        records.insert(insert_pos, delta);
+        Err(pos) => records.insert(pos, delta),
     }
 }
 
@@ -2251,10 +2257,10 @@ mod tests {
 
         let expected_ordered_ids = vec![
             TrajectoryRecordId::new("run-1", 1, 0),
-            TrajectoryRecordId::new("run-1", 2, 0),
-            TrajectoryRecordId::new("run-1", 5, 0),
             TrajectoryRecordId::new("run-2", 1, 0),
+            TrajectoryRecordId::new("run-1", 2, 0),
             TrajectoryRecordId::new("run-2", 2, 0),
+            TrajectoryRecordId::new("run-1", 5, 0),
             TrajectoryRecordId::new("run-2", 5, 0),
         ];
 
@@ -2275,7 +2281,7 @@ mod tests {
         let pass1_ids: Vec<_> = records.iter().map(|r| r.id.clone()).collect();
         assert_eq!(
             pass1_ids, expected_ordered_ids,
-            "first pass must insert records in strictly monotonic TrajectoryRecordId order"
+            "first pass must insert records in (source_seq, sub_seq, run_id) stream order"
         );
 
         // Second pass: idempotence check

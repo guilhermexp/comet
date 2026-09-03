@@ -17,88 +17,6 @@ use crate::{icons, theme::Theme};
 /// Invariant: No state (loading, error, reveal) is allowed to alter this height.
 pub const ROW_HEIGHT: Pixels = px(26.0);
 
-/// Visible viewport bounds in virtualized row units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LedgerViewport {
-    pub first_visible: usize,
-    pub visible_count: usize,
-}
-
-/// Compute the target `first_visible` index to bring a selected row into the viewport.
-///
-/// Returns `None` if:
-/// - The row `id` is not found in `rows`.
-/// - The row is already fully visible within `viewport`.
-///
-/// Returns `Some(target_index)` when scrolling is necessary:
-/// - If the row is above the viewport (`target_idx < first_visible`), returns `Some(target_idx)`.
-/// - If the row is below the viewport (`target_idx >= first_visible + visible_count`),
-///   returns `Some(target_idx + 1 - visible_count)`.
-pub fn scroll_target_for_row(
-    rows: &[LedgerRow],
-    id: &RowId,
-    viewport: LedgerViewport,
-) -> Option<usize> {
-    let target_idx = rows.iter().position(|r| r.id == *id)?;
-    if viewport.visible_count == 0 {
-        return Some(target_idx);
-    }
-    let end_visible = viewport.first_visible + viewport.visible_count;
-    if target_idx < viewport.first_visible {
-        Some(target_idx)
-    } else if target_idx >= end_visible {
-        Some(
-            target_idx
-                .saturating_add(1)
-                .saturating_sub(viewport.visible_count),
-        )
-    } else {
-        None
-    }
-}
-
-/// Resolve the new row index for an anchor after historical prepend.
-///
-/// When older items are prepended to the ledger (e.g. historical backfill/paging),
-/// this function locates the anchored row in `rows_after` so the scroller can
-/// adjust its offset and preserve visual continuity.
-///
-/// Returns `Some(new_index)` if `anchor` exists in `rows_after`, or `None` if missing.
-pub fn anchor_after_prepend(
-    _rows_before: &[LedgerRow],
-    rows_after: &[LedgerRow],
-    anchor: &RowId,
-) -> Option<usize> {
-    rows_after.iter().position(|r| r.id == *anchor)
-}
-
-/// Compute whether live append should follow the edge or remain anchored.
-pub fn should_follow_live_edge(model: &TrajectoryViewModel) -> bool {
-    model.following_live()
-}
-
-/// Compute scroll target for live edge append.
-pub fn live_edge_scroll_target(
-    rows: &[LedgerRow],
-    following_live: bool,
-    viewport: LedgerViewport,
-) -> Option<usize> {
-    if !following_live || rows.is_empty() {
-        return None;
-    }
-    let last_idx = rows.len().saturating_sub(1);
-    let end_visible = viewport.first_visible + viewport.visible_count;
-    if last_idx >= end_visible {
-        Some(
-            last_idx
-                .saturating_add(1)
-                .saturating_sub(viewport.visible_count),
-        )
-    } else {
-        None
-    }
-}
-
 /// Whether the ledger viewport sits away from the bottom of the list.
 ///
 /// Read from the scroll handle rather than from a wheel handler: position is
@@ -119,6 +37,27 @@ pub fn is_away_from_live_edge(
         return false;
     }
     -offset_y < max_offset_y - tolerance
+}
+
+/// Decide whether live following survives an arriving record. Judged before
+/// the catch-up scroll is queued, so a stream faster than the frame rate can
+/// never starve the check.
+///
+/// `pending_jump_from` is the offset recorded when a live-edge jump was queued
+/// that prepaint has not applied yet. Until it lands, only the user can move
+/// the offset, so any change means they scrolled and they win. With no jump
+/// pending, offset and `max_offset_y` describe the same frame and position
+/// alone decides.
+pub fn keep_following_live(
+    offset_y: gpui::Pixels,
+    max_offset_y: gpui::Pixels,
+    pending_jump_from: Option<gpui::Pixels>,
+    tolerance: gpui::Pixels,
+) -> bool {
+    match pending_jump_from {
+        Some(from) => offset_y == from,
+        None => !is_away_from_live_edge(offset_y, max_offset_y, tolerance),
+    }
 }
 
 /// Render the virtualized ledger list using GPUI's uniform_list.
@@ -338,148 +277,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use zeron_proto::trajectory::TrajectoryStatus;
-
     use super::*;
-
-    fn make_test_row(id: &str, depth: u8, kind: LedgerRowKind) -> LedgerRow {
-        LedgerRow {
-            id: RowId::from(id),
-            kind,
-            depth,
-            label: SharedString::from(id),
-            record: None,
-            lane: None,
-            status: Some(TrajectoryStatus::Completed),
-            is_error: false,
-            dimmed: false,
-            foldable: false,
-            folded: false,
-        }
-    }
 
     #[test]
     fn test_trajectory_ledger_fixed_row_height() {
         assert_eq!(ROW_HEIGHT, px(26.0));
-    }
-
-    #[test]
-    fn test_trajectory_ledger_scroll_target_for_row_above_and_below_viewport() {
-        let rows: Vec<LedgerRow> = (0..50)
-            .map(|i| make_test_row(&format!("row-{i}"), 0, LedgerRowKind::Event))
-            .collect();
-
-        let viewport = LedgerViewport {
-            first_visible: 10,
-            visible_count: 5, // rows 10..15 visible (10, 11, 12, 13, 14)
-        };
-
-        // Target above viewport (row 4): returns 4 so it scrolls up to place row 4 as first_visible
-        let target_above = RowId::from("row-4");
-        assert_eq!(
-            scroll_target_for_row(&rows, &target_above, viewport),
-            Some(4)
-        );
-
-        // Target below viewport (row 20): returns 20 + 1 - 5 = 16 so it scrolls down to place row 20 at bottom of viewport
-        let target_below = RowId::from("row-20");
-        assert_eq!(
-            scroll_target_for_row(&rows, &target_below, viewport),
-            Some(16)
-        );
-
-        // Target exactly at bottom edge (row 15): index 15 is >= 10 + 5 (15), so returns 15 + 1 - 5 = 11
-        let target_edge_below = RowId::from("row-15");
-        assert_eq!(
-            scroll_target_for_row(&rows, &target_edge_below, viewport),
-            Some(11)
-        );
-    }
-
-    #[test]
-    fn test_trajectory_ledger_scroll_target_for_row_already_visible() {
-        let rows: Vec<LedgerRow> = (0..50)
-            .map(|i| make_test_row(&format!("row-{i}"), 0, LedgerRowKind::Event))
-            .collect();
-
-        let viewport = LedgerViewport {
-            first_visible: 10,
-            visible_count: 5, // rows 10..15 visible (10, 11, 12, 13, 14)
-        };
-
-        // Targets currently inside visible range: should return None (no scroll needed)
-        assert_eq!(
-            scroll_target_for_row(&rows, &RowId::from("row-10"), viewport),
-            None
-        );
-        assert_eq!(
-            scroll_target_for_row(&rows, &RowId::from("row-12"), viewport),
-            None
-        );
-        assert_eq!(
-            scroll_target_for_row(&rows, &RowId::from("row-14"), viewport),
-            None
-        );
-
-        // Non-existent row ID: should return None
-        assert_eq!(
-            scroll_target_for_row(&rows, &RowId::from("row-unknown"), viewport),
-            None
-        );
-    }
-
-    #[test]
-    fn test_trajectory_ledger_anchor_after_prepend_preserves_position() {
-        let rows_before: Vec<LedgerRow> = vec![
-            make_test_row("row-10", 0, LedgerRowKind::Event),
-            make_test_row("row-11", 0, LedgerRowKind::Event),
-            make_test_row("row-12", 0, LedgerRowKind::Event),
-        ];
-
-        let anchor = RowId::from("row-10");
-
-        // 5 older rows prepended (row-5..row-9)
-        let mut rows_after: Vec<LedgerRow> = (5..10)
-            .map(|i| make_test_row(&format!("row-{i}"), 0, LedgerRowKind::Event))
-            .collect();
-        rows_after.extend(rows_before.clone());
-
-        // The anchor "row-10" was at index 0 in rows_before, now at index 5 in rows_after
-        let new_index = anchor_after_prepend(&rows_before, &rows_after, &anchor);
-        assert_eq!(new_index, Some(5));
-
-        // Unknown anchor returns None
-        let missing_anchor = RowId::from("row-nonexistent");
-        assert_eq!(
-            anchor_after_prepend(&rows_before, &rows_after, &missing_anchor),
-            None
-        );
-    }
-
-    #[test]
-    fn test_trajectory_ledger_live_append_following_vs_anchored() {
-        let mut model = TrajectoryViewModel::new("chat-1");
-
-        // By default, following_live is true
-        assert!(should_follow_live_edge(&model));
-
-        let rows: Vec<LedgerRow> = (0..30)
-            .map(|i| make_test_row(&format!("row-{i}"), 0, LedgerRowKind::Event))
-            .collect();
-
-        let viewport = LedgerViewport {
-            first_visible: 0,
-            visible_count: 10, // rows 0..10 visible
-        };
-
-        // When following_live == true, new append (up to row 29) yields scroll target to bring the edge into view
-        let target = live_edge_scroll_target(&rows, true, viewport);
-        assert_eq!(target, Some(29 + 1 - 10)); // 20
-
-        // When following_live == false (user scrolled away or paused), live_edge_scroll_target returns None
-        model.set_following_live(false);
-        assert!(!should_follow_live_edge(&model));
-        assert_eq!(live_edge_scroll_target(&rows, false, viewport), None);
     }
 
     /// The gap the native pass exposed: `following_live` never went false, so
@@ -509,6 +311,41 @@ mod tests {
         assert!(!is_away_from_live_edge(
             gpui::px(0.0),
             gpui::px(0.0),
+            tolerance
+        ));
+    }
+
+    /// A stream faster than the frame rate keeps a catch-up scroll pending at
+    /// every render; the decision must still read the user's scroll-back.
+    #[test]
+    fn test_trajectory_ledger_keep_following_live_decision() {
+        let row = gpui::px(26.0);
+        let tolerance = row * 2.0;
+        let bottom = -row * 20.0;
+
+        // No jump pending: position decides.
+        assert!(keep_following_live(bottom, row * 20.0, None, tolerance));
+        assert!(!keep_following_live(
+            -row * 10.0,
+            row * 20.0,
+            None,
+            tolerance
+        ));
+
+        // Follow Live queued a jump from the top that prepaint has not applied:
+        // an unchanged offset is our own pending jump, not the user scrolling.
+        assert!(keep_following_live(
+            gpui::px(0.0),
+            row * 20.0,
+            Some(gpui::px(0.0)),
+            tolerance
+        ));
+
+        // Jump pending but the offset moved: only the user could have done it.
+        assert!(!keep_following_live(
+            -row * 5.0,
+            row * 20.0,
+            Some(bottom),
             tolerance
         ));
     }
