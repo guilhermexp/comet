@@ -1014,6 +1014,7 @@ pub fn seed_trajectory_fixture(
     fixture: TrajectoryCaptureFixture,
     cx: &mut Context<TrajectoryView>,
 ) {
+    view.park_watch();
     let chat_id = view.chat_id().to_string();
     let selected_id = apply_trajectory_fixture(view.model_mut(), &chat_id, fixture);
     if let Some(id) = &selected_id {

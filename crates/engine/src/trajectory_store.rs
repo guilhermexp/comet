@@ -516,12 +516,11 @@ impl TrajectoryStore {
         if records.is_empty() {
             return Ok(());
         }
-        if let Some(reason) = self
+        let mut reason_guard = self
             .degraded_reason
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(reason) = reason_guard.as_ref() {
             self.emit_degraded(degraded_intervals_by_run(
                 &records,
                 &format!("Store degraded: {}", reason),
@@ -531,18 +530,13 @@ impl TrajectoryStore {
                 reason
             )));
         }
-        let on_writer_death = degraded_intervals_by_run(&records, "Writer channel closed");
         match self
             .writer_tx
             .try_send(WriterCommand::WriteRecords(records))
         {
-            Ok(()) => {
-                if self.is_degraded() {
-                    self.emit_degraded(on_writer_death);
-                }
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(WriterCommand::WriteRecords(recs))) => {
+                drop(reason_guard);
                 tracing::warn!(
                     count = recs.len(),
                     "trajectory capture queue saturated; recording degraded intervals"
@@ -551,16 +545,12 @@ impl TrajectoryStore {
                 Err(TrajectoryStoreError::QueueFull)
             }
             Err(TrySendError::Full(_)) => Err(TrajectoryStoreError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => {
-                let mut reason_guard = self
-                    .degraded_reason
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if reason_guard.is_none() {
-                    *reason_guard = Some("Writer channel closed".into());
-                }
+            Err(TrySendError::Disconnected(cmd)) => {
+                *reason_guard = Some("Writer channel closed".into());
                 drop(reason_guard);
-                self.emit_degraded(on_writer_death);
+                if let WriterCommand::WriteRecords(recs) = cmd {
+                    self.emit_degraded(degraded_intervals_by_run(&recs, "Writer channel closed"));
+                }
                 Err(TrajectoryStoreError::ChannelClosed)
             }
         }

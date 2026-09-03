@@ -167,6 +167,13 @@ impl TrajectoryView {
         self.watch_task = Some(Self::spawn_watch(self.chat_id.clone(), cx));
     }
 
+    /// Occupy the watch slot with a finished task so every later
+    /// `ensure_watch` from the shell is a no-op: a capture fixture owns the
+    /// model and no engine stream may write over it.
+    pub fn park_watch(&mut self) {
+        self.watch_task = Some(Task::ready(()));
+    }
+
     /// The engine handle is re-read on every (re)connect: after a sign-out /
     /// sign-in the shell replaces the runtime, and a handle pinned at spawn
     /// time would keep dialing the dead client forever.
