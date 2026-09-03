@@ -2032,6 +2032,23 @@ mod tests {
     }
 
     #[test]
+    fn test_opaque_token_straddling_preview_cap_is_redacted_before_truncation() {
+        // An opaque 40-char token that starts 14 bytes before the 1024-byte
+        // cap: truncating first would leave a 14-char prefix that the >=32
+        // opaque rule no longer matches, leaking part of the secret.
+        let token = "Zq7Lm9Xk3Vb2Nc8Pw5Rt1Yh6Uj4Gf0Dd9Ss2Aa7E";
+        assert_eq!(token.len(), 40);
+        let filler = "a ".repeat(505);
+        assert_eq!(filler.len(), 1010);
+        let text = format!("{filler}{token} tail");
+        let (summary, preview) = sanitize_prompt_preview(&text, 1024);
+        let preview = preview.unwrap();
+        assert!(preview.ends_with("(truncated)"), "cap not applied: {preview:?}");
+        assert!(!preview.contains(&token[..14]), "preview leaked {preview:?}");
+        assert!(!summary.contains(&token[..14]), "summary leaked {summary:?}");
+    }
+
+    #[test]
     fn test_multibyte_prompt_sanitization_boundary() {
         // Multibyte characters (e.g. 3-byte Japanese kanji, 4-byte emojis) crossing the 256-byte summary cap
         // must not panic with slice indexing errors.
