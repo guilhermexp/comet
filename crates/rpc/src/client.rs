@@ -233,6 +233,20 @@ impl RpcClient {
         Ok(subscription)
     }
 
+    /// Watch Trajectory records and live deltas for a chat.
+    ///
+    /// Uses [`subscribe_checked`] to guarantee the stream cancellation frame is sent
+    /// immediately upon dropping [`RpcSubscription`].
+    pub async fn watch_trajectory(
+        &self,
+        params: crate::WatchTrajectoryParams,
+    ) -> Result<RpcSubscription, RpcError> {
+        let value = serde_json::to_value(params)
+            .map_err(|e| RpcError::BadParams(format!("serialize params: {e}")))?;
+        self.subscribe_checked(crate::methods::WATCH_TRAJECTORY, value)
+            .await
+    }
+
     async fn send(&self, frame: ClientFrame) -> Result<(), RpcError> {
         let json = serde_json::to_string(&frame)
             .map_err(|e| RpcError::Transport(format!("serialize frame: {e}")))?;

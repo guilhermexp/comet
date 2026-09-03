@@ -17,7 +17,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-
+pub use zeron_proto::trajectory::{
+    TrajectoryDegradedInterval, TrajectoryRawField, TrajectoryRawRef, TrajectoryRecord,
+    TrajectoryRecordId,
+};
 mod client;
 pub mod device_room;
 pub mod method;
@@ -112,6 +115,294 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     RpcClient::new(client_out, client_in)
 }
 
+// ---------------------------------------------------------------------------
+// Trajectory Wire Types
+// ---------------------------------------------------------------------------
+
+/// Full `(source_seq, sub_seq)` position plus store revision for Trajectory watch and paging.
+///
+/// Critical invariant: `source_seq` alone is insufficient because legacy Interrupted records
+/// can share `source_seq` with a prefix record at `sub_seq = u32::MAX`.
+///
+/// `rev` is the store's monotonic per-commit revision observed by the holder of this cursor.
+/// Position alone cannot express an in-place replacement (a partial record finalized under the
+/// same `(source_seq, sub_seq)`), so resume asks for "everything past this position OR written
+/// after this revision". `rev == 0` means "no revision knowledge" and disables that clause.
+/// Ordering stays position-first: `rev` only breaks ties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrajectoryCursor {
+    pub source_seq: u64,
+    pub sub_seq: u32,
+    #[serde(default)]
+    pub rev: u64,
+}
+
+impl TrajectoryCursor {
+    pub const fn new(source_seq: u64, sub_seq: u32) -> Self {
+        Self {
+            source_seq,
+            sub_seq,
+            rev: 0,
+        }
+    }
+
+    /// Same position, carrying the store revision the holder has already observed.
+    pub const fn with_rev(self, rev: u64) -> Self {
+        Self { rev, ..self }
+    }
+}
+
+impl From<(u64, u32)> for TrajectoryCursor {
+    fn from((source_seq, sub_seq): (u64, u32)) -> Self {
+        Self::new(source_seq, sub_seq)
+    }
+}
+
+impl From<&TrajectoryRecord> for TrajectoryCursor {
+    fn from(r: &TrajectoryRecord) -> Self {
+        Self::new(r.source_seq, r.sub_seq)
+    }
+}
+
+impl From<TrajectoryRecordId> for TrajectoryCursor {
+    fn from(id: TrajectoryRecordId) -> Self {
+        Self::new(id.source_seq, id.sub_seq)
+    }
+}
+
+impl From<&TrajectoryRecordId> for TrajectoryCursor {
+    fn from(id: &TrajectoryRecordId) -> Self {
+        Self::new(id.source_seq, id.sub_seq)
+    }
+}
+
+/// Request parameters for `WatchTrajectory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchTrajectoryParams {
+    pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_cursor: Option<TrajectoryCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl WatchTrajectoryParams {
+    pub fn new(chat_id: impl Into<String>) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+            after_cursor: None,
+            limit: None,
+        }
+    }
+
+    pub fn with_cursor(mut self, cursor: impl Into<TrajectoryCursor>) -> Self {
+        self.after_cursor = Some(cursor.into());
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+/// Reason why a Trajectory watch stream reached a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrajectoryTerminalReason {
+    ChatDeleted,
+    StoreUnavailable,
+}
+
+/// Stream items emitted by `WatchTrajectory`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TrajectoryWatchItem {
+    /// Initial snapshot of historical records up to `watermark`.
+    /// May be delivered in multiple bounded frames if `has_more` is true.
+    Snapshot {
+        records: Vec<TrajectoryRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watermark: Option<TrajectoryCursor>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        degraded: Vec<TrajectoryDegradedInterval>,
+        #[serde(default)]
+        has_more: bool,
+    },
+    /// Live deltas emitted strictly after the snapshot watermark or previous delta watermark.
+    Deltas {
+        records: Vec<TrajectoryRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watermark: Option<TrajectoryCursor>,
+    },
+    /// Notification of a new degraded interval during active watch.
+    Degraded {
+        intervals: Vec<TrajectoryDegradedInterval>,
+    },
+    /// Explicit instruction to client to clear local state and resubscribe / resnapshot
+    /// when an unrecoverable gap is detected.
+    ResyncRequired { reason: String },
+    /// Stream closure due to terminal lifecycle events (e.g. Chat deleted).
+    Terminal {
+        reason: TrajectoryTerminalReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+pub const DEFAULT_TRAJECTORY_PAGE_SIZE: usize = 250;
+pub const MAX_TRAJECTORY_PAGE_SIZE: usize = 1000;
+pub const MIN_TRAJECTORY_PAGE_SIZE: usize = 1;
+
+pub const CURRENT_RAW_SOURCE_VERSION: u32 = 1;
+
+fn default_raw_source_version() -> u32 {
+    CURRENT_RAW_SOURCE_VERSION
+}
+
+/// Request parameters for `RevealTrajectoryRaw`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevealTrajectoryRawParams {
+    pub chat_id: String,
+    pub source_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub field: TrajectoryRawField,
+    #[serde(default = "default_raw_source_version")]
+    pub source_version: u32,
+}
+
+impl RevealTrajectoryRawParams {
+    pub fn new(
+        chat_id: impl Into<String>,
+        source_seq: u64,
+        parent_tool_use_id: Option<String>,
+        call_id: Option<String>,
+        field: TrajectoryRawField,
+    ) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+            source_seq,
+            parent_tool_use_id,
+            call_id,
+            field,
+            source_version: CURRENT_RAW_SOURCE_VERSION,
+        }
+    }
+
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.source_version = version;
+        self
+    }
+
+    pub fn to_raw_ref(&self) -> TrajectoryRawRef {
+        TrajectoryRawRef {
+            chat_id: self.chat_id.clone(),
+            source_seq: self.source_seq,
+            parent_tool_use_id: self.parent_tool_use_id.clone(),
+            call_id: self.call_id.clone(),
+            field: self.field,
+            source_version: self.source_version,
+        }
+    }
+}
+
+impl From<TrajectoryRawRef> for RevealTrajectoryRawParams {
+    fn from(r: TrajectoryRawRef) -> Self {
+        Self {
+            chat_id: r.chat_id,
+            source_seq: r.source_seq,
+            parent_tool_use_id: r.parent_tool_use_id,
+            call_id: r.call_id,
+            field: r.field,
+            source_version: r.source_version,
+        }
+    }
+}
+
+impl From<&TrajectoryRawRef> for RevealTrajectoryRawParams {
+    fn from(r: &TrajectoryRawRef) -> Self {
+        Self {
+            chat_id: r.chat_id.clone(),
+            source_seq: r.source_seq,
+            parent_tool_use_id: r.parent_tool_use_id.clone(),
+            call_id: r.call_id.clone(),
+            field: r.field,
+            source_version: r.source_version,
+        }
+    }
+}
+
+impl From<RevealTrajectoryRawParams> for TrajectoryRawRef {
+    fn from(p: RevealTrajectoryRawParams) -> Self {
+        p.to_raw_ref()
+    }
+}
+
+impl From<&RevealTrajectoryRawParams> for TrajectoryRawRef {
+    fn from(p: &RevealTrajectoryRawParams) -> Self {
+        p.to_raw_ref()
+    }
+}
+
+/// Reason why a raw reveal lookup resulted in unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrajectoryUnavailableReason {
+    NotFound,
+    ForeignDevice,
+    ChatDeleted,
+    SourceCorrupt,
+    SourceOversized,
+    MismatchedReference,
+    UnsupportedSourceVersion,
+    StoreUnavailable,
+}
+
+/// Typed result returned by `RevealTrajectoryRaw`.
+///
+/// Invariant: Raw text is ephemeral response data and must NEVER be persisted or synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum TrajectoryRawRevealResult {
+    Available {
+        field: TrajectoryRawField,
+        text: String,
+    },
+    Unavailable {
+        field: TrajectoryRawField,
+        reason: TrajectoryUnavailableReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+impl TrajectoryRawRevealResult {
+    pub fn available(field: TrajectoryRawField, text: impl Into<String>) -> Self {
+        Self::Available {
+            field,
+            text: text.into(),
+        }
+    }
+
+    pub fn unavailable(
+        field: TrajectoryRawField,
+        reason: TrajectoryUnavailableReason,
+        message: Option<String>,
+    ) -> Self {
+        Self::Unavailable {
+            field,
+            reason,
+            message,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,7 +432,12 @@ mod tests {
             method: &str,
             _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
-            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                && method != methods::WATCH_TRAJECTORY
+            {
+                if method == "Echo" {
+                    return Ok(RpcReply::Value(_params));
+                }
                 return Err(RpcError::UnknownMethod(method.into()));
             }
             let guard = DropSignal(self.dropped.lock().unwrap().take());
@@ -305,14 +601,201 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_stream_receiver_cancels_server_side() {
-        let client = memory_client(Arc::new(TestService));
-        let items = client
-            .subscribe("Never", serde_json::Value::Null)
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let client = memory_client(service);
+        let subscription = client
+            .subscribe_checked(
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+                serde_json::Value::Null,
+            )
             .await
-            .unwrap();
-        drop(items);
+            .expect("subscribe_checked");
+        drop(subscription);
+
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx).await;
+        assert!(
+            dropped.is_ok(),
+            "dropping stream subscription must cancel and tear down server task"
+        );
         // The next unary call still works — the dead stream didn't wedge the connection.
         let echoed = client.call("Echo", serde_json::json!(2)).await.unwrap();
         assert_eq!(echoed, serde_json::json!(2));
+    }
+
+    #[test]
+    fn test_trajectory_cursor_ordering_revision_and_legacy_serialization() {
+        let c1 = TrajectoryCursor::new(1, 0);
+        let c2 = TrajectoryCursor::new(1, 1);
+        let c3 = TrajectoryCursor::new(2, 0);
+        let c4 = TrajectoryCursor::new(1, u32::MAX);
+
+        assert!(c1 < c2);
+        assert!(c2 < c4);
+        assert!(c4.with_rev(u64::MAX) < c3);
+        assert!(c2.with_rev(1) < c2.with_rev(2));
+
+        let json = serde_json::to_string(&c2.with_rev(7)).unwrap();
+        assert_eq!(json, r#"{"sourceSeq":1,"subSeq":1,"rev":7}"#);
+        let parsed: TrajectoryCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, c2.with_rev(7));
+
+        let legacy: TrajectoryCursor =
+            serde_json::from_str(r#"{"sourceSeq":1,"subSeq":1}"#).unwrap();
+        assert_eq!(legacy, c2);
+    }
+
+    #[test]
+    fn test_watch_trajectory_params_and_items_serde() {
+        let params = WatchTrajectoryParams::new("chat-123")
+            .with_cursor((5, 2))
+            .with_limit(100);
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains(r#""chatId":"chat-123""#));
+        assert!(json.contains(r#""afterCursor":{"sourceSeq":5,"subSeq":2,"rev":0}"#));
+        assert!(json.contains(r#""limit":100"#));
+
+        let parsed: WatchTrajectoryParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, params);
+
+        // Snapshot item
+        let snap_raw = r#"{
+            "kind": "snapshot",
+            "records": [],
+            "watermark": {"sourceSeq": 10, "subSeq": 0},
+            "degraded": [{
+                "chatId": "chat-123",
+                "runId": "run-1",
+                "fromSeq": 1,
+                "toSeq": 3,
+                "reason": "storage fault",
+                "recordedAt": "2026-09-01T12:00:00Z"
+            }],
+            "hasMore": false
+        }"#;
+        let snap: TrajectoryWatchItem = serde_json::from_str(snap_raw).unwrap();
+        let snap_json = serde_json::to_string(&snap).unwrap();
+        assert!(snap_json.contains(r#""kind":"snapshot""#));
+        let parsed_snap: TrajectoryWatchItem = serde_json::from_str(&snap_json).unwrap();
+        assert_eq!(parsed_snap, snap);
+
+        // Deltas item
+        let deltas = TrajectoryWatchItem::Deltas {
+            records: Vec::new(),
+            watermark: Some(TrajectoryCursor::new(11, 0)),
+        };
+        let deltas_json = serde_json::to_string(&deltas).unwrap();
+        assert!(deltas_json.contains(r#""kind":"deltas""#));
+
+        // Degraded item
+        let deg = TrajectoryWatchItem::Degraded {
+            intervals: Vec::new(),
+        };
+        let deg_json = serde_json::to_string(&deg).unwrap();
+        assert!(deg_json.contains(r#""kind":"degraded""#));
+
+        // ResyncRequired item
+        let resync = TrajectoryWatchItem::ResyncRequired {
+            reason: "gap detected".into(),
+        };
+        let resync_json = serde_json::to_string(&resync).unwrap();
+        assert!(resync_json.contains(r#""kind":"resyncRequired""#));
+        assert!(resync_json.contains(r#""reason":"gap detected""#));
+
+        // Terminal item
+        let term = TrajectoryWatchItem::Terminal {
+            reason: TrajectoryTerminalReason::ChatDeleted,
+            message: Some("Chat was deleted".into()),
+        };
+        let term_json = serde_json::to_string(&term).unwrap();
+        assert!(term_json.contains(r#""kind":"terminal""#));
+        assert!(term_json.contains(r#""reason":"chatDeleted""#));
+    }
+
+    #[test]
+    fn test_reveal_trajectory_raw_params_and_result_serde() {
+        let params = RevealTrajectoryRawParams::new(
+            "chat-456",
+            42,
+            Some("parent-tool-1".into()),
+            Some("call-99".into()),
+            TrajectoryRawField::Payload,
+        );
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains(r#""chatId":"chat-456""#));
+        assert!(json.contains(r#""sourceSeq":42"#));
+        assert!(json.contains(r#""parentToolUseId":"parent-tool-1""#));
+        assert!(json.contains(r#""callId":"call-99""#));
+        assert!(json.contains(r#""field":"payload""#));
+        assert!(json.contains(r#""sourceVersion":1"#));
+
+        let parsed: RevealTrajectoryRawParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_version, CURRENT_RAW_SOURCE_VERSION);
+
+        // Omitted sourceVersion defaults to CURRENT_RAW_SOURCE_VERSION
+        let legacy_json = r#"{"chatId":"chat-456","sourceSeq":42,"field":"payload"}"#;
+        let parsed_legacy: RevealTrajectoryRawParams = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed_legacy.source_version, CURRENT_RAW_SOURCE_VERSION);
+
+        // Explicit unknown version is parsed accurately (no silent rewrite)
+        let unknown_json =
+            r#"{"chatId":"chat-456","sourceSeq":42,"field":"payload","sourceVersion":99}"#;
+        let parsed_unknown: RevealTrajectoryRawParams = serde_json::from_str(unknown_json).unwrap();
+        assert_eq!(parsed_unknown.source_version, 99);
+
+        let raw_ref = params.to_raw_ref();
+        assert_eq!(raw_ref.chat_id, "chat-456");
+        assert_eq!(raw_ref.source_seq, 42);
+        assert_eq!(raw_ref.source_version, CURRENT_RAW_SOURCE_VERSION);
+
+        // Version 99 preserves across all From and to_raw_ref conversions
+        let v99_params =
+            RevealTrajectoryRawParams::new("chat-99", 100, None, None, TrajectoryRawField::Payload)
+                .with_version(99);
+        assert_eq!(v99_params.source_version, 99);
+
+        let v99_raw_ref = v99_params.to_raw_ref();
+        assert_eq!(v99_raw_ref.source_version, 99);
+
+        let round_trip_params: RevealTrajectoryRawParams = v99_raw_ref.clone().into();
+        assert_eq!(round_trip_params.source_version, 99);
+
+        let round_trip_ref_params: RevealTrajectoryRawParams = (&v99_raw_ref).into();
+        assert_eq!(round_trip_ref_params.source_version, 99);
+
+        let round_trip_raw_ref: TrajectoryRawRef = round_trip_params.into();
+        assert_eq!(round_trip_raw_ref.source_version, 99);
+
+        let avail = TrajectoryRawRevealResult::available(
+            TrajectoryRawField::Payload,
+            "const secret = 'raw';",
+        );
+        let avail_json = serde_json::to_string(&avail).unwrap();
+        assert!(avail_json.contains(r#""status":"available""#));
+        assert!(avail_json.contains(r#""text":"const secret = 'raw';""#));
+
+        let unavail = TrajectoryRawRevealResult::unavailable(
+            TrajectoryRawField::Result,
+            TrajectoryUnavailableReason::ForeignDevice,
+            Some("chat is on another device".into()),
+        );
+        let unavail_json = serde_json::to_string(&unavail).unwrap();
+        assert!(unavail_json.contains(r#""status":"unavailable""#));
+        assert!(unavail_json.contains(r#""reason":"foreignDevice""#));
+    }
+
+    #[test]
+    fn test_trajectory_rpc_methods_local_only() {
+        assert_eq!(methods::WATCH_TRAJECTORY, "WatchTrajectory");
+        assert_eq!(methods::REVEAL_TRAJECTORY_RAW, "RevealTrajectoryRaw");
+        assert!(methods::is_local_only(methods::WATCH_TRAJECTORY));
+        assert!(methods::is_local_only(methods::REVEAL_TRAJECTORY_RAW));
+        assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
+        assert!(methods::is_local_only(methods::LOCAL_DEVICE));
+        assert!(methods::is_local_only(methods::STOP_ENGINE));
+        assert!(!methods::is_local_only(methods::LIST_HARNESSES));
+        assert!(!methods::is_local_only(methods::FETCH_TOOL_INPUT));
     }
 }

@@ -22,6 +22,7 @@ not built yet).
 | 1.11 Changes viewer | done | Unified and side-by-side file/hunk/line projection, paired no-newline markers, sticky active-file headers, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
 | 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Gap: prefers-reduced-motion switch. |
 | 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); reconnect from scratch. |
+| 1.14 Chat Trajectory preview | done | Analytical timeline (3 fixed lanes: Input/Model/Tools, Sequence and Recorded duration modes), virtualized execution ledger, 5-tab record inspector (Summary, Payload, Result, Schema, Timing), ephemeral device-local Raw Reveal, live-edge follow/pause, and responsive Split/NarrowDetail layout switching in the unified right tab strip (`ui/src/trajectory/`). |
 
 ## §2 Control plane
 
@@ -38,6 +39,7 @@ not built yet).
 | Mutate ops | partial | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exists on the doc layer but is not yet exposed as a Mutate op. |
 | AuthRpc | done | AuthStatus emits the canonical proto shape (`{"state": "signedIn", …}`); SignIn/SignInHeadless/CompleteSignIn/SignOut/ListOrgs/CreateOrg/SelectOrg. |
 | Wire types | done | `zeron-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
+| Trajectory RPCs | done | Local-only atomic snapshot-watermark-delta watch (`WatchTrajectory`) and bounded owner-checked raw field reveal (`RevealTrajectoryRaw`) over Run Journal; never forwarded across devices. |
 
 ## §3 Backend engine
 
@@ -105,6 +107,6 @@ not built yet).
 
 ## Summary
 
-Table rows above: **40 done · 6 partial**, plus the cross-cutting deferrals
+Table rows above: **42 done · 6 partial**, plus the cross-cutting deferrals
 (mobile, E2EE, macOS packaging execution, engine hardening) — the last
 overlaps the named gaps in the partial rows.

@@ -25,6 +25,9 @@ pub trait RpcMethod {
     /// watch methods stream on the wire too but are never forwarded, so they
     /// stay `false`: this flag drives relay routing, not reply shape.
     const STREAM: bool;
+    /// Whether this method is strictly device-local: rejected at relay ingress
+    /// on peer virtual connections, never forwarded. Implies `!FORWARDABLE`.
+    const LOCAL_ONLY: bool;
     /// Reply deadline for a relay-forwarded unary call.
     const DEADLINE: Duration;
     /// Request payload.
@@ -43,6 +46,8 @@ pub struct MethodInfo {
     /// Whether the relay proxies the reply as a stream of items (see
     /// [`RpcMethod::STREAM`]); implies `forwardable`.
     pub stream: bool,
+    /// Whether the method is device-local only (see [`RpcMethod::LOCAL_ONLY`]).
+    pub local_only: bool,
     /// Reply deadline for a relay-forwarded unary call.
     pub deadline: Duration,
 }
@@ -61,6 +66,7 @@ macro_rules! rpc_methods {
             reply: $r:ty
             $(, forwardable: $fwd:literal)?
             $(, stream: $st:literal)?
+            $(, local_only: $lo:literal)?
             $(, deadline_secs: $dl:literal)?
         }
     ),* $(,)?) => {
@@ -71,6 +77,13 @@ macro_rules! rpc_methods {
                 $(#[$meta])*
                 pub const $konst: &str = $name;
             )*
+
+            /// Whether a wire name is a strictly device-local method: rejected
+            /// at relay ingress, never forwarded. Unknown names are not ours,
+            /// so they are not local-only either.
+            pub fn is_local_only(name: &str) -> bool {
+                super::info(name).is_some_and(|method| method.local_only)
+            }
         }
 
         /// Every wire name in declaration order.
@@ -84,6 +97,7 @@ macro_rules! rpc_methods {
                 const NAME: &'static str = $name;
                 const FORWARDABLE: bool = false $(|| $fwd)?;
                 const STREAM: bool = false $(|| $st)?;
+                const LOCAL_ONLY: bool = false $(|| $lo)?;
                 const DEADLINE: Duration = Duration::from_secs(30 $(* 0 + $dl)?);
                 type Params = $p;
                 type Reply = $r;
@@ -98,6 +112,7 @@ macro_rules! rpc_methods {
                         name: $name,
                         forwardable: <$ty as RpcMethod>::FORWARDABLE,
                         stream: <$ty as RpcMethod>::STREAM,
+                        local_only: <$ty as RpcMethod>::LOCAL_ONLY,
                         deadline: <$ty as RpcMethod>::DEADLINE,
                     }),
                 )*
@@ -162,18 +177,18 @@ rpc_methods! {
     WATCH_SPACES / WatchSpaces = "WatchSpaces" { params: serde_json::Value, reply: serde_json::Value },
     /// Local-only OMP Live Voice lifecycle. Media remains inside OMP; Comet
     /// exposes only control, state, and transcript metadata.
-    PROBE_LIVE_VOICE / ProbeLiveVoice = "ProbeLiveVoice" { params: serde_json::Value, reply: serde_json::Value },
-    START_LIVE_VOICE / StartLiveVoice = "StartLiveVoice" { params: serde_json::Value, reply: serde_json::Value },
-    SET_LIVE_VOICE_MUTED / SetLiveVoiceMuted = "SetLiveVoiceMuted" { params: serde_json::Value, reply: serde_json::Value },
-    STOP_LIVE_VOICE / StopLiveVoice = "StopLiveVoice" { params: serde_json::Value, reply: serde_json::Value },
-    WATCH_LIVE_VOICE / WatchLiveVoice = "WatchLiveVoice" { params: serde_json::Value, reply: serde_json::Value },
+    PROBE_LIVE_VOICE / ProbeLiveVoice = "ProbeLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    START_LIVE_VOICE / StartLiveVoice = "StartLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    SET_LIVE_VOICE_MUTED / SetLiveVoiceMuted = "SetLiveVoiceMuted" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    STOP_LIVE_VOICE / StopLiveVoice = "StopLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
+    WATCH_LIVE_VOICE / WatchLiveVoice = "WatchLiveVoice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     MUTATE / Mutate = "Mutate" { params: serde_json::Value, reply: serde_json::Value },
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
-    LOCAL_DEVICE / LocalDevice = "LocalDevice" { params: serde_json::Value, reply: serde_json::Value },
+    LOCAL_DEVICE / LocalDevice = "LocalDevice" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     /// This engine runtime's fixed device and workspace identity.
     ENGINE_INFO / EngineInfo = "EngineInfo" { params: serde_json::Value, reply: serde_json::Value },
     /// Readiness barrier for the engine runtime. The call completes once stores
@@ -182,7 +197,7 @@ rpc_methods! {
     /// Ask a headless IPC owner to drain its runtime and exit successfully.
     /// Headed IPC owners do not implement this method: closing another app's
     /// engine behind its windows would leave that process unusable.
-    STOP_ENGINE / StopEngine = "StopEngine" { params: serde_json::Value, reply: serde_json::Value },
+    STOP_ENGINE / StopEngine = "StopEngine" { params: serde_json::Value, reply: serde_json::Value, local_only: true },
     AUTH_STATUS / AuthStatus = "AuthStatus" { params: serde_json::Value, reply: serde_json::Value },
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     SIGN_IN / SignIn = "SignIn" { params: serde_json::Value, reply: serde_json::Value },
@@ -253,6 +268,12 @@ rpc_methods! {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     APPLY_UPDATE / ApplyUpdate = "ApplyUpdate" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
+    // Trajectory (device-local read model & explicit raw reveal; strictly
+    // IPC-only, rejected at relay ingress, never forwarded).
+    /// Stream of bounded Trajectory snapshot frames and ordered live deltas.
+    WATCH_TRAJECTORY / WatchTrajectory = "WatchTrajectory" { params: crate::WatchTrajectoryParams, reply: crate::TrajectoryWatchItem, local_only: true },
+    /// Device-local unary lookup to reveal one raw field from Run Journal.
+    REVEAL_TRAJECTORY_RAW / RevealTrajectoryRaw = "RevealTrajectoryRaw" { params: crate::RevealTrajectoryRawParams, reply: crate::TrajectoryRawRevealResult, local_only: true },
 }
 
 #[cfg(test)]
@@ -272,5 +293,23 @@ mod tests {
             info(methods::CLONE_REPO).unwrap().deadline,
             std::time::Duration::from_secs(15 * 60)
         );
+    }
+
+    #[test]
+    fn local_only_methods_are_never_forwardable() {
+        for name in ALL_METHOD_NAMES {
+            let method = info(name).unwrap_or_else(|| panic!("{name} missing from registry"));
+            if method.local_only {
+                assert!(
+                    !method.forwardable,
+                    "{name}: device-local methods must never be relay-forwarded"
+                );
+            }
+        }
+        assert!(methods::is_local_only(methods::WATCH_TRAJECTORY));
+        assert!(methods::is_local_only(methods::REVEAL_TRAJECTORY_RAW));
+        assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
+        assert!(!methods::is_local_only(methods::LIST_HARNESSES));
+        assert!(!methods::is_local_only("Nope"));
     }
 }

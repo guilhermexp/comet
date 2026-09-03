@@ -53,12 +53,19 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
-use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, info, methods, parse_params};
+use zeron_rpc::{
+    LinkCache, RevealTrajectoryRawParams, RpcError, RpcReply, RpcService, TrajectoryCursor,
+    TrajectoryRawField, TrajectoryRawRevealResult, TrajectoryTerminalReason,
+    TrajectoryUnavailableReason, TrajectoryWatchItem, WatchTrajectoryParams, info, methods,
+    parse_params,
+};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -67,8 +74,10 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
+use crate::run_journal::RunJournal;
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
+use crate::trajectory_store::{TrajectoryStore, TrajectoryStoreEvent};
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
@@ -450,7 +459,10 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     local_import: Option<crate::local_import::LocalImporter>,
+    trajectory: Option<Arc<TrajectoryStore>>,
+    run_journal: Option<Arc<RunJournal>>,
     engine_info: EngineInfo,
+    reveal_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl EngineRpc {
@@ -487,8 +499,31 @@ impl EngineRpc {
             links: None,
             updater: None,
             local_import: None,
+            trajectory: None,
+            run_journal: None,
             engine_info,
+            reveal_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RAW_REVEALS)),
         }
+    }
+
+    /// Attach a specific trajectory store (used in tests or profile setup).
+    pub fn with_trajectory_store(mut self, store: Arc<TrajectoryStore>) -> Self {
+        self.trajectory = Some(store);
+        self
+    }
+
+    /// Attach a specific run journal (used in tests).
+    pub fn with_run_journal(mut self, journal: Arc<RunJournal>) -> Self {
+        self.run_journal = Some(journal);
+        self
+    }
+
+    pub fn trajectory_store(&self) -> Option<Arc<TrajectoryStore>> {
+        self.trajectory.clone()
+    }
+
+    pub fn run_journal(&self) -> Option<Arc<RunJournal>> {
+        self.run_journal.clone()
     }
 
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
@@ -967,6 +1002,295 @@ fn doc_messages_stream(
     .boxed()
 }
 
+const TRAJECTORY_SNAPSHOT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const TRAJECTORY_STREAM_CHANNEL_CAP: usize = 256;
+const RESERVED_CONTROL_SLOTS: usize = 1;
+const MAX_CONCURRENT_RAW_REVEALS: usize = 4;
+const RAW_REVEAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn watch_trajectory_stream(
+    store: Arc<TrajectoryStore>,
+    workspace: Option<WorkspaceHost>,
+    local_device_id: Option<String>,
+    chat_id: String,
+    after_cursor: Option<TrajectoryCursor>,
+    limit: Option<usize>,
+) -> BoxStream<'static, serde_json::Value> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(TRAJECTORY_STREAM_CHANNEL_CAP);
+    let page_size = limit
+        .map(|l| l.clamp(1, zeron_rpc::MAX_TRAJECTORY_PAGE_SIZE))
+        .unwrap_or(zeron_rpc::DEFAULT_TRAJECTORY_PAGE_SIZE);
+
+    tokio::spawn(async move {
+        // M-race: Subscribe to events FIRST before checking authoritative state
+        let mut events_rx = store.subscribe_events();
+
+        // Recheck authoritative chat state within the task to eliminate race windows
+        if let Some(ws) = workspace {
+            let local_device = local_device_id.unwrap_or_default();
+            match ws.chat(&chat_id) {
+                Ok(Some(chat)) => {
+                    if !local_device.is_empty() && chat.device_id != local_device {
+                        let term = TrajectoryWatchItem::Terminal {
+                            reason: TrajectoryTerminalReason::StoreUnavailable,
+                            message: Some("Chat belongs to another device".into()),
+                        };
+                        if let Ok(val) = serde_json::to_value(&term) {
+                            let _ = tx.send(val).await;
+                        }
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let term = TrajectoryWatchItem::Terminal {
+                        reason: TrajectoryTerminalReason::ChatDeleted,
+                        message: Some("Chat not found".into()),
+                    };
+                    if let Ok(val) = serde_json::to_value(&term) {
+                        let _ = tx.send(val).await;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    let term = TrajectoryWatchItem::Terminal {
+                        reason: TrajectoryTerminalReason::StoreUnavailable,
+                        message: Some(e.to_string()),
+                    };
+                    if let Ok(val) = serde_json::to_value(&term) {
+                        let _ = tx.send(val).await;
+                    }
+                    return;
+                }
+            }
+        }
+
+        let store_clone = store.clone();
+        let chat_id_for_snap = chat_id.clone();
+        let tx_for_snap = tx.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let snapshot_res = tokio::task::spawn_blocking(move || {
+            let degraded = store_clone
+                .get_degraded_intervals_with_limit(&chat_id_for_snap, Some(page_size))?;
+            let mut is_first_page = true;
+            let mut final_watermark = after_cursor;
+            let mut send_timed_out = false;
+
+            store_clone.stream_snapshot_pages(
+                &chat_id_for_snap,
+                after_cursor,
+                page_size,
+                |records, watermark, has_more| {
+                    final_watermark = watermark;
+                    let snap_item = TrajectoryWatchItem::Snapshot {
+                        records,
+                        watermark,
+                        degraded: if is_first_page {
+                            degraded.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        has_more,
+                    };
+                    is_first_page = false;
+                    let Ok(value) = serde_json::to_value(&snap_item) else {
+                        return false;
+                    };
+
+                    // M7: Reserve control slots in channel for guaranteed ResyncRequired delivery
+                    let mut value_to_send = value;
+                    if tx_for_snap.capacity() > RESERVED_CONTROL_SLOTS {
+                        match tx_for_snap.try_send(value_to_send) {
+                            Ok(()) => return true,
+                            Err(TrySendError::Closed(_)) => return false,
+                            Err(TrySendError::Full(v)) => {
+                                value_to_send = v;
+                            }
+                        }
+                    }
+
+                    // Consumer is behind: wait bounded time for data capacity without eating the reserved control slot
+                    let wait_start = std::time::Instant::now();
+                    let mut sent = false;
+                    while wait_start.elapsed() < TRAJECTORY_SNAPSHOT_SEND_TIMEOUT {
+                        runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(10)));
+                        if tx_for_snap.capacity() > RESERVED_CONTROL_SLOTS {
+                            match tx_for_snap.try_send(value_to_send) {
+                                Ok(()) => {
+                                    sent = true;
+                                    break;
+                                }
+                                Err(TrySendError::Closed(_)) => return false,
+                                Err(TrySendError::Full(v)) => {
+                                    value_to_send = v;
+                                }
+                            }
+                        }
+                    }
+                    if !sent {
+                        send_timed_out = true;
+                        false
+                    } else {
+                        true
+                    }
+                },
+            )?;
+
+            Ok::<_, crate::trajectory_store::TrajectoryStoreError>((
+                final_watermark,
+                send_timed_out,
+            ))
+        })
+        .await;
+
+        let (mut current_watermark, send_timed_out) = match snapshot_res {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(err)) => {
+                let _ = tx
+                    .send(
+                        serde_json::to_value(&TrajectoryWatchItem::Terminal {
+                            reason: TrajectoryTerminalReason::StoreUnavailable,
+                            message: Some(err.to_string()),
+                        })
+                        .unwrap(),
+                    )
+                    .await;
+                return;
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(
+                        serde_json::to_value(&TrajectoryWatchItem::Terminal {
+                            reason: TrajectoryTerminalReason::StoreUnavailable,
+                            message: Some(err.to_string()),
+                        })
+                        .unwrap(),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        if send_timed_out {
+            let item = TrajectoryWatchItem::ResyncRequired {
+                reason: "Snapshot delivery timed out; resubscribe required".into(),
+            };
+            if let Ok(value) = serde_json::to_value(&item) {
+                // M7: Guaranteed delivery into the reserved control slot:
+                let _ = tx.try_send(value);
+            }
+            return;
+        }
+
+        let snapshot_rev = current_watermark.map_or(0, |watermark| watermark.rev);
+        loop {
+            tokio::select! {
+                _ = tx.closed() => {
+                    break;
+                }
+                event_res = events_rx.recv() => {
+                    match event_res {
+                        Ok(TrajectoryStoreEvent::RecordsCommitted {
+                            chat_id: event_chat_id,
+                            records: committed_records,
+                            watermark: _,
+                            rev,
+                        }) => {
+                            if event_chat_id != chat_id || rev <= snapshot_rev {
+                                continue;
+                            }
+                            if !committed_records.is_empty() {
+                                let batch_max_cursor = committed_records
+                                    .iter()
+                                    .map(TrajectoryCursor::from)
+                                    .max();
+                                let newest_rev = current_watermark
+                                    .map_or(rev, |watermark| watermark.rev.max(rev));
+                                // Advance by position (None sorts lowest), then stamp the newest
+                                // revision so an in-place finalization still moves the cursor.
+                                current_watermark = current_watermark
+                                    .max(batch_max_cursor)
+                                    .map(|cursor| cursor.with_rev(newest_rev));
+
+                                let delta_item = TrajectoryWatchItem::Deltas {
+                                    records: committed_records.as_ref().clone(),
+                                    watermark: current_watermark,
+                                };
+                                if let Ok(value) = serde_json::to_value(&delta_item)
+                                    && tx.send(value).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(TrajectoryStoreEvent::DegradedRecorded {
+                            chat_id: event_chat_id,
+                            interval,
+                        }) => {
+                            if event_chat_id != chat_id {
+                                continue;
+                            }
+                            let item = TrajectoryWatchItem::Degraded {
+                                intervals: vec![interval],
+                            };
+                            if let Ok(value) = serde_json::to_value(&item)
+                                && tx.send(value).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(TrajectoryStoreEvent::ChatDeleted {
+                            chat_id: event_chat_id,
+                        }) => {
+                            if event_chat_id != chat_id {
+                                continue;
+                            }
+                            let item = TrajectoryWatchItem::Terminal {
+                                reason: TrajectoryTerminalReason::ChatDeleted,
+                                message: Some("Chat deleted".into()),
+                            };
+                            if let Ok(value) = serde_json::to_value(&item) {
+                                let _ = tx.send(value).await;
+                            }
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            let item = TrajectoryWatchItem::ResyncRequired {
+                                reason: format!("Watch stream lagged by {skipped} broadcast events"),
+                            };
+                            if let Ok(value) = serde_json::to_value(&item) {
+                                let _ = tx.send(value).await;
+                            }
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    futures::stream::unfold(rx, |mut rx| async move {
+        let value = rx.recv().await?;
+        Some((value, rx))
+    })
+    .boxed()
+}
+
+/// Answer a failed raw reveal with a typed, client-safe `Unavailable`: the underlying
+/// error text stays in the debug log so it can never leak through the wire envelope.
+fn reveal_unavailable(
+    field: TrajectoryRawField,
+    reason: TrajectoryUnavailableReason,
+    client_message: &str,
+    error: impl std::fmt::Display,
+    context: &str,
+) -> TrajectoryRawRevealResult {
+    tracing::debug!(error = %error, "trajectory raw reveal: {context}");
+    TrajectoryRawRevealResult::unavailable(field, reason, Some(client_message.into()))
+}
+
 /// Authentication-only RPC surface used while the headed app is waiting for a
 /// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
 /// the UI show its sign-in and organization gates before identity-scoped Loro
@@ -1076,6 +1400,16 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if methods::is_local_only(method)
+            && params
+                .get("targetDeviceId")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(RpcError::BadParams(format!(
+                "method '{method}' is local-only"
+            )));
+        }
+
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if info(method).is_some_and(|i| i.forwardable)
@@ -1842,6 +2176,186 @@ impl RpcService for EngineRpc {
                 .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "snapshot": snapshot }))
             }
+            methods::WATCH_TRAJECTORY => {
+                let p: WatchTrajectoryParams = parse_params(params)?;
+                let Some(store) = self.trajectory_store() else {
+                    let term = TrajectoryWatchItem::Terminal {
+                        reason: TrajectoryTerminalReason::StoreUnavailable,
+                        message: Some("Trajectory store unavailable".into()),
+                    };
+                    let val =
+                        serde_json::to_value(&term).map_err(|e| RpcError::Failed(e.to_string()))?;
+                    return Ok(RpcReply::Stream(
+                        futures::stream::once(async move { val }).boxed(),
+                    ));
+                };
+
+                let stream = watch_trajectory_stream(
+                    store,
+                    Some(self.workspace.clone()),
+                    Some(self.doc_host.device_id().to_string()),
+                    p.chat_id,
+                    p.after_cursor,
+                    p.limit,
+                );
+                Ok(RpcReply::Stream(stream))
+            }
+            methods::REVEAL_TRAJECTORY_RAW => {
+                let p: RevealTrajectoryRawParams = parse_params(params)?;
+                if p.source_version != zeron_rpc::CURRENT_RAW_SOURCE_VERSION {
+                    let result = TrajectoryRawRevealResult::unavailable(
+                        p.field,
+                        TrajectoryUnavailableReason::UnsupportedSourceVersion,
+                        Some(format!("Unsupported source version {}", p.source_version)),
+                    );
+                    return RpcReply::value(&result);
+                }
+
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+
+                let local_device = self.doc_host.device_id();
+                if let Some(c) = &chat {
+                    if c.device_id != local_device {
+                        let result = TrajectoryRawRevealResult::unavailable(
+                            p.field,
+                            TrajectoryUnavailableReason::ForeignDevice,
+                            Some("Chat is on a foreign device".into()),
+                        );
+                        return RpcReply::value(&result);
+                    }
+                } else {
+                    let result = TrajectoryRawRevealResult::unavailable(
+                        p.field,
+                        TrajectoryUnavailableReason::ChatDeleted,
+                        Some("Chat not found".into()),
+                    );
+                    return RpcReply::value(&result);
+                }
+
+                let Some(journal) = self.run_journal() else {
+                    let result = TrajectoryRawRevealResult::unavailable(
+                        p.field,
+                        TrajectoryUnavailableReason::StoreUnavailable,
+                        Some("Run journal unavailable".into()),
+                    );
+                    return RpcReply::value(&result);
+                };
+
+                let Some(store) = self.trajectory_store() else {
+                    let result = TrajectoryRawRevealResult::unavailable(
+                        p.field,
+                        TrajectoryUnavailableReason::StoreUnavailable,
+                        Some("Trajectory store unavailable".into()),
+                    );
+                    return RpcReply::value(&result);
+                };
+
+                // M3-transport: Acquire permit from bounded concurrency semaphore with deadline
+                let start_time = std::time::Instant::now();
+                let permit = match tokio::time::timeout(
+                    RAW_REVEAL_TIMEOUT,
+                    self.reveal_semaphore.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        let result = TrajectoryRawRevealResult::unavailable(
+                            p.field,
+                            TrajectoryUnavailableReason::StoreUnavailable,
+                            Some("Semaphore closed".into()),
+                        );
+                        return RpcReply::value(&result);
+                    }
+                    Err(_) => {
+                        let result = TrajectoryRawRevealResult::unavailable(
+                            p.field,
+                            TrajectoryUnavailableReason::StoreUnavailable,
+                            Some(
+                                "Too many concurrent raw reveal requests; acquisition timed out"
+                                    .into(),
+                            ),
+                        );
+                        return RpcReply::value(&result);
+                    }
+                };
+
+                let raw_ref = p.to_raw_ref();
+                let chat_id = p.chat_id.clone();
+                let source_seq = p.source_seq;
+                let parent_tool_use_id = p.parent_tool_use_id.clone();
+                let call_id = p.call_id.clone();
+                let field = p.field;
+
+                let reveal_task = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let is_attached = match store.validate_raw_ref(&raw_ref) {
+                        Ok(is_attached) => is_attached,
+                        Err(error) => {
+                            return reveal_unavailable(
+                                field,
+                                TrajectoryUnavailableReason::StoreUnavailable,
+                                "Trajectory store unavailable",
+                                &error,
+                                "store validation failed",
+                            );
+                        }
+                    };
+                    if !is_attached {
+                        return TrajectoryRawRevealResult::unavailable(
+                            field,
+                            TrajectoryUnavailableReason::NotFound,
+                            Some(
+                                "Raw reference is not attached to any stored trajectory record"
+                                    .into(),
+                            ),
+                        );
+                    }
+                    match journal.raw_reveal(
+                        &chat_id,
+                        source_seq,
+                        parent_tool_use_id.as_deref(),
+                        call_id.as_deref(),
+                        field,
+                    ) {
+                        Ok(result) => result,
+                        Err(crate::run_journal::JournalError::Io(error)) => reveal_unavailable(
+                            field,
+                            TrajectoryUnavailableReason::StoreUnavailable,
+                            "Run journal unavailable",
+                            &error,
+                            "journal I/O failed",
+                        ),
+                        Err(crate::run_journal::JournalError::Json(error)) => reveal_unavailable(
+                            field,
+                            TrajectoryUnavailableReason::SourceCorrupt,
+                            "Run journal source is corrupt",
+                            &error,
+                            "journal source was corrupt",
+                        ),
+                    }
+                });
+                let remaining = RAW_REVEAL_TIMEOUT.saturating_sub(start_time.elapsed());
+                let reveal_res = match tokio::time::timeout(remaining, reveal_task).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => reveal_unavailable(
+                        field,
+                        TrajectoryUnavailableReason::StoreUnavailable,
+                        "Raw reveal unavailable",
+                        &error,
+                        "blocking task failed",
+                    ),
+                    Err(_) => TrajectoryRawRevealResult::unavailable(
+                        field,
+                        TrajectoryUnavailableReason::StoreUnavailable,
+                        Some("Raw reveal timed out".into()),
+                    ),
+                };
+                RpcReply::value(&reveal_res)
+            }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
@@ -1959,5 +2473,1805 @@ mod tests {
             }),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trajectory Transport Tests (F2)
+    // -----------------------------------------------------------------------
+
+    use zeron_proto::trajectory::*;
+
+    fn sample_record(chat_id: &str, run_id: &str, seq: u64, sub: u32) -> TrajectoryRecord {
+        TrajectoryRecord {
+            id: TrajectoryRecordId::new(run_id, seq, sub),
+            chat_id: chat_id.to_string(),
+            run_id: run_id.to_string(),
+            source_seq: seq,
+            sub_seq: sub,
+            lane: TrajectoryLane::Input,
+            kind: TrajectoryRecordKind::UserMessage,
+            status: TrajectoryStatus::Completed,
+            is_partial: false,
+            title: "User".into(),
+            summary: "Hello".into(),
+            turn_id: None,
+            step_id: None,
+            call_id: None,
+            parent_tool_use_id: None,
+            timing: None,
+            usage: None,
+            payload: None,
+            result: None,
+            error_message: None,
+            is_degraded: false,
+        }
+    }
+
+    fn assert_trajectory_cursor(
+        cursor: Option<TrajectoryCursor>,
+        source_seq: u64,
+        sub_seq: u32,
+    ) -> TrajectoryCursor {
+        let cursor = cursor.expect("trajectory cursor");
+        assert_eq!((cursor.source_seq, cursor.sub_seq), (source_seq, sub_seq));
+        assert!(
+            cursor.rev > 0,
+            "trajectory cursor must carry store revision"
+        );
+        cursor
+    }
+
+    fn sample_record_with_payload_raw_ref(
+        chat_id: &str,
+        run_id: &str,
+        seq: u64,
+        sub: u32,
+        parent_tool_use_id: Option<String>,
+        call_id: Option<String>,
+    ) -> TrajectoryRecord {
+        let mut r = sample_record(chat_id, run_id, seq, sub);
+        r.parent_tool_use_id = parent_tool_use_id.clone();
+        r.call_id = call_id.clone();
+        r.payload = Some(TrajectoryPayloadPreview {
+            summary: "summary".into(),
+            sanitized_text: None,
+            schema_info: None,
+            raw_ref: Some(TrajectoryRawRef::new(
+                chat_id,
+                seq,
+                parent_tool_use_id,
+                call_id,
+                TrajectoryRawField::Payload,
+            )),
+        });
+        r
+    }
+
+    fn sample_record_with_result_raw_ref(
+        chat_id: &str,
+        run_id: &str,
+        seq: u64,
+        sub: u32,
+        parent_tool_use_id: Option<String>,
+        call_id: Option<String>,
+    ) -> TrajectoryRecord {
+        let mut r = sample_record(chat_id, run_id, seq, sub);
+        r.parent_tool_use_id = parent_tool_use_id.clone();
+        r.call_id = call_id.clone();
+        r.result = Some(TrajectoryResultPreview {
+            summary: "summary".into(),
+            sanitized_text: None,
+            is_error: false,
+            exit_code: None,
+            raw_ref: Some(TrajectoryRawRef::new(
+                chat_id,
+                seq,
+                parent_tool_use_id,
+                call_id,
+                TrajectoryRawField::Result,
+            )),
+        });
+        r
+    }
+
+    async fn setup_test_engine(temp: &tempfile::TempDir) -> (crate::EngineCore, Arc<EngineRpc>) {
+        let core = crate::EngineCore::assemble(
+            temp.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .expect("assemble engine");
+
+        let rpc = core.rpc_service();
+
+        (core, rpc)
+    }
+
+    #[test]
+    fn test_trajectory_rpc_methods_are_absent_from_forwardable_stream_sets() {
+        for method in [methods::WATCH_TRAJECTORY, methods::REVEAL_TRAJECTORY_RAW] {
+            let entry =
+                info(method).unwrap_or_else(|| panic!("{method} missing from the rpc registry"));
+            assert!(!entry.forwardable, "{method} must never be forwarded");
+            assert!(!entry.stream, "{method} must never be relay-proxied");
+            assert!(entry.local_only, "{method} must be device-local");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_rpc_rejects_target_device_id_ingress() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        core.workspace
+            .create_chat("chat-local-only", None, Some(&local_device), None, None)
+            .unwrap();
+
+        for (method, params) in [
+            (
+                methods::WATCH_TRAJECTORY,
+                serde_json::json!({
+                    "chatId": "chat-local-only",
+                    "targetDeviceId": "other-device",
+                }),
+            ),
+            (
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": "chat-local-only",
+                    "sourceSeq": 1,
+                    "field": "payload",
+                    "targetDeviceId": "other-device",
+                }),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    rpc.handle(method, params).await,
+                    Err(RpcError::BadParams(_))
+                ),
+                "{method} must reject device-addressed ingress"
+            );
+        }
+
+        assert!(matches!(
+            rpc.handle(
+                methods::WATCH_TRAJECTORY,
+                serde_json::json!({
+                    "chatId": "chat-local-only",
+                    "targetDeviceId": null,
+                }),
+            )
+            .await,
+            Ok(RpcReply::Stream(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_finalization_advances_revision_for_resume() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_partial_final_replacement";
+        let mut partial = sample_record(chat_id, "run1", 5, 0);
+        partial.is_partial = true;
+        partial.summary = "In-flight assistant response".into();
+        store.try_enqueue(partial).unwrap();
+        store.sync_flush().unwrap();
+
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, None);
+        let snapshot: TrajectoryWatchItem =
+            serde_json::from_value(stream.next().await.expect("snapshot item")).unwrap();
+        let snapshot_watermark = match snapshot {
+            TrajectoryWatchItem::Snapshot {
+                records,
+                watermark: Some(watermark),
+                has_more,
+                ..
+            } => {
+                assert_eq!(records.len(), 1);
+                assert!(records[0].is_partial);
+                assert_eq!((watermark.source_seq, watermark.sub_seq), (5, 0));
+                assert!(watermark.rev > 0);
+                assert!(!has_more);
+                watermark
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        };
+
+        let mut final_record = sample_record(chat_id, "run1", 5, 0);
+        final_record.summary = "Completed assistant response".into();
+        store.try_enqueue(final_record).unwrap();
+        store.sync_flush().unwrap();
+
+        let delta: TrajectoryWatchItem =
+            serde_json::from_value(stream.next().await.expect("delta item")).unwrap();
+        let delta_watermark = match delta {
+            TrajectoryWatchItem::Deltas {
+                records,
+                watermark: Some(watermark),
+            } => {
+                assert_eq!(records.len(), 1);
+                assert!(!records[0].is_partial);
+                assert_eq!(records[0].summary, "Completed assistant response");
+                assert_eq!((watermark.source_seq, watermark.sub_seq), (5, 0));
+                assert!(
+                    watermark.rev > snapshot_watermark.rev,
+                    "in-place finalization must advance the client change cursor"
+                );
+                watermark
+            }
+            other => panic!("expected Deltas, got {other:?}"),
+        };
+        drop(stream);
+
+        let mut resumed = watch_trajectory_stream(
+            store,
+            None,
+            None,
+            chat_id.into(),
+            Some(snapshot_watermark),
+            None,
+        );
+        let resumed_item: TrajectoryWatchItem =
+            serde_json::from_value(resumed.next().await.expect("resumed snapshot")).unwrap();
+        match resumed_item {
+            TrajectoryWatchItem::Snapshot {
+                records,
+                watermark: Some(watermark),
+                ..
+            } => {
+                assert_eq!(records.len(), 1);
+                assert!(!records[0].is_partial);
+                assert_eq!(watermark, delta_watermark);
+            }
+            other => panic!("expected resumed Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trajectory_watch_handoff_drops_commit_already_in_snapshot() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (core, _rpc) = setup_test_engine(&temp).await;
+            let store = core.trajectory.clone();
+            let chat_id = "chat_handoff_revision";
+
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("blocking worker occupied");
+
+            let mut stream =
+                watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(1));
+            tokio::task::yield_now().await;
+
+            store
+                .try_enqueue(sample_record(chat_id, "run1", 1, 0))
+                .unwrap();
+            store.sync_flush().unwrap();
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+
+            let snapshot: TrajectoryWatchItem = serde_json::from_value(
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                    .await
+                    .expect("snapshot timed out")
+                    .expect("snapshot item"),
+            )
+            .unwrap();
+            match snapshot {
+                TrajectoryWatchItem::Snapshot {
+                    records,
+                    watermark: Some(watermark),
+                    ..
+                } => {
+                    assert_eq!(records.len(), 1);
+                    assert!(watermark.rev > 0);
+                }
+                other => panic!("expected Snapshot, got {other:?}"),
+            }
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                    .await
+                    .is_err(),
+                "a commit included in the snapshot must not be emitted again as a delta"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_stalled_snapshot_aborts_with_resync() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+        let chat_id = "chat_stalled_snapshot";
+        store
+            .try_enqueue_batch(
+                (1..=300)
+                    .map(|seq| sample_record(chat_id, "run1", seq, 0))
+                    .collect(),
+            )
+            .unwrap();
+        store.sync_flush().unwrap();
+
+        let mut stream = watch_trajectory_stream(store, None, None, chat_id.into(), None, Some(1));
+        tokio::time::sleep(
+            TRAJECTORY_SNAPSHOT_SEND_TIMEOUT * 2 + std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        let saw_resync = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(value) = stream.next().await {
+                let item: TrajectoryWatchItem = serde_json::from_value(value).unwrap();
+                if matches!(item, TrajectoryWatchItem::ResyncRequired { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("stalled snapshot producer did not terminate");
+        assert!(saw_resync, "stalled snapshot must require a clean resync");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_bounded_multi_frame_paging() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_paging_5_records";
+        let mut recs = Vec::new();
+        for seq in 1..=5 {
+            recs.push(sample_record(chat_id, "run1", seq, 0));
+        }
+        store.try_enqueue_batch(recs).unwrap();
+        store.sync_flush().unwrap();
+
+        // Request limit = 2 on 5 historical records
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(2));
+
+        // Frame 1: 2 records, has_more: true, watermark (2, 0)
+        let f1_val = stream.next().await.expect("frame 1");
+        let f1: TrajectoryWatchItem = serde_json::from_value(f1_val).unwrap();
+        match f1 {
+            TrajectoryWatchItem::Snapshot {
+                records,
+                watermark,
+                has_more,
+                ..
+            } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].source_seq, 1);
+                assert_eq!(records[1].source_seq, 2);
+                assert_trajectory_cursor(watermark, 2, 0);
+                assert!(has_more, "frame 1 must have has_more: true");
+            }
+            other => panic!("expected Snapshot frame 1, got {:?}", other),
+        }
+
+        // Frame 2: 2 records, has_more: true, watermark (4, 0)
+        let f2_val = stream.next().await.expect("frame 2");
+        let f2: TrajectoryWatchItem = serde_json::from_value(f2_val).unwrap();
+        match f2 {
+            TrajectoryWatchItem::Snapshot {
+                records,
+                watermark,
+                has_more,
+                ..
+            } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].source_seq, 3);
+                assert_eq!(records[1].source_seq, 4);
+                assert_trajectory_cursor(watermark, 4, 0);
+                assert!(has_more, "frame 2 must have has_more: true");
+            }
+            other => panic!("expected Snapshot frame 2, got {:?}", other),
+        }
+
+        // Frame 3: 1 record, has_more: false, watermark (5, 0)
+        let f3_val = stream.next().await.expect("frame 3");
+        let f3: TrajectoryWatchItem = serde_json::from_value(f3_val).unwrap();
+        match f3 {
+            TrajectoryWatchItem::Snapshot {
+                records,
+                watermark,
+                has_more,
+                ..
+            } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].source_seq, 5);
+                assert_trajectory_cursor(watermark, 5, 0);
+                assert!(!has_more, "frame 3 must have has_more: false");
+            }
+            other => panic!("expected Snapshot frame 3, got {:?}", other),
+        }
+
+        // Live commit arrives after paging
+        let r6 = sample_record(chat_id, "run1", 6, 0);
+        store.try_enqueue(r6).unwrap();
+        store.sync_flush().unwrap();
+
+        let delta_val = stream.next().await.expect("live delta item");
+        let delta_item: TrajectoryWatchItem = serde_json::from_value(delta_val).unwrap();
+        match delta_item {
+            TrajectoryWatchItem::Deltas { records, watermark } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].source_seq, 6);
+                assert_trajectory_cursor(watermark, 6, 0);
+            }
+            other => panic!("expected Deltas, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_commit_during_paging_and_late_earlier_cursor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_commit_during_paging";
+        let mut recs = Vec::new();
+        for seq in 1..=4 {
+            recs.push(sample_record(chat_id, "run1", seq, 0));
+        }
+        store.try_enqueue_batch(recs).unwrap();
+        store.sync_flush().unwrap();
+
+        // Start stream with page_size = 2
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(2));
+
+        // Read Frame 1 (records 1 and 2)
+        let _f1 = stream.next().await.expect("frame 1");
+
+        // Concurrent commit happens during paging:
+        // Record at earlier sequence (e.g. coalesced reasoning at (2, 1)) AND new record at (5, 0)
+        let r_late_earlier = sample_record(chat_id, "run1", 2, 1);
+        let r5 = sample_record(chat_id, "run1", 5, 0);
+        store
+            .try_enqueue_batch(vec![r_late_earlier.clone(), r5.clone()])
+            .unwrap();
+        store.sync_flush().unwrap();
+
+        // Frame 2 (records 3 and 4 with has_more: false, isolated from concurrent commits)
+        let f2_val = stream.next().await.expect("frame 2");
+        let f2: TrajectoryWatchItem = serde_json::from_value(f2_val).unwrap();
+        match f2 {
+            TrajectoryWatchItem::Snapshot {
+                records,
+                watermark,
+                has_more,
+                ..
+            } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].source_seq, 3);
+                assert_eq!(records[1].source_seq, 4);
+                assert_trajectory_cursor(watermark, 4, 0);
+                assert!(
+                    !has_more,
+                    "snapshot transaction had 4 records, so frame 2 has has_more: false"
+                );
+            }
+            other => panic!("expected Snapshot frame 2, got {:?}", other),
+        }
+
+        // Live Deltas receive the committed batch (including late earlier cursor and new record)
+        let delta_val = stream.next().await.expect("delta item");
+        let delta_item: TrajectoryWatchItem = serde_json::from_value(delta_val).unwrap();
+        match delta_item {
+            TrajectoryWatchItem::Deltas { records, watermark } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].source_seq, 2);
+                assert_eq!(records[0].sub_seq, 1);
+                assert_eq!(records[1].source_seq, 5);
+                assert_eq!(records[1].sub_seq, 0);
+                assert_trajectory_cursor(watermark, 5, 0);
+            }
+            other => panic!("expected Deltas, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_reconnect_with_cursor_and_pagination() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_reconnect";
+        let r1 = sample_record(chat_id, "run1", 1, 0);
+        let r2 = sample_record(chat_id, "run1", 1, 1);
+        let r3 = sample_record(chat_id, "run1", 2, 0);
+        store
+            .try_enqueue_batch(vec![r1.clone(), r2.clone(), r3.clone()])
+            .unwrap();
+        store.sync_flush().unwrap();
+
+        // Reconnect after cursor (1, 0) -> should receive (1, 1) and (2, 0) in snapshot
+        let mut stream = watch_trajectory_stream(
+            store.clone(),
+            None,
+            None,
+            chat_id.into(),
+            Some(TrajectoryCursor::new(1, 0)),
+            None,
+        );
+
+        let snap_val = stream.next().await.expect("snapshot item");
+        let snap_item: TrajectoryWatchItem = serde_json::from_value(snap_val).unwrap();
+        match snap_item {
+            TrajectoryWatchItem::Snapshot {
+                records, watermark, ..
+            } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].source_seq, 1);
+                assert_eq!(records[0].sub_seq, 1);
+                assert_eq!(records[1].source_seq, 2);
+                assert_eq!(records[1].sub_seq, 0);
+                assert_trajectory_cursor(watermark, 2, 0);
+            }
+            other => panic!("expected Snapshot, got {:?}", other),
+        }
+
+        // Live record arrives at (2, 1)
+        let r4 = sample_record(chat_id, "run1", 2, 1);
+        store.try_enqueue_batch(vec![r4.clone()]).unwrap();
+        store.sync_flush().unwrap();
+
+        let delta_val = stream.next().await.expect("delta item");
+        let delta_item: TrajectoryWatchItem = serde_json::from_value(delta_val).unwrap();
+        match delta_item {
+            TrajectoryWatchItem::Deltas { records, watermark } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].source_seq, 2);
+                assert_eq!(records[0].sub_seq, 1);
+                assert_trajectory_cursor(watermark, 2, 1);
+            }
+            other => panic!("expected Deltas, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_same_source_different_sub_seq_ordering() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_same_source_sub";
+        let r_prefix = sample_record(chat_id, "run1", 10, 0);
+        let r_mid = sample_record(chat_id, "run1", 10, 1);
+        let r_interrupted = sample_record(chat_id, "run1", 10, u32::MAX);
+
+        store
+            .try_enqueue_batch(vec![r_prefix.clone(), r_mid.clone(), r_interrupted.clone()])
+            .unwrap();
+        store.sync_flush().unwrap();
+
+        let records = store
+            .list_records_after_cursor(chat_id, Some(TrajectoryCursor::new(10, 0)), None)
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sub_seq, 1);
+        assert_eq!(records[1].sub_seq, u32::MAX);
+
+        let records_from_mid = store
+            .list_records_after_cursor(chat_id, Some(TrajectoryCursor::new(10, 1)), None)
+            .unwrap();
+        assert_eq!(records_from_mid.len(), 1);
+        assert_eq!(records_from_mid[0].sub_seq, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_cancellation_does_not_affect_capture() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_cancel";
+        let r1 = sample_record(chat_id, "run1", 1, 0);
+        store.try_enqueue(r1).unwrap();
+        store.sync_flush().unwrap();
+
+        let stream = watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, None);
+        // Explicitly drop stream to simulate client cancellation / closing surface
+        drop(stream);
+
+        // Capture continues uninterrupted
+        let r2 = sample_record(chat_id, "run1", 2, 0);
+        let r3 = sample_record(chat_id, "run1", 3, 0);
+        assert!(store.try_enqueue_batch(vec![r2, r3]).is_ok());
+        assert!(store.sync_flush().is_ok());
+
+        let all = store.list_records(chat_id, None, None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_chat_deleted_terminal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, _rpc) = setup_test_engine(&temp).await;
+        let store = core.trajectory.clone();
+
+        let chat_id = "chat_watch_delete";
+        let r1 = sample_record(chat_id, "run1", 1, 0);
+        store.try_enqueue(r1).unwrap();
+        store.sync_flush().unwrap();
+
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, None);
+        let _snap = stream.next().await.expect("snapshot");
+
+        // Delete chat
+        store.delete_chat(chat_id).await.unwrap();
+
+        // Terminal item must arrive
+        let term_val = stream.next().await.expect("terminal event");
+        let term_item: TrajectoryWatchItem = serde_json::from_value(term_val).unwrap();
+        match term_item {
+            TrajectoryWatchItem::Terminal { reason, .. } => {
+                assert_eq!(reason, TrajectoryTerminalReason::ChatDeleted);
+            }
+            other => panic!("expected Terminal, got {:?}", other),
+        }
+
+        // Stream must end
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_degraded_store_reporting() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let deg_store = Arc::new(TrajectoryStore::degraded(temp.path(), "disk failure"));
+
+        let mut stream =
+            watch_trajectory_stream(deg_store, None, None, "chat_deg".into(), None, None);
+        let snap_val = stream.next().await.expect("snapshot");
+        let snap_item: TrajectoryWatchItem = serde_json::from_value(snap_val).unwrap();
+        match snap_item {
+            TrajectoryWatchItem::Snapshot { records, .. } => {
+                assert!(records.is_empty());
+            }
+            other => panic!("expected Snapshot, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_foreign_chat_terminal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+
+        // Create a chat hosted on another device
+        core.workspace
+            .create_chat("chat_foreign", None, Some("other-dev-99"), None, None)
+            .unwrap();
+
+        let reply = rpc
+            .handle(
+                methods::WATCH_TRAJECTORY,
+                serde_json::json!({
+                    "chatId": "chat_foreign",
+                }),
+            )
+            .await
+            .unwrap();
+
+        match reply {
+            RpcReply::Stream(mut stream) => {
+                let val = stream.next().await.unwrap();
+                let item: TrajectoryWatchItem = serde_json::from_value(val).unwrap();
+                match item {
+                    TrajectoryWatchItem::Terminal { reason, .. } => {
+                        assert_eq!(reason, TrajectoryTerminalReason::StoreUnavailable);
+                    }
+                    other => panic!("expected Terminal, got {:?}", other),
+                }
+            }
+            _ => panic!("expected stream reply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_degraded_intervals_respects_page_size() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(TrajectoryStore::open(temp.path()).unwrap());
+        let chat_id = "chat_deg_page_size";
+
+        // Record 5 distinct degraded intervals
+        for i in 1..=5 {
+            store.record_degraded_in_memory(TrajectoryDegradedInterval {
+                chat_id: chat_id.into(),
+                run_id: format!("run{i}"),
+                from_seq: i * 10,
+                to_seq: i * 10 + 5,
+                reason: format!("disk error {i}"),
+                recorded_at: chrono::Utc::now(),
+            });
+        }
+
+        // Watch with limit = Some(2)
+        let mut stream =
+            watch_trajectory_stream(store.clone(), None, None, chat_id.into(), None, Some(2));
+        let snap_val = stream.next().await.expect("snapshot");
+        let snap_item: TrajectoryWatchItem = serde_json::from_value(snap_val).unwrap();
+        match snap_item {
+            TrajectoryWatchItem::Snapshot { degraded, .. } => {
+                assert_eq!(
+                    degraded.len(),
+                    2,
+                    "Snapshot frame must limit degraded intervals to page_size"
+                );
+            }
+            other => panic!("expected Snapshot, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_watch_deletion_race_terminates_immediately() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+
+        let chat_id = "chat_race_delete";
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        // Concurrently delete chat right as watch is requested
+        core.workspace.delete_chat(chat_id).unwrap();
+
+        let reply = rpc
+            .handle(
+                methods::WATCH_TRAJECTORY,
+                serde_json::json!({
+                    "chatId": chat_id,
+                }),
+            )
+            .await
+            .unwrap();
+
+        match reply {
+            RpcReply::Stream(mut stream) => {
+                let val = stream.next().await.unwrap();
+                let item: TrajectoryWatchItem = serde_json::from_value(val).unwrap();
+                match item {
+                    TrajectoryWatchItem::Terminal { reason, .. } => {
+                        assert_eq!(reason, TrajectoryTerminalReason::ChatDeleted);
+                    }
+                    other => panic!("expected Terminal(ChatDeleted), got {:?}", other),
+                }
+                assert!(
+                    stream.next().await.is_none(),
+                    "stream must terminate immediately"
+                );
+            }
+            _ => panic!("expected stream reply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_raw_reveal_concurrency_limit_and_timeout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_concurrency_reveal";
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        // Exhaust permits in the semaphore
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_RAW_REVEALS {
+            if let Ok(permit) = rpc.reveal_semaphore.clone().try_acquire_owned() {
+                permits.push(permit);
+            }
+        }
+        assert_eq!(permits.len(), MAX_CONCURRENT_RAW_REVEALS);
+
+        // Release a permit shortly after to prove concurrency queueing works under bound
+        let release_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(permits);
+        });
+
+        // Request while semaphore was saturated -> waits for permit and finishes cleanly
+        let reply = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": 1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        release_task.await.unwrap();
+
+        match reply {
+            RpcReply::Value(val) => {
+                let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+                // Journal entry not found -> NotFound, but executed cleanly through the semaphore
+                match res {
+                    TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                        assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                    }
+                    other => panic!("expected NotFound unavailable, got {:?}", other),
+                }
+            }
+            _ => panic!("expected value reply"),
+        }
+    }
+    #[tokio::test]
+    async fn test_trajectory_reveal_ownership_and_local_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+
+        let local_device = core.doc_host.device_id().to_string();
+        core.workspace
+            .create_chat("chat_local", None, Some(&local_device), None, None)
+            .unwrap();
+        core.workspace
+            .create_chat("chat_remote", None, Some("foreign-dev"), None, None)
+            .unwrap();
+
+        // Foreign chat reveal -> Unavailable(ForeignDevice)
+        let reply_foreign = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": "chat_remote",
+                    "sourceSeq": 1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+
+        match reply_foreign {
+            RpcReply::Value(val) => {
+                let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+                match res {
+                    TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                        assert_eq!(reason, TrajectoryUnavailableReason::ForeignDevice);
+                    }
+                    _ => panic!("expected unavailable foreign device"),
+                }
+            }
+            _ => panic!("expected value reply"),
+        }
+
+        // Nonexistent chat reveal -> Unavailable(ChatDeleted / NotFound)
+        let reply_missing = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": "chat_unknown",
+                    "sourceSeq": 1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+
+        match reply_missing {
+            RpcReply::Value(val) => {
+                let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+                match res {
+                    TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                        assert_eq!(reason, TrajectoryUnavailableReason::ChatDeleted);
+                    }
+                    _ => panic!("expected unavailable chat deleted"),
+                }
+            }
+            _ => panic!("expected value reply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_payload_and_result_fields() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_reveal_fields";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        let seq1 = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::UserMessage {
+                    text: "Prompt text with sensitive credentials".into(),
+                },
+            )
+            .unwrap();
+
+        let seq2 = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::ToolCall {
+                    id: "tool-call-100".into(),
+                    call: ToolCall::WriteFile {
+                        path: "config.json".into(),
+                        content: Some("{\n  \"apiKey\": \"secret-12345\"\n}".into()),
+                    },
+                },
+            )
+            .unwrap();
+
+        let seq3 = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::ToolResult {
+                    id: "tool-call-100".into(),
+                    is_error: false,
+                    output: Some("File written successfully (100 bytes)".into()),
+                    diff: None,
+                    execution: None,
+                },
+            )
+            .unwrap();
+
+        let r1 = sample_record_with_payload_raw_ref(chat_id, "run1", seq1, 0, None, None);
+        let r2 = sample_record_with_payload_raw_ref(
+            chat_id,
+            "run1",
+            seq2,
+            0,
+            None,
+            Some("tool-call-100".into()),
+        );
+        let r3 = sample_record_with_result_raw_ref(
+            chat_id,
+            "run1",
+            seq3,
+            0,
+            None,
+            Some("tool-call-100".into()),
+        );
+        store.try_enqueue_batch(vec![r1, r2, r3]).unwrap();
+        store.sync_flush().unwrap();
+
+        // 1. Reveal UserMessage Payload
+        let r1 = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r1 {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Available { text, field } => {
+                    assert_eq!(field, TrajectoryRawField::Payload);
+                    assert_eq!(text, "Prompt text with sensitive credentials");
+                }
+                other => panic!("expected Available, got {:?}", other),
+            }
+        }
+
+        // 2. Reveal ToolCall Payload
+        let r2 = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq2,
+                    "callId": "tool-call-100",
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r2 {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Available { text, field } => {
+                    assert_eq!(field, TrajectoryRawField::Payload);
+                    assert_eq!(text, "{\n  \"apiKey\": \"secret-12345\"\n}");
+                }
+                other => panic!("expected Available, got {:?}", other),
+            }
+        }
+
+        // 3. Reveal ToolResult Result
+        let r3 = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq3,
+                    "callId": "tool-call-100",
+                    "field": "result",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r3 {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Available { text, field } => {
+                    assert_eq!(field, TrajectoryRawField::Result);
+                    assert_eq!(text, "File written successfully (100 bytes)");
+                }
+                other => panic!("expected Available, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_nested_subagent_scoping() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_subagent_reveal";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        let subagent_seq = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::Subagent {
+                    parent_tool_use_id: "parent-tool-spawn-1".into(),
+                    event: Box::new(zeron_proto::AgentEvent::UserMessage {
+                        text: "Inner subagent directive text".into(),
+                    }),
+                },
+            )
+            .unwrap();
+
+        let r_sub = sample_record_with_payload_raw_ref(
+            chat_id,
+            "run1",
+            subagent_seq,
+            0,
+            Some("parent-tool-spawn-1".into()),
+            None,
+        );
+        store.try_enqueue(r_sub).unwrap();
+        store.sync_flush().unwrap();
+
+        // Reveal with matching parentToolUseId
+        let r_match = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": subagent_seq,
+                    "parentToolUseId": "parent-tool-spawn-1",
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r_match {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Available { text, field } => {
+                    assert_eq!(field, TrajectoryRawField::Payload);
+                    assert_eq!(text, "Inner subagent directive text");
+                }
+                other => panic!("expected Available, got {:?}", other),
+            }
+        }
+
+        // Reveal with missing parentToolUseId -> MismatchedReference
+        let r_mismatch = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": subagent_seq,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r_mismatch {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_mismatched_reference() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_mismatched_ref";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        let seq = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::ToolCall {
+                    id: "tool-expected-1".into(),
+                    call: ToolCall::Exec {
+                        command: "ls -la".into(),
+                    },
+                },
+            )
+            .unwrap();
+
+        let r_tool = sample_record_with_payload_raw_ref(
+            chat_id,
+            "run1",
+            seq,
+            0,
+            None,
+            Some("tool-expected-1".into()),
+        );
+        store.try_enqueue(r_tool).unwrap();
+        store.sync_flush().unwrap();
+
+        // 1. Wrong call ID -> NotFound (unattached)
+        let r_wrong_call = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq,
+                    "callId": "tool-wrong-2",
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r_wrong_call {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+
+        // 2. Wrong field (ToolCall has Payload, but requesting Result) -> NotFound (unattached)
+        let r_wrong_field = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq,
+                    "callId": "tool-expected-1",
+                    "field": "result",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r_wrong_field {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_oversized_line() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_oversized";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let store = rpc.trajectory_store().expect("trajectory store");
+        let r_over = sample_record_with_payload_raw_ref(chat_id, "run1", 1, 0, None, None);
+        store.try_enqueue(r_over).unwrap();
+        store.sync_flush().unwrap();
+
+        // Write an oversized raw line (> 8 MiB) directly to the chat's JSONL journal
+        let journal_path = core.sessions.run_journal().path_for(chat_id);
+        if let Some(parent) = journal_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+
+        use std::io::Write;
+        file.write_all(&vec![b'x'; 9 * 1024 * 1024]).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let r_over = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": 1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r_over {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::SourceOversized);
+                }
+                other => panic!("expected Unavailable SourceOversized, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_async_responsiveness() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_responsive";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        let mut recs = Vec::new();
+        for i in 1..=50 {
+            journal
+                .append(
+                    chat_id,
+                    &zeron_proto::AgentEvent::UserMessage {
+                        text: format!("Message index {i}"),
+                    },
+                )
+                .unwrap();
+            recs.push(sample_record_with_payload_raw_ref(
+                chat_id, "run1", i, 0, None, None,
+            ));
+        }
+        store.try_enqueue_batch(recs).unwrap();
+        store.sync_flush().unwrap();
+
+        // Run 20 concurrent raw reveal requests across multiple tokio tasks
+        let mut handles = Vec::new();
+        for i in 1..=20 {
+            let rpc_clone = rpc.clone();
+            let c_id = chat_id.to_string();
+            handles.push(tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let reply = rpc_clone
+                    .handle(
+                        methods::REVEAL_TRAJECTORY_RAW,
+                        serde_json::json!({
+                            "chatId": c_id,
+                            "sourceSeq": i,
+                            "field": "payload",
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let duration = start.elapsed();
+                (reply, duration)
+            }));
+        }
+
+        for h in handles {
+            let (reply, duration) = h.await.unwrap();
+            assert!(duration < Duration::from_secs(2));
+            if let RpcReply::Value(val) = reply {
+                let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+                assert!(matches!(res, TrajectoryRawRevealResult::Available { .. }));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_rpc_end_to_end_memory_client() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_e2e_rpc";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        let seq = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::UserMessage {
+                    text: "End-to-end memory client test payload".into(),
+                },
+            )
+            .unwrap();
+
+        let r = sample_record_with_payload_raw_ref(chat_id, "run1", seq, 0, None, None);
+        store.try_enqueue(r).unwrap();
+        store.sync_flush().unwrap();
+
+        let client = zeron_rpc::memory_client(rpc);
+
+        let reveal_val = client
+            .call(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .expect("reveal call succeeded");
+
+        let reveal_res: TrajectoryRawRevealResult = serde_json::from_value(reveal_val).unwrap();
+        match reveal_res {
+            TrajectoryRawRevealResult::Available { text, field } => {
+                assert_eq!(field, TrajectoryRawField::Payload);
+                assert_eq!(text, "End-to-end memory client test payload");
+            }
+            other => panic!("expected Available, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_fabricated_reference_rejected() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_fabricated_ref";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        // Write directly to Run Journal only (NOT in TrajectoryStore, no prior watch)
+        let journal = rpc.run_journal().expect("run journal");
+        let seq = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::UserMessage {
+                    text: "Secret text in journal but not in trajectory store".into(),
+                },
+            )
+            .unwrap();
+
+        // Requesting raw reveal with fabricated coordinate must return NotFound (unattached)
+        // and must NOT self-authorize by triggering legacy import
+        let reply = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+
+        if let RpcReply::Value(val) = reply {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable {
+                    reason, message, ..
+                } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                    assert!(message.unwrap().contains("not attached"));
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_unsupported_version_rejected() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_version_reject";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let reply = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": 1,
+                    "field": "payload",
+                    "sourceVersion": 99,
+                }),
+            )
+            .await
+            .unwrap();
+
+        if let RpcReply::Value(val) = reply {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                    assert_eq!(
+                        reason,
+                        TrajectoryUnavailableReason::UnsupportedSourceVersion
+                    );
+                }
+                other => panic!(
+                    "expected Unavailable UnsupportedSourceVersion, got {:?}",
+                    other
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_missing_tool_result_and_done_fields_typed_unavailable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_missing_result_fields";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        // 1. ToolResult with output: None, diff: None
+        let seq1 = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::ToolResult {
+                    id: "tool-no-out".into(),
+                    output: None,
+                    diff: None,
+                    is_error: false,
+                    execution: None,
+                },
+            )
+            .unwrap();
+
+        let r1 = sample_record_with_result_raw_ref(
+            chat_id,
+            "run1",
+            seq1,
+            0,
+            None,
+            Some("tool-no-out".into()),
+        );
+        store.try_enqueue(r1).unwrap();
+
+        // 2. Done with result: None, error: None
+        let seq2 = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::Done {
+                    status: zeron_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        let r2 = sample_record_with_result_raw_ref(chat_id, "run1", seq2, 0, None, None);
+        store.try_enqueue(r2).unwrap();
+        store.sync_flush().unwrap();
+
+        // 1. Reveal missing ToolResult result -> Unavailable(NotFound), never empty string
+        let reply1 = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq1,
+                    "callId": "tool-no-out",
+                    "field": "result",
+                }),
+            )
+            .await
+            .unwrap();
+
+        if let RpcReply::Value(val) = reply1 {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable {
+                    reason, message, ..
+                } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                    assert!(message.unwrap().contains("no raw output or diff"));
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+
+        // 2. Reveal missing Done result -> Unavailable(NotFound), never Debug format
+        let reply2 = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq2,
+                    "field": "result",
+                }),
+            )
+            .await
+            .unwrap();
+
+        if let RpcReply::Value(val) = reply2 {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable {
+                    reason, message, ..
+                } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                    assert!(message.unwrap().contains("no raw result or error text"));
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_coalesced_streaming_deltas() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_coalesced_deltas";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let journal = rpc.run_journal().expect("run journal");
+        let store = rpc.trajectory_store().expect("trajectory store");
+
+        // Streaming text deltas appended across multiple journal lines
+        let seq_start = journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::TextDelta {
+                    text: "The quick brown fox ".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::TextDelta {
+                    text: "jumps over ".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::TextDelta {
+                    text: "the lazy dog.".into(),
+                },
+            )
+            .unwrap();
+
+        // Terminal event closes streaming
+        journal
+            .append(
+                chat_id,
+                &zeron_proto::AgentEvent::Done {
+                    status: zeron_proto::DoneStatus::Completed,
+                    result: Some("done".into()),
+                    error: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        // Trajectory record points at start_seq
+        let r = sample_record_with_payload_raw_ref(chat_id, "run1", seq_start, 0, None, None);
+        store.try_enqueue(r).unwrap();
+        store.sync_flush().unwrap();
+
+        let reply = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": seq_start,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+
+        if let RpcReply::Value(val) = reply {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Available { text, field } => {
+                    assert_eq!(field, TrajectoryRawField::Payload);
+                    assert_eq!(text, "The quick brown fox jumps over the lazy dog.");
+                }
+                other => panic!("expected Available with assembled deltas, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_store_multi_chat_degraded_notification() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(TrajectoryStore::open(temp.path()).unwrap());
+
+        let mut events_rx = store.subscribe_events();
+
+        // Create records for chat-A and chat-B
+        let r_a1 = sample_record("chat_a", "run_a", 1, 0);
+        let r_b1 = sample_record("chat_b", "run_b", 1, 0);
+
+        // Corrupt table schema to force durable write failure in writer thread
+        let db_path = temp.path().join("trajectory.sqlite3");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DROP TABLE trajectory_records", []).unwrap();
+        drop(conn);
+
+        // Fail-open: whether the writer already observed the broken schema
+        // (enqueue rejected, store marked degraded) or not (rejected later at
+        // commit time), capture never propagates the failure — and BOTH chats
+        // in the batch must still be accounted as degraded.
+        let _ = store.try_enqueue_batch(vec![r_a1, r_b1]);
+
+        // Must receive DegradedRecorded for both chat_a and chat_b
+        let mut degraded_chats = std::collections::HashSet::new();
+        let timeout = std::time::Instant::now();
+        while degraded_chats.len() < 2 && timeout.elapsed() < std::time::Duration::from_secs(3) {
+            if let Ok(event) = events_rx.try_recv()
+                && let TrajectoryStoreEvent::DegradedRecorded { chat_id, .. } = event
+            {
+                degraded_chats.insert(chat_id);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            degraded_chats.contains("chat_a"),
+            "chat_a must receive degraded notification"
+        );
+        assert!(
+            degraded_chats.contains("chat_b"),
+            "chat_b must receive degraded notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_missing_or_corrupt_journal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_missing_corrupt";
+
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        // 1. Attached record in store, but journal file does not contain that seq
+        let store = rpc.trajectory_store().expect("trajectory store");
+        let r = sample_record_with_payload_raw_ref(chat_id, "run1", 9999, 0, None, None);
+        store.try_enqueue(r).unwrap();
+        store.sync_flush().unwrap();
+
+        let r_missing = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": 9999,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .unwrap();
+        if let RpcReply::Value(val) = r_missing {
+            let res: TrajectoryRawRevealResult = serde_json::from_value(val).unwrap();
+            match res {
+                TrajectoryRawRevealResult::Unavailable { reason, .. } => {
+                    assert_eq!(reason, TrajectoryUnavailableReason::NotFound);
+                }
+                other => panic!("expected Unavailable NotFound, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_reveal_io_failure_is_typed_store_unavailable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (core, rpc) = setup_test_engine(&temp).await;
+        let local_device = core.doc_host.device_id().to_string();
+        let chat_id = "chat_journal_io_failure";
+        core.workspace
+            .create_chat(chat_id, None, Some(&local_device), None, None)
+            .unwrap();
+
+        let store = rpc.trajectory_store().expect("trajectory store");
+        store
+            .try_enqueue(sample_record_with_payload_raw_ref(
+                chat_id, "run1", 1, 0, None, None,
+            ))
+            .unwrap();
+        store.sync_flush().unwrap();
+
+        let journal_path = rpc.run_journal().unwrap().path_for(chat_id);
+        std::fs::create_dir(&journal_path).unwrap();
+
+        let reply = rpc
+            .handle(
+                methods::REVEAL_TRAJECTORY_RAW,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceSeq": 1,
+                    "field": "payload",
+                }),
+            )
+            .await
+            .expect("expected typed unavailable value");
+        let RpcReply::Value(value) = reply else {
+            panic!("expected value reply");
+        };
+        let result: TrajectoryRawRevealResult = serde_json::from_value(value).unwrap();
+        match result {
+            TrajectoryRawRevealResult::Unavailable {
+                reason, message, ..
+            } => {
+                assert_eq!(reason, TrajectoryUnavailableReason::StoreUnavailable);
+                assert_eq!(message.as_deref(), Some("Run journal unavailable"));
+            }
+            other => panic!("expected typed store unavailable, got {other:?}"),
+        }
     }
 }

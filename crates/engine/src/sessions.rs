@@ -34,6 +34,7 @@ use zeron_harness::{
     CancellationToken, Harness, LiveVoiceContextKind, LiveVoiceControl, LiveVoiceEvent,
     LiveVoiceHandle, LiveVoiceRequest, RunControls, SteerMessage,
 };
+use zeron_proto::trajectory::*;
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, LiveVoiceAvailability, LiveVoiceState,
     LiveVoiceUnavailableReason, RunRequest, Session, SessionStatus, UserInputAnswer,
@@ -47,8 +48,8 @@ use crate::live_voice::{
 };
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
+use crate::trajectory_store::{TrajectoryStore, TrajectoryStoreEvent};
 use crate::{EngineError, new_id, now_ms};
-
 /// One published event. Durable events carry their journal seq; transient
 /// previews use seq 0 and exist only on the live broadcast.
 #[derive(Debug, Clone)]
@@ -182,7 +183,46 @@ struct RoutedSteer {
     prompt: String,
     message_id: String,
 }
+#[derive(Debug)]
+struct BoundedTombstones {
+    set: HashSet<String>,
+    queue: std::collections::VecDeque<String>,
+    capacity: usize,
+}
 
+impl BoundedTombstones {
+    fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            queue: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, chat_id: String) {
+        if self.set.insert(chat_id.clone()) {
+            self.queue.push_back(chat_id);
+            if self.queue.len() > self.capacity
+                && let Some(oldest) = self.queue.pop_front()
+            {
+                self.set.remove(&oldest);
+            }
+        }
+    }
+
+    fn contains(&self, chat_id: &str) -> bool {
+        self.set.contains(chat_id)
+    }
+}
+
+struct InFlightTrajectory {
+    run_id: String,
+    start_seq: u64,
+    text: String,
+    last_emitted_at: std::time::Instant,
+    turn_id: Option<String>,
+    step_id: Option<String>,
+}
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -207,11 +247,14 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
-    /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
-    /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
-    /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
     live_voice: LiveVoiceCoordinator,
+    trajectory: Mutex<Option<Arc<TrajectoryStore>>>,
+    in_flight_text: Mutex<HashMap<String, InFlightTrajectory>>,
+    in_flight_reasoning: Mutex<HashMap<String, InFlightTrajectory>>,
+    fallback_trajectory_runs: Mutex<HashMap<String, String>>,
+    trajectory_tool_names: Mutex<HashMap<String, HashMap<String, String>>>,
+    tombstoned_chats: Mutex<BoundedTombstones>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -269,10 +312,54 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 live_voice: LiveVoiceCoordinator::new(),
+                trajectory: Mutex::new(None),
+                in_flight_text: Mutex::new(HashMap::new()),
+                in_flight_reasoning: Mutex::new(HashMap::new()),
+                fallback_trajectory_runs: Mutex::new(HashMap::new()),
+                trajectory_tool_names: Mutex::new(HashMap::new()),
+                tombstoned_chats: Mutex::new(BoundedTombstones::new(4096)),
             }),
         }
     }
 
+    pub fn set_trajectory_store(&self, store: Arc<TrajectoryStore>) {
+        let mut slot = lock(&self.inner.trajectory);
+        *slot = Some(store.clone());
+        drop(slot);
+        let weak = Arc::downgrade(&self.inner);
+        let mut rx = store.subscribe_events();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(TrajectoryStoreEvent::ChatDeleted { chat_id }) => {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.tombstone_chat(&chat_id);
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    pub fn tombstone_chat(&self, chat_id: &str) {
+        self.inner.tombstone_chat(chat_id);
+    }
+
+    pub fn trajectory_store(&self) -> Option<Arc<TrajectoryStore>> {
+        lock(&self.inner.trajectory).clone()
+    }
+
+    pub fn run_journal(&self) -> Arc<crate::run_journal::RunJournal> {
+        self.inner.journal.clone()
+    }
+
+    pub fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        self.inner.publish(chat_id, event)
+    }
     pub fn file_tool_input(
         &self,
         chat_id: &str,
@@ -1355,6 +1442,9 @@ impl Inner {
                 event: event.clone(),
             });
         }
+        if let Some(store) = lock(&self.trajectory).clone() {
+            self.capture_trajectory_event(&store, chat_id, seq, event);
+        }
         seq
     }
 
@@ -1586,7 +1676,408 @@ impl Inner {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
+            lock(&self.fallback_trajectory_runs).remove(chat_id);
         }
+    }
+
+    pub fn tombstone_chat(&self, chat_id: &str) {
+        lock(&self.tombstoned_chats).insert(chat_id.to_string());
+        lock(&self.in_flight_text).remove(chat_id);
+        lock(&self.in_flight_reasoning).remove(chat_id);
+        lock(&self.fallback_trajectory_runs).remove(chat_id);
+        lock(&self.trajectory_tool_names).remove(chat_id);
+    }
+
+    fn has_in_flight_buffers(&self, chat_id: &str) -> bool {
+        lock(&self.in_flight_text)
+            .get(chat_id)
+            .is_some_and(|inf| !inf.text.is_empty())
+            || lock(&self.in_flight_reasoning)
+                .get(chat_id)
+                .is_some_and(|inf| !inf.text.is_empty())
+    }
+
+    fn trajectory_run_id(&self, chat_id: &str, seq: u64, event: &AgentEvent) -> String {
+        lock(&self.runs)
+            .get(chat_id)
+            .map(|handle| handle.run_id.clone())
+            .unwrap_or_else(|| {
+                let mut fallback = lock(&self.fallback_trajectory_runs);
+                if matches!(event, AgentEvent::SessionStarted { .. })
+                    && !self.has_in_flight_buffers(chat_id)
+                {
+                    fallback.insert(chat_id.to_string(), format!("run_{}", seq.max(1)));
+                }
+                fallback
+                    .entry(chat_id.to_string())
+                    .or_insert_with(|| format!("run_{}", seq.max(1)))
+                    .clone()
+            })
+    }
+
+    fn flush_in_flight_reasoning(&self, store: &Arc<TrajectoryStore>, chat_id: &str) {
+        if lock(&self.tombstoned_chats).contains(chat_id) {
+            lock(&self.in_flight_reasoning).remove(chat_id);
+            return;
+        }
+        let inf = lock(&self.in_flight_reasoning).remove(chat_id);
+        if let Some(inf) = inf {
+            let (summary, sanitized_text) =
+                zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024);
+            let rec = TrajectoryRecord {
+                id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 1),
+                chat_id: chat_id.to_string(),
+                run_id: inf.run_id.clone(),
+                source_seq: inf.start_seq,
+                sub_seq: 1,
+                lane: TrajectoryLane::Model,
+                kind: TrajectoryRecordKind::Reasoning,
+                status: TrajectoryStatus::Completed,
+                is_partial: false,
+                title: "Reasoning".into(),
+                summary,
+                turn_id: inf.turn_id,
+                step_id: inf.step_id,
+                call_id: None,
+                parent_tool_use_id: None,
+                timing: Some(TrajectoryTiming::recorded(
+                    None,
+                    Some(Utc::now()),
+                    None,
+                    None,
+                )),
+                usage: None,
+                payload: Some(TrajectoryPayloadPreview {
+                    summary: "Reasoning completed".to_string(),
+                    sanitized_text,
+                    schema_info: None,
+                    raw_ref: Some(TrajectoryRawRef::new(
+                        chat_id,
+                        inf.start_seq,
+                        None,
+                        None,
+                        TrajectoryRawField::Payload,
+                    )),
+                }),
+                result: None,
+                error_message: None,
+                is_degraded: false,
+            };
+            let _ = store.try_enqueue(rec);
+        }
+    }
+
+    fn flush_in_flight_text(&self, store: &Arc<TrajectoryStore>, chat_id: &str) {
+        if lock(&self.tombstoned_chats).contains(chat_id) {
+            lock(&self.in_flight_text).remove(chat_id);
+            return;
+        }
+        let inf = lock(&self.in_flight_text).remove(chat_id);
+        if let Some(inf) = inf {
+            let (summary, sanitized_text) =
+                zeron_proto::trajectory::sanitize_prompt_preview(&inf.text, 1024);
+            let rec = TrajectoryRecord {
+                id: TrajectoryRecordId::new(&inf.run_id, inf.start_seq, 0),
+                chat_id: chat_id.to_string(),
+                run_id: inf.run_id.clone(),
+                source_seq: inf.start_seq,
+                sub_seq: 0,
+                lane: TrajectoryLane::Model,
+                kind: TrajectoryRecordKind::AssistantMessage,
+                status: TrajectoryStatus::Completed,
+                is_partial: false,
+                title: "Assistant".into(),
+                summary,
+                turn_id: inf.turn_id,
+                step_id: inf.step_id,
+                call_id: None,
+                parent_tool_use_id: None,
+                timing: Some(TrajectoryTiming::recorded(
+                    None,
+                    Some(Utc::now()),
+                    None,
+                    None,
+                )),
+                usage: None,
+                payload: Some(TrajectoryPayloadPreview {
+                    summary: "Response completed".to_string(),
+                    sanitized_text,
+                    schema_info: None,
+                    raw_ref: Some(TrajectoryRawRef::new(
+                        chat_id,
+                        inf.start_seq,
+                        None,
+                        None,
+                        TrajectoryRawField::Payload,
+                    )),
+                }),
+                result: None,
+                error_message: None,
+                is_degraded: false,
+            };
+            let _ = store.try_enqueue(rec);
+        }
+    }
+
+    fn capture_trajectory_event(
+        &self,
+        store: &Arc<TrajectoryStore>,
+        chat_id: &str,
+        seq: u64,
+        event: &AgentEvent,
+    ) {
+        if lock(&self.tombstoned_chats).contains(chat_id) {
+            return;
+        }
+        match event {
+            AgentEvent::TextDelta { text } => {
+                let mut in_flight = lock(&self.in_flight_text);
+                if in_flight.get_mut(chat_id).is_none() {
+                    drop(in_flight);
+                    let run_id = self.trajectory_run_id(chat_id, seq, event);
+                    in_flight = lock(&self.in_flight_text);
+                    if in_flight.get_mut(chat_id).is_none() {
+                        in_flight.insert(
+                            chat_id.to_string(),
+                            InFlightTrajectory {
+                                run_id,
+                                start_seq: seq,
+                                text: String::new(),
+                                last_emitted_at: std::time::Instant::now(),
+                                turn_id: None,
+                                step_id: None,
+                            },
+                        );
+                    }
+                }
+                const PREVIEW_CAP: usize = 1024;
+                let entry = in_flight
+                    .get_mut(chat_id)
+                    .expect("in-flight text inserted above");
+                if entry.text.len() < PREVIEW_CAP {
+                    entry.text.push_str(text);
+                }
+                if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
+                    let (summary, sanitized_text) =
+                        zeron_proto::trajectory::sanitize_prompt_preview(&entry.text, PREVIEW_CAP);
+                    let rec = TrajectoryRecord {
+                        id: TrajectoryRecordId::new(&entry.run_id, entry.start_seq, 0),
+                        chat_id: chat_id.to_string(),
+                        run_id: entry.run_id.clone(),
+                        source_seq: entry.start_seq,
+                        sub_seq: 0,
+                        lane: TrajectoryLane::Model,
+                        kind: TrajectoryRecordKind::AssistantMessage,
+                        status: TrajectoryStatus::Running,
+                        is_partial: true,
+                        title: "Assistant".to_string(),
+                        summary,
+                        turn_id: entry.turn_id.clone(),
+                        step_id: entry.step_id.clone(),
+                        call_id: None,
+                        parent_tool_use_id: None,
+                        timing: Some(TrajectoryTiming::recorded(
+                            Some(Utc::now()),
+                            None,
+                            None,
+                            None,
+                        )),
+                        usage: None,
+                        payload: Some(TrajectoryPayloadPreview {
+                            summary: "In-flight response".to_string(),
+                            sanitized_text,
+                            schema_info: None,
+                            raw_ref: Some(TrajectoryRawRef::new(
+                                chat_id,
+                                entry.start_seq,
+                                None,
+                                None,
+                                TrajectoryRawField::Payload,
+                            )),
+                        }),
+                        result: None,
+                        error_message: None,
+                        is_degraded: false,
+                    };
+                    entry.last_emitted_at = std::time::Instant::now();
+                    let _ = store.try_enqueue(rec);
+                }
+            }
+            AgentEvent::ReasoningDelta { text } => {
+                let mut in_flight = lock(&self.in_flight_reasoning);
+                if in_flight.get_mut(chat_id).is_none() {
+                    drop(in_flight);
+                    let run_id = self.trajectory_run_id(chat_id, seq, event);
+                    in_flight = lock(&self.in_flight_reasoning);
+                    if in_flight.get_mut(chat_id).is_none() {
+                        in_flight.insert(
+                            chat_id.to_string(),
+                            InFlightTrajectory {
+                                run_id,
+                                start_seq: seq,
+                                text: String::new(),
+                                last_emitted_at: std::time::Instant::now(),
+                                turn_id: None,
+                                step_id: None,
+                            },
+                        );
+                    }
+                }
+                const PREVIEW_CAP: usize = 1024;
+                let entry = in_flight
+                    .get_mut(chat_id)
+                    .expect("in-flight reasoning inserted above");
+                if entry.text.len() < PREVIEW_CAP {
+                    entry.text.push_str(text);
+                }
+                if entry.last_emitted_at.elapsed() >= std::time::Duration::from_millis(120) {
+                    let (summary, sanitized_text) =
+                        zeron_proto::trajectory::sanitize_prompt_preview(&entry.text, PREVIEW_CAP);
+                    let rec = TrajectoryRecord {
+                        id: TrajectoryRecordId::new(&entry.run_id, entry.start_seq, 1),
+                        chat_id: chat_id.to_string(),
+                        run_id: entry.run_id.clone(),
+                        source_seq: entry.start_seq,
+                        sub_seq: 1,
+                        lane: TrajectoryLane::Model,
+                        kind: TrajectoryRecordKind::Reasoning,
+                        status: TrajectoryStatus::Running,
+                        is_partial: true,
+                        title: "Reasoning".to_string(),
+                        summary,
+                        turn_id: entry.turn_id.clone(),
+                        step_id: entry.step_id.clone(),
+                        call_id: None,
+                        parent_tool_use_id: None,
+                        timing: Some(TrajectoryTiming::recorded(
+                            Some(Utc::now()),
+                            None,
+                            None,
+                            None,
+                        )),
+                        usage: None,
+                        payload: Some(TrajectoryPayloadPreview {
+                            summary: "In-flight reasoning".to_string(),
+                            sanitized_text,
+                            schema_info: None,
+                            raw_ref: Some(TrajectoryRawRef::new(
+                                chat_id,
+                                entry.start_seq,
+                                None,
+                                None,
+                                TrajectoryRawField::Payload,
+                            )),
+                        }),
+                        result: None,
+                        error_message: None,
+                        is_degraded: false,
+                    };
+                    entry.last_emitted_at = std::time::Instant::now();
+                    let _ = store.try_enqueue(rec);
+                }
+            }
+            AgentEvent::AssistantMessageCompleted { .. } => {
+                self.flush_in_flight_reasoning(store, chat_id);
+                self.flush_in_flight_text(store, chat_id);
+            }
+            _ => {
+                let skip_session_started_boundary =
+                    matches!(event, AgentEvent::SessionStarted { .. })
+                        && self.has_in_flight_buffers(chat_id);
+
+                if !skip_session_started_boundary
+                    && matches!(
+                        event,
+                        AgentEvent::SessionStarted { .. }
+                            | AgentEvent::Steered { .. }
+                            | AgentEvent::Done { .. }
+                            | AgentEvent::Error { .. }
+                            | AgentEvent::ToolCall { .. }
+                    )
+                {
+                    self.flush_in_flight_reasoning(store, chat_id);
+                    self.flush_in_flight_text(store, chat_id);
+                }
+
+                if matches!(event, AgentEvent::SessionStarted { .. })
+                    && !skip_session_started_boundary
+                {
+                    lock(&self.trajectory_tool_names).remove(chat_id);
+                }
+                if let Some((call_id, call)) = trajectory_tool_call(event) {
+                    lock(&self.trajectory_tool_names)
+                        .entry(chat_id.to_string())
+                        .or_default()
+                        .insert(
+                            call_id.to_string(),
+                            crate::trajectory_store::tool_name_for(call),
+                        );
+                }
+                let originating_tool_name = trajectory_tool_result_id(event).and_then(|call_id| {
+                    lock(&self.trajectory_tool_names)
+                        .get(chat_id)
+                        .and_then(|names| names.get(call_id))
+                        .cloned()
+                });
+
+                if trajectory_event_projects(event) {
+                    let run_id = self.trajectory_run_id(chat_id, seq, event);
+                    if let Some(record) = crate::trajectory_store::project_event_to_record(
+                        chat_id,
+                        &run_id,
+                        seq,
+                        event,
+                        None,
+                        originating_tool_name.as_deref(),
+                    ) {
+                        let _ = store.try_enqueue(record);
+                    }
+                }
+
+                if matches!(event, AgentEvent::Done { .. }) {
+                    lock(&self.fallback_trajectory_runs).remove(chat_id);
+                    lock(&self.trajectory_tool_names).remove(chat_id);
+                }
+            }
+        }
+    }
+}
+
+fn trajectory_tool_call(event: &AgentEvent) -> Option<(&str, &zeron_proto::ToolCall)> {
+    match event {
+        AgentEvent::ToolCall { id, call } => Some((id, call)),
+        AgentEvent::Subagent { event, .. } => trajectory_tool_call(event),
+        _ => None,
+    }
+}
+
+fn trajectory_tool_result_id(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::ToolResult { id, .. } => Some(id),
+        AgentEvent::Subagent { event, .. } => trajectory_tool_result_id(event),
+        _ => None,
+    }
+}
+
+fn trajectory_event_projects(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::SessionStarted { .. }
+        | AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::Usage { .. }
+        | AgentEvent::AvailableCommands { .. }
+        | AgentEvent::WorkflowTask { .. }
+        | AgentEvent::Error { .. }
+        | AgentEvent::InputRequested { .. }
+        | AgentEvent::InputResolved { .. }
+        | AgentEvent::Steered { .. }
+        | AgentEvent::Done { .. }
+        | AgentEvent::UserMessage { .. } => true,
+        AgentEvent::Subagent { event, .. } => trajectory_event_projects(event),
+        AgentEvent::TextDelta { .. }
+        | AgentEvent::ReasoningDelta { .. }
+        | AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::ToolCallPreview { .. } => false,
     }
 }
 
@@ -2855,14 +3346,15 @@ mod tests {
         resolve_pending_question, segment_duration_ms, should_journal_event, subagent_doc_id,
         workflow_tasks_from_entries,
     };
+    use crate::trajectory_store::TrajectoryStore;
     use chrono::Utc;
     use tokio::sync::oneshot;
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+    use zeron_proto::trajectory::*;
     use zeron_proto::{
-        AgentEvent, ContextUsage, HarnessId, RunRequest, SandboxLevel, Session, SessionStatus,
-        ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
+        AgentEvent, ContextUsage, DoneStatus, HarnessId, RunRequest, SandboxLevel, Session,
+        SessionStatus, ToolCall, WorkflowTaskStatus, WorkflowTaskUpdate,
     };
-
     #[test]
     fn journal_policy_skips_transient_preview_but_keeps_authoritative_file_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -3212,6 +3704,959 @@ mod tests {
         assert_ne!(
             subagent_doc_id("chat", "a:b"),
             subagent_doc_id("chat", "a:c")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_complete_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat-1";
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-model".into(),
+                tools: vec!["bash".into()],
+                cwd: "/workspace".into(),
+                session_id: "s1".into(),
+                assistant_message_id: "m1".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "List files".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCall {
+                id: "call_1".into(),
+                call: zeron_proto::ToolCall::Exec {
+                    command: "ls -la".into(),
+                },
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolResult {
+                id: "call_1".into(),
+                is_error: false,
+                output: Some("total 0\n-rw-r--r-- 1 user user 0 file.txt".into()),
+                diff: None,
+                execution: Some(zeron_proto::ToolExecutionMeta {
+                    exit_code: Some(0),
+                    duration_ms: Some(15),
+                }),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("All files listed".into()),
+                error: None,
+                session_id: Some("s1".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 5);
+
+        assert_eq!(records[0].lane, TrajectoryLane::Input);
+        assert_eq!(records[0].kind, TrajectoryRecordKind::SessionStarted);
+
+        assert_eq!(records[1].lane, TrajectoryLane::Input);
+        assert_eq!(records[1].kind, TrajectoryRecordKind::UserMessage);
+
+        assert_eq!(records[2].lane, TrajectoryLane::Tools);
+        assert!(matches!(
+            records[2].kind,
+            TrajectoryRecordKind::ToolCall { .. }
+        ));
+        assert_eq!(records[2].call_id.as_deref(), Some("call_1"));
+
+        assert_eq!(records[3].lane, TrajectoryLane::Tools);
+        assert_eq!(records[3].status, TrajectoryStatus::Completed);
+        assert_eq!(
+            records[3].kind,
+            TrajectoryRecordKind::ToolResult {
+                tool_name: "bash".into()
+            }
+        );
+        assert_eq!(records[3].call_id.as_deref(), Some("call_1"));
+
+        assert_eq!(records[4].lane, TrajectoryLane::Model);
+        assert_eq!(records[4].kind, TrajectoryRecordKind::Done);
+        assert_eq!(records[4].status, TrajectoryStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_coalescing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat-2";
+        // 1. Initial text delta
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "token0 ".into(),
+            },
+        );
+
+        // 2. Sleep 130ms crossing the 120ms in-flight threshold and emit second delta
+        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "token1 ".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let partial_records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(
+            partial_records.len(),
+            1,
+            "partial delta must create 1 in-flight record"
+        );
+        let partial = &partial_records[0];
+        assert_eq!(partial.lane, TrajectoryLane::Model);
+        assert_eq!(partial.kind, TrajectoryRecordKind::AssistantMessage);
+        assert!(
+            partial.is_partial,
+            "in-flight delta crossing 120ms must be marked partial"
+        );
+        assert_eq!(partial.status, TrajectoryStatus::Running);
+        assert!(partial.summary.contains("token0"));
+        let stable_id = partial.id.clone();
+
+        // 3. Sleep 130ms again and emit third delta
+        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "token2 ".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let updated_records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(updated_records.len(), 1);
+        assert_eq!(
+            updated_records[0].id, stable_id,
+            "record identity must remain stable across partial updates"
+        );
+        assert!(updated_records[0].is_partial);
+        assert!(
+            updated_records[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.sanitized_text.as_ref())
+                .unwrap()
+                .contains("token2")
+        );
+
+        // 4. Complete assistant message
+        engine.publish(
+            chat_id,
+            &AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "m1".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let final_records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(
+            final_records.len(),
+            1,
+            "finalized response must remain a single record"
+        );
+        let final_rec = &final_records[0];
+        assert_eq!(
+            final_rec.id, stable_id,
+            "final record must have the exact same stable identity"
+        );
+        assert!(!final_rec.is_partial, "final record must not be partial");
+        assert_eq!(final_rec.status, TrajectoryStatus::Completed);
+        assert!(
+            final_rec
+                .payload
+                .as_ref()
+                .and_then(|p| p.sanitized_text.as_ref())
+                .unwrap()
+                .contains("token0 token1 token2")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_transient_events_preserve_in_flight_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+        let chat_id = "chat-transient";
+
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "first ".into(),
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "second ".into(),
+            },
+        );
+        store.flush().await.unwrap();
+        let partial = store
+            .list_all_records(chat_id)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.kind == TrajectoryRecordKind::AssistantMessage)
+            .expect("partial assistant record");
+        assert!(partial.is_partial);
+        let stable_id = partial.id;
+
+        engine.publish(
+            chat_id,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "parent".into(),
+                event: Box::new(AgentEvent::Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    context_usage: None,
+                }),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCallPreview {
+                id: "preview".into(),
+                call: ToolCall::Exec {
+                    command: "printf preview".into(),
+                },
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 5,
+                context_usage: None,
+            },
+        );
+        store.flush().await.unwrap();
+        let assistant_records: Vec<_> = store
+            .list_all_records(chat_id)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == TrajectoryRecordKind::AssistantMessage)
+            .collect();
+        assert_eq!(assistant_records.len(), 1);
+        assert_eq!(assistant_records[0].id, stable_id);
+        assert!(
+            assistant_records[0].is_partial,
+            "transient events must not finalize the model segment"
+        );
+
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "third".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "message".into(),
+            },
+        );
+        store.flush().await.unwrap();
+        let assistant_records: Vec<_> = store
+            .list_all_records(chat_id)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == TrajectoryRecordKind::AssistantMessage)
+            .collect();
+        assert_eq!(assistant_records.len(), 1);
+        assert_eq!(assistant_records[0].id, stable_id);
+        assert!(!assistant_records[0].is_partial);
+        assert_eq!(assistant_records[0].summary, "first second third");
+    }
+    #[tokio::test]
+    async fn test_trajectory_capture_fail_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let degraded_store = Arc::new(TrajectoryStore::degraded(
+            dir.path(),
+            "simulated IO failure",
+        ));
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(degraded_store.clone());
+
+        assert!(degraded_store.is_degraded());
+
+        // Even with a failed/degraded trajectory store, publication and journal replay continue without panic
+        let seq1 = engine.publish(
+            "chat-3",
+            &AgentEvent::UserMessage {
+                text: "Hello".into(),
+            },
+        );
+        let seq2 = engine.publish(
+            "chat-3",
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("ok".into()),
+                error: None,
+                session_id: None,
+            },
+        );
+
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        let journal_events = journal.replay("chat-3", 0).unwrap();
+        assert_eq!(journal_events.len(), 2);
+
+        // The degraded store records degraded intervals
+        let intervals = degraded_store.get_degraded_intervals("chat-3").unwrap();
+        assert!(!intervals.is_empty());
+        assert!(intervals[0].reason.contains("simulated IO failure"));
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_mixed_stream_interleaved_reasoning_and_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_mixed";
+        engine.publish(
+            chat_id,
+            &AgentEvent::ReasoningDelta {
+                text: "Thinking part 1. ".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "Response part 1. ".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ReasoningDelta {
+                text: "Thinking part 2.".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "Response part 2.".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "msg_1".into(),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+
+        // Must have exactly two distinct records: one Reasoning and one AssistantMessage
+        assert_eq!(records.len(), 2);
+
+        let reasoning_rec = records
+            .iter()
+            .find(|r| matches!(r.kind, TrajectoryRecordKind::Reasoning))
+            .expect("must have distinct Reasoning record");
+        let assistant_rec = records
+            .iter()
+            .find(|r| matches!(r.kind, TrajectoryRecordKind::AssistantMessage))
+            .expect("must have distinct AssistantMessage record");
+
+        assert_eq!(reasoning_rec.title, "Reasoning");
+        assert!(
+            reasoning_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Thinking part 1. Thinking part 2.")
+        );
+        assert!(
+            !reasoning_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Response")
+        );
+
+        assert_eq!(assistant_rec.title, "Assistant");
+        assert!(
+            assistant_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Response part 1. Response part 2.")
+        );
+        assert!(
+            !assistant_rec
+                .payload
+                .as_ref()
+                .unwrap()
+                .sanitized_text
+                .as_ref()
+                .unwrap()
+                .contains("Thinking")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_fallback_run_id_grouping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_headless_multi_event";
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "First turn".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCall {
+                id: "tool_1".into(),
+                call: zeron_proto::ToolCall::ReadFile {
+                    path: "foo.rs".into(),
+                },
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolResult {
+                id: "tool_1".into(),
+                is_error: false,
+                output: Some("content".into()),
+                diff: None,
+                execution: None,
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("finished turn 1".into()),
+                error: None,
+                session_id: None,
+            },
+        );
+
+        // Publish turn 2
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Second turn".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("finished turn 2".into()),
+                error: None,
+                session_id: None,
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 6);
+
+        // Turn 1 records (first 4) must share the same stable run_id
+        let turn1_run_id = &records[0].run_id;
+        assert_eq!(&records[1].run_id, turn1_run_id);
+        assert_eq!(&records[2].run_id, turn1_run_id);
+        assert_eq!(&records[3].run_id, turn1_run_id);
+
+        // Turn 2 records (last 2) must share their own stable run_id
+        let turn2_run_id = &records[4].run_id;
+        assert_eq!(&records[5].run_id, turn2_run_id);
+        assert_ne!(turn1_run_id, turn2_run_id);
+
+        // Pure projection grouping produces exactly two distinct runs
+        let runs = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].turns.len(), 1);
+        assert_eq!(runs[1].turns.len(), 1);
+    }
+    #[tokio::test]
+    async fn test_trajectory_capture_missing_done_headless_then_session_started() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_headless_missing_done";
+        // Run 1: UserMessage and AssistantMessageCompleted WITHOUT a Done event
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Prompt 1".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCall {
+                id: "tool_1".into(),
+                call: zeron_proto::ToolCall::ReadFile {
+                    path: "foo.rs".into(),
+                },
+            },
+        );
+
+        // Run 2: Starts with SessionStarted
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "model-2".into(),
+                cwd: "/work".into(),
+                session_id: "s2".into(),
+                assistant_message_id: "m2".into(),
+                tools: Vec::new(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Prompt 2".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("ok".into()),
+                error: None,
+                session_id: Some("s2".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 5);
+
+        // Records from Run 1 (indices 0 and 1) must have the first run_id
+        let run1_id = records[0].run_id.clone();
+        assert_eq!(records[1].run_id, run1_id);
+
+        // SessionStarted and subsequent records must have a NEW run_id
+        let session_started_rec = &records[2];
+        assert_eq!(
+            session_started_rec.kind,
+            TrajectoryRecordKind::SessionStarted
+        );
+        let run2_id = session_started_rec.run_id.clone();
+        assert_ne!(
+            run2_id, run1_id,
+            "SessionStarted must rotate to a new fallback run ID and not inherit previous unfinished run ID"
+        );
+        assert_eq!(records[3].run_id, run2_id);
+        assert_eq!(records[4].run_id, run2_id);
+
+        let runs = zeron_proto::trajectory::group_records(&records);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, run1_id);
+        assert_eq!(runs[1].run_id, run2_id);
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_nested_subagent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine =
+            SessionsEngine::new("device".into(), journal, Arc::new(HarnessRegistry::new()));
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat-4";
+        engine.publish(
+            chat_id,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "parent_call_10".into(),
+                event: Box::new(AgentEvent::ToolCall {
+                    id: "child_tool_5".into(),
+                    call: zeron_proto::ToolCall::ReadFile {
+                        path: "src/main.rs".into(),
+                    },
+                }),
+            },
+        );
+
+        store.flush().await.unwrap();
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].parent_tool_use_id.as_deref(),
+            Some("parent_call_10")
+        );
+        assert_eq!(records[0].call_id.as_deref(), Some("child_tool_5"));
+        assert_eq!(
+            records[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.raw_ref.as_ref())
+                .and_then(|r| r.parent_tool_use_id.as_deref()),
+            Some("parent_call_10")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_zero_viewers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(store.clone());
+
+        // Publish events without any watch / subscriber / UI viewer connected
+        let chat_id = "chat_headless";
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-model".into(),
+                tools: vec!["bash".into()],
+                cwd: "/root".into(),
+                session_id: "s_zero".into(),
+                assistant_message_id: "m_zero".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::UserMessage {
+                text: "Running in background with 0 viewers".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("Completed without viewer".into()),
+                error: None,
+                session_id: Some("s_zero".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+
+        // Proves that all records are captured into TrajectoryStore even with 0 active viewers
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].kind, TrajectoryRecordKind::SessionStarted);
+        assert_eq!(records[1].kind, TrajectoryRecordKind::UserMessage);
+        assert_eq!(records[2].kind, TrajectoryRecordKind::Done);
+    }
+    #[tokio::test]
+    async fn test_trajectory_capture_deleted_chat_events_after_deletion_are_not_persisted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_deleted_test";
+
+        // Run begins and accumulates in-flight text and reasoning
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-model".into(),
+                tools: vec!["bash".into()],
+                cwd: "/root".into(),
+                session_id: "s_del".into(),
+                assistant_message_id: "m_del".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "in-flight streaming text".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ReasoningDelta {
+                text: "in-flight thinking".into(),
+            },
+        );
+        store.flush().await.unwrap();
+
+        // Delete chat in store and tombstone in engine
+        store.delete_chat(chat_id).await.unwrap();
+        engine.tombstone_chat(chat_id);
+        store.flush().await.unwrap();
+
+        assert_eq!(
+            store.list_all_records(chat_id).unwrap().len(),
+            0,
+            "chat must have 0 records after deletion"
+        );
+
+        // Subsequent late events (e.g. interrupt synthesize Done, or late deltas)
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                result: None,
+                error: Some("Run interrupted by delete".into()),
+                session_id: Some("s_del".into()),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "late delta after deletion".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::ToolCall {
+                id: "call_late".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+
+        store.flush().await.unwrap();
+
+        // After all late events, deleted chat MUST remain completely empty
+        let records = store.list_all_records(chat_id).unwrap();
+        assert_eq!(
+            records.len(),
+            0,
+            "events published after delete_chat must never re-insert records for tombstoned chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_mid_run_session_started_with_in_flight_preserves_run_and_segment()
+     {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_mid_session_started";
+
+        // 1. Session starts
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "claude-3-7-sonnet".into(),
+                tools: vec!["bash".into()],
+                cwd: "/root".into(),
+                session_id: "s_mid_1".into(),
+                assistant_message_id: "m_mid_1".into(),
+            },
+        );
+
+        // 2. Stream partial text
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "Initial chunk of answer. ".into(),
+            },
+        );
+
+        // 3. Mid-run SessionStarted re-emission (Claude SDK background re-invocation)
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "claude-3-7-sonnet".into(),
+                tools: vec!["bash".into()],
+                cwd: "/root".into(),
+                session_id: "s_mid_2".into(),
+                assistant_message_id: "m_mid_2".into(),
+            },
+        );
+
+        // 4. Continue streaming text in the same turn
+        engine.publish(
+            chat_id,
+            &AgentEvent::TextDelta {
+                text: "Second chunk continuing the same turn.".into(),
+            },
+        );
+
+        // 5. Complete assistant message
+        engine.publish(
+            chat_id,
+            &AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "m_mid_2".into(),
+            },
+        );
+        engine.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("All done".into()),
+                error: None,
+                session_id: Some("s_mid_2".into()),
+            },
+        );
+
+        store.flush().await.unwrap();
+
+        let records = store.list_all_records(chat_id).unwrap();
+
+        // Verify AssistantMessage records: there must be exactly ONE completed AssistantMessage record
+        let assistant_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.kind == TrajectoryRecordKind::AssistantMessage && !r.is_partial)
+            .collect();
+        assert_eq!(
+            assistant_records.len(),
+            1,
+            "mid-run SessionStarted must not split in-flight response into multiple completed records"
+        );
+
+        let assistant_record = assistant_records[0];
+        let payload = assistant_record.payload.as_ref().unwrap();
+        let text = payload.sanitized_text.as_ref().unwrap();
+        assert!(
+            text.contains("Initial chunk of answer") && text.contains("Second chunk continuing"),
+            "accumulated text across mid-run SessionStarted must be preserved in single record: {}",
+            text
+        );
+
+        // Verify all records share the same run_id
+        let first_run_id = &records[0].run_id;
+        for r in &records {
+            assert_eq!(
+                &r.run_id, first_run_id,
+                "mid-run SessionStarted must not rotate fallback run ID"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trajectory_capture_in_flight_text_growth_is_bounded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let store = Arc::new(TrajectoryStore::open(dir.path()).unwrap());
+        let engine = SessionsEngine::new(
+            "device".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        engine.set_trajectory_store(store.clone());
+
+        let chat_id = "chat_huge_stream";
+        engine.publish(
+            chat_id,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-model".into(),
+                tools: vec![],
+                cwd: "/root".into(),
+                session_id: "s_huge".into(),
+                assistant_message_id: "m_huge".into(),
+            },
+        );
+
+        // Publish 50 chunks of 200 bytes (10,000 bytes > 1024 cap)
+        let chunk = "x".repeat(200);
+        for _ in 0..50 {
+            engine.publish(
+                chat_id,
+                &AgentEvent::TextDelta {
+                    text: chunk.clone(),
+                },
+            );
+        }
+
+        engine.publish(
+            chat_id,
+            &AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "m_huge".into(),
+            },
+        );
+        store.flush().await.unwrap();
+
+        let records = store.list_all_records(chat_id).unwrap();
+        let assistant_rec = records
+            .iter()
+            .find(|r| r.kind == TrajectoryRecordKind::AssistantMessage && !r.is_partial)
+            .expect("must find completed assistant record");
+        let text = assistant_rec
+            .payload
+            .as_ref()
+            .and_then(|p| p.sanitized_text.as_ref())
+            .unwrap();
+        assert!(
+            text.len() <= 1024,
+            "sanitized preview text length must be <= 1024 bytes, got {}",
+            text.len()
         );
     }
 }

@@ -52,6 +52,7 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_library;
 pub mod tool_icons;
+pub mod trajectory;
 pub mod transcript;
 mod turn_steps;
 pub mod typography;

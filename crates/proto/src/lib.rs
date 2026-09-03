@@ -8,12 +8,14 @@ pub mod agent;
 pub mod entities;
 pub mod live_voice;
 pub mod motion;
+pub mod trajectory;
 pub mod view;
 pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
 pub use live_voice::*;
+pub use trajectory::*;
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

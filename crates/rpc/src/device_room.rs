@@ -417,6 +417,31 @@ struct VirtualConn {
     in_tx: mpsc::Sender<String>,
 }
 
+/// Wrapper service applied to peer virtual connections on relay ingress.
+///
+/// Rejects any device-local method ([`crate::methods::is_local_only`]) before
+/// reaching the inner dispatch loop, ensuring remote peers cannot invoke local-only
+/// Trajectory or Live Voice methods over the relay regardless of param shape.
+struct RelayPeerService {
+    inner: Arc<dyn RpcService>,
+}
+
+#[async_trait]
+impl RpcService for RelayPeerService {
+    async fn handle(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<crate::RpcReply, RpcError> {
+        if crate::methods::is_local_only(method) {
+            return Err(RpcError::BadParams(format!(
+                "method '{method}' is local-only and cannot be invoked over relay"
+            )));
+        }
+        self.inner.handle(method, params).await
+    }
+}
+
 fn make_virtual_conn(
     service: Arc<dyn RpcService>,
     conn_id: String,
@@ -424,7 +449,8 @@ fn make_virtual_conn(
 ) -> VirtualConn {
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
     let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<String>(256);
-    tokio::spawn(serve_connection(service, srv_out_tx, in_rx));
+    let relay_service = Arc::new(RelayPeerService { inner: service });
+    tokio::spawn(serve_connection(relay_service, srv_out_tx, in_rx));
     tokio::spawn(async move {
         while let Some(text) = srv_out_rx.recv().await {
             let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(conn_id.clone());
