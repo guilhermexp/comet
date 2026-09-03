@@ -38,6 +38,14 @@ _Avoid_: log, transcript, history
 A leitura local e técnica dos runs de um Chat capturados no device atual, organizada como timeline e ledger de eventos para auditoria. É uma read model própria: não é o Run Journal bruto, não sincroniza entre devices e protege Payload e Result até uma revelação explícita.
 _Avoid_: trace, timeline, log, Run Journal, Chat Transcript
 
+**Degraded Interval**:
+O registro explícito de um intervalo de sequência (`from_seq` a `to_seq`) gravado pelo Trajectory store (em memória e persistido em SQLite) quando há perda, saturação ou falha de escrita na captura de eventos de um run, declarando formalmente que o histórico de trajetória está incompleto e o motivo da degradação. Garante que histórico incompleto se declare incompleto em vez de omitir eventos silenciosamente; não é erro fatal de runtime nem corrupção de banco de dados.
+_Avoid_: gap silencioso, store error, corrupted trace, missing logs
+
+**Raw Reveal**:
+A leitura efêmera, device-local e sob demanda do payload de entrada (`Payload`) ou resultado de execução (`Result`) bruto do Run Journal/Trajectory de um evento específico, acionada explicitamente pelo usuário no Inspector da Trajectory. Nunca é persistido em disco pelo read model, não transita no stream padrão de watch, não sincroniza entre devices e é limpo imediatamente ao trocar a seleção ou fechar a surface.
+_Avoid_: payload dump, raw log, unredacted trace, permanent reveal
+
 **Chat Transcript Export**:
 Uma cópia do Chat Transcript num formato levável para fora do comet. Do transcript nunca carrega nada que o Chat Transcript já não mostre; a única fonte adicional é o índice de CLI Workers do Chat, que entra como Artifact.
 _Avoid_: chat dump, backup, download, export de sessão
@@ -77,3 +85,15 @@ _Avoid_: parent project, container, root project
 **Worked Project**:
 O Leaf Root que contém ao menos um caminho absoluto tocado pelos próprios turnos de assistente de um Chat — leitura, escrita, edição, busca ou comando. É o que o bloco `Projects worked` do card Workspace lista. Deriva só do transcript daquele Chat: nunca de Worker despachado, nunca de subagente, e nunca inclui o Chat Checkout do próprio Chat.
 _Avoid_: touched folder, visited project, worker project
+
+## Workers
+
+**Worker** / **CLI Worker**:
+A unidade autônoma de execução CLI gerenciada localmente pelo runtime Unpeel em processo dedicado (`__session_host__`), com TUI/viewport de terminal, ciclo de vida de atividade, hooks, presets e servidores MCP próprios em worktree ou pasta de projeto. Pode ser despachado por um Chat ou criado de forma independente; não é uma conversa durável de chat, não é um subagent inline acionado dentro de um turno de agente e nunca sincroniza entre devices.
+_Avoid_: Chat, subagent, task worker, background agent, thread
+
+## Voice
+
+**Live Voice**:
+A call de voz interativa mantida pela engine host em segundo plano com um agente/runtime (OMP), projetando contexto operacional contínuo (status, texto visível em janela temporal e labels de tool) e despachando comandos vocais confirmados como comandos duráveis `Steer` no Chat ativo. Pertence à engine host, sobrevivendo à troca de Chat ativo, perda de foco ou minimização da janela. Não pertence à surface selecionada nem a uma aba específica, e não é transcrição assíncrona de áudio.
+_Avoid_: voice input, chat voice, voice note, speech-to-text, microfone do chat

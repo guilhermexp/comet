@@ -409,15 +409,15 @@
       <div class="hero-fact"><strong>Modelo mental:</strong> a interface é um viewport; a engine Rust executa Claude Code ou Codex no dispositivo que possui o projeto; documentos Loro e o edge Cloudflare mantêm tudo sincronizado.</div>
       <div class="meta">
         <span>Método: runtime local + probes RPC + auditoria de fonte</span>
-        <span>Escopo: desktop, engine, TUI, iOS e edge</span>
+        <span>Escopo: desktop, engine, iOS e edge</span>
         <span>Confiança: alta para existência; média para UX não exercitada</span>
       </div>
     </header>
 
     <div class="kpis" aria-label="Resumo">
-      <div class="kpi"><div class="value">16</div><div class="label">Áreas funcionais inventariadas</div></div>
+      <div class="kpi"><div class="value">21</div><div class="label">Áreas funcionais inventariadas</div></div>
       <div class="kpi"><div class="value">3</div><div class="label">Validadas em runtime nesta sessão</div></div>
-      <div class="kpi"><div class="value">13</div><div class="label">Confirmadas por fonte, sem fluxo completo</div></div>
+      <div class="kpi"><div class="value">18</div><div class="label">Confirmadas por fonte, sem fluxo completo</div></div>
       <div class="kpi"><div class="value">0</div><div class="label">Bloqueios P0 encontrados</div></div>
     </div>
 
@@ -435,7 +435,7 @@
           </div>
           <div class="field">
             <div class="field-label">Valor central</div>
-            <div class="field-value">Separar o trabalho do agente da interface: a engine continua rodando; desktop, TUI e iPhone apenas conectam, enviam comandos e exibem o mesmo estado.</div>
+            <div class="field-value">Separar o trabalho do agente da interface: a engine continua rodando; desktop e iPhone apenas conectam, enviam comandos e exibem o mesmo estado.</div>
           </div>
         </div>
         <div class="identity-card secondary">
@@ -455,9 +455,8 @@
             <div class="field-label">Superfícies</div>
             <div class="tags">
               <span class="tag">Desktop gpui</span>
-              <span class="tag">TUI ratatui</span>
+              <span class="tag">CLI / headless / daemon</span>
               <span class="tag">iOS SwiftUI</span>
-              <span class="tag">CLI / daemon</span>
               <span class="tag">Cloudflare edge</span>
             </div>
           </div>
@@ -494,7 +493,7 @@ flowchart TD
   I -->|Responder| G
   I -->|Parar| J["Interromper execução"]
   I -->|Concluir| K["Revisar diff ou abrir terminal"]
-  K --> L["Estado disponível no desktop, TUI e iOS"]
+  K --> L["Estado disponível no desktop e iOS"]
         </script>
       </div>
     </section>
@@ -588,11 +587,46 @@ flowchart TD
           <div class="card-foot">CLI: <code>apps/comet/src/main.rs</code> · <code>daemon.rs</code> · crate <code>update</code></div>
         </article>
         <article class="ve-card wide">
-          <div class="card-kicker">Viewport alternativo</div>
-          <h3>TUI para terminal e SSH</h3>
-          <p>Interface ratatui que usa o mesmo RPC e nunca embute a engine.</p>
-          <ul><li>Anexa a daemon existente ou inicia uma desanexada.</li><li>Fechar TUI não encerra os agentes.</li><li>Sidebar, sessões, transcript e composer no terminal.</li><li>Sem tick ocioso; virtualização e cache por mensagem.</li></ul>
-          <div class="card-foot">TUI: <code>crates/tui</code> · comando <code>comet tui</code></div>
+          <div class="card-kicker">Execução paralela</div>
+          <h3>Workers / subagents locais</h3>
+          <p>Coordenação de múltiplos workers desacoplados com controle de ciclo de vida e notificações estruturadas.</p>
+          <ul><li>Integração via <code>crates/workers-unpeel</code> com bridge de atividades, MCP de controle e rastreamento de links pai-filho.</li><li>UI de gerenciamento em <code>crates/ui/src/workers/</code> com menus de atividade, monitor de recursos e galeria de sessões.</li><li>Detecção de candidatos à hibernação e política de idle para preservação de recursos.</li></ul>
+          <div class="card-foot">Crates: <code>crates/workers-unpeel</code> · UI: <code>crates/ui/src/workers/</code></div>
+        </article>
+        <article class="ve-card">
+          <div class="card-kicker">Voz ao vivo</div>
+          <h3>OMP Live Voice</h3>
+          <p>Streaming bidirecional de áudio e contexto operacional conectado ao harness Oh My Pi.</p>
+          <ul><li>Loop de transcrição, níveis de áudio, controle de mute e transições de fase de voz em tempo real.</li><li>Injeção contínua de contexto da sessão (janela de texto e deltas) para o modelo de voz durante a execução.</li></ul>
+          <div class="card-foot">Engine: <code>crates/engine/src/live_voice.rs</code> · Harness: <code>crates/harness/src/omp/</code></div>
+        </article>
+        <article class="ve-card">
+          <div class="card-kicker">Exportação</div>
+          <h3>Chat Transcript Export</h3>
+          <p>Exportação estruturada do histórico de conversa e artefatos em Markdown e formatos legíveis.</p>
+          <ul><li>Geração de metadata de sessão (id, title, branch, cwd, timestamp) e transcrição de mensagens e ferramentas.</li><li>Separação e categorização de artefatos: file writes, saídas pesadas, subagentes e workers.</li></ul>
+          <div class="card-foot">UI: <code>crates/ui/src/chat_export.rs</code></div>
+        </article>
+        <article class="ve-card">
+          <div class="card-kicker">Projetos</div>
+          <h3>Projects Settings</h3>
+          <p>Gerenciamento durável de repositórios conhecidos e detalhes de configuração no ledger do workspace.</p>
+          <ul><li>Listagem durável de projetos independentemente do working set ativo, com busca e adição.</li><li>Inspeção de estado git (commits âncora, status de repositório) e configuração de worktrees.</li></ul>
+          <div class="card-foot">UI: <code>crates/ui/src/settings/projects.rs</code> · <code>crates/workers-unpeel/src/project_ledger.rs</code></div>
+        </article>
+        <article class="ve-card">
+          <div class="card-kicker">Desenvolvimento</div>
+          <h3>GPUI Dev Inspector</h3>
+          <p>Ferramenta nativa de inspeção de elementos de interface para builds de desenvolvimento.</p>
+          <ul><li>Painel alternável (⌥⌘I) e modo de captura de elementos com exibição de localização de código (arquivo:linha) e instance_id.</li><li>Totalmente isolado sob <code>#[cfg(debug_assertions)]</code>, com zero overhead em builds release.</li></ul>
+          <div class="card-foot">UI: <code>crates/ui/src/inspector.rs</code></div>
+        </article>
+        <article class="ve-card wide">
+          <div class="card-kicker">Assinaturas gerenciadas</div>
+          <h3>Managed Provider Usage (Antigravity e Kimi)</h3>
+          <p>Monitoramento device-local de cotas e janelas de uso de assinaturas de provedores gerenciados.</p>
+          <ul><li>Antigravity: consulta de quota e resumo de uso Google CloudCode com renovação de token segura em memória.</li><li>Kimi Code: leitura restrita de credenciais locais e consulta de uso da API de coding sem expor tokens bearer.</li></ul>
+          <div class="card-foot">Engine: <code>crates/engine/src/antigravity_usage.rs</code> · <code>crates/engine/src/kimi_usage.rs</code></div>
         </article>
         <article class="ve-card wide">
           <div class="card-kicker">Mobile</div>
@@ -636,12 +670,16 @@ flowchart TD
             <tr><td>9</td><td>Changes / diff</td><td>Desktop / engine</td><td><span class="status partial">PARCIAL</span></td><td>Watcher, patch, sidecar e viewer implementados; não exercitados em um checkout mutável.</td></tr>
             <tr><td>10</td><td>Settings</td><td>Desktop</td><td><span class="status partial">PARCIAL</span></td><td>Devices, Accounts, Shortcuts e Archived existem; ações visuais não executadas.</td></tr>
             <tr><td>11</td><td>Daemon e headless</td><td>CLI / engine</td><td><span class="status partial">PARCIAL</span></td><td>Headless do demo está ativo; install/start/restart do serviço real não foi alterado.</td></tr>
-            <tr><td>12</td><td>TUI</td><td>Terminal</td><td><span class="status partial">PARCIAL</span></td><td>Código e smoke scripts existem; não aberta para não assumir controle do terminal atual.</td></tr>
-            <tr><td>13</td><td>iOS</td><td>SwiftUI</td><td><span class="status partial">PARCIAL</span></td><td>Projeto e implementação existem; build bloqueado localmente porque só Command Line Tools está ativo, sem Xcode completo.</td></tr>
-            <tr><td>14</td><td>Sync multi-device</td><td>Engine / edge</td><td><span class="status partial">PARCIAL</span></td><td>CRDT, relay e e2e smoke documentados; execução atual é demo offline de um único host.</td></tr>
-            <tr><td>15</td><td>Auth, edge, R2 e update</td><td>Cloudflare / WorkOS</td><td><span class="status partial">PARCIAL</span></td><td>Rotas e handlers existem; produção e aplicação de update não foram acionadas nesta sessão.</td></tr>
-            <tr><td>16</td><td>Chat Trajectory preview</td><td>Desktop / UI / RPC</td><td><span class="status ok">OK</span></td><td>Modelo puro, timeline, ledger virtualizado, inspector e view com testes unitários por módulo; duas passagens nativas (<code>cargo run -p zeron</code>, perfil real e engine mock) registradas em <code>openspec/changes/archive/2026-09-03-add-chat-trajectory-preview/tasks.md</code>.</td></tr>
-          </tbody>
+            <tr><td>12</td><td>Workers e subagents locais</td><td>Unpeel / UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/workers-unpeel</code> e <code>crates/ui/src/workers/</code>; fluxos de orquestração completos não foram exercitados nesta sessão.</td></tr>
+            <tr><td>13</td><td>OMP Live Voice</td><td>Engine / Harness</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/engine/src/live_voice.rs</code> e <code>crates/harness/src/omp/</code>; streaming de áudio não acionado nesta sessão.</td></tr>
+            <tr><td>14</td><td>Chat Transcript Export</td><td>Desktop UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/ui/src/chat_export.rs</code>; geração e salvamento de arquivo não disparados na auditoria.</td></tr>
+            <tr><td>15</td><td>Projects Settings</td><td>Desktop UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>crates/ui/src/settings/projects.rs</code>; navegação e mutações de ledger não foram executadas.</td></tr>
+            <tr><td>16</td><td>GPUI Dev Inspector</td><td>Desktop UI</td><td><span class="status partial">PARCIAL</span></td><td>Implementado sob <code>#[cfg(debug_assertions)]</code> em <code>crates/ui/src/inspector.rs</code>; atalho ⌥⌘I não enviado via automação.</td></tr>
+            <tr><td>17</td><td>Managed Provider Usage (Antigravity / Kimi)</td><td>Engine</td><td><span class="status partial">PARCIAL</span></td><td>Implementado em <code>antigravity_usage.rs</code> e <code>kimi_usage.rs</code>; consultas externas de quota não foram disparadas.</td></tr>
+            <tr><td>18</td><td>iOS</td><td>SwiftUI</td><td><span class="status partial">PARCIAL</span></td><td>Projeto e implementação existem; build bloqueado localmente porque só Command Line Tools está ativo, sem Xcode completo.</td></tr>
+            <tr><td>19</td><td>Sync multi-device</td><td>Engine / edge</td><td><span class="status partial">PARCIAL</span></td><td>CRDT, relay e e2e smoke documentados; execução atual é demo offline de um único host.</td></tr>
+            <tr><td>20</td><td>Auth, edge, R2 e update</td><td>Cloudflare / WorkOS</td><td><span class="status partial">PARCIAL</span></td><td>Rotas e handlers existem; produção e aplicação de update não foram acionadas nesta sessão.</td></tr>
+            <tr><td>21</td><td>Chat Trajectory preview</td><td>Desktop / UI / RPC</td><td><span class="status ok">OK</span></td><td>Modelo puro, timeline, ledger virtualizado, inspector e view com testes unitários por módulo; duas passagens nativas (<code>cargo run -p zeron</code>, perfil real e engine mock) registradas em <code>openspec/changes/archive/2026-09-03-add-chat-trajectory-preview/tasks.md</code>.</td></tr>
         </table>
       </div></div>
     </section>
@@ -670,7 +708,9 @@ mindmap
       Trajectory preview — OK
     Viewports
       Desktop gpui — PARCIAL
-      TUI ratatui — FONTE
+      Workers e subagents — PARCIAL
+      OMP Live Voice — PARCIAL
+      Export e Inspector — PARCIAL
       iOS SwiftUI — FONTE
     Plataforma
       Sync Loro — FONTE
@@ -690,7 +730,7 @@ mindmap
 flowchart TD
   subgraph V["Viewports"]
     Desktop["Desktop gpui"]
-    TUI["TUI ratatui"]
+    CLI["CLI / daemon"]
     IOS["iOS SwiftUI"]
   end
   subgraph D["Dispositivo host"]
@@ -708,7 +748,7 @@ flowchart TD
     R2[("R2 attachments")]
   end
   Desktop <-->|"RPC local ou memória"| Engine
-  TUI <-->|"RPC localhost"| Engine
+  CLI <-->|"RPC localhost"| Engine
   IOS <-->|"Loro e relay"| Worker
   Engine --> Agents
   Engine --> Git
@@ -751,7 +791,7 @@ flowchart TD
         <div class="opinion-grid">
           <div><h3>O propósito é claro?</h3><p>Sim. O Comet resolve um problema específico: manter agentes rodando fora da vida útil de uma janela e controlá-los de qualquer viewport.</p></div>
           <div><h3>O MVP faz sentido?</h3><p>Sim. Engine persistente, sessão sincronizada, Claude/Codex, conversa, terminal e diff formam um produto coeso.</p></div>
-          <div><h3>O que está sobrando?</h3><p>Nada óbvio no núcleo. Desktop, TUI e iOS são superfícies diferentes sobre o mesmo contrato, não três backends duplicados.</p></div>
+          <div><h3>O que está sobrando?</h3><p>Nada óbvio no núcleo. Desktop, CLI e iOS são superfícies diferentes sobre o mesmo contrato, não três backends duplicados.</p></div>
           <div><h3>O que está faltando?</h3><p>Prova de produção self-hosted, execução iOS nesta máquina e um caminho de dev macOS que funcione sem workaround. Cursor e E2EE são gaps explícitos.</p></div>
           <div><h3>Qualidade geral</h3><p>A arquitetura é deliberada: RPC tipado, CRDT durável, engine separada da UI, controle remoto e políticas de privacidade para tool inputs. O risco maior está na amplitude de superfícies e na validação operacional.</p></div>
           <div><h3>Estado atual</h3><p>O desktop mock está rodando e o núcleo local respondeu. Isso comprova que o binário e o IPC funcionam; não comprova, sozinho, o mesh de produção.</p></div>

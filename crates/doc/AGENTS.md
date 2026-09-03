@@ -37,7 +37,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 | `src/**` (fold, ledger, mirror) | unit | `cargo test -p zeron-doc` |
 | `src/schema.rs` (strict parse, diagnóstico estrutural e salvage de shell incremental) | unit | `cargo test -p zeron-doc schema::tests` |
 | `tests/attachments_roundtrip.rs` | integration | `cargo test -p zeron-doc` |
-| Interop de shape com o edge | integration — pelo `crates/sync/tests/edge_convergence.rs` | `cargo test -p zeron-sync` |
+| Interop de shape com o edge | integration — pelo `crates/sync/tests/registry_edge.rs` | `cargo test -p zeron-sync` |
 
 ## Child DOX Index
 

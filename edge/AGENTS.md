@@ -21,7 +21,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 
 ## Work Guidance
 
-- Convergência com o cliente Rust se prova em `crates/sync/tests/edge_convergence.rs`, não por inspeção.
+- Convergência com o cliente Rust se prova em `crates/sync/tests/registry_edge.rs`, não por inspeção.
 - Config de runtime em `wrangler.jsonc` e `env.ts`; segredo nunca entra no repo.
 
 ## Verification
