@@ -521,25 +521,29 @@ fn dispatch_action(
         }
         "list_presets" => {
             let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
-            // Preference order, not storage order. The star (quick_launch) wins,
-            // then drag order — the same rule the UI applies when it picks a
-            // preset for the user (ui/src/shell/tabs.rs). Carrying it in the
-            // position means the first entry already answers "which preset",
-            // with no extra field or sentence spent saying so.
-            let mut presets = bootstrap
-                .presets
-                .into_iter()
-                .filter(|preset| preset.enabled)
-                .collect::<Vec<_>>();
-            presets.sort_by_key(|preset| !preset.quick_launch);
+            // Screen order, exactly as Settings ▸ Presets shows it: that list
+            // IS the fallback order (`fallback_order`, 1-based), and the star
+            // (quick_launch) is a separate `preferred` flag — never a
+            // re-sort, so the emitted position always matches the screen even
+            // when the starred preset is not first. Disabled presets are
+            // filtered out, so `enabled` is not emitted (it would always be
+            // true).
             Ok(json!({
-                "presets": presets.into_iter().map(|preset| json!({
-                    "id": preset.id,
-                    "label": preset.label,
-                    "command": preset.command,
-                    "cli_id": preset.cli_id,
-                    "is_default": preset.is_default
-                })).collect::<Vec<_>>()
+                "presets": bootstrap
+                    .presets
+                    .into_iter()
+                    .filter(|preset| preset.enabled)
+                    .enumerate()
+                    .map(|(index, preset)| json!({
+                        "id": preset.id,
+                        "label": preset.label,
+                        "command": preset.command,
+                        "cli_id": preset.cli_id,
+                        "is_default": preset.is_default,
+                        "fallback_order": index + 1,
+                        "preferred": preset.quick_launch
+                    }))
+                    .collect::<Vec<_>>()
             }))
         }
         "launch_worker" => {
@@ -1255,7 +1259,7 @@ fn tool_definition() -> Value {
             "required": ["action"],
             "properties": {
                 "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
-                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter." },
+                "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter. list_presets rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite)." },
                 "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
                 "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Exactly one of preset_id or command." },
                 "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },

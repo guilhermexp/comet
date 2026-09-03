@@ -398,6 +398,63 @@ fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// The emitted order is the Presets screen order (fallback order), not
+/// "starred first": a starred preset that is NOT first must stay in place,
+/// carry `preferred: true`, and a disabled preset must not appear at all.
+#[test]
+fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let home = TempDir::new()?;
+    fs::write(
+        home.path().join("app-state.json"),
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [
+                { "id": "omp", "label": "OMP CLI", "command": "omp", "enabled": true, "quick_launch": false },
+                { "id": "disabled", "label": "pi", "command": "pi", "enabled": false, "quick_launch": true },
+                { "id": "claude", "label": "claude", "command": "claude", "enabled": true, "quick_launch": true },
+                { "id": "codex", "label": "codex", "command": "codex", "enabled": true, "quick_launch": false }
+            ],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))?,
+    )?;
+    let _guard = UnpeelHomeGuard::set(home.path());
+
+    let response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": { "action": "list_presets" }
+        }
+    }))
+    .expect("tools/call responds");
+
+    assert_eq!(response["result"]["isError"], false);
+    let presets = &response["result"]["structuredContent"]["presets"];
+    let rows: Vec<(&str, u64, bool)> = presets
+        .as_array()
+        .expect("presets array")
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().expect("id"),
+                row["fallback_order"].as_u64().expect("fallback_order"),
+                row["preferred"].as_bool().expect("preferred"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("omp", 1, false), ("claude", 2, true), ("codex", 3, false)]
+    );
+    assert!(presets[0].get("enabled").is_none());
+    Ok(())
+}
+
 /// `launch_worker` only accepts a project_id that is already in the list, so a
 /// checkout nobody registered is unlaunchable. Without this action the caller's
 /// only working move was an ancestor project — which is how two workers ended
