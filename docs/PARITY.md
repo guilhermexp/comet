@@ -105,11 +105,11 @@ not built yet).
 - **E2EE** — transport is TLS + WorkOS bearers; end-to-end encryption of doc
   contents not designed.
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
-- **Engine hardening**: single-instance lock, parent-PID watchdog, crash
-  shield, boot warm-open of recent chats.
+- **Engine hardening**: parent-PID watchdog, crash shield, boot warm-open of
+  recent chats.
 
 ## Summary
 
-Table rows above: **43 done · 6 partial**, plus the cross-cutting deferrals
+Table rows above: **49 done · 5 partial** (the `done (changed shape)` row counts as done), plus the cross-cutting deferrals
 (mobile, E2EE, macOS packaging execution, engine hardening) — the last
 overlaps the named gaps in the partial rows.
