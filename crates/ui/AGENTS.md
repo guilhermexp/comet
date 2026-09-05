@@ -141,12 +141,13 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   selecionável, mas comando + motivo entram em `WorkersModel.error`, sobrevivem
   ao refresh seguinte e nenhum Worker é lançado automaticamente nele.
 - **Settings → Accounts renderiza provedores na ordem fixa Claude, Codex, Kimi,
-  Antigravity, Cursor, Grok.** Contas gerenciadas (Kimi Code, Antigravity) chegam da
-  engine `active: true, switchable: false`; a linha não expõe Add account,
-  Switch nem Forget, e a autenticação permanece nos CLIs. Grok detecta o
-  `apiKey` de `user-settings.json` e também não oferece Add (não há
-  `grok login`). O empty state das gerenciadas compartilha a cópia de
-  assinatura não detectada. Cada row tem um toggle de Usage (default ON): id em
+  Antigravity, Cursor, Grok.** Contas gerenciadas (Kimi Code, Antigravity, Grok)
+  chegam da engine `active: true, switchable: false`; a linha não expõe Add
+  account, Switch nem Forget, e a autenticação permanece nos CLIs. Grok é o
+  login `grok login` em `auth.json` (assinatura grok.com), nunca o `apiKey`
+  de `user-settings.json`. Antigravity lista cada credencial do pool
+  (`~/.cli-proxy-api/antigravity-*.json` e Keychain distinto). Cada row tem um
+  toggle de Usage (default ON): id em
   `UiSettings.usage_widget_hidden_account_ids` some do widget; meters na
   página Accounts continuam. O widget deriva uma row por conta visível, na
   mesma ordem, inclusive Cursor e Grok; sem contas visíveis não há placeholder

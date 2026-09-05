@@ -13,9 +13,9 @@
 //!   (`StoredSdkCredentials`) holding the named, expiring user API key its
 //!   browser login mints. Deliberately SEPARATE from `cursor-agent login`'s
 //!   whole-account session tokens, which zeron never reads.
-//! - **Grok** — `$GROK_HOME/user-settings.json` (default `~/.grok`): the
-//!   CLI's `apiKey`. Sibling fields (`defaultModel`, payments) stay on the
-//!   live file; slots store only `{apiKey}`.
+//! - **Grok** — `$GROK_HOME/auth.json` (default `~/.grok`): the grok.com
+//!   CLI login from `grok login`. Not the console.x.ai `apiKey` in
+//!   `user-settings.json`.
 //!
 //! Claude-swap mechanics:
 //!
@@ -108,7 +108,7 @@ pub struct AgentAccountsConfig {
     /// named, expiring API key minted by its browser login. SEPARATE from
     /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
-    /// Grok home (`$GROK_HOME` or `~/.grok`) — holds `user-settings.json`.
+    /// Grok home (`$GROK_HOME` or `~/.grok`) — holds `auth.json` from `grok login`.
     pub grok_home: PathBuf,
 }
 
@@ -143,8 +143,8 @@ impl AgentAccountsConfig {
     fn codex_auth_file(&self) -> PathBuf {
         self.codex_home.join("auth.json")
     }
-    fn grok_user_settings_file(&self) -> PathBuf {
-        self.grok_home.join("user-settings.json")
+    fn grok_auth_file(&self) -> PathBuf {
+        self.grok_home.join("auth.json")
     }
 
     fn root_dir(&self) -> PathBuf {
@@ -417,8 +417,8 @@ impl AgentAccounts {
         };
         let antigravity = async {
             match &self.inner.antigravity_usage {
-                Some(usage) => Some(usage.snapshot(force_usage, Utc::now().timestamp()).await),
-                None => None,
+                Some(usage) => usage.snapshots(force_usage, Utc::now().timestamp()).await,
+                None => Vec::new(),
             }
         };
         let (local_usage, (claude, claude_warning), kimi, antigravity) =
@@ -454,12 +454,8 @@ impl AgentAccounts {
                 });
             }
         }
-        if let Some(detected) = self.detect_grok() {
-            active_keys.insert(HarnessId::Grok, detected.account_key.clone());
-            self.snapshot_detected(HarnessId::Grok, &detected)?;
-        }
 
-        let (claude_accounts, codex_accounts, cursor_accounts, grok_accounts) = tokio::join!(
+        let (claude_accounts, codex_accounts, cursor_accounts) = tokio::join!(
             self.provider_accounts(
                 HarnessId::ClaudeCode,
                 &active_keys,
@@ -476,13 +472,6 @@ impl AgentAccounts {
             ),
             self.provider_accounts(
                 HarnessId::Cursor,
-                &active_keys,
-                &unreadable,
-                &local_usage,
-                force_usage,
-            ),
-            self.provider_accounts(
-                HarnessId::Grok,
                 &active_keys,
                 &unreadable,
                 &local_usage,
@@ -517,32 +506,42 @@ impl AgentAccounts {
                 });
             }
         }
-        if let Some(antigravity) = &antigravity {
+        if let Some(antigravity) = antigravity.first() {
             if let Some(message) = &antigravity.warning {
                 warnings.push(AgentAccountWarning {
                     harness: HarnessId::Antigravity,
                     message: message.clone(),
                 });
             }
-            if antigravity.present {
-                accounts.push(AgentAccount {
-                    id: "antigravity-managed".into(),
-                    harness: HarnessId::Antigravity,
-                    email: antigravity.email.clone(),
-                    plan_label: Some("Managed".into()),
-                    active: true,
-                    usage_windows: antigravity.usage_windows.clone(),
-                    usage_lines: Vec::new(),
-                    display_name: Some("Antigravity".into()),
-                    organization: None,
-                    auth_kind: Some(AgentAuthKind::Oauth),
-                    switchable: false,
-                    saved_at: None,
-                });
+        }
+        for (index, antigravity) in antigravity.into_iter().enumerate() {
+            if !antigravity.present {
+                continue;
             }
+            let id = antigravity
+                .email
+                .as_deref()
+                .map(|email| format!("antigravity-managed-{email}"))
+                .unwrap_or_else(|| format!("antigravity-managed-{index}"));
+            accounts.push(AgentAccount {
+                id,
+                harness: HarnessId::Antigravity,
+                email: antigravity.email.clone(),
+                plan_label: Some("Managed".into()),
+                active: true,
+                usage_windows: antigravity.usage_windows.clone(),
+                usage_lines: Vec::new(),
+                display_name: Some("Antigravity".into()),
+                organization: None,
+                auth_kind: Some(AgentAuthKind::Oauth),
+                switchable: false,
+                saved_at: None,
+            });
         }
         accounts.extend(cursor_accounts);
-        accounts.extend(grok_accounts);
+        if let Some(grok) = self.detect_grok_login() {
+            accounts.push(grok);
+        }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
@@ -630,7 +629,6 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
             HarnessId::Codex => self.activate_codex(&slot)?,
             HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
-            HarnessId::Grok => self.activate_grok(&slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -700,12 +698,6 @@ impl AgentAccounts {
         let json = serde_json::to_string_pretty(&slot.credentials)
             .map_err(|e| EngineError::Other(format!("serialize codex auth: {e}")))?;
         write_file_atomic(&self.inner.config.codex_auth_file(), json.as_bytes(), true)
-    }
-
-    fn activate_grok(&self, slot: &Slot) -> Result<(), EngineError> {
-        let api_key = str_field(&slot.credentials, "apiKey")
-            .ok_or_else(|| EngineError::Other("That saved Grok login has no API key.".into()))?;
-        self.write_grok_api_key(&api_key)
     }
 
     // ── forget ──────────────────────────────────────────────────────────────
@@ -1239,25 +1231,9 @@ impl AgentAccounts {
         read_json(&self.inner.config.cursor_sdk_auth_file).and_then(parse_cursor_auth)
     }
 
-    fn detect_grok(&self) -> Option<Detected> {
-        read_json(&self.inner.config.grok_user_settings_file()).and_then(parse_grok_settings)
-    }
-
-    fn write_grok_api_key(&self, api_key: &str) -> Result<(), EngineError> {
-        let file = self.inner.config.grok_user_settings_file();
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut settings = read_json(&file).unwrap_or_else(|| serde_json::json!({}));
-        match settings.as_object_mut() {
-            Some(object) => {
-                object.insert("apiKey".into(), serde_json::Value::String(api_key.into()));
-            }
-            None => settings = serde_json::json!({ "apiKey": api_key }),
-        }
-        let json = serde_json::to_string_pretty(&settings)
-            .map_err(|e| EngineError::Other(format!("serialize grok settings: {e}")))?;
-        write_file_atomic(&file, json.as_bytes(), true)
+    fn detect_grok_login(&self) -> Option<AgentAccount> {
+        let auth = read_json(&self.inner.config.grok_auth_file())?;
+        parse_grok_login(auth)
     }
 
     /// A live cursor login that runs can actually use: present, parseable,
@@ -2015,27 +1991,40 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
-fn parse_grok_settings(settings: serde_json::Value) -> Option<Detected> {
-    let api_key = str_field(&settings, "apiKey").filter(|key| !key.is_empty())?;
-    let digest = Sha256::digest(api_key.as_bytes());
-    let tail: String = api_key
-        .chars()
-        .skip(api_key.len().saturating_sub(4))
-        .collect();
-    Some(Detected {
-        account_key: format!("api-key:{}", &crate::repos::hex(&digest)[..12]),
-        profile: SlotProfile {
-            email: format!("API key ·…{tail}"),
-            display_name: Some("Grok".into()),
+fn parse_grok_login(auth: serde_json::Value) -> Option<AgentAccount> {
+    let entries = auth.as_object()?;
+    for entry in entries.values() {
+        let Some(email) = str_field(entry, "email") else {
+            continue;
+        };
+        let Some(key) = str_field(entry, "key").filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        let _ = key;
+        let first = str_field(entry, "first_name").unwrap_or_default();
+        let last = str_field(entry, "last_name").unwrap_or_default();
+        let display_name = format!("{first} {last}").trim().to_string();
+        return Some(AgentAccount {
+            id: "grok-cli-managed".into(),
+            harness: HarnessId::Grok,
+            email: Some(email),
+            plan_label: Some("Managed".into()),
+            active: true,
+            usage_windows: Vec::new(),
+            usage_lines: Vec::new(),
+            display_name: Some(if display_name.is_empty() {
+                "Grok".into()
+            } else {
+                display_name
+            }),
             organization: None,
-            plan: Some("API key".into()),
-            auth_kind: AgentAuthKind::ApiKey,
-        },
-        credentials: Some(serde_json::json!({ "apiKey": api_key })),
-        claude_config: None,
-    })
+            auth_kind: Some(AgentAuthKind::Oauth),
+            switchable: false,
+            saved_at: None,
+        });
+    }
+    None
 }
-
 /// Present, parseable, and unexpired — what a run can actually use.
 fn cursor_key_usable(auth: &serde_json::Value) -> bool {
     str_field(auth, "apiKey").is_some()
@@ -2374,6 +2363,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn antigravity_pool_lists_every_directory_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+        };
+        let cred_dir = root.path().join("cli-proxy");
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        for (email, token) in [
+            ("one@gmail.com", "ya29.one-private"),
+            ("two@gmail.com", "ya29.two-private"),
+        ] {
+            std::fs::write(
+                cred_dir.join(format!("antigravity-{email}.json")),
+                format!(
+                    r#"{{"access_token":"{token}","refresh_token":"1//{email}-rt","expired":"2099-01-01T00:00:00Z","disabled":false}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let antigravity = crate::antigravity_usage::AntigravityUsage::new(
+            cred_dir,
+            "http://127.0.0.1:1/v1internal:retrieveUserQuotaSummary".into(),
+            "http://127.0.0.1:1/token".into(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let snapshot = AgentAccounts::new_with_antigravity_usage(config, antigravity)
+            .list(false)
+            .await
+            .unwrap();
+        let emails: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.harness == HarnessId::Antigravity)
+            .map(|account| account.email.clone())
+            .collect();
+        assert_eq!(
+            emails,
+            [Some("one@gmail.com".into()), Some("two@gmail.com".into())]
+        );
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("ya29.one-private"));
+        assert!(!wire.contains("ya29.two-private"));
+    }
+
+    #[tokio::test]
     async fn kimi_windows_survive_forced_then_non_forced_account_lists() {
         use std::os::unix::fs::PermissionsExt as _;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2635,7 +2676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grok_api_key_is_a_switchable_device_local_account() {
+    async fn grok_cli_login_is_a_managed_subscription_not_an_api_key() {
         let root = tempfile::tempdir().unwrap();
         let config = AgentAccountsConfig {
             data_dir: root.path().join("data"),
@@ -2646,61 +2687,45 @@ mod tests {
             grok_home: root.path().join("grok"),
         };
         std::fs::create_dir_all(&config.grok_home).unwrap();
-        let settings_file = config.grok_home.join("user-settings.json");
         std::fs::write(
-            &settings_file,
+            config.grok_home.join("user-settings.json"),
+            serde_json::json!({ "apiKey": "xai-must-not-surface" }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            config.grok_home.join("auth.json"),
             serde_json::json!({
-                "apiKey": "xai-test-key-aaaa",
-                "defaultModel": "grok-4.3",
+                "https://auth.x.ai::client": {
+                    "auth_mode": "oidc",
+                    "email": "grok-user@example.com",
+                    "first_name": "Grok",
+                    "last_name": "User",
+                    "key": "session-token-private",
+                    "refresh_token": "refresh-token-private",
+                }
             })
             .to_string(),
         )
         .unwrap();
 
-        let accounts = AgentAccounts::new(config.clone());
-        let snapshot = accounts.list(false).await.unwrap();
+        let snapshot = AgentAccounts::new(config.clone())
+            .list(false)
+            .await
+            .unwrap();
         let grok = snapshot
             .accounts
             .iter()
             .find(|account| account.harness == HarnessId::Grok)
             .expect("grok account");
         assert!(grok.active);
-        assert!(grok.switchable);
-        assert_eq!(grok.auth_kind, Some(AgentAuthKind::ApiKey));
-        assert_eq!(grok.display_name.as_deref(), Some("Grok"));
-        assert_eq!(grok.email.as_deref(), Some("API key ·…aaaa"));
-        let first_id = grok.id.clone();
+        assert!(!grok.switchable);
+        assert_eq!(grok.auth_kind, Some(AgentAuthKind::Oauth));
+        assert_eq!(grok.plan_label.as_deref(), Some("Managed"));
+        assert_eq!(grok.email.as_deref(), Some("grok-user@example.com"));
+        assert_eq!(grok.id, "grok-cli-managed");
         let wire = serde_json::to_string(&snapshot).unwrap();
-        assert!(
-            !wire.contains("xai-test-key-aaaa"),
-            "raw grok key must not cross the snapshot"
-        );
-
-        std::fs::write(
-            &settings_file,
-            serde_json::json!({
-                "apiKey": "xai-test-key-bbbb",
-                "defaultModel": "grok-4.3",
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let snapshot = accounts.list(false).await.unwrap();
-        let grok_accounts: Vec<_> = snapshot
-            .accounts
-            .iter()
-            .filter(|account| account.harness == HarnessId::Grok)
-            .collect();
-        assert_eq!(grok_accounts.len(), 2);
-
-        accounts
-            .activate(HarnessId::Grok, &first_id)
-            .await
-            .expect("activate first grok key");
-        let live: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings_file).unwrap()).unwrap();
-        assert_eq!(live["apiKey"], "xai-test-key-aaaa");
-        assert_eq!(live["defaultModel"], "grok-4.3");
+        assert!(!wire.contains("session-token-private"));
+        assert!(!wire.contains("xai-must-not-surface"));
 
         let empty = AgentAccountsConfig {
             data_dir: root.path().join("empty-data"),

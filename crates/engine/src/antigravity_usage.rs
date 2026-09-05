@@ -349,6 +349,86 @@ impl AntigravityUsage {
         }
     }
 
+    /// Every usable Antigravity login on this device, each with its own quota.
+    /// CLIProxyAPI routes across the pool — Accounts must not collapse it to one row.
+    pub(crate) async fn snapshots(&self, force: bool, now: i64) -> Vec<AntigravityUsageSnapshot> {
+        let creds = self.discover_pool(now).await;
+        let mut out = Vec::with_capacity(creds.len());
+        for cred in creds {
+            out.push(self.snapshot_pool_member(cred, force, now).await);
+        }
+        out
+    }
+
+    async fn discover_pool(&self, now: i64) -> Vec<AntigravityCredential> {
+        let dir_creds = read_directory_credentials(&self.credential_dir).unwrap_or_default();
+        #[cfg(target_os = "macos")]
+        let keychain_cred = if self.include_keychain {
+            keychain::read_credentials()
+                .await
+                .and_then(|val| credential_from_keychain_json(&val))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let keychain_cred = None;
+        let _ = now;
+        pool_credentials(dir_creds, keychain_cred)
+    }
+
+    async fn snapshot_pool_member(
+        &self,
+        mut cred: AntigravityCredential,
+        force: bool,
+        now: i64,
+    ) -> AntigravityUsageSnapshot {
+        if cred.needs_refresh(now) {
+            let Some(oauth_client) = self.oauth_client.as_ref() else {
+                return AntigravityUsageSnapshot {
+                    present: true,
+                    usage_windows: Vec::new(),
+                    warning: None,
+                    email: cred.email.clone(),
+                };
+            };
+            match refresh_token(
+                &self.http,
+                &self.token_url,
+                oauth_client,
+                &cred.refresh_token,
+                now,
+            )
+            .await
+            {
+                Ok((access_token, expires_at, email)) => {
+                    cred.access_token = access_token;
+                    cred.expires_at = expires_at;
+                    cred.email = cred.email.clone().or(email);
+                }
+                Err(error) => {
+                    return AntigravityUsageSnapshot::unavailable(true, error, cred.email.clone());
+                }
+            }
+        }
+        if !force && cred.access_token.is_empty() {
+            return AntigravityUsageSnapshot {
+                present: true,
+                usage_windows: Vec::new(),
+                warning: None,
+                email: cred.email.clone(),
+            };
+        }
+        match fetch_quota(&self.http, &self.usage_url, &cred.access_token).await {
+            Ok(windows) => AntigravityUsageSnapshot {
+                present: true,
+                usage_windows: windows,
+                warning: None,
+                email: cred.email.clone(),
+            },
+            Err(error) => AntigravityUsageSnapshot::unavailable(true, error, cred.email.clone()),
+        }
+    }
+
     fn expire_rejected_access_token(&self, rejected: &AntigravityCredential) {
         let mut active = lock(&self.active_credential);
         if let Some(current) = active.as_mut()
@@ -538,6 +618,26 @@ pub(crate) fn select_best_credential(
                 .cloned()
                 .or_else(|| keychain_cred.cloned())
         })
+}
+
+/// Directory credentials first (sorted by email), then the Keychain login when
+/// it names a different account — or any account, if the blob has no email.
+pub(crate) fn pool_credentials(
+    mut dir_creds: Vec<AntigravityCredential>,
+    keychain_cred: Option<AntigravityCredential>,
+) -> Vec<AntigravityCredential> {
+    dir_creds.sort_by(|left, right| left.email.cmp(&right.email));
+    if let Some(keychain) = keychain_cred {
+        let duplicate = keychain.email.as_ref().is_some_and(|email| {
+            dir_creds
+                .iter()
+                .any(|cred| cred.email.as_deref() == Some(email.as_str()))
+        });
+        if !duplicate {
+            dir_creds.push(keychain);
+        }
+    }
+    dir_creds
 }
 
 /// Renews the access token in memory. Google does NOT return a new refresh
@@ -1066,6 +1166,45 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label, "weekly (Custom Experimental Models)");
         assert!((windows[0].used_fraction - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pool_keeps_every_directory_credential_and_a_distinct_keychain_login() {
+        let one = AntigravityCredential {
+            access_token: "a".into(),
+            refresh_token: "rt-a".into(),
+            expires_at: 1,
+            email: Some("one@gmail.com".into()),
+        };
+        let two = AntigravityCredential {
+            access_token: "b".into(),
+            refresh_token: "rt-b".into(),
+            expires_at: 2,
+            email: Some("two@gmail.com".into()),
+        };
+        let same = AntigravityCredential {
+            access_token: "kc".into(),
+            refresh_token: "rt-kc".into(),
+            expires_at: 9,
+            email: Some("one@gmail.com".into()),
+        };
+        let other = AntigravityCredential {
+            access_token: "kc2".into(),
+            refresh_token: "rt-kc2".into(),
+            expires_at: 9,
+            email: Some("keychain@gmail.com".into()),
+        };
+        let pooled = pool_credentials(vec![two.clone(), one.clone()], Some(same));
+        assert_eq!(
+            pooled.iter().map(|c| c.email.clone()).collect::<Vec<_>>(),
+            [Some("one@gmail.com".into()), Some("two@gmail.com".into())]
+        );
+        let pooled = pool_credentials(vec![one, two], Some(other));
+        assert_eq!(pooled.len(), 3);
+        assert_eq!(
+            pooled.last().and_then(|c| c.email.as_deref()),
+            Some("keychain@gmail.com")
+        );
     }
 
     #[test]

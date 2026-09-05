@@ -1380,8 +1380,7 @@ impl Render for AccountsPage {
                                  Cursor sessions."
                             ),
                             HarnessId::Grok => format!(
-                                "No {name} API key detected on this device — grok reads it \
-                                 from user-settings.json."
+                                "No {name} subscription detected on this device — run grok login."
                             ),
                             _ => format!(
                                 "No {name} login detected on this device — sign in \
@@ -1487,9 +1486,9 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code, Codex, Cursor, and Grok logins plus managed Kimi Code \
-                         and Antigravity Usage on this device. Zeron keeps switchable \
-                         accounts backed up; authentication for Kimi and Antigravity \
+                        "The Claude Code, Codex, and Cursor logins plus managed Kimi Code, \
+                         Grok, and Antigravity Usage on this device. Zeron keeps switchable \
+                         accounts backed up; authentication for Kimi, Grok, and Antigravity \
                          remains owned by their CLIs.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
