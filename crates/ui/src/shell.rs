@@ -3911,7 +3911,13 @@ impl Shell {
                     cx.notify();
                 });
 
-                let result = zeron_workers_unpeel::run_runtime_update(&cli_id).await;
+                let result = cx
+                    .background_executor()
+                    .spawn({
+                        let cli_id = cli_id.clone();
+                        async move { zeron_workers_unpeel::run_runtime_update_blocking(&cli_id) }
+                    })
+                    .await;
                 if result.status == zeron_workers_unpeel::UpdateOutcomeStatus::Succeeded {
                     succeeded += 1;
                 } else {

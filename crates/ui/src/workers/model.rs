@@ -14,7 +14,7 @@ use zeron_workers_unpeel::{
     WorkersSessionCommand, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
     WorkersWorktreeResult, ack_worker_parent_notification, build_worker_parent_notification_prompt,
     get_all_advisories_blocking, hibernate_confirmed_candidates, hibernation_candidates,
-    pending_worker_parent_notifications, run_runtime_update, worker_parent_links,
+    pending_worker_parent_notifications, run_runtime_update_blocking, worker_parent_links,
 };
 
 use crate::state::AppState;
@@ -728,7 +728,13 @@ impl WorkersModel {
 
         let target_cli = cli_id.clone();
         let task = cx.spawn(async move |this, cx| {
-            let result = run_runtime_update(&target_cli).await;
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let target_cli = target_cli.clone();
+                    async move { run_runtime_update_blocking(&target_cli) }
+                })
+                .await;
             this.update(cx, |model, cx| {
                 model.updating_runtimes.remove(&target_cli);
                 model.runtime_update_tasks.remove(&target_cli);
@@ -772,7 +778,13 @@ impl WorkersModel {
 
         cx.spawn(async move |this, cx| {
             for cli in updatable {
-                let _ = run_runtime_update(&cli).await;
+                let _ = cx
+                    .background_executor()
+                    .spawn({
+                        let cli = cli.clone();
+                        async move { run_runtime_update_blocking(&cli) }
+                    })
+                    .await;
                 let _ = this.update(cx, |model, cx| {
                     model.updating_runtimes.remove(&cli);
                     cx.notify();

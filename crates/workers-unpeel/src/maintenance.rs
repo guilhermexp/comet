@@ -745,11 +745,15 @@ pub async fn get_all_advisories() -> Vec<RuntimeVersionAdvisory> {
 /// Probe CLIs on a private current-thread Tokio runtime. `get_all_advisories`
 /// uses `tokio::process`; polling it on gpui's executor aborts the app.
 pub fn get_all_advisories_blocking() -> Vec<RuntimeVersionAdvisory> {
+    block_on_cli_tokio(get_all_advisories())
+}
+
+fn block_on_cli_tokio<T>(fut: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("cli advisory runtime")
-        .block_on(get_all_advisories())
+        .expect("cli tokio runtime")
+        .block_on(fut)
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +841,10 @@ pub async fn run_runtime_update(cli_id: &str) -> RuntimeUpdateResult {
     }
 
     result
+}
+
+pub fn run_runtime_update_blocking(cli_id: &str) -> RuntimeUpdateResult {
+    block_on_cli_tokio(run_runtime_update(cli_id))
 }
 
 async fn run_runtime_update_inner(def: &RuntimeMaintenanceDefinition) -> RuntimeUpdateResult {
