@@ -3,6 +3,7 @@
 mod activity_bridge;
 mod controller_mcp;
 mod hook_migration;
+pub mod maintenance;
 mod parent_notifications;
 pub mod project_git;
 pub mod project_ledger;
@@ -16,6 +17,10 @@ pub use controller_mcp::{
 };
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;
+pub use maintenance::{
+    RuntimeInstallSource, RuntimeUpdateResult, RuntimeUpdateStatus, RuntimeVersionAdvisory,
+    UpdateOutcomeStatus, get_all_advisories, run_runtime_update,
+};
 pub use parent_notifications::{
     WorkerCompletionEvidence, WorkerParentLink, WorkerParentNotification,
     WorkerParentNotificationKind, ack_worker_parent_notification,

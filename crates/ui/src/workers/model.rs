@@ -6,15 +6,15 @@ use gpui::{Context, Entity, Task};
 use zeron_doc::SessionCommandPayload;
 use zeron_rpc::methods;
 use zeron_workers_unpeel::{
-    LocalWorkersClient, PresetPatch, SessionAction, SessionOrganizationPatch, WorkerParentLink,
-    WorkerParentNotification, WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap,
-    WorkersCreateGroupRequest, WorkersCreateWorktreeRequest, WorkersLaunchRequest,
-    WorkersNotificationSettings, WorkersPreset, WorkersProject, WorkersProjectOrganizationPatch,
-    WorkersResourceSettings, WorkersSession, WorkersSessionCommand, WorkersSessionSort,
-    WorkersSettingsSnapshot, WorkersTranscriptSettings, WorkersWorktreeResult,
-    ack_worker_parent_notification, build_worker_parent_notification_prompt,
-    hibernate_confirmed_candidates, hibernation_candidates, pending_worker_parent_notifications,
-    worker_parent_links,
+    LocalWorkersClient, PresetPatch, RuntimeUpdateStatus, RuntimeVersionAdvisory, SessionAction,
+    SessionOrganizationPatch, WorkerParentLink, WorkerParentNotification,
+    WorkersAppearanceSettings, WorkersArtifact, WorkersBootstrap, WorkersCreateGroupRequest,
+    WorkersCreateWorktreeRequest, WorkersLaunchRequest, WorkersNotificationSettings, WorkersPreset,
+    WorkersProject, WorkersProjectOrganizationPatch, WorkersResourceSettings, WorkersSession,
+    WorkersSessionCommand, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
+    WorkersWorktreeResult, ack_worker_parent_notification, build_worker_parent_notification_prompt,
+    get_all_advisories, hibernate_confirmed_candidates, hibernation_candidates,
+    pending_worker_parent_notifications, run_runtime_update, worker_parent_links,
 };
 
 use crate::state::AppState;
@@ -463,6 +463,12 @@ pub struct WorkersModel {
     parent_notification_in_flight: HashSet<String>,
     parent_notification_failures: HashMap<String, ParentNotificationRetry>,
     _poll_task: Task<()>,
+    pub advisories: Vec<RuntimeVersionAdvisory>,
+    pub advisories_loading: bool,
+    pub updating_runtimes: HashSet<String>,
+    pub update_all_in_progress: bool,
+    advisories_task: Option<Task<()>>,
+    runtime_update_tasks: HashMap<String, Task<()>>,
 }
 
 impl WorkersModel {
@@ -539,6 +545,12 @@ impl WorkersModel {
             parent_notification_in_flight: HashSet::new(),
             parent_notification_failures: HashMap::new(),
             _poll_task: poll_task,
+            advisories: Vec::new(),
+            advisories_loading: false,
+            updating_runtimes: HashSet::new(),
+            update_all_in_progress: false,
+            advisories_task: None,
+            runtime_update_tasks: HashMap::new(),
         };
         model.refresh(cx);
         model
@@ -673,6 +685,105 @@ impl WorkersModel {
             })
             .ok();
         }));
+    }
+
+    pub fn refresh_advisories(&mut self, cx: &mut Context<Self>) {
+        if self.advisories_task.is_some() {
+            return;
+        }
+        self.advisories_loading = true;
+        cx.notify();
+
+        self.advisories_task = Some(cx.spawn(async move |this, cx| {
+            let advisories = get_all_advisories().await;
+            this.update(cx, |model, cx| {
+                model.advisories = advisories;
+                model.advisories_loading = false;
+                model.advisories_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub fn advisory_for_cli(&self, cli_id: &str) -> Option<&RuntimeVersionAdvisory> {
+        self.advisories
+            .iter()
+            .find(|adv| adv.cli_id == cli_id || adv.binary_name == cli_id)
+    }
+
+    pub fn is_runtime_updating(&self, cli_id: &str) -> bool {
+        self.updating_runtimes.contains(cli_id)
+    }
+
+    pub fn update_runtime(&mut self, cli_id: String, cx: &mut Context<Self>) {
+        if self.updating_runtimes.contains(&cli_id) {
+            return;
+        }
+        self.updating_runtimes.insert(cli_id.clone());
+        cx.notify();
+
+        let target_cli = cli_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = run_runtime_update(&target_cli).await;
+            this.update(cx, |model, cx| {
+                model.updating_runtimes.remove(&target_cli);
+                model.runtime_update_tasks.remove(&target_cli);
+                if let Some(adv) = result.advisory {
+                    if let Some(pos) = model.advisories.iter().position(|a| a.cli_id == adv.cli_id)
+                    {
+                        model.advisories[pos] = adv;
+                    } else {
+                        model.advisories.push(adv);
+                    }
+                }
+                model.refresh_settings(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+
+        self.runtime_update_tasks.insert(cli_id, task);
+    }
+
+    pub fn update_all_runtimes(&mut self, cx: &mut Context<Self>) {
+        if self.update_all_in_progress {
+            return;
+        }
+        let updatable: Vec<String> = self
+            .advisories
+            .iter()
+            .filter(|adv| adv.can_update && adv.status == RuntimeUpdateStatus::BehindLatest)
+            .map(|adv| adv.cli_id.clone())
+            .collect();
+
+        if updatable.is_empty() {
+            return;
+        }
+
+        self.update_all_in_progress = true;
+        for cli in &updatable {
+            self.updating_runtimes.insert(cli.clone());
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            for cli in updatable {
+                let _ = run_runtime_update(&cli).await;
+                let _ = this.update(cx, |model, cx| {
+                    model.updating_runtimes.remove(&cli);
+                    cx.notify();
+                });
+            }
+            this.update(cx, |model, cx| {
+                model.update_all_in_progress = false;
+                model.refresh_advisories(cx);
+                model.refresh_settings(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn selected_session(&self) -> Option<&WorkersSession> {
