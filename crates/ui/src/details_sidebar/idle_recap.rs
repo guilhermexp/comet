@@ -3,8 +3,8 @@
 //! Evaluates when an active chat is genuinely idle, determines the timer delay,
 //! enforces epoch-based staleness invalidation, and prunes persisted recap entries.
 
-use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// Minimum seconds of idle before generating a recap.
 pub const IDLE_RECAP_MIN_SECONDS: u64 = 60;
@@ -234,7 +234,10 @@ mod tests {
             entry: Some(&entry),
             delay_seconds: 240,
         };
-        assert_eq!(evaluate_idle_recap(&state_streaming), IdleRecapAction::Clear);
+        assert_eq!(
+            evaluate_idle_recap(&state_streaming),
+            IdleRecapAction::Clear
+        );
 
         let state_draft = IdleRecapState {
             is_streaming: false,
@@ -268,22 +271,25 @@ mod tests {
         // Valid recent entry
         map.insert("chat-1".to_string(), sample_entry(2, 3600 * 1000, now));
         // Expired entry (25h old)
-        map.insert(
-            "chat-2".to_string(),
-            sample_entry(2, 25 * 3600 * 1000, now),
-        );
+        map.insert("chat-2".to_string(), sample_entry(2, 25 * 3600 * 1000, now));
         // Future timestamp entry
-        map.insert("chat-3".to_string(), IdleRecapEntry {
-            text: "Future".to_string(),
-            epoch: 1,
-            generated_at: now + 5000,
-        });
+        map.insert(
+            "chat-3".to_string(),
+            IdleRecapEntry {
+                text: "Future".to_string(),
+                epoch: 1,
+                generated_at: now + 5000,
+            },
+        );
         // Empty text
-        map.insert("chat-4".to_string(), IdleRecapEntry {
-            text: "   ".to_string(),
-            epoch: 1,
-            generated_at: now - 1000,
-        });
+        map.insert(
+            "chat-4".to_string(),
+            IdleRecapEntry {
+                text: "   ".to_string(),
+                epoch: 1,
+                generated_at: now - 1000,
+            },
+        );
 
         prune_idle_recaps(&mut map, now);
         assert_eq!(map.len(), 1);

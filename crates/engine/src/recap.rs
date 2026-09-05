@@ -4,18 +4,18 @@
 //! from its stored transcript tail without touching the chat's live session,
 //! adding turns, or consuming conversation context.
 
+use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::StreamExt;
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 
+use crate::EngineError;
+use crate::registry::HarnessRegistry;
 use zeron_harness::{CancellationToken, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     UserInputAnswer, UserInputQuestion,
 };
-use crate::EngineError;
-use crate::registry::HarnessRegistry;
 
 /// Max characters of transcript fed to the model.
 pub const RECAP_TRANSCRIPT_MAX_CHARS: usize = 6000;
@@ -188,15 +188,29 @@ pub fn validate_recap(raw: Option<&str>) -> Option<String> {
         let lower = cleaned.to_lowercase();
         let mut stripped_prefix = false;
         for prefix in &[
-            "sure:", "sure,", "sure -",
-            "okay:", "okay,", "okay -",
-            "ok:", "ok,", "ok -",
-            "recap:", "recap,", "recap -",
-            "summary:", "summary,", "summary -",
-            "here's the recap:", "here is the recap:",
-            "here's a recap:", "here is a recap:",
-            "here's a summary:", "here is a summary:",
-            "here's what's happening:", "here is what's happening:",
+            "sure:",
+            "sure,",
+            "sure -",
+            "okay:",
+            "okay,",
+            "okay -",
+            "ok:",
+            "ok,",
+            "ok -",
+            "recap:",
+            "recap,",
+            "recap -",
+            "summary:",
+            "summary,",
+            "summary -",
+            "here's the recap:",
+            "here is the recap:",
+            "here's a recap:",
+            "here is a recap:",
+            "here's a summary:",
+            "here is a summary:",
+            "here's what's happening:",
+            "here is what's happening:",
         ] {
             if lower.starts_with(prefix) {
                 cleaned = cleaned[prefix.len()..].trim().to_string();

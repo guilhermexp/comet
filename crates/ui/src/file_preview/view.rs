@@ -614,8 +614,7 @@ fn render_code(
     let mono_font = mono.clone();
     let line_count = code_lines.len();
 
-    let scroll_id =
-        SharedString::from(format!("file-preview-code-scroll:{context_key}:{path}"));
+    let scroll_id = SharedString::from(format!("file-preview-code-scroll:{context_key}:{path}"));
     let code = div()
         .id(SharedString::from(format!(
             "file-preview-code-wrapper:{context_key}:{path}"

@@ -2086,8 +2086,9 @@ impl DetailsSidebar {
                 workspace_body = workspace_body.child(worked_section);
             }
             if let Some(entry) = self.sidebar.idle_recap_for(&context.key) {
-                let generated_at = chrono::DateTime::from_timestamp_millis(entry.generated_at as i64)
-                    .unwrap_or_else(chrono::Utc::now);
+                let generated_at =
+                    chrono::DateTime::from_timestamp_millis(entry.generated_at as i64)
+                        .unwrap_or_else(chrono::Utc::now);
                 let local_now = chrono::Local::now();
                 let entry_local = generated_at.with_timezone(&chrono::Local);
                 let clock_text = if entry_local.date_naive() == local_now.date_naive() {
@@ -2116,12 +2117,12 @@ impl DetailsSidebar {
                             .child(format!("※ recap: {}", entry.text)),
                     )
                     .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(10.0))
-                        .text_color(theme.text_muted.opacity(0.50))
-                        .child(clock_text),
-                );
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.50))
+                            .child(clock_text),
+                    );
                 workspace_body = workspace_body.child(recap_row);
             }
         }
