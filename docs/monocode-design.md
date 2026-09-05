@@ -1,6 +1,6 @@
 # Especificação de Design e Port do Tema MonoCode para o Comet
 
-Referência canônica de design e especificação de port para a criação da família de temas built-in `MonoCode` no subsistema `zeron-theme` do Comet (`crates/theme/src/lib.rs:402-444`, `crates/theme/src/builtins.rs:74-213`). Este documento traduz a arquitetura visual paramétrica do MonoCode em valores literais estáticos exigidos pelo modelo de temas do Comet, detalhando sementes, derivações, conformidade WCAG 2.1 e fronteiras arquiteturais.
+Referência canônica de design e especificação de port para a criação da família de temas built-in `MonoCode` no subsistema `zeron-theme` do Comet (`crates/theme/src/lib.rs:488-502`, `crates/theme/src/builtins.rs:74-213`). Este documento traduz a arquitetura visual paramétrica do MonoCode em valores literais estáticos exigidos pelo modelo de temas do Comet, detalhando sementes, derivações, conformidade WCAG 2.1 e fronteiras arquiteturais.
 
 ---
 
@@ -405,7 +405,7 @@ O enum `SurfaceTreatment` do Comet (`crates/theme/src/lib.rs:59-65`) é estritam
 - Raio de desfoque configurável (o parâmetro `1` a `64px` do MonoCode é omitido).
 - Desfoque em nível de componente individual (CSS `backdrop-blur`).
 
-No runtime do Comet, `Frosted` ativa translucidez de janela exclusivamente no macOS (`Theme::GLASS_ALPHA = 0.80`, `crates/ui/src/theme.rs:686`), enquanto Linux e Windows operam em modo opaco por limitações dos compositores de desktop (`crates/ui/src/theme.rs:794-797`).
+No runtime do Comet, a elegibilidade ao tratamento frost abrange tanto macOS quanto Linux (`is_frost()`, `crates/ui/src/theme.rs:794-797`), ficando o Windows de fora; o alpha de vidro translúcido reduzido é exclusivo do macOS (`Theme::GLASS_ALPHA = 0.80`, `crates/ui/src/theme.rs:686`), enquanto as demais plataformas operam com alpha 1.0.
 
 ---
 
@@ -426,7 +426,7 @@ Esta seção lista os aspectos da identidade visual do MonoCode que dependem de 
 
 ## 12. Apêndice: fora do tema
 
-O escopo do modelo de temas do Comet (`crates/theme/src/lib.rs:446-475`) abrange unicamente a paleta de cores (`ThemeColors`), o acento (`AccentRoles`), a recomendação de superfície (`SurfaceTreatment`) e as famílias de fonte tipográficas (`ThemeFonts`). 
+O escopo do modelo de temas do Comet (`crates/theme/src/lib.rs:488-502`) abrange unicamente a identidade da variante (`id`, `family_id`, `name`, `appearance`), a recomendação de superfície (`recommended_surface_treatment`), a paleta de cores (`ThemeColors`), o acento (`AccentRoles`), os tokens de sintaxe (`syntax`), a paleta de terminal (`TerminalPalette`) e a proveniência (`ThemeSource`). Famílias de fontes tipográficas não integram o modelo de temas.
 
 Os seguintes aspectos do design do MonoCode pertencem à camada de estrutura e renderização de componentes, situando-se fora das capacidades do tema:
 
@@ -435,7 +435,7 @@ Os seguintes aspectos do design do MonoCode pertencem à camada de estrutura e r
 - **Escala tipográfica:**
   O MonoCode adota tamanhos arbitrários Tailwind como `text-[11px]`, `text-[12px]`, `text-[13px]` e entrelinhas finas (`leading-4`, `leading-5.5`). A escala tipográfica do Comet é governada por tokens internos de `crates/ui`.
 - **Famílias de fontes:**
-  O MonoCode define pilhas genéricas do sistema (`--font-sans: system-ui, -apple-system, ...` e `--font-mono: ui-monospace, Menlo, ...`; `src/index.css:16-21`). O Comet utiliza Geist e Geist Mono como padrões canônicos (`crates/theme/src/lib.rs:260-315`), permitindo apenas apontar nomes de famílias locais.
+  O MonoCode define pilhas genéricas do sistema (`--font-sans: system-ui, -apple-system, ...` e `--font-mono: ui-monospace, Menlo, ...`; `src/index.css:16-21`). No Comet, a tipografia é de responsabilidade da camada de UI, que utiliza Geist e Geist Mono como padrões canônicos (`crates/ui/src/theme.rs:946-947`), situando-se completamente fora do modelo de temas de `crates/theme`.
 - **Iconografia:**
   O MonoCode emprega ícones da biblioteca `@hugeicons/react` (`package.json:35`). O Comet utiliza vetores SVG embutidos em código e desenhados nativamente pelo GPUI (`crates/ui/src/icons.rs`).
 - **Motion e micro-interações:**
