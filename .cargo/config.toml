@@ -1,2 +1,3 @@
-[env]
-OMP_EXECUTABLE = { value = "scripts/omp-dev", relative = true }
+# Normal cargo run uses the installed OMP, resolved by the harness.
+# Opt into the sibling development checkout explicitly when needed:
+# OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run

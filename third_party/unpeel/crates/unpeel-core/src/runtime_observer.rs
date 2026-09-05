@@ -789,7 +789,20 @@ mod platform {
     }
 
     fn process_argv(pid: u32) -> Option<Vec<String>> {
-        let buffer = kern_procargs2(pid)?;
+        parse_procargs2(&kern_procargs2(pid)?)
+    }
+
+    /// Decodes a `KERN_PROCARGS2` buffer into argv.
+    ///
+    /// Layout: `argc`, the exec path, NUL padding, then `argc` NUL-terminated
+    /// arguments. A runtime that rewrites its own process title truncates that
+    /// region: libuv's `uv_set_process_title`, which backs `process.title = …`
+    /// in Node, writes the new title over `argv[0]` and zero-fills the rest,
+    /// while `argc` still reflects the original `execve`. Stop at the first
+    /// empty slot and keep the prefix that survived, because discarding the
+    /// whole array would also discard the rewritten `argv[0]` that identifies
+    /// the runtime.
+    fn parse_procargs2(buffer: &[u8]) -> Option<Vec<String>> {
         if buffer.len() < 4 {
             return None;
         }
@@ -807,15 +820,22 @@ mod platform {
 
         let mut argv = Vec::with_capacity(argc as usize);
         for _ in 0..argc {
-            let suffix = rest.get(cursor..)?;
-            let end = suffix.iter().position(|byte| *byte == 0)?;
+            let Some(suffix) = rest.get(cursor..) else {
+                break;
+            };
+            let Some(end) = suffix.iter().position(|byte| *byte == 0) else {
+                break;
+            };
             if end == 0 {
-                return None;
+                break;
             }
             argv.push(String::from_utf8_lossy(&suffix[..end]).into_owned());
-            cursor = cursor.checked_add(end + 1)?;
+            let Some(next) = cursor.checked_add(end + 1) else {
+                break;
+            };
+            cursor = next;
         }
-        Some(argv)
+        (!argv.is_empty()).then_some(argv)
     }
 
     fn kern_procargs2(pid: u32) -> Option<Vec<u8>> {
@@ -852,6 +872,79 @@ mod platform {
         }
         buffer.truncate(size);
         Some(buffer)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Builds a `KERN_PROCARGS2` buffer: `argc`, exec path, NUL padding,
+        /// then the argv region padded out to `region_len` with NUL bytes.
+        fn procargs2(argc: i32, exec_path: &str, argv: &[&str], region_len: usize) -> Vec<u8> {
+            let mut buffer = argc.to_ne_bytes().to_vec();
+            buffer.extend_from_slice(exec_path.as_bytes());
+            buffer.extend_from_slice(&[0, 0, 0]);
+            let mut region = Vec::new();
+            for argument in argv {
+                region.extend_from_slice(argument.as_bytes());
+                region.push(0);
+            }
+            region.resize(region_len.max(region.len()), 0);
+            buffer.extend_from_slice(&region);
+            buffer
+        }
+
+        #[test]
+        fn parses_a_full_argv_array() {
+            let buffer = procargs2(3, "/usr/bin/node", &["node", "/opt/app/cli.js", "."], 0);
+            assert_eq!(
+                parse_procargs2(&buffer).as_deref(),
+                Some(
+                    [
+                        "node".to_owned(),
+                        "/opt/app/cli.js".to_owned(),
+                        ".".to_owned()
+                    ]
+                    .as_slice()
+                )
+            );
+        }
+
+        #[test]
+        fn keeps_the_rewritten_title_when_the_runtime_zero_fills_argv() {
+            // `pi` is installed as a Node CLI and sets `process.title = "pi"`,
+            // so libuv overwrites argv[0] and zero-fills the remainder while
+            // argc still reports the original seven arguments. The surviving
+            // argv[0] is the only thing that identifies the runtime.
+            let buffer = procargs2(7, "/usr/bin/node", &["pi"], 96);
+            assert_eq!(
+                parse_procargs2(&buffer).as_deref(),
+                Some(["pi".to_owned()].as_slice())
+            );
+        }
+
+        #[test]
+        fn rejects_a_buffer_with_no_readable_arguments() {
+            assert_eq!(
+                parse_procargs2(&procargs2(4, "/usr/bin/node", &[], 64)),
+                None
+            );
+            assert_eq!(parse_procargs2(&2i32.to_ne_bytes()), None);
+            assert_eq!(
+                parse_procargs2(&procargs2(0, "/usr/bin/node", &["node"], 0)),
+                None
+            );
+        }
+
+        #[test]
+        fn a_zero_filled_argv_still_resolves_the_pi_runtime() {
+            let argv = parse_procargs2(&procargs2(7, "/usr/bin/node", &["pi"], 96))
+                .expect("argv prefix survives the title rewrite");
+            assert_eq!(
+                super::super::runtime_id_for_executable(&argv[0]),
+                Some("pi")
+            );
+        }
     }
 }
 

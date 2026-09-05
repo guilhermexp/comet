@@ -2,14 +2,15 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc}
 
 use comet_syntax::HighlightedDocument;
 use gpui::{
-    AnyElement, ClipboardItem, Context, EventEmitter, Image, IntoElement, ObjectFit, Render,
-    SharedString, StyledText, Task, Window, div, font, img, prelude::*, px,
+    AnyElement, ClipboardItem, Context, EventEmitter, Image, InteractiveElement, IntoElement,
+    ListHorizontalSizingBehavior, ObjectFit, Render, SharedString, StyledText, Task,
+    UniformListScrollHandle, Window, div, font, img, prelude::*, px, uniform_list,
 };
 
 use crate::{
     details_sidebar::files_view::material_icon_path,
     file_preview::{
-        loader::{LoadedPreview, PreviewLoadError, load_preview},
+        loader::{LoadedPreview, PreviewLoadError, load_preview_with_typography},
         model::{PreviewDisplayMode, PreviewTabs},
     },
     icons,
@@ -55,6 +56,7 @@ pub struct FilePreview {
     generation: u64,
     display_mode: PreviewDisplayMode,
     load_task: Option<Task<()>>,
+    scroll_handles: HashMap<(String, String), UniformListScrollHandle>,
     #[cfg(target_os = "macos")]
     native_document: Option<(
         PathBuf,
@@ -72,6 +74,7 @@ impl FilePreview {
             generation: 0,
             display_mode: PreviewDisplayMode::SidePeek,
             load_task: None,
+            scroll_handles: HashMap::new(),
             #[cfg(target_os = "macos")]
             native_document: None,
         }
@@ -134,11 +137,17 @@ impl FilePreview {
             self.load_active(cx);
         }
     }
-
     pub fn close_path(&mut self, context_key: &str, relative_path: &str, cx: &mut Context<Self>) {
+        let is_active_context = self.active_context.as_deref() == Some(context_key);
+        let was_active_tab =
+            is_active_context && self.tabs.active_path(context_key) == Some(relative_path);
         self.tabs.close(context_key, relative_path);
-        if self.active_context.as_deref() == Some(context_key) {
-            self.load_active(cx);
+        self.scroll_handles
+            .remove(&(context_key.to_string(), relative_path.to_string()));
+        if is_active_context {
+            if was_active_tab {
+                self.load_active(cx);
+            }
             cx.emit(FilePreviewEvent::ActiveChanged {
                 context_key: context_key.to_string(),
                 relative_path: self.tabs.active_path(context_key).map(str::to_owned),
@@ -153,6 +162,7 @@ impl FilePreview {
         let paths = self.tabs.paths(&context_key).to_vec();
         for path in paths {
             self.tabs.close(&context_key, &path);
+            self.scroll_handles.remove(&(context_key.clone(), path));
         }
         self.load_active(cx);
         cx.emit(FilePreviewEvent::ActiveChanged {
@@ -181,10 +191,21 @@ impl FilePreview {
             return;
         };
         self.loaded = PreviewLoadState::Loading;
+        let font_mono = Theme::of(cx).font_mono.clone();
+        let font_size = px(12.5);
+        let text_system = cx.text_system().clone();
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { load_preview(&root, std::path::Path::new(&relative_path)) })
+                .spawn(async move {
+                    load_preview_with_typography(
+                        &root,
+                        std::path::Path::new(&relative_path),
+                        font_mono,
+                        font_size,
+                        Some(text_system),
+                    )
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -378,8 +399,25 @@ impl FilePreview {
                     &|_| None,
                 ))
                 .into_any_element(),
-            PreviewLoadState::Ready(LoadedPreview::Code { lines, highlights }) => {
-                render_code(&path, lines, highlights, theme)
+            PreviewLoadState::Ready(LoadedPreview::Code {
+                lines,
+                highlights,
+                widest_line_ix,
+            }) => {
+                let scroll_handle = self
+                    .scroll_handles
+                    .entry((context_key.to_string(), path.clone()))
+                    .or_default()
+                    .clone();
+                render_code(
+                    context_key,
+                    &path,
+                    lines,
+                    highlights,
+                    widest_line_ix,
+                    &scroll_handle,
+                    theme,
+                )
             }
             PreviewLoadState::Ready(LoadedPreview::Html(document)) => {
                 self.render_native_document(window, theme, NativeSource::Html(document.as_ref()))
@@ -518,9 +556,12 @@ fn centered_message(message: impl Into<SharedString>, theme: &Theme) -> AnyEleme
 }
 
 fn render_code(
+    context_key: &str,
     path: &str,
     lines: Arc<[SharedString]>,
     highlights: Option<Arc<HighlightedDocument>>,
+    widest_line_ix: Option<usize>,
+    scroll_handle: &UniformListScrollHandle,
     theme: &Theme,
 ) -> AnyElement {
     let mono = font(theme.font_mono.clone());
@@ -569,52 +610,67 @@ fn render_code(
         );
     let code_lines = lines.clone();
     let code_highlights = highlights;
+    let code_theme = theme.clone();
+    let mono_font = mono.clone();
+    let line_count = code_lines.len();
+
+    let scroll_id =
+        SharedString::from(format!("file-preview-code-scroll:{context_key}:{path}"));
     let code = div()
         .id(SharedString::from(format!(
-            "file-preview-code-scroll:{path}"
+            "file-preview-code-wrapper:{context_key}:{path}"
         )))
         .flex_1()
         .min_w_0()
         .h_full()
-        .overflow_scroll()
         .py(px(10.0))
-        .children((0..code_lines.len()).map(move |index| {
-            let line = code_lines[index].clone();
-            let runs = markdown_render::runs_for_syntax_line_with_plain(
-                line.as_ref(),
-                code_highlights
-                    .as_deref()
-                    .and_then(|document| document.lines.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-                &mono,
-                theme.text.opacity(0.92),
-                theme,
-            );
-            div()
-                .h(px(20.0))
-                .min_w_full()
-                .flex()
-                .items_center()
-                .font_family(theme.font_mono.clone())
-                .text_size(px(12.5))
-                .child(
-                    div()
-                        .w(px(54.0))
-                        .flex_none()
-                        .pr(px(14.0))
-                        .flex()
-                        .justify_end()
-                        .text_color(theme.text_faint)
-                        .child((index + 1).to_string()),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .whitespace_nowrap()
-                        .child(StyledText::new(line).with_runs(runs)),
-                )
-        }));
+        .child(
+            uniform_list(scroll_id, line_count, move |range, _window, _cx| {
+                range
+                    .map(|index| {
+                        let line = code_lines[index].clone();
+                        let runs = markdown_render::runs_for_syntax_line_with_plain(
+                            line.as_ref(),
+                            code_highlights
+                                .as_deref()
+                                .and_then(|document| document.lines.get(index))
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                            &mono_font,
+                            code_theme.text.opacity(0.92),
+                            &code_theme,
+                        );
+                        div()
+                            .h(px(20.0))
+                            .min_w_full()
+                            .flex()
+                            .items_center()
+                            .font_family(code_theme.font_mono.clone())
+                            .text_size(px(12.5))
+                            .child(
+                                div()
+                                    .w(px(64.0))
+                                    .flex_none()
+                                    .pr(px(12.0))
+                                    .flex()
+                                    .justify_end()
+                                    .text_color(code_theme.text_faint)
+                                    .child((index + 1).to_string()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .child(StyledText::new(line).with_runs(runs)),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+            .with_width_from_item(widest_line_ix)
+            .track_scroll(scroll_handle)
+            .size_full(),
+        );
     div()
         .size_full()
         .flex()

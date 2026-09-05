@@ -48,4 +48,5 @@ dispatch2 = "0.3.1"
 block2 = "0.6.2"
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

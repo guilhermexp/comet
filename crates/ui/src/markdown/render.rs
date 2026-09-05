@@ -88,12 +88,16 @@ pub struct RenderOptions {
 /// Um destino de link que o preview interno sabe abrir: caminho local, sem
 /// esquema (`https://`, `mailto:`) e de um tipo que `load_preview` renderiza.
 fn is_previewable_file_link(url: &str) -> bool {
-    !url.contains("://")
-        && !url.starts_with('#')
-        && !url.starts_with("mailto:")
-        && !url.starts_with("tel:")
-        && crate::file_preview::model::classify_preview_kind(url)
-            != crate::file_preview::model::PreviewKind::Unsupported
+    if url.contains("://")
+        || url.starts_with('#')
+        || url.starts_with("mailto:")
+        || url.starts_with("tel:")
+    {
+        return false;
+    }
+    let clean = crate::file_preview::model::strip_line_col(url);
+    crate::file_preview::model::classify_preview_kind(clean)
+        != crate::file_preview::model::PreviewKind::Unsupported
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code

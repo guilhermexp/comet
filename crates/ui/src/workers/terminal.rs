@@ -100,27 +100,64 @@ fn mouse_report_bytes(
     column: usize,
     row: usize,
     modifiers: gpui::Modifiers,
+    protocol: MouseProtocol,
 ) -> Vec<u8> {
-    let base = match kind {
-        MouseReportKind::Down | MouseReportKind::Up => 0,
-        MouseReportKind::Drag => 32,
-        MouseReportKind::Move => 35,
-    };
     let modifier_bits = if modifiers.shift { 4 } else { 0 }
         + if modifiers.alt { 8 } else { 0 }
         + if modifiers.control { 16 } else { 0 };
-    let suffix = if kind == MouseReportKind::Up {
-        'm'
-    } else {
-        'M'
-    };
-    format!(
-        "\x1b[<{};{};{}{suffix}",
-        base + modifier_bits,
-        column.saturating_add(1),
-        row.saturating_add(1)
-    )
-    .into_bytes()
+
+    match protocol {
+        MouseProtocol::Sgr => {
+            let base = match kind {
+                MouseReportKind::Down | MouseReportKind::Up => 0,
+                MouseReportKind::Drag => 32,
+                MouseReportKind::Move => 35,
+            };
+            let suffix = if kind == MouseReportKind::Up {
+                'm'
+            } else {
+                'M'
+            };
+            format!(
+                "\x1b[<{};{};{}{suffix}",
+                base + modifier_bits,
+                column.saturating_add(1),
+                row.saturating_add(1)
+            )
+            .into_bytes()
+        }
+        MouseProtocol::Normal | MouseProtocol::Utf8 => {
+            let base = match kind {
+                MouseReportKind::Down => 0,
+                MouseReportKind::Up => 3,
+                MouseReportKind::Drag => 32,
+                MouseReportKind::Move => 35,
+            };
+            let button = base + modifier_bits;
+            let mut report = vec![0x1b, b'[', b'M', 32 + button as u8];
+            let utf8 = protocol == MouseProtocol::Utf8;
+            let mut push_coord = |coord: usize| {
+                if utf8 {
+                    // In UTF-8 mode (mode 1005), 1-based coordinates up to 2015 can be encoded in 2-byte UTF-8.
+                    let col_1 = coord.saturating_add(1).min(2015);
+                    let encoded = 32 + col_1;
+                    if encoded >= 128 {
+                        report.push((0xC0 + encoded / 64) as u8);
+                        report.push((0x80 + (encoded & 63)) as u8);
+                    } else {
+                        report.push(encoded as u8);
+                    }
+                } else {
+                    // In Normal mode (mode 1000), coordinates saturate at 223 (1-based), so 32 + 223 = 255.
+                    let col_1 = coord.saturating_add(1).min(223);
+                    report.push((32 + col_1) as u8);
+                }
+            };
+            push_coord(column);
+            push_coord(row);
+            report
+        }
+    }
 }
 
 fn scroll_action(
@@ -163,6 +200,15 @@ impl RemoteGridTracker {
         if self.grids.get(session_id) == Some(&(cols, rows)) {
             self.grids.remove(session_id);
         }
+    }
+
+    fn retain_sessions(
+        &mut self,
+        live_ids: &std::collections::HashSet<String>,
+        active_id: Option<&str>,
+    ) {
+        self.grids
+            .retain(|id, _| live_ids.contains(id) || active_id == Some(id.as_str()));
     }
 }
 
@@ -260,6 +306,18 @@ const MAX_RESIZE_RETRIES: u32 = 3;
 /// Parar de re-armar o retry de resize? Ver [`MAX_RESIZE_RETRIES`].
 fn give_up_on_resize(consecutive_failures: u32) -> bool {
     consecutive_failures >= MAX_RESIZE_RETRIES
+}
+
+/// Um Worker que terminou não é falha de transporte.
+///
+/// O host responde `409: session has exited` a QUALQUER request feito contra
+/// uma sessão morta — write, resize, poll — e o banner de disconnect
+/// transformava o encerramento normal de um Worker num erro vermelho no topo
+/// da grade. O rodapé do terminal já diz que a sessão encerrou, então o banner
+/// só repetia o fato em tom de falha. Erro de transporte de verdade (host
+/// fora, socket recusado, payload inválido) continua aparecendo.
+fn is_expected_session_exit(error: &str) -> bool {
+    error.contains("session has exited")
 }
 
 fn is_visible(last_prepaint: Option<Instant>, now: Instant) -> bool {
@@ -474,6 +532,11 @@ impl WorkersTerminalState {
     }
 
     fn apply_refresh(&mut self, output: WorkersOutput, viewport: Option<WorkersViewport>) -> bool {
+        // Clear any previous resize error on successful output/viewport refresh.
+        // If polling succeeds, the worker session is alive and connected; keeping
+        // a stale resize error banner over a functional grid leads to a false
+        // "Worker terminal disconnected" indicator.
+        self.resize_error = None;
         let had_data = !output.data.is_empty();
         let truncated = output.truncated;
         let backlog_end = viewport.as_ref().map(|viewport| viewport.output_offset);
@@ -580,6 +643,12 @@ impl RetainedWorkerTerminals {
             state.emulator.clear_scrollback();
             state.selection_drag = None;
         }
+    }
+
+    fn retain_sessions(&mut self, live_ids: &std::collections::HashSet<String>) {
+        let active_id = self.active_id.clone();
+        self.states
+            .retain(|id, _| live_ids.contains(id) || active_id.as_deref() == Some(id.as_str()));
     }
 }
 
@@ -699,6 +768,7 @@ impl WorkersTerminal {
                                 let was_catching_up = state.historical_replay.is_catching_up();
                                 let had_data = state.apply_refresh(output, viewport);
                                 let catching_up = state.historical_replay.is_catching_up();
+                                state.resize_error = None;
                                 terminal.error = None;
                                 if should_paint(
                                     was_catching_up,
@@ -765,6 +835,11 @@ impl WorkersTerminal {
         if self.session_id == session_id {
             return;
         }
+        // Flush any pending coalesced input to the previous session before switching,
+        // so typing/pasting immediately before a switch is not discarded.
+        self.flush_input(cx);
+        self.flush_task = None;
+
         self.focus_pending = session_id.is_some();
         self.session_id = session_id.clone();
         let (cols, rows) = self
@@ -774,6 +849,13 @@ impl WorkersTerminal {
         let inserted = self.terminals.select(session_id, cols, rows);
         if inserted && let Some(state) = self.terminals.active_mut() {
             state.historical_replay.start();
+        }
+        // Reset resize retry counters upon entering the session, giving it a fresh
+        // chance to synchronize geometry. If the session has exited, `is_expected_session_exit`
+        // will immediately saturate retries on the first failure without looping.
+        if let Some(state) = self.terminals.active_mut() {
+            state.resize_failures = 0;
+            state.resize_retry_blocked = false;
         }
         self.generation = self.generation.wrapping_add(1);
         self.error = None;
@@ -875,12 +957,19 @@ impl WorkersTerminal {
                         }
                     }
                     Err(error) => {
+                        let error_str = error.to_string();
                         tracing::warn!(%error, "workers terminal resize failed");
                         terminal.remote_grids.invalidate(&session_id, cols, rows);
                         if let Some(state) = terminal.terminals.states.get_mut(&session_id) {
-                            state.resize_error = Some(error.to_string());
+                            state.resize_error = Some(error_str.clone());
                             state.resize_retry_blocked = true;
-                            state.resize_failures = state.resize_failures.saturating_add(1);
+                            // An expected session exit is not a transient transport failure:
+                            // do not burn retries in the 500ms timer; give up immediately.
+                            if is_expected_session_exit(&error_str) {
+                                state.resize_failures = MAX_RESIZE_RETRIES;
+                            } else {
+                                state.resize_failures = state.resize_failures.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -916,6 +1005,12 @@ impl WorkersTerminal {
     pub fn shed_scrollback(&mut self, include_active: bool, cx: &mut Context<Self>) {
         self.terminals.shed_scrollback(include_active);
         cx.notify();
+    }
+
+    pub fn retain_sessions(&mut self, live_ids: &std::collections::HashSet<String>) {
+        self.terminals.retain_sessions(live_ids);
+        self.remote_grids
+            .retain_sessions(live_ids, self.session_id.as_deref());
     }
 
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1258,11 +1353,10 @@ impl WorkersTerminal {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
-        let input_modes = self
-            .active_state()
-            .map_or(WorkersViewportInputModes::default(), |state| {
-                state.input_modes
-            });
+        let (input_modes, mouse_protocol) = self.active_state().map_or(
+            (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
+            |state| (state.input_modes, state.mouse_protocol),
+        );
         if input_modes.known && input_modes.mouse_reporting {
             let Some(hit) = self.cell_hit_at(event.position) else {
                 return;
@@ -1271,7 +1365,13 @@ impl WorkersTerminal {
                 state.selection_drag = None;
             }
             self.queue_input(
-                &mouse_report_bytes(MouseReportKind::Down, hit.col, hit.row, event.modifiers),
+                &mouse_report_bytes(
+                    MouseReportKind::Down,
+                    hit.col,
+                    hit.row,
+                    event.modifiers,
+                    mouse_protocol,
+                ),
                 cx,
             );
             return;
@@ -1326,11 +1426,10 @@ impl WorkersTerminal {
             }
             return;
         }
-        let input_modes = self
-            .active_state()
-            .map_or(WorkersViewportInputModes::default(), |state| {
-                state.input_modes
-            });
+        let (input_modes, mouse_protocol) = self.active_state().map_or(
+            (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
+            |state| (state.input_modes, state.mouse_protocol),
+        );
         if input_modes.known && input_modes.mouse_reporting {
             let kind = match event.pressed_button {
                 Some(MouseButton::Left) if input_modes.mouse_button_motion => MouseReportKind::Drag,
@@ -1341,7 +1440,7 @@ impl WorkersTerminal {
                 return;
             };
             self.queue_input(
-                &mouse_report_bytes(kind, hit.col, hit.row, event.modifiers),
+                &mouse_report_bytes(kind, hit.col, hit.row, event.modifiers, mouse_protocol),
                 cx,
             );
             return;
@@ -1381,15 +1480,20 @@ impl WorkersTerminal {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let input_modes = self
-            .active_state()
-            .map_or(WorkersViewportInputModes::default(), |state| {
-                state.input_modes
-            });
+        let (input_modes, mouse_protocol) = self.active_state().map_or(
+            (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
+            |state| (state.input_modes, state.mouse_protocol),
+        );
         if input_modes.known && input_modes.mouse_reporting {
             if let Some(hit) = self.cell_hit_at(event.position) {
                 self.queue_input(
-                    &mouse_report_bytes(MouseReportKind::Up, hit.col, hit.row, event.modifiers),
+                    &mouse_report_bytes(
+                        MouseReportKind::Up,
+                        hit.col,
+                        hit.row,
+                        event.modifiers,
+                        mouse_protocol,
+                    ),
                     cx,
                 );
             }
@@ -1448,7 +1552,8 @@ impl Render for WorkersTerminal {
         let error = self
             .active_state()
             .and_then(|state| state.resize_error.clone())
-            .or_else(|| self.error.clone());
+            .or_else(|| self.error.clone())
+            .filter(|error| !is_expected_session_exit(error));
         let theme = crate::theme::Theme::of(cx).clone();
         // Suprimir o notify do replay nao basta: qualquer outro repaint da
         // janela pinta o emulador no meio do backlog, e o usuario ve o
@@ -1525,9 +1630,24 @@ mod tests {
     use super::{
         HistoricalReplay, Instant, MAX_SILENT_REPLAY_CHUNKS, MAX_SILENT_REPLAY_WINDOW,
         MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync, RetainedWorkerTerminals,
-        TerminalRefresh, TerminalScrollAction, WorkersTerminalView, mouse_report_bytes,
-        scroll_action, should_paint, terminal_refresh, viewport_has_tui_jump_hint,
+        TerminalRefresh, TerminalScrollAction, WorkersTerminalView, is_expected_session_exit,
+        mouse_report_bytes, scroll_action, should_paint, terminal_refresh,
+        viewport_has_tui_jump_hint,
     };
+
+    #[test]
+    fn a_finished_worker_is_not_reported_as_a_disconnect() {
+        // The host answers every request against a dead session this way, so
+        // the banner fired on normal Worker completion.
+        assert!(is_expected_session_exit(
+            "Unpeel request failed with status 409: session has exited"
+        ));
+        // Real transport failures must still reach the banner.
+        assert!(!is_expected_session_exit(
+            "Unpeel request failed with status 500: internal error"
+        ));
+        assert!(!is_expected_session_exit("connection refused"));
+    }
 
     #[test]
     fn retained_session_switch_preserves_history_and_view_position() {
@@ -2137,16 +2257,184 @@ mod tests {
         };
 
         assert_eq!(
-            mouse_report_bytes(MouseReportKind::Down, 0, 0, modifiers),
+            mouse_report_bytes(MouseReportKind::Down, 0, 0, modifiers, MouseProtocol::Sgr),
             b"\x1b[<28;1;1M"
         );
         assert_eq!(
-            mouse_report_bytes(MouseReportKind::Drag, 7, 4, Modifiers::default()),
+            mouse_report_bytes(
+                MouseReportKind::Drag,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Sgr
+            ),
             b"\x1b[<32;8;5M"
         );
         assert_eq!(
-            mouse_report_bytes(MouseReportKind::Up, 7, 4, Modifiers::default()),
+            mouse_report_bytes(
+                MouseReportKind::Up,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Sgr
+            ),
             b"\x1b[<0;8;5m"
+        );
+    }
+
+    #[test]
+    fn normal_and_utf8_mouse_encoder_formats_and_saturation() {
+        let modifiers = Modifiers {
+            shift: true,
+            alt: true,
+            control: true,
+            ..Modifiers::default()
+        };
+
+        // Normal mode (X10 / mode 1000):
+        // Down with modifiers (shift=4, alt=8, ctrl=16 -> 28; button 32 + 28 = 60 ('<')):
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                0,
+                0,
+                modifiers,
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 60, 33, 33]
+        );
+        // Down with no modifiers: button 32 + 0 = 32 (' ')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                0,
+                0,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Up with no modifiers: release code 3 -> button 32 + 3 = 35 ('#')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Up,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 35, 40, 37]
+        );
+        // Drag with no modifiers: code 32 -> button 32 + 32 = 64 ('@')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Drag,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 64, 40, 37]
+        );
+        // Move with no modifiers: code 35 -> button 32 + 35 = 67 ('C')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Move,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 67, 40, 37]
+        );
+        // Coordinate saturation in Normal mode: coordinates saturate at 223 (1-based), so 32 + 223 = 255 (0xFF):
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                300,
+                500,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 32, 255, 255]
+        );
+
+        // UTF-8 mode (mode 1005):
+        // Single byte coordinates for <= 95 (0-based 94 -> 1-based 95 -> encoded 127):
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                0,
+                0,
+                Modifiers::default(),
+                MouseProtocol::Utf8
+            ),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // 2-byte UTF-8 encoding for coordinate > 95 (column 100 -> 1-based 101 -> encoded 133):
+        // 133 in UTF-8 is [0xC2, 0x85]
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                100,
+                0,
+                Modifiers::default(),
+                MouseProtocol::Utf8
+            ),
+            vec![0x1b, b'[', b'M', 32, 0xC2, 0x85, 33]
+        );
+        // Saturation in UTF-8 mode: coordinates saturate at 2015 (1-based), encoded = 2047:
+        // 2047 in UTF-8 is [0xDF, 0xBF]
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                5000,
+                5000,
+                Modifiers::default(),
+                MouseProtocol::Utf8
+            ),
+            vec![0x1b, b'[', b'M', 32, 0xDF, 0xBF, 0xDF, 0xBF]
+        );
+    }
+
+    #[test]
+    fn retain_sessions_removes_dead_sessions_while_preserving_active() {
+        let mut terminals = RetainedWorkerTerminals::default();
+        terminals.select(Some("a".into()), 8, 2);
+        terminals.select(Some("b".into()), 8, 2);
+        terminals.select(Some("c".into()), 8, 2);
+        // Active is "c".
+        let mut live = std::collections::HashSet::new();
+        live.insert("a".into());
+        // "b" is dead (not in live). "c" is not in live, but is currently active.
+        terminals.retain_sessions(&live);
+        assert!(terminals.states.contains_key("a"), "live session retained");
+        assert!(!terminals.states.contains_key("b"), "dead session pruned");
+        assert!(
+            terminals.states.contains_key("c"),
+            "active session preserved even if not in live"
+        );
+    }
+
+    #[test]
+    fn apply_refresh_clears_stale_resize_error() {
+        let mut state = super::WorkersTerminalState::new(8, 2);
+        state.resize_error = Some("500 internal server error".into());
+        assert!(state.resize_error.is_some());
+
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 0,
+                next_offset: 4,
+                data: b"live".to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+
+        assert!(
+            state.resize_error.is_none(),
+            "successful poll output clears resize_error"
         );
     }
 

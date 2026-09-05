@@ -66,7 +66,7 @@ fn threshold_settings(
                 next.per_worker_warning_gib,
                 delta,
                 1,
-                next.per_worker_critical_gib,
+                next.per_worker_critical_gib.max(1),
             );
         }
         ThresholdKind::Critical => {
@@ -82,7 +82,9 @@ fn threshold_settings(
 }
 
 fn add_signed_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
-    (i32::from(value) + i32::from(delta)).clamp(i32::from(minimum), i32::from(maximum)) as u16
+    let lower = minimum.min(maximum);
+    let upper = minimum.max(maximum);
+    (i32::from(value) + i32::from(delta)).clamp(i32::from(lower), i32::from(upper)) as u16
 }
 
 fn resource_metric_card(theme: &Theme, label: &'static str, value: String) -> AnyElement {
@@ -1551,6 +1553,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c", "a", "b"]
         );
+    }
+    #[test]
+    fn add_signed_u16_handles_inverted_range_without_panicking() {
+        assert_eq!(super::add_signed_u16(5, 2, 10, 1), 7);
+        assert_eq!(super::add_signed_u16(5, 10, 10, 1), 10);
+        assert_eq!(super::add_signed_u16(5, -10, 10, 1), 1);
+        assert_eq!(super::add_signed_u16(1, -1, 1, 0), 0);
+    }
+
+    #[test]
+    fn threshold_settings_warning_does_not_panic_when_critical_is_zero() {
+        use zeron_workers_unpeel::WorkersResourceSettings;
+        let mut settings = WorkersResourceSettings::default();
+        settings.per_worker_critical_gib = 0;
+        let next = super::threshold_settings(&settings, super::ThresholdKind::Warning, 1);
+        assert_eq!(next.per_worker_warning_gib, 1);
     }
 
     fn session(session_id: &str, bytes: u64) -> WorkersSessionResource {

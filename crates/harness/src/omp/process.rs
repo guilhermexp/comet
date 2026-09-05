@@ -173,6 +173,17 @@ impl OmpProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Which `omp` we resolved is the first thing a "before ready" failure
+        // needs and the one thing the error never carried: PATH, the login
+        // shell's PATH and `OMP_EXECUTABLE` can each point at a different
+        // build, and a broken source checkout fails identically to a broken
+        // install.
+        tracing::debug!(
+            target: "zeron_harness::omp",
+            executable = %launch.executable.display(),
+            cwd = %launch.cwd.display(),
+            "spawning OMP RPC"
+        );
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(launch.executable.display().to_string())
@@ -270,7 +281,10 @@ impl OmpProcess {
             }
             Ok(Ok(Err(message))) => {
                 let _ = process.shutdown().await;
-                Err(HarnessError::Protocol(message))
+                Err(HarnessError::Protocol(format!(
+                    "{message} (executable: {})",
+                    launch.executable.display()
+                )))
             }
             Ok(Err(_)) => {
                 let _ = process.shutdown().await;

@@ -607,6 +607,20 @@ impl Default for WorkersTranscriptSettings {
         }
     }
 }
+impl WorkersTranscriptSettings {
+    /// Clamps `max_entries` to the nearest valid value accepted by the API and UI
+    /// (`0, 20, 50, 100`). Legacy or migrated configurations stored in `app-state.json`
+    /// might contain arbitrary numbers, which would otherwise leave all range buttons
+    /// unselected and cause any subsequent setting toggle to fail validation on save.
+    pub fn clamped_for_load(mut self) -> Self {
+        const VALID_ENTRIES: [usize; 4] = [0, 20, 50, 100];
+        self.max_entries = VALID_ENTRIES
+            .into_iter()
+            .min_by_key(|&candidate| candidate.abs_diff(self.max_entries))
+            .unwrap_or(20);
+        self
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkersNotificationSettings {
@@ -675,6 +689,22 @@ impl Default for WorkersResourceSettings {
 }
 
 impl WorkersResourceSettings {
+    /// Sanitizes resource settings when loaded from storage.
+    ///
+    /// Unlike `validated()` which rejects out-of-range thresholds (returning an `Err`
+    /// that previously caused `unwrap_or_default()` to wipe out unrelated valid
+    /// settings like hibernation preferences), this method clamps each numeric field
+    /// independently to keep valid user configuration intact.
+    pub fn clamped_for_load(mut self) -> Self {
+        self.per_worker_warning_gib = self.per_worker_warning_gib.clamp(1, 1_024);
+        self.per_worker_critical_gib = self
+            .per_worker_critical_gib
+            .clamp(self.per_worker_warning_gib, 1_024);
+        self.hibernate_after_idle_minutes = self.hibernate_after_idle_minutes.clamp(1, 10_080);
+        self.max_live_idle_workers = self.max_live_idle_workers.clamp(1, 256);
+        self
+    }
+
     fn validated(mut self) -> Result<Self, WorkersError> {
         if self.per_worker_warning_gib == 0 {
             return Err(WorkersError::State(
@@ -1342,7 +1372,8 @@ impl LocalWorkersClient {
             .cloned()
             .map(serde_json::from_value::<WorkersTranscriptSettings>)
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .clamped_for_load();
         let notifications = raw
             .get("comet_workers_notifications")
             .cloned()
@@ -1361,8 +1392,7 @@ impl LocalWorkersClient {
             .map(serde_json::from_value::<WorkersResourceSettings>)
             .transpose()?
             .unwrap_or_default()
-            .validated()
-            .unwrap_or_default();
+            .clamped_for_load();
         let runtimes = runtime_catalog_snapshot();
         let presets = preset_settings(presets, &runtimes);
         Ok(WorkersSettingsSnapshot {
@@ -2325,16 +2355,56 @@ impl LocalWorkersClient {
         if response.status == 200 {
             return Ok(response.body);
         }
-        let message = response
-            .body
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown upstream error")
-            .to_owned();
+        let message = extract_upstream_error_message(&response.body);
         Err(WorkersError::Upstream {
             status: response.status,
             message,
         })
+    }
+}
+pub(crate) fn extract_upstream_error_message(body: &Value) -> String {
+    const MAX_ERROR_LEN: usize = 300;
+    // The host answers with `error`; gateways in front of it answer with
+    // `message` or `detail`, and a dead proxy answers with a bare string or
+    // HTML. Every one of those used to reach the user as "unknown upstream
+    // error", which diagnoses nothing.
+    const KEYS: [&str; 3] = ["error", "message", "detail"];
+
+    let candidate = match body {
+        Value::Object(map) => KEYS
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .map(|value| match value {
+                Value::String(text) => text.trim().to_owned(),
+                structured => structured.to_string(),
+            })
+            .find(|text| !text.is_empty())
+            .unwrap_or_else(|| {
+                // A blank value under an error key means the host said nothing:
+                // serializing the envelope around it just shows the user a
+                // quoted run of spaces.
+                if KEYS.iter().any(|key| map.contains_key(*key)) {
+                    String::new()
+                } else {
+                    body.to_string()
+                }
+            }),
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return "unknown upstream error".to_owned();
+    }
+
+    if trimmed.chars().count() > MAX_ERROR_LEN {
+        let mut truncated: String = trimmed.chars().take(MAX_ERROR_LEN).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -4008,5 +4078,159 @@ mod hibernation_tests {
             ids(&sessions, None),
             vec!["worker-00".to_owned(), "worker-01".to_owned()]
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_settings_clamping_tests {
+    use super::WorkersResourceSettings;
+
+    #[test]
+    fn clamped_for_load_clamps_thresholds_without_wiping_other_fields() {
+        let invalid = WorkersResourceSettings {
+            monitoring_enabled: false,
+            per_worker_warning_gib: 0,
+            per_worker_critical_gib: 0,
+            notifications_enabled: false,
+            hibernation_enabled: true,
+            hibernate_after_idle_minutes: 45,
+            max_live_idle_workers: 8,
+        };
+
+        let loaded = invalid.clamped_for_load();
+
+        // Numeric thresholds clamped to valid range
+        assert_eq!(loaded.per_worker_warning_gib, 1);
+        assert_eq!(loaded.per_worker_critical_gib, 1);
+
+        // Other settings preserved
+        assert!(!loaded.monitoring_enabled);
+        assert!(!loaded.notifications_enabled);
+        assert!(loaded.hibernation_enabled);
+        assert_eq!(loaded.hibernate_after_idle_minutes, 45);
+        assert_eq!(loaded.max_live_idle_workers, 8);
+    }
+
+    #[test]
+    fn clamped_for_load_ensures_critical_is_at_least_warning() {
+        let inverted = WorkersResourceSettings {
+            per_worker_warning_gib: 10,
+            per_worker_critical_gib: 5,
+            ..WorkersResourceSettings::default()
+        };
+
+        let loaded = inverted.clamped_for_load();
+        assert_eq!(loaded.per_worker_warning_gib, 10);
+        assert_eq!(loaded.per_worker_critical_gib, 10);
+    }
+}
+
+#[cfg(test)]
+mod transcript_settings_clamping_tests {
+    use super::WorkersTranscriptSettings;
+
+    #[test]
+    fn clamped_for_load_maps_to_nearest_valid_range() {
+        let cases = [
+            (0, 0),
+            (5, 0),
+            (10, 0),
+            (11, 20),
+            (20, 20),
+            (30, 20),
+            (35, 20),
+            (36, 50),
+            (50, 50),
+            (60, 50),
+            (75, 50),
+            (76, 100),
+            (100, 100),
+            (250, 100),
+        ];
+
+        for (input, expected) in cases {
+            let settings = WorkersTranscriptSettings {
+                max_entries: input,
+                ..WorkersTranscriptSettings::default()
+            };
+            assert_eq!(
+                settings.clamped_for_load().max_entries,
+                expected,
+                "input {input} should clamp to {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod upstream_error_message_tests {
+    use super::extract_upstream_error_message;
+    use serde_json::json;
+
+    #[test]
+    fn falls_back_through_error_message_detail_and_serialized() {
+        // "error" key present
+        let error_obj = json!({"error": "upstream daemon failed"});
+        assert_eq!(
+            extract_upstream_error_message(&error_obj),
+            "upstream daemon failed"
+        );
+
+        // "message" key fallback when "error" is absent
+        let message_obj = json!({"message": "gateway timeout"});
+        assert_eq!(
+            extract_upstream_error_message(&message_obj),
+            "gateway timeout"
+        );
+
+        // "detail" key fallback when "error" and "message" are absent
+        let detail_obj = json!({"detail": "session closed"});
+        assert_eq!(
+            extract_upstream_error_message(&detail_obj),
+            "session closed"
+        );
+
+        // Fallback when "error" is blank/whitespace
+        let blank_error = json!({"error": "   ", "message": "actual error"});
+        assert_eq!(extract_upstream_error_message(&blank_error), "actual error");
+
+        // Structured detail object fallback
+        let structured_detail = json!({"detail": {"code": 404, "reason": "not found"}});
+        let extracted_detail = extract_upstream_error_message(&structured_detail);
+        assert!(extracted_detail.contains("404"));
+        assert!(extracted_detail.contains("not found"));
+
+        // Serialized body fallback for other objects
+        let arbitrary_obj = json!({"status": "unhealthy", "code": 503});
+        let extracted_arbitrary = extract_upstream_error_message(&arbitrary_obj);
+        assert!(extracted_arbitrary.contains("503"));
+        assert!(extracted_arbitrary.contains("unhealthy"));
+
+        // String body fallback
+        let string_body = json!("502 Bad Gateway from reverse proxy");
+        assert_eq!(
+            extract_upstream_error_message(&string_body),
+            "502 Bad Gateway from reverse proxy"
+        );
+
+        // Null and empty fall back to unknown
+        assert_eq!(
+            extract_upstream_error_message(&serde_json::Value::Null),
+            "unknown upstream error"
+        );
+        let empty_obj = json!({"error": "   "});
+        assert_eq!(
+            extract_upstream_error_message(&empty_obj),
+            "unknown upstream error"
+        );
+    }
+
+    #[test]
+    fn truncates_overly_long_error_messages() {
+        let long_html = format!("<html><body>{}</body></html>", "A".repeat(500));
+        let body = json!(long_html);
+        let extracted = extract_upstream_error_message(&body);
+        assert!(extracted.ends_with("..."));
+        assert!(extracted.chars().count() <= 303);
     }
 }

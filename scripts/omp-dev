@@ -1,4 +1,17 @@
 #!/bin/sh
+# Optional development launcher for OMP. Normal `cargo run` uses installed OMP.
+# Opt in with `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` to use a local
+# OMP source checkout (e.g. for Live Voice development capabilities).
+#
+# A source checkout is only usable when its dependencies are installed. Without
+# `node_modules`, `cli.ts` still runs, imports a symbol from whatever version of
+# `@oh-my-pi/pi-natives` sits in bun's global cache, and dies in the module
+# parse BEFORE the RPC handshake — which surfaced in the app as the useless
+# `OMP RPC exited before ready: SyntaxError: Export named 'MacOSPowerAssertion'
+# not found`, on every launch, with no hint that a dev override was even in
+# play. Falling back to the installed `omp` is always better than handing the
+# app a checkout that cannot boot: the override exists to ADD a capability, not
+# to take the agent away.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -6,7 +19,11 @@ omp_source=${ZERON_OMP_SOURCE_DIR:-"$script_dir/../../oh-my-pi"}
 omp_cli="$omp_source/packages/coding-agent/src/cli.ts"
 
 if [ -x "$omp_cli" ]; then
-  exec "$omp_cli" "$@"
+  if [ -d "$omp_source/node_modules/@oh-my-pi/pi-natives" ]; then
+    exec "$omp_cli" "$@"
+  fi
+  # stderr only: stdout is the RPC transport.
+  echo "omp-dev: $omp_source has no installed dependencies (run \`bun install\` there); using the installed omp" >&2
 fi
 
 exec omp "$@"

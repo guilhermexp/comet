@@ -370,8 +370,11 @@ async fn older_omp_keeps_idle_live_available_but_rejects_session_context() {
     let support = harness.probe_live_voice(temp.path()).await.unwrap();
     assert!(support.available);
     assert!(!support.session_context);
-    assert!(support.usable(false));
-    assert!(!support.usable(true));
+    assert_eq!(support.gap(false), None);
+    assert_eq!(
+        support.gap(true),
+        Some(zeron_proto::LiveVoiceUnavailableReason::ActiveRun)
+    );
 
     let handle = harness
         .start_live_voice(LiveVoiceRequest {

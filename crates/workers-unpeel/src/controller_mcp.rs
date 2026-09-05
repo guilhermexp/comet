@@ -245,17 +245,17 @@ pub fn parse_launch_briefing(
     arguments: Value,
 ) -> Result<(WorkersLaunchRequest, Option<String>), String> {
     let project_id = required_string(&arguments, "project_id")?;
-    let preset_id = optional_string(&arguments, "preset_id");
-    let command = optional_string(&arguments, "command");
-    let mut request = match (preset_id, command) {
-        (Some(preset_id), None) => WorkersLaunchRequest::preset(project_id, preset_id),
-        (None, Some(command)) if !command.trim().is_empty() => {
-            WorkersLaunchRequest::command(project_id, command)
-        }
-        _ => {
-            return Err("launch_worker requires exactly one non-empty preset_id or command".into());
-        }
-    };
+    // Preset is the only launch mode on this surface. A raw command would let
+    // the caller pick a binary, model or reasoning flag the user never enabled
+    // in Presets — a decision that is the user's, made in the CLI itself.
+    if arguments.get("command").is_some() {
+        return Err(
+            "launch_worker takes no command: launch an enabled preset_id, or ask the user which preset to enable."
+                .into(),
+        );
+    }
+    let preset_id = required_string(&arguments, "preset_id")?;
+    let mut request = WorkersLaunchRequest::preset(project_id, preset_id);
     match (
         optional_string(&arguments, "worktree_path"),
         optional_string(&arguments, "worktree_branch"),
@@ -670,14 +670,9 @@ fn dispatch_action(
                 return Err("text is empty after removing control characters".into());
             }
             let track_episode = tracks_task_episode(parent_chat_id, submit);
-            let baseline = track_episode
-                .then(|| capture_process_baseline(&session.id))
-                .transpose()?;
             let submitted_at_unix_ms = unix_time_ms();
-            let episode = baseline
-                .map(|baseline| {
-                    crate::prepare_worker_parent_task(&session.id, submitted_at_unix_ms, baseline)
-                })
+            let episode = track_episode
+                .then(|| crate::prepare_worker_parent_task(&session.id, submitted_at_unix_ms))
                 .transpose()?;
             let delivery = match episode {
                 Some(episode) => {
@@ -776,20 +771,6 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn capture_process_baseline(session_id: &str) -> Result<Vec<(u32, u64)>, String> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match crate::resources::current_session_process_identities(session_id) {
-            Ok(identities) if !identities.is_empty() => return Ok(identities),
-            Ok(_) | Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(_) => return Err("session process tree is empty".into()),
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 /// How long a just-created worker gets to publish its manifest.
 const MANIFEST_WAIT: Duration = Duration::from_secs(5);
 /// How long the agent prompt gets to become ready, measured from the manifest
@@ -875,18 +856,9 @@ fn submit_initial_briefing(
         } else {
             return Err("agent screen was unavailable before timeout".into());
         }
-        let baseline = match capture_baseline.then(|| capture_process_baseline(session_id)) {
-            None => Vec::new(),
-            Some(Ok(baseline)) => baseline,
-            Some(Err(_)) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Some(Err(error)) => return Err(error),
-        };
         let submitted_at_unix_ms = unix_time_ms();
         let episode = capture_baseline
-            .then(|| crate::prepare_worker_parent_task(session_id, submitted_at_unix_ms, baseline))
+            .then(|| crate::prepare_worker_parent_task(session_id, submitted_at_unix_ms))
             .transpose()?;
         loop {
             let delivery = match episode {
@@ -1109,11 +1081,16 @@ fn validate_launch_target(
             request.project_id
         ));
     }
-    if let Some(preset_id) = request.preset_id.as_deref()
-        && !bootstrap
-            .presets
-            .iter()
-            .any(|preset| preset.id == preset_id && preset.enabled)
+    // Fail closed: a launch without an *enabled* preset is refused instead of
+    // silently running whatever command it carries. Disabling a preset in
+    // Settings is what makes it unspawnable here.
+    let Some(preset_id) = request.preset_id.as_deref() else {
+        return Err("launch_worker requires a preset_id from list_presets.".into());
+    };
+    if !bootstrap
+        .presets
+        .iter()
+        .any(|preset| preset.id == preset_id && preset.enabled)
     {
         return Err(format!("Unknown or disabled preset '{preset_id}'."));
     }
@@ -1261,8 +1238,7 @@ fn tool_definition() -> Value {
                 "action": { "type": "string", "enum": ACTIONS, "description": "Operation to run. `help` returns the live per-action contract and limits." },
                 "project_id": { "type": "string", "description": "launch_worker: the project the worker runs in, resolved from list_projects or add_project. list_presets: optional scope filter." },
                 "path": { "type": "string", "description": "add_project: absolute path of the checkout to register as a runnable project. Idempotent — an already-registered path returns its existing id." },
-                "preset_id": { "type": "string", "description": "launch_worker: which worker preset to launch, from list_presets. Its rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite). Exactly one of preset_id or command." },
-                "command": { "type": "string", "description": "launch_worker: raw command to launch instead of a preset. Exactly one of preset_id or command." },
+                "preset_id": { "type": "string", "description": "launch_worker: required — which worker preset to launch, from list_presets, and the only launch mode here. Its rows carry `fallback_order` (1-based, the fallback order exactly as the Presets screen lists them) and `preferred` (the starred favorite). A preset launches exactly as the user configured it; if no enabled preset fits the work, ask the user instead of assembling a command." },
                 "session_id": { "type": "string", "description": "The worker to act on, as returned by launch_worker or list_workers. Required by inspect_worker, read_output, read_transcript, send_text, send_keys, wait_for_status, stop_worker, archive_worker and restart_worker." },
                 "text": { "type": "string", "description": "send_text: text to type into the worker, at most 64 KiB." },
                 "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 64, "description": "send_keys: named keys — enter, escape, tab, backspace, the arrows, ctrl-c, or text:<literal>." },

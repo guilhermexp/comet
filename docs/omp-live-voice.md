@@ -550,6 +550,14 @@ launchctl unsetenv OMP_EXECUTABLE
 
 `OMP_EXECUTABLE` must not remain globally set after the smoke test.
 
+`scripts/omp-dev` only hands the app the sibling checkout when that checkout has
+its dependencies installed (`node_modules/@oh-my-pi/pi-natives` present);
+otherwise it warns on stderr and execs the installed `omp`. Without that guard
+an uninstalled checkout dies inside its own module parse, before the RPC
+handshake, and every launch reported `OMP RPC exited before ready: SyntaxError`
+with no hint that a dev override was in play. The override exists to add a
+capability, never to take the agent away.
+
 ## Verification inventory
 
 ### OMP

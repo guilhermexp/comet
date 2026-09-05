@@ -162,10 +162,15 @@ pub fn unavailable_message(reason: LiveVoiceUnavailableReason) -> &'static str {
         LiveVoiceUnavailableReason::RemoteChat => "Open this Chat on its host device",
         LiveVoiceUnavailableReason::NonOmp => "Live Voice is available for OMP Chats",
         LiveVoiceUnavailableReason::Archived => "Unarchive this Chat to use Live Voice",
+        // The gate is a capability in OMP's ready frame, never a version
+        // comparison, and the host cannot tell whether some other build has it:
+        // the published `omp` here is newer than the one that does. So these two
+        // name the missing capability and stop, instead of telling the user to
+        // update — the update they'd reach for is what removed the capability.
         LiveVoiceUnavailableReason::ActiveRun => {
-            "Update Comet on the Chat host to use Live Voice during active work"
+            "The OMP here cannot join Live Voice during active work"
         }
-        LiveVoiceUnavailableReason::UnsupportedOmp => "Update OMP to use Live Voice",
+        LiveVoiceUnavailableReason::UnsupportedOmp => "The OMP here has no Live Voice capability",
         LiveVoiceUnavailableReason::AnotherLiveCall => "End the active Live Voice call first",
     }
 }
@@ -312,11 +317,11 @@ mod tests {
             ),
             (
                 LiveVoiceUnavailableReason::ActiveRun,
-                "Update Comet on the Chat host to use Live Voice during active work",
+                "The OMP here cannot join Live Voice during active work",
             ),
             (
                 LiveVoiceUnavailableReason::UnsupportedOmp,
-                "Update OMP to use Live Voice",
+                "The OMP here has no Live Voice capability",
             ),
             (
                 LiveVoiceUnavailableReason::AnotherLiveCall,

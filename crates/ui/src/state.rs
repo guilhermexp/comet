@@ -620,6 +620,10 @@ pub struct AppState {
     /// the local device.
     pub selected_device: Option<String>,
     pub selected_chat: Option<String>,
+    /// Chats whose transcript watch keeps failing to subscribe, by the reason
+    /// the engine gave. Device-local: it describes THIS app's delivery, not
+    /// anything in the doc.
+    pub transcript_stalls: std::collections::HashMap<String, String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
     /// First chats / spaces watch frame has landed — device-local state that
@@ -698,6 +702,7 @@ impl AppState {
             no_project: false,
             selected_device: None,
             selected_chat: None,
+            transcript_stalls: std::collections::HashMap::new(),
             transcript: Vec::new(),
             transcript_replayed: false,
             echoes: HashMap::new(),
@@ -831,6 +836,34 @@ impl AppState {
 
     pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
         self.connectivity = connectivity;
+    }
+
+    /// Record that this chat's transcript delivery is down, with the reason the
+    /// engine gave. Returns whether the surface changed.
+    ///
+    /// The watch loop retries forever by design (a return there freezes the
+    /// transcript with no heal), but silence during those retries is a lie:
+    /// the canvas paints EMPTY, which reads as "this chat has no messages".
+    pub fn mark_transcript_stall(&mut self, chat_id: &str, reason: String) -> bool {
+        match self.transcript_stalls.get(chat_id) {
+            Some(existing) if *existing == reason => false,
+            _ => {
+                self.transcript_stalls.insert(chat_id.to_owned(), reason);
+                true
+            }
+        }
+    }
+
+    /// Delivery came back. Returns whether the surface changed.
+    pub fn clear_transcript_stall(&mut self, chat_id: &str) -> bool {
+        self.transcript_stalls.remove(chat_id).is_some()
+    }
+
+    /// Why this chat's transcript is not arriving, if it is not.
+    pub fn transcript_stall(&self, chat_id: &str) -> Option<&str> {
+        self.transcript_stalls
+            .get(chat_id)
+            .map(std::string::String::as_str)
     }
 
     /// Is this chat's delivery path degraded — will a send QUEUE rather than
@@ -2102,6 +2135,15 @@ fn spawn_transcript_watch(
         // task itself is dropped by select_chat/apply_chats when the chat is
         // deselected or deleted, so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        // How many consecutive subscribe failures before the surface says so.
+        // One failure is an engine restart healing itself; a run of them means
+        // delivery is down, and the canvas rendering EMPTY while this loop
+        // retries forever reads as "the chat lost its messages" — which is
+        // exactly how a second app instance on the same profile presented
+        // itself: blank transcript, no banner, `error=connection closed`
+        // visible only in the log.
+        const STALL_THRESHOLD: u32 = 3;
+        let mut consecutive_failures: u32 = 0;
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
@@ -2109,10 +2151,35 @@ fn spawn_transcript_watch(
                 .subscribe(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
-                Ok(rx) => rx,
+                Ok(rx) => {
+                    consecutive_failures = 0;
+                    let chat_id = chat_id.clone();
+                    if this
+                        .update(cx, |state, cx| {
+                            if state.clear_transcript_stall(&chat_id) {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    rx
+                }
                 Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
-                    if this.update(cx, |_, _| {}).is_err() {
+                    let stalled = consecutive_failures >= STALL_THRESHOLD;
+                    let reason = err.to_string();
+                    let chat_id = chat_id.clone();
+                    if this
+                        .update(cx, |state, cx| {
+                            if stalled && state.mark_transcript_stall(&chat_id, reason) {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     cx.background_executor().timer(RETRY_DELAY).await;
@@ -3231,6 +3298,28 @@ mod tests {
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             },
         );
+    }
+
+    #[test]
+    fn a_stalled_transcript_is_reported_until_delivery_returns() {
+        let mut state = AppState::new();
+        assert_eq!(state.transcript_stall("c"), None);
+
+        // First mark surfaces the reason; repeating the same one is not a
+        // change (the watch retries every 2s and must not repaint each time).
+        assert!(state.mark_transcript_stall("c", "connection closed".into()));
+        assert!(!state.mark_transcript_stall("c", "connection closed".into()));
+        assert_eq!(state.transcript_stall("c"), Some("connection closed"));
+
+        // A different reason is news.
+        assert!(state.mark_transcript_stall("c", "engine restarting".into()));
+        assert_eq!(state.transcript_stall("c"), Some("engine restarting"));
+
+        // Only the stalled chat is affected, and a successful subscribe clears.
+        assert_eq!(state.transcript_stall("other"), None);
+        assert!(state.clear_transcript_stall("c"));
+        assert!(!state.clear_transcript_stall("c"));
+        assert_eq!(state.transcript_stall("c"), None);
     }
 
     #[test]

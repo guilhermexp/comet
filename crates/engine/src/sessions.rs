@@ -255,6 +255,9 @@ struct Inner {
     fallback_trajectory_runs: Mutex<HashMap<String, String>>,
     trajectory_tool_names: Mutex<HashMap<String, HashMap<String, String>>>,
     tombstoned_chats: Mutex<BoundedTombstones>,
+    restart_gate: Mutex<Option<zeron_update::RestartGate>>,
+    #[cfg(test)]
+    admission_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -273,11 +276,14 @@ fn live_voice_unavailable_message(reason: LiveVoiceUnavailableReason) -> String 
         LiveVoiceUnavailableReason::Archived => {
             "Live Voice is unavailable for archived Chats".into()
         }
+        // Both OMP gaps are a capability absent from the ready frame, so neither
+        // message may promise that updating anything fixes it: the published
+        // `omp` can be strictly newer than a build that has Live Voice.
         LiveVoiceUnavailableReason::ActiveRun => {
-            "Live Voice during active work requires a newer Comet host".into()
+            "The OMP here cannot join Live Voice during active work".into()
         }
         LiveVoiceUnavailableReason::UnsupportedOmp => {
-            "Installed OMP does not support Live Voice; update OMP".into()
+            "The OMP here has no Live Voice capability".into()
         }
         LiveVoiceUnavailableReason::AnotherLiveCall => {
             "Another Live Voice call is already active on this device".into()
@@ -318,6 +324,9 @@ impl SessionsEngine {
                 fallback_trajectory_runs: Mutex::new(HashMap::new()),
                 trajectory_tool_names: Mutex::new(HashMap::new()),
                 tombstoned_chats: Mutex::new(BoundedTombstones::new(4096)),
+                restart_gate: Mutex::new(None),
+                #[cfg(test)]
+                admission_hook: Mutex::new(None),
             }),
         }
     }
@@ -347,6 +356,17 @@ impl SessionsEngine {
 
     pub fn tombstone_chat(&self, chat_id: &str) {
         self.inner.tombstone_chat(chat_id);
+    }
+
+    pub fn set_restart_gate(&self, gate: zeron_update::RestartGate) {
+        let mut slot = lock(&self.inner.restart_gate);
+        *slot = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub fn set_admission_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let mut slot = lock(&self.inner.admission_hook);
+        *slot = Some(hook);
     }
 
     pub fn trajectory_store(&self) -> Option<Arc<TrajectoryStore>> {
@@ -444,10 +464,10 @@ impl SessionsEngine {
         let active = self.is_active_session(chat_id);
         let harness = self.inner.registry.resolve(HarnessId::Omp)?;
         let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
-        let available = support.usable(active);
+        let gap = support.gap(active);
         Ok(LiveVoiceAvailability {
-            available,
-            reason: (!available).then_some(LiveVoiceUnavailableReason::UnsupportedOmp),
+            available: gap.is_none(),
+            reason: gap,
         })
     }
 
@@ -471,9 +491,8 @@ impl SessionsEngine {
                 return Err(error.into());
             }
         };
-        if !supported.usable(self.is_active_session(chat_id)) {
-            let message =
-                live_voice_unavailable_message(LiveVoiceUnavailableReason::UnsupportedOmp);
+        if let Some(gap) = supported.gap(self.is_active_session(chat_id)) {
+            let message = live_voice_unavailable_message(gap);
             self.inner.live_voice.fail(&call_id, &message);
             return Err(EngineError::Other(message));
         }
@@ -903,9 +922,21 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        let _admission_guard = if let Some(gate) = lock(&self.inner.restart_gate).as_ref() {
+            Some(
+                gate.reserve_admission()
+                    .map_err(|_| EngineError::Other("engine is restarting for an update".into()))?,
+            )
+        } else {
+            None
+        };
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.inner.admission_hook).as_ref() {
+            hook();
+        }
         request.workers_parent_chat_id = request.enable_workers_mcp.then(|| chat_id.to_owned());
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
@@ -4658,5 +4689,147 @@ mod tests {
             "sanitized preview text length must be <= 1024 bytes, got {}",
             text.len()
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejected_when_restart_authorized() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(temp.path()).unwrap());
+        let registry = Arc::new(HarnessRegistry::new());
+        let engine = SessionsEngine::new("device_1".into(), journal, registry);
+        let gate = zeron_update::RestartGate::new(None);
+        engine.set_restart_gate(gate.clone());
+        let _auth = gate.force_authorize_restart().unwrap();
+        let err = engine
+            .dispatch("chat_1", HarnessId::Mock, request(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("engine is restarting for an update")
+        );
+    }
+
+    struct BarrierHarness {
+        release_rx: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_harness::Harness for BarrierHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Barrier"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: zeron_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            use futures::StreamExt as _;
+            let release_rx = self.release_rx.lock().unwrap().take();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "active".into(),
+                    }))
+                    .await;
+                if let Some(rx) = release_rx {
+                    let _ = rx.await;
+                }
+                let _ = tx
+                    .send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }))
+                    .await;
+            });
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            });
+            Ok(stream.boxed())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_admission_reserved_before_setup_blocks_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let (release_tx, release_rx) = oneshot::channel();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(BarrierHarness {
+            release_rx: Mutex::new(Some(release_rx)),
+        }));
+        let core = crate::EngineCore::assemble(temp.path(), registry, HarnessId::Mock, None)
+            .expect("engine core assembles");
+        let engine = core.sessions.clone();
+        let engine_for_gate = engine.clone();
+        let gate =
+            zeron_update::RestartGate::new(Some(Arc::new(move || !engine_for_gate.any_active())));
+        engine.set_restart_gate(gate.clone());
+        let (in_setup_tx, in_setup_rx) = std::sync::mpsc::channel();
+        let (allow_tx, allow_rx) = std::sync::mpsc::channel();
+        let allow_rx = Arc::new(std::sync::Mutex::new(allow_rx));
+
+        engine.set_admission_hook(Box::new(move || {
+            let _ = in_setup_tx.send(());
+            let _ = allow_rx.lock().unwrap().recv();
+        }));
+
+        let dispatch_engine = engine.clone();
+        let dispatch_task = tokio::spawn(async move {
+            dispatch_engine
+                .dispatch("chat_1", HarnessId::Mock, request(), None)
+                .await
+        });
+
+        // Wait until dispatch has acquired admission reservation and entered turn listener:
+        in_setup_rx.recv().expect("reached in_setup");
+
+        // While setup is in-flight (run not yet in engine.runs):
+        assert!(
+            !engine.any_active(),
+            "run is not yet registered in active runs"
+        );
+        // Restart authorization MUST be rejected with WorkActive because admission is reserved:
+        let auth_res = gate.try_authorize_restart();
+        assert_eq!(
+            auth_res.err(),
+            Some(zeron_update::RestartBlockedReason::WorkActive)
+        );
+
+        // Now allow dispatch to complete setup:
+        allow_tx.send(()).expect("allow dispatch");
+        let run_id = dispatch_task.await.unwrap().unwrap();
+        assert!(!run_id.is_empty());
+
+        // Now run is registered and active:
+        assert!(engine.any_active());
+        // Restart authorization STILL fails with WorkActive because run is active:
+        assert_eq!(
+            gate.try_authorize_restart().err(),
+            Some(zeron_update::RestartBlockedReason::WorkActive)
+        );
+
+        // Release stream barrier so run completes cleanly:
+        let _ = release_tx.send(());
     }
 }

@@ -127,8 +127,15 @@ fn notifications_do_not_receive_json_rpc_responses() {
 }
 
 #[test]
-fn launch_requires_exactly_one_launch_mode() {
+fn launch_accepts_only_an_enabled_preset_never_a_raw_command() {
     assert!(controller_mcp_parse_launch(json!({ "project_id": "p" })).is_err());
+    assert!(
+        controller_mcp_parse_launch(json!({
+            "project_id": "p",
+            "command": "omp --model anthropic/claude-opus-4-8"
+        }))
+        .is_err()
+    );
     assert!(
         controller_mcp_parse_launch(json!({
             "project_id": "p",

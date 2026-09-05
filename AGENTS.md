@@ -38,6 +38,8 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Gotchas duráveis
 
+- **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
+
 - **Sync com o upstream é frequente** (várias versões por semana). A receita que faz o merge passar é `cargo fmt --all` do nosso lado **antes** do merge. Conflitos se resolvem a favor do fork, e o motivo de cada um vai no corpo do commit de merge.
 - `crates/tui` / `apps/tui` foram **deletados** (upstream removeu o viewport ratatui). Isso **não** é o painel de terminal dentro do app — esse vive em `crates/ui/src/terminal/` e está intacto.
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.

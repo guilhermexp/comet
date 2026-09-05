@@ -339,7 +339,7 @@ impl Harness for OmpHarness {
         let setup = async {
             if !process.capabilities().live_voice {
                 return Err(HarnessError::Unsupported(
-                    "installed OMP does not support Live Voice; update OMP".into(),
+                    "this OMP's ready frame has no Live Voice capability".into(),
                 ));
             }
             if let Some(session_path) = request.resume.as_deref() {

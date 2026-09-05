@@ -33,7 +33,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `crates/{engine,harness,rpc,workers-unpeel,doc,sync}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
 | `crates/ui` (render gpui) | none — sem harness de render; validação é visual no `scripts/dev-demo.sh` | — |
-| `crates/update` | none — wrapper fino sobre download/replace, coberto no smoke | — |
+| `crates/update` | unit (versão/manifest, swap symlink, shutdown, restart gate) | `cargo test -p zeron-update` |
 
 ## Child DOX Index
 

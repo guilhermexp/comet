@@ -931,10 +931,12 @@ fn file_open_target(
     cwd: &str,
     path: &str,
 ) -> Option<(String, std::path::PathBuf, String)> {
+    let clean_path = crate::file_preview::model::strip_line_col(path);
+    let expanded = crate::file_preview::model::expand_tilde(clean_path);
     let root = std::path::PathBuf::from(cwd);
-    let candidate = std::path::Path::new(path);
+    let candidate = std::path::Path::new(expanded.as_ref());
     if !candidate.is_absolute() {
-        return Some((context_key.to_string(), root, path.to_string()));
+        return Some((context_key.to_string(), root, clean_path.to_string()));
     }
     if let Ok(relative) = candidate.strip_prefix(&root) {
         return Some((
@@ -949,7 +951,7 @@ fn file_open_target(
     // raiz do contexto continua sendo o cwd, entao as abas ja abertas contra
     // ele nao se perdem, e dois `report.md` de diretorios diferentes seguem
     // sendo duas abas.
-    Some((context_key.to_string(), root, path.to_string()))
+    Some((context_key.to_string(), root, expanded.into_owned()))
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -10285,6 +10287,22 @@ mod tests {
         let outside = file_open_target("chat", "/repo", "/tmp/worker/report.md").unwrap();
         assert_eq!(outside.1, std::path::PathBuf::from("/repo"));
         assert_eq!(outside.2, "/tmp/worker/report.md");
+
+        // Tilde expande para a home do usuario e abre como absoluto.
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let tilde =
+                file_open_target("chat", "/repo", "~/.orchestrator/outputs/emissao.png").unwrap();
+            assert_eq!(tilde.1, std::path::PathBuf::from("/repo"));
+            assert_eq!(
+                tilde.2,
+                home.join(".orchestrator/outputs/emissao.png")
+                    .to_string_lossy()
+            );
+        }
+
+        // Indicador de linha e coluna é despojado.
+        let with_line = file_open_target("chat", "/repo", "src/main.rs:42:15").unwrap();
+        assert_eq!(with_line.2, "src/main.rs");
     }
 
     #[test]

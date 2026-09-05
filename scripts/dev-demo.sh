@@ -16,6 +16,15 @@ IPC=27921
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 
+# Discard our own artifacts so the demo can never run stale app code: a cached
+# `cargo build` prints "Finished" without recompiling, which reads as success.
+# Scoped to workspace members — wiping dependency artifacts too would turn a
+# ~40s rebuild into minutes of gpui compilation for no extra freshness.
+echo "▸ clearing workspace artifacts (deps stay cached)…"
+cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(" ".join("-p " + p["name"] for p in json.load(sys.stdin)["packages"]))' \
+  | xargs cargo clean -q
+
 echo "▸ building (first run takes a few minutes)…"
 cargo build -p zeron -q
 

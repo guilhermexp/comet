@@ -1369,24 +1369,27 @@ impl Pickers {
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
         // a model is the expected flow. Esc, click-out, or the chip close it.
+        // Every explicit pick becomes the next Chat's last-used model,
+        // including picks made inside an existing Chat. Keep the opaque id:
+        // the same model offered by different providers is a different choice.
+        if let Some(harness) = self.effective_harness(cx) {
+            let label = self
+                .models
+                .get(&harness)
+                .and_then(|l| l.ready())
+                .and_then(|models| models.iter().find(|m| m.id == model_id))
+                .map(|m| m.label.clone())
+                .unwrap_or_else(|| model_id.clone());
+            self.defaults
+                .remember_model(harness, model_id.clone(), label);
+            self.save_defaults();
+        }
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
         } else {
-            // New chat: draft pick + sticky last-used memory for this harness.
-            self.config.model = Some(model_id.clone());
-            if let Some(harness) = self.effective_harness(cx) {
-                let label = self
-                    .models
-                    .get(&harness)
-                    .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
-                    .map(|m| m.label.clone())
-                    .unwrap_or_else(|| model_id.clone());
-                self.defaults.remember_model(harness, model_id, label);
-                self.save_defaults();
-            }
+            self.config.model = Some(model_id);
         }
         cx.notify();
     }
@@ -4178,6 +4181,91 @@ mod tests {
         );
     }
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn existing_chat_model_pick_is_remembered_for_new_chats(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let dir = tempfile::tempdir().unwrap();
+        let old = "openrouter/openai/gpt-6-astra";
+        let chosen = "openai-codex/gpt-6-astra";
+        let mut defaults = ComposerDefaults::default();
+        defaults.remember_model(HarnessId::Omp, old.into(), "OpenRouter Astra".into());
+        defaults.save(dir.path()).unwrap();
+        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "existing", "deviceId": "dev", "archived": false,
+            "createdAt": "2026-09-05T00:00:00Z",
+            "config": ChatConfig { harness: HarnessId::Omp, model: Some(old.into()),
+                reasoning: None, model_options: Default::default(), sandbox: SandboxLevel::WorkspaceWrite }
+        })).unwrap();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(dir.path().to_path_buf());
+            state.chats.push(chat);
+            state.selected_chat = Some("existing".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Omp, "omp")]);
+            pickers.models.insert(
+                HarnessId::Omp,
+                Loadable::Ready(vec![
+                    bare_model(old, "OpenRouter Astra"),
+                    bare_model(chosen, "ChatGPT Astra"),
+                ]),
+            );
+            pickers.pick_model(chosen.into(), cx);
+        });
+        assert_eq!(
+            state.read_with(cx, |s, _| s.chats[0].config.as_ref().unwrap().model.clone()),
+            Some(chosen.into())
+        );
+        let saved = ComposerDefaults::load(dir.path());
+        assert_eq!(
+            saved.model_for(HarnessId::Omp).map(|m| m.id.as_str()),
+            Some(chosen)
+        );
+        assert_eq!(
+            saved.model_for(HarnessId::Omp).map(|m| m.label.as_str()),
+            Some("ChatGPT Astra")
+        );
+        state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        assert_eq!(
+            pickers.read_with(cx, |p, cx| p.resolved(cx).model),
+            Some(chosen.into())
+        );
+        // Reading the older Chat config is navigation, not a new explicit pick.
+        state.update(cx, |state, cx| {
+            state.chats[0].config.as_mut().unwrap().model = Some(old.into());
+            state.selected_chat = Some("existing".into());
+            cx.notify();
+        });
+        assert_eq!(
+            pickers.read_with(cx, |p, cx| p.resolved(cx).model),
+            Some(old.into())
+        );
+        state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        assert_eq!(
+            pickers.read_with(cx, |p, cx| p.resolved(cx).model),
+            Some(chosen.into())
+        );
+        let reloaded = cx.new(|cx| Pickers::new(state.clone(), cx));
+        assert_eq!(
+            reloaded.read_with(cx, |p, _| p
+                .defaults
+                .model_for(HarnessId::Omp)
+                .unwrap()
+                .id
+                .clone()),
+            chosen
+        );
+    }
 
     fn bare_model(id: &str, label: &str) -> Model {
         Model {

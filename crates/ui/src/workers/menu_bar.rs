@@ -243,6 +243,9 @@ mod platform {
         mode: WorkersMenuBarMode,
         frame: usize,
         spinner_labels: Vec<*mut Object>,
+        active_icon: Option<&'static str>,
+        active_icon_image: *mut Object,
+        last_menu: Option<WorkersActivityMenu>,
     }
 
     impl NativeMenuBar {
@@ -279,6 +282,9 @@ mod platform {
                     mode: WorkersMenuBarMode::Idle,
                     frame: 0,
                     spinner_labels: Vec::new(),
+                    active_icon: None,
+                    active_icon_image: std::ptr::null_mut(),
+                    last_menu: None,
                 };
                 native.update(menu);
                 native
@@ -286,8 +292,31 @@ mod platform {
         }
 
         pub fn update(&mut self, menu: &WorkersActivityMenu) {
+            if self.last_menu.as_ref() == Some(menu) {
+                return;
+            }
+            self.last_menu = Some(menu.clone());
             self.mode = menu.mode;
             self.frame = 0;
+            let new_active_icon = menu
+                .jobs
+                .first()
+                .map(|r| r.runtime_icon)
+                .or_else(|| menu.blockers.first().map(|r| r.runtime_icon))
+                .or_else(|| menu.finished.first().map(|r| r.runtime_icon));
+            if new_active_icon != self.active_icon {
+                self.active_icon = new_active_icon;
+                unsafe {
+                    if !self.active_icon_image.is_null() {
+                        let _: () = msg_send![self.active_icon_image, release];
+                        self.active_icon_image = std::ptr::null_mut();
+                    }
+                    if let Some(icon) = self.active_icon {
+                        self.active_icon_image =
+                            provider_icon_image(icon).unwrap_or(std::ptr::null_mut());
+                    }
+                }
+            }
             let targets = menu
                 .blockers
                 .iter()
@@ -308,6 +337,14 @@ mod platform {
                 self.spinner_labels = spinner_labels;
                 let _: () = msg_send![controller, setView: content];
                 let _: () = msg_send![self.popover, setContentViewController: controller];
+                // `build_content` returns an owned `alloc`/`init` view and the
+                // controller retains it, so our reference has to go - the same
+                // hand-off `add_row` already does for its image and image view.
+                // Without this every refresh (the model notifies about twice a
+                // second) stranded a whole popover subtree: 10k NSViews, 42k
+                // NSTextFields and 21k NSButtons alive at once, each one with
+                // KVO appearance observers behind it.
+                let _: () = msg_send![content, release];
                 let _: () = msg_send![controller, release];
             }
         }
@@ -351,13 +388,23 @@ mod platform {
             let button: *mut Object = unsafe { msg_send![self.status_item, button] };
             let working = matches!(self.mode, WorkersMenuBarMode::Working { .. });
             let image = if working {
-                std::ptr::null_mut()
+                if !self.active_icon_image.is_null() {
+                    self.active_icon_image
+                } else {
+                    std::ptr::null_mut()
+                }
             } else {
                 status_mark()
             };
             let _: () = unsafe { msg_send![button, setImage: image] };
             let _: () = unsafe {
-                msg_send![button, setImagePosition: if working { 0_u64 } else if matches!(self.mode, WorkersMenuBarMode::Idle) { 1_u64 } else { 2_u64 }]
+                msg_send![button, setImagePosition: if working {
+                    if image.is_null() { 0_u64 } else { 2_u64 }
+                } else if matches!(self.mode, WorkersMenuBarMode::Idle) {
+                    1_u64
+                } else {
+                    2_u64
+                }]
             };
             match self.mode {
                 WorkersMenuBarMode::Working {
@@ -383,6 +430,10 @@ mod platform {
         fn drop(&mut self) {
             unsafe {
                 self.close();
+                if !self.active_icon_image.is_null() {
+                    let _: () = msg_send![self.active_icon_image, release];
+                    self.active_icon_image = std::ptr::null_mut();
+                }
                 let _: () = msg_send![self.status_bar, removeStatusItem: self.status_item];
                 let _: () = msg_send![self.status_item, release];
                 let _: () = msg_send![self.popover, release];
@@ -469,22 +520,14 @@ mod platform {
         unsafe { add_label(view, &row.title, rect(38.0, y + 20.0, 202.0, 18.0), 13.0) };
         unsafe { add_label(view, &row.project, rect(38.0, y + 4.0, 202.0, 15.0), 11.0) };
         unsafe { add_label(view, row.status, rect(240.0, y + 5.0, 62.0, 15.0), 11.0) };
-        if let Some(bytes) = provider_icon_bytes(row.runtime_icon) {
-            let data: *mut Object = unsafe {
-                msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() length: bytes.len()]
-            };
-            let image: *mut Object = unsafe { msg_send![class!(NSImage), alloc] };
-            let image: *mut Object = unsafe { msg_send![image, initWithData: data] };
-            if !image.is_null() {
-                let image_view: *mut Object = unsafe { msg_send![class!(NSImageView), alloc] };
-                let image_view: *mut Object = unsafe {
-                    msg_send![image_view, initWithFrame: rect(296.0, y + 13.0, 16.0, 16.0)]
-                };
-                let _: () = unsafe { msg_send![image_view, setImage: image] };
-                let _: () = unsafe { msg_send![view, addSubview: image_view] };
-                let _: () = unsafe { msg_send![image_view, release] };
-                let _: () = unsafe { msg_send![image, release] };
-            }
+        if let Some(image) = provider_icon_image(row.runtime_icon) {
+            let image_view: *mut Object = unsafe { msg_send![class!(NSImageView), alloc] };
+            let image_view: *mut Object =
+                unsafe { msg_send![image_view, initWithFrame: rect(296.0, y + 13.0, 16.0, 16.0)] };
+            let _: () = unsafe { msg_send![image_view, setImage: image] };
+            let _: () = unsafe { msg_send![view, addSubview: image_view] };
+            let _: () = unsafe { msg_send![image_view, release] };
+            let _: () = unsafe { msg_send![image, release] };
         }
         let button: *mut Object = unsafe {
             msg_send![class!(NSButton), buttonWithTitle: ns_string("") target: target action: sel!(performAction:)]
@@ -521,8 +564,12 @@ mod platform {
         }) as *mut Object
     }
 
+    pub(crate) fn sanitize_label(value: &str) -> String {
+        value.replace('\0', "")
+    }
+
     fn ns_string(value: &str) -> *mut Object {
-        let value = CString::new(value.replace('\0', "")).expect("valid native string");
+        let value = CString::new(sanitize_label(value)).expect("valid native string");
         unsafe { msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()] }
     }
 
@@ -620,7 +667,26 @@ mod platform {
         let _: () = unsafe { msg_send![attributed, release] };
     }
 
-    fn provider_icon_bytes(path: &str) -> Option<&'static [u8]> {
+    fn provider_icon_image(path: &str) -> Option<*mut Object> {
+        let bytes = provider_icon_bytes(path)?;
+        unsafe {
+            let data: *mut Object =
+                msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() length: bytes.len()];
+            let image: *mut Object = msg_send![class!(NSImage), alloc];
+            let image: *mut Object = msg_send![image, initWithData: data];
+            if !image.is_null() {
+                let _: () = msg_send![image, setSize: NSSize { width: 16.0, height: 16.0 }];
+                let _: () = msg_send![image, setTemplate: true];
+                Some(image)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub(super) fn provider_icon_bytes(path: &str) -> Option<&'static [u8]> {
+        let path = path.strip_prefix("icons/").unwrap_or(path);
+        let path = path.strip_suffix(".svg").unwrap_or(path);
         match path {
             "workers/amp" => Some(include_bytes!("../../assets/icons/workers/amp.svg")),
             "workers/claude" => Some(include_bytes!("../../assets/icons/workers/claude.svg")),
@@ -630,15 +696,21 @@ mod platform {
                 "../../assets/icons/workers/cursor-agent.svg"
             )),
             "workers/gemini" => Some(include_bytes!("../../assets/icons/workers/gemini.svg")),
+            "workers/generic-agent" => Some(include_bytes!(
+                "../../assets/icons/workers/generic-agent.svg"
+            )),
             "workers/grok" => Some(include_bytes!("../../assets/icons/workers/grok.svg")),
             "workers/kimi" => Some(include_bytes!("../../assets/icons/workers/kimi.svg")),
             "workers/kiro" => Some(include_bytes!("../../assets/icons/workers/kiro.svg")),
             "workers/muse-code" => Some(include_bytes!("../../assets/icons/workers/muse-code.svg")),
             "workers/opencode" => Some(include_bytes!("../../assets/icons/workers/opencode.svg")),
+            "workers/omp" => Some(include_bytes!("../../assets/icons/workers/omp.svg")),
             "workers/pi" => Some(include_bytes!("../../assets/icons/workers/pi.svg")),
-            "workers/generic-agent" => Some(include_bytes!(
-                "../../assets/icons/workers/generic-agent.svg"
-            )),
+            "workers/prime-agent" => {
+                Some(include_bytes!("../../assets/icons/workers/prime-agent.svg"))
+            }
+            "antigravity" => Some(include_bytes!("../../assets/icons/antigravity.svg")),
+            "terminal" => Some(include_bytes!("../../assets/icons/terminal.svg")),
             _ => None,
         }
     }
@@ -691,5 +763,75 @@ mod tests {
             bindings.intent_for_tag(ALL_RECENT_TAG),
             Some(MenuBarIntent::ShowAllRecent)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_icon_bytes_resolves_every_known_runtime_icon() {
+        for runtime_id in [
+            "com.sourcegraph.amp",
+            "com.anthropic.claude-code",
+            "bot.cline.cli",
+            "com.openai.codex",
+            "com.cursor.agent",
+            "com.google.gemini-cli",
+            "ai.x.grok-cli",
+            "com.moonshot.kimi-code",
+            "dev.kiro.cli",
+            "ai.meta.muse-code",
+            "ai.opencode.cli",
+            "dev.mariozechner.pi",
+            "sh.omp.cli",
+            "ai.primeintellect.prime-agent",
+            "com.google.antigravity-cli",
+            "unknown",
+        ] {
+            let path = crate::workers::presentation::runtime_icon_path(Some(runtime_id), None);
+            assert!(
+                super::platform::provider_icon_bytes(path).is_some(),
+                "missing menu bar provider icon for {runtime_id}: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_menu_equality_detects_identical_state_for_update_deduplication() {
+        use crate::workers::activity_menu::{
+            WorkersActivityMenu, WorkersActivityRow, WorkersActivityRowKind, WorkersMenuBarMode,
+        };
+
+        let menu1 = WorkersActivityMenu {
+            mode: WorkersMenuBarMode::Working {
+                blocked: false,
+                running: 1,
+            },
+            jobs: vec![WorkersActivityRow {
+                project_id: "p1".into(),
+                session_id: "s1".into(),
+                title: "task".into(),
+                project: "proj".into(),
+                status: "busy".into(),
+                command: "zsh".into(),
+                runtime_icon: "workers/codex",
+                spinner_tint: None,
+                kind: WorkersActivityRowKind::Working,
+            }],
+            ..Default::default()
+        };
+        let menu2 = menu1.clone();
+        assert_eq!(menu1, menu2);
+
+        let mut menu3 = menu1.clone();
+        menu3.mode = WorkersMenuBarMode::Working {
+            blocked: true,
+            running: 1,
+        };
+        assert_ne!(menu1, menu3);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sanitize_label_removes_null_bytes() {
+        assert_eq!(super::platform::sanitize_label("menu\0item\0"), "menuitem");
     }
 }

@@ -33,6 +33,18 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - O workspace continua com `exclude = ["third_party/unpeel"]` porque o snapshot
   contém workspaces próprios. Só `unpeel-core` entra no build do Comet pela
   dependência path explícita do `Cargo.toml` raiz.
+- **`apps/website` foi deletado localmente** (unpeel.com: site, docs, UI de
+  compra e o serviço de licença React/Hono em Worker). Nada do Comet o
+  consumia — nenhum `Cargo.toml`, script, workflow ou `edge/` o referenciava —
+  e ele carregava a única árvore React do repositório. A remoção limpou o que
+  ficaria pendurado: os scripts `dev:website`/`build`/`check` do
+  `package.json` do workspace Unpeel, o `bun.lock` (regerado, 95 pacotes),
+  o gate de changelog em `apps/native/release.sh` e o `cd apps/website` dos
+  dois `release:updates:*`, hoje apontando para `apps/releases`. A prosa
+  upstream (`unpeel/README.md`, `unpeel/AGENTS.md`, `docs/`) continua citando
+  o site de propósito: é documentação do upstream e o sync a sobrescreve.
+  Sync futuro do Unpeel reapresenta `apps/website` como adição nova — deletar
+  de novo e recomputar `vendored_tree`.
 - Patch necessária ao Comet é editada no próprio fonte vendorizado, com teste
   downstream e atualização simultânea de `vendored_tree` na metadata.
 - `cmux/` não é rastreado, está excluído em `.git/info/exclude`, e nenhum build,

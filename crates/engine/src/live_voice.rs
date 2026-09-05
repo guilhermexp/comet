@@ -1413,7 +1413,7 @@ mod tests {
             request: LiveVoiceRequest,
         ) -> Result<LiveVoiceHandle, HarnessError> {
             if !self.supported.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(HarnessError::Unsupported("update OMP".into()));
+                return Err(HarnessError::Unsupported("no Live Voice capability".into()));
             }
             lock(&self.live_requests).push(request);
             let (control_tx, mut control_rx) = mpsc::channel::<LiveVoiceControl>(16);
@@ -1676,6 +1676,10 @@ mod tests {
             core.sessions.session_status("active").unwrap().status,
             SessionStatus::Working
         );
+        // Base capability present, operational-context capability gone, run in
+        // flight: that is `ActiveRun`, not `UnsupportedOmp`. Collapsing the two
+        // is what made the tooltip say "update OMP" for a Live Voice that works
+        // fine the moment the run settles.
         harness.set_session_context_supported(false);
         assert_eq!(
             core.sessions
@@ -1683,7 +1687,7 @@ mod tests {
                 .await
                 .unwrap()
                 .reason,
-            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
+            Some(LiveVoiceUnavailableReason::ActiveRun)
         );
         core.sessions.interrupt("active").await.unwrap();
         assert!(

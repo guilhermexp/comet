@@ -189,6 +189,24 @@ pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
     if fullscreen { 12.0 } else { 88.0 }
 }
 
+/// Whether ⌘W archives the Worker session on screen instead of closing the
+/// window.
+///
+/// Deliberately blind to `Shell::route`: `render_main` returns the Workers
+/// content whenever the sidebar mode is Workers, **before** it looks at the
+/// route, so app Settings followed by the Workers switcher leaves
+/// `route == Settings` under a visible Workers workspace. Gating on
+/// `Route::Chat` made the shortcut dead exactly there, with no feedback.
+fn worker_archive_shortcut_enabled(
+    sidebar_mode: SidebarMode,
+    workers_route: WorkersRoute,
+    overlay_owns_keyboard: bool,
+) -> bool {
+    sidebar_mode == SidebarMode::Workers
+        && workers_route == WorkersRoute::Workspace
+        && !overlay_owns_keyboard
+}
+
 /// Width of the spacer ahead of the control cluster for a strip that already
 /// carries `container_pad` px of its own left padding. macOS only — on
 /// Linux/Windows there are no traffic lights and the cluster hugs the edge.
@@ -321,6 +339,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
+        // Closing a Worker session rides ⌘W, whose action (`CloseWindow`) is
+        // owned by AppKit's Window ▸ Close key equivalent — see the handler in
+        // `Shell::render`. Nothing to bind here.
     ]);
     // Cmd+1..Cmd+9 open the sidebar's first nine rows. A slot left unbound
     // binds nothing rather than falling back: the user cleared it on purpose.
@@ -7418,6 +7439,7 @@ impl Shell {
                             .band_top(Theme::TRANSCRIPT_FADE_BAND)
                             .band_bottom(bottom_band),
                         )
+                        .children(self.render_transcript_stall_notice(cx))
                         .children(self.render_jump_to_bottom(stack_h, cx))
                 },
             )
@@ -7467,6 +7489,62 @@ impl Shell {
                     })),
             )
             .into_any_element()
+    }
+
+    /// The transcript is not arriving and the watch is still retrying: say so
+    /// where the messages would be.
+    ///
+    /// An empty canvas is indistinguishable from "this chat has no messages",
+    /// which is how a second app instance on the same profile presented
+    /// itself — every `WatchDocMessages` answered `connection closed`, the log
+    /// filled up, and the surface said nothing.
+    fn render_transcript_stall_notice(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let chat_id = state.selected_chat.clone()?;
+        let reason = state.transcript_stall(&chat_id)?.to_owned();
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .absolute()
+                .top(px(Theme::TITLEBAR_HEIGHT + Theme::SPACE_MD))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(520.0))
+                        .px(px(Theme::SPACE_MD))
+                        .py(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .bg(theme.ink(0.85))
+                        .border_1()
+                        .border_color(theme.warning.opacity(0.5))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.warning)
+                                .child("Transcript not arriving — retrying"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(reason)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child("Another zeron instance on this profile owns the engine; close it and this heals."),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The "↓ Scroll to bottom" pill (round-9 §3): a LABELED rounded-full
@@ -7729,10 +7807,6 @@ impl Shell {
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let surface = self.resolved_right_active(cx);
-        let tab_strip = match surface {
-            RightSurface::Picker => gpui::Empty.into_any_element(),
-            _ => self.render_right_tab_strip(cx),
-        };
         let content: AnyElement = match surface {
             RightSurface::Diff(id) => self
                 .diffs
@@ -7824,9 +7898,10 @@ impl Shell {
             .bg(panel_bg)
             .overflow_hidden()
             // The titlebar is a glass overlay over the full-height content
-            // row; utility chrome starts below it.
+            // row, and the surface tabs ride INSIDE it (the header overlays in
+            // `render_session_title_bar` / the Workers bar). So this padding is
+            // the tab band itself, not dead space above one.
             .pt(px(Theme::TITLEBAR_HEIGHT))
-            .child(tab_strip)
             .child(div().flex_1().min_h_0().overflow_hidden().child(content));
         let target = self.right_target(cx);
         self.right_pane_container(
@@ -9282,6 +9357,39 @@ impl Render for Shell {
                     this.archive_selected_chat(cx)
                 }
             }))
+            // ⌘W closes what is on screen: with a Worker session in the viewer
+            // that means archiving it, and only when there is nothing to close
+            // does the keystroke fall through to the window itself. The action
+            // is `CloseWindow` because AppKit owns ⌘W as the key equivalent of
+            // the Window ▸ Close item and dispatches THAT action — binding a
+            // second action to the same combo would never be reached.
+            //
+            // Gated on the surface actually painted, NOT on `self.route`:
+            // `render_main` returns the Workers content whenever the sidebar
+            // mode is Workers, before it ever looks at the route, so opening
+            // app Settings and then switching to Workers leaves
+            // `route == Settings` under a visible Workers workspace. The
+            // Workers route still matters: its own Settings/Recent pages have
+            // no session to archive.
+            .on_action(
+                cx.listener(|this, _: &crate::app_menus::CloseWindow, _, cx| {
+                    if !worker_archive_shortcut_enabled(
+                        this.sidebar_mode,
+                        this.workers_model.read(cx).route,
+                        this.overlay_owns_keyboard(cx),
+                    ) {
+                        return;
+                    }
+                    let archived = this
+                        .workers_model
+                        .update(cx, |model, cx| model.archive_selected_session(cx));
+                    if archived {
+                        // Nothing else may see this keystroke, or the window
+                        // would close on top of the archive.
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             // A jump routes back to chat itself, so Settings is not a dead
             // spot — the same call a click on that sidebar row makes. But an
             // open picker/palette owns the keyboard: no jumping underneath
@@ -10164,6 +10272,44 @@ mod tests {
             titlebar_cluster_start(false),
             "the rendered row padding and spacer must land on the declared cluster start"
         );
+    }
+
+    #[test]
+    fn cmd_w_archives_a_worker_regardless_of_the_shell_route() {
+        use crate::workers::model::{WorkersRoute, WorkersSettingsTab};
+
+        // The case that was dead: app Settings was opened once, then the user
+        // switched to Workers. `render_main` paints the Workers workspace
+        // regardless, so the shortcut has to fire even though `Shell::route`
+        // still says Settings.
+        assert!(worker_archive_shortcut_enabled(
+            SidebarMode::Workers,
+            WorkersRoute::Workspace,
+            false
+        ));
+        // Orchestrator has its own archive verb on its own combo.
+        assert!(!worker_archive_shortcut_enabled(
+            SidebarMode::Orchestrator,
+            WorkersRoute::Workspace,
+            false
+        ));
+        // Workers' own pages have no session on screen to archive.
+        for route in [
+            WorkersRoute::Recent,
+            WorkersRoute::Settings(WorkersSettingsTab::Presets),
+        ] {
+            assert!(!worker_archive_shortcut_enabled(
+                SidebarMode::Workers,
+                route,
+                false
+            ));
+        }
+        // An open picker or palette owns the keyboard.
+        assert!(!worker_archive_shortcut_enabled(
+            SidebarMode::Workers,
+            WorkersRoute::Workspace,
+            true
+        ));
     }
 
     #[test]

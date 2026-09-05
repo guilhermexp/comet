@@ -23,6 +23,7 @@ use super::archive::{archived_sessions_for_project, restore_action};
 use super::notification_policy::{
     NotificationSample, NotificationState, WorkerNotification, reduce_notification,
 };
+use crate::workers::presentation::compare_sessions_by_activity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkersSettingsTab {
@@ -90,7 +91,11 @@ pub struct WorkersReveal {
 
 pub fn reconcile_selection(current: Option<&str>, sessions: &[WorkersSession]) -> Option<String> {
     current
-        .filter(|current| sessions.iter().any(|session| session.id == *current))
+        .filter(|current| {
+            sessions
+                .iter()
+                .any(|session| session.id == *current && !session.archived)
+        })
         .map(str::to_owned)
 }
 
@@ -118,19 +123,29 @@ pub fn selection_after_remove(
     if current != Some(removed_session_id) {
         return current.map(str::to_owned);
     }
-    let removed_index = sessions
+    let removed_session = sessions
+        .iter()
+        .find(|session| session.id == removed_session_id)?;
+    let project_id = &removed_session.project_id;
+    let target_archived = removed_session.archived;
+
+    let mut project_sessions: Vec<&WorkersSession> = sessions
+        .iter()
+        .filter(|session| session.project_id == *project_id && session.archived == target_archived)
+        .collect();
+    project_sessions.sort_by(|left, right| compare_sessions_by_activity(left, right));
+
+    let removed_index = project_sessions
         .iter()
         .position(|session| session.id == removed_session_id)?;
-    let project_id = &sessions[removed_index].project_id;
-    sessions
-        .iter()
-        .skip(removed_index + 1)
-        .find(|session| session.project_id == *project_id && !session.archived)
+    project_sessions
+        .get(removed_index + 1)
         .or_else(|| {
-            sessions[..removed_index]
-                .iter()
-                .rev()
-                .find(|session| session.project_id == *project_id && !session.archived)
+            if removed_index > 0 {
+                project_sessions.get(removed_index - 1)
+            } else {
+                None
+            }
         })
         .map(|session| session.id.clone())
 }
@@ -219,22 +234,82 @@ struct PendingReplacement {
     remaining_refreshes: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingRemove {
-    session_id: String,
-    archived: bool,
+pub type QueuedApply = Box<dyn FnOnce(&mut WorkersModel) + Send>;
+pub type QueuedOperation = Box<
+    dyn FnOnce(LocalWorkersClient) -> Result<QueuedApply, zeron_workers_unpeel::WorkersError>
+        + Send,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedActionKind {
+    Workspace,
+    Settings,
 }
 
-fn dispatch_or_queue_remove(
-    action_running: bool,
-    queued: &mut Option<PendingRemove>,
-    request: PendingRemove,
-) -> Option<PendingRemove> {
-    if action_running {
-        *queued = Some(request);
-        None
-    } else {
-        Some(request)
+pub struct QueuedAction {
+    pub operation: QueuedOperation,
+    pub kind: QueuedActionKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ActionDrain<T> {
+    Dispatch(T),
+    Complete {
+        refresh_workspace: bool,
+        refresh_settings: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct ActionQueue<T> {
+    queue: VecDeque<T>,
+    running: bool,
+    needs_refresh: bool,
+    needs_settings_refresh: bool,
+}
+
+impl<T> ActionQueue<T> {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            running: false,
+            needs_refresh: false,
+            needs_settings_refresh: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    pub fn enqueue(&mut self, action: T) -> Option<T> {
+        if self.running {
+            self.queue.push_back(action);
+            None
+        } else {
+            self.running = true;
+            Some(action)
+        }
+    }
+
+    pub fn finish_action(&mut self, kind: QueuedActionKind) -> ActionDrain<T> {
+        match kind {
+            QueuedActionKind::Workspace => self.needs_refresh = true,
+            QueuedActionKind::Settings => self.needs_settings_refresh = true,
+        }
+        if let Some(next) = self.queue.pop_front() {
+            ActionDrain::Dispatch(next)
+        } else {
+            self.running = false;
+            ActionDrain::Complete {
+                refresh_workspace: std::mem::take(&mut self.needs_refresh),
+                refresh_settings: std::mem::take(&mut self.needs_settings_refresh),
+            }
+        }
     }
 }
 
@@ -373,7 +448,7 @@ pub struct WorkersModel {
     refresh_task: Option<Task<()>>,
     refresh_requested: bool,
     action_task: Option<Task<()>>,
-    pending_remove: Option<PendingRemove>,
+    action_queue: ActionQueue<QueuedAction>,
     launch_queue: VecDeque<WorkersLaunchRequest>,
     launch_task: Option<Task<()>>,
     pending_launch_selection: Option<PendingLaunchSelection>,
@@ -449,7 +524,7 @@ impl WorkersModel {
             refresh_task: None,
             refresh_requested: false,
             action_task: None,
-            pending_remove: None,
+            action_queue: ActionQueue::new(),
             launch_queue: VecDeque::new(),
             launch_task: None,
             pending_launch_selection: None,
@@ -503,7 +578,9 @@ impl WorkersModel {
     }
 
     pub fn action_in_flight(&self) -> bool {
-        self.action_task.is_some() || self.launch_task.is_some() || !self.launch_queue.is_empty()
+        self.action_queue.is_running()
+            || self.launch_task.is_some()
+            || !self.launch_queue.is_empty()
     }
 
     pub fn has_attention(&self) -> bool {
@@ -598,7 +675,7 @@ impl WorkersModel {
         let selected = self.selected_session_id.as_deref()?;
         self.sessions()
             .iter()
-            .find(|session| session.id == selected)
+            .find(|session| session.id == selected && !session.archived)
     }
 
     pub fn appearance_settings(&self) -> WorkersAppearanceSettings {
@@ -1483,21 +1560,17 @@ impl WorkersModel {
             return;
         };
         let archived = std::mem::take(&mut self.confirming_remove_archived);
-        self.selected_session_id = selection_after_remove(
-            self.selected_session_id.as_deref(),
-            &session_id,
-            self.sessions(),
-        );
-        let request = PendingRemove {
-            session_id,
-            archived,
+        let sessions = if archived {
+            &self.archived_sessions
+        } else {
+            self.sessions()
         };
-        if let Some(request) = dispatch_or_queue_remove(
-            self.action_task.is_some(),
-            &mut self.pending_remove,
-            request,
-        ) {
-            self.dispatch_remove(request, cx);
+        self.selected_session_id =
+            selection_after_remove(self.selected_session_id.as_deref(), &session_id, sessions);
+        if archived {
+            self.remove_archived(session_id, cx);
+        } else {
+            self.remove(session_id, cx);
         }
         cx.notify();
     }
@@ -1540,6 +1613,34 @@ impl WorkersModel {
             },
             cx,
         );
+    }
+
+    /// Archive whatever session the viewer is showing and hand the viewer to
+    /// the neighbour that stays in the tree.
+    ///
+    /// Selection moves BEFORE the request: the archive round-trip takes a
+    /// refresh to land, and leaving the id selected in the meantime kept the
+    /// viewer on a session that had just left the list. `selection_after_remove`
+    /// is the right rule because archiving removes the row from the tree
+    /// exactly like a remove does — next live sibling in the same project,
+    /// previous one if it was the last, `None` when the project empties out.
+    /// Returns whether there was anything to archive.
+    pub fn archive_selected_session(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return false;
+        };
+        let Some(live) = self
+            .sessions()
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(WorkersSession::is_live)
+        else {
+            return false;
+        };
+        self.selected_session_id =
+            selection_after_remove(Some(&session_id), &session_id, self.sessions());
+        self.stop_and_archive(session_id, live, cx);
+        true
     }
 
     pub fn rename(&mut self, session_id: String, title: String, cx: &mut Context<Self>) {
@@ -1676,22 +1777,6 @@ impl WorkersModel {
         }
     }
 
-    fn dispatch_remove(&mut self, request: PendingRemove, cx: &mut Context<Self>) {
-        if request.archived {
-            self.remove_archived(request.session_id, cx);
-        } else {
-            self.remove(request.session_id, cx);
-        }
-    }
-
-    fn start_pending_remove(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(request) = self.pending_remove.take() else {
-            return false;
-        };
-        self.dispatch_remove(request, cx);
-        true
-    }
-
     fn prepare_replacement_for(&mut self, source: &WorkersSession) {
         self.pending_replacement = Some(PendingReplacement {
             source_id: source.id.clone(),
@@ -1778,9 +1863,7 @@ impl WorkersModel {
                 .sessions
                 .iter()
                 .any(|session| session.id == pending.source_id)
-                && pending.remaining_refreshes > 0
             {
-                pending.remaining_refreshes -= 1;
                 self.selected_session_id = Some(pending.source_id.clone());
                 self.pending_replacement = Some(pending);
             } else {
@@ -1878,6 +1961,54 @@ impl WorkersModel {
         self.run_action(operation, |_, ()| {}, cx);
     }
 
+    fn dispatch_action(&mut self, action: QueuedAction, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { (action.operation)(client) })
+                .await;
+            this.update(cx, |model, cx| {
+                match (action.kind, result) {
+                    (QueuedActionKind::Workspace, Ok(apply)) => {
+                        apply(model);
+                    }
+                    (QueuedActionKind::Workspace, Err(error)) => {
+                        model.pending_replacement = None;
+                        let error = error.to_string();
+                        model.error = Some(error.clone());
+                        model.post_refresh_error = Some(error);
+                    }
+                    (QueuedActionKind::Settings, Ok(apply)) => {
+                        apply(model);
+                    }
+                    (QueuedActionKind::Settings, Err(error)) => {
+                        model.settings_error = Some(error.to_string());
+                    }
+                }
+                match model.action_queue.finish_action(action.kind) {
+                    ActionDrain::Dispatch(next) => {
+                        model.dispatch_action(next, cx);
+                    }
+                    ActionDrain::Complete {
+                        refresh_workspace,
+                        refresh_settings,
+                    } => {
+                        model.action_task = None;
+                        if refresh_workspace {
+                            model.refresh(cx);
+                        }
+                        if refresh_settings {
+                            model.refresh_settings(cx);
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn run_action<T: Send + 'static>(
         &mut self,
         operation: impl FnOnce(LocalWorkersClient) -> Result<T, zeron_workers_unpeel::WorkersError>
@@ -1886,35 +2017,18 @@ impl WorkersModel {
         apply: impl FnOnce(&mut Self, T) + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        if self.action_task.is_some() {
-            return;
+        let queued_op: QueuedOperation = Box::new(move |client| {
+            let value = operation(client)?;
+            let apply_fn: QueuedApply = Box::new(move |model| apply(model, value));
+            Ok(apply_fn)
+        });
+        let action = QueuedAction {
+            operation: queued_op,
+            kind: QueuedActionKind::Workspace,
+        };
+        if let Some(immediate) = self.action_queue.enqueue(action) {
+            self.dispatch_action(immediate, cx);
         }
-        let client = self.client.clone();
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { operation(client) })
-                .await;
-            this.update(cx, |model, cx| {
-                model.action_task = None;
-                match result {
-                    Ok(value) => {
-                        apply(model, value);
-                    }
-                    Err(error) => {
-                        model.pending_replacement = None;
-                        let error = error.to_string();
-                        model.error = Some(error.clone());
-                        model.post_refresh_error = Some(error);
-                    }
-                }
-                if !model.start_pending_remove(cx) {
-                    model.refresh(cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 
     fn run_settings_action<T: Send + 'static>(
@@ -1924,29 +2038,18 @@ impl WorkersModel {
         + 'static,
         cx: &mut Context<Self>,
     ) {
-        if self.action_task.is_some() {
-            return;
+        let queued_op: QueuedOperation = Box::new(move |client| {
+            operation(client)?;
+            let apply_fn: QueuedApply = Box::new(|_| {});
+            Ok(apply_fn)
+        });
+        let action = QueuedAction {
+            operation: queued_op,
+            kind: QueuedActionKind::Settings,
+        };
+        if let Some(immediate) = self.action_queue.enqueue(action) {
+            self.dispatch_action(immediate, cx);
         }
-        let client = self.client.clone();
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { operation(client) })
-                .await;
-            this.update(cx, |model, cx| {
-                model.action_task = None;
-                match result {
-                    Ok(_) if !model.start_pending_remove(cx) => model.refresh_settings(cx),
-                    Ok(_) => {}
-                    Err(error) => model.settings_error = Some(error.to_string()),
-                }
-                if model.action_task.is_none() {
-                    model.start_pending_remove(cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 }
 
@@ -1961,13 +2064,13 @@ mod tests {
     };
 
     use super::{
-        PendingRemove, PendingReplacement, WorkersSessionTarget, WorkersSettingsTab,
-        claim_parent_notification_delivery, dispatch_or_queue_remove,
-        note_parent_notification_failure, notification_settings_for_snapshot,
-        parent_notification_retry_allowed, parent_notification_rpc_params, reconcile_selection,
-        reconcile_selection_with_pending, replacement_selection, resolve_session_target,
-        selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
-        toggle_expanded, worktree_setup_failure_message,
+        ActionDrain, ActionQueue, PendingReplacement, QueuedActionKind, WorkersSessionTarget,
+        WorkersSettingsTab, claim_parent_notification_delivery, note_parent_notification_failure,
+        notification_settings_for_snapshot, parent_notification_retry_allowed,
+        parent_notification_rpc_params, reconcile_selection, reconcile_selection_with_pending,
+        replacement_selection, resolve_session_target, selection_after_remove,
+        sessions_for_parent_chat_from_links, sessions_for_project, toggle_expanded,
+        worktree_setup_failure_message,
     };
 
     fn parent_notification() -> WorkerParentNotification {
@@ -2082,17 +2185,47 @@ mod tests {
     }
 
     #[test]
-    fn remove_is_queued_instead_of_dropped_while_another_action_finishes() {
-        let request = PendingRemove {
-            session_id: "session-1".into(),
-            archived: false,
-        };
-        let mut queued = None;
+    fn action_queue_dispatches_queued_actions_in_order() {
+        let mut queue: ActionQueue<&'static str> = ActionQueue::new();
+        assert_eq!(queue.enqueue("action-1"), Some("action-1"));
+        assert_eq!(queue.enqueue("action-2"), None);
+        assert_eq!(queue.enqueue("action-3"), None);
 
-        let immediate = dispatch_or_queue_remove(true, &mut queued, request.clone());
+        assert_eq!(
+            queue.finish_action(QueuedActionKind::Workspace),
+            ActionDrain::Dispatch("action-2")
+        );
+        assert_eq!(
+            queue.finish_action(QueuedActionKind::Workspace),
+            ActionDrain::Dispatch("action-3")
+        );
+        assert_eq!(
+            queue.finish_action(QueuedActionKind::Workspace),
+            ActionDrain::Complete {
+                refresh_workspace: true,
+                refresh_settings: false,
+            }
+        );
+    }
 
-        assert_eq!(immediate, None);
-        assert_eq!(queued, Some(request));
+    #[test]
+    fn action_queue_failure_does_not_swallow_subsequent_actions() {
+        let mut queue: ActionQueue<&'static str> = ActionQueue::new();
+        assert_eq!(queue.enqueue("failing-action"), Some("failing-action"));
+        assert_eq!(queue.enqueue("subsequent-action"), None);
+
+        // Even when the first action fails, finish_action drains the next queued action:
+        assert_eq!(
+            queue.finish_action(QueuedActionKind::Workspace),
+            ActionDrain::Dispatch("subsequent-action")
+        );
+        assert_eq!(
+            queue.finish_action(QueuedActionKind::Settings),
+            ActionDrain::Complete {
+                refresh_workspace: true,
+                refresh_settings: true,
+            }
+        );
     }
 
     fn session(id: &str, project_id: &str, live: bool) -> WorkersSession {
@@ -2228,10 +2361,19 @@ mod tests {
 
     #[test]
     fn removing_the_selected_session_selects_the_nearest_sibling_in_the_same_project() {
+        // Settled Workers, distinct settle stamps: the row order the sidebar
+        // shows is first > selected > next. Three Workers mid-run would all
+        // rank by their launch stamp instead — the point of the settle key.
+        let settled = |id: &str, at: u64| {
+            let mut s = session(id, "project", true);
+            s.activity = "done".to_owned();
+            s.idle_since_unix_ms = Some(at);
+            s
+        };
         let sessions = vec![
-            session("first", "project", true),
-            session("selected", "project", true),
-            session("next", "project", true),
+            settled("first", 300),
+            settled("selected", 200),
+            settled("next", 100),
             session("foreign", "other", true),
         ];
 
@@ -2259,6 +2401,89 @@ mod tests {
         assert_eq!(
             selection_after_remove(Some("selected"), "removed", &sessions).as_deref(),
             Some("selected")
+        );
+    }
+
+    #[test]
+    fn archiving_the_last_session_of_a_project_empties_the_viewer() {
+        // ⌘W on the only session in the project: there is nothing left to show,
+        // and the sibling in another project must not be pulled in.
+        let sessions = vec![
+            session("only", "project", false),
+            session("foreign", "other", true),
+        ];
+
+        assert_eq!(
+            selection_after_remove(Some("only"), "only", &sessions),
+            None
+        );
+    }
+
+    #[test]
+    fn archiving_hands_the_viewer_to_a_session_that_stays_visible() {
+        // An already archived neighbour is not in the tree, so handing the
+        // viewer to it would leave the surface on an invisible row.
+        let mut archived = session("archived", "project", false);
+        archived.archived = true;
+        let sessions = vec![
+            session("live", "project", true),
+            archived,
+            session("selected", "project", false),
+        ];
+
+        assert_eq!(
+            selection_after_remove(Some("selected"), "selected", &sessions).as_deref(),
+            Some("live")
+        );
+    }
+
+    #[test]
+    fn selection_after_remove_orders_by_activity_rather_than_raw_host_order() {
+        // Host order: ["low", "selected", "high"]
+        // Activity order: ["high", "selected", "low"]
+        let mut low = session("low", "project", true);
+        low.updated_at_unix_ms = 100;
+        let mut selected = session("selected", "project", true);
+        selected.updated_at_unix_ms = 200;
+        let mut high = session("high", "project", true);
+        high.updated_at_unix_ms = 300;
+
+        let sessions = vec![low, selected, high];
+
+        // In raw host order, next sibling would be "high".
+        // In activity order ("high" -> "selected" -> "low"), next sibling is "low".
+        assert_eq!(
+            selection_after_remove(Some("selected"), "selected", &sessions).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn selection_after_remove_handles_archived_session_list() {
+        let mut archived1 = session("archived-1", "project", false);
+        archived1.archived = true;
+        archived1.updated_at_unix_ms = 200;
+        let mut archived2 = session("archived-2", "project", false);
+        archived2.archived = true;
+        archived2.updated_at_unix_ms = 100;
+        let archived_sessions = vec![archived1, archived2];
+
+        assert_eq!(
+            selection_after_remove(Some("archived-1"), "archived-1", &archived_sessions).as_deref(),
+            Some("archived-2")
+        );
+    }
+
+    #[test]
+    fn reconcile_selection_discards_archived_session() {
+        let mut archived = session("archived", "project", false);
+        archived.archived = true;
+        let sessions = vec![session("live", "project", true), archived];
+
+        assert_eq!(reconcile_selection(Some("archived"), &sessions), None);
+        assert_eq!(
+            reconcile_selection(Some("live"), &sessions).as_deref(),
+            Some("live")
         );
     }
 

@@ -434,14 +434,118 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
 /// re-applying it on their merged output is harmless.
 fn autolink_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out = Vec::with_capacity(runs.len());
-    for run in runs {
-        if run.style.link.is_some() || run.style.code {
+    for mut run in runs {
+        if run.style.link.is_some() {
+            out.push(run);
+        } else if run.style.code {
+            if let Some(target) = crate::file_preview::model::is_file_path_candidate(&run.text) {
+                run.style.link = Some(target.to_string());
+            }
             out.push(run);
         } else {
             push_text_autolinked(&mut out, &run.text, &run.style);
         }
     }
     out
+}
+
+enum NextLink {
+    Url { at: usize, len: usize },
+    FilePath { at: usize, len: usize },
+}
+
+fn next_autolink(text: &str) -> Option<NextLink> {
+    let url_opt = find_url_start(text).and_then(|at| {
+        let from = &text[at..];
+        let scheme = if from.starts_with("https://") {
+            "https://".len()
+        } else {
+            "http://".len()
+        };
+        let len = bare_url_len(from);
+        if len > scheme { Some((at, len)) } else { None }
+    });
+
+    let file_opt = find_file_path(text);
+
+    match (url_opt, file_opt) {
+        (Some((u_at, u_len)), Some((f_at, f_len))) => {
+            if u_at <= f_at {
+                Some(NextLink::Url {
+                    at: u_at,
+                    len: u_len,
+                })
+            } else {
+                Some(NextLink::FilePath {
+                    at: f_at,
+                    len: f_len,
+                })
+            }
+        }
+        (Some((u_at, u_len)), None) => Some(NextLink::Url {
+            at: u_at,
+            len: u_len,
+        }),
+        (None, Some((f_at, f_len))) => Some(NextLink::FilePath {
+            at: f_at,
+            len: f_len,
+        }),
+        (None, None) => None,
+    }
+}
+
+fn find_file_path(text: &str) -> Option<(usize, usize)> {
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let remainder = &text[cursor..];
+        let Some(first_non_ws) = remainder.find(|c: char| !c.is_whitespace()) else {
+            break;
+        };
+        let start = cursor + first_non_ws;
+        let boundary = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+        if !boundary {
+            cursor = start + 1;
+            continue;
+        }
+
+        let token_slice = &text[start..];
+        let token_end = token_slice
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`'))
+            .map_or(token_slice.len(), |(i, _)| i);
+        let mut raw_token = &token_slice[..token_end];
+
+        while let Some(last) = raw_token.chars().next_back() {
+            let trim = match last {
+                '.' | ',' | ';' | '!' | '?' | '*' | '_' | '~' => true,
+                ')' => raw_token.matches('(').count() < raw_token.matches(')').count(),
+                ']' => raw_token.matches('[').count() < raw_token.matches(']').count(),
+                ':' => !raw_token.rsplit_once(':').map_or(false, |(_, s)| {
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                }),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            raw_token = &raw_token[..raw_token.len() - last.len_utf8()];
+        }
+
+        if !raw_token.is_empty()
+            && !raw_token.contains("://")
+            && !raw_token.starts_with('#')
+            && crate::file_preview::model::is_file_path_candidate(raw_token).is_some()
+        {
+            return Some((start, raw_token.len()));
+        }
+
+        cursor = start + token_end.max(1);
+    }
+    None
 }
 
 fn push_text_autolinked(runs: &mut Vec<InlineRun>, text: &str, style: &InlineStyle) {
@@ -454,25 +558,16 @@ fn push_text_autolinked(runs: &mut Vec<InlineRun>, text: &str, style: &InlineSty
         }
     };
     let mut rest = text;
-    while let Some(at) = find_url_start(rest) {
-        let from = &rest[at..];
-        let scheme = if from.starts_with("https://") {
-            "https://".len()
-        } else {
-            "http://".len()
+    while let Some(link) = next_autolink(rest) {
+        let (at, len) = match link {
+            NextLink::Url { at, len } => (at, len),
+            NextLink::FilePath { at, len } => (at, len),
         };
-        let len = bare_url_len(from);
-        if len <= scheme {
-            // A scheme with nothing after it stays text (don't re-find it).
-            push(runs, &rest[..at + scheme], style.clone());
-            rest = &from[scheme..];
-            continue;
-        }
         push(runs, &rest[..at], style.clone());
         let mut linked = style.clone();
-        linked.link = Some(from[..len].to_string());
-        push(runs, &from[..len], linked);
-        rest = &from[len..];
+        linked.link = Some(rest[at..at + len].to_string());
+        push(runs, &rest[at..at + len], linked);
+        rest = &rest[at + len..];
     }
     push(runs, rest, style.clone());
 }
@@ -1002,6 +1097,32 @@ mod tests {
         assert_eq!(
             only_link("[https://shown.dev](https://real.dev)\n"),
             Some(("https://shown.dev".into(), "https://real.dev".into()))
+        );
+    }
+
+    #[test]
+    fn file_paths_autolink_in_code_and_plain_text() {
+        assert_eq!(
+            only_link("Saved to `~/.orchestrator/outputs/emissao-remota-tutor.png`.\n"),
+            Some((
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into(),
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Saved to ~/.orchestrator/outputs/emissao-remota-tutor.png.\n"),
+            Some((
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into(),
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Inspect `src/main.rs` for details\n"),
+            Some(("src/main.rs".into(), "src/main.rs".into()))
+        );
+        assert_eq!(
+            only_link("See /tmp/output.png now\n"),
+            Some(("/tmp/output.png".into(), "/tmp/output.png".into()))
         );
     }
 

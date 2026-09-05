@@ -769,12 +769,14 @@ impl Engine {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
             // on quiescence so a restart never lands under a live run or open PTY.
-            let quiescent: zeron_update::QuiescentCheck = {
-                let sessions = core.sessions.clone();
-                let terminals = core.terminals.clone();
-                Arc::new(move || !sessions.any_active() && !terminals.any_open())
-            };
-            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            let sessions = core.sessions.clone();
+            let terminals = core.terminals.clone();
+            let gate = zeron_update::RestartGate::new(Some(Arc::new(move || {
+                !sessions.any_active() && !terminals.any_open()
+            })));
+            core.sessions.set_restart_gate(gate.clone());
+            core.terminals.set_restart_gate(gate.clone());
+            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(gate));
             if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
                 let updater_for_tokens = updater.clone();
                 let wake = tokio::spawn(async move {

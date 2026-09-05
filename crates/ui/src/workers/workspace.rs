@@ -27,9 +27,13 @@ use super::presentation::{
     HOSTED_SIDEBAR_TOP_PADDING, PROJECT_ROW_BASE_LEADING, SESSION_ROW_BASE_LEADING,
     SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
     SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
-    SessionIndicator, relative_age, runtime_icon_path, runtime_spinner_tint, session_indicator,
-    session_title_truncate, spinner_frame,
+    SessionIndicator, compare_sessions_by_activity, relative_age, runtime_icon_path,
+    runtime_spinner_tint, session_indicator, session_title_truncate, spinner_frame,
 };
+
+/// Deepest parent chain the sidebar walks. Same guard as [`project_depth`] and
+/// [`project_visible`]: a cycle in `parent_project_id` must not hang the render.
+const MAX_PROJECT_DEPTH: usize = 8;
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
 use super::resource_monitor::{PressureAction, WorkersResourceGlobal};
@@ -48,7 +52,7 @@ fn project_depth(project: &WorkersProject, projects: &[WorkersProject]) -> usize
             break;
         };
         depth += 1;
-        if depth >= 8 {
+        if depth >= MAX_PROJECT_DEPTH {
             break;
         }
         parent = project.parent_project_id.as_deref();
@@ -115,17 +119,233 @@ fn project_visible(
         };
         parent = project.parent_project_id.as_deref();
         depth += 1;
-        if depth >= 8 {
-            break;
+        if depth >= MAX_PROJECT_DEPTH {
+            return false;
         }
     }
     true
+}
+
+/// Session rows rendered for an expanded project before the reveal control
+/// takes over. One busy project used to expand into every session it owns and
+/// push the rest of the tree off-screen.
+const SESSION_ROW_CAP: usize = 5;
+
+/// Which session indices to render for an expanded project, and how many stay
+/// hidden behind the reveal control.
+///
+/// `Some(hidden)` means the control belongs at the end of the list; `None`
+/// means every session is on screen. The selected session is always among the
+/// visible rows even when its rank exceeds [`SESSION_ROW_CAP`]: a row nobody
+/// can see must not be the one ⌘W archives.
+pub fn project_session_row_plan(
+    total: usize,
+    selected_index: Option<usize>,
+    revealed: bool,
+) -> (Vec<usize>, Option<usize>) {
+    if total <= SESSION_ROW_CAP {
+        return ((0..total).collect(), None);
+    }
+    if revealed {
+        return (
+            (0..total).collect(),
+            Some(total.saturating_sub(SESSION_ROW_CAP)),
+        );
+    }
+    let mut visible: Vec<usize> = (0..SESSION_ROW_CAP).collect();
+    if let Some(selected) = selected_index {
+        if selected >= SESSION_ROW_CAP && selected < total {
+            visible.push(selected);
+        }
+    }
+    let hidden = total.saturating_sub(visible.len());
+    let hidden_count = if hidden > 0 { Some(hidden) } else { None };
+    (visible, hidden_count)
+}
+
+/// Filters non-archived sessions for a project and applies the project's chosen sort order.
+pub fn project_sessions_sorted(
+    project: &WorkersProject,
+    sessions: &[WorkersSession],
+) -> Vec<WorkersSession> {
+    let mut project_sessions = sessions
+        .iter()
+        .filter(|session| session.project_id == project.id && !session.archived)
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches!(project.session_sort, WorkersSessionSort::RecentlyUpdated) {
+        project_sessions.sort_by(compare_sessions_by_activity);
+    }
+    project_sessions
+}
+
+fn prune_revealed_projects(
+    revealed_projects: &mut std::collections::HashSet<String>,
+    projects: &[WorkersProject],
+) {
+    let live_project_ids: std::collections::HashSet<&str> =
+        projects.iter().map(|project| project.id.as_str()).collect();
+    revealed_projects.retain(|id| live_project_ids.contains(id.as_str()));
+}
+
+/// Whether a project earns a row in the sidebar working set.
+///
+/// A project with no live session is noise here: fourteen "No sessions yet."
+/// rows pushed the projects that actually have workers off-screen. The durable
+/// ledger is NOT touched — the project stays in Settings › Projects, and
+/// re-adding the same path (or launching into it) brings the row back with its
+/// archive drawer. Kept alive regardless:
+/// - a group whose subtree owns a live session, because dropping the folder
+///   would orphan the row nested under it;
+/// - the project the user just selected or aimed the launcher at, which is
+///   empty precisely because they are about to launch into it.
+///
+/// Archived sessions deliberately do NOT keep a row: a project whose workers
+/// all finished and were archived is exactly the row the user asked to stop
+/// seeing, and `archived_session_count > 0` held most of them on screen.
+pub fn project_has_working_set(
+    project: &WorkersProject,
+    projects: &[WorkersProject],
+    sessions: &[WorkersSession],
+    selected_project_id: Option<&str>,
+    launcher_project_id: Option<&str>,
+) -> bool {
+    if selected_project_id == Some(project.id.as_str())
+        || launcher_project_id == Some(project.id.as_str())
+    {
+        return true;
+    }
+    sessions
+        .iter()
+        .filter(|session| !session.archived)
+        .any(|session| {
+            let mut current = Some(session.project_id.as_str());
+            let mut depth = 0;
+            while let Some(id) = current {
+                if id == project.id {
+                    return true;
+                }
+                // Same cycle/runaway guard the rest of the tree walks use.
+                depth += 1;
+                if depth >= MAX_PROJECT_DEPTH {
+                    return false;
+                }
+                current = projects
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .and_then(|candidate| candidate.parent_project_id.as_deref());
+            }
+            false
+        })
+}
+
+/// Newest SETTLE per project, folded up the parent chain.
+///
+/// A group owns no sessions of its own, so without the fold every folder would
+/// rank as inactive and sink below the projects nested inside it. Archived
+/// sessions are excluded because they are not rendered either. The key is
+/// [`session_settled_at`], not `updated_at_unix_ms`: a folder must not overtake
+/// its neighbours just because a Worker inside it printed a line.
+fn project_activity(
+    projects: &[WorkersProject],
+    sessions: &[WorkersSession],
+) -> HashMap<String, u64> {
+    let mut activity: HashMap<String, u64> = HashMap::new();
+    for session in sessions.iter().filter(|session| !session.archived) {
+        let mut current = Some(session.project_id.as_str());
+        let mut depth = 0;
+        while let Some(id) = current {
+            let entry = activity.entry(id.to_owned()).or_default();
+            *entry = (*entry).max(crate::workers::presentation::session_settled_at(session));
+            depth += 1;
+            if depth >= MAX_PROJECT_DEPTH {
+                break;
+            }
+            current = projects
+                .iter()
+                .find(|project| project.id == id)
+                .and_then(|project| project.parent_project_id.as_deref());
+        }
+    }
+    activity
+}
+
+/// The parent a project actually has in this snapshot. A `parent_project_id`
+/// pointing at a project the host did not return makes the project a root here,
+/// exactly as [`project_visible`] already treats it — otherwise the tree walk
+/// would drop the row entirely.
+fn resolved_parent<'a>(
+    project: &'a WorkersProject,
+    projects: &[WorkersProject],
+) -> Option<&'a str> {
+    project
+        .parent_project_id
+        .as_deref()
+        .filter(|parent| projects.iter().any(|candidate| candidate.id == *parent))
+}
+
+/// Flat project list re-ordered by activity, depth-first.
+///
+/// Depth-first is what keeps a child beside its parent: siblings rank by their
+/// own subtree activity, and siblings with no activity at all fall back to the
+/// order the host persisted, so manual arrangement still decides among equally
+/// idle projects.
+fn projects_ordered_by_activity(
+    projects: &[WorkersProject],
+    sessions: &[WorkersSession],
+) -> Vec<WorkersProject> {
+    let activity = project_activity(projects, sessions);
+    let mut ordered: Vec<WorkersProject> = Vec::with_capacity(projects.len());
+    push_project_level(None, projects, &activity, 0, &mut ordered);
+    // A cycle or a chain deeper than the guard stops the walk mid-tree; the
+    // rows it did not reach are appended in host order rather than vanishing.
+    if ordered.len() < projects.len() {
+        for project in projects {
+            if !ordered.iter().any(|emitted| emitted.id == project.id) {
+                ordered.push(project.clone());
+            }
+        }
+    }
+    ordered
+}
+
+fn push_project_level(
+    parent: Option<&str>,
+    projects: &[WorkersProject],
+    activity: &HashMap<String, u64>,
+    depth: usize,
+    ordered: &mut Vec<WorkersProject>,
+) {
+    if depth >= MAX_PROJECT_DEPTH {
+        return;
+    }
+    let mut level = projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| resolved_parent(project, projects) == parent)
+        .collect::<Vec<_>>();
+    // `None` sorts below `Some`, so descending by the optional key puts every
+    // project with activity ahead of every project without any.
+    level.sort_by(|(left_index, left), (right_index, right)| {
+        activity
+            .get(&right.id)
+            .cmp(&activity.get(&left.id))
+            .then_with(|| left_index.cmp(right_index))
+    });
+    for (_, project) in level {
+        ordered.push(project.clone());
+        push_project_level(Some(&project.id), projects, activity, depth + 1, ordered);
+    }
 }
 
 pub struct WorkersSidebar {
     model: Entity<WorkersModel>,
     content: Entity<WorkersContent>,
     picker_task: Option<Task<()>>,
+    /// Projects whose session list is revealed past [`SESSION_ROW_CAP`].
+    /// View-local and volatile, like the Orchestrator's archived page size:
+    /// collapsing the project drops the entry, so reopening it starts capped.
+    revealed_projects: std::collections::HashSet<String>,
     _spinner_task: Task<()>,
     _model_observation: Subscription,
 }
@@ -136,7 +356,10 @@ impl WorkersSidebar {
         content: Entity<WorkersContent>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let model_observation = cx.observe(&model, |_, _, cx| cx.notify());
+        let model_observation = cx.observe(&model, |this, model, cx| {
+            prune_revealed_projects(&mut this.revealed_projects, model.read(cx).projects());
+            cx.notify();
+        });
         let spinner_task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -151,6 +374,7 @@ impl WorkersSidebar {
             model,
             content,
             picker_task: None,
+            revealed_projects: std::collections::HashSet::new(),
             _spinner_task: spinner_task,
             _model_observation: model_observation,
         }
@@ -429,10 +653,15 @@ impl WorkersSidebar {
         let menu_sessions = sessions.clone();
         let menu_project = project.clone();
         let menu_content = self.content.clone();
-        let rows = sessions
+        let selected_index =
+            selected_session_id.and_then(|id| sessions.iter().position(|session| session.id == id));
+        let revealed = self.revealed_projects.contains(&project.id);
+        let (visible_indices, hidden_sessions) =
+            project_session_row_plan(sessions.len(), selected_index, revealed);
+        let rows = visible_indices
             .into_iter()
-            .enumerate()
-            .map(|(session_index, session)| {
+            .map(|session_index| {
+                let session = sessions[session_index].clone();
                 self.render_session(
                     session,
                     selected_session_id,
@@ -443,6 +672,9 @@ impl WorkersSidebar {
                 )
             })
             .collect::<Vec<_>>();
+        let reveal_control = hidden_sessions.map(|hidden| {
+            self.render_session_reveal(&project.id, hidden, revealed, depth, index, theme, cx)
+        });
 
         let terminal_project_id = project.id.clone();
         let terminal_worktree_path = project
@@ -546,6 +778,9 @@ impl WorkersSidebar {
                     .cursor_pointer()
                     .hover(|el| el.bg(crate::theme::ink(0.10)))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if expanded {
+                            this.revealed_projects.remove(&toggle_project_id);
+                        }
                         this.model.update(cx, |model, cx| {
                             if !is_group {
                                 model.select_project(select_project_id.clone(), cx);
@@ -691,9 +926,61 @@ impl WorkersSidebar {
                             .child("No sessions yet."),
                     )
                 } else {
-                    el.children(rows)
+                    el.children(rows).children(reveal_control)
                 }
             })
+            .into_any_element()
+    }
+
+    /// The `Show N more` / `Show less` row that ends a capped session list.
+    /// Styled off the session row metrics so it reads as the last child of the
+    /// project, not as a floating button.
+    fn render_session_reveal(
+        &self,
+        project_id: &str,
+        hidden: usize,
+        revealed: bool,
+        depth: usize,
+        index: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = if revealed {
+            SharedString::from("Show less")
+        } else {
+            SharedString::from(format!("Show {hidden} more"))
+        };
+        let toggle_id = project_id.to_owned();
+        div()
+            .id(("workers-session-reveal", index))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(px(
+                SESSION_ROW_BASE_LEADING + depth as f32 * SIDEBAR_NESTING_STEP
+            ))
+            .pr(px(5.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(SIDEBAR_ROW_RADIUS))
+            .cursor_pointer()
+            .text_size(px(11.0))
+            .text_color(theme.text_faint)
+            .hover(|el| el.bg(crate::theme::ink(0.08)).text_color(theme.text_muted))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.revealed_projects.remove(&toggle_id) {
+                    this.revealed_projects.insert(toggle_id.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                // `icons::icon` paints only with a color on the svg itself —
+                // the parent's `text_color` never cascades into it.
+                icon(if revealed { icons::MINUS } else { icons::PLUS })
+                    .size(px(11.0))
+                    .flex_none()
+                    .text_color(theme.text_faint),
+            )
+            .child(label)
             .into_any_element()
     }
 
@@ -810,7 +1097,14 @@ impl WorkersSidebar {
                 }),
             SessionIndicator::Restarting => theme.text_muted,
             SessionIndicator::Attention => theme.warning,
-            SessionIndicator::Unread => theme.accent,
+            // Blue, not the configured accent: this dot means "finished, not
+            // opened yet" and has to read the same whatever accent family the
+            // user picked. The pair comes from the folder palette so light and
+            // dark both get a tone that survives their background.
+            SessionIndicator::Unread => {
+                project_folder_tint(Some("blue"), theme.appearance.is_dark())
+                    .unwrap_or(theme.accent)
+            }
             SessionIndicator::Idle => gpui::transparent_black(),
             SessionIndicator::Exited => theme.text_faint.opacity(0.45),
         };
@@ -819,7 +1113,13 @@ impl WorkersSidebar {
             .unwrap_or_default()
             .as_millis() as u64;
         let runtime_icon = runtime_icon_path(runtime_id, Some(session.command.as_str()));
-        let age = relative_age(session.updated_at_unix_ms, now_ms);
+        // Same stamp the row is RANKED by, so the age can never disagree with
+        // the position: "13s" on a settled Worker reads as "finished 13s ago",
+        // and a Worker mid-run holds the age of its launch.
+        let age = relative_age(
+            crate::workers::presentation::session_settled_at(&session),
+            now_ms,
+        );
         let session_target = WorkersSessionTarget::new(&session.project_id, &session.id);
         let menu_session_target = session_target.clone();
 
@@ -942,12 +1242,24 @@ impl Render for WorkersSidebar {
         if let WorkersRoute::Settings(tab) = route {
             return self.render_settings_nav(tab, &theme, cx);
         }
-        let (loading, error, selected_session_id, expanded, projects, all_sessions, presets) = {
+        let (
+            loading,
+            error,
+            selected_session_id,
+            selected_project_id,
+            launcher_project_id,
+            expanded,
+            projects,
+            all_sessions,
+            presets,
+        ) = {
             let model = self.model.read(cx);
             (
                 model.loading,
                 model.error.clone(),
                 model.selected_session_id.clone(),
+                model.selected_project_id.clone(),
+                model.launcher_project_id.clone(),
                 model.expanded_project_ids.clone(),
                 model.projects().to_vec(),
                 model.sessions().to_vec(),
@@ -955,17 +1267,26 @@ impl Render for WorkersSidebar {
             )
         };
 
-        let rows = projects
+        // Presentation-only projection: the snapshot keeps the host's order, so
+        // the persisted sibling order and per-project session sort on disk are
+        // untouched.
+        let ordered_projects = projects_ordered_by_activity(&projects, &all_sessions);
+        let rows = ordered_projects
             .iter()
-            .filter(|project| project_visible(project, &projects, &expanded))
+            .filter(|project| {
+                project_visible(project, &projects, &expanded)
+                    && project_has_working_set(
+                        project,
+                        &projects,
+                        &all_sessions,
+                        selected_project_id.as_deref(),
+                        launcher_project_id.as_deref(),
+                    )
+            })
             .cloned()
             .enumerate()
             .map(|(index, project)| {
-                let sessions = all_sessions
-                    .iter()
-                    .filter(|session| session.project_id == project.id && !session.archived)
-                    .cloned()
-                    .collect();
+                let sessions = project_sessions_sorted(&project, &all_sessions);
                 self.render_project(
                     project.clone(),
                     sessions,
@@ -1120,6 +1441,7 @@ impl Render for WorkersSidebar {
                             .opacity(if expanded.is_empty() { 0.4 } else { 1.0 })
                             .hover(|el| el.bg(crate::theme::ink(0.10)))
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.revealed_projects.clear();
                                 this.model
                                     .update(cx, |model, cx| model.collapse_all_projects(cx));
                             }))
@@ -1208,11 +1530,27 @@ impl WorkersContent {
         let model_observation = cx.observe(&model, {
             let terminal = terminal.clone();
             move |this, model, cx| {
-                let session_id = model.read(cx).selected_session_id.clone();
-                terminal.update(cx, |terminal, cx| terminal.set_session(session_id, cx));
-                if this.gallery_session_id != model.read(cx).selected_session_id
-                    || !matches!(model.read(cx).route, WorkersRoute::Workspace)
-                {
+                // The read borrow has to end before `terminal.update` takes `cx`
+                // mutably, so every field this observer needs is copied out here.
+                let (session_id, live_ids, on_workspace) = {
+                    let model = model.read(cx);
+                    let live_ids: std::collections::HashSet<String> = model
+                        .sessions()
+                        .iter()
+                        .filter(|session| !session.archived)
+                        .map(|session| session.id.clone())
+                        .collect();
+                    (
+                        model.selected_session_id.clone(),
+                        live_ids,
+                        matches!(model.route, WorkersRoute::Workspace),
+                    )
+                };
+                terminal.update(cx, |terminal, cx| {
+                    terminal.retain_sessions(&live_ids);
+                    terminal.set_session(session_id.clone(), cx);
+                });
+                if this.gallery_session_id != session_id || !on_workspace {
                     this.close_session_gallery(cx);
                 }
                 cx.notify();
@@ -2085,10 +2423,17 @@ impl WorkersContent {
             SessionMenuItem::CopyTranscript50 => self.copy_transcript(session.id, Some(50), cx),
             SessionMenuItem::CopyTranscriptAll => self.copy_transcript(session.id, Some(0), cx),
             SessionMenuItem::StopAndArchive | SessionMenuItem::Archive => {
-                let is_live = session.is_live();
-                self.model.update(cx, |model, cx| {
-                    model.stop_and_archive(session.id, is_live, cx)
-                });
+                let is_selected =
+                    self.model.read(cx).selected_session_id.as_deref() == Some(session.id.as_str());
+                if is_selected {
+                    self.model
+                        .update(cx, |model, cx| model.archive_selected_session(cx));
+                } else {
+                    let is_live = session.is_live();
+                    self.model.update(cx, |model, cx| {
+                        model.stop_and_archive(session.id, is_live, cx)
+                    });
+                }
             }
             SessionMenuItem::RestoreAndResume => {
                 self.model
@@ -3835,5 +4180,425 @@ mod layout_tests {
             project_folder_tint(Some("sky"), true)
         );
         assert!(project_folder_tint(Some("unknown"), true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::{
+        SESSION_ROW_CAP, compare_sessions_by_activity, project_activity, project_has_working_set,
+        project_session_row_plan, project_sessions_sorted, project_visible,
+        projects_ordered_by_activity, prune_revealed_projects,
+    };
+    use zeron_workers_unpeel::{
+        WorkersProject, WorkersSession, WorkersSessionCapabilities, WorkersSessionSort,
+    };
+
+    fn project(id: &str, parent: Option<&str>) -> WorkersProject {
+        WorkersProject {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/tmp/{id}"),
+            folder_id: None,
+            parent_project_id: parent.map(str::to_owned),
+            is_group: parent.is_some(),
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        }
+    }
+
+    fn session(id: &str, project_id: &str, updated: u64, created: u64) -> WorkersSession {
+        WorkersSession {
+            id: id.to_owned(),
+            project_id: project_id.to_owned(),
+            title: id.to_owned(),
+            command: "zsh".to_owned(),
+            state: "exited".to_owned(),
+            activity: "idle".to_owned(),
+            unread: false,
+            pinned: false,
+            archived: false,
+            provider_id: None,
+            active_runtime_id: None,
+            runtime_launch_pending: false,
+            runtime_generation: 1,
+            notify_when_done: false,
+            terminal_background_hex: None,
+            worktree_branch: None,
+            created_at_unix_ms: created,
+            updated_at_unix_ms: updated,
+            idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
+            total_tokens: None,
+            model_usage: Vec::new(),
+            capabilities: WorkersSessionCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn empty_projects_leave_the_sidebar_working_set() {
+        let projects = vec![project("busy", None), project("empty", None)];
+        let sessions = vec![session("s1", "busy", 100, 100)];
+
+        assert!(project_has_working_set(
+            &projects[0],
+            &projects,
+            &sessions,
+            None,
+            None
+        ));
+        assert!(!project_has_working_set(
+            &projects[1],
+            &projects,
+            &sessions,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_group_stays_while_its_subtree_owns_a_session() {
+        // Dropping the folder would orphan the row nested under it.
+        let projects = vec![project("group", None), project("child", Some("group"))];
+        let sessions = vec![session("s1", "child", 100, 100)];
+
+        assert!(project_has_working_set(
+            &projects[0],
+            &projects,
+            &sessions,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_project_whose_sessions_were_all_archived_loses_its_row() {
+        // This is the row the user asked to stop seeing: the workers finished
+        // and were archived, so the project reads "No sessions yet."
+        let mut projects = vec![project("only-archived", None)];
+        projects[0].archived_session_count = 2;
+        let mut archived = session("s1", "only-archived", 100, 100);
+        archived.archived = true;
+
+        assert!(!project_has_working_set(
+            &projects[0],
+            &projects,
+            &[archived],
+            None,
+            None
+        ));
+
+        // Selecting it brings the row — and its archive drawer — back.
+        assert!(project_has_working_set(
+            &projects[0],
+            &projects,
+            &[],
+            Some("only-archived"),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_freshly_added_project_stays_until_it_owns_a_session() {
+        // Just added or aimed at by the launcher: it is empty precisely because
+        // the user is about to launch into it, and hiding it would hide the
+        // launcher too.
+        let projects = vec![project("new", None)];
+
+        assert!(project_has_working_set(
+            &projects[0],
+            &projects,
+            &[],
+            Some("new"),
+            None
+        ));
+        assert!(project_has_working_set(
+            &projects[0],
+            &projects,
+            &[],
+            None,
+            Some("new")
+        ));
+        assert!(!project_has_working_set(
+            &projects[0],
+            &projects,
+            &[],
+            None,
+            None
+        ));
+    }
+
+    fn order(sessions: &[WorkersSession]) -> Vec<String> {
+        let mut sorted = sessions.to_vec();
+        sorted.sort_by(compare_sessions_by_activity);
+        sorted.into_iter().map(|session| session.id).collect()
+    }
+
+    fn project_ids(projects: &[WorkersProject], sessions: &[WorkersSession]) -> Vec<String> {
+        projects_ordered_by_activity(projects, sessions)
+            .into_iter()
+            .map(|project| project.id)
+            .collect()
+    }
+
+    #[test]
+    fn sessions_sorted_by_activity_newest_first() {
+        let sessions = vec![
+            session("old", "p", 100, 100),
+            session("newest", "p", 900, 100),
+            session("middle", "p", 400, 100),
+        ];
+
+        assert_eq!(order(&sessions), ["newest", "middle", "old"]);
+    }
+
+    #[test]
+    fn sessions_with_equal_activity_break_ties_deterministically() {
+        let sessions = vec![
+            session("b-older-create", "p", 500, 100),
+            session("a-same-create", "p", 500, 200),
+            session("c-same-create", "p", 500, 200),
+        ];
+
+        let first = order(&sessions);
+        assert_eq!(first, ["a-same-create", "c-same-create", "b-older-create"]);
+        // Total order: re-running on the same input cannot reshuffle.
+        assert_eq!(order(&sessions), first);
+    }
+
+    #[test]
+    fn projects_sorted_by_newest_session_activity() {
+        let projects = vec![project("stale", None), project("fresh", None)];
+        let sessions = vec![
+            session("s1", "stale", 100, 100),
+            session("s2", "fresh", 900, 100),
+        ];
+
+        assert_eq!(project_ids(&projects, &sessions), ["fresh", "stale"]);
+    }
+
+    #[test]
+    fn group_inherits_descendant_activity() {
+        let projects = vec![
+            project("plain", None),
+            project("group", None),
+            project("child", Some("group")),
+        ];
+        let sessions = vec![
+            session("s1", "plain", 100, 100),
+            session("s2", "child", 900, 100),
+        ];
+
+        // The group holds no sessions of its own but leads on its child's
+        // activity, and the child stays directly beneath it.
+        assert_eq!(
+            project_ids(&projects, &sessions),
+            ["group", "child", "plain"]
+        );
+    }
+
+    #[test]
+    fn projects_without_activity_keep_host_order_last() {
+        let projects = vec![
+            project("empty-first", None),
+            project("empty-second", None),
+            project("busy", None),
+        ];
+        let sessions = vec![session("s1", "busy", 500, 100)];
+
+        assert_eq!(
+            project_ids(&projects, &sessions),
+            ["busy", "empty-first", "empty-second"]
+        );
+    }
+
+    #[test]
+    fn archived_sessions_do_not_rank_projects() {
+        let projects = vec![project("archived-only", None), project("live", None)];
+        let mut archived = session("s1", "archived-only", 900, 100);
+        archived.archived = true;
+        let sessions = vec![archived, session("s2", "live", 100, 100)];
+
+        assert!(
+            project_activity(&projects, &sessions)
+                .get("archived-only")
+                .is_none()
+        );
+        assert_eq!(project_ids(&projects, &sessions), ["live", "archived-only"]);
+    }
+
+    #[test]
+    fn orphaned_child_projects_still_render() {
+        // `parent_project_id` pointing at a project the host did not return
+        // must not drop the row: `project_visible` already treats it as a root.
+        let projects = vec![project("orphan", Some("missing")), project("root", None)];
+        let sessions = vec![session("s1", "root", 500, 100)];
+
+        let ids = project_ids(&projects, &sessions);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"orphan".to_owned()));
+    }
+
+    #[test]
+    fn session_rows_cap_at_five_with_remaining_count() {
+        let (visible, hidden) = project_session_row_plan(12, None, false);
+        assert_eq!(visible.len(), SESSION_ROW_CAP);
+        assert_eq!(hidden, Some(7));
+    }
+
+    #[test]
+    fn revealing_a_project_shows_every_session() {
+        // Revealed keeps the control (now "Show less") so the list can be
+        // capped again without collapsing the whole project.
+        let (visible, hidden) = project_session_row_plan(12, None, true);
+        assert_eq!(visible.len(), 12);
+        assert_eq!(hidden, Some(7));
+    }
+
+    #[test]
+    fn projects_at_or_below_the_cap_have_no_reveal_control() {
+        for total in 0..=SESSION_ROW_CAP {
+            assert_eq!(
+                project_session_row_plan(total, None, false),
+                ((0..total).collect::<Vec<_>>(), None)
+            );
+            // Stale reveal state cannot conjure a control on a short list.
+            assert_eq!(
+                project_session_row_plan(total, None, true),
+                ((0..total).collect::<Vec<_>>(), None)
+            );
+        }
+    }
+
+    #[test]
+    fn collapsing_a_project_clears_its_reveal_state() {
+        // Collapse drops the project from `revealed_projects`, so the next
+        // expansion plans from `revealed = false`.
+        assert_eq!(
+            project_session_row_plan(12, None, false).0.len(),
+            SESSION_ROW_CAP
+        );
+    }
+
+    #[test]
+    fn project_session_row_plan_includes_selected_session_beyond_cap() {
+        // When selected is at index 7 of 10 (beyond the cap of 5),
+        // visible indices are 0..5 plus 7, and hidden count is accurately 10 - 6 = 4.
+        let (visible, hidden) = project_session_row_plan(10, Some(7), false);
+        assert_eq!(visible, vec![0, 1, 2, 3, 4, 7]);
+        assert_eq!(hidden, Some(4));
+
+        // When selected is at index 2 (within cap of 5), visible is 0..5, hidden is 10 - 5 = 5.
+        let (visible, hidden) = project_session_row_plan(10, Some(2), false);
+        assert_eq!(visible, vec![0, 1, 2, 3, 4]);
+        assert_eq!(hidden, Some(5));
+
+        // When selected is the 6th of 6 sessions (index 5 of 6), all 6 are visible, hidden is None.
+        let (visible, hidden) = project_session_row_plan(6, Some(5), false);
+        assert_eq!(visible, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(hidden, None);
+    }
+
+    #[test]
+    fn project_visible_depth_limit_and_cycle_guard() {
+        let mut projects = Vec::new();
+        let mut expanded = std::collections::HashSet::new();
+        for i in 0..=9 {
+            let id = format!("p{i}");
+            expanded.insert(id.clone());
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(format!("p{}", i - 1))
+            };
+            projects.push(WorkersProject {
+                id: id.clone(),
+                name: id.clone(),
+                path: format!("/tmp/{id}"),
+                folder_id: None,
+                parent_project_id: parent,
+                is_group: false,
+                worktree_branch: None,
+                git_branch: None,
+                archived_session_count: 0,
+                folder_color_id: None,
+                session_sort: WorkersSessionSort::Custom,
+            });
+        }
+        // At depth < MAX_PROJECT_DEPTH (e.g. depth 7 -> p7), visible if all ancestors expanded.
+        assert!(project_visible(&projects[7], &projects, &expanded));
+        // At depth >= MAX_PROJECT_DEPTH (e.g. depth 8 -> p8, depth 9 -> p9), returns false.
+        assert!(!project_visible(&projects[8], &projects, &expanded));
+        assert!(!project_visible(&projects[9], &projects, &expanded));
+
+        // Also verify cyclic parent chain breaks and returns false.
+        let cycle_a = WorkersProject {
+            id: "cycle_a".into(),
+            name: "cycle_a".into(),
+            path: "/tmp/a".into(),
+            folder_id: None,
+            parent_project_id: Some("cycle_b".into()),
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        };
+        let cycle_b = WorkersProject {
+            id: "cycle_b".into(),
+            name: "cycle_b".into(),
+            path: "/tmp/b".into(),
+            folder_id: None,
+            parent_project_id: Some("cycle_a".into()),
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: WorkersSessionSort::Custom,
+        };
+        expanded.insert("cycle_a".into());
+        expanded.insert("cycle_b".into());
+        let cycle_projects = vec![cycle_a.clone(), cycle_b];
+        assert!(!project_visible(&cycle_a, &cycle_projects, &expanded));
+    }
+
+    #[test]
+    fn project_sessions_sorted_honors_session_sort() {
+        let mut proj = project("p1", None);
+        let sessions = vec![
+            session("old", "p1", 100, 100),
+            session("newest", "p1", 900, 100),
+            session("middle", "p1", 400, 100),
+        ];
+
+        // Custom preserves host order without reordering.
+        proj.session_sort = WorkersSessionSort::Custom;
+        let sorted_custom = project_sessions_sorted(&proj, &sessions);
+        let custom_ids: Vec<_> = sorted_custom.into_iter().map(|s| s.id).collect();
+        assert_eq!(custom_ids, ["old", "newest", "middle"]);
+
+        // RecentlyUpdated orders by activity, newest first.
+        proj.session_sort = WorkersSessionSort::RecentlyUpdated;
+        let sorted_recent = project_sessions_sorted(&proj, &sessions);
+        let recent_ids: Vec<_> = sorted_recent.into_iter().map(|s| s.id).collect();
+        assert_eq!(recent_ids, ["newest", "middle", "old"]);
+    }
+
+    #[test]
+    fn prune_revealed_projects_removes_dead_projects() {
+        let mut revealed = std::collections::HashSet::new();
+        revealed.insert("alive".to_owned());
+        revealed.insert("dead".to_owned());
+        let projects = vec![project("alive", None)];
+
+        prune_revealed_projects(&mut revealed, &projects);
+        assert!(revealed.contains("alive"));
+        assert!(!revealed.contains("dead"));
     }
 }

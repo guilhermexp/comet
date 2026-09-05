@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, LiveVoicePhase, LiveVoiceTranscript, Model, ReasoningLevel, RunRequest,
-    SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, LiveVoicePhase, LiveVoiceTranscript, LiveVoiceUnavailableReason, Model,
+    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -81,10 +81,21 @@ pub struct LiveVoiceSupport {
 }
 
 impl LiveVoiceSupport {
-    /// Live Voice needs the base capability; starting on top of an already
-    /// active run additionally needs the operational-context capability.
-    pub fn usable(&self, active_run: bool) -> bool {
-        self.available && (!active_run || self.session_context)
+    /// Why Live Voice cannot start, in the OMP's own terms; `None` means it can.
+    ///
+    /// Both gaps are a missing OMP capability, never a stale Comet host: either
+    /// the base capability is absent from the ready frame, or it is there
+    /// without the operational-context capability that joining an already
+    /// active run additionally needs. Returning the reason instead of a bool
+    /// keeps the two apart all the way to the tooltip.
+    pub fn gap(&self, active_run: bool) -> Option<LiveVoiceUnavailableReason> {
+        if !self.available {
+            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
+        } else if active_run && !self.session_context {
+            Some(LiveVoiceUnavailableReason::ActiveRun)
+        } else {
+            None
+        }
     }
 }
 
