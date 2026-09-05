@@ -117,16 +117,17 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 5] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 6] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Kimi, "Kimi Code", "kimi"),
     (HarnessId::Antigravity, "Antigravity", "agy"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Grok, "Grok", "grok"),
 ];
 
 pub fn provider_can_add(harness: HarnessId) -> bool {
-    harness != HarnessId::Kimi && harness != HarnessId::Antigravity
+    harness != HarnessId::Kimi && harness != HarnessId::Antigravity && harness != HarnessId::Grok
 }
 
 /// Accounts of one provider, in the engine's order (slot creation). No
@@ -1283,6 +1284,7 @@ impl Render for AccountsPage {
                         HarnessId::Kimi => "accounts-skeleton-kimi",
                         HarnessId::Antigravity => "accounts-skeleton-antigravity",
                         HarnessId::Cursor => "accounts-skeleton-cursor",
+                        HarnessId::Grok => "accounts-skeleton-grok",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -1373,12 +1375,13 @@ impl Render for AccountsPage {
                             HarnessId::Kimi | HarnessId::Antigravity => {
                                 format!("No {name} managed subscription detected on this device.")
                             }
-                            // Cursor's app login is SEPARATE from `cursor-agent
-                            // login` — pointing at the CLI would send users to a
-                            // sign-in that does not light this up.
                             HarnessId::Cursor => format!(
                                 "{name} isn't connected on this device — connect it to run \
                                  Cursor sessions."
+                            ),
+                            HarnessId::Grok => format!(
+                                "No {name} API key detected on this device — grok reads it \
+                                 from user-settings.json."
                             ),
                             _ => format!(
                                 "No {name} login detected on this device — sign in \
@@ -1484,7 +1487,7 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code, Codex, and Cursor logins plus managed Kimi Code \
+                        "The Claude Code, Codex, Cursor, and Grok logins plus managed Kimi Code \
                          and Antigravity Usage on this device. Zeron keeps switchable \
                          accounts backed up; authentication for Kimi and Antigravity \
                          remains owned by their CLIs.",
@@ -1551,10 +1554,12 @@ mod tests {
                 HarnessId::Kimi,
                 HarnessId::Antigravity,
                 HarnessId::Cursor,
+                HarnessId::Grok,
             ]
         );
         assert!(!provider_can_add(HarnessId::Kimi));
         assert!(!provider_can_add(HarnessId::Antigravity));
+        assert!(!provider_can_add(HarnessId::Grok));
         assert!(provider_can_add(HarnessId::ClaudeCode));
     }
 

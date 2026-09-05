@@ -13,6 +13,9 @@
 //!   (`StoredSdkCredentials`) holding the named, expiring user API key its
 //!   browser login mints. Deliberately SEPARATE from `cursor-agent login`'s
 //!   whole-account session tokens, which zeron never reads.
+//! - **Grok** — `$GROK_HOME/user-settings.json` (default `~/.grok`): the
+//!   CLI's `apiKey`. Sibling fields (`defaultModel`, payments) stay on the
+//!   live file; slots store only `{apiKey}`.
 //!
 //! Claude-swap mechanics:
 //!
@@ -105,6 +108,8 @@ pub struct AgentAccountsConfig {
     /// named, expiring API key minted by its browser login. SEPARATE from
     /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
+    /// Grok home (`$GROK_HOME` or `~/.grok`) — holds `user-settings.json`.
+    pub grok_home: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -127,6 +132,7 @@ impl AgentAccountsConfig {
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
+            grok_home: env_dir("GROK_HOME").unwrap_or_else(|| home_dir().join(".grok")),
         }
     }
 
@@ -136,6 +142,9 @@ impl AgentAccountsConfig {
 
     fn codex_auth_file(&self) -> PathBuf {
         self.codex_home.join("auth.json")
+    }
+    fn grok_user_settings_file(&self) -> PathBuf {
+        self.grok_home.join("user-settings.json")
     }
 
     fn root_dir(&self) -> PathBuf {
@@ -151,6 +160,7 @@ impl AgentAccountsConfig {
             && self.claude_config_file == detected.claude_config_file
             && self.codex_home == detected.codex_home
             && self.cursor_sdk_auth_file == detected.cursor_sdk_auth_file
+            && self.grok_home == detected.grok_home
     }
 }
 
@@ -444,8 +454,12 @@ impl AgentAccounts {
                 });
             }
         }
+        if let Some(detected) = self.detect_grok() {
+            active_keys.insert(HarnessId::Grok, detected.account_key.clone());
+            self.snapshot_detected(HarnessId::Grok, &detected)?;
+        }
 
-        let (claude_accounts, codex_accounts, cursor_accounts) = tokio::join!(
+        let (claude_accounts, codex_accounts, cursor_accounts, grok_accounts) = tokio::join!(
             self.provider_accounts(
                 HarnessId::ClaudeCode,
                 &active_keys,
@@ -462,6 +476,13 @@ impl AgentAccounts {
             ),
             self.provider_accounts(
                 HarnessId::Cursor,
+                &active_keys,
+                &unreadable,
+                &local_usage,
+                force_usage,
+            ),
+            self.provider_accounts(
+                HarnessId::Grok,
                 &active_keys,
                 &unreadable,
                 &local_usage,
@@ -521,6 +542,7 @@ impl AgentAccounts {
             }
         }
         accounts.extend(cursor_accounts);
+        accounts.extend(grok_accounts);
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
@@ -608,6 +630,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
             HarnessId::Codex => self.activate_codex(&slot)?,
             HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
+            HarnessId::Grok => self.activate_grok(&slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -677,6 +700,12 @@ impl AgentAccounts {
         let json = serde_json::to_string_pretty(&slot.credentials)
             .map_err(|e| EngineError::Other(format!("serialize codex auth: {e}")))?;
         write_file_atomic(&self.inner.config.codex_auth_file(), json.as_bytes(), true)
+    }
+
+    fn activate_grok(&self, slot: &Slot) -> Result<(), EngineError> {
+        let api_key = str_field(&slot.credentials, "apiKey")
+            .ok_or_else(|| EngineError::Other("That saved Grok login has no API key.".into()))?;
+        self.write_grok_api_key(&api_key)
     }
 
     // ── forget ──────────────────────────────────────────────────────────────
@@ -1208,6 +1237,27 @@ impl AgentAccounts {
 
     fn detect_cursor(&self) -> Option<Detected> {
         read_json(&self.inner.config.cursor_sdk_auth_file).and_then(parse_cursor_auth)
+    }
+
+    fn detect_grok(&self) -> Option<Detected> {
+        read_json(&self.inner.config.grok_user_settings_file()).and_then(parse_grok_settings)
+    }
+
+    fn write_grok_api_key(&self, api_key: &str) -> Result<(), EngineError> {
+        let file = self.inner.config.grok_user_settings_file();
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut settings = read_json(&file).unwrap_or_else(|| serde_json::json!({}));
+        match settings.as_object_mut() {
+            Some(object) => {
+                object.insert("apiKey".into(), serde_json::Value::String(api_key.into()));
+            }
+            None => settings = serde_json::json!({ "apiKey": api_key }),
+        }
+        let json = serde_json::to_string_pretty(&settings)
+            .map_err(|e| EngineError::Other(format!("serialize grok settings: {e}")))?;
+        write_file_atomic(&file, json.as_bytes(), true)
     }
 
     /// A live cursor login that runs can actually use: present, parseable,
@@ -1965,6 +2015,27 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
+fn parse_grok_settings(settings: serde_json::Value) -> Option<Detected> {
+    let api_key = str_field(&settings, "apiKey").filter(|key| !key.is_empty())?;
+    let digest = Sha256::digest(api_key.as_bytes());
+    let tail: String = api_key
+        .chars()
+        .skip(api_key.len().saturating_sub(4))
+        .collect();
+    Some(Detected {
+        account_key: format!("api-key:{}", &crate::repos::hex(&digest)[..12]),
+        profile: SlotProfile {
+            email: format!("API key ·…{tail}"),
+            display_name: Some("Grok".into()),
+            organization: None,
+            plan: Some("API key".into()),
+            auth_kind: AgentAuthKind::ApiKey,
+        },
+        credentials: Some(serde_json::json!({ "apiKey": api_key })),
+        claude_config: None,
+    })
+}
+
 /// Present, parseable, and unexpired — what a run can actually use.
 fn cursor_key_usable(auth: &serde_json::Value) -> bool {
     str_field(auth, "apiKey").is_some()
@@ -2215,6 +2286,7 @@ mod tests {
             claude_config_file: root.path().join("claude.json"),
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
         };
         let credential = root
             .path()
@@ -2264,6 +2336,7 @@ mod tests {
             claude_config_file: root.path().join("claude.json"),
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
         };
         let cred_dir = root.path().join("cli-proxy");
         std::fs::create_dir_all(&cred_dir).unwrap();
@@ -2312,6 +2385,7 @@ mod tests {
             claude_config_file: root.path().join("claude.json"),
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
         };
         let credential = root
             .path()
@@ -2558,5 +2632,90 @@ mod tests {
         let updated = with_claude_ai_oauth(&creds, serde_json::json!({ "accessToken": "new" }));
         assert_eq!(updated["claudeAiOauth"]["accessToken"], "new");
         assert_eq!(updated["mcpOAuth"]["github"]["accessToken"], "keep");
+    }
+
+    #[tokio::test]
+    async fn grok_api_key_is_a_switchable_device_local_account() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+        };
+        std::fs::create_dir_all(&config.grok_home).unwrap();
+        let settings_file = config.grok_home.join("user-settings.json");
+        std::fs::write(
+            &settings_file,
+            serde_json::json!({
+                "apiKey": "xai-test-key-aaaa",
+                "defaultModel": "grok-4.3",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let accounts = AgentAccounts::new(config.clone());
+        let snapshot = accounts.list(false).await.unwrap();
+        let grok = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Grok)
+            .expect("grok account");
+        assert!(grok.active);
+        assert!(grok.switchable);
+        assert_eq!(grok.auth_kind, Some(AgentAuthKind::ApiKey));
+        assert_eq!(grok.display_name.as_deref(), Some("Grok"));
+        assert_eq!(grok.email.as_deref(), Some("API key ·…aaaa"));
+        let first_id = grok.id.clone();
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !wire.contains("xai-test-key-aaaa"),
+            "raw grok key must not cross the snapshot"
+        );
+
+        std::fs::write(
+            &settings_file,
+            serde_json::json!({
+                "apiKey": "xai-test-key-bbbb",
+                "defaultModel": "grok-4.3",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshot = accounts.list(false).await.unwrap();
+        let grok_accounts: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.harness == HarnessId::Grok)
+            .collect();
+        assert_eq!(grok_accounts.len(), 2);
+
+        accounts
+            .activate(HarnessId::Grok, &first_id)
+            .await
+            .expect("activate first grok key");
+        let live: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_file).unwrap()).unwrap();
+        assert_eq!(live["apiKey"], "xai-test-key-aaaa");
+        assert_eq!(live["defaultModel"], "grok-4.3");
+
+        let empty = AgentAccountsConfig {
+            data_dir: root.path().join("empty-data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("missing-grok"),
+        };
+        let empty_snapshot = AgentAccounts::new(empty).list(false).await.unwrap();
+        assert!(
+            empty_snapshot
+                .accounts
+                .iter()
+                .all(|account| account.harness != HarnessId::Grok)
+        );
     }
 }

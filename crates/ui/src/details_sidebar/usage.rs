@@ -69,6 +69,7 @@ pub fn usage_provider_icon(harness: HarnessId) -> (&'static str, bool) {
         HarnessId::Kimi => (crate::icons::WORKER_KIMI, false),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY, false),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, false),
+        HarnessId::Grok => (crate::icons::GROK_MARK, false),
         _ => (crate::icons::OPENAI_MARK, false),
     }
 }
@@ -80,6 +81,7 @@ pub fn usage_provider_label(harness: HarnessId) -> &'static str {
         HarnessId::Kimi => "Kimi",
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Cursor => "Cursor",
+        HarnessId::Grok => "Grok",
         _ => "Agent",
     }
 }
@@ -708,6 +710,22 @@ mod tests {
         assert_eq!(
             usage_provider_icon(HarnessId::Cursor),
             (crate::icons::CURSOR_MARK, false)
+        );
+    }
+
+    #[test]
+    fn grok_account_appears_when_visible() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![account("grok-1", HarnessId::Grok, true, vec![])],
+            warnings: vec![],
+        };
+        let rows = usage_rows(&snapshot, Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Grok");
+        assert_eq!(rows[0].account_id.as_deref(), Some("grok-1"));
+        assert_eq!(
+            usage_provider_icon(HarnessId::Grok),
+            (crate::icons::GROK_MARK, false)
         );
     }
 
