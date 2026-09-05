@@ -23,6 +23,7 @@ not built yet).
 | 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Gap: prefers-reduced-motion switch. |
 | 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); reconnect from scratch. |
 | 1.14 Chat Trajectory preview | done | Analytical timeline (3 fixed lanes: Input/Model/Tools, Sequence and Recorded duration modes), virtualized execution ledger, 5-tab record inspector (Summary, Payload, Result, Schema, Timing), ephemeral device-local Raw Reveal, live-edge follow/pause, and responsive Split/NarrowDetail layout switching in the unified right tab strip (`ui/src/trajectory/`). |
+| 1.15 Idle session recap | done | Paridade exata com orchestrator.dev: timer de ociosidade na DetailsSidebar, guarda de época (epoch = message count), RPC GenerateChatRecap one-shot desacoplado sem turnos no chat, persistência em ui-settings.json (prune 50/24h) e renderização no card Workspace abaixo de Projects worked (`crates/ui/src/details_sidebar/`). |
 
 ## §2 Control plane
 
@@ -41,6 +42,7 @@ not built yet).
 | Wire types | done | `zeron-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
 | Trajectory RPCs | done | Local-only atomic snapshot-watermark-delta watch (`WatchTrajectory`) and bounded owner-checked raw field reveal (`RevealTrajectoryRaw`) over Run Journal; never forwarded across devices. |
 
+| GenerateChatRecap | done | RPC local-only (`crates/rpc`, `crates/engine/src/recap.rs`) que projeta o transcript tail e executa one-shot throwaway via cheapest model do harness. |
 ## §3 Backend engine
 
 | Item | Status | Notes |
