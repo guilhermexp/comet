@@ -19,7 +19,7 @@ pub use controller_mcp::{
 pub use hook_migration::remove_legacy_hook_root_at;
 pub use maintenance::{
     RuntimeInstallSource, RuntimeUpdateResult, RuntimeUpdateStatus, RuntimeVersionAdvisory,
-    UpdateOutcomeStatus, get_all_advisories, run_runtime_update,
+    UpdateOutcomeStatus, get_all_advisories, get_all_advisories_blocking, run_runtime_update,
 };
 pub use parent_notifications::{
     WorkerCompletionEvidence, WorkerParentLink, WorkerParentNotification,

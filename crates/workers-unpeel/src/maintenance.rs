@@ -742,6 +742,16 @@ pub async fn get_all_advisories() -> Vec<RuntimeVersionAdvisory> {
     advisories
 }
 
+/// Probe CLIs on a private current-thread Tokio runtime. `get_all_advisories`
+/// uses `tokio::process`; polling it on gpui's executor aborts the app.
+pub fn get_all_advisories_blocking() -> Vec<RuntimeVersionAdvisory> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cli advisory runtime")
+        .block_on(get_all_advisories())
+}
+
 // ---------------------------------------------------------------------------
 // Update Execution
 // ---------------------------------------------------------------------------

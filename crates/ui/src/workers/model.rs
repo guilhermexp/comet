@@ -13,7 +13,7 @@ use zeron_workers_unpeel::{
     WorkersProject, WorkersProjectOrganizationPatch, WorkersResourceSettings, WorkersSession,
     WorkersSessionCommand, WorkersSessionSort, WorkersSettingsSnapshot, WorkersTranscriptSettings,
     WorkersWorktreeResult, ack_worker_parent_notification, build_worker_parent_notification_prompt,
-    get_all_advisories, hibernate_confirmed_candidates, hibernation_candidates,
+    get_all_advisories_blocking, hibernate_confirmed_candidates, hibernation_candidates,
     pending_worker_parent_notifications, run_runtime_update, worker_parent_links,
 };
 
@@ -695,7 +695,10 @@ impl WorkersModel {
         cx.notify();
 
         self.advisories_task = Some(cx.spawn(async move |this, cx| {
-            let advisories = get_all_advisories().await;
+            let advisories = cx
+                .background_executor()
+                .spawn(async { get_all_advisories_blocking() })
+                .await;
             this.update(cx, |model, cx| {
                 model.advisories = advisories;
                 model.advisories_loading = false;

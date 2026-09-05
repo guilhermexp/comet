@@ -1760,7 +1760,10 @@ impl Shell {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            let advisories = zeron_workers_unpeel::get_all_advisories().await;
+            let advisories = cx
+                .background_executor()
+                .spawn(async { zeron_workers_unpeel::get_all_advisories_blocking() })
+                .await;
             let behind: Vec<_> = advisories
                 .iter()
                 .filter(|a| a.status == zeron_workers_unpeel::RuntimeUpdateStatus::BehindLatest)
