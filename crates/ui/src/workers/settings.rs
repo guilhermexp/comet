@@ -322,20 +322,150 @@ pub fn cli_to_harness_id(cli_or_cmd: &str) -> Option<HarnessId> {
     }
 }
 
+pub fn format_model_label(raw: &str) -> String {
+    let clean = raw.trim();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("default") {
+        return "Default".to_string();
+    }
+    match clean {
+        "gpt-6-astra" => return "GPT-6-Astra".to_string(),
+        "gpt-5.6-sol" => return "GPT-5.6-Sol".to_string(),
+        "gpt-5.6-terra" => return "GPT-5.6-Terra".to_string(),
+        "gpt-5.6-luna" => return "GPT-5.6-Luna".to_string(),
+        "gpt-5.5" => return "GPT-5.5".to_string(),
+        "gpt-5.4" => return "GPT-5.4".to_string(),
+        "gpt-5.4-mini" => return "GPT-5.4-Mini".to_string(),
+        "gpt-5.3-codex-spark" => return "GPT-5.3-Codex-Spark".to_string(),
+        "claude-3-7-sonnet-20250219" | "claude-3-7-sonnet" | "sonnet-3.7" => {
+            return "Sonnet 3.7".to_string();
+        }
+        "claude-3-5-sonnet-20241022" | "claude-3-5-sonnet" | "sonnet-3.5" => {
+            return "Sonnet 3.5".to_string();
+        }
+        "claude-3-5-haiku-20241022" | "claude-3-5-haiku" | "haiku-3.5" => {
+            return "Haiku 3.5".to_string();
+        }
+        "claude-sonnet-5" | "sonnet-5" => return "Sonnet 5".to_string(),
+        "claude-opus-5" | "opus-5" => return "Opus 5".to_string(),
+        "claude-fable-5" | "fable-5" => return "Fable 5".to_string(),
+        "gemini-3.8-flash" => return "Gemini 3.8 Flash".to_string(),
+        "gemini-2.5-pro" => return "Gemini 2.5 Pro".to_string(),
+        "gemini-2.5-flash" => return "Gemini 2.5 Flash".to_string(),
+        "glm-5" => return "GLM 5".to_string(),
+        "composer-2.5" => return "Composer 2.5".to_string(),
+        _ => {}
+    }
+
+    let candidate = clean.split('/').last().unwrap_or(clean);
+    let parts: Vec<&str> = candidate.split(&['-', '_'][..]).collect();
+    let capitalized: Vec<String> = parts
+        .iter()
+        .map(|p| {
+            if p.eq_ignore_ascii_case("gpt") {
+                "GPT".to_string()
+            } else if p.eq_ignore_ascii_case("glm") {
+                "GLM".to_string()
+            } else if p.eq_ignore_ascii_case("claude") {
+                "Claude".to_string()
+            } else if p.eq_ignore_ascii_case("gemini") {
+                "Gemini".to_string()
+            } else if p.eq_ignore_ascii_case("flash") {
+                "Flash".to_string()
+            } else if p.eq_ignore_ascii_case("pro") {
+                "Pro".to_string()
+            } else if p.eq_ignore_ascii_case("sonnet") {
+                "Sonnet".to_string()
+            } else if p.eq_ignore_ascii_case("opus") {
+                "Opus".to_string()
+            } else if p.eq_ignore_ascii_case("haiku") {
+                "Haiku".to_string()
+            } else if let Some(first) = p.chars().next() {
+                format!("{}{}", first.to_uppercase(), &p[first.len_utf8()..])
+            } else {
+                p.to_string()
+            }
+        })
+        .collect();
+    capitalized.join(" ")
+}
+
+pub fn detect_cli_default_model(cli_or_cmd: &str) -> (String, String) {
+    let head = cli_or_cmd.split_whitespace().next().unwrap_or(cli_or_cmd);
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    match head {
+        "omp" => {
+            if let Some(home_path) = &home {
+                let config_path = home_path.join(".omp/agent/config.yml");
+                if let Ok(content) = std::fs::read_to_string(config_path) {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if let Some(rest) = trimmed.strip_prefix("default:") {
+                            let raw_model = rest.trim();
+                            let clean_id = raw_model.split(':').next().unwrap_or(raw_model);
+                            let label = format_model_label(clean_id);
+                            return (clean_id.to_string(), label);
+                        }
+                    }
+                }
+            }
+            (
+                "google-antigravity/gemini-3.8-flash".into(),
+                "Gemini 3.8 Flash".into(),
+            )
+        }
+        "codex" => {
+            if let Some(home_path) = &home {
+                let config_path = home_path.join(".codex/config.toml");
+                if let Ok(content) = std::fs::read_to_string(config_path) {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if let Some(rest) = trimmed.strip_prefix("model =") {
+                            let clean_id = rest.trim().trim_matches('"');
+                            let label = format_model_label(clean_id);
+                            return (clean_id.to_string(), label);
+                        }
+                    }
+                }
+            }
+            ("gpt-6-astra".into(), "GPT-6-Astra".into())
+        }
+        "pi" => {
+            if let Some(home_path) = &home {
+                let config_path = home_path.join(".pi/agent/settings.json");
+                if let Ok(content) = std::fs::read_to_string(config_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(m) = json.get("defaultModel").and_then(|v| v.as_str()) {
+                            let label = format_model_label(m);
+                            return (m.to_string(), label);
+                        }
+                    }
+                }
+            }
+            ("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into())
+        }
+        "claude" | "claude-code" => ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
+        "opencode" => ("glm-5".into(), "GLM 5".into()),
+        "prime-agent" | "agy" => ("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into()),
+        "cursor" | "cursor-agent" => ("composer-2.5".into(), "Composer 2.5".into()),
+        _ => ("default".into(), "Default".into()),
+    }
+}
+
 pub fn static_models_for_cli(cli_or_cmd: &str) -> Vec<(String, String)> {
     let head = cli_or_cmd.split_whitespace().next().unwrap_or(cli_or_cmd);
     match head {
         "claude" | "claude-code" => vec![
-            ("default".into(), "Default (Sonnet 3.7)".into()),
+            ("default".into(), "Default".into()),
+            ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
             ("claude-sonnet-5".into(), "Sonnet 5".into()),
             ("claude-opus-5".into(), "Opus 5".into()),
-            ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
             ("claude-3-5-sonnet-20241022".into(), "Sonnet 3.5".into()),
             ("claude-3-5-haiku-20241022".into(), "Haiku 3.5".into()),
             ("claude-fable-5".into(), "Fable 5".into()),
         ],
         "codex" => vec![
-            ("default".into(), "Default (GPT-5.6-Sol)".into()),
+            ("default".into(), "Default".into()),
+            ("gpt-6-astra".into(), "GPT-6-Astra".into()),
             ("gpt-5.6-sol".into(), "GPT-5.6-Sol".into()),
             ("gpt-5.6-terra".into(), "GPT-5.6-Terra".into()),
             ("gpt-5.6-luna".into(), "GPT-5.6-Luna".into()),
@@ -346,6 +476,10 @@ pub fn static_models_for_cli(cli_or_cmd: &str) -> Vec<(String, String)> {
         ],
         "omp" => vec![
             ("default".into(), "Default".into()),
+            (
+                "google-antigravity/gemini-3.8-flash".into(),
+                "Gemini 3.8 Flash".into(),
+            ),
             ("anthropic/claude-sonnet-5".into(), "Claude Sonnet 5".into()),
             ("anthropic/claude-opus-5".into(), "Claude Opus 5".into()),
             ("openai/gpt-5.6".into(), "GPT-5.6".into()),
@@ -355,12 +489,13 @@ pub fn static_models_for_cli(cli_or_cmd: &str) -> Vec<(String, String)> {
         ],
         "pi" => vec![
             ("default".into(), "Default".into()),
+            ("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into()),
             ("claude-sonnet-5".into(), "Claude Sonnet 5".into()),
             ("gpt-5.6".into(), "GPT-5.6".into()),
             ("deepseek-v3".into(), "DeepSeek V3".into()),
         ],
         "opencode" => vec![
-            ("default".into(), "Default (GLM 5)".into()),
+            ("default".into(), "Default".into()),
             ("glm-5".into(), "GLM 5".into()),
             ("claude-sonnet-5".into(), "Claude Sonnet 5".into()),
             ("gpt-5.6".into(), "GPT-5.6".into()),
@@ -368,18 +503,19 @@ pub fn static_models_for_cli(cli_or_cmd: &str) -> Vec<(String, String)> {
             ("qwen-2.5-coder".into(), "Qwen 2.5 Coder".into()),
         ],
         "cursor" | "cursor-agent" => vec![
-            ("default".into(), "Default (Composer 2.5)".into()),
+            ("default".into(), "Default".into()),
             ("composer-2.5".into(), "Composer 2.5".into()),
             ("claude-sonnet-5".into(), "Sonnet 5".into()),
             ("gpt-5.6".into(), "GPT-5.6".into()),
         ],
         "grok" => vec![
-            ("default".into(), "Default (Grok 4.6)".into()),
+            ("default".into(), "Default".into()),
             ("grok-4.6".into(), "Grok 4.6".into()),
             ("grok-4".into(), "Grok 4".into()),
         ],
         "prime-agent" | "agy" => vec![
             ("default".into(), "Default".into()),
+            ("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into()),
             ("gemini-2.5-pro".into(), "Gemini 2.5 Pro".into()),
             ("gemini-2.5-flash".into(), "Gemini 2.5 Flash".into()),
         ],
@@ -610,20 +746,31 @@ impl WorkersSettingsView {
             let enabled = preset.enabled;
 
             let current_model_id = extract_model_from_command(&preset.command);
+            let (_default_id, default_label) =
+                detect_cli_default_model(preset.cli_id.as_deref().unwrap_or(&preset.command));
+
             let mut models =
                 self.available_models_for_preset(preset.cli_id.as_deref(), &preset.command);
-            if let Some(curr) = &current_model_id {
-                if !models.iter().any(|(id, _)| id == curr) {
-                    models.push((curr.clone(), curr.clone()));
+
+            if let Some(first) = models.first_mut() {
+                if first.0 == "default" {
+                    first.1 = format!("Default ({default_label})");
                 }
             }
+
+            if let Some(curr) = &current_model_id {
+                if !models.iter().any(|(id, _)| id == curr) {
+                    models.push((curr.clone(), format_model_label(curr)));
+                }
+            }
+
             let current_label = match &current_model_id {
                 Some(id) => models
                     .iter()
                     .find(|(m_id, _)| m_id == id)
                     .map(|(_, l)| l.as_str())
                     .unwrap_or_else(|| id.as_str()),
-                None => "Default",
+                None => default_label.as_str(),
             };
 
             let is_menu_open = self.open_model_menu_preset_id.as_deref() == Some(&preset.id);
@@ -671,11 +818,7 @@ impl WorkersSettingsView {
                         .truncate()
                         .text_size(px(11.5))
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if current_model_id.is_some() {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
+                        .text_color(theme.text)
                         .child(current_label.to_string()),
                 )
                 .child(
@@ -2050,6 +2193,27 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id == "anthropic/claude-sonnet-5")
         );
+    }
+
+    #[test]
+    fn detect_cli_default_model_and_formatting() {
+        use super::{detect_cli_default_model, format_model_label};
+
+        assert_eq!(format_model_label("gemini-3.8-flash"), "Gemini 3.8 Flash");
+        assert_eq!(format_model_label("gpt-6-astra"), "GPT-6-Astra");
+        assert_eq!(
+            format_model_label("claude-3-7-sonnet-20250219"),
+            "Sonnet 3.7"
+        );
+
+        let (_, claude_label) = detect_cli_default_model("claude");
+        assert_eq!(claude_label, "Sonnet 3.7");
+
+        let (_, omp_label) = detect_cli_default_model("omp");
+        assert!(!omp_label.is_empty() && omp_label != "Default");
+
+        let (_, codex_label) = detect_cli_default_model("codex");
+        assert!(!codex_label.is_empty() && codex_label != "Default");
     }
 
     #[test]
