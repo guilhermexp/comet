@@ -2425,6 +2425,9 @@ impl Shell {
 
     fn worker_panel_context(&self, cx: &App) -> Option<WorkersPanelContext> {
         let model = self.workers_model.read(cx);
+        if matches!(model.route, WorkersRoute::Settings(_)) {
+            return None;
+        }
         let session = model.selected_session();
         let project = session
             .and_then(|session| {
@@ -2532,6 +2535,9 @@ impl Shell {
             }
             SidebarMode::Workers => {
                 let model = self.workers_model.read(cx);
+                if matches!(model.route, WorkersRoute::Settings(_)) {
+                    return None;
+                }
                 context_for_worker(model.selected_project(), model.selected_session())
             }
         }
@@ -4592,6 +4598,19 @@ impl Shell {
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.sidebar_mode == SidebarMode::Workers {
+            if matches!(self.workers_model.read(cx).route, WorkersRoute::Settings(_)) {
+                let inner = div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pl(px(self.title_bar_content_start()))
+                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+                return self
+                    .titlebar_drag_region("workers-settings-header-titlebar", bar, cx)
+                    .into_any_element();
+            }
             let theme = Theme::of(cx).clone();
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
             let (
@@ -9496,7 +9515,10 @@ impl Render for Shell {
                 // The right utility surface is chat-scoped chrome: the Settings
                 // route never renders it — the per-session open flags stay
                 // intact for the return trip.
-                let on_chat = matches!(self.route, Route::Chat);
+                let in_settings = matches!(self.route, Route::Settings(_))
+                    || (self.sidebar_mode == SidebarMode::Workers
+                        && matches!(self.workers_model.read(cx).route, WorkersRoute::Settings(_)));
+                let on_chat = !in_settings;
                 let right_open = on_chat && self.right_pane_open(cx);
                 // Takeover mode derives its width from the viewport, so a
                 // manual drag handle would fight the expanded target.
@@ -10310,6 +10332,24 @@ mod tests {
             WorkersRoute::Workspace,
             true
         ));
+    }
+
+    #[test]
+    fn workers_settings_route_suppresses_right_and_details_chrome() {
+        use crate::workers::model::{WorkersRoute, WorkersSettingsTab};
+
+        let in_settings_workspace = matches!(Route::Chat, Route::Settings(_))
+            || (SidebarMode::Workers == SidebarMode::Workers
+                && matches!(WorkersRoute::Workspace, WorkersRoute::Settings(_)));
+        assert!(!in_settings_workspace);
+
+        let in_settings_workers = matches!(Route::Chat, Route::Settings(_))
+            || (SidebarMode::Workers == SidebarMode::Workers
+                && matches!(
+                    WorkersRoute::Settings(WorkersSettingsTab::Presets),
+                    WorkersRoute::Settings(_)
+                ));
+        assert!(in_settings_workers);
     }
 
     #[test]
