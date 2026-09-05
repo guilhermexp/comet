@@ -131,13 +131,7 @@ impl OmpProcess {
     pub async fn start(launch: OmpLaunch) -> Result<Self, HarnessError> {
         let mut command = Command::new(&launch.executable);
         command
-            .args([
-                "--mode",
-                "rpc-ui",
-                "--auto-approve",
-                "--no-extensions",
-                "--allow-home",
-            ])
+            .args(["--mode", "rpc-ui", "--auto-approve", "--allow-home"])
             .arg("--cwd")
             .arg(&launch.cwd);
         // Losing skill scoping must never cost the turn: without the overlay the

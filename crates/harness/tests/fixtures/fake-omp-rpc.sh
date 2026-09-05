@@ -104,6 +104,12 @@ case "$scenario" in
       [ "$arg" != "--no-session" ] || exit 48
     done
     ;;
+  reject-no-extensions)
+    has " $* " " --no-extensions " && exit 50
+    has " $* " " --mode rpc-ui " || exit 51
+    has " $* " " --auto-approve " || exit 52
+    has " $* " " --allow-home " || exit 53
+    ;;
 esac
 [ -z "${FAKE_OMP_PID_FILE:-}" ] || printf '%s\n' "$$" > "$FAKE_OMP_PID_FILE"
 if [ "$scenario" = "early-exit" ]; then
