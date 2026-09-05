@@ -143,7 +143,12 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   Antigravity, Cursor.** Contas gerenciadas (Kimi Code, Antigravity) chegam da
   engine `active: true, switchable: false`; a linha não expõe Add account,
   Switch nem Forget, e a autenticação permanece nos CLIs. O empty state das
-  duas compartilha a cópia de assinatura gerenciada não detectada.
+  duas compartilha a cópia de assinatura gerenciada não detectada. Cada row
+  tem um toggle de Usage (default ON): id em
+  `UiSettings.usage_widget_hidden_account_ids` some do widget; meters na
+  página Accounts continuam. O widget deriva uma row por conta visível, na
+  mesma ordem, inclusive Cursor; sem contas visíveis não há placeholder
+  NotSignedIn.
 
 ## Work Guidance
 
@@ -172,9 +177,9 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 | `src/{popover,pickers,composer}.rs` (completion/model popups) | unit + compile | `cargo test -p zeron-ui scrollbar_metrics && cargo test -p zeron-ui composer` |
 | `src/shell/{spaces,tabs}.rs` (ordem visual e atalhos de Chat) | unit | `cargo test -p zeron-ui shell::spaces::tests && cargo test -p zeron-ui shell::tabs::cycle_tests` |
 | `src/mermaid_preview.rs` (fit, slack de pan, fatores de gesto) | unit — matemática pura; a lightbox em si é visual | `cargo test -p zeron-ui --lib mermaid_preview` · `ZERON_MOCK_MEDIA=1 scripts/dev-demo.sh` |
-| `src/settings/accounts.rs` (ordem de provedores, ausência de add em managed, thresholds e format_reset) | unit | `cargo test -p zeron-ui accounts` |
+| `src/settings/accounts.rs` (ordem de provedores, ausência de add em managed, thresholds e format_reset; toggle de Usage é visual) | unit | `cargo test -p zeron-ui accounts` |
 | `src/settings/projects.rs` (filtro, git remoto, editor/config e decisões de ícone) | unit; render gpui continua visual | `cargo test -p zeron-ui projects` · `scripts/dev-demo.sh` |
-| `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
+| `src/details_sidebar/usage.rs` (remaining, tom semanal, gate do badge de reset, pace, membership por hidden-id) | unit — derivações puras sobre um `now` injetado | `cargo test -p zeron-ui usage` |
 | `src/details_sidebar/worked_projects.rs` (Worked Projects, Leaf Root, expansão de home, primeiro contato) | unit | `cargo test -p zeron-ui worked_projects` |
 | `src/details_sidebar/{chat_workers,widgets}.rs` (projeção, formatação e disclosure de telemetria de Worker) | unit + visual gpui | `cargo test -p zeron-ui details_sidebar` · `scripts/dev-demo.sh` |
 | `src/details_sidebar/view.rs` (ticker de usage, retenção de snapshot, render gpui) | none — ciclo de vida de `Task`/entidade sem harness; validação é visual | `scripts/dev-demo.sh` |

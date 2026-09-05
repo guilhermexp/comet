@@ -24,6 +24,7 @@ use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
+use crate::settings::{self, SavePolicy};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -856,6 +857,9 @@ impl AccountsPage {
                 })
         });
 
+        let visible = settings::current(cx).usage_widget_account_visible(&account.id);
+        let toggle_account_id = account.id.clone();
+
         div()
             .px(px(20.0))
             .py(px(14.0))
@@ -932,6 +936,21 @@ impl AccountsPage {
                     .gap(px(8.0))
                     .child(badges)
                     .children(actions),
+            )
+            .child(
+                widgets::toggle_switch(theme, visible)
+                    .id(SharedString::from(format!(
+                        "account-usage-toggle-{toggle_account_id}"
+                    )))
+                    .self_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::update(SavePolicy::Immediate, cx, |current| {
+                            let next = !current.usage_widget_account_visible(&toggle_account_id);
+                            current.set_usage_widget_account_visible(&toggle_account_id, next);
+                        });
+                        cx.refresh_windows();
+                    })),
             )
             .into_any_element()
     }

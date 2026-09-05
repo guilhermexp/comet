@@ -1,5 +1,9 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
-use zeron_proto::{AgentAccountsSnapshot, AgentUsageLine, HarnessId};
+use zeron_proto::{AgentAccount, AgentAccountsSnapshot, AgentUsageLine, HarnessId};
+
+use crate::settings::accounts::{PROVIDERS, provider_accounts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderUsageState {
@@ -46,6 +50,7 @@ pub struct ProviderUsageRow {
     pub harness: HarnessId,
     pub label: &'static str,
     pub account_id: Option<String>,
+    pub account_label: Option<String>,
     pub state: ProviderUsageState,
     pub weekly_summary: Option<String>,
     pub weekly_tone: UsageTone,
@@ -63,7 +68,19 @@ pub fn usage_provider_icon(harness: HarnessId) -> (&'static str, bool) {
         HarnessId::ClaudeCode => (crate::icons::CLAUDE_MARK, true),
         HarnessId::Kimi => (crate::icons::WORKER_KIMI, false),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY, false),
+        HarnessId::Cursor => (crate::icons::CURSOR_MARK, false),
         _ => (crate::icons::OPENAI_MARK, false),
+    }
+}
+
+pub fn usage_provider_label(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Claude",
+        HarnessId::Codex => "Codex",
+        HarnessId::Kimi => "Kimi",
+        HarnessId::Antigravity => "Antigravity",
+        HarnessId::Cursor => "Cursor",
+        _ => "Agent",
     }
 }
 
@@ -184,113 +201,127 @@ pub fn derive_usage_pace(
 
 pub fn provider_usage_rows(
     snapshot: &AgentAccountsSnapshot,
+    hidden_account_ids: &BTreeSet<String>,
     now: DateTime<Utc>,
 ) -> Vec<ProviderUsageRow> {
-    [
-        (HarnessId::ClaudeCode, "Claude"),
-        (HarnessId::Codex, "Codex"),
-        (HarnessId::Kimi, "Kimi"),
-        (HarnessId::Antigravity, "Antigravity"),
-    ]
-    .into_iter()
-    .map(|(harness, label)| {
-        let account = snapshot
-            .accounts
-            .iter()
-            .filter(|account| account.harness == harness)
-            .min_by_key(|account| !account.active);
-        let Some(account) = account else {
-            return ProviderUsageRow {
-                harness,
-                label,
-                account_id: None,
-                state: ProviderUsageState::NotSignedIn,
-                weekly_summary: None,
-                weekly_tone: UsageTone::Neutral,
-                windows: Vec::new(),
-                weekly_reset_badge: None,
-                usage_lines: Vec::new(),
-            };
-        };
-        let windows: Vec<_> = account
-            .usage_windows
-            .iter()
-            .map(|window| {
-                let remaining =
-                    ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u8;
-                UsageWindowRow {
-                    label: window.label.clone(),
-                    used_fraction: window.used_fraction.clamp(0.0, 1.0),
-                    remaining_percent: remaining,
-                    reset_text: reset_text(window.resets_at, now),
-                    pace: derive_usage_pace(
-                        window.used_fraction,
-                        window.resets_at,
-                        if window.label.to_lowercase().contains("week") {
-                            Some(10_080)
-                        } else if window.label.to_lowercase().contains("session")
-                            || window.label.to_lowercase().contains("5h")
-                        {
-                            Some(300)
-                        } else {
-                            None
-                        },
-                        now,
-                    ),
-                }
+    PROVIDERS
+        .into_iter()
+        .flat_map(|(harness, _, _)| {
+            let visible: Vec<&AgentAccount> = provider_accounts(snapshot, harness)
+                .into_iter()
+                .filter(|account| !hidden_account_ids.contains(&account.id))
+                .collect();
+            let show_account_label = visible.len() > 1;
+            visible
+                .into_iter()
+                .map(move |account| account_usage_row(account, show_account_label, now))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn account_usage_row(
+    account: &AgentAccount,
+    show_account_label: bool,
+    now: DateTime<Utc>,
+) -> ProviderUsageRow {
+    let windows: Vec<_> = account
+        .usage_windows
+        .iter()
+        .map(|window| {
+            let remaining = ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u8;
+            UsageWindowRow {
+                label: window.label.clone(),
+                used_fraction: window.used_fraction.clamp(0.0, 1.0),
+                remaining_percent: remaining,
+                reset_text: reset_text(window.resets_at, now),
+                pace: derive_usage_pace(
+                    window.used_fraction,
+                    window.resets_at,
+                    if window.label.to_lowercase().contains("week") {
+                        Some(10_080)
+                    } else if window.label.to_lowercase().contains("session")
+                        || window.label.to_lowercase().contains("5h")
+                    {
+                        Some(300)
+                    } else {
+                        None
+                    },
+                    now,
+                ),
+            }
+        })
+        .collect();
+    let weekly_window = windows
+        .iter()
+        .find(|window| window.label.to_lowercase().contains("week"));
+    let weekly_remaining_percent = weekly_window.map(|w| w.remaining_percent);
+    let weekly_summary = weekly_remaining_percent.map(|remaining| format!("Weekly {remaining}%"));
+    let weekly_reset_badge = account
+        .usage_windows
+        .iter()
+        .find(|window| window.label.to_lowercase().contains("week"))
+        .and_then(|window| {
+            let remaining = ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u8;
+            reset_badge_text(window.resets_at, remaining, now)
+        });
+    let state = if windows.is_empty() && account.usage_lines.is_empty() {
+        ProviderUsageState::NoUsage
+    } else {
+        ProviderUsageState::Ready
+    };
+    let weekly_tone = if state == ProviderUsageState::Ready {
+        weekly_usage_tone(weekly_remaining_percent)
+    } else {
+        UsageTone::Neutral
+    };
+    ProviderUsageRow {
+        harness: account.harness,
+        label: usage_provider_label(account.harness),
+        account_id: Some(account.id.clone()),
+        account_label: show_account_label
+            .then(|| {
+                account
+                    .email
+                    .clone()
+                    .or_else(|| account.display_name.clone())
             })
-            .collect();
-        let weekly_window = windows
-            .iter()
-            .find(|window| window.label.to_lowercase().contains("week"));
-        let weekly_remaining_percent = weekly_window.map(|w| w.remaining_percent);
-        let weekly_summary =
-            weekly_remaining_percent.map(|remaining| format!("Weekly {remaining}%"));
-        let weekly_reset_badge = account
-            .usage_windows
-            .iter()
-            .find(|window| window.label.to_lowercase().contains("week"))
-            .and_then(|window| {
-                let remaining =
-                    ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u8;
-                reset_badge_text(window.resets_at, remaining, now)
-            });
-        let state = if windows.is_empty() && account.usage_lines.is_empty() {
-            ProviderUsageState::NoUsage
-        } else {
-            ProviderUsageState::Ready
-        };
-        let weekly_tone = if state == ProviderUsageState::Ready {
-            weekly_usage_tone(weekly_remaining_percent)
-        } else {
-            UsageTone::Neutral
-        };
-        ProviderUsageRow {
-            harness,
-            label,
-            account_id: Some(account.id.clone()),
-            state,
-            weekly_summary,
-            weekly_tone,
-            windows,
-            weekly_reset_badge,
-            usage_lines: account.usage_lines.clone(),
-        }
-    })
-    .collect()
+            .flatten(),
+        state,
+        weekly_summary,
+        weekly_tone,
+        windows,
+        weekly_reset_badge,
+        usage_lines: account.usage_lines.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use std::collections::BTreeSet;
+
+    use chrono::{DateTime, TimeZone, Utc};
     use zeron_proto::{
         AgentAccount, AgentAccountsSnapshot, AgentUsageLine, AgentUsageWindow, HarnessId,
     };
 
     use super::{
-        ProviderUsageState, UsageTone, derive_usage_pace, provider_usage_rows, reset_text,
-        usage_provider_icon,
+        ProviderUsageRow, ProviderUsageState, UsageTone, derive_usage_pace, provider_usage_rows,
+        reset_text, usage_provider_icon,
     };
+
+    fn usage_rows(snapshot: &AgentAccountsSnapshot, now: DateTime<Utc>) -> Vec<ProviderUsageRow> {
+        provider_usage_rows(snapshot, &BTreeSet::new(), now)
+    }
+
+    fn usage_rows_hiding(
+        snapshot: &AgentAccountsSnapshot,
+        hidden: &[&str],
+        now: DateTime<Utc>,
+    ) -> Vec<ProviderUsageRow> {
+        let hidden = hidden.iter().map(|id| (*id).to_string()).collect();
+        provider_usage_rows(snapshot, &hidden, now)
+    }
 
     #[test]
     fn weekly_pace_reports_deficit_and_projected_exhaustion() {
@@ -416,7 +447,7 @@ mod tests {
             warnings: Vec::new(),
         };
         let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
-        let rows = provider_usage_rows(&snapshot, now);
+        let rows = usage_rows_hiding(&snapshot, &["claude-old"], now);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].label, "Claude");
         assert_eq!(rows[0].account_id.as_deref(), Some("claude-active"));
@@ -464,7 +495,7 @@ mod tests {
             warnings: Vec::new(),
         };
 
-        let rows = provider_usage_rows(&snapshot, Utc::now());
+        let rows = usage_rows(&snapshot, Utc::now());
         let codex = rows
             .iter()
             .find(|row| row.harness == HarnessId::Codex)
@@ -475,13 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_provider_account_is_explicitly_unavailable() {
-        let rows = provider_usage_rows(&AgentAccountsSnapshot::default(), Utc::now());
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].state, ProviderUsageState::NotSignedIn);
-        assert_eq!(rows[1].state, ProviderUsageState::NotSignedIn);
-        assert_eq!(rows[2].state, ProviderUsageState::NotSignedIn);
-        assert_eq!(rows[3].state, ProviderUsageState::NotSignedIn);
+    fn missing_provider_account_yields_no_placeholder_rows() {
+        let rows = usage_rows(&AgentAccountsSnapshot::default(), Utc::now());
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -501,9 +528,7 @@ mod tests {
                 )],
                 warnings: Vec::new(),
             };
-            provider_usage_rows(&snapshot, now)[0]
-                .weekly_reset_badge
-                .clone()
+            usage_rows(&snapshot, now)[0].weekly_reset_badge.clone()
         };
 
         // Emphasis tracks RESET PROXIMITY, never how much quota is left: this
@@ -546,7 +571,7 @@ mod tests {
                 )],
                 warnings: Vec::new(),
             };
-            let rows = provider_usage_rows(&snapshot, now);
+            let rows = usage_rows(&snapshot, now);
             rows[0].weekly_tone
         };
 
@@ -566,12 +591,11 @@ mod tests {
     }
 
     #[test]
-    fn weekly_tone_neutral_when_not_signed_in_no_usage_or_no_weekly_window() {
+    fn weekly_tone_neutral_when_no_usage_or_no_weekly_window() {
         let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
-        // NotSignedIn
+        // Empty snapshot: no placeholder rows.
         let empty_snapshot = AgentAccountsSnapshot::default();
-        let rows = provider_usage_rows(&empty_snapshot, now);
-        assert_eq!(rows[0].weekly_tone, UsageTone::Neutral);
+        assert!(usage_rows(&empty_snapshot, now).is_empty());
 
         // NoUsage
         let no_usage_snapshot = AgentAccountsSnapshot {
@@ -583,8 +607,8 @@ mod tests {
             )],
             warnings: Vec::new(),
         };
-        let rows = provider_usage_rows(&no_usage_snapshot, now);
-        assert_eq!(rows[0].weekly_tone, UsageTone::Neutral);
+        let no_usage_rows = usage_rows(&no_usage_snapshot, now);
+        assert_eq!(no_usage_rows[0].weekly_tone, UsageTone::Neutral);
 
         // Ready but with only non-weekly window (e.g. 5h)
         let non_weekly_snapshot = AgentAccountsSnapshot {
@@ -600,7 +624,7 @@ mod tests {
             )],
             warnings: Vec::new(),
         };
-        let rows = provider_usage_rows(&non_weekly_snapshot, now);
+        let rows = usage_rows(&non_weekly_snapshot, now);
         let kimi = rows.iter().find(|r| r.harness == HarnessId::Kimi).unwrap();
         assert_eq!(kimi.state, ProviderUsageState::Ready);
         assert_eq!(kimi.weekly_tone, UsageTone::Neutral);
@@ -627,19 +651,72 @@ mod tests {
         };
 
         // 1. remaining_percent == 0 and reset 5 days in the future -> badge present (e.g. "Reset 5d 0h")
-        let rows = provider_usage_rows(&make_snapshot(1.0, Some(reset_5d)), now);
+        let rows = usage_rows(&make_snapshot(1.0, Some(reset_5d)), now);
         assert_eq!(rows[0].weekly_reset_badge.as_deref(), Some("Reset 5d 0h"));
 
         // 2. remaining_percent == 60 (comfortable quota) and reset 5 days in the future -> badge absent
-        let rows = provider_usage_rows(&make_snapshot(0.40, Some(reset_5d)), now);
-        assert_eq!(rows[0].weekly_reset_badge, None);
+        let exhausted_distant = usage_rows(&make_snapshot(0.40, Some(reset_5d)), now);
+        assert_eq!(exhausted_distant[0].weekly_reset_badge, None);
 
         // 3. remaining_percent == 60 and reset in 12h (soon) -> badge present
-        let rows = provider_usage_rows(&make_snapshot(0.40, Some(reset_12h)), now);
-        assert_eq!(rows[0].weekly_reset_badge.as_deref(), Some("Reset 12h 16m"));
+        let soon = usage_rows(&make_snapshot(0.40, Some(reset_12h)), now);
+        assert_eq!(soon[0].weekly_reset_badge.as_deref(), Some("Reset 12h 16m"));
 
         // 4. remaining_percent == 0 and resets_at is None -> badge absent
-        let rows = provider_usage_rows(&make_snapshot(1.0, None), now);
-        assert_eq!(rows[0].weekly_reset_badge, None);
+        let no_reset = usage_rows(&make_snapshot(1.0, None), now);
+        assert_eq!(no_reset[0].weekly_reset_badge, None);
+    }
+
+    #[test]
+    fn hidden_account_is_omitted_and_two_visible_claudes_are_two_rows() {
+        let now = Utc::now();
+        let mut alice = account("claude-alice", HarnessId::ClaudeCode, true, vec![]);
+        alice.email = Some("alice@example.com".into());
+        let mut bob = account("claude-bob", HarnessId::ClaudeCode, false, vec![]);
+        bob.email = Some("bob@example.com".into());
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![alice, bob],
+            warnings: vec![],
+        };
+
+        let visible = usage_rows(&snapshot, now);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].account_id.as_deref(), Some("claude-alice"));
+        assert_eq!(
+            visible[0].account_label.as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(visible[1].account_id.as_deref(), Some("claude-bob"));
+        assert_eq!(visible[1].account_label.as_deref(), Some("bob@example.com"));
+
+        let hidden = usage_rows_hiding(&snapshot, &["claude-bob"], now);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].account_id.as_deref(), Some("claude-alice"));
+        assert_eq!(hidden[0].account_label, None);
+    }
+
+    #[test]
+    fn cursor_account_appears_when_visible() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![account("cursor-1", HarnessId::Cursor, true, vec![])],
+            warnings: vec![],
+        };
+        let rows = usage_rows(&snapshot, Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Cursor");
+        assert_eq!(rows[0].account_id.as_deref(), Some("cursor-1"));
+        assert_eq!(
+            usage_provider_icon(HarnessId::Cursor),
+            (crate::icons::CURSOR_MARK, false)
+        );
+    }
+
+    #[test]
+    fn fully_hidden_snapshot_has_no_rows() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![account("kimi-managed", HarnessId::Kimi, true, vec![])],
+            warnings: vec![],
+        };
+        assert!(usage_rows_hiding(&snapshot, &["kimi-managed"], Utc::now()).is_empty());
     }
 }

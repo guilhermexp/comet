@@ -936,8 +936,11 @@ impl DetailsSidebar {
                 cx.background_executor().timer(USAGE_TICK).await;
                 let keep_ticking = this.update(cx, |this, cx| {
                     if let Some(snapshot) = &this.usage_snapshot {
-                        this.usage =
-                            LoadState::Ready(provider_usage_rows(snapshot, chrono::Utc::now()));
+                        this.usage = LoadState::Ready(provider_usage_rows(
+                            snapshot,
+                            &crate::settings::current(cx).usage_widget_hidden_account_ids,
+                            chrono::Utc::now(),
+                        ));
                         cx.notify();
                     }
                     let should_fetch = this
@@ -980,7 +983,11 @@ impl DetailsSidebar {
                         Ok(snapshot) => {
                             this.usage_fetched_at = Some(std::time::Instant::now());
                             let snapshot = this.usage_snapshot.insert(snapshot);
-                            let rows = provider_usage_rows(snapshot, chrono::Utc::now());
+                            let rows = provider_usage_rows(
+                                snapshot,
+                                &crate::settings::current(cx).usage_widget_hidden_account_ids,
+                                chrono::Utc::now(),
+                            );
                             this.usage = LoadState::Ready(rows);
                         }
                         Err(error) => {
@@ -2231,23 +2238,36 @@ impl DetailsSidebar {
             ));
         }
 
-        let usage_body = match &self.usage {
-            LoadState::Ready(rows) => div().children(
-                rows.clone()
-                    .into_iter()
-                    .map(|row| self.render_usage_row(row, theme, cx)),
-            ),
-            LoadState::Loading => div()
+        let hidden = crate::settings::current(cx).usage_widget_hidden_account_ids;
+        let usage_body = match (&self.usage, &self.usage_snapshot) {
+            (_, Some(snapshot)) => {
+                let rows = provider_usage_rows(snapshot, &hidden, chrono::Utc::now());
+                if rows.is_empty() {
+                    div()
+                        .p(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(
+                            "No accounts in Usage. Toggle them on in Settings → Accounts.",
+                        ))
+                } else {
+                    div().children(
+                        rows.into_iter()
+                            .map(|row| self.render_usage_row(row, theme, cx)),
+                    )
+                }
+            }
+            (LoadState::Loading, None) => div()
                 .p(px(10.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_muted)
                 .child("Loading usage…"),
-            LoadState::Error(message) => div()
+            (LoadState::Error(message), None) => div()
                 .p(px(10.0))
                 .text_size(px(12.0))
                 .text_color(theme.danger)
                 .child(message.clone()),
-            LoadState::Idle => div(),
+            _ => div(),
         };
         content.child(widget_card(
             "usage-widget",
@@ -2264,7 +2284,10 @@ impl DetailsSidebar {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let key = row.label.to_string();
+        let key = row
+            .account_id
+            .clone()
+            .unwrap_or_else(|| row.label.to_string());
         let expandable = row.state == ProviderUsageState::Ready
             && (!row.windows.is_empty() || !row.usage_lines.is_empty());
         let expanded = expandable && self.usage_expanded.contains(&key);
@@ -2322,10 +2345,27 @@ impl DetailsSidebar {
                     )
                     .child(
                         div()
-                            .text_size(px(12.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(row.label),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(row.label),
+                            )
+                            .when_some(row.account_label.clone(), |el, label| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(label)),
+                                )
+                            }),
                     )
                     .child(
                         // Badge + percent read as one right-aligned cluster, so

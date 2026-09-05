@@ -7,6 +7,7 @@
 //! defaults, and loaded values are clamped so a hand-edited file can't wedge the
 //! layout.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -274,6 +275,9 @@ pub struct UiSettings {
     pub details_sidebar_width: f32,
     pub details_sidebar_open: bool,
     pub details_sidebar_preferences: crate::details_sidebar::view::DetailsSidebarPreferences,
+    /// Account ids omitted from the Usage widget. Missing id = visible.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub usage_widget_hidden_account_ids: BTreeSet<String>,
     #[serde(skip_serializing)]
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
@@ -327,6 +331,7 @@ impl Default for UiSettings {
             details_sidebar_open: false,
             details_sidebar_preferences:
                 crate::details_sidebar::view::DetailsSidebarPreferences::default(),
+            usage_widget_hidden_account_ids: BTreeSet::new(),
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
@@ -784,6 +789,19 @@ impl UiSettings {
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join(FILE_NAME)
     }
+
+    pub fn usage_widget_account_visible(&self, account_id: &str) -> bool {
+        !self.usage_widget_hidden_account_ids.contains(account_id)
+    }
+
+    pub fn set_usage_widget_account_visible(&mut self, account_id: &str, visible: bool) {
+        if visible {
+            self.usage_widget_hidden_account_ids.remove(account_id);
+        } else {
+            self.usage_widget_hidden_account_ids
+                .insert(account_id.to_string());
+        }
+    }
 }
 
 fn clamp_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
@@ -852,9 +870,47 @@ mod tests {
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
+            usage_widget_hidden_account_ids: BTreeSet::from(["claude-1".into()]),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
+    }
+
+    #[test]
+    fn usage_widget_hidden_ids_round_trip_and_default_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = UiSettings::default();
+        assert!(settings.usage_widget_account_visible("claude-1"));
+        settings.set_usage_widget_account_visible("claude-1", false);
+        assert!(!settings.usage_widget_account_visible("claude-1"));
+        settings.save(dir.path()).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.usage_widget_account_visible("claude-1"));
+        assert!(loaded.usage_widget_account_visible("claude-2"));
+    }
+
+    #[test]
+    fn omitted_hidden_ids_field_means_every_account_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = UiSettings::path(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(loaded.usage_widget_hidden_account_ids.is_empty());
+        assert!(loaded.usage_widget_account_visible("claude-1"));
+    }
+
+    #[test]
+    fn apply_shell_settings_does_not_clobber_usage_widget_hidden_ids() {
+        let mut current = UiSettings::default();
+        current.set_usage_widget_account_visible("claude-1", false);
+        let shell = UiSettings {
+            sidebar_width: 320.0,
+            ..UiSettings::default()
+        };
+        apply_shell_settings(&mut current, &shell);
+        assert!(!current.usage_widget_account_visible("claude-1"));
+        assert_eq!(current.sidebar_width, 320.0);
     }
 
     #[test]
