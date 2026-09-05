@@ -35,7 +35,7 @@ Donos do fluxo de dev e do artefato de release. Não contêm lógica de produto 
 | `dev-demo.sh` | none — ferramenta de dev; validação é usar | `scripts/dev-demo.sh` |
 | `seed-demo-workers.py` | integration — fixture consumido pelo bootstrap real | `cargo test -p zeron-workers-unpeel --test dev_demo_fixture` |
 | `package-*.sh` | none — sem suite; validação é gerar o pacote e abrir | execução manual |
-| `omp-dev` | none — wrapper de 1 decisão; validação é o handshake | `printf '{"type":"ping","id":"x"}\n' \| scripts/omp-dev --mode rpc-ui --auto-approve --no-extensions --allow-home --cwd "$HOME" \| head -1` (espera `"type":"ready"`) |
+| `omp-dev` | none — wrapper de 1 decisão; validação é o handshake | `printf '{"type":"ping","id":"x"}\n' \| scripts/omp-dev --mode rpc-ui --auto-approve --allow-home --cwd "$HOME" \| head -1` (espera `"type":"ready"`) |
 
 ## Child DOX Index
 

@@ -1,12 +1,12 @@
 ## 1. Regression Coverage
 
-- [x] 1.1 Add a fake-OMP argv scenario that fails if `--no-extensions` is present and still requires `--mode rpc-ui --auto-approve --allow-home`
-- [x] 1.2 Add a harness integration test that starts `OmpProcess` with that scenario
+- [x] 1.1 Do not retain an argv-only fake-OMP test; it does not prove extension discovery
+- [x] 1.2 Keep `every_omp_launch_scopes_skills_to_the_project` as the automated skill-overlay regression
 
 ## 2. Session Launch
 
 - [x] 2.1 Remove `--no-extensions` from `OmpProcess::start` and leave the remaining launch flags, skill overlay, and session semantics unchanged
-- [x] 2.2 Confirm the new test and `every_omp_launch_scopes_skills_to_the_project` pass
+- [x] 2.2 Confirm `every_omp_launch_scopes_skills_to_the_project` still passes
 
 ## 3. Contracts and Verification
 

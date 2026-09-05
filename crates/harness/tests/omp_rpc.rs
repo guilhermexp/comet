@@ -212,17 +212,6 @@ async fn omp_live_protocol_retains_additive_capability() {
     unsupported.shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn omp_session_launch_discovers_extensions() {
-    // The fixture exits 50 if `--no-extensions` is present, and 51-53 if the
-    // rest of the Session launch contract is missing. Discovery is OMP's
-    // default; Comet must not disable it.
-    let process = OmpProcess::start(fake_launch("reject-no-extensions"))
-        .await
-        .expect("Session launch must omit --no-extensions");
-    process.shutdown().await.unwrap();
-}
-
 #[test]
 fn omp_live_protocol_parses_and_validates_transient_events() {
     assert_eq!(
