@@ -1638,6 +1638,64 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
+            methods::GENERATE_CHAT_RECAP => {
+                let p: zeron_rpc::GenerateChatRecapParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let Some(chat) = chat else {
+                    return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                };
+
+                let doc_handle = match self.doc_host.open(&p.chat_id) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        tracing::debug!(chat = %p.chat_id, error = %err, "recap failed to open chat doc");
+                        return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                    }
+                };
+
+                let entries = match doc_handle.doc().read_entries() {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::debug!(chat = %p.chat_id, error = %err, "recap failed to read entries");
+                        return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                    }
+                };
+
+                let transcript = crate::recap::select_recap_transcript(&entries);
+                if transcript.is_empty() {
+                    return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                }
+
+                let prompt = crate::recap::build_recap_prompt(&transcript, chat.title.as_deref());
+                let harness_id = chat
+                    .config
+                    .as_ref()
+                    .map(|c| c.harness)
+                    .or_else(|| self.registry.enabled_set().into_iter().next())
+                    .unwrap_or(HarnessId::ClaudeCode);
+                let cwd = chat.cwd.as_deref().unwrap_or(".");
+
+                let recap = match crate::recap::run_recap_model(
+                    &p.chat_id,
+                    harness_id,
+                    &prompt,
+                    cwd,
+                    &self.registry,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::warn!(chat = %p.chat_id, error = %err, "recap model generation failed");
+                        None
+                    }
+                };
+
+                RpcReply::value(&zeron_rpc::GenerateChatRecapReply { recap })
+            }
             methods::LOCAL_IMPORT_STATUS => {
                 let importer = self.local_importer()?.clone();
                 let status = tokio::task::spawn_blocking(move || importer.status())

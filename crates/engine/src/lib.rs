@@ -30,6 +30,7 @@ pub(crate) mod process;
 pub mod profile;
 mod provider_usage_archive;
 pub mod registry;
+pub mod recap;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
