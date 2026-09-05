@@ -443,7 +443,42 @@ pub fn detect_cli_default_model(cli_or_cmd: &str) -> (String, String) {
             }
             ("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into())
         }
-        "claude" | "claude-code" => ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
+        "claude" | "claude-code" => {
+            if let Ok(m) = std::env::var("ANTHROPIC_MODEL") {
+                let label = format_model_label(&m);
+                return (m, label);
+            }
+            if let Some(home_path) = &home {
+                let config_path = home_path.join(".claude.json");
+                if let Ok(content) = std::fs::read_to_string(config_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(slots) =
+                            json.get("clientDataCacheSlots").and_then(|v| v.as_object())
+                        {
+                            let mut best_slot: Option<(&serde_json::Value, u64)> = None;
+                            for (_, slot) in slots {
+                                if let Some(_m) = slot.get("model").and_then(|v| v.as_str()) {
+                                    let at = slot.get("at").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let is_cli = slot.get("entrypoint").and_then(|v| v.as_str())
+                                        == Some("cli");
+                                    let score = if is_cli { at + 1_000_000_000_000 } else { at };
+                                    if best_slot.as_ref().map_or(true, |(_, s)| score > *s) {
+                                        best_slot = Some((slot, score));
+                                    }
+                                }
+                            }
+                            if let Some((slot, _)) = best_slot {
+                                if let Some(m) = slot.get("model").and_then(|v| v.as_str()) {
+                                    let label = format_model_label(m);
+                                    return (m.to_string(), label);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ("claude-opus-5".into(), "Opus 5".into())
+        }
         "opencode" => ("glm-5".into(), "GLM 5".into()),
         "prime-agent" | "agy" => ("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into()),
         "cursor" | "cursor-agent" => ("composer-2.5".into(), "Composer 2.5".into()),
@@ -456,9 +491,9 @@ pub fn static_models_for_cli(cli_or_cmd: &str) -> Vec<(String, String)> {
     match head {
         "claude" | "claude-code" => vec![
             ("default".into(), "Default".into()),
-            ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
-            ("claude-sonnet-5".into(), "Sonnet 5".into()),
             ("claude-opus-5".into(), "Opus 5".into()),
+            ("claude-sonnet-5".into(), "Sonnet 5".into()),
+            ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
             ("claude-3-5-sonnet-20241022".into(), "Sonnet 3.5".into()),
             ("claude-3-5-haiku-20241022".into(), "Haiku 3.5".into()),
             ("claude-fable-5".into(), "Fable 5".into()),
@@ -2207,7 +2242,7 @@ mod tests {
         );
 
         let (_, claude_label) = detect_cli_default_model("claude");
-        assert_eq!(claude_label, "Sonnet 3.7");
+        assert!(!claude_label.is_empty() && claude_label != "Default");
 
         let (_, omp_label) = detect_cli_default_model("omp");
         assert!(!omp_label.is_empty() && omp_label != "Default");
