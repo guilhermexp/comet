@@ -10,6 +10,9 @@ pub struct DetailsSidebarPreferences {
     pub active_tab: DetailsTab,
     pub expanded: HashMap<String, Vec<String>>,
     pub hidden: HashMap<String, bool>,
+    pub idle_recaps: HashMap<String, super::idle_recap::IdleRecapEntry>,
+    pub idle_recap_enabled: bool,
+    pub idle_recap_delay_seconds: u64,
 }
 
 impl Default for DetailsSidebarPreferences {
@@ -18,6 +21,9 @@ impl Default for DetailsSidebarPreferences {
             active_tab: DetailsTab::Details,
             expanded: HashMap::new(),
             hidden: HashMap::new(),
+            idle_recaps: HashMap::new(),
+            idle_recap_enabled: true,
+            idle_recap_delay_seconds: super::idle_recap::IDLE_RECAP_DEFAULT_SECONDS,
         }
     }
 }
@@ -64,7 +70,12 @@ pub struct DetailsSidebarState {
 }
 
 impl DetailsSidebarState {
-    pub fn new(preferences: DetailsSidebarPreferences) -> Self {
+    pub fn new(mut preferences: DetailsSidebarPreferences) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        super::idle_recap::prune_idle_recaps(&mut preferences.idle_recaps, now);
         Self {
             context: None,
             preferences,
@@ -134,6 +145,27 @@ impl DetailsSidebarState {
             paths.push(KEY.to_string());
             paths.sort();
         }
+    }
+
+    pub fn idle_recap_for(&self, context_key: &str) -> Option<&super::idle_recap::IdleRecapEntry> {
+        self.preferences.idle_recaps.get(context_key)
+    }
+
+    pub fn set_idle_recap(
+        &mut self,
+        context_key: String,
+        entry: super::idle_recap::IdleRecapEntry,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.preferences.idle_recaps.insert(context_key, entry);
+        super::idle_recap::prune_idle_recaps(&mut self.preferences.idle_recaps, now);
+    }
+
+    pub fn clear_idle_recap(&mut self, context_key: &str) {
+        self.preferences.idle_recaps.remove(context_key);
     }
 
     pub fn toggle_expanded(&mut self, relative_path: &str) {

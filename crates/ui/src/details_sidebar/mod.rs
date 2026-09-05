@@ -3,6 +3,7 @@ pub mod context;
 pub mod file_tree;
 pub(crate) mod files_view;
 pub mod recency;
+pub mod idle_recap;
 pub(crate) mod subagent_avatars;
 pub mod todos;
 pub mod usage;
