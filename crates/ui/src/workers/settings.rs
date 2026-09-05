@@ -2,22 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, Render, Subscription, Window, div,
-    prelude::*, px,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, Render, SharedString, Subscription,
+    Task, Window, div, prelude::*, px,
 };
+use zeron_proto::HarnessId;
+use zeron_rpc::methods;
 use zeron_workers_unpeel::resources::WorkersSessionResource;
 use zeron_workers_unpeel::{
     PresetPatch, WorkersNotificationSettings, WorkersResourceSettings, WorkersTranscriptSettings,
 };
 
-use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::icons::{self, icon};
-use crate::settings::widgets;
-use crate::theme::Theme;
-
 use super::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use super::presentation::{runtime_icon_path, spinner_frame};
 use super::resource_monitor::{WorkersResourceGlobal, WorkersResourceMonitor};
+use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::icons::{self, icon};
+use crate::popover;
+use crate::settings::widgets;
+use crate::theme::Theme;
 
 fn format_memory_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
@@ -209,12 +211,191 @@ fn normalize_preset_command(raw: &str) -> Option<(String, String)> {
     (!command.is_empty()).then(|| (command.to_owned(), command.to_owned()))
 }
 
+pub fn extract_model_from_command(command: &str) -> Option<String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+        if part == "--model" || part == "-m" {
+            if i + 1 < parts.len() {
+                let val = parts[i + 1].trim_matches(|c| c == '"' || c == '\'');
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        } else if let Some(val) = part.strip_prefix("--model=") {
+            let val = val.trim_matches(|c| c == '"' || c == '\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        } else if let Some(val) = part.strip_prefix("-m=") {
+            let val = val.trim_matches(|c| c == '"' || c == '\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+pub fn apply_model_to_command(command: &str, new_model: Option<&str>) -> String {
+    let clean_model = new_model.and_then(|m| {
+        let t = m.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("default") {
+            None
+        } else {
+            Some(t)
+        }
+    });
+
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.is_empty() {
+        if let Some(model) = clean_model {
+            return format!("--model {model}");
+        }
+        return String::new();
+    }
+
+    let mut new_parts = Vec::new();
+    let mut replaced = false;
+    let mut i = 0;
+
+    while i < parts.len() {
+        let part = parts[i];
+        if part == "--model" || part == "-m" {
+            if let Some(model) = clean_model {
+                if !replaced {
+                    new_parts.push(part);
+                    new_parts.push(model);
+                    replaced = true;
+                }
+            }
+            if i + 1 < parts.len() {
+                i += 1;
+            }
+        } else if part.starts_with("--model=") {
+            if let Some(model) = clean_model {
+                if !replaced {
+                    new_parts.push("--model");
+                    new_parts.push(model);
+                    replaced = true;
+                }
+            }
+        } else if part.starts_with("-m=") {
+            if let Some(model) = clean_model {
+                if !replaced {
+                    new_parts.push("-m");
+                    new_parts.push(model);
+                    replaced = true;
+                }
+            }
+        } else {
+            new_parts.push(part);
+        }
+        i += 1;
+    }
+
+    if let Some(model) = clean_model {
+        if !replaced {
+            new_parts.push("--model");
+            new_parts.push(model);
+        }
+    }
+
+    new_parts.join(" ")
+}
+
+pub fn cli_to_harness_id(cli_or_cmd: &str) -> Option<HarnessId> {
+    let head = cli_or_cmd.split_whitespace().next().unwrap_or(cli_or_cmd);
+    match head {
+        "claude" | "claude-code" => Some(HarnessId::ClaudeCode),
+        "codex" => Some(HarnessId::Codex),
+        "omp" => Some(HarnessId::Omp),
+        "pi" => Some(HarnessId::Pi),
+        "opencode" => Some(HarnessId::Opencode),
+        "cursor" | "cursor-agent" => Some(HarnessId::Cursor),
+        "grok" => Some(HarnessId::Grok),
+        "hermes" => Some(HarnessId::Hermes),
+        "mock" => Some(HarnessId::Mock),
+        _ => None,
+    }
+}
+
+pub fn static_models_for_cli(cli_or_cmd: &str) -> Vec<(String, String)> {
+    let head = cli_or_cmd.split_whitespace().next().unwrap_or(cli_or_cmd);
+    match head {
+        "claude" | "claude-code" => vec![
+            ("default".into(), "Default (Sonnet 3.7)".into()),
+            ("claude-sonnet-5".into(), "Sonnet 5".into()),
+            ("claude-opus-5".into(), "Opus 5".into()),
+            ("claude-3-7-sonnet-20250219".into(), "Sonnet 3.7".into()),
+            ("claude-3-5-sonnet-20241022".into(), "Sonnet 3.5".into()),
+            ("claude-3-5-haiku-20241022".into(), "Haiku 3.5".into()),
+            ("claude-fable-5".into(), "Fable 5".into()),
+        ],
+        "codex" => vec![
+            ("default".into(), "Default (GPT-5.6-Sol)".into()),
+            ("gpt-5.6-sol".into(), "GPT-5.6-Sol".into()),
+            ("gpt-5.6-terra".into(), "GPT-5.6-Terra".into()),
+            ("gpt-5.6-luna".into(), "GPT-5.6-Luna".into()),
+            ("gpt-5.5".into(), "GPT-5.5".into()),
+            ("gpt-5.4".into(), "GPT-5.4".into()),
+            ("gpt-5.4-mini".into(), "GPT-5.4-Mini".into()),
+            ("gpt-5.3-codex-spark".into(), "GPT-5.3-Codex-Spark".into()),
+        ],
+        "omp" => vec![
+            ("default".into(), "Default".into()),
+            ("anthropic/claude-sonnet-5".into(), "Claude Sonnet 5".into()),
+            ("anthropic/claude-opus-5".into(), "Claude Opus 5".into()),
+            ("openai/gpt-5.6".into(), "GPT-5.6".into()),
+            ("google/gemini-2.5-pro".into(), "Gemini 2.5 Pro".into()),
+            ("google/gemini-2.5-flash".into(), "Gemini 2.5 Flash".into()),
+            ("deepseek/deepseek-v3".into(), "DeepSeek V3".into()),
+        ],
+        "pi" => vec![
+            ("default".into(), "Default".into()),
+            ("claude-sonnet-5".into(), "Claude Sonnet 5".into()),
+            ("gpt-5.6".into(), "GPT-5.6".into()),
+            ("deepseek-v3".into(), "DeepSeek V3".into()),
+        ],
+        "opencode" => vec![
+            ("default".into(), "Default (GLM 5)".into()),
+            ("glm-5".into(), "GLM 5".into()),
+            ("claude-sonnet-5".into(), "Claude Sonnet 5".into()),
+            ("gpt-5.6".into(), "GPT-5.6".into()),
+            ("deepseek-v3".into(), "DeepSeek V3".into()),
+            ("qwen-2.5-coder".into(), "Qwen 2.5 Coder".into()),
+        ],
+        "cursor" | "cursor-agent" => vec![
+            ("default".into(), "Default (Composer 2.5)".into()),
+            ("composer-2.5".into(), "Composer 2.5".into()),
+            ("claude-sonnet-5".into(), "Sonnet 5".into()),
+            ("gpt-5.6".into(), "GPT-5.6".into()),
+        ],
+        "grok" => vec![
+            ("default".into(), "Default (Grok 4.6)".into()),
+            ("grok-4.6".into(), "Grok 4.6".into()),
+            ("grok-4".into(), "Grok 4".into()),
+        ],
+        "prime-agent" | "agy" => vec![
+            ("default".into(), "Default".into()),
+            ("gemini-2.5-pro".into(), "Gemini 2.5 Pro".into()),
+            ("gemini-2.5-flash".into(), "Gemini 2.5 Flash".into()),
+        ],
+        _ => vec![("default".into(), "Default".into())],
+    }
+}
+
 pub struct WorkersSettingsView {
     model: Entity<WorkersModel>,
     resource_monitor: Entity<WorkersResourceMonitor>,
     command_input: Entity<ComposerInput>,
     editing_preset_id: Option<String>,
     expanded_resource_sessions: HashSet<String>,
+    open_model_menu_preset_id: Option<String>,
+    dynamic_models: HashMap<String, Vec<(String, String)>>,
+    _model_fetch_task: Option<Task<()>>,
     _model_observation: Subscription,
     _resource_observation: Subscription,
     _command_events: Subscription,
@@ -254,10 +435,63 @@ impl WorkersSettingsView {
             command_input,
             editing_preset_id: None,
             expanded_resource_sessions: HashSet::new(),
+            open_model_menu_preset_id: None,
+            dynamic_models: HashMap::new(),
+            _model_fetch_task: None,
             _model_observation: model_observation,
             _resource_observation: resource_observation,
             _command_events: command_events,
         }
+    }
+
+    fn load_models_for_cli(&mut self, cli_or_cmd: &str, cx: &mut Context<Self>) {
+        let head = cli_or_cmd.split_whitespace().next().unwrap_or(cli_or_cmd);
+        let key = head.to_string();
+        if self.dynamic_models.contains_key(&key) {
+            return;
+        }
+        let Some(harness) = cli_to_harness_id(head) else {
+            return;
+        };
+        let Some(engine) = self.model.read(cx).state().read(cx).engine().cloned() else {
+            return;
+        };
+        let cli_key = key.clone();
+        self._model_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<Vec<zeron_proto::Model>>(
+                    methods::LIST_MODELS,
+                    serde_json::json!({ "harness": harness }),
+                )
+                .await;
+            if let Ok(models) = result {
+                if !models.is_empty() {
+                    this.update(cx, |this, cx| {
+                        let mut list = vec![("default".to_string(), "Default".to_string())];
+                        list.extend(models.into_iter().map(|m| (m.id, m.label)));
+                        this.dynamic_models.insert(cli_key, list);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+    }
+
+    fn available_models_for_preset(
+        &self,
+        cli_id: Option<&str>,
+        command: &str,
+    ) -> Vec<(String, String)> {
+        let head = command.split_whitespace().next().unwrap_or(command);
+        let key = cli_id.unwrap_or(head);
+        if let Some(models) = self.dynamic_models.get(key) {
+            if !models.is_empty() {
+                return models.clone();
+            }
+        }
+        static_models_for_cli(key)
     }
 
     fn submit_preset(&mut self, cx: &mut Context<Self>) {
@@ -374,6 +608,176 @@ impl WorkersSettingsView {
             let delete_id = preset.id.clone();
             let quick_launch = preset.quick_launch;
             let enabled = preset.enabled;
+
+            let current_model_id = extract_model_from_command(&preset.command);
+            let mut models =
+                self.available_models_for_preset(preset.cli_id.as_deref(), &preset.command);
+            if let Some(curr) = &current_model_id {
+                if !models.iter().any(|(id, _)| id == curr) {
+                    models.push((curr.clone(), curr.clone()));
+                }
+            }
+            let current_label = match &current_model_id {
+                Some(id) => models
+                    .iter()
+                    .find(|(m_id, _)| m_id == id)
+                    .map(|(_, l)| l.as_str())
+                    .unwrap_or_else(|| id.as_str()),
+                None => "Default",
+            };
+
+            let is_menu_open = self.open_model_menu_preset_id.as_deref() == Some(&preset.id);
+            let preset_id_for_toggle = preset.id.clone();
+            let preset_id_for_menu = preset.id.clone();
+            let preset_command_for_menu = preset.command.clone();
+            let cli_or_cmd_for_load = preset
+                .cli_id
+                .clone()
+                .unwrap_or_else(|| preset.command.clone());
+
+            let mut model_selector = div()
+                .id(("workers-preset-model-btn", index))
+                .h(px(26.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if is_menu_open {
+                    theme.accent
+                } else {
+                    theme.border.opacity(0.6)
+                })
+                .bg(if is_menu_open {
+                    crate::theme::ink(0.08)
+                } else {
+                    crate::theme::ink(0.03)
+                })
+                .hover(|el| el.bg(crate::theme::ink(0.06)))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.open_model_menu_preset_id.as_deref() == Some(&preset_id_for_toggle) {
+                        this.open_model_menu_preset_id = None;
+                    } else {
+                        this.open_model_menu_preset_id = Some(preset_id_for_toggle.clone());
+                        this.load_models_for_cli(&cli_or_cmd_for_load, cx);
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .max_w(px(140.0))
+                        .truncate()
+                        .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if current_model_id.is_some() {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(current_label.to_string()),
+                )
+                .child(
+                    icon(icons::SORT_VERTICAL)
+                        .size(px(11.0))
+                        .text_color(theme.text_faint),
+                );
+
+            if is_menu_open {
+                let row_id_prefix = format!("preset-model-row-{index}");
+                let menu = popover::popover_card(theme)
+                    .w(px(220.0))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.open_model_menu_preset_id = None;
+                        cx.notify();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(popover::menu_heading(theme, "Select Model"))
+                    .child(
+                        div()
+                            .id(("workers-preset-model-list", index))
+                            .max_h(px(240.0))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(models.into_iter().enumerate().map(
+                                |(m_ix, (m_id, m_label))| {
+                                    let is_active = match &current_model_id {
+                                        Some(curr) => curr == &m_id,
+                                        None => m_id == "default",
+                                    };
+                                    let p_id = preset_id_for_menu.clone();
+                                    let p_cmd = preset_command_for_menu.clone();
+                                    let chosen_model = m_id.clone();
+                                    let item_id = format!("{row_id_prefix}-{m_ix}");
+                                    popover::menu_row(theme, is_active, item_id.clone())
+                                        .id(SharedString::from(item_id))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_model_menu_preset_id = None;
+                                            let new_cmd = apply_model_to_command(
+                                                &p_cmd,
+                                                if chosen_model == "default" {
+                                                    None
+                                                } else {
+                                                    Some(&chosen_model)
+                                                },
+                                            );
+                                            if new_cmd != p_cmd {
+                                                if this.editing_preset_id.as_deref() == Some(&p_id)
+                                                {
+                                                    this.command_input.update(cx, |input, cx| {
+                                                        input.set_text(&new_cmd, cx)
+                                                    });
+                                                }
+                                                this.model.update(cx, |model, cx| {
+                                                    model.update_preset(
+                                                        p_id.clone(),
+                                                        PresetPatch {
+                                                            command: Some(new_cmd),
+                                                            ..PresetPatch::default()
+                                                        },
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(12.0))
+                                                .text_color(if is_active {
+                                                    theme.text
+                                                } else {
+                                                    theme.text_muted
+                                                })
+                                                .child(m_label),
+                                        )
+                                        .when(is_active, |el| {
+                                            el.child(
+                                                icon(icons::CHECK)
+                                                    .size(px(13.0))
+                                                    .text_color(theme.accent),
+                                            )
+                                        })
+                                },
+                            )),
+                    )
+                    .into_any_element();
+                model_selector = model_selector.child(popover::anchored_menu_below_end(
+                    SharedString::from(format!("workers-preset-model-menu-{index}")),
+                    menu,
+                    None,
+                ));
+            }
+
             div()
                 .id(("workers-preset-setting", index))
                 .min_h(px(48.0))
@@ -424,6 +828,7 @@ impl WorkersSettingsView {
                             )
                         }),
                 )
+                .child(model_selector)
                 .child(
                     div()
                         .id(("workers-preset-favorite", index))
@@ -1531,6 +1936,120 @@ mod tests {
             Some(("codex --plan".to_owned(), "codex --plan".to_owned()))
         );
         assert_eq!(normalize_preset_command("   "), None);
+    }
+
+    #[test]
+    fn extract_model_from_command_parses_various_formats() {
+        use super::extract_model_from_command;
+        assert_eq!(extract_model_from_command("claude"), None);
+        assert_eq!(
+            extract_model_from_command("claude --model sonnet"),
+            Some("sonnet".into())
+        );
+        assert_eq!(
+            extract_model_from_command("claude --model \"claude-sonnet-5\""),
+            Some("claude-sonnet-5".into())
+        );
+        assert_eq!(
+            extract_model_from_command("omp -m anthropic/claude-opus-4-8"),
+            Some("anthropic/claude-opus-4-8".into())
+        );
+        assert_eq!(
+            extract_model_from_command(
+                "codex --dangerously-bypass-approvals-and-sandbox --model=gpt-5.6"
+            ),
+            Some("gpt-5.6".into())
+        );
+        assert_eq!(
+            extract_model_from_command("pi -m=gpt-5.4"),
+            Some("gpt-5.4".into())
+        );
+    }
+
+    #[test]
+    fn apply_model_to_command_updates_or_appends_cleanly() {
+        use super::apply_model_to_command;
+        // Append model to bare command
+        assert_eq!(
+            apply_model_to_command("claude", Some("claude-sonnet-5")),
+            "claude --model claude-sonnet-5"
+        );
+        // Replace existing model
+        assert_eq!(
+            apply_model_to_command("claude --model opus", Some("claude-sonnet-5")),
+            "claude --model claude-sonnet-5"
+        );
+        // Replace existing model in complex command
+        assert_eq!(
+            apply_model_to_command(
+                "codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.5",
+                Some("gpt-5.6-sol")
+            ),
+            "codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol"
+        );
+        // Replace flag with -m
+        assert_eq!(
+            apply_model_to_command(
+                "omp -m anthropic/claude-opus-4-8",
+                Some("deepseek/deepseek-v3")
+            ),
+            "omp -m deepseek/deepseek-v3"
+        );
+        // Replace flag with --model=
+        assert_eq!(
+            apply_model_to_command("pi --model=gpt-5.4", Some("gpt-5.6")),
+            "pi --model gpt-5.6"
+        );
+        // Remove model when Default or None is given
+        assert_eq!(
+            apply_model_to_command("claude --model sonnet", None),
+            "claude"
+        );
+        assert_eq!(
+            apply_model_to_command("claude --model sonnet", Some("default")),
+            "claude"
+        );
+        assert_eq!(
+            apply_model_to_command(
+                "codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.5",
+                Some("default")
+            ),
+            "codex --dangerously-bypass-approvals-and-sandbox"
+        );
+        assert_eq!(
+            apply_model_to_command("omp -m anthropic/claude-opus-4-8", Some("Default")),
+            "omp"
+        );
+    }
+
+    #[test]
+    fn cli_mappings_and_static_models_contain_expected_defaults() {
+        use super::{cli_to_harness_id, static_models_for_cli};
+        use zeron_proto::HarnessId;
+
+        assert_eq!(cli_to_harness_id("claude"), Some(HarnessId::ClaudeCode));
+        assert_eq!(
+            cli_to_harness_id("codex --dangerously-bypass-approvals-and-sandbox"),
+            Some(HarnessId::Codex)
+        );
+        assert_eq!(cli_to_harness_id("omp"), Some(HarnessId::Omp));
+        assert_eq!(cli_to_harness_id("pi"), Some(HarnessId::Pi));
+        assert_eq!(cli_to_harness_id("opencode"), Some(HarnessId::Opencode));
+
+        let claude_models = static_models_for_cli("claude");
+        assert!(claude_models.iter().any(|(id, _)| id == "claude-sonnet-5"));
+        assert!(claude_models.iter().any(|(id, _)| id == "default"));
+
+        let codex_models = static_models_for_cli("codex");
+        assert!(codex_models.iter().any(|(id, _)| id == "gpt-5.6-sol"));
+        assert!(codex_models.iter().any(|(id, _)| id == "default"));
+
+        let omp_models = static_models_for_cli("omp");
+        assert!(
+            omp_models
+                .iter()
+                .any(|(id, _)| id == "anthropic/claude-sonnet-5")
+        );
     }
 
     #[test]

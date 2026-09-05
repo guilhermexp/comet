@@ -544,6 +544,10 @@ impl WorkersModel {
         model
     }
 
+    pub fn state(&self) -> &Entity<AppState> {
+        &self.state
+    }
+
     pub fn projects(&self) -> &[WorkersProject] {
         self.snapshot
             .as_ref()
