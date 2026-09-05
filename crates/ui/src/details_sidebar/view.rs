@@ -440,6 +440,9 @@ pub struct DetailsSidebar {
     recency_refresh: Option<Task<()>>,
     usage_task: Option<Task<()>>,
     usage_tick: Option<Task<()>>,
+    recap_task: Option<Task<()>>,
+    recap_armed_epoch: Option<(String, usize)>,
+    failed_epochs: std::collections::HashMap<String, usize>,
     _state_observe: Subscription,
     _workers_observe: Subscription,
     _search_events: Subscription,
@@ -474,6 +477,7 @@ impl DetailsSidebar {
             if local_files_became_available {
                 this.reload_files(cx);
             }
+            this.sync_idle_recap(cx);
             cx.notify();
         });
         let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
@@ -502,6 +506,9 @@ impl DetailsSidebar {
             recency_tick: None,
             recency_ticking: false,
             recency_refresh: None,
+            recap_task: None,
+            recap_armed_epoch: None,
+            failed_epochs: std::collections::HashMap::new(),
             _state_observe: state_observe,
             _workers_observe: workers_observe,
             _search_events: search_events,
@@ -532,6 +539,7 @@ impl DetailsSidebar {
             self.reload_files(cx);
             self.load_branch(cx);
             cx.notify();
+            self.sync_idle_recap(cx);
         }
     }
 
@@ -559,6 +567,159 @@ impl DetailsSidebar {
 
     fn reload_files(&mut self, cx: &mut Context<Self>) {
         self.load_files(false, cx);
+    }
+
+    fn sync_idle_recap(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.sidebar.context() else {
+            self.recap_task = None;
+            self.recap_armed_epoch = None;
+            return;
+        };
+
+        if context.mode != super::context::DetailsMode::Orchestrator {
+            self.recap_task = None;
+            self.recap_armed_epoch = None;
+            return;
+        }
+
+        let Some(chat_id) = context.chat_id.clone() else {
+            self.recap_task = None;
+            self.recap_armed_epoch = None;
+            return;
+        };
+        let context_key = context.key.clone();
+
+        let (is_working, message_count) = {
+            let state = self.app_state.read(cx);
+            let is_working = state.indicator_for(&chat_id, chrono::Utc::now())
+                == crate::state::Indicator::Working;
+            let count = state.transcript.len();
+            (is_working, count)
+        };
+
+        let has_entry = self.sidebar.idle_recap_for(&context_key).is_some();
+        let prefs = self.sidebar.preferences();
+        let failed_epoch = self.failed_epochs.get(&chat_id).copied();
+
+        let state = super::idle_recap::IdleRecapState {
+            enabled: prefs.idle_recap_enabled,
+            can_generate: failed_epoch != Some(message_count),
+            is_streaming: is_working,
+            is_compacting: false,
+            has_draft: false,
+            message_count,
+            entry: self.sidebar.idle_recap_for(&context_key),
+            delay_seconds: prefs.idle_recap_delay_seconds,
+        };
+
+        let action = super::idle_recap::evaluate_idle_recap(&state);
+        match action {
+            super::idle_recap::IdleRecapAction::Clear => {
+                self.recap_task = None;
+                self.recap_armed_epoch = None;
+                if has_entry {
+                    self.sidebar.clear_idle_recap(&context_key);
+                    self.emit_preferences(cx);
+                    cx.notify();
+                }
+            }
+            super::idle_recap::IdleRecapAction::Keep | super::idle_recap::IdleRecapAction::None => {
+                self.recap_task = None;
+                self.recap_armed_epoch = None;
+            }
+            super::idle_recap::IdleRecapAction::Arm { delay_ms } => {
+                if self.recap_armed_epoch.as_ref() == Some(&(chat_id.clone(), message_count))
+                    && self.recap_task.is_some()
+                {
+                    return;
+                }
+
+                self.recap_armed_epoch = Some((chat_id.clone(), message_count));
+                let chat_id_clone = chat_id.clone();
+                let context_key = context.key.clone();
+                let epoch_at_arm = message_count;
+
+                self.recap_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(delay_ms))
+                        .await;
+
+                    let should_call = this
+                        .update(cx, |this, cx| {
+                            let state = this.app_state.read(cx);
+                            let is_working = state.indicator_for(&chat_id_clone, chrono::Utc::now())
+                                == crate::state::Indicator::Working;
+                            let count_now = state.transcript.len();
+                            let active_chat =
+                                this.sidebar.context().and_then(|c| c.chat_id.as_deref());
+                            !is_working
+                                && count_now == epoch_at_arm
+                                && active_chat == Some(&chat_id_clone)
+                        })
+                        .unwrap_or(false);
+
+                    if !should_call {
+                        return;
+                    }
+                    let engine = this
+                        .update(cx, |this, cx| {
+                            this.app_state.read(cx).engine().cloned()
+                        })
+                        .ok()
+                        .flatten();
+
+                    let Some(engine) = engine else {
+                        return;
+                    };
+
+                    let result = engine
+                        .client()
+                        .call_as::<zeron_rpc::GenerateChatRecapReply>(
+                            zeron_rpc::methods::GENERATE_CHAT_RECAP,
+                            serde_json::to_value(zeron_rpc::GenerateChatRecapParams::new(
+                                &chat_id_clone,
+                            ))
+                            .unwrap_or_default(),
+                        )
+                        .await;
+
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(reply) => {
+                                if let Some(text) = reply.recap {
+                                    let state = this.app_state.read(cx);
+                                    let is_working = state
+                                        .indicator_for(&chat_id_clone, chrono::Utc::now())
+                                        == crate::state::Indicator::Working;
+                                    let count_now = state.transcript.len();
+                                    if !is_working && count_now == epoch_at_arm {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        let entry = super::idle_recap::IdleRecapEntry {
+                                            text,
+                                            epoch: epoch_at_arm,
+                                            generated_at: now,
+                                        };
+                                        this.sidebar.set_idle_recap(context_key, entry);
+                                        this.emit_preferences(cx);
+                                        cx.notify();
+                                    }
+                                } else {
+                                    this.failed_epochs.insert(chat_id_clone, epoch_at_arm);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(chat = %chat_id_clone, error = %err, "GenerateChatRecap failed");
+                                this.failed_epochs.insert(chat_id_clone, epoch_at_arm);
+                            }
+                        }
+                    })
+                    .ok();
+                }));
+            }
+        }
     }
 
     /// Rescan without flipping to `Loading`, so a watcher-driven refresh keeps
@@ -1923,6 +2084,45 @@ impl DetailsSidebar {
                     );
                 }
                 workspace_body = workspace_body.child(worked_section);
+            }
+            if let Some(entry) = self.sidebar.idle_recap_for(&context.key) {
+                let generated_at = chrono::DateTime::from_timestamp_millis(entry.generated_at as i64)
+                    .unwrap_or_else(chrono::Utc::now);
+                let local_now = chrono::Local::now();
+                let entry_local = generated_at.with_timezone(&chrono::Local);
+                let clock_text = if entry_local.date_naive() == local_now.date_naive() {
+                    entry_local.format("%H:%M").to_string()
+                } else {
+                    entry_local.format("%b %d, %H:%M").to_string()
+                };
+
+                let recap_row = div()
+                    .id("idle-recap-row")
+                    .mt(px(4.0))
+                    .pt(px(6.0))
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.50))
+                    .flex()
+                    .items_end()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .italic()
+                            .text_color(theme.text_muted.opacity(0.85))
+                            .child(format!("※ recap: {}", entry.text)),
+                    )
+                    .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted.opacity(0.50))
+                        .child(clock_text),
+                );
+                workspace_body = workspace_body.child(recap_row);
             }
         }
         let mut content = div()
