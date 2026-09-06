@@ -456,6 +456,13 @@ fn composer_footer_right(model_controls: AnyElement) -> gpui::Div {
         },
     )
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoTarget {
+    pub path: String,
+    pub device_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub branch: Option<String>,
+}
 
 pub struct Pickers {
     state: Entity<AppState>,
@@ -471,6 +478,7 @@ pub struct Pickers {
     draft_owner: Option<String>,
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
+    pub active_repo_target: Option<RepoTarget>,
     open: popover::Popup<PickerKind>,
     /// The harness/model picker's rail selection (favorites vs the effective
     /// harness's list). Re-primed on every open.
@@ -646,6 +654,7 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             refs: Loadable::Idle,
+            active_repo_target: None,
             refs_space: None,
             active: 0,
             model_scroll: gpui::UniformListScrollHandle::new(),
@@ -1174,21 +1183,29 @@ impl Pickers {
     /// Rows carry checkout state (`current`, `worktreePath`) so the picker can
     /// tag refs and the checkout-kind selector can offer worktree reuse.
     fn ensure_refs(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
+        let (repo_path, device_id, target_key) = if let Some(target) = &self.active_repo_target {
+            (
+                target.path.clone(),
+                target.device_id.clone(),
+                target.path.clone(),
+            )
+        } else if let Some(space) = self.state.read(cx).selected_space_row().cloned() {
+            if !space.git_detected {
+                return;
+            }
+            (
+                space.path.clone(),
+                Some(space.device_id.clone()),
+                space.id.clone(),
+            )
+        } else {
             return;
         };
-        if !space.git_detected {
+
+        let fresh = self.refs_space.as_deref() == Some(target_key.as_str());
+        if fresh && matches!(self.refs, Loadable::Loading) {
             return;
         }
-        let fresh = self.refs_space.as_deref() == Some(space.id.as_str());
-        if fresh && matches!(self.refs, Loadable::Loading) {
-            return; // a load is already in flight
-        }
-        // Non-forced (the footer's eager kick, re-run every render) only loads
-        // from Idle: an Error must WAIT for an explicit retry/reopen (force),
-        // or re-render would flip Error back to Loading before the retry row
-        // ever paints — an eternal skeleton plus an RPC storm (user report:
-        // "the ref dropdown never loads anything").
         if !force && fresh && !matches!(self.refs, Loadable::Idle) {
             return;
         }
@@ -1196,25 +1213,17 @@ impl Pickers {
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
-        // Stale-while-revalidate: a forced refresh of an already-loaded space
-        // keeps the current rows on screen while the reload runs — a send that
-        // just minted a worktree (or a terminal-side branch) appears on the
-        // popover's next open without the list ever flashing to a skeleton.
         if !(force && fresh && matches!(self.refs, Loadable::Ready(_))) {
             self.refs = Loadable::Loading;
         }
-        self.refs_space = Some(space.id.clone());
+        self.refs_space = Some(target_key);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
-            params.insert(
-                "repoPath".into(),
-                serde_json::Value::String(space.path.clone()),
-            );
-            if local.as_deref() != Some(space.device_id.as_str()) {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(space.device_id.clone()),
-                );
+            params.insert("repoPath".into(), serde_json::Value::String(repo_path));
+            if let Some(dev) = device_id
+                && local.as_deref() != Some(dev.as_str())
+            {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(dev));
             }
             let result = engine
                 .client()
@@ -1228,8 +1237,6 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                // Rows landed under an open, un-searched popover: re-home the
-                // nav highlight to the selected row.
                 if pickers.open_kind() == Some(PickerKind::Branch)
                     && pickers.search.read(cx).text().is_empty()
                 {
@@ -1244,6 +1251,28 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
+        if let Some(target) = self.active_repo_target.clone() {
+            if let Some(chat_id) = &target.chat_id {
+                let now = chrono::Utc::now();
+                if self.state.read(cx).indicator_for(chat_id, now)
+                    == zeron_proto::view::Indicator::Working
+                {
+                    self.switch_error =
+                        Some("Cannot switch branches while the agent is working".into());
+                    cx.notify();
+                    return;
+                }
+                if let Some(worktree_path) = &row.worktree_path {
+                    self.switch_live_worktree(chat_id, worktree_path, &row.name, cx);
+                } else {
+                    self.switch_live_ref(chat_id, &target.path, &row.name, cx);
+                }
+            } else {
+                self.switch_repo_ref(&target.path, target.device_id.as_deref(), &row.name, cx);
+            }
+            return;
+        }
+
         if let Some(chat) = self.state.read(cx).selected_chat_row().cloned() {
             let now = chrono::Utc::now();
             if self.state.read(cx).indicator_for(&chat.id, now)
@@ -1271,24 +1300,17 @@ impl Pickers {
         }
 
         if row.worktree_path.is_some() {
-            // Reuse the ref's existing worktree ("Current worktree") — the
-            // t3code `reuseExistingWorktree` path.
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
-            // Base pick for a new worktree, or the already-current ref.
             self.config.branch = Some(row.name.clone());
         } else {
-            // Local mode + a plain non-current ref: CHECK OUT the space
-            // folder (full t3code `switchRef` — picking `main` means "put my
-            // local checkout on main", it must never flip the mode).
             self.switch_draft_ref(row, cx);
             return;
         }
         self.animate_close(cx);
         cx.notify();
     }
-
     fn switch_live_ref(
         &mut self,
         chat_id: &str,
@@ -1404,6 +1426,62 @@ impl Pickers {
                 pickers.config.branch = Some(ref_name);
                 pickers.animate_close(cx);
                 pickers.ensure_refs(true, cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+    fn switch_repo_ref(
+        &mut self,
+        repo_path: &str,
+        target_device_id: Option<&str>,
+        ref_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        self.switch_error = None;
+        self.switching = Some(ref_name.to_string());
+        let ref_name = ref_name.to_string();
+        let repo_path = repo_path.to_string();
+        let target_device_id = target_device_id.map(str::to_string);
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(repo_path));
+            params.insert(
+                "refName".into(),
+                serde_json::Value::String(ref_name.clone()),
+            );
+            if let Some(target) = target_device_id
+                && local.as_deref() != Some(target.as_str())
+            {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::SWITCH_REF, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |pickers, cx| {
+                pickers.switching = None;
+                match result {
+                    Ok(_) => {
+                        if let Some(target) = pickers.active_repo_target.as_mut() {
+                            target.branch = Some(ref_name.clone());
+                        }
+                        pickers.config.branch = Some(ref_name);
+                        pickers.animate_close(cx);
+                        pickers.ensure_refs(true, cx);
+                    }
+                    Err(err) => {
+                        pickers.switch_error = Some(err.to_string());
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -1803,10 +1881,15 @@ impl Pickers {
     fn selected_ref_index(&self, cx: &App) -> usize {
         let rows = self.filtered_ref_rows(cx);
         let selected = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.branch.clone())
+            .active_repo_target
+            .as_ref()
+            .and_then(|t| t.branch.clone())
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .selected_chat_row()
+                    .and_then(|c| c.branch.clone())
+            })
             .or_else(|| self.config.branch.clone());
         let index = match selected {
             Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
@@ -2869,7 +2952,9 @@ impl Pickers {
     /// "Showing X of Y refs" footer when the list is capped.
     fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        if self.state.read(cx).selected_space_row().is_none() {
+        let has_repo =
+            self.active_repo_target.is_some() || self.state.read(cx).selected_space_row().is_some();
+        if !has_repo {
             return div()
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
@@ -2880,14 +2965,17 @@ impl Pickers {
         let rows = self.filtered_ref_rows(cx);
         let total = rows.len();
         let shown = total.min(MAX_REF_ROWS);
-        // Existing session: the highlighted row is the SESSION's branch and a
-        // pick switches the checkout (see `pick_ref`); a new chat highlights
-        // the draft pick.
+        // Existing session or active target branch:
         let session_branch = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.branch.clone());
+            .active_repo_target
+            .as_ref()
+            .and_then(|t| t.branch.clone())
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .selected_chat_row()
+                    .and_then(|c| c.branch.clone())
+            });
         let switching = self.switching.clone();
         let body: AnyElement =
             match &self.refs {
@@ -3060,13 +3148,25 @@ impl Pickers {
     /// Interactive branch switcher control for the Details Sidebar Workspace widget.
     pub fn render_workspace_branch_control(
         &mut self,
-        current_branch: Option<&str>,
+        target: RepoTarget,
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = self.open.closing_since();
         let kind = PickerKind::Branch;
+
+        let target_changed = self
+            .active_repo_target
+            .as_ref()
+            .is_none_or(|t| t.path != target.path || t.chat_id != target.chat_id);
+        if target_changed {
+            self.active_repo_target = Some(target.clone());
+            self.refs = Loadable::Idle;
+            self.refs_space = None;
+        } else {
+            self.active_repo_target = Some(target.clone());
+        }
 
         if !disabled && matches!(self.refs, Loadable::Idle) {
             self.ensure_refs(false, cx);
@@ -3080,12 +3180,12 @@ impl Pickers {
             _ => None,
         };
 
-        let label: SharedString = current_branch
-            .map(str::to_string)
+        let label: SharedString = target
+            .branch
+            .clone()
             .or_else(|| self.config.branch.clone())
             .unwrap_or_else(|| "—".to_string())
             .into();
-
         let is_open = self.open_kind() == Some(kind);
         let id = "workspace-branch-trigger";
         let trigger = div()

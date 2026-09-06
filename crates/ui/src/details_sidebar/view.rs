@@ -485,7 +485,17 @@ impl DetailsSidebar {
             cx.notify();
         });
         let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
-        let pickers_observe = cx.observe(&pickers, |_this, _, cx| cx.notify());
+        let pickers_observe = cx.observe(&pickers, |this, p, cx| {
+            if let Some(target) = &p.read(cx).active_repo_target {
+                if let Some(branch) = &target.branch {
+                    if this.resolved_branch.as_ref() != Some(branch) {
+                        this.resolved_branch = Some(branch.clone());
+                        this.reload_files(cx);
+                    }
+                }
+            }
+            cx.notify();
+        });
         let mut sidebar = Self {
             app_state,
             workers_model,
@@ -1998,29 +2008,21 @@ impl DetailsSidebar {
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
             .to_string();
-        let branch_control: AnyElement =
-            if context.mode == super::context::DetailsMode::Orchestrator {
-                let space_has_git = self
-                    .app_state
-                    .read(cx)
-                    .selected_space_row()
-                    .is_some_and(|s| s.git_detected);
-                let disabled = !space_has_git;
-                let current_branch = self
-                    .resolved_branch
-                    .as_deref()
-                    .or(context.branch.as_deref());
-                self.pickers.update(cx, |p, cx| {
-                    p.render_workspace_branch_control(current_branch, disabled, cx)
-                })
-            } else {
-                div()
-                    .truncate()
-                    .text_size(px(12.0))
-                    .text_color(theme.text)
-                    .child(self.resolved_branch.clone().unwrap_or_else(|| "—".into()))
-                    .into_any_element()
-            };
+        let current_branch = self
+            .resolved_branch
+            .as_deref()
+            .or(context.branch.as_deref());
+        let has_git = current_branch.is_some() || context.cwd.join(".git").exists();
+        let disabled = !has_git;
+        let repo_target = crate::pickers::RepoTarget {
+            path: context.cwd.to_string_lossy().to_string(),
+            device_id: context.target_device_id.clone(),
+            chat_id: context.chat_id.clone(),
+            branch: current_branch.map(str::to_string),
+        };
+        let branch_control: AnyElement = self.pickers.update(cx, |p, cx| {
+            p.render_workspace_branch_control(repo_target, disabled, cx)
+        });
 
         let mut workspace_body = div()
             .child(property_row_custom(
