@@ -2632,6 +2632,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live grok CLI endpoints if auth.json is present"]
+    async fn live_grok_usage_smoke() {
+        let home = crate::repos::home_dir();
+        let auth_file = home.join(".grok").join("auth.json");
+        if !auth_file.exists() {
+            eprintln!("skipped: no ~/.grok/auth.json");
+            return;
+        }
+        let grok = crate::grok_usage::GrokUsage::production().expect("production client");
+        let snapshot = grok.snapshot(true, chrono::Utc::now()).await;
+        eprintln!(
+            "live grok snapshot: present={} windows={} warning={:?}",
+            snapshot.present,
+            snapshot.usage_windows.len(),
+            snapshot.warning
+        );
+        if let Some(w) = snapshot.usage_windows.first() {
+            eprintln!(
+                "  window: label={} used={:.1}% resets={:?}",
+                w.label,
+                w.used_fraction * 100.0,
+                w.resets_at
+            );
+        }
+        assert!(snapshot.present);
+        assert!(
+            !snapshot.usage_windows.is_empty(),
+            "expected at least 1 quota window from live grok subscription"
+        );
+    }
+
+    #[tokio::test]
     async fn last_good_usage_served_when_probe_returns_none() {
         let root = tempfile::tempdir().unwrap();
         let config = AgentAccountsConfig {
