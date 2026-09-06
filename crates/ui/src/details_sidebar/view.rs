@@ -282,11 +282,12 @@ use crate::{
         },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
-            chat_workers_viewport_height_px, property_row, widget_card, worker_expansion_key,
-            workers_tab_presence,
+            chat_workers_viewport_height_px, property_row, property_row_custom, widget_card,
+            worker_expansion_key, workers_tab_presence,
         },
     },
     icons,
+    pickers::Pickers,
     state::AppState,
     theme::Theme,
     workers::{
@@ -418,6 +419,7 @@ fn worker_click_event(
 pub struct DetailsSidebar {
     app_state: Entity<AppState>,
     workers_model: Entity<WorkersModel>,
+    pickers: Entity<Pickers>,
     sidebar: DetailsSidebarState,
     chat_workers: ChatWorkersWidgetState,
     files: LoadState<Vec<FileNode>>,
@@ -445,6 +447,7 @@ pub struct DetailsSidebar {
     failed_epochs: std::collections::HashMap<String, usize>,
     _state_observe: Subscription,
     _workers_observe: Subscription,
+    _pickers_observe: Subscription,
     _search_events: Subscription,
 }
 
@@ -453,6 +456,7 @@ impl DetailsSidebar {
         app_state: Entity<AppState>,
         workers_model: Entity<WorkersModel>,
         preferences: DetailsSidebarPreferences,
+        pickers: Entity<Pickers>,
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| ComposerInput::with_context("Search files…", "PaletteSearch", cx));
@@ -481,9 +485,11 @@ impl DetailsSidebar {
             cx.notify();
         });
         let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
+        let pickers_observe = cx.observe(&pickers, |_this, _, cx| cx.notify());
         let mut sidebar = Self {
             app_state,
             workers_model,
+            pickers,
             sidebar: DetailsSidebarState::new(preferences),
             chat_workers: ChatWorkersWidgetState::default(),
             files: LoadState::Idle,
@@ -511,6 +517,7 @@ impl DetailsSidebar {
             failed_epochs: std::collections::HashMap::new(),
             _state_observe: state_observe,
             _workers_observe: workers_observe,
+            _pickers_observe: pickers_observe,
             _search_events: search_events,
         };
         sidebar.load_usage(cx);
@@ -1991,11 +1998,35 @@ impl DetailsSidebar {
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
             .to_string();
+        let branch_control: AnyElement =
+            if context.mode == super::context::DetailsMode::Orchestrator {
+                let space_has_git = self
+                    .app_state
+                    .read(cx)
+                    .selected_space_row()
+                    .is_some_and(|s| s.git_detected);
+                let disabled = !space_has_git;
+                let current_branch = self
+                    .resolved_branch
+                    .as_deref()
+                    .or(context.branch.as_deref());
+                self.pickers.update(cx, |p, cx| {
+                    p.render_workspace_branch_control(current_branch, disabled, cx)
+                })
+            } else {
+                div()
+                    .truncate()
+                    .text_size(px(12.0))
+                    .text_color(theme.text)
+                    .child(self.resolved_branch.clone().unwrap_or_else(|| "—".into()))
+                    .into_any_element()
+            };
+
         let mut workspace_body = div()
-            .child(property_row(
+            .child(property_row_custom(
                 icons::GIT_BRANCH,
                 "Branch",
-                self.resolved_branch.clone().unwrap_or_else(|| "—".into()),
+                branch_control,
                 theme,
             ))
             .child(property_row(icons::FOLDER, "Path", folder, theme));

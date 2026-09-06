@@ -507,11 +507,64 @@ impl Repos {
     /// as linked worktrees (`worktree_path`). Feeds the composer's ref picker
     /// and its checkout-kind selector.
     pub async fn refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
-        let names = self.branches(repo_path).await?;
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut local_set = std::collections::HashSet::new();
+        let mut push = |name: &str| {
+            if seen.insert(name.to_string()) {
+                names.push(name.to_string());
+            }
+        };
+        let out = self
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/remotes",
+                ],
+                Some(repo_path),
+            )
+            .await?;
+        for line in out.lines().map(str::trim) {
+            if let Some(name) = line.strip_prefix("refs/heads/") {
+                local_set.insert(name.to_string());
+                push(name);
+            }
+        }
+        for line in out.lines().map(str::trim) {
+            if let Some(remote) = line.strip_prefix("refs/remotes/")
+                && let Some((_, name)) = remote.split_once('/')
+            {
+                push(name);
+            }
+        }
+        let default = match self
+            .git(
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                Some(repo_path),
+            )
+            .await
+        {
+            Ok(short) => short.split_once('/').map(|(_, b)| b.to_string()),
+            Err(_) => None,
+        };
+        let default = match default {
+            Some(branch) => Some(branch),
+            None => self
+                .current_branch(repo_path)
+                .await
+                .ok()
+                .filter(|b| b != "HEAD"),
+        };
+        if let Some(default_name) = &default
+            && let Some(pos) = names.iter().position(|n| n == default_name)
+        {
+            let head = names.remove(pos);
+            names.insert(0, head);
+        }
+
         let current = self.current_branch(repo_path).await.ok();
-        // `git worktree list --porcelain`: stanzas of `worktree <path>` /
-        // `HEAD <sha>` / `branch refs/heads/<name>`. The first stanza is the
-        // main checkout — excluded (it's `current`, not a linked worktree).
         let mut worktrees: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         if let Ok(out) = self
@@ -523,7 +576,6 @@ impl Repos {
             for line in out.lines().map(str::trim) {
                 if let Some(p) = line.strip_prefix("worktree ") {
                     stanza += 1;
-                    // The first stanza is the main checkout, not a linked tree.
                     path = (stanza > 1).then(|| p.to_string());
                 } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
                     && let Some(path) = path.take()
@@ -534,10 +586,16 @@ impl Repos {
         }
         Ok(names
             .into_iter()
-            .map(|name| RepoRef {
-                current: current.as_deref() == Some(name.as_str()),
-                worktree_path: worktrees.get(&name).cloned(),
-                name,
+            .map(|name| {
+                let is_remote = !local_set.contains(&name);
+                let is_default = default.as_deref() == Some(name.as_str());
+                RepoRef {
+                    current: current.as_deref() == Some(name.as_str()),
+                    worktree_path: worktrees.get(&name).cloned(),
+                    is_remote: Some(is_remote),
+                    is_default: Some(is_default),
+                    name,
+                }
             })
             .collect())
     }

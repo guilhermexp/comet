@@ -13,6 +13,7 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 ## Local Contracts
 
 - **Modelo de novos Chats é a última escolha explícita**, feita no draft ou dentro de um Chat existente. `Pickers::pick_model` salva harness + id completo (incluindo provider) em `composer-defaults.json` antes de aplicar a configuração ao destino. Navegar por Chats ou carregar catálogos não substitui essa escolha. A configuração própria de cada Chat continua independente.
+- **Controle de Ref / Branch Switcher vive exclusivamente no card Workspace da Details Sidebar**: O footer do composer não renderiza nenhum controle de branch (mantendo apenas o cluster de modelo e esforço). A seleção e troca de branch é feita pelo trigger interativo `[branch ▾]` no card Workspace de `details_sidebar`, abrindo o popover de branches com badges de status (`local`, `remote`, `default`) e permitindo `git checkout` via `methods::SWITCH_REF` ou retarget via `methods::SET_CHAT_CWD` em chats ativos, com guarda de bloqueio quando o agente estiver em estado `Working`.
 
 - gpui vem do fork `wingleeio/zed` pinado por rev no `Cargo.toml` raiz. **Não usamos as crates GPL do Zed** (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos. Puxar uma delas é problema de licença, não de gosto.
 - As macros legadas de `objc 0.2` emitem `cfg(feature = "cargo-clippy")`; `Cargo.toml` declara somente esse valor no `unexpected_cfgs`, mantendo o lint ativo para qualquer outro cfg inesperado.

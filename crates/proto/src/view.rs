@@ -801,6 +801,8 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: None,
+            is_remote: None,
+            is_default: None,
         }
     }
 
@@ -809,6 +811,8 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: Some(path.into()),
+            is_remote: None,
+            is_default: None,
         }
     }
 

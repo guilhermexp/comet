@@ -244,6 +244,12 @@ pub struct RepoRef {
     /// Path of the linked worktree this branch is checked out in, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// Whether this ref is from a remote tracking branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_remote: Option<bool>,
+    /// Whether this ref is the default branch of the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
 }
 
 /// Public Git reference attached to a commit in the history graph.

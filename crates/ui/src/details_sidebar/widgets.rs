@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Div, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Div, SharedString, div, prelude::*, px};
 
 use crate::{icons, theme::Theme};
 
@@ -285,6 +285,38 @@ pub fn property_row(
                 .text_color(theme.text)
                 .child(value.into()),
         )
+}
+pub fn property_row_custom(
+    icon_path: &'static str,
+    label: impl Into<SharedString>,
+    value_element: AnyElement,
+    theme: &Theme,
+) -> Div {
+    div()
+        .h(px(30.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .w(px(108.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .child(
+                    icons::icon(icon_path)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(label.into()),
+                ),
+        )
+        .child(div().flex_1().min_w_0().child(value_element))
 }
 
 #[cfg(test)]

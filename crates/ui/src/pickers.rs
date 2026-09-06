@@ -434,16 +434,14 @@ pub enum PickerKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerFooterControl {
     Model,
-    Branch,
 }
 
-fn composer_footer_right_order() -> [ComposerFooterControl; 2] {
-    [ComposerFooterControl::Model, ComposerFooterControl::Branch]
+fn composer_footer_right_order() -> [ComposerFooterControl; 1] {
+    [ComposerFooterControl::Model]
 }
 
-fn composer_footer_right(model_controls: AnyElement, branch_control: AnyElement) -> gpui::Div {
+fn composer_footer_right(model_controls: AnyElement) -> gpui::Div {
     let mut model_controls = Some(model_controls);
-    let mut branch_control = Some(branch_control);
     composer_footer_right_order().into_iter().fold(
         div()
             .flex()
@@ -454,9 +452,6 @@ fn composer_footer_right(model_controls: AnyElement, branch_control: AnyElement)
         |row, control| match control {
             ComposerFooterControl::Model => {
                 row.child(model_controls.take().expect("one model control"))
-            }
-            ComposerFooterControl::Branch => {
-                row.child(branch_control.take().expect("one branch control"))
             }
         },
     )
@@ -1249,12 +1244,32 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Refs are fixed at creation: an existing session can never move
-        // (wing's rule — the footer renders read-only labels there, so this
-        // is a belt-and-braces guard).
-        if self.state.read(cx).selected_chat_row().is_some() {
+        if let Some(chat) = self.state.read(cx).selected_chat_row().cloned() {
+            let now = chrono::Utc::now();
+            if self.state.read(cx).indicator_for(&chat.id, now)
+                == zeron_proto::view::Indicator::Working
+            {
+                self.switch_error =
+                    Some("Cannot switch branches while the agent is working".into());
+                cx.notify();
+                return;
+            }
+            if let Some(worktree_path) = &row.worktree_path {
+                self.switch_live_worktree(&chat.id, worktree_path, &row.name, cx);
+            } else {
+                let repo_path = chat.cwd.clone().or_else(|| {
+                    self.state
+                        .read(cx)
+                        .selected_space_row()
+                        .map(|s| s.path.clone())
+                });
+                if let Some(repo_path) = repo_path {
+                    self.switch_live_ref(&chat.id, &repo_path, &row.name, cx);
+                }
+            }
             return;
         }
+
         if row.worktree_path.is_some() {
             // Reuse the ref's existing worktree ("Current worktree") — the
             // t3code `reuseExistingWorktree` path.
@@ -1274,6 +1289,127 @@ impl Pickers {
         cx.notify();
     }
 
+    fn switch_live_ref(
+        &mut self,
+        chat_id: &str,
+        repo_path: &str,
+        ref_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let target_device_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|c| c.device_id.clone());
+        let local = self.state.read(cx).local_device_id.clone();
+        self.switch_error = None;
+        self.switching = Some(ref_name.to_string());
+        let ref_name = ref_name.to_string();
+        let repo_path = repo_path.to_string();
+        let chat_id = chat_id.to_string();
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(repo_path));
+            params.insert(
+                "refName".into(),
+                serde_json::Value::String(ref_name.clone()),
+            );
+            if let Some(target) = target_device_id
+                && local.as_deref() != Some(target.as_str())
+            {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::SWITCH_REF, serde_json::Value::Object(params))
+                .await;
+            match result {
+                Ok(_) => {
+                    let mutate_params = serde_json::json!({
+                        "op": "setChatBranch",
+                        "chatId": chat_id,
+                        "branch": ref_name,
+                    });
+                    let _ = engine.client().call(methods::MUTATE, mutate_params).await;
+                    this.update(cx, |pickers, cx| {
+                        pickers.switching = None;
+                        pickers.config.branch = Some(ref_name);
+                        pickers.animate_close(cx);
+                        pickers.ensure_refs(true, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(err) => {
+                    this.update(cx, |pickers, cx| {
+                        pickers.switching = None;
+                        pickers.switch_error = Some(err.to_string());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn switch_live_worktree(
+        &mut self,
+        chat_id: &str,
+        worktree_path: &str,
+        ref_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.switch_error = None;
+        self.switching = Some(ref_name.to_string());
+        let ref_name = ref_name.to_string();
+        let worktree_path = worktree_path.to_string();
+        let chat_id = chat_id.to_string();
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mutate_cwd = serde_json::json!({
+                "op": "setChatCwd",
+                "chatId": chat_id,
+                "cwd": worktree_path,
+            });
+            let res = engine.client().call(methods::MUTATE, mutate_cwd).await;
+            if let Err(err) = res {
+                this.update(cx, |pickers, cx| {
+                    pickers.switching = None;
+                    pickers.switch_error = Some(err.to_string());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            let mutate_branch = serde_json::json!({
+                "op": "setChatBranch",
+                "chatId": chat_id,
+                "branch": ref_name,
+            });
+            let _ = engine.client().call(methods::MUTATE, mutate_branch).await;
+            this.update(cx, |pickers, cx| {
+                pickers.switching = None;
+                pickers.config.branch = Some(ref_name);
+                pickers.animate_close(cx);
+                pickers.ensure_refs(true, cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
     /// Draft-mode checkout switch: `git checkout` in the SPACE's folder
     /// (relay-forwarded for remote spaces). Success records the pick and
     /// refreshes tags; failure keeps the popover open with git's message.
@@ -1733,17 +1869,6 @@ impl Pickers {
             }
         }
     }
-
-    /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
-    /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
-    fn ref_label(&self) -> SharedString {
-        match (self.config.checkout, self.effective_ref_name()) {
-            (_, None) => SharedString::from("Select ref"),
-            (CheckoutKind::NewWorktree, Some(name)) => SharedString::from(format!("From {name}")),
-            (CheckoutKind::Local, Some(name)) => SharedString::from(name),
-        }
-    }
-
     // ---- the space picker (new-session canvas) ----
 
     /// The picker's project rows: scoped to the canvas's device — the device
@@ -2485,20 +2610,7 @@ impl Pickers {
             } else {
                 div()
             };
-            let branch_control = git_space
-                .map(|_| {
-                    Self::footer_label(
-                        crate::icons::GIT_BRANCH,
-                        chat.branch
-                            .clone()
-                            .map(SharedString::from)
-                            .unwrap_or_else(|| SharedString::from("No ref")),
-                        &theme,
-                    )
-                    .into_any_element()
-                })
-                .unwrap_or_else(|| div().into_any_element());
-            let branch_control = div()
+            let right_cluster = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2512,10 +2624,8 @@ impl Pickers {
                         &theme,
                     ))
                 })
-                .child(branch_control)
-                .into_any_element();
-            let right = composer_footer_right(model_controls, branch_control);
-            return Some(row().child(left).child(right).into_any_element());
+                .child(composer_footer_right(model_controls));
+            return Some(row().child(left).child(right_cluster).into_any_element());
         }
 
         // New-session draft: checkout stays left; model + effort + optional
@@ -2529,10 +2639,6 @@ impl Pickers {
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = if git {
             match self.mounted_kind() {
-                Some(PickerKind::Branch) => {
-                    let content = self.render_branch_popover(cx);
-                    Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
-                }
                 Some(PickerKind::Checkout) => {
                     let content = self.render_checkout_popover(cx);
                     Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
@@ -2573,27 +2679,7 @@ impl Pickers {
         } else {
             div()
         };
-        let branch_control = if git {
-            let ref_chip = self.footer_chip(
-                PickerKind::Branch,
-                "picker-branch",
-                crate::icons::GIT_BRANCH,
-                self.ref_label(),
-                &theme,
-                cx,
-            );
-            attach_overlay_end(
-                ref_chip,
-                &mut overlay,
-                PickerKind::Branch,
-                "branch-popover",
-                closing,
-            )
-            .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-        let right = composer_footer_right(model_controls, branch_control);
+        let right = composer_footer_right(model_controls);
         Some(row().child(left).child(right).into_any_element())
     }
 
@@ -2816,7 +2902,7 @@ impl Pickers {
                     .p(px(Theme::SPACE_SM))
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from("No refs found."))
+                    .child(SharedString::from("No branches found."))
                     .into_any_element(),
                 Loadable::Ready(_) => {
                     let active = self.active;
@@ -2826,22 +2912,18 @@ impl Pickers {
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
-                        .max_h(px(224.0))
+                        .max_h(px(260.0))
                         .overflow_y_scroll()
                         .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
                             |(ix, row)| {
                                 let label: SharedString = row.name.clone().into();
                                 let is_selected = selected.as_deref() == Some(row.name.as_str());
-                                // Right-aligned muted tag (t3code `text-[10px]
-                                // text-muted-foreground/45`): current beats worktree.
-                                let tag: Option<&'static str> = if row.current {
-                                    Some("current")
-                                } else if row.worktree_path.is_some() {
-                                    Some("worktree")
-                                } else {
-                                    None
-                                };
+                                let is_remote = row.is_remote.unwrap_or(false);
+                                let is_default = row.is_default.unwrap_or(false);
+                                let is_current = row.current || is_selected;
+                                let is_worktree = row.worktree_path.is_some() && !row.current;
                                 let is_switching = switching.as_deref() == Some(row.name.as_str());
+
                                 popover::menu_row_nav(
                                     &theme,
                                     is_selected,
@@ -2853,6 +2935,12 @@ impl Pickers {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_ref(row.clone(), cx);
                                 }))
+                                .child(
+                                    crate::icons::icon(crate::icons::GIT_BRANCH)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted)
+                                        .flex_none(),
+                                )
                                 .child(div().flex_1().min_w_0().truncate().child(label))
                                 .when(is_switching, |el| {
                                     el.child(
@@ -2863,13 +2951,56 @@ impl Pickers {
                                             .child(SharedString::from("switching…")),
                                     )
                                 })
-                                .when_some(tag, |el, tag| {
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .px(px(4.5))
+                                        .py(px(1.0))
+                                        .rounded(px(3.0))
+                                        .when(is_remote, |el| {
+                                            el.bg(gpui::rgba(0xf973161a))
+                                                .text_color(gpui::rgb(0xf97316))
+                                                .child(SharedString::from("remote"))
+                                        })
+                                        .when(!is_remote, |el| {
+                                            el.bg(gpui::rgba(0x3b82f61a))
+                                                .text_color(gpui::rgb(0x3b82f6))
+                                                .child(SharedString::from("local"))
+                                        }),
+                                )
+                                .when(is_default, |el| {
                                     el.child(
                                         div()
                                             .flex_none()
                                             .text_size(px(10.0))
-                                            .text_color(theme.text_muted.opacity(0.45))
-                                            .child(SharedString::from(tag)),
+                                            .px(px(4.0))
+                                            .py(px(1.0))
+                                            .rounded(px(3.0))
+                                            .bg(theme.ink(0.08))
+                                            .text_color(theme.text_muted.opacity(0.8))
+                                            .child(SharedString::from("default")),
+                                    )
+                                })
+                                .when(is_worktree, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.0))
+                                            .px(px(4.0))
+                                            .py(px(1.0))
+                                            .rounded(px(3.0))
+                                            .bg(theme.ink(0.08))
+                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .child(SharedString::from("worktree")),
+                                    )
+                                })
+                                .when(is_current, |el| {
+                                    el.child(
+                                        crate::icons::icon(crate::icons::CHECK)
+                                            .size(px(12.0))
+                                            .text_color(theme.text)
+                                            .flex_none(),
                                     )
                                 })
                             },
@@ -2911,6 +3042,103 @@ impl Pickers {
             );
         }
         popover.into_any_element()
+    }
+    pub fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open.open(PickerKind::Branch);
+        self.search_reset_muted = true;
+        self.search.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder("Search branches…", cx);
+        });
+        let handle = self.search.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.active = self.selected_ref_index(cx);
+        self.switch_error = None;
+        self.ensure_refs(true, cx);
+    }
+
+    /// Interactive branch switcher control for the Details Sidebar Workspace widget.
+    pub fn render_workspace_branch_control(
+        &mut self,
+        current_branch: Option<&str>,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let closing = self.open.closing_since();
+        let kind = PickerKind::Branch;
+
+        if !disabled && matches!(self.refs, Loadable::Idle) {
+            self.ensure_refs(false, cx);
+        }
+
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+            Some(PickerKind::Branch) => {
+                let content = self.render_branch_popover(cx);
+                Some((PickerKind::Branch, self.popover_frame(290.0, content, cx)))
+            }
+            _ => None,
+        };
+
+        let label: SharedString = current_branch
+            .map(str::to_string)
+            .or_else(|| self.config.branch.clone())
+            .unwrap_or_else(|| "—".to_string())
+            .into();
+
+        let is_open = self.open_kind() == Some(kind);
+        let id = "workspace-branch-trigger";
+        let trigger = div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(6.0))
+            .py(px(2.0))
+            .ml(px(-6.0))
+            .rounded_md()
+            .text_size(px(12.0))
+            .text_color(theme.text)
+            .when(is_open, |el| el.bg(theme.element_hover))
+            .when(!is_open, |el| {
+                el.hover(|style| style.bg(crate::theme::ink(0.06)))
+            })
+            .when(disabled, |el| el.cursor_default().opacity(0.5))
+            .when(!disabled, |el| {
+                el.cursor_pointer()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, _| {
+                            this.open.note_trigger_press_matching(|open| *open == kind)
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle(kind, window, cx);
+                    }))
+            })
+            .child(div().max_w(px(180.0)).truncate().child(label))
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                    .size(px(11.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .flex_none(),
+            );
+
+        if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
+            && let Some((_, element)) = overlay.take()
+        {
+            return trigger
+                .relative()
+                .child(popover::anchored_menu_below(
+                    "branch-popover",
+                    element,
+                    closing,
+                ))
+                .into_any_element();
+        }
+
+        trigger.into_any_element()
     }
 
     /// The checkout-kind dropdown (t3code BranchToolbarEnvModeSelector): two
@@ -4177,8 +4405,30 @@ mod tests {
     fn picker_controls_move_to_footer() {
         assert_eq!(
             composer_footer_right_order(),
-            [ComposerFooterControl::Model, ComposerFooterControl::Branch]
+            [ComposerFooterControl::Model]
         );
+    }
+    #[test]
+    fn branch_ref_metadata_classification() {
+        let local_ref = RepoRef {
+            name: "feature/branch".into(),
+            current: true,
+            worktree_path: None,
+            is_remote: Some(false),
+            is_default: Some(false),
+        };
+        assert_eq!(local_ref.is_remote, Some(false));
+        assert!(local_ref.current);
+
+        let remote_ref = RepoRef {
+            name: "main".into(),
+            current: false,
+            worktree_path: None,
+            is_remote: Some(true),
+            is_default: Some(true),
+        };
+        assert_eq!(remote_ref.is_remote, Some(true));
+        assert_eq!(remote_ref.is_default, Some(true));
     }
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
 

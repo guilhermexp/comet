@@ -1877,11 +1877,13 @@ impl Shell {
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
+        let pickers = composer.read(cx).pickers().clone();
         let details_sidebar = cx.new({
             let state = state.clone();
             let workers_model = workers_model.clone();
             let preferences = settings.details_sidebar_preferences.clone();
-            move |cx| DetailsSidebar::new(state, workers_model, preferences, cx)
+            let pickers = pickers.clone();
+            move |cx| DetailsSidebar::new(state, workers_model, preferences, pickers, cx)
         });
         let file_preview = cx.new(|_| FilePreview::new());
         let details_sub = cx.subscribe(
