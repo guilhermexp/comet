@@ -2941,12 +2941,14 @@ impl Shell {
         }
         // Opening a file must OPEN the pane, not just record the surface: the
         // column stays at width 0 while `visible` is false, so the click
-        // looked dead.
+        // looked dead. The width tween is the shared `finish_right_transition`
+        // guard — a file opened into an already-open column must not hold
+        // `motion_active` for 200ms while WebKit is coming up.
         self.panels.show(&key);
         self.panels.update(&key, |panels| {
             panels.right_active = surface;
         });
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        self.finish_right_transition(from, cx);
         self.set_right_active(surface, cx);
     }
 

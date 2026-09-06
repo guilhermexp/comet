@@ -1,4 +1,10 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use comet_syntax::HighlightedDocument;
 use gpui::{
@@ -26,13 +32,42 @@ enum PreviewLoadState {
     Error(SharedString),
 }
 
-/// What the native host is being asked to paint. HTML arrives as a sanitized
-/// string; PDF and video are loaded straight off disk by WebKit.
-#[derive(Clone, Copy)]
-enum NativeSource<'a> {
-    Html(&'a str),
-    Pdf,
-    Video,
+/// Construction of the native host (WKWebView) is decided from load state,
+/// never from `Render`. Paint only attaches an already-built view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDocumentAction {
+    Hide,
+    Keep,
+    OpenHtml,
+    OpenPdf,
+    OpenVideo,
+}
+
+fn native_document_action(
+    loaded: &PreviewLoadState,
+    absolute: &Path,
+    existing: Option<&Path>,
+) -> NativeDocumentAction {
+    let open = match loaded {
+        PreviewLoadState::Ready(LoadedPreview::Html(_)) => NativeDocumentAction::OpenHtml,
+        PreviewLoadState::Ready(LoadedPreview::Pdf) => NativeDocumentAction::OpenPdf,
+        PreviewLoadState::Ready(LoadedPreview::Video) => NativeDocumentAction::OpenVideo,
+        _ => return NativeDocumentAction::Hide,
+    };
+    if existing == Some(absolute) {
+        NativeDocumentAction::Keep
+    } else {
+        open
+    }
+}
+
+fn preview_absolute_path(root: &Path, relative_path: &str) -> PathBuf {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute() {
+        relative.to_path_buf()
+    } else {
+        root.join(relative)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +250,7 @@ impl FilePreview {
                     Ok(preview) => PreviewLoadState::Ready(preview),
                     Err(error) => PreviewLoadState::Error(load_error_message(&error).into()),
                 };
+                this.ensure_native_document();
                 cx.notify();
             });
         }));
@@ -419,16 +455,12 @@ impl FilePreview {
                     theme,
                 )
             }
-            PreviewLoadState::Ready(LoadedPreview::Html(document)) => {
-                self.render_native_document(window, theme, NativeSource::Html(document.as_ref()))
+            PreviewLoadState::Ready(LoadedPreview::Html(_))
+            | PreviewLoadState::Ready(LoadedPreview::Pdf)
+            | PreviewLoadState::Ready(LoadedPreview::Video) => {
+                self.render_native_document(window, theme)
             }
             PreviewLoadState::Ready(LoadedPreview::Image(image)) => render_image(image, theme),
-            PreviewLoadState::Ready(LoadedPreview::Pdf) => {
-                self.render_native_document(window, theme, NativeSource::Pdf)
-            }
-            PreviewLoadState::Ready(LoadedPreview::Video) => {
-                self.render_native_document(window, theme, NativeSource::Video)
-            }
             PreviewLoadState::Ready(LoadedPreview::Table(rows)) => render_data(&path, rows, theme),
         }
     }
@@ -440,47 +472,72 @@ impl FilePreview {
         }
     }
 
-    fn render_native_document(
-        &mut self,
-        window: &Window,
-        theme: &Theme,
-        source: NativeSource<'_>,
-    ) -> AnyElement {
+    fn active_absolute_path(&self) -> Option<PathBuf> {
+        let context_key = self.active_context.as_deref()?;
+        let relative = self.tabs.active_path(context_key)?;
+        let root = self.roots.get(context_key)?;
+        Some(preview_absolute_path(root, relative))
+    }
+
+    fn ensure_native_document(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            let Some(context_key) = self.active_context.as_deref() else {
-                return gpui::Empty.into_any_element();
-            };
-            let Some(relative_path) = self.tabs.active_path(context_key) else {
-                return gpui::Empty.into_any_element();
-            };
-            let Some(root) = self.roots.get(context_key).cloned() else {
-                return centered_message("Project folder is unavailable.", theme);
-            };
-            let absolute = root.join(relative_path);
-            let needs_new = self
-                .native_document
-                .as_ref()
-                .is_none_or(|(path, _)| path != &absolute);
-            if needs_new {
+            let Some(absolute) = self.active_absolute_path() else {
                 self.clear_native_document();
-                let view = match source {
-                    NativeSource::Html(document) => {
-                        super::native_document::NativeDocumentView::open_html(document)
+                return;
+            };
+            let action = {
+                let existing = self
+                    .native_document
+                    .as_ref()
+                    .map(|(path, _)| path.as_path());
+                native_document_action(&self.loaded, &absolute, existing)
+            };
+            match action {
+                NativeDocumentAction::Hide => self.clear_native_document(),
+                NativeDocumentAction::Keep => {}
+                NativeDocumentAction::OpenHtml => {
+                    let document = match &self.loaded {
+                        PreviewLoadState::Ready(LoadedPreview::Html(document)) => document.clone(),
+                        _ => {
+                            self.clear_native_document();
+                            return;
+                        }
+                    };
+                    self.clear_native_document();
+                    if let Some(view) =
+                        super::native_document::NativeDocumentView::open_html(document.as_ref())
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
-                    NativeSource::Pdf => {
+                }
+                NativeDocumentAction::OpenPdf => {
+                    self.clear_native_document();
+                    if let Some(view) =
                         super::native_document::NativeDocumentView::open_pdf(&absolute)
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
-                    NativeSource::Video => {
+                }
+                NativeDocumentAction::OpenVideo => {
+                    self.clear_native_document();
+                    if let Some(view) =
                         super::native_document::NativeDocumentView::open_video(&absolute)
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
-                };
-                let Some(view) = view else {
-                    return centered_message("The native preview could not be opened.", theme);
-                };
-                self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
+                }
             }
-            let view = self.native_document.as_ref().unwrap().1.clone();
+        }
+    }
+
+    fn render_native_document(&mut self, window: &Window, theme: &Theme) -> AnyElement {
+        #[cfg(target_os = "macos")]
+        {
+            let Some((_, view)) = self.native_document.as_ref() else {
+                return centered_message("The native preview could not be opened.", theme);
+            };
+            let view = view.clone();
             let viewport_height = f32::from(window.viewport_size().height) as f64;
             return gpui::canvas(
                 move |bounds, _, _| {
@@ -498,7 +555,10 @@ impl FilePreview {
             .into_any_element();
         }
         #[cfg(not(target_os = "macos"))]
-        centered_message("Open this file in its native app to preview it.", theme)
+        {
+            let _ = window;
+            centered_message("Open this file in its native app to preview it.", theme)
+        }
     }
 }
 
@@ -755,5 +815,63 @@ mod tests {
         assert_eq!(sampled.len(), 240);
         assert_eq!(sampled.first(), Some(&0));
         assert!(sampled.last().is_some_and(|last| *last < 1_000));
+    }
+
+    #[test]
+    fn native_webview_is_planned_from_load_state_not_from_paint() {
+        use super::{NativeDocumentAction, PreviewLoadState, native_document_action};
+        use crate::file_preview::loader::LoadedPreview;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let html = PreviewLoadState::Ready(LoadedPreview::Html(Arc::from("<p>hi</p>")));
+        let pdf = PreviewLoadState::Ready(LoadedPreview::Pdf);
+        let video = PreviewLoadState::Ready(LoadedPreview::Video);
+        let path = Path::new("/tmp/a.html");
+        let other = Path::new("/tmp/b.html");
+
+        assert_eq!(
+            native_document_action(&html, path, None),
+            NativeDocumentAction::OpenHtml
+        );
+        assert_eq!(
+            native_document_action(&html, path, Some(path)),
+            NativeDocumentAction::Keep
+        );
+        assert_eq!(
+            native_document_action(&html, path, Some(other)),
+            NativeDocumentAction::OpenHtml
+        );
+        assert_eq!(
+            native_document_action(&pdf, Path::new("/tmp/a.pdf"), None),
+            NativeDocumentAction::OpenPdf
+        );
+        assert_eq!(
+            native_document_action(&video, Path::new("/tmp/a.mp4"), None),
+            NativeDocumentAction::OpenVideo
+        );
+        assert_eq!(
+            native_document_action(&PreviewLoadState::Loading, path, Some(path)),
+            NativeDocumentAction::Hide
+        );
+        assert_eq!(
+            native_document_action(&PreviewLoadState::Idle, path, None),
+            NativeDocumentAction::Hide
+        );
+    }
+
+    #[test]
+    fn preview_absolute_path_keeps_out_of_checkout_keys() {
+        use super::preview_absolute_path;
+        use std::path::{Path, PathBuf};
+
+        assert_eq!(
+            preview_absolute_path(Path::new("/repo"), "docs/a.html"),
+            PathBuf::from("/repo/docs/a.html")
+        );
+        assert_eq!(
+            preview_absolute_path(Path::new("/repo"), "/tmp/out.html"),
+            PathBuf::from("/tmp/out.html")
+        );
     }
 }
