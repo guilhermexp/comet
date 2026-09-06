@@ -316,7 +316,14 @@ pub fn property_row_custom(
                         .child(label.into()),
                 ),
         )
-        .child(div().flex_1().min_w_0().child(value_element))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .child(value_element),
+        )
 }
 
 #[cfg(test)]

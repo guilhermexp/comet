@@ -3186,7 +3186,6 @@ impl Pickers {
             .or_else(|| self.config.branch.clone())
             .unwrap_or_else(|| "—".to_string())
             .into();
-        let is_open = self.open_kind() == Some(kind);
         let id = "workspace-branch-trigger";
         let trigger = div()
             .id(id)
@@ -3194,19 +3193,13 @@ impl Pickers {
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .px(px(6.0))
             .py(px(2.0))
-            .ml(px(-6.0))
-            .rounded_md()
             .text_size(px(12.0))
             .text_color(theme.text)
-            .when(is_open, |el| el.bg(theme.element_hover))
-            .when(!is_open, |el| {
-                el.hover(|style| style.bg(crate::theme::ink(0.06)))
-            })
             .when(disabled, |el| el.cursor_default().opacity(0.5))
             .when(!disabled, |el| {
                 el.cursor_pointer()
+                    .hover(|style| style.text_color(theme.accent))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(move |this, _, _, _| {
