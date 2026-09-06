@@ -1365,9 +1365,9 @@ async fn oversized_workers_result_returns_a_bounded_error_to_omp() {
 
 #[tokio::test]
 async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
-    let hold_path = std::env::temp_dir().join(format!("zeron-c2-hold-{}", std::process::id()));
+    let hold_path = std::env::temp_dir().join("zeron-c2-hold-host-slow");
     let _ = std::fs::remove_file(&hold_path);
-    unsafe { std::env::set_var("FAKE_WORKERS_HOLD", &hold_path) };
+
 
     let harness = fake_harness("workers-wait-steer");
     let (controls, steer, _interrupt) = controls_with_answer("Yes");
@@ -1418,6 +1418,121 @@ async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
     let before = before.expect("previous-task tail before ACK must stay visible");
     let steered = steered.expect("steer consumption must emit Steered once");
     let after = after.expect("consumed steer must continue the run");
+    assert!(
+        before < steered,
+        "leftover previous-task frame must not open a new frontier: {events:?}"
+    );
+    assert!(
+        steered < after,
+        "post-steer text belongs after the consumption frontier: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "steer prompt processed exactly once: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
+    let hold_path = std::env::temp_dir().join("zeron-c2-hold-host-hold");
+    let cancel_path = std::env::temp_dir().join(format!("zeron-c2-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_file(&hold_path);
+    let _ = std::fs::remove_file(&cancel_path);
+
+    let mut env = fake_env("workers-steer-cancel");
+    env.insert(
+        "FAKE_OMP_CANCEL_MARKER".into(),
+        cancel_path.to_string_lossy().into_owned(),
+    );
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("tools-pending barrier")
+            .expect("stream")
+            .unwrap();
+        let pending = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "tools-pending"
+        );
+        events.push(event);
+        if pending {
+            steer
+                .send(SteerMessage {
+                    prompt: "steer-now".into(),
+                    message_id: Some("m-steer".into()),
+                })
+                .await
+                .unwrap();
+            std::fs::write(&cancel_path, b"cancel").unwrap();
+            break;
+        }
+    }
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("cancelled toolResult")
+            .expect("stream")
+            .unwrap();
+        let cancelled = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "cancelled-delivered"
+        );
+        events.push(event);
+        if cancelled {
+            std::fs::write(&hold_path, b"late").unwrap();
+            break;
+        }
+    }
+    events.extend(
+        tokio::time::timeout(Duration::from_secs(8), collect_until_done(&mut stream))
+            .await
+            .expect("cancelled host tool plus steer must complete"),
+    );
+    let _ = std::fs::remove_file(&hold_path);
+    let _ = std::fs::remove_file(&cancel_path);
+
+    let cancelled = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "cancelled-delivered"),
+    );
+    let before = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "before-steer-tail"),
+    );
+    let steered = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }));
+    let after = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TextDelta { text } if text == "after wait"));
+    let cancelled = cancelled.expect("cancelled toolResult must reach OMP before steer");
+    let before = before.expect("previous-task tail must stay visible");
+    let steered = steered.expect("steer consumption must emit Steered once");
+    let after = after.expect("consumed steer must continue the run");
+    assert!(
+        cancelled < before,
+        "cancelled toolResult must precede leftover and steer: {events:?}"
+    );
     assert!(
         before < steered,
         "leftover previous-task frame must not open a new frontier: {events:?}"

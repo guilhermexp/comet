@@ -50,3 +50,14 @@ Test: `steer_during_pending_host_tool_is_consumed_once_after_tool_result`
 - **AND** a leftover previous-task frame emitted before the steer ACK does not emit `AgentEvent::Steered`
 - **AND** `message_start` for the steered user message before the transport ACK emits `AgentEvent::Steered` once
 - **AND** the steer prompt is processed exactly once after that consumption
+
+#### Scenario: Host tool cancel with a queued steer delivers cancelled result first
+
+Test: `steer_queued_during_host_tool_cancel_is_consumed_once`
+
+- **GIVEN** an OMP run with a held `workers` host tool call
+- **WHEN** a steer is queued after the pending-tools barrier and the fixture then emits `host_tool_cancel`
+- **THEN** the cancelled `host_tool_result` is delivered to OMP before `type=steer`
+- **AND** a late sidecar completion does not deliver a second result or a second `AgentEvent::Steered`
+- **AND** the steer prompt is processed exactly once
+

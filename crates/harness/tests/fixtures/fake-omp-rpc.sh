@@ -353,7 +353,7 @@ while IFS= read -r line; do
         fi
       elif [ "$scenario" = "workers-wait-steer" ]; then
         emit '{"type":"agent_start"}'
-        emit '{"type":"host_tool_call","id":"host-slow","toolCallId":"workers-slow","toolName":"workers","arguments":{"action":"hold"}}'
+        emit "{\"type\":\"host_tool_call\",\"id\":\"host-slow\",\"toolCallId\":\"workers-slow\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${TMPDIR:-/tmp}/zeron-c2-hold-host-slow\"}}"
         emit '{"type":"host_tool_call","id":"host-fast","toolCallId":"workers-fast","toolName":"workers","arguments":{"action":"help"}}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
         got_slow=
@@ -376,6 +376,47 @@ while IFS= read -r line; do
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"before-steer-tail"}}'
           emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"steer-now"}]}}'
           respond "$steer" '{}'
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after wait"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage steer 32
+        fi
+      elif [ "$scenario" = "workers-steer-cancel" ]; then
+        emit '{"type":"agent_start"}'
+        emit "{\"type\":\"host_tool_call\",\"id\":\"host-hold\",\"toolCallId\":\"workers-hold\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${TMPDIR:-/tmp}/zeron-c2-hold-host-hold\"}}"
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
+        marker=${FAKE_OMP_CANCEL_MARKER:-}
+        if [ -n "$marker" ]; then
+          (
+            while [ ! -f "$marker" ]; do sleep 0.05; done
+            emit '{"type":"host_tool_cancel","id":"cancel-host","targetId":"host-hold"}'
+          ) &
+        fi
+        got_result=
+        while [ -z "$got_result" ]; do
+          read -r host_result
+          if has "$host_result" '"type":"steer"'; then
+            fail_stage steer_before_tool_result 30
+          fi
+          if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-hold"'; then
+            if has "$host_result" '"isError":true'; then
+              emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"cancelled-delivered"}}'
+              got_result=1
+            else
+              fail_stage expected_cancelled 33
+            fi
+          else
+            fail_stage host_wait 31
+          fi
+        done
+        read -r after_result
+        if has "$after_result" '"type":"host_tool_result"'; then
+          fail_stage duplicate_tool_result 34
+        fi
+        if has "$after_result" '"type":"steer"' && has "$after_result" '"message":"steer-now"'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"before-steer-tail"}}'
+          emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"steer-now"}]}}'
+          respond "$after_result" '{}'
           emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after wait"}}'
           emit '{"type":"agent_end","messages":[]}'
         else
