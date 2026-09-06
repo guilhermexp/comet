@@ -1346,7 +1346,7 @@ fn monocode_dark() -> ThemeVariant {
         appearance: Appearance::Dark,
         treatment: SurfaceTreatment::Frosted,
         background: "#171717",
-        shell: "#151515",
+        shell: "#171717",
         raised: "#282828",
         card: "#222222",
         text: "#ebebeb",

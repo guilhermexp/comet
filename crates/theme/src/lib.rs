@@ -868,6 +868,10 @@ mod tests {
             .expect("monocode-dark variant should be resolved");
 
         assert_eq!(variant.colors.background.to_string(), "#171717");
+        // The macOS `has-native-glass` branch paints the MonoCode sidebar as
+        // `background` at 85% alpha, never darker than the canvas; a shell
+        // darker than `background` means the opaque fallback rule crept back in.
+        assert_eq!(variant.colors.shell.to_string(), "#171717");
         assert_eq!(variant.colors.text.to_string(), "#ebebeb");
         assert_eq!(variant.colors.text_muted.to_string(), "#818181");
         assert_eq!(variant.accent.primary.to_string(), "#459bf7");

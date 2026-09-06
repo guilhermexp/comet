@@ -141,7 +141,7 @@ Se uma cor semeada não atingir o contraste mínimo normativo, o Comet aplica **
 | Campo `Seeds` | Hex Semeado | Origem MonoCode (`path:linha`) | Hex Efetivo Pós-`variant()` | Delta de Endurecimento | Justificativa de Mapeamento |
 |---|---|---|---|---|---|
 | `background` | `#171717` | `src/index.css:7-9, 28` | `#171717` | Nenhum (0) | Base do canvas com lightness 9% (`var(--color-background-base)`). |
-| `shell` | `#151515` | `src/index.css:104-106` | `#151515` | Nenhum (0) | Superfície da sidebar `.sidebar-glass` misturada com 10% preto. |
+| `shell` | `#171717` | `src/index.css:98-102, 114-119` | `#171717` | Nenhum (0) | No macOS o branch `html.has-native-glass .sidebar-glass` pinta a sidebar como `background` a `var(--sidebar-opacity)` = 85% sobre a janela transparente, então ela nunca fica mais escura que o canvas (medido `#191919` sobre desktop escuro). A regra opaca `color-mix(... 90%, black)` de `:104-106` é fallback de plataforma sem vidro e semeá-la invertia o sinal. Alpha por superfície não existe no modelo do Comet, então o flatten determinístico é o próprio `background`. |
 | `raised` | `#2c2c2c` | `src/chrome/ApprovalToasts.tsx:64` | `#2c2c2c` | Nenhum (0) | Superfície elevada com 10% de `content` sobre `background`. |
 | `card` | `#222222` | `src/chrome/ColorPickerPopover.tsx:181` | `#222222` | Nenhum (0) | Superfície de card intermediária (5% `content` sobre `background`). |
 | `text` | `#ebebeb` | `src/index.css:10-12, 29` | `#ebebeb` | Nenhum (0) | Texto primário `content` com lightness 92% (`var(--color-content)`). |
