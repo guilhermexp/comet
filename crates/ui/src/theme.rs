@@ -98,9 +98,7 @@ fn accent_tokens(accent: AccentColor, appearance: Appearance) -> AccentTokens {
         // achromatic. Lightness follows the same ladder as the hued presets so
         // selections and controls keep their weight.
         (AccentColor::Gray, Appearance::Dark) => (oklch(0.74, 0.0, 0.0), oklch(0.52, 0.0, 0.0)),
-        (AccentColor::Gray, Appearance::Light) => {
-            (oklch(0.47, 0.0, 0.0), oklch(0.47, 0.0, 0.0))
-        }
+        (AccentColor::Gray, Appearance::Light) => (oklch(0.47, 0.0, 0.0), oklch(0.47, 0.0, 0.0)),
     };
     AccentTokens {
         primary,

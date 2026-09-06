@@ -613,6 +613,7 @@ mod tests {
             semantic,
             state: "working".to_owned(),
             activity: "building".to_owned(),
+            created_at_unix_ms: 1000,
             updated_at_unix_ms: 1000,
             total_tokens: None,
             model_usage: Vec::new(),

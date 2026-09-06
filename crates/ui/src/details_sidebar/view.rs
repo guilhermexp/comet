@@ -1340,7 +1340,13 @@ impl DetailsSidebar {
                 theme.text_muted
             })
             .when(active == tab, |pill| pill.bg(crate::theme::ink(0.08)))
-            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .hover(move |style| {
+                if active == tab {
+                    style.bg(crate::theme::ink(0.10))
+                } else {
+                    style.bg(crate::theme::ink(0.05))
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.chat_workers.select(tab);
                 cx.notify();
@@ -1350,7 +1356,11 @@ impl DetailsSidebar {
                 pill.child(
                     div()
                         .text_size(px(10.0))
-                        .text_color(theme.text_muted)
+                        .text_color(if active == tab {
+                            theme.text_muted.opacity(0.9)
+                        } else {
+                            theme.text_muted
+                        })
                         .child(count.to_string()),
                 )
             })
@@ -1843,15 +1853,24 @@ impl DetailsSidebar {
         // follow. And an errored snapshot goes in as absence, never as zero —
         // `current_chat_workers` empties the list on any client failure, so a
         // count would make the recovery look like a launch.
-        self.chat_workers.sync_dispatch(
+        let latest_started = [
+            snapshot.latest_started_at(ChatWorkersTab::Workflows),
+            snapshot.latest_started_at(ChatWorkersTab::Subagents),
+            snapshot.latest_started_at(ChatWorkersTab::Workers),
+        ];
+        self.chat_workers.sync_dispatch_with_recency(
             Some(workflows),
             Some(subagents),
             workers_error.is_none().then_some(workers),
+            latest_started,
         );
-        let active = self.chat_workers.active_tab(
-            workflows,
-            subagents,
-            workers_tab_presence(workers, workers_error.is_some()),
+        let active = self.chat_workers.active_tab_with_recency(
+            (workflows, latest_started[0]),
+            (subagents, latest_started[1]),
+            (
+                workers_tab_presence(workers, workers_error.is_some()),
+                latest_started[2],
+            ),
         );
         // Shimmer de atividade: a strip inteira brilha enquanto ha worker
         // rodando ou workflow/subagente em voo — um sinal por widget, em vez de
@@ -3087,6 +3106,7 @@ mod tests {
             usage: None,
             progress: Vec::new(),
             subagent_type: Some("reviewer".into()),
+            started_at_unix_ms: 0,
         };
         let worker = ChatWorkerRow {
             session_id: "worker-42".into(),
@@ -3097,6 +3117,7 @@ mod tests {
             semantic: WorkerSemantic::Working,
             state: "running".into(),
             activity: "working".into(),
+            created_at_unix_ms: 0,
             updated_at_unix_ms: 42,
             total_tokens: None,
             model_usage: Vec::new(),
@@ -3140,6 +3161,7 @@ mod tests {
             semantic: WorkerSemantic::Disconnected,
             state: "disconnected".into(),
             activity: "disconnected".into(),
+            created_at_unix_ms: 0,
             updated_at_unix_ms: 42,
             total_tokens: None,
             model_usage: Vec::new(),
