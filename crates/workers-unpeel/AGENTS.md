@@ -23,6 +23,7 @@ internal host modes (`__session_host__` et al.).
 | `workspace_trust.rs` | Workspace trust decisions |
 | `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
+| `maintenance.rs` | Worker CLI version detection (`--version`), npm/brew latest version querying with TTL cache, semver comparison, advisory generation, and safe update command execution |
 | `tests/` | Integration tests per surface |
 
 Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
