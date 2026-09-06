@@ -1230,6 +1230,269 @@ async fn run_reports_provider_error_honestly() {
 }
 
 #[tokio::test]
+async fn local_command_output_is_preserved() {
+    let harness = fake_harness("local-command-output");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/context");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text_deltas,
+        vec![
+            "Context window: 1048576 tokens (3% used)\n".to_string(),
+            "  System prompt: 15553 tokens\n".to_string(),
+        ],
+        "local command_output text must be preserved in order"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1,
+        "local command must complete with exactly one Done"
+    );
+
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                ..
+            }
+        ),
+        "local command completion must have DoneStatus::Completed and no duplicated result"
+    );
+}
+
+#[tokio::test]
+async fn local_command_output_burst_exceeding_channel_capacity_progresses() {
+    let harness = fake_harness("local-burst-output");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/burst");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(text_deltas.len(), 300);
+    assert_eq!(text_deltas[0], "chunk-0\n");
+    assert_eq!(text_deltas[299], "chunk-299\n");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_command_empty_output_completes_without_invented_content() {
+    let harness = fake_harness("local-empty-output");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/empty");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(text_deltas.is_empty(), "empty output must not invent text");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_command_failure_preserves_partial_output_and_reports_error() {
+    let harness = fake_harness("local-failure-with-partial");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/fail");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text_deltas,
+        vec!["partial output before failure\n".to_string()]
+    );
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        ),
+        "failed local command must report DoneStatus::Errored"
+    );
+}
+
+#[tokio::test]
+async fn local_command_premature_exit_preserves_partial_output() {
+    let harness = fake_harness("local-premature-exit");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/crash");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text_deltas,
+        vec!["partial output before exit\n".to_string()]
+    );
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event on process exit");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        ),
+        "premature exit must report DoneStatus::Errored"
+    );
+}
+
+#[tokio::test]
+async fn local_command_long_work_can_be_cancelled() {
+    let harness = fake_harness("local-long-cancel");
+    let (controls, _steer, interrupt) = controls_with_answer("Yes");
+    let request = request("/long");
+    let mut stream = harness.run(request, controls).await.unwrap();
+
+    // Wait for at least one event (SessionStarted or partial TextDelta) before cancelling
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let is_text = matches!(event, AgentEvent::TextDelta { .. });
+        events.push(event);
+        if is_text {
+            interrupt.cancel();
+            break;
+        }
+    }
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(text_deltas, vec!["working on long operation\n".to_string()]);
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event on cancellation");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            }
+        ),
+        "cancelled operation must report DoneStatus::Interrupted"
+    );
+}
+
+#[tokio::test]
+async fn prompt_omitted_agent_invoked_streams_normally() {
+    let harness = fake_harness("prompt-omitted-agent-invoked");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("normal");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(text_deltas, vec!["normal prompt output".to_string()]);
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ),
+        "normal prompt must complete"
+    );
+}
+
+#[tokio::test]
 async fn run_rejects_state_without_resume_identity() {
     let harness = fake_harness("missing-session");
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");

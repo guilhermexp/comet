@@ -3307,3 +3307,92 @@ async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
         "the gauge fell back to an unmeasured state between turns: {observed:?}"
     );
 }
+
+#[tokio::test]
+async fn local_command_output_persists_and_survives_reopening_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Omp,
+            model: "omp-default".into(),
+            tools: Vec::new(),
+            cwd: "/tmp".into(),
+            session_id: "omp-local-session".into(),
+            assistant_message_id: "msg-assistant-local".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "Context window: 1048576 tokens (3% used)\n".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "  System prompt: 15553 tokens\n".into(),
+        },
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("omp-local-session".into()),
+        },
+    ];
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script,
+            step_delay: Duration::from_millis(1),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-local-1",
+        SessionCommandPayload::Run {
+            request: run_request("/context"),
+            message_id: "msg-user-local".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "local command assistant entry to complete",
+    )
+    .await;
+
+    let all = entries(&core);
+    assert_eq!(all.len(), 2, "user + assistant entries, got {all:#?}");
+    assert_eq!(all[0].id, "msg-user-local");
+    assert_eq!(all[0].role, MessageRole::User);
+
+    let assistant = &all[1];
+    assert_eq!(assistant.role, MessageRole::Assistant);
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    let expected_text = "Context window: 1048576 tokens (3% used)\n  System prompt: 15553 tokens\n";
+    let text_part = assistant
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("must contain text part");
+    assert_eq!(text_part, expected_text);
+
+    // Reopen doc from disk to prove persistence and readability across chat close/reopen
+    drop(handle);
+    let reopened = core.doc_host.open(CHAT).unwrap();
+    let reopened_entries = reopened.doc().read_entries().unwrap();
+    assert_eq!(reopened_entries.len(), 2);
+    let reopened_assistant_text = reopened_entries[1]
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("must contain text part after reopening");
+    assert_eq!(reopened_assistant_text, expected_text);
+}

@@ -261,8 +261,42 @@ while IFS= read -r line; do
       ;;
     prompt)
       if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_prompt 59; fi
-      respond "$line" '{"agentInvoked":true}'
-      if [ "$scenario" = "full-run" ]; then
+      if [ "$scenario" = "local-command-output" ]; then
+        emit '{"type":"command_output","text":"Context window: 1048576 tokens (3% used)\n"}'
+        emit '{"type":"command_output","text":"  System prompt: 15553 tokens\n"}'
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-burst-output" ]; then
+        i=0
+        while [ "$i" -lt 300 ]; do
+          emit "{\"type\":\"command_output\",\"text\":\"chunk-$i\n\"}"
+          i=$((i + 1))
+        done
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-empty-output" ]; then
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-failure-with-partial" ]; then
+        emit '{"type":"command_output","text":"partial output before failure\n"}'
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"command execution failed\"}"
+      elif [ "$scenario" = "local-premature-exit" ]; then
+        emit '{"type":"command_output","text":"partial output before exit\n"}'
+        exit 12
+      elif [ "$scenario" = "local-long-cancel" ]; then
+        emit '{"type":"command_output","text":"working on long operation\n"}'
+        while read -r abort_cmd; do
+          if has "$abort_cmd" '"type":"abort"'; then
+            respond "$abort_cmd" '{}'
+            emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"Operation aborted\"}"
+            break
+          fi
+        done
+      elif [ "$scenario" = "prompt-omitted-agent-invoked" ]; then
+        respond "$line" '{}'
+        emit '{"type":"agent_start"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"normal prompt output"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      else
+        respond "$line" '{"agentInvoked":true}'
+        if [ "$scenario" = "full-run" ]; then
         emit '{"type":"agent_start"}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"checking"}}'
@@ -453,6 +487,7 @@ while IFS= read -r line; do
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "wait" ]; then
         sleep 60
+      fi
       fi
       ;;
     *)

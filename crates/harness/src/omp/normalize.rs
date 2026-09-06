@@ -56,6 +56,15 @@ impl OmpNormalizer {
 
     pub fn push(&mut self, frame: Value) -> Vec<AgentEvent> {
         match frame.get("type").and_then(Value::as_str) {
+            Some("command_output") => frame
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| AgentEvent::TextDelta {
+                    text: text.to_owned(),
+                })
+                .into_iter()
+                .collect(),
             Some("message_update") => self.message_update(&frame),
             Some("message_start" | "message_end") => {
                 self.streaming_tools.clear();

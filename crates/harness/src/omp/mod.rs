@@ -130,7 +130,15 @@ pub struct OmpHarness {
     env: Option<HashMap<String, String>>,
     handshake_timeout: Duration,
     request_timeout: Duration,
+    prompt_timeout: Duration,
 }
+
+/// Prazo padrão para comandos e execuções de prompt no OMP.
+///
+/// Comandos locais como `/compact` ou operações longas não podem herdar o prazo
+/// curto de ACK (10s), que expira durante trabalho legítimo. Este prazo longo é
+/// finito e cancelável.
+const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Quanto esperar o `{"type":"ready"}` do `omp` antes de desistir.
 ///
@@ -169,6 +177,7 @@ impl Default for OmpHarness {
             env: None,
             handshake_timeout: handshake_timeout_from_env(),
             request_timeout: Duration::from_secs(10),
+            prompt_timeout: DEFAULT_PROMPT_TIMEOUT,
         }
     }
 }
@@ -201,6 +210,11 @@ impl OmpHarness {
     pub fn with_timeouts(mut self, handshake: Duration, request: Duration) -> Self {
         self.handshake_timeout = handshake;
         self.request_timeout = request;
+        self
+    }
+
+    pub fn with_prompt_timeout(mut self, timeout: Duration) -> Self {
+        self.prompt_timeout = timeout;
         self
     }
 
@@ -486,8 +500,6 @@ impl Harness for OmpHarness {
         if !images.is_empty() {
             prompt["images"] = Value::Array(images);
         }
-        let prompt_response = process.request(prompt).await?;
-
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         event_tx
             .send(Ok(AgentEvent::SessionStarted {
@@ -500,32 +512,19 @@ impl Harness for OmpHarness {
             }))
             .await
             .map_err(|_| HarnessError::Protocol("OMP event consumer closed".into()))?;
-        if prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
-            event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Completed,
-                    result: None,
-                    error: None,
-                    session_id: Some(session_id),
-                }))
-                .await
-                .ok();
-            if let Some(workers) = workers {
-                let _ = workers.shutdown().await;
-            }
-            let _ = process.shutdown().await;
-        } else {
-            tokio::spawn(run_session(
-                process,
-                events,
-                event_tx,
-                controls,
-                workers,
-                request.cwd,
-                model,
-                session_id,
-            ));
-        }
+
+        tokio::spawn(run_session(
+            process,
+            events,
+            event_tx,
+            controls,
+            workers,
+            request.cwd,
+            model,
+            session_id,
+            prompt,
+            self.prompt_timeout,
+        ));
 
         Ok(
             futures::stream::unfold(event_rx, |mut receiver| async move {
@@ -864,6 +863,8 @@ async fn run_session(
     cwd: String,
     model: String,
     mut session_id: String,
+    prompt: Value,
+    prompt_timeout: Duration,
 ) {
     let RunControls {
         request_input,
@@ -886,8 +887,56 @@ async fn run_session(
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
     let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
 
+    let prompt_fut = process.request_with_timeout(prompt, prompt_timeout);
+    tokio::pin!(prompt_fut);
+    let mut prompt_pending = true;
+
     while !finished {
         tokio::select! {
+            prompt_res = &mut prompt_fut, if prompt_pending => {
+                prompt_pending = false;
+                match prompt_res {
+                    Ok(prompt_response) => {
+                        if prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
+                            while let Ok(frame) = events.try_recv() {
+                                for event in normalizer.push(frame) {
+                                    if !emit(&event_tx, event).await {
+                                        finished = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !finished {
+                                let _ = emit(&event_tx, AgentEvent::Done {
+                                    status: DoneStatus::Completed,
+                                    result: None,
+                                    error: None,
+                                    session_id: Some(session_id.clone()),
+                                }).await;
+                            }
+                            finished = true;
+                        }
+                    }
+                    Err(err) => {
+                        while let Ok(frame) = events.try_recv() {
+                            for event in normalizer.push(frame) {
+                                if !emit(&event_tx, event).await {
+                                    break;
+                                }
+                            }
+                        }
+                        let message = err.to_string();
+                        let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
+                        let _ = emit(&event_tx, AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(message),
+                            session_id: Some(session_id.clone()),
+                        }).await;
+                        finished = true;
+                    }
+                }
+            }
             _ = event_tx.closed() => {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(500),
