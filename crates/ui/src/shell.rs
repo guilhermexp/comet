@@ -66,7 +66,7 @@ use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, ToggleTerminal};
 use crate::theme::Theme;
 use crate::trajectory::TrajectoryView;
 use crate::transcript::{self, Transcript, TranscriptEvent};
-use crate::workers::model::{WorkersModel, WorkersRoute};
+use crate::workers::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
 use crate::workers::session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
@@ -465,6 +465,42 @@ impl SidebarMode {
     fn shows_orchestrator_content(self) -> bool {
         matches!(self, Self::Orchestrator)
     }
+}
+
+fn settings_layer_open(app_route: Route, workers_route: WorkersRoute) -> bool {
+    matches!(app_route, Route::Settings(_)) || matches!(workers_route, WorkersRoute::Settings(_))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCatalog {
+    Orchestrator(SettingsSection),
+    Workers(WorkersSettingsTab),
+}
+
+fn settings_catalog_for_mode(
+    mode: SidebarMode,
+    app_route: Route,
+    workers_route: WorkersRoute,
+) -> SettingsCatalog {
+    match mode {
+        SidebarMode::Orchestrator => SettingsCatalog::Orchestrator(match app_route {
+            Route::Settings(section) => section,
+            Route::Chat => SettingsSection::Devices,
+        }),
+        SidebarMode::Workers => SettingsCatalog::Workers(match workers_route {
+            WorkersRoute::Settings(tab) => tab,
+            _ => WorkersSettingsTab::Presets,
+        }),
+    }
+}
+
+fn sidebar_mode_switch_catalog(
+    in_settings: bool,
+    mode: SidebarMode,
+    app_route: Route,
+    workers_route: WorkersRoute,
+) -> Option<SettingsCatalog> {
+    in_settings.then(|| settings_catalog_for_mode(mode, app_route, workers_route))
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1111,30 +1147,6 @@ const EXPORT_MENU_ITEMS: &[ExportMenuItem] = &[
     },
 ];
 
-/// The sidebar notice strip's payload. `ok` rides with the text so a success
-/// message can never inherit the previous failure's red.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SidebarNotice {
-    text: SharedString,
-    ok: bool,
-}
-
-impl SidebarNotice {
-    fn failure(text: impl Into<SharedString>) -> Self {
-        Self {
-            text: text.into(),
-            ok: false,
-        }
-    }
-
-    fn success(text: impl Into<SharedString>) -> Self {
-        Self {
-            text: text.into(),
-            ok: true,
-        }
-    }
-}
-
 /// Where a Chat Transcript Export lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportDelivery {
@@ -1168,8 +1180,13 @@ fn export_outcome_with_worker_loss(
 ) -> ExportOutcome {
     match (outcome, worker_error) {
         (delivered @ (ExportOutcome::Downloaded(_) | ExportOutcome::Copied), Some(reason)) => {
+            let delivered_str = match &delivered {
+                ExportOutcome::Downloaded(file) => format!("Exported to Downloads: {file}"),
+                ExportOutcome::Copied => "Chat copied to clipboard".to_string(),
+                _ => String::new(),
+            };
             ExportOutcome::Incomplete {
-                delivered: export_notice(&delivered).text.to_string(),
+                delivered: delivered_str,
                 reason,
             }
         }
@@ -1177,16 +1194,18 @@ fn export_outcome_with_worker_loss(
     }
 }
 
-fn export_notice(outcome: &ExportOutcome) -> SidebarNotice {
+fn export_toast(outcome: &ExportOutcome) -> crate::toast::Toast {
     match outcome {
         ExportOutcome::Downloaded(file) => {
-            SidebarNotice::success(format!("Exported to Downloads: {file}"))
+            crate::toast::Toast::success(format!("Exported to Downloads: {file}"))
         }
-        ExportOutcome::Copied => SidebarNotice::success("Chat copied to clipboard"),
+        ExportOutcome::Copied => crate::toast::Toast::success("Chat copied to clipboard"),
         ExportOutcome::Incomplete { delivered, reason } => {
-            SidebarNotice::failure(format!("{delivered} — without the worker index: {reason}"))
+            crate::toast::Toast::error(format!("{delivered} — without the worker index: {reason}"))
         }
-        ExportOutcome::Failed(reason) => SidebarNotice::failure(format!("Export failed: {reason}")),
+        ExportOutcome::Failed(reason) => {
+            crate::toast::Toast::error(format!("Export failed: {reason}"))
+        }
     }
 }
 
@@ -1576,6 +1595,7 @@ pub struct Shell {
     sidebar_mode: SidebarMode,
     workers_model: Entity<WorkersModel>,
     workers_reveal_generation: u64,
+    workers_settings_open: bool,
     workers_sidebar: Entity<WorkersSidebar>,
     workers_content: Entity<WorkersContent>,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -1593,7 +1613,7 @@ pub struct Shell {
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     rename_dialog: Option<RenameChatDialog>,
-    /// Chat id awaiting delete confirmation.
+    /// Chat id awaiting inline delete confirmation on its sidebar row.
     delete_confirm: Option<String>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
@@ -1621,10 +1641,6 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
-    /// Inline sidebar notice strip (mutation failures, export outcomes); click
-    /// dismisses. The tone rides WITH the text: two parallel fields would let a
-    /// caller set a success message and leave the previous failure's red on it.
-    sidebar_notice: Option<SidebarNotice>,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -1738,12 +1754,24 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let workers_reveal_generation = workers_model.read(cx).reveal().generation;
+        let workers_settings_open =
+            matches!(workers_model.read(cx).route, WorkersRoute::Settings(_));
         let workers_observation = cx.observe(&workers_model, |this, model, cx| {
             let generation = model.read(cx).reveal().generation;
             if generation != this.workers_reveal_generation {
                 this.workers_reveal_generation = generation;
                 this.sidebar_mode = SidebarMode::Workers;
             }
+            let workers_in_settings = matches!(model.read(cx).route, WorkersRoute::Settings(_));
+            if this.workers_settings_open
+                && !workers_in_settings
+                && this.sidebar_mode == SidebarMode::Workers
+                && matches!(this.route, Route::Settings(_))
+            {
+                this.route = Route::Chat;
+                this.nav.push(NavEntry::Chat(this.active_chat.clone()));
+            }
+            this.workers_settings_open = workers_in_settings;
             cx.notify();
         });
         let workers_content = cx.new({
@@ -2062,6 +2090,7 @@ impl Shell {
             },
             workers_model,
             workers_reveal_generation,
+            workers_settings_open,
             workers_sidebar,
             workers_content,
             nav,
@@ -2090,7 +2119,6 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
-            sidebar_notice: None,
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -2145,7 +2173,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(SidebarNotice::failure(notice));
+            self.push_toast(crate::toast::Toast::error(notice), cx);
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -3466,10 +3494,15 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some(SidebarNotice::success("Zeron conversation link copied"));
+            self.push_toast(
+                crate::toast::Toast::success("Zeron conversation link copied"),
+                cx,
+            );
         } else {
-            self.sidebar_notice =
-                Some(SidebarNotice::failure("Conversation link is not ready yet"));
+            self.push_toast(
+                crate::toast::Toast::error("Conversation link is not ready yet"),
+                cx,
+            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3485,7 +3518,10 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
-            self.sidebar_notice = Some(SidebarNotice::success(format!("{} copied", link.label)));
+            self.push_toast(
+                crate::toast::Toast::success(format!("{} copied", link.label)),
+                cx,
+            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3501,7 +3537,10 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
-            self.sidebar_notice = Some(SidebarNotice::success("Harness session ID copied"));
+            self.push_toast(
+                crate::toast::Toast::success("Harness session ID copied"),
+                cx,
+            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3523,6 +3562,39 @@ impl Shell {
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        self.workers_model.update(cx, |model, cx| {
+            if matches!(model.route, WorkersRoute::Settings(_)) {
+                model.close_settings(cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn select_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        if self.sidebar_mode == mode {
+            return;
+        }
+        let workers_route = self.workers_model.read(cx).route;
+        let in_settings = settings_layer_open(self.route, workers_route);
+        self.sidebar_mode = mode;
+        if let Some(catalog) =
+            sidebar_mode_switch_catalog(in_settings, mode, self.route, workers_route)
+        {
+            match catalog {
+                SettingsCatalog::Orchestrator(section) => {
+                    if !matches!(self.route, Route::Settings(current) if current == section) {
+                        self.open_settings(section, cx);
+                    }
+                }
+                SettingsCatalog::Workers(tab) => {
+                    if !matches!(workers_route, WorkersRoute::Settings(current) if current == tab) {
+                        self.workers_model.update(cx, |model, cx| {
+                            model.open_settings(tab, cx);
+                        });
+                    }
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -3821,8 +3893,7 @@ impl Shell {
     }
 
     fn report_export(&mut self, outcome: ExportOutcome, cx: &mut Context<Self>) {
-        self.sidebar_notice = Some(export_notice(&outcome));
-        cx.notify();
+        self.push_toast(export_toast(&outcome), cx);
     }
 
     pub fn push_toast(&mut self, toast: crate::toast::Toast, cx: &mut Context<Self>) {
@@ -3945,15 +4016,13 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some(SidebarNotice::failure("Engine not connected"));
-            cx.notify();
+            self.push_toast(crate::toast::Toast::error("Engine not connected"), cx);
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
-                    cx.notify();
+                    shell.push_toast(crate::toast::Toast::error(format!("{err}")), cx);
                 })
                 .ok();
             }
@@ -4189,9 +4258,10 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice = Some(SidebarNotice::failure(format!(
-                            "Could not cancel sign-in: {err}"
-                        )));
+                        shell.push_toast(
+                            crate::toast::Toast::error(format!("Could not cancel sign-in: {err}")),
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -4513,9 +4583,10 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice =
-                        Some(SidebarNotice::failure(format!("Sign in failed: {err}")));
-                    cx.notify();
+                    shell.push_toast(
+                        crate::toast::Toast::error(format!("Sign in failed: {err}")),
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -5589,10 +5660,7 @@ impl Shell {
             })
             .hover(move |el| el.bg(hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if this.sidebar_mode != mode {
-                    this.sidebar_mode = mode;
-                    cx.notify();
-                }
+                this.select_sidebar_mode(mode, cx);
             }))
             .child(SharedString::from(label))
             .into_any_element()
@@ -5912,6 +5980,75 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_chat_delete_confirm(
+        &self,
+        id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let confirm_id = id.to_string();
+        div()
+            .id(SharedString::from(format!("chat-delete-confirm-{id}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .min_h(px(45.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .bg(crate::theme::ink(0.10))
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .child(SharedString::from("Delete session?"))
+            .child(div().flex_1().min_w(px(4.0)))
+            .child(
+                div()
+                    .id(SharedString::from(format!("chat-delete-cancel-{id}")))
+                    .h(px(20.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .bg(crate::theme::ink(0.06))
+                    .hover(|el| el.bg(crate::theme::ink(0.10)).text_color(theme.text))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_confirm = None;
+                        cx.notify();
+                    }))
+                    .child("Cancel"),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-delete-confirm-button-{id}"
+                    )))
+                    .h(px(20.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.danger)
+                    .bg(theme.danger.opacity(0.15))
+                    .hover(|el| el.bg(theme.danger.opacity(0.25)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_chat(confirm_id.clone(), cx);
+                    }))
+                    .child("Delete"),
+            )
+            .into_any_element()
+    }
+
     /// One session row: context + status on line one, harness + title on line
     /// two, and source metadata below. Working uses the live thread glyph in
     /// the status corner. Click selects; right-click opens the context menu.
@@ -5936,6 +6073,9 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.delete_confirm.as_deref() == Some(id.as_str()) {
+            return self.render_chat_delete_confirm(&id, theme, cx);
+        }
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
@@ -6512,33 +6652,6 @@ impl Shell {
             // appearing IS the signal.
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
-            })
-            // Inline notice: mutation failures and export outcomes.
-            .when_some(self.sidebar_notice.clone(), |el, notice| {
-                let ink = if notice.ok {
-                    theme.text_muted
-                } else {
-                    theme.danger
-                };
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(ink)
-                        .text_size(px(11.0))
-                        .text_color(ink)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_notice = None;
-                            cx.notify();
-                        }))
-                        .child(notice.text),
-                )
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
@@ -7366,50 +7479,6 @@ impl Shell {
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
-        }
-
-        if let Some(chat_id) = self.delete_confirm.clone() {
-            let title = transcript::single_line(
-                &self
-                    .state
-                    .read(cx)
-                    .chats
-                    .iter()
-                    .find(|c| c.id == chat_id)
-                    .and_then(|c| c.title.clone())
-                    .unwrap_or_else(|| "New session".into()),
-            );
-            let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Delete session?"))
-                .child(div().mt(px(6.0)).child(popover::dialog_body(
-                    &theme,
-                    format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
-                )))
-                .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel")
-                                .id("delete-chat-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_confirm = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            popover::btn_danger(&theme, "Delete")
-                                .id("delete-chat-confirm")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_chat(chat_id.clone(), cx)
-                                })),
-                        ),
-                )
-                .into_any_element();
-            overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
@@ -9696,9 +9765,8 @@ impl Render for Shell {
                 // The right utility surface is chat-scoped chrome: the Settings
                 // route never renders it — the per-session open flags stay
                 // intact for the return trip.
-                let in_settings = matches!(self.route, Route::Settings(_))
-                    || (self.sidebar_mode == SidebarMode::Workers
-                        && matches!(self.workers_model.read(cx).route, WorkersRoute::Settings(_)));
+                let in_settings =
+                    settings_layer_open(self.route, self.workers_model.read(cx).route);
                 let on_chat = !in_settings;
                 let right_open = on_chat && self.right_pane_open(cx);
                 // Takeover mode derives its width from the viewport, so a
@@ -9919,27 +9987,23 @@ mod tests {
     /// Every outcome is visible and says which one it was — success names the
     /// file or the clipboard, failure names the reason. Nothing is silent.
     #[test]
-    fn export_notice_states_the_outcome_and_its_tone() {
-        let downloaded = export_notice(&ExportOutcome::Downloaded(
+    fn export_toast_states_the_outcome_and_its_tone() {
+        let downloaded = export_toast(&ExportOutcome::Downloaded(
             "Fix_the_thing-a1b2c3d4.md".into(),
         ));
         assert_eq!(
-            downloaded,
-            SidebarNotice::success("Exported to Downloads: Fix_the_thing-a1b2c3d4.md")
+            downloaded.title.as_ref(),
+            "Exported to Downloads: Fix_the_thing-a1b2c3d4.md"
         );
-        assert!(downloaded.ok);
+        assert_eq!(downloaded.kind, crate::toast::ToastKind::Success);
 
-        assert_eq!(
-            export_notice(&ExportOutcome::Copied),
-            SidebarNotice::success("Chat copied to clipboard")
-        );
+        let copied = export_toast(&ExportOutcome::Copied);
+        assert_eq!(copied.title.as_ref(), "Chat copied to clipboard");
+        assert_eq!(copied.kind, crate::toast::ToastKind::Success);
 
-        let failed = export_notice(&ExportOutcome::Failed("permission denied".into()));
-        assert_eq!(
-            failed,
-            SidebarNotice::failure("Export failed: permission denied")
-        );
-        assert!(!failed.ok);
+        let failed = export_toast(&ExportOutcome::Failed("permission denied".into()));
+        assert_eq!(failed.title.as_ref(), "Export failed: permission denied");
+        assert_eq!(failed.kind, crate::toast::ToastKind::Error);
     }
 
     /// A broken workers join delivers a file that reads as complete. The
@@ -9951,17 +10015,16 @@ mod tests {
             ExportOutcome::Downloaded("Fix_the_thing-a1b2c3d4.md".into()),
             Some("parse app-state.json: expected value".into()),
         );
-        let notice = export_notice(&incomplete);
-        assert!(!notice.ok);
-        assert!(notice.text.contains("Fix_the_thing-a1b2c3d4.md"));
-        assert!(notice.text.contains("parse app-state.json"));
+        let toast = export_toast(&incomplete);
+        assert_eq!(toast.kind, crate::toast::ToastKind::Error);
+        assert!(toast.title.contains("Fix_the_thing-a1b2c3d4.md"));
+        assert!(toast.title.contains("parse app-state.json"));
 
-        let copied = export_notice(&export_outcome_with_worker_loss(
+        let copied = export_toast(&export_outcome_with_worker_loss(
             ExportOutcome::Copied,
             Some("boom".into()),
         ));
-        assert!(!copied.ok);
-
+        assert_eq!(copied.kind, crate::toast::ToastKind::Error);
         // A healthy join leaves the outcome untouched.
         assert_eq!(
             export_outcome_with_worker_loss(ExportOutcome::Copied, None),
@@ -10020,6 +10083,81 @@ mod tests {
     fn workers_mode_hides_orchestrator_content() {
         assert!(SidebarMode::Orchestrator.shows_orchestrator_content());
         assert!(!SidebarMode::Workers.shows_orchestrator_content());
+    }
+
+    #[test]
+    fn switcher_outside_settings_does_not_open_a_catalog() {
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                false,
+                SidebarMode::Workers,
+                Route::Chat,
+                WorkersRoute::Workspace,
+            ),
+            None
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                false,
+                SidebarMode::Orchestrator,
+                Route::Chat,
+                WorkersRoute::Workspace,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn switcher_in_settings_picks_the_other_catalog_and_restores_the_last_page() {
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Workers,
+                Route::Settings(SettingsSection::Agents),
+                WorkersRoute::Workspace,
+            ),
+            Some(SettingsCatalog::Workers(WorkersSettingsTab::Presets))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Orchestrator,
+                Route::Chat,
+                WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Orchestrator(SettingsSection::Devices))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Workers,
+                Route::Settings(SettingsSection::Agents),
+                WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Workers(WorkersSettingsTab::Resources))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Orchestrator,
+                Route::Settings(SettingsSection::Agents),
+                WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Orchestrator(SettingsSection::Agents))
+        );
+    }
+
+    #[test]
+    fn settings_layer_is_open_from_either_catalog() {
+        assert!(!settings_layer_open(Route::Chat, WorkersRoute::Workspace));
+        assert!(settings_layer_open(
+            Route::Settings(SettingsSection::Devices),
+            WorkersRoute::Workspace,
+        ));
+        assert!(settings_layer_open(
+            Route::Chat,
+            WorkersRoute::Settings(WorkersSettingsTab::Presets),
+        ));
     }
 
     #[test]
@@ -10517,20 +10655,15 @@ mod tests {
 
     #[test]
     fn workers_settings_route_suppresses_right_and_details_chrome() {
-        use crate::workers::model::{WorkersRoute, WorkersSettingsTab};
-
-        let in_settings_workspace = matches!(Route::Chat, Route::Settings(_))
-            || (SidebarMode::Workers == SidebarMode::Workers
-                && matches!(WorkersRoute::Workspace, WorkersRoute::Settings(_)));
-        assert!(!in_settings_workspace);
-
-        let in_settings_workers = matches!(Route::Chat, Route::Settings(_))
-            || (SidebarMode::Workers == SidebarMode::Workers
-                && matches!(
-                    WorkersRoute::Settings(WorkersSettingsTab::Presets),
-                    WorkersRoute::Settings(_)
-                ));
-        assert!(in_settings_workers);
+        assert!(!settings_layer_open(Route::Chat, WorkersRoute::Workspace));
+        assert!(settings_layer_open(
+            Route::Chat,
+            WorkersRoute::Settings(WorkersSettingsTab::Presets),
+        ));
+        assert!(settings_layer_open(
+            Route::Settings(SettingsSection::Devices),
+            WorkersRoute::Workspace,
+        ));
     }
 
     #[test]

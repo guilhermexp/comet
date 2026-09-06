@@ -157,6 +157,45 @@ impl Toast {
             duration: Some(Duration::from_secs(6)),
         }
     }
+
+    pub fn success(title: impl Into<SharedString>) -> Self {
+        Self {
+            id: next_toast_id(),
+            kind: ToastKind::Success,
+            title: title.into(),
+            description: None,
+            primary_action: None,
+            secondary_action: None,
+            created_at: Instant::now(),
+            duration: Some(Duration::from_secs(4)),
+        }
+    }
+
+    pub fn error(title: impl Into<SharedString>) -> Self {
+        Self {
+            id: next_toast_id(),
+            kind: ToastKind::Error,
+            title: title.into(),
+            description: None,
+            primary_action: None,
+            secondary_action: None,
+            created_at: Instant::now(),
+            duration: Some(Duration::from_secs(5)),
+        }
+    }
+
+    pub fn info(title: impl Into<SharedString>) -> Self {
+        Self {
+            id: next_toast_id(),
+            kind: ToastKind::Info,
+            title: title.into(),
+            description: None,
+            primary_action: None,
+            secondary_action: None,
+            created_at: Instant::now(),
+            duration: Some(Duration::from_secs(4)),
+        }
+    }
 }
 
 /// Render a single toast card matching Orchestrator.dev's styling.
@@ -170,28 +209,50 @@ pub fn render_toast_card<S: 'static>(
     let toast_id = toast.id;
     let is_progress = matches!(toast.kind, ToastKind::UpdatingProgress { .. });
 
+    let border_color = match toast.kind {
+        ToastKind::Error => theme.danger.opacity(0.7),
+        ToastKind::Warning => theme.warning.opacity(0.7),
+        ToastKind::Success => theme.success.opacity(0.6),
+        _ => theme.border.opacity(0.85),
+    };
+
+    let leading_icon = match toast.kind {
+        ToastKind::Error => Some((icons::CLOSE_CIRCLE, theme.danger)),
+        ToastKind::Warning => Some((icons::INFO_CIRCLE, theme.warning)),
+        ToastKind::Success => Some((icons::CHECK, theme.success)),
+        _ => None,
+    };
+
     let mut card = div()
         .id(("toast-item", toast.id))
         .w(px(320.0))
         .p(px(14.0))
         .rounded(px(10.0))
         .border_1()
-        .border_color(theme.border.opacity(0.85))
+        .border_color(border_color)
         .bg(theme.surface_overlay)
         .shadow_md()
         .flex()
         .flex_col()
         .gap(px(6.0));
+
     // Header row: Title + dismiss button
     let mut header = div().flex().items_start().justify_between().gap(px(8.0));
 
-    let title_el = div()
-        .text_size(px(13.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.text)
-        .child(toast.title.clone());
+    let mut title_content = div().flex().items_center().gap(px(6.0));
+    if let Some((ico, color)) = leading_icon {
+        title_content =
+            title_content.child(crate::icons::icon(ico).size(px(13.0)).text_color(color));
+    }
+    title_content = title_content.child(
+        div()
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .child(toast.title.clone()),
+    );
 
-    header = header.child(title_el);
+    header = header.child(title_content);
 
     if !is_progress {
         let dismiss_btn = div()
