@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn builtins_have_complete_provenance_and_no_validation_errors() {
         let registry = ThemeRegistry::builtin();
-        assert_eq!(registry.families.len(), 19);
+        assert_eq!(registry.families.len(), 20);
         assert!(registry.variant("zeron-light").is_some());
         assert!(registry.variant("zeron-dark").is_some());
         let errors: Vec<_> = registry
@@ -849,7 +849,44 @@ mod tests {
             .iter()
             .map(|family| family.variants.len())
             .sum::<usize>();
-        assert_eq!(variants, 30);
-        assert_eq!(variants * VisualFixture::ALL.len(), 300);
+        assert_eq!(variants, 31);
+        assert_eq!(variants * VisualFixture::ALL.len(), 310);
+    }
+
+    #[test]
+    fn monocode_dark_seed_fidelity_and_surface_treatment() {
+        let registry = ThemeRegistry::builtin();
+        let family = registry
+            .families
+            .iter()
+            .find(|f| f.id == "monocode")
+            .expect("monocode family should be registered");
+        assert_eq!(family.variants.len(), 1);
+
+        let variant = registry
+            .variant("monocode-dark")
+            .expect("monocode-dark variant should be resolved");
+
+        assert_eq!(variant.colors.background.to_string(), "#171717");
+        assert_eq!(variant.colors.text.to_string(), "#ebebeb");
+        assert_eq!(variant.colors.text_muted.to_string(), "#818181");
+        assert_eq!(variant.accent.primary.to_string(), "#459bf7");
+
+        assert_eq!(
+            variant.recommended_surface_treatment,
+            SurfaceTreatment::Frosted
+        );
+
+        let expected_ansi = [
+            "#1d2428", "#f87171", "#4ade80", "#fbbf24", "#60a5fa", "#c084fc", "#22d3ee", "#e8eef2",
+            "#64748b", "#fca5a5", "#86efac", "#fde68a", "#93c5fd", "#d8b4fe", "#67e8f9", "#f8fafc",
+        ];
+        let actual_ansi: Vec<String> = variant
+            .terminal
+            .ansi
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(actual_ansi, expected_ansi);
     }
 }

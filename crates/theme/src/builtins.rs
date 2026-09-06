@@ -59,6 +59,7 @@ pub fn builtin_registry() -> &'static ThemeRegistry {
             ),
             family("cobalt2", "Cobalt2", vec![cobalt2()]),
             family("andromeda", "Andromeda", vec![andromeda()]),
+            family("monocode", "MonoCode", vec![monocode_dark()]),
         ],
     })
 }
@@ -1332,6 +1333,43 @@ fn andromeda() -> ThemeVariant {
             "vscode",
             "https://github.com/EliverLara/Andromeda",
             "d1abb48c69493000aa0133a32d594eb25e523d4f",
+            "MIT",
+        ),
+    })
+}
+
+fn monocode_dark() -> ThemeVariant {
+    variant(Seeds {
+        id: "monocode-dark",
+        family_id: "monocode",
+        name: "MonoCode",
+        appearance: Appearance::Dark,
+        treatment: SurfaceTreatment::Frosted,
+        background: "#171717",
+        shell: "#151515",
+        raised: "#282828",
+        card: "#222222",
+        text: "#ebebeb",
+        muted: "#818181",
+        faint: "#616161",
+        accent: "#459bf7",
+        danger: "#f87171",
+        warning: "#fbbf24",
+        success: "#4ade80",
+        terminal_background: "#141b1f",
+        ansi: [
+            "#1d2428", "#f87171", "#4ade80", "#fbbf24", "#60a5fa", "#c084fc", "#22d3ee", "#e8eef2",
+            "#64748b", "#fca5a5", "#86efac", "#fde68a", "#93c5fd", "#d8b4fe", "#67e8f9", "#f8fafc",
+        ],
+        syntax: [
+            "#fefdc2", "#ff8ffd", "#b4fa72", "#b4fa72", "#ff8272", "#a5d5fe", "#d0d1fe", "#ebebeb",
+            "#ebebeb", "#ff8272", "#d0d1fe", "#ffc4bd",
+        ],
+        source: source(
+            "monocode-dark",
+            "css",
+            "https://github.com/hardbeat920/monocode",
+            "65fbe78",
             "MIT",
         ),
     })
