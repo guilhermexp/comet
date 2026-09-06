@@ -168,7 +168,7 @@ impl ChatWorkersWidgetState {
             let count_grew = next_counts[ix] > previous_counts[ix];
             let new_item_started = match (latest_started[ix], previous_started[ix]) {
                 (Some(next_ts), Some(prev_ts)) => next_ts > prev_ts,
-                (Some(_), None) if next_counts[ix] > 0 => previous_counts[ix] == 0,
+                (Some(next_ts), None) => next_ts > 0,
                 _ => false,
             };
             if count_grew || new_item_started {

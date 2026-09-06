@@ -2566,9 +2566,9 @@ struct SessionWire {
     terminal_background_hex: Option<String>,
     #[serde(default)]
     worktree_branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "created_at", alias = "createdAt")]
     created_at_unix_ms: u64,
-    #[serde(default)]
+    #[serde(default, alias = "updated_at", alias = "updatedAt")]
     updated_at_unix_ms: u64,
     #[serde(default)]
     total_tokens: Option<u64>,
