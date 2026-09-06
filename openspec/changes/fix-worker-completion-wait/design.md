@@ -6,7 +6,7 @@
 
 ## Decisions
 
-- **D-01 — Reuse parent-notification evidence.** `wait_for_status(completed)` consults Stop/`done`+unread + `WorkerCompletionEvidence` + generation/task-episode. The `acknowledged_completed_episode` latch keeps a valid completion visible after ACK but does not satisfy blocked, a newer generation, growing output, or episode N-1. Idle without that evidence is not completed.
+- **D-01 — Reuse parent-notification evidence.** `wait_for_status(completed)` consults Stop/`done`+unread + `WorkerCompletionEvidence` + generation/task-episode. ACK stores `acknowledged_completed_generation` from the notification. The latch requires that generation plus not blocked/working and quiescent output. Missing stored generation fails closed. Idle without evidence is not completed.
 - **D-02 — Injectable match seam.** `wait_until` stays host-free. A `wait_until_matching` extra predicate is how tests inject episode completion without a worker host; production `wait_for_status` passes `current_episode_completed`.
 - **D-03 — Harness loop owns pending delivery and the steer queue.** Register delivering when `begin_call` is accepted. Tasks only forward the MCP outcome; the loop writes `toolResult`/fallback, then drops delivering, then drains steers if none remain. Do not use sidecar `has_pending` (it clears before delivery) and do not drain from the task.
 - **D-04 — Steered is user-message lifecycle, not ACK.** Register the sent intent synchronously before dispatch. Consume on matching `message_start` (`role=user`, `steering=true`) by prompt, not `front()`. ACK does not mint a frontier and is not required before consumption. Leftover previous-task frames stay in the previous segment. Send failure removes that intent.

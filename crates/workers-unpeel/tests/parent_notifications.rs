@@ -838,3 +838,118 @@ fn current_episode_completed_ignores_prior_episode_on_same_generation() {
         "Stop for episode N-1 must not complete episode N on the same generation"
     );
 }
+
+#[test]
+fn current_episode_completed_journal_less_ack_rejects_new_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    std::fs::remove_file(
+        sessions_root
+            .join("worker-1")
+            .join("comet-hook-events.jsonl"),
+    )
+    .unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 8, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "journal-less ACK must not complete a newer generation"
+    );
+}
+
+#[test]
+fn current_episode_completed_journal_less_ack_keeps_same_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    std::fs::remove_file(
+        sessions_root
+            .join("worker-1")
+            .join("comet-hook-events.jsonl"),
+    )
+    .unwrap();
+    assert!(
+        current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "journal-less ACK of the same generation must stay completed"
+    );
+}
+
+#[test]
+fn current_episode_completed_legacy_ack_without_generation_fails_closed() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    std::fs::remove_file(
+        sessions_root
+            .join("worker-1")
+            .join("comet-hook-events.jsonl"),
+    )
+    .unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["comet_worker_parent_notifications"]["worker-1"]
+        .as_object_mut()
+        .unwrap()
+        .remove("acknowledged_completed_generation");
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "legacy ACK without a stored generation must fail closed"
+    );
+}
+
+#[test]
+fn current_episode_completed_rejects_working_even_when_quiescent() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "working", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "working must not complete on the journal path"
+    );
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "working", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "working must not complete on the ACK latch"
+    );
+}

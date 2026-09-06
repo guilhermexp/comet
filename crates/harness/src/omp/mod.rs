@@ -882,6 +882,7 @@ async fn run_session(
     let mut queued_steers: VecDeque<SteerMessage> = VecDeque::new();
     let mut in_flight_steers: Vec<(String, Option<String>)> = Vec::new();
     let mut delivering: HashSet<String> = HashSet::new();
+    let mut answered: HashSet<String> = HashSet::new();
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
     let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
 
@@ -950,6 +951,24 @@ async fn run_session(
                 }
             }
             Some((tool_id, outcome)) = tool_rx.recv() => {
+                if answered.contains(&tool_id) {
+                    delivering.remove(&tool_id);
+                    if delivering.is_empty() {
+                        while let Some(SteerMessage { prompt, message_id }) =
+                            queued_steers.pop_front()
+                        {
+                            in_flight_steers.push((prompt.clone(), message_id));
+                            dispatch_steer(
+                                process.clone(),
+                                event_tx.clone(),
+                                prompt,
+                                steer_failed_tx.clone(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                answered.insert(tool_id.clone());
                 let result = outcome.unwrap_or_else(|| {
                     json!({
                         "type": "host_tool_result",
@@ -1030,9 +1049,14 @@ async fn run_session(
                                     });
                                 }
                                 Err(result) => {
-                                    if let Err(error) = process.send_control(result) {
-                                        let message = protocol::sanitize_diagnostic(&error.to_string());
-                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                    if answered.insert(id.to_owned()) {
+                                        if let Err(error) = process.send_control(result) {
+                                            let message = protocol::sanitize_diagnostic(
+                                                &error.to_string(),
+                                            );
+                                            let _ = emit(&event_tx, AgentEvent::Error { message })
+                                                .await;
+                                        }
                                     }
                                 }
                             },

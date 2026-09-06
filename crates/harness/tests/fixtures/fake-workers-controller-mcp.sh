@@ -17,7 +17,6 @@ while IFS= read -r line; do
       case "$line" in
         *'"action":"hold"'*)
           hold=$(printf '%s' "$line" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
-          [ -n "$hold" ] || hold="${FAKE_WORKERS_HOLD:-}"
           [ -n "$hold" ] || exit 19
           while [ ! -f "$hold" ]; do sleep 0.05; done
           emit "{\"jsonrpc\":\"2.0\",\"id\":$(rid "$line"),\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"held\"}],\"isError\":false}}"

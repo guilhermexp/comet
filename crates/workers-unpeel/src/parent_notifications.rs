@@ -24,6 +24,8 @@ struct WorkerParentBinding {
     submitted_at_unix_ms: u64,
     #[serde(default)]
     acknowledged_completed_episode: Option<u64>,
+    #[serde(default)]
+    acknowledged_completed_generation: Option<u64>,
     #[serde(default, alias = "acknowledged_event_ids")]
     acknowledged_notification_ids: HashSet<String>,
 }
@@ -298,6 +300,7 @@ fn register_in_state(
             task_episode_active: false,
             submitted_at_unix_ms: 0,
             acknowledged_completed_episode: None,
+            acknowledged_completed_generation: None,
             acknowledged_notification_ids: HashSet::new(),
         },
     )
@@ -657,19 +660,7 @@ fn episode_completed_from_state(
         return Ok(false);
     }
     if binding.acknowledged_completed_episode == Some(binding.active_task_episode) {
-        if session.activity == "blocked" || !evidence.permits_completion() {
-            return Ok(false);
-        }
-        let journal_events = hook_events(binding, session, worker_session_dir)?;
-        return Ok(match journal_events {
-            None => true,
-            Some((events, _)) => {
-                events
-                    .iter()
-                    .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed)
-                    || lifecycle_kind(session) == Some(WorkerParentNotificationKind::Completed)
-            }
-        });
+        return Ok(latched_completion_still_holds(binding, session, evidence));
     }
     let submission_recovered =
         submitted_task_episode(worker_session_dir) == Some(binding.active_task_episode);
@@ -692,7 +683,26 @@ fn episode_completed_from_state(
     let has_completed = events
         .iter()
         .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed);
-    Ok(has_completed && session.activity != "blocked" && evidence.permits_completion())
+    Ok(has_completed
+        && !activity_blocks_completion(&session.activity)
+        && evidence.permits_completion())
+}
+
+fn activity_blocks_completion(activity: &str) -> bool {
+    activity == "blocked" || activity == "working"
+}
+
+fn latched_completion_still_holds(
+    binding: &WorkerParentBinding,
+    session: &WorkersSession,
+    evidence: WorkerCompletionEvidence,
+) -> bool {
+    let Some(acked_generation) = binding.acknowledged_completed_generation else {
+        return false;
+    };
+    !activity_blocks_completion(&session.activity)
+        && evidence.permits_completion()
+        && session.runtime_generation == acked_generation
 }
 
 pub fn current_episode_completed(session: &WorkersSession) -> bool {
@@ -787,6 +797,7 @@ fn acknowledge_in_state(
         .insert(notification.event_id.clone());
     if notification.kind == WorkerParentNotificationKind::Completed {
         binding.acknowledged_completed_episode = Some(notification.task_episode);
+        binding.acknowledged_completed_generation = Some(notification.runtime_generation);
         binding.task_episode_active = false;
     } else if notification.kind == WorkerParentNotificationKind::Exited {
         binding.task_episode_active = false;

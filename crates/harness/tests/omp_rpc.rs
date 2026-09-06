@@ -1365,11 +1365,19 @@ async fn oversized_workers_result_returns_a_bounded_error_to_omp() {
 
 #[tokio::test]
 async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
-    let hold_path = std::env::temp_dir().join("zeron-c2-hold-host-slow");
-    let _ = std::fs::remove_file(&hold_path);
+    let hold_dir = tempfile::tempdir().unwrap();
+    let hold_path = hold_dir.path().join("hold");
+    let mut env = fake_env("workers-wait-steer");
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        hold_path.to_string_lossy().into_owned(),
+    );
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
 
-
-    let harness = fake_harness("workers-wait-steer");
     let (controls, steer, _interrupt) = controls_with_answer("Yes");
     let mut run_request = request("workers");
     run_request.enable_workers_mcp = true;
@@ -1445,16 +1453,20 @@ async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
 
 #[tokio::test]
 async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
-    let hold_path = std::env::temp_dir().join("zeron-c2-hold-host-hold");
-    let cancel_path = std::env::temp_dir().join(format!("zeron-c2-cancel-{}", std::process::id()));
-    let _ = std::fs::remove_file(&hold_path);
-    let _ = std::fs::remove_file(&cancel_path);
-
+    let hold_dir = tempfile::tempdir().unwrap();
+    let hold_path = hold_dir.path().join("hold");
+    let cancel_dir = tempfile::tempdir().unwrap();
+    let cancel_path = cancel_dir.path().join("cancel");
     let mut env = fake_env("workers-steer-cancel");
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        hold_path.to_string_lossy().into_owned(),
+    );
     env.insert(
         "FAKE_OMP_CANCEL_MARKER".into(),
         cancel_path.to_string_lossy().into_owned(),
     );
+
     let harness = OmpHarness::new()
         .with_executable(fixture_path())
         .with_env(env)
@@ -1549,6 +1561,30 @@ async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
         1,
         "steer prompt processed exactly once: {events:?}"
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn duplicate_host_tool_id_delivers_one_result() {
+    let harness = fake_harness("workers-duplicate-id");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
+        .await
+        .expect("duplicate host_tool_call id must complete with one result");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { text } if text == "after-dup"
+    )));
     assert_eq!(
         events
             .iter()

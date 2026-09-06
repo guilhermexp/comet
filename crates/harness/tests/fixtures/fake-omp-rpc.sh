@@ -353,7 +353,7 @@ while IFS= read -r line; do
         fi
       elif [ "$scenario" = "workers-wait-steer" ]; then
         emit '{"type":"agent_start"}'
-        emit "{\"type\":\"host_tool_call\",\"id\":\"host-slow\",\"toolCallId\":\"workers-slow\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${TMPDIR:-/tmp}/zeron-c2-hold-host-slow\"}}"
+        emit "{\"type\":\"host_tool_call\",\"id\":\"host-slow\",\"toolCallId\":\"workers-slow\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${FAKE_OMP_HOLD_PATH}\"}}"
         emit '{"type":"host_tool_call","id":"host-fast","toolCallId":"workers-fast","toolName":"workers","arguments":{"action":"help"}}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
         got_slow=
@@ -383,7 +383,7 @@ while IFS= read -r line; do
         fi
       elif [ "$scenario" = "workers-steer-cancel" ]; then
         emit '{"type":"agent_start"}'
-        emit "{\"type\":\"host_tool_call\",\"id\":\"host-hold\",\"toolCallId\":\"workers-hold\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${TMPDIR:-/tmp}/zeron-c2-hold-host-hold\"}}"
+        emit "{\"type\":\"host_tool_call\",\"id\":\"host-hold\",\"toolCallId\":\"workers-hold\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${FAKE_OMP_HOLD_PATH}\"}}"
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
         marker=${FAKE_OMP_CANCEL_MARKER:-}
         if [ -n "$marker" ]; then
@@ -422,6 +422,35 @@ while IFS= read -r line; do
         else
           fail_stage steer 32
         fi
+      elif [ "$scenario" = "workers-duplicate-id" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-dup","toolCallId":"workers-dup","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"host_tool_call","id":"host-dup","toolCallId":"workers-dup","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"host_tool_call","id":"host-tail","toolCallId":"workers-tail","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
+        dup_count=0
+        got_tail=
+        while [ -z "$got_tail" ]; do
+          read -r host_result
+          if has "$host_result" '"type":"steer"'; then
+            fail_stage unexpected_steer 30
+          fi
+          if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-dup"'; then
+            dup_count=$((dup_count + 1))
+            if [ "$dup_count" -gt 1 ]; then
+              fail_stage duplicate_tool_result 34
+            fi
+          elif has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-tail"'; then
+            got_tail=1
+          else
+            fail_stage host_wait 31
+          fi
+        done
+        if [ "$dup_count" -ne 1 ]; then
+          fail_stage expected_one_dup_result 35
+        fi
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after-dup"}}'
+        emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "wait" ]; then
         sleep 60
       fi

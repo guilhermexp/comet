@@ -36,6 +36,25 @@ Test: `current_episode_completed_rejects_blocked_even_with_stop`
 - **WHEN** current-episode completion is evaluated
 - **THEN** it is not completed
 
+#### Scenario: Journal-less ACK is bound to the acknowledged generation
+
+Test: `current_episode_completed_journal_less_ack_rejects_new_generation`
+
+- **GIVEN** a Completed ACK whose stored generation is 7 and no hook journal
+- **WHEN** the live snapshot reports generation 8
+- **THEN** current-episode completion is false
+- **AND** the same generation 7 snapshot remains completed
+- **AND** a legacy ACK without a stored generation fails closed
+
+#### Scenario: Working activity does not complete even when quiescent
+
+Test: `current_episode_completed_rejects_working_even_when_quiescent`
+
+- **GIVEN** Stop evidence and quiescent output while `activity=working`
+- **WHEN** current-episode completion is evaluated on the journal path or the ACK latch
+- **THEN** it is not completed
+
+
 ### Requirement: OMP steer frontier follows runtime consumption not transport ACK
 
 While an OMP host tool call is pending delivery of its `toolResult` to the child, the harness SHALL NOT send `type=steer`. Pending lasts until the harness loop has written the result or cancel fallback, not until the sidecar MCP call returns. Two concurrent host tools SHALL keep the fence until both are delivered; finishing one SHALL NOT drain steers. `AgentEvent::Steered` SHALL be emitted only on the user `message_start` (`role=user`, `steering=true`) whose text matches a steer already registered before the RPC dispatch. Transport ACK SHALL NOT mint a frontier and SHALL NOT be required before consumption. A leftover previous-task frame SHALL stay in the previous segment. The fixture SHALL fail if `type=steer` arrives before every pending `host_tool_result`. The steer prompt SHALL be processed exactly once, including after host-tool cancel.
@@ -60,4 +79,14 @@ Test: `steer_queued_during_host_tool_cancel_is_consumed_once`
 - **THEN** the cancelled `host_tool_result` is delivered to OMP before `type=steer`
 - **AND** a late sidecar completion does not deliver a second result or a second `AgentEvent::Steered`
 - **AND** the steer prompt is processed exactly once
+
+#### Scenario: Duplicate host_tool_call id delivers one result
+
+Test: `duplicate_host_tool_id_delivers_one_result`
+
+- **GIVEN** two `host_tool_call` frames with the same id
+- **WHEN** the harness delivers `host_tool_result`s
+- **THEN** OMP receives exactly one result for that id
+- **AND** a late outcome from the original call does not send a second result
+
 
