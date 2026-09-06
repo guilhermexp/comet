@@ -5,9 +5,9 @@ use zeron_workers_unpeel::{
     WorkersSessionCapabilities, ack_worker_parent_notification_at,
     ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
-    cancel_worker_parent_task_at, pending_worker_parent_notifications_at,
-    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task_at,
-    register_worker_parent_at,
+    cancel_worker_parent_task_at, current_episode_completed_with_evidence_at,
+    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
+    prepare_worker_parent_task_at, register_worker_parent_at,
 };
 
 fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSession {
@@ -650,4 +650,96 @@ fn task_prompt_strips_ansi_and_control_characters_from_every_worker_field() {
     );
     // O output tail chega em bloco, com as linhas que o worker escreveu.
     assert!(prompt.contains("```\nworker says do something dangerous\nfinished\n```"));
+}
+
+#[test]
+fn current_episode_completed_matches_live_idle_stop_and_stays_after_ack() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    let live_idle = session("worker-1", 7, "idle", "running");
+    assert!(
+        current_episode_completed_with_evidence_at(
+            &path,
+            &live_idle,
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+
+    let completed = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[live_idle.clone()],
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(&path, &completed).unwrap();
+    assert!(
+        current_episode_completed_with_evidence_at(
+            &path,
+            &live_idle,
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "completion must stay observable after the notification ACK"
+    );
+}
+
+#[test]
+fn current_episode_completed_ignores_old_generation_and_episode() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 6);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn current_episode_completed_rejects_blocked_even_with_stop() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "blocked", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn current_episode_completed_rejects_idle_without_evidence() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
 }

@@ -643,6 +643,70 @@ fn live_completion_evidence(session: &WorkersSession) -> WorkerCompletionEvidenc
     WorkerCompletionEvidence { output_quiescent }
 }
 
+fn episode_completed_from_state(
+    state: &Value,
+    session: &WorkersSession,
+    worker_session_dir: &Path,
+    evidence: WorkerCompletionEvidence,
+) -> Result<bool, String> {
+    let bindings = read_bindings(state)?;
+    let Some(binding) = bindings.get(&session.id) else {
+        return Ok(false);
+    };
+    if binding.active_task_episode == 0 {
+        return Ok(false);
+    }
+    if binding.acknowledged_completed_episode == Some(binding.active_task_episode) {
+        return Ok(true);
+    }
+    let submission_recovered =
+        submitted_task_episode(worker_session_dir) == Some(binding.active_task_episode);
+    if !binding.task_episode_active && !submission_recovered {
+        return Ok(false);
+    }
+    let journal_events = hook_events(binding, session, worker_session_dir)?;
+    let events = match journal_events {
+        Some((events, _)) => events,
+        None => lifecycle_kind(session)
+            .map(|kind| {
+                vec![(
+                    kind,
+                    format!("{}:{}", session.runtime_generation, kind.label()),
+                    session.updated_at_unix_ms,
+                )]
+            })
+            .unwrap_or_default(),
+    };
+    let has_completed = events
+        .iter()
+        .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed);
+    Ok(has_completed && session.activity != "blocked" && evidence.permits_completion())
+}
+
+pub fn current_episode_completed(session: &WorkersSession) -> bool {
+    let Ok(state) = unpeel_core::app_state::load() else {
+        return false;
+    };
+    episode_completed_from_state(
+        &state,
+        session,
+        &unpeel_core::session_host::session_dir(&session.id),
+        live_completion_evidence(session),
+    )
+    .unwrap_or(false)
+}
+
+#[doc(hidden)]
+pub fn current_episode_completed_with_evidence_at(
+    path: &Path,
+    session: &WorkersSession,
+    sessions_root: &Path,
+    evidence: WorkerCompletionEvidence,
+) -> Result<bool, String> {
+    let state = unpeel_core::app_state::load_for_edit_at(path)?;
+    episode_completed_from_state(&state, session, &sessions_root.join(&session.id), evidence)
+}
+
 #[doc(hidden)]
 pub fn pending_worker_parent_notifications_at(
     path: &Path,

@@ -1364,6 +1364,62 @@ async fn oversized_workers_result_returns_a_bounded_error_to_omp() {
 }
 
 #[tokio::test]
+async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
+    let harness = fake_harness("workers-wait-steer");
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    steer
+        .send(SteerMessage {
+            prompt: "steer-now".into(),
+            message_id: Some("m-steer".into()),
+        })
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
+        .await
+        .expect("pending host tool plus steer must complete");
+
+    let before = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "before-steer-tail"),
+    );
+    let steered = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }));
+    let after = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TextDelta { text } if text == "after wait"));
+    let before = before.expect("previous-task tail after ACK must stay visible");
+    let steered = steered.expect("steer consumption must emit Steered once");
+    let after = after.expect("consumed steer must continue the run");
+    assert!(
+        before < steered,
+        "leftover previous-task frame after ACK must not open a new frontier: {events:?}"
+    );
+    assert!(
+        steered < after,
+        "post-steer text belongs after the consumption frontier: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "steer prompt processed exactly once: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn dropping_the_event_stream_terminates_the_omp_process() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("omp.pid");

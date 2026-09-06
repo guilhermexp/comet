@@ -29,6 +29,7 @@ pub use parent_notifications::{
     activate_worker_parent_task, activate_worker_parent_task_at, begin_worker_parent_task,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task, cancel_worker_parent_task_at, confirm_worker_parent_task_submission,
+    current_episode_completed, current_episode_completed_with_evidence_at,
     pending_worker_parent_notifications, pending_worker_parent_notifications_at,
     pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
     prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
@@ -167,6 +168,7 @@ pub fn controller_mcp_handle_request(request: Value) -> Option<Value> {
 #[doc(hidden)]
 pub use controller_mcp::{
     WAIT_TIMED_OUT_NEXT, serve as controller_mcp_serve, wait_until as controller_mcp_wait_until,
+    wait_until_matching as controller_mcp_wait_until_matching,
 };
 
 #[doc(hidden)]

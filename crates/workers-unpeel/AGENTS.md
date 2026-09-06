@@ -273,6 +273,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `cli_id: null` / `is_default: false` são mortos no wire e ficam como estão
   por decisão explícita.
 - **O orquestrador é dono da duração de `wait_for_status`; o teto (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 4h) é só sanidade de transporte.** Schema (`maximum`), help (`limits.wait_seconds`) e `.clamp` derivam da mesma constante. Default continua 30s. Expiração devolve `timed_out: true` + snapshot + `next` (`WAIT_TIMED_OUT_NEXT`): esperar de novo com timeout do tamanho do trabalho, ou encerrar o turno e receber `[worker-task-notification]`. Wait curto repetido é polling e custa um turno inteiro do modelo por chamada — foi o que aconteceu com teto de 120s (≈100 chamadas por attempt em worker de horas).
+- **`wait_for_status(completed)` casa evidência do episódio atual, não o processo.** O Worker vivo fica `state=running` / `activity=idle` depois do Stop (filhos MCP de longa duração). O predicado reusa Stop/`done`+unread + `WorkerCompletionEvidence` + generation/task-episode e o latch `acknowledged_completed_episode` — a conclusão continua observável depois do ACK da notificação. Idle sem essa evidência não é completed; blocked humano e geração/episódio velhos tampouco. `wait_until_matching` é o núcleo injetável; o teto de 4h não muda.
+
 - **`serve` despacha concorrente e cancelável.** `run_stdio` é casca sobre `serve(reader, writer, handler)`: uma thread por request, `stdout` atrás de `Mutex`, registro de ids em voo. `notifications/cancelled` flipa o flag do request (`wait_until` checa a cada tick de 250ms) e o request cancelado **não recebe resposta** (contrato MCP). EOF flipa só o flag de saída — waits pendentes morrem, respostas em voo ainda são escritas. `wait_until` é o núcleo puro do wait (poll injetado) para testar deadline, cancel e `next` sem host.
 - **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
   `project_id` and `validate_launch_target` rejects any id absent from the live
@@ -371,8 +373,8 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `src/lib.rs` (16 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (30) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
-| `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
+| `tests/controller_mcp.rs` (32) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/parent_notifications.rs` (22) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

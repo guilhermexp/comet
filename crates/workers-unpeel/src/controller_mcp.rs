@@ -1106,15 +1106,23 @@ fn wait_for_status(
     let wanted = required_string(arguments, "status")?.to_ascii_lowercase();
     let timeout =
         clamp_wait_for_status_timeout(arguments.get("timeout_seconds").and_then(Value::as_u64));
-    wait_until(timeout, &wanted, cancel, || {
-        client
-            .bootstrap()
-            .map_err(|error| error.to_string())?
-            .sessions
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))
-    })
+    wait_until_matching(
+        timeout,
+        &wanted,
+        cancel,
+        || {
+            client
+                .bootstrap()
+                .map_err(|error| error.to_string())?
+                .sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| format!("Worker '{session_id}' no longer exists."))
+        },
+        |session| {
+            wanted.eq_ignore_ascii_case("completed") && crate::current_episode_completed(session)
+        },
+    )
 }
 
 /// The blocking core of `wait_for_status`, separated from the host client so the
@@ -1123,13 +1131,26 @@ pub fn wait_until(
     timeout_seconds: u64,
     wanted: &str,
     cancel: &AtomicBool,
+    poll: impl FnMut() -> Result<WorkersSession, String>,
+) -> Result<Value, String> {
+    wait_until_matching(timeout_seconds, wanted, cancel, poll, |_| false)
+}
+/// Like [`wait_until`], with an extra predicate so `completed` can match current-episode
+/// evidence without a worker host. Production `wait_for_status` passes current-episode
+/// completion; idle without that evidence does not match.
+pub fn wait_until_matching(
+    timeout_seconds: u64,
+    wanted: &str,
+    cancel: &AtomicBool,
     mut poll: impl FnMut() -> Result<WorkersSession, String>,
+    mut extra_match: impl FnMut(&WorkersSession) -> bool,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
         let session = poll()?;
         let matched = session.activity.eq_ignore_ascii_case(wanted)
-            || session.state.eq_ignore_ascii_case(wanted);
+            || session.state.eq_ignore_ascii_case(wanted)
+            || extra_match(&session);
         if matched {
             return Ok(json!({ "matched": true, "worker": session_json(&session) }));
         }

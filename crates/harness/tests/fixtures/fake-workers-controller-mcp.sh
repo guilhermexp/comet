@@ -15,6 +15,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"tools/call"'*)
       case "$line" in
+        *'"action":"short-hang"'*) sleep 1 ;;
         *'"action":"hang"'*) sleep 60 ;;
         *'"action":"oversized"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"' "$(rid "$line")"

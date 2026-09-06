@@ -297,6 +297,7 @@ while IFS= read -r line; do
         else
           fail_stage steer 27
         fi
+        emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"next"}]}}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" after steer"}}'
         emit '{"type":"agent_end","isTerminal":false,"messages":[]}'
         emit '{"type":"agent_start"}'
@@ -350,6 +351,30 @@ while IFS= read -r line; do
         else
           fail_stage workers_oversized 29
         fi
+      elif [ "$scenario" = "workers-wait-steer" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-wait","toolCallId":"workers-wait","toolName":"workers","arguments":{"action":"help"}}'
+        queued_steer=
+        while read -r host_result; do
+          if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-wait"'; then
+            break
+          fi
+          if has "$host_result" '"type":"steer"' && has "$host_result" '"message":"steer-now"'; then
+            queued_steer=$host_result
+          else
+            fail_stage host_wait 31
+          fi
+        done
+        if [ -n "$queued_steer" ]; then steer=$queued_steer; else read -r steer; fi
+        if has "$steer" '"type":"steer"' && has "$steer" '"message":"steer-now"'; then
+          respond "$steer" '{}'
+        else
+          fail_stage steer 32
+        fi
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"before-steer-tail"}}'
+        emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"steer-now"}]}}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after wait"}}'
+        emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "wait" ]; then
         sleep 60
       fi

@@ -1,6 +1,6 @@
 //! Native Oh My Pi driver over `omp --mode rpc-ui`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -808,6 +808,54 @@ fn context_usage_from_state(state: &Value) -> Option<zeron_proto::ContextUsage> 
     })
 }
 
+fn user_steering_text(frame: &Value) -> Option<String> {
+    if frame.get("type").and_then(Value::as_str) != Some("message_start") {
+        return None;
+    }
+    let message = frame.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if message.get("steering").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    let mut text = String::new();
+    for part in message.get("content")?.as_array()? {
+        if part.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(piece) = part.get("text").and_then(Value::as_str)
+        {
+            text.push_str(piece);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn dispatch_steer(
+    process: OmpProcess,
+    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    prompt: String,
+    message_id: Option<String>,
+    acked: mpsc::UnboundedSender<(String, Option<String>)>,
+) {
+    tokio::spawn(async move {
+        match process
+            .request(json!({ "type": "steer", "message": prompt }))
+            .await
+        {
+            Ok(_) => {
+                let _ = acked.send((prompt, message_id));
+            }
+            Err(error) => {
+                let message = protocol::sanitize_diagnostic(&error.to_string());
+                let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+            }
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     process: OmpProcess,
@@ -833,6 +881,10 @@ async fn run_session(
     let mut pending_agent_end: Option<Value> = None;
     let mut steering_open = true;
     let mut finished = false;
+    let queued_steers = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<SteerMessage>::new()));
+    let mut unconsumed_steers: VecDeque<(String, Option<String>)> = VecDeque::new();
+    let (steer_acked_tx, mut steer_acked_rx) =
+        mpsc::unbounded_channel::<(String, Option<String>)>();
 
     while !finished {
         tokio::select! {
@@ -875,25 +927,23 @@ async fn run_session(
             steer = steering.recv(), if steering_open => {
                 match steer {
                     Some(SteerMessage { prompt, message_id }) => {
-                        let steer_process = process.clone();
-                        let steer_events = event_tx.clone();
-                        tokio::spawn(async move {
-                            match steer_process.request(json!({ "type": "steer", "message": prompt })).await {
-                                Ok(_) => {
-                                    let _ = emit(&steer_events, AgentEvent::Steered {
-                                        assistant_message_id: message_id,
-                                        next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
-                                    }).await;
-                                }
-                                Err(error) => {
-                                    let message = protocol::sanitize_diagnostic(&error.to_string());
-                                    let _ = emit(&steer_events, AgentEvent::Error { message }).await;
-                                }
-                            }
-                        });
+                        if workers.as_ref().is_some_and(|bridge| bridge.has_pending()) {
+                            queued_steers.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerMessage { prompt, message_id });
+                        } else {
+                            dispatch_steer(
+                                process.clone(),
+                                event_tx.clone(),
+                                prompt,
+                                message_id,
+                                steer_acked_tx.clone(),
+                            );
+                        }
                     }
                     None => steering_open = false,
                 }
+            }
+            Some((prompt, message_id)) = steer_acked_rx.recv() => {
+                unconsumed_steers.push_back((prompt, message_id));
             }
             frame = events.recv() => {
                 let Some(frame) = frame else {
@@ -907,6 +957,21 @@ async fn run_session(
                     }).await;
                     break;
                 };
+                if let Some(text) = user_steering_text(&frame)
+                    && unconsumed_steers
+                        .front()
+                        .is_some_and(|(prompt, _)| prompt == &text)
+                {
+                    let (_, message_id) = unconsumed_steers.pop_front().expect("front checked");
+                    let _ = emit(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: message_id,
+                            next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
+                        },
+                    )
+                    .await;
+                }
                 match frame.get("type").and_then(Value::as_str) {
                     Some("host_tool_call") => {
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -917,6 +982,10 @@ async fn run_session(
                                 Ok(result) => {
                                     let tool_process = process.clone();
                                     let tool_events = event_tx.clone();
+                                    let queued = std::sync::Arc::clone(&queued_steers);
+                                    let acked = steer_acked_tx.clone();
+                                    let steer_process = process.clone();
+                                    let steer_events = event_tx.clone();
                                     tokio::spawn(async move {
                                         if let Ok(result) = result.await {
                                             let id = result
@@ -925,7 +994,9 @@ async fn run_session(
                                                 .unwrap_or_default()
                                                 .to_owned();
                                             if let Err(error) = tool_process.send_control(result) {
-                                                let message = protocol::sanitize_diagnostic(&error.to_string());
+                                                let message = protocol::sanitize_diagnostic(
+                                                    &error.to_string(),
+                                                );
                                                 let fallback = json!({
                                                     "type": "host_tool_result",
                                                     "id": id,
@@ -939,6 +1010,20 @@ async fn run_session(
                                                     let _ = emit(&tool_events, AgentEvent::Error { message }).await;
                                                 }
                                             }
+                                        }
+                                        let pending = queued
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .drain(..)
+                                            .collect::<Vec<_>>();
+                                        for SteerMessage { prompt, message_id } in pending {
+                                            dispatch_steer(
+                                                steer_process.clone(),
+                                                steer_events.clone(),
+                                                prompt,
+                                                message_id,
+                                                acked.clone(),
+                                            );
                                         }
                                     });
                                 }

@@ -4,7 +4,8 @@ use std::fs;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
-    WorkersSession, WorkersSessionCapabilities, controller_mcp_archive_guard,
+    WorkerCompletionEvidence, WorkersSession, WorkersSessionCapabilities,
+    begin_worker_parent_task_at, controller_mcp_archive_guard,
     controller_mcp_briefing_stability_key, controller_mcp_choose_semantic_output,
     controller_mcp_clean_output, controller_mcp_consume_authority_marker,
     controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_is_booting_screen,
@@ -12,8 +13,9 @@ use zeron_workers_unpeel::{
     controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
     controller_mcp_replacement_session_id, controller_mcp_sanitize_text,
     controller_mcp_startup_prompt_response, controller_mcp_take_parent_chat_id,
-    controller_mcp_tracks_task_episode, ensure_controller_mcp_host_launcher, is_session_host_mode,
-    register_worker_parent_at, worker_parent_links_at,
+    controller_mcp_tracks_task_episode, current_episode_completed_with_evidence_at,
+    ensure_controller_mcp_host_launcher, is_session_host_mode, register_worker_parent_at,
+    worker_parent_links_at,
 };
 
 #[test]
@@ -916,4 +918,96 @@ fn workers_wait_for_status_ceiling_is_orchestrator_owned_and_documented() {
         sentence_count <= 2,
         "timeout_seconds description must be concise and at most 2 sentences, got {sentence_count}: {desc}"
     );
+}
+
+fn write_stop_hook(root: &std::path::Path, session_id: &str, generation: u64) {
+    let dir = root.join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("comet-hook-events.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "sequence": 1,
+                "hook_event_name": "Stop",
+                "runtime_generation": generation,
+                "occurred_at_unix_ms": 1_000
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn wait_for_completed_matches_live_idle_worker_with_current_episode_evidence() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app-state.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    let sessions_root = dir.path().join("sessions");
+    write_stop_hook(&sessions_root, "worker-1", 1);
+
+    let cancel = AtomicBool::new(false);
+    let polls = AtomicU32::new(0);
+    let started = Instant::now();
+    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        1800,
+        "completed",
+        &cancel,
+        || {
+            let n = polls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                n < 3,
+                "completed wait polled {n} times instead of matching current-episode evidence on a live idle Worker"
+            );
+            Ok(worker_with_state("running"))
+        },
+        |session| {
+            current_episode_completed_with_evidence_at(
+                &path,
+                session,
+                &sessions_root,
+                WorkerCompletionEvidence::quiescent(),
+            )
+            .unwrap_or(false)
+        },
+    )
+    .expect("completed should match");
+    assert_eq!(result["matched"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "wait must not consume the 1800s timeout"
+    );
+}
+
+#[test]
+fn wait_for_completed_does_not_treat_idle_as_done() {
+    use std::sync::atomic::AtomicBool;
+
+    let cancel = AtomicBool::new(false);
+    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        1,
+        "completed",
+        &cancel,
+        || Ok(worker_with_state("running")),
+        |_| false,
+    )
+    .expect("timeout is a normal read");
+    assert_eq!(result["timed_out"], true);
+    assert_eq!(result["matched"], false);
 }
