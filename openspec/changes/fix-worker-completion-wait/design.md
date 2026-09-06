@@ -6,10 +6,10 @@
 
 ## Decisions
 
-- **D-01 — Reuse parent-notification evidence.** `wait_for_status(completed)` consults the same Stop/`done`+unread + `WorkerCompletionEvidence` + generation/task-episode path (and the `acknowledged_completed_episode` latch so completion stays visible after ACK). No second detector. Idle without that evidence is not completed.
+- **D-01 — Reuse parent-notification evidence.** `wait_for_status(completed)` consults Stop/`done`+unread + `WorkerCompletionEvidence` + generation/task-episode. The `acknowledged_completed_episode` latch keeps a valid completion visible after ACK but does not satisfy blocked, a newer generation, growing output, or episode N-1. Idle without that evidence is not completed.
 - **D-02 — Injectable match seam.** `wait_until` stays host-free. A `wait_until_matching` extra predicate is how tests inject episode completion without a worker host; production `wait_for_status` passes `current_episode_completed`.
-- **D-03 — Do not send steer while a host tool is in flight.** Sending `type=steer` to OMP during `wait_for_status` is what cancelled/failed the tool. Queue the `SteerMessage` until the host `toolResult` or cancel error has been written to OMP.
-- **D-04 — Steered is user-message lifecycle, not ACK and not the next frame.** Installed OMP (`session.steer` → `#queueUserMessage`) ACKs when the user message is queued, not when it is consumed. Consumption is the runtime `message_start` for that user message (`role=user`, `steering=true`, text matching the sent prompt). A leftover frame from the previous task may already be queued after ACK (`agent_start`/`agent_end`/`tool_result`/isolated text do not correlate). Keep those frames in the previous segment. Do not emit on request ACK, on pending-host-tool count hitting zero, or on the first frame after ACK.
+- **D-03 — Harness loop owns pending delivery and the steer queue.** Register delivering when `begin_call` is accepted. Tasks only forward the MCP outcome; the loop writes `toolResult`/fallback, then drops delivering, then drains steers if none remain. Do not use sidecar `has_pending` (it clears before delivery) and do not drain from the task.
+- **D-04 — Steered is user-message lifecycle, not ACK.** Register the sent intent synchronously before dispatch. Consume on matching `message_start` (`role=user`, `steering=true`) by prompt, not `front()`. ACK does not mint a frontier and is not required before consumption. Leftover previous-task frames stay in the previous segment. Send failure removes that intent.
 - **D-05 — Engine unchanged.** `sessions.rs` already treats `Steered` as a real frontier. The harness must not emit it early.
 - **D-06 — Ceiling stays 4h.** Do not mask the bug by shortening the wait.
 

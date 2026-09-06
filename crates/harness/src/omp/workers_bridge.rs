@@ -176,10 +176,6 @@ impl WorkersBridge {
         &self.definition
     }
 
-    pub fn has_pending(&self) -> bool {
-        !lock(&self.pending).is_empty()
-    }
-
     pub async fn handle_call(&self, id: &str, tool_name: &str, arguments: Value) -> Value {
         match self.begin_call(id, tool_name, arguments) {
             Ok(receiver) => receiver

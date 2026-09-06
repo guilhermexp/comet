@@ -14,7 +14,7 @@ Test: `wait_for_completed_matches_live_idle_worker_with_current_episode_evidence
 
 #### Scenario: Idle without completion evidence does not match
 
-Test: `wait_for_completed_does_not_treat_idle_as_done`
+Test: `current_episode_completed_rejects_idle_without_evidence`
 
 - **GIVEN** a live Worker with `activity=idle` and no current-episode completion evidence
 - **WHEN** `wait_for_status` is called with `status=completed`
@@ -38,15 +38,15 @@ Test: `current_episode_completed_rejects_blocked_even_with_stop`
 
 ### Requirement: OMP steer frontier follows runtime consumption not transport ACK
 
-While an OMP host tool call is pending, the harness SHALL NOT send `type=steer` to the child. The host `toolResult` or cancel error SHALL be delivered first. `AgentEvent::Steered` SHALL be emitted only when the OMP runtime consumes the sent steer as a user message (`message_start` with `role=user` and `steering=true` whose text matches the sent prompt). Transport ACK of `request(type=steer)` SHALL NOT mint a frontier. The first frame after ACK SHALL NOT mint a frontier: leftover frames from the previous task may already be queued, and `agent_start`, `agent_end`, `tool_result`, or isolated later text do not correlate to the steer. Those frames SHALL stay in the previous segment. Pending host-tool count reaching zero SHALL NOT by itself mint a frontier. The steer prompt SHALL be processed exactly once. Cancel of the host tool SHALL still return a result and then allow the queued steer to be consumed.
+While an OMP host tool call is pending delivery of its `toolResult` to the child, the harness SHALL NOT send `type=steer`. Pending lasts until the harness loop has written the result or cancel fallback, not until the sidecar MCP call returns. Two concurrent host tools SHALL keep the fence until both are delivered; finishing one SHALL NOT drain steers. `AgentEvent::Steered` SHALL be emitted only on the user `message_start` (`role=user`, `steering=true`) whose text matches a steer already registered before the RPC dispatch. Transport ACK SHALL NOT mint a frontier and SHALL NOT be required before consumption. A leftover previous-task frame SHALL stay in the previous segment. The fixture SHALL fail if `type=steer` arrives before every pending `host_tool_result`. The steer prompt SHALL be processed exactly once, including after host-tool cancel.
 
 #### Scenario: Steer ACK during a pending host wait does not close the turn
 
 Test: `steer_during_pending_host_tool_is_consumed_once_after_tool_result`
 
-- **GIVEN** an OMP run with a pending `workers` host tool call
-- **WHEN** a steer arrives before the host tool returns
-- **THEN** the host `toolResult` is delivered to OMP before `type=steer` is sent
-- **AND** a leftover previous-task frame emitted after the steer ACK does not emit `AgentEvent::Steered`
-- **AND** `AgentEvent::Steered` is emitted once, only on the user `message_start` that matches the sent steer
+- **GIVEN** an OMP run with two pending `workers` host tool calls, one of which finishes first
+- **WHEN** a steer arrives after a pending-tools barrier and before both `toolResult`s are written
+- **THEN** the fixture sees no `type=steer` until every `host_tool_result` is delivered
+- **AND** a leftover previous-task frame emitted before the steer ACK does not emit `AgentEvent::Steered`
+- **AND** `message_start` for the steered user message before the transport ACK emits `AgentEvent::Steered` once
 - **AND** the steer prompt is processed exactly once after that consumption

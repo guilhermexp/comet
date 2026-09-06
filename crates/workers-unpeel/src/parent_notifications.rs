@@ -657,7 +657,19 @@ fn episode_completed_from_state(
         return Ok(false);
     }
     if binding.acknowledged_completed_episode == Some(binding.active_task_episode) {
-        return Ok(true);
+        if session.activity == "blocked" || !evidence.permits_completion() {
+            return Ok(false);
+        }
+        let journal_events = hook_events(binding, session, worker_session_dir)?;
+        return Ok(match journal_events {
+            None => true,
+            Some((events, _)) => {
+                events
+                    .iter()
+                    .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed)
+                    || lifecycle_kind(session) == Some(WorkerParentNotificationKind::Completed)
+            }
+        });
     }
     let submission_recovered =
         submitted_task_episode(worker_session_dir) == Some(binding.active_task_episode);

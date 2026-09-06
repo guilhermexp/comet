@@ -837,18 +837,16 @@ fn dispatch_steer(
     process: OmpProcess,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     prompt: String,
-    message_id: Option<String>,
-    acked: mpsc::UnboundedSender<(String, Option<String>)>,
+    failed: mpsc::UnboundedSender<String>,
 ) {
     tokio::spawn(async move {
         match process
             .request(json!({ "type": "steer", "message": prompt }))
             .await
         {
-            Ok(_) => {
-                let _ = acked.send((prompt, message_id));
-            }
+            Ok(_) => {}
             Err(error) => {
+                let _ = failed.send(prompt);
                 let message = protocol::sanitize_diagnostic(&error.to_string());
                 let _ = emit(&event_tx, AgentEvent::Error { message }).await;
             }
@@ -881,10 +879,11 @@ async fn run_session(
     let mut pending_agent_end: Option<Value> = None;
     let mut steering_open = true;
     let mut finished = false;
-    let queued_steers = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<SteerMessage>::new()));
-    let mut unconsumed_steers: VecDeque<(String, Option<String>)> = VecDeque::new();
-    let (steer_acked_tx, mut steer_acked_rx) =
-        mpsc::unbounded_channel::<(String, Option<String>)>();
+    let mut queued_steers: VecDeque<SteerMessage> = VecDeque::new();
+    let mut in_flight_steers: Vec<(String, Option<String>)> = Vec::new();
+    let mut delivering: HashSet<String> = HashSet::new();
+    let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
+    let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
 
     while !finished {
         tokio::select! {
@@ -927,23 +926,65 @@ async fn run_session(
             steer = steering.recv(), if steering_open => {
                 match steer {
                     Some(SteerMessage { prompt, message_id }) => {
-                        if workers.as_ref().is_some_and(|bridge| bridge.has_pending()) {
-                            queued_steers.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerMessage { prompt, message_id });
-                        } else {
+                        if delivering.is_empty() {
+                            in_flight_steers.push((prompt.clone(), message_id));
                             dispatch_steer(
                                 process.clone(),
                                 event_tx.clone(),
                                 prompt,
-                                message_id,
-                                steer_acked_tx.clone(),
+                                steer_failed_tx.clone(),
                             );
+                        } else {
+                            queued_steers.push_back(SteerMessage { prompt, message_id });
                         }
                     }
                     None => steering_open = false,
                 }
             }
-            Some((prompt, message_id)) = steer_acked_rx.recv() => {
-                unconsumed_steers.push_back((prompt, message_id));
+            Some(failed_prompt) = steer_failed_rx.recv() => {
+                if let Some(index) = in_flight_steers
+                    .iter()
+                    .position(|(prompt, _)| prompt == &failed_prompt)
+                {
+                    in_flight_steers.remove(index);
+                }
+            }
+            Some((tool_id, outcome)) = tool_rx.recv() => {
+                let result = outcome.unwrap_or_else(|| {
+                    json!({
+                        "type": "host_tool_result",
+                        "id": tool_id,
+                        "result": { "content": [{ "type": "text", "text": "OMP host tool was cancelled" }] },
+                        "isError": true
+                    })
+                });
+                if let Err(error) = process.send_control(result) {
+                    let message = protocol::sanitize_diagnostic(&error.to_string());
+                    let fallback = json!({
+                        "type": "host_tool_result",
+                        "id": tool_id,
+                        "result": { "content": [{
+                            "type": "text",
+                            "text": "Workers result exceeded the OMP RPC frame budget"
+                        }] },
+                        "isError": true
+                    });
+                    if process.send_control(fallback).is_err() {
+                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                    }
+                }
+                delivering.remove(&tool_id);
+                if delivering.is_empty() {
+                    while let Some(SteerMessage { prompt, message_id }) = queued_steers.pop_front() {
+                        in_flight_steers.push((prompt.clone(), message_id));
+                        dispatch_steer(
+                            process.clone(),
+                            event_tx.clone(),
+                            prompt,
+                            steer_failed_tx.clone(),
+                        );
+                    }
+                }
             }
             frame = events.recv() => {
                 let Some(frame) = frame else {
@@ -958,11 +999,11 @@ async fn run_session(
                     break;
                 };
                 if let Some(text) = user_steering_text(&frame)
-                    && unconsumed_steers
-                        .front()
-                        .is_some_and(|(prompt, _)| prompt == &text)
+                    && let Some(index) = in_flight_steers
+                        .iter()
+                        .position(|(prompt, _)| prompt == &text)
                 {
-                    let (_, message_id) = unconsumed_steers.pop_front().expect("front checked");
+                    let (_, message_id) = in_flight_steers.remove(index);
                     let _ = emit(
                         &event_tx,
                         AgentEvent::Steered {
@@ -979,52 +1020,13 @@ async fn run_session(
                         let arguments = frame.get("arguments").cloned().unwrap_or(Value::Null);
                         match &workers {
                             Some(workers) => match workers.begin_call(id, tool, arguments) {
-                                Ok(result) => {
-                                    let tool_process = process.clone();
-                                    let tool_events = event_tx.clone();
-                                    let queued = std::sync::Arc::clone(&queued_steers);
-                                    let acked = steer_acked_tx.clone();
-                                    let steer_process = process.clone();
-                                    let steer_events = event_tx.clone();
+                                Ok(receiver) => {
+                                    delivering.insert(id.to_owned());
+                                    let tool_id = id.to_owned();
+                                    let tool_tx = tool_tx.clone();
                                     tokio::spawn(async move {
-                                        if let Ok(result) = result.await {
-                                            let id = result
-                                                .get("id")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or_default()
-                                                .to_owned();
-                                            if let Err(error) = tool_process.send_control(result) {
-                                                let message = protocol::sanitize_diagnostic(
-                                                    &error.to_string(),
-                                                );
-                                                let fallback = json!({
-                                                    "type": "host_tool_result",
-                                                    "id": id,
-                                                    "result": { "content": [{
-                                                        "type": "text",
-                                                        "text": "Workers result exceeded the OMP RPC frame budget"
-                                                    }] },
-                                                    "isError": true
-                                                });
-                                                if tool_process.send_control(fallback).is_err() {
-                                                    let _ = emit(&tool_events, AgentEvent::Error { message }).await;
-                                                }
-                                            }
-                                        }
-                                        let pending = queued
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .drain(..)
-                                            .collect::<Vec<_>>();
-                                        for SteerMessage { prompt, message_id } in pending {
-                                            dispatch_steer(
-                                                steer_process.clone(),
-                                                steer_events.clone(),
-                                                prompt,
-                                                message_id,
-                                                acked.clone(),
-                                            );
-                                        }
+                                        let outcome = receiver.await.ok();
+                                        let _ = tool_tx.send((tool_id, outcome));
                                     });
                                 }
                                 Err(result) => {

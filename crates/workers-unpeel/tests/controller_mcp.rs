@@ -994,20 +994,3 @@ fn wait_for_completed_matches_live_idle_worker_with_current_episode_evidence() {
         "wait must not consume the 1800s timeout"
     );
 }
-
-#[test]
-fn wait_for_completed_does_not_treat_idle_as_done() {
-    use std::sync::atomic::AtomicBool;
-
-    let cancel = AtomicBool::new(false);
-    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
-        1,
-        "completed",
-        &cancel,
-        || Ok(worker_with_state("running")),
-        |_| false,
-    )
-    .expect("timeout is a normal read");
-    assert_eq!(result["timed_out"], true);
-    assert_eq!(result["matched"], false);
-}

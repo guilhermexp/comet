@@ -743,3 +743,98 @@ fn current_episode_completed_rejects_idle_without_evidence() {
         .unwrap()
     );
 }
+
+fn ack_completed_idle(path: &std::path::Path, sessions_root: &std::path::Path) {
+    let live_idle = session("worker-1", 7, "idle", "running");
+    let completed = pending_worker_parent_notifications_with_evidence_at(
+        path,
+        &[live_idle],
+        sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(path, &completed).unwrap();
+}
+
+#[test]
+fn current_episode_completed_ack_does_not_satisfy_blocked() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "blocked", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "ACK latch must not complete a blocked Worker"
+    );
+}
+
+#[test]
+fn current_episode_completed_ack_does_not_satisfy_new_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 8, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "ACK latch must not complete a newer runtime generation"
+    );
+}
+
+#[test]
+fn current_episode_completed_ack_does_not_satisfy_growing_output() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence {
+                output_quiescent: false,
+            },
+        )
+        .unwrap(),
+        "ACK latch must not complete while output is still growing"
+    );
+}
+
+#[test]
+fn current_episode_completed_ignores_prior_episode_on_same_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook_for_episode(&sessions_root, "worker-1", "Stop", 7, 1, 1_000);
+    begin_worker_parent_task_at(&path, "worker-1", 1_100).unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "Stop for episode N-1 must not complete episode N on the same generation"
+    );
+}

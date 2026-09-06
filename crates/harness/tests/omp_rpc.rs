@@ -1365,22 +1365,46 @@ async fn oversized_workers_result_returns_a_bounded_error_to_omp() {
 
 #[tokio::test]
 async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
+    let hold_path = std::env::temp_dir().join(format!("zeron-c2-hold-{}", std::process::id()));
+    let _ = std::fs::remove_file(&hold_path);
+    unsafe { std::env::set_var("FAKE_WORKERS_HOLD", &hold_path) };
+
     let harness = fake_harness("workers-wait-steer");
     let (controls, steer, _interrupt) = controls_with_answer("Yes");
     let mut run_request = request("workers");
     run_request.enable_workers_mcp = true;
     run_request.workers_parent_chat_id = Some("chat-1".into());
     let mut stream = harness.run(run_request, controls).await.unwrap();
-    steer
-        .send(SteerMessage {
-            prompt: "steer-now".into(),
-            message_id: Some("m-steer".into()),
-        })
-        .await
-        .unwrap();
-    let events = tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
-        .await
-        .expect("pending host tool plus steer must complete");
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("tools-pending barrier")
+            .expect("stream")
+            .unwrap();
+        let pending = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "tools-pending"
+        );
+        events.push(event);
+        if pending {
+            steer
+                .send(SteerMessage {
+                    prompt: "steer-now".into(),
+                    message_id: Some("m-steer".into()),
+                })
+                .await
+                .unwrap();
+            std::fs::write(&hold_path, b"go").unwrap();
+            break;
+        }
+    }
+    events.extend(
+        tokio::time::timeout(Duration::from_secs(8), collect_until_done(&mut stream))
+            .await
+            .expect("pending host tools plus steer must complete"),
+    );
+    let _ = std::fs::remove_file(&hold_path);
 
     let before = events.iter().position(
         |event| matches!(event, AgentEvent::TextDelta { text } if text == "before-steer-tail"),
@@ -1391,12 +1415,12 @@ async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
     let after = events
         .iter()
         .position(|event| matches!(event, AgentEvent::TextDelta { text } if text == "after wait"));
-    let before = before.expect("previous-task tail after ACK must stay visible");
+    let before = before.expect("previous-task tail before ACK must stay visible");
     let steered = steered.expect("steer consumption must emit Steered once");
     let after = after.expect("consumed steer must continue the run");
     assert!(
         before < steered,
-        "leftover previous-task frame after ACK must not open a new frontier: {events:?}"
+        "leftover previous-task frame must not open a new frontier: {events:?}"
     );
     assert!(
         steered < after,
