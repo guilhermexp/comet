@@ -292,10 +292,14 @@ pub enum AccentPreset {
     Cyan,
     Blue,
     Pink,
+    /// Neutral accent for palettes whose identity is achromatic: it keeps
+    /// controls and selections legible without tinting the chrome. Both tones
+    /// are pure greys, so the swatch matches what the UI paints.
+    Gray,
 }
 
 impl AccentPreset {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Zeron,
         Self::Orange,
         Self::Amber,
@@ -303,6 +307,7 @@ impl AccentPreset {
         Self::Cyan,
         Self::Blue,
         Self::Pink,
+        Self::Gray,
     ];
 
     pub fn label(self) -> &'static str {
@@ -314,6 +319,7 @@ impl AccentPreset {
             Self::Cyan => "Cyan",
             Self::Blue => "Blue",
             Self::Pink => "Pink",
+            Self::Gray => "Gray",
         }
     }
 
@@ -326,6 +332,7 @@ impl AccentPreset {
             Self::Cyan => ("#22d3ee", "#0e7490"),
             Self::Blue => ("#60a5fa", "#2563eb"),
             Self::Pink => ("#f472b6", "#be185d"),
+            Self::Gray => ("#a3a3a3", "#525252"),
         };
         if appearance.is_dark() { dark } else { light }
             .parse()

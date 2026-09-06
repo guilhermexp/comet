@@ -1844,7 +1844,7 @@ mod tests {
         );
         assert_eq!(
             registry.variants_for(zeron_theme::Appearance::Dark).count(),
-            20
+            21
         );
     }
 
