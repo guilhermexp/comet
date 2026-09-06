@@ -59,6 +59,7 @@ use zeron_proto::{
 };
 
 use crate::antigravity_usage::AntigravityUsage;
+use crate::grok_usage::GrokUsage;
 use crate::kimi_usage::KimiUsage;
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
@@ -272,6 +273,12 @@ struct Inner {
     kimi_setup_warning: Option<String>,
     antigravity_usage: Option<AntigravityUsage>,
     antigravity_setup_warning: Option<String>,
+    grok_usage: Option<GrokUsage>,
+    grok_setup_warning: Option<String>,
+    /// `"{harness}:{accountKey}"` → last successfully probed windows. A failed
+    /// or skipped forced probe serves these instead of rendering the failure
+    /// as empty usage.
+    last_good_usage: Mutex<HashMap<String, UsageSnapshot>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -301,18 +308,28 @@ impl AgentAccounts {
         } else {
             (None, None)
         };
+        let (grok_usage, grok_setup_warning) = if config.uses_detected_paths() {
+            match GrokUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
         Self::new_inner(
             config,
             kimi_usage,
             kimi_setup_warning,
             antigravity_usage,
             antigravity_setup_warning,
+            grok_usage,
+            grok_setup_warning,
         )
     }
 
     #[cfg(test)]
     fn new_with_kimi_usage(config: AgentAccountsConfig, kimi_usage: KimiUsage) -> Self {
-        Self::new_inner(config, Some(kimi_usage), None, None, None)
+        Self::new_inner(config, Some(kimi_usage), None, None, None, None, None)
     }
 
     #[cfg(test)]
@@ -320,7 +337,20 @@ impl AgentAccounts {
         config: AgentAccountsConfig,
         antigravity_usage: AntigravityUsage,
     ) -> Self {
-        Self::new_inner(config, None, None, Some(antigravity_usage), None)
+        Self::new_inner(
+            config,
+            None,
+            None,
+            Some(antigravity_usage),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_grok_usage(config: AgentAccountsConfig, grok_usage: GrokUsage) -> Self {
+        Self::new_inner(config, None, None, None, None, Some(grok_usage), None)
     }
 
     fn new_inner(
@@ -329,6 +359,8 @@ impl AgentAccounts {
         kimi_setup_warning: Option<String>,
         antigravity_usage: Option<AntigravityUsage>,
         antigravity_setup_warning: Option<String>,
+        grok_usage: Option<GrokUsage>,
+        grok_setup_warning: Option<String>,
     ) -> Self {
         // Startup sweep: a previous process that crashed mid-login leaves
         // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
@@ -357,6 +389,9 @@ impl AgentAccounts {
                 kimi_setup_warning,
                 antigravity_usage,
                 antigravity_setup_warning,
+                grok_usage,
+                grok_setup_warning,
+                last_good_usage: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -384,6 +419,16 @@ impl AgentAccounts {
                     .cloned()
                     .map(|message| AgentAccountWarning {
                         harness: HarnessId::Antigravity,
+                        message,
+                    }),
+            )
+            .chain(
+                self.inner
+                    .grok_setup_warning
+                    .iter()
+                    .cloned()
+                    .map(|message| AgentAccountWarning {
+                        harness: HarnessId::Grok,
                         message,
                     }),
             )
@@ -421,8 +466,14 @@ impl AgentAccounts {
                 None => Vec::new(),
             }
         };
-        let (local_usage, (claude, claude_warning), kimi, antigravity) =
-            tokio::join!(local_usage, self.detect_claude(), kimi, antigravity);
+        let grok = async {
+            match &self.inner.grok_usage {
+                Some(usage) => Some(usage.snapshot(force_usage, Utc::now()).await),
+                None => None,
+            }
+        };
+        let (local_usage, (claude, claude_warning), kimi, antigravity, grok) =
+            tokio::join!(local_usage, self.detect_claude(), kimi, antigravity, grok);
         if let Some(message) = claude_warning {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::ClaudeCode,
@@ -539,8 +590,21 @@ impl AgentAccounts {
             });
         }
         accounts.extend(cursor_accounts);
-        if let Some(grok) = self.detect_grok_login() {
-            accounts.push(grok);
+        if let Some(usage) = grok {
+            if let Some(message) = &usage.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Grok,
+                    message: message.clone(),
+                });
+            }
+            if usage.present
+                && let Some(mut account) = self.detect_grok_login()
+            {
+                account.usage_windows = usage.usage_windows;
+                accounts.push(account);
+            }
+        } else if let Some(account) = self.detect_grok_login() {
+            accounts.push(account);
         }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
@@ -1429,6 +1493,15 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot).await,
             _ => None,
+        };
+        // Last-known-good: a transient probe failure must not erase rendered
+        // quota. Successes refresh the store; failures serve it.
+        let usage = match usage {
+            Some(usage) => {
+                lock(&self.inner.last_good_usage).insert(key.clone(), usage.clone());
+                Some(usage)
+            }
+            None => lock(&self.inner.last_good_usage).get(&key).cloned(),
         };
         lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
         usage
@@ -2480,6 +2553,137 @@ mod tests {
         assert_eq!(windows(&cached), Some(1));
     }
 
+    #[tokio::test]
+    async fn grok_account_carries_windows_from_usage_and_no_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+        };
+        let credential = config.grok_auth_file();
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credential,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "https://auth.x.ai::test-client": {
+                    "key": "test-key-private",
+                    "refresh_token": "test-refresh-private",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "oidc_client_id": "test-client",
+                    "oidc_issuer": "https://auth.x.ai",
+                    "email": "user@example.com",
+                    "first_name": "Test",
+                    "last_name": "User"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = "{\"config\":{\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"start\":\"2026-09-05T17:00:00Z\",\"end\":\"2026-09-12T17:00:00Z\"},\"creditUsagePercent\":50.0}}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let grok = crate::grok_usage::GrokUsage::from_paths(
+            credential,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+            Duration::from_secs(1),
+            [Duration::ZERO, Duration::ZERO],
+            [Duration::ZERO; 5],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_grok_usage(config, grok);
+
+        let snapshot = accounts.list(true).await.unwrap();
+        server.await.unwrap();
+
+        let grok_account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Grok)
+            .expect("Grok account present");
+        assert_eq!(grok_account.usage_windows.len(), 1);
+        assert_eq!(grok_account.usage_windows[0].label, "Weekly");
+        assert_eq!(grok_account.email.as_deref(), Some("user@example.com"));
+
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("test-key-private"));
+        assert!(!wire.contains("test-refresh-private"));
+    }
+
+    #[tokio::test]
+    async fn last_good_usage_served_when_probe_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+        };
+        let accounts = AgentAccounts::new_inner(config, None, None, None, None, None, None);
+        let slot = Slot {
+            id: "codex-test".into(),
+            harness: HarnessId::Codex,
+            account_key: "acc-1".into(),
+            profile: SlotProfile {
+                email: "acc@example.com".into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({ "tokens": { "access_token": "token-1", "account_id": "aid" } }),
+            claude_config: None,
+            saved_at: 0,
+            created_at: None,
+        };
+        let key = format!("codex:{}", slot.account_key);
+
+        // Pre-populate last_good_usage directly to simulate a prior successful probe.
+        let prior_windows = vec![AgentUsageWindow {
+            label: "5h".into(),
+            used_fraction: 0.3,
+            resets_at: None,
+        }];
+        lock(&accounts.inner.last_good_usage).insert(
+            key.clone(),
+            UsageSnapshot {
+                windows: prior_windows.clone(),
+                plan_label: Some("ChatGPT Plus".into()),
+            },
+        );
+
+        // A forced probe that fails (hits the network or an invalid endpoint)
+        // falls back to the stored last-good snapshot.
+        let fallback = accounts
+            .usage_for(HarnessId::Codex, &slot, false, true)
+            .await;
+        let usage = fallback.expect("fallback serves prior good windows");
+        assert_eq!(usage.windows, prior_windows);
+        assert_eq!(usage.plan_label.as_deref(), Some("ChatGPT Plus"));
+    }
     #[test]
     fn plan_labels() {
         assert_eq!(

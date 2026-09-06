@@ -22,6 +22,7 @@ pub mod change_requests;
 pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
+pub(crate) mod grok_usage;
 pub mod instance_lock;
 pub(crate) mod kimi_usage;
 pub mod live_voice;
