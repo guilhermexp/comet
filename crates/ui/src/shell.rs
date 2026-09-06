@@ -1194,18 +1194,15 @@ fn export_outcome_with_worker_loss(
     }
 }
 
-fn export_toast(outcome: &ExportOutcome) -> crate::toast::Toast {
+fn export_toast(outcome: &ExportOutcome) -> Option<crate::toast::Toast> {
     match outcome {
-        ExportOutcome::Downloaded(file) => {
-            crate::toast::Toast::success(format!("Exported to Downloads: {file}"))
-        }
-        ExportOutcome::Copied => crate::toast::Toast::success("Chat copied to clipboard"),
-        ExportOutcome::Incomplete { delivered, reason } => {
-            crate::toast::Toast::error(format!("{delivered} — without the worker index: {reason}"))
-        }
-        ExportOutcome::Failed(reason) => {
-            crate::toast::Toast::error(format!("Export failed: {reason}"))
-        }
+        ExportOutcome::Downloaded(_) | ExportOutcome::Copied => None,
+        ExportOutcome::Incomplete { delivered, reason } => Some(crate::toast::Toast::error(
+            format!("{delivered} — without the worker index: {reason}"),
+        )),
+        ExportOutcome::Failed(reason) => Some(crate::toast::Toast::error(format!(
+            "Export failed: {reason}"
+        ))),
     }
 }
 
@@ -3494,10 +3491,6 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.push_toast(
-                crate::toast::Toast::success("Zeron conversation link copied"),
-                cx,
-            );
         } else {
             self.push_toast(
                 crate::toast::Toast::error("Conversation link is not ready yet"),
@@ -3518,10 +3511,6 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
-            self.push_toast(
-                crate::toast::Toast::success(format!("{} copied", link.label)),
-                cx,
-            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3537,10 +3526,6 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
-            self.push_toast(
-                crate::toast::Toast::success("Harness session ID copied"),
-                cx,
-            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3893,7 +3878,9 @@ impl Shell {
     }
 
     fn report_export(&mut self, outcome: ExportOutcome, cx: &mut Context<Self>) {
-        self.push_toast(export_toast(&outcome), cx);
+        if let Some(toast) = export_toast(&outcome) {
+            self.push_toast(toast, cx);
+        }
     }
 
     pub fn push_toast(&mut self, toast: crate::toast::Toast, cx: &mut Context<Self>) {
@@ -9988,20 +9975,16 @@ mod tests {
     /// file or the clipboard, failure names the reason. Nothing is silent.
     #[test]
     fn export_toast_states_the_outcome_and_its_tone() {
-        let downloaded = export_toast(&ExportOutcome::Downloaded(
-            "Fix_the_thing-a1b2c3d4.md".into(),
-        ));
-        assert_eq!(
-            downloaded.title.as_ref(),
-            "Exported to Downloads: Fix_the_thing-a1b2c3d4.md"
+        assert!(
+            export_toast(&ExportOutcome::Downloaded(
+                "Fix_the_thing-a1b2c3d4.md".into(),
+            ))
+            .is_none()
         );
-        assert_eq!(downloaded.kind, crate::toast::ToastKind::Success);
 
-        let copied = export_toast(&ExportOutcome::Copied);
-        assert_eq!(copied.title.as_ref(), "Chat copied to clipboard");
-        assert_eq!(copied.kind, crate::toast::ToastKind::Success);
+        assert!(export_toast(&ExportOutcome::Copied).is_none());
 
-        let failed = export_toast(&ExportOutcome::Failed("permission denied".into()));
+        let failed = export_toast(&ExportOutcome::Failed("permission denied".into())).unwrap();
         assert_eq!(failed.title.as_ref(), "Export failed: permission denied");
         assert_eq!(failed.kind, crate::toast::ToastKind::Error);
     }
@@ -10015,7 +9998,7 @@ mod tests {
             ExportOutcome::Downloaded("Fix_the_thing-a1b2c3d4.md".into()),
             Some("parse app-state.json: expected value".into()),
         );
-        let toast = export_toast(&incomplete);
+        let toast = export_toast(&incomplete).unwrap();
         assert_eq!(toast.kind, crate::toast::ToastKind::Error);
         assert!(toast.title.contains("Fix_the_thing-a1b2c3d4.md"));
         assert!(toast.title.contains("parse app-state.json"));
@@ -10023,7 +10006,8 @@ mod tests {
         let copied = export_toast(&export_outcome_with_worker_loss(
             ExportOutcome::Copied,
             Some("boom".into()),
-        ));
+        ))
+        .unwrap();
         assert_eq!(copied.kind, crate::toast::ToastKind::Error);
         // A healthy join leaves the outcome untouched.
         assert_eq!(
