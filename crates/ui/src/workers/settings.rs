@@ -402,9 +402,11 @@ pub fn detect_cli_default_model(cli_or_cmd: &str) -> (String, String) {
                         let trimmed = line.trim();
                         if let Some(rest) = trimmed.strip_prefix("default:") {
                             let raw_model = rest.trim();
-                            let clean_id = raw_model.split(':').next().unwrap_or(raw_model);
-                            let label = format_model_label(clean_id);
-                            return (clean_id.to_string(), label);
+                            if !raw_model.is_empty() {
+                                let clean_id = raw_model.split(':').next().unwrap_or(raw_model);
+                                let label = format_model_label(clean_id);
+                                return (clean_id.to_string(), label);
+                            }
                         }
                     }
                 }

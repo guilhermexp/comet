@@ -254,26 +254,34 @@ fn account_usage_row(
             }
         })
         .collect();
-    let weekly_window = windows
-        .iter()
-        .find(|window| window.label.to_lowercase().contains("week"));
-    let weekly_remaining_percent = weekly_window.map(|w| w.remaining_percent);
-    let weekly_summary = weekly_remaining_percent.map(|remaining| format!("Weekly {remaining}%"));
-    let weekly_reset_badge = account
-        .usage_windows
+    // Primary quota window: week-labeled when present, otherwise the first window.
+    // This allows non-weekly cycles (Cursor's billing-cycle Monthly) to render
+    // their own headline ("Monthly 37%") instead of blanking out as "—".
+    let primary_window = windows
         .iter()
         .find(|window| window.label.to_lowercase().contains("week"))
-        .and_then(|window| {
-            let remaining = ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u8;
-            reset_badge_text(window.resets_at, remaining, now)
-        });
+        .or_else(|| windows.first());
+    let primary_remaining_percent = primary_window.map(|w| w.remaining_percent);
+    let weekly_summary =
+        primary_window.map(|window| format!("{} {}%", window.label, window.remaining_percent));
+    let weekly_reset_badge = primary_window.and_then(|window| {
+        reset_badge_text(
+            account
+                .usage_windows
+                .iter()
+                .find(|w| w.label == window.label)
+                .and_then(|w| w.resets_at),
+            window.remaining_percent,
+            now,
+        )
+    });
     let state = if windows.is_empty() && account.usage_lines.is_empty() {
         ProviderUsageState::NoUsage
     } else {
         ProviderUsageState::Ready
     };
     let weekly_tone = if state == ProviderUsageState::Ready {
-        weekly_usage_tone(weekly_remaining_percent)
+        weekly_usage_tone(primary_remaining_percent)
     } else {
         UsageTone::Neutral
     };
@@ -363,6 +371,33 @@ mod tests {
             switchable: true,
             saved_at: None,
         }
+    }
+
+    #[test]
+    fn monthly_window_renders_its_own_headline_summary() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap();
+        let reset = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![account(
+                "cursor-active",
+                HarnessId::Cursor,
+                true,
+                vec![AgentUsageWindow {
+                    label: "Monthly".into(),
+                    used_fraction: 0.63,
+                    resets_at: Some(reset),
+                }],
+            )],
+            warnings: vec![],
+        };
+        let rows = usage_rows(&snapshot, now);
+        let cursor_row = rows
+            .iter()
+            .find(|row| row.harness == HarnessId::Cursor)
+            .expect("cursor row");
+        assert_eq!(cursor_row.weekly_summary.as_deref(), Some("Monthly 37%"));
+        assert_eq!(cursor_row.state, ProviderUsageState::Ready);
+        assert_eq!(cursor_row.weekly_tone, UsageTone::Warning);
     }
 
     #[test]

@@ -53,9 +53,9 @@ use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::projects::ProjectsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    self, CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
-    JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX,
-    SIDEBAR_MIN, SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, UiSettings, badge_combo,
+    self, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN, JUMP_SLOTS,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
+    SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, UiSettings, badge_combo,
     jump_hints_visible, platform_combo,
 };
 use crate::state::{
@@ -71,9 +71,6 @@ use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_in
 use crate::workers::session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
 use crate::workers::workspace::{WorkersContent, WorkersSidebar};
-use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
-#[cfg(target_os = "macos")]
-use crate::workers::workspace_open_menu::native as native_workspace_open_menu;
 
 mod spaces;
 mod tabs;
@@ -430,11 +427,33 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// Maximum requested width the right pane may occupy while retaining the
-/// conversation floor. The responsive multi-column allocator applies the
-/// final live constraint when Details is also open.
+/// Shared visible budget for the right columns. Drag constraints and passive
+/// window layout must reserve the same main-column floor and gutter.
 fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
-    (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
+    (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN - RESPONSIVE_COLUMN_GUTTER).max(0.0)
+}
+
+/// The utility divider has Details to its right; only its own width moves.
+fn right_pane_drag_width(viewport: f32, sidebar: f32, pointer_x: f32, details: f32) -> f32 {
+    let max = (right_pane_max_width(viewport, sidebar) - details).max(0.0);
+    (viewport - pointer_x - details).clamp(RIGHT_PANE_MIN.min(max), max)
+}
+
+fn details_sidebar_drag_width(
+    viewport: f32,
+    sidebar: f32,
+    pointer_x: f32,
+    right: f32,
+    expanded: bool,
+) -> f32 {
+    let max = if expanded {
+        // Takeover deliberately shares all remaining space with the utility.
+        right_pane_takeover_width(viewport, sidebar) - RIGHT_PANE_MIN
+    } else {
+        right_pane_max_width(viewport, sidebar) - right
+    }
+    .clamp(0.0, DETAILS_SIDEBAR_MAX);
+    (viewport - pointer_x).clamp(DETAILS_SIDEBAR_MIN.min(max), max)
 }
 
 /// Width available to a right-pane takeover. The conversation yields while
@@ -567,8 +586,7 @@ fn responsive_right_column_widths(
     let right = if right_open { requested_right } else { 0.0 };
     let details = if details_open { requested_details } else { 0.0 };
     let requested_total = right + details;
-    let budget =
-        (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN - RESPONSIVE_COLUMN_GUTTER).max(0.0);
+    let budget = right_pane_max_width(viewport, sidebar);
     if requested_total <= budget || requested_total <= f32::EPSILON {
         return (right, details);
     }
@@ -1240,8 +1258,7 @@ async fn fetch_transcript_once(
     Err("the chat stream closed before sending anything".into())
 }
 
-/// The Downloads directory of the current user, or `None` when `HOME` is unset
-/// (the same resolution `workspace_open_menu` uses for `~/Applications`).
+/// The Downloads directory of the current user, or `None` when `HOME` is unset.
 fn downloads_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads"))
 }
@@ -2674,9 +2691,24 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let viewport = f32::from(window.viewport_size().width);
-        let width = viewport - f32::from(event.event.position.x);
-        self.settings.details_sidebar_width = width.clamp(DETAILS_SIDEBAR_MIN, DETAILS_SIDEBAR_MAX);
+        let sidebar = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let right = self.eval_tween(self.right_tween, self.right_target(cx));
+        self.settings.details_sidebar_width = details_sidebar_drag_width(
+            viewport,
+            sidebar,
+            f32::from(event.event.position.x),
+            right,
+            self.right_pane_expanded,
+        );
+        // Rebase the neighbor onto what is actually painted, not its larger
+        // persisted preference from before responsive compression.
+        if right > 0.0 && !self.right_pane_expanded {
+            self.settings.right_pane_width = right;
+        }
         self.details_tween = None;
+        self.right_tween = None;
+        self.right_takeover_content_tween = None;
+        self.main_takeover_tween = None;
         self.schedule_save(cx);
         cx.notify();
     }
@@ -3427,16 +3459,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let viewport = f32::from(window.viewport_size().width);
-        let width = viewport - f32::from(event.event.position.x);
-        // No arbitrary percentage or pixel ceiling: persist the requested
-        // width, while the responsive target arbitrates the live main/details
-        // column budget.
-        let max = right_pane_max_width(viewport, self.sidebar_target());
-        self.settings.right_pane_width = if max >= RIGHT_PANE_MIN {
-            width.clamp(RIGHT_PANE_MIN, max)
-        } else {
-            max
-        };
+        let sidebar = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let details = self.eval_tween(self.details_tween, self.details_target(cx));
+        self.settings.right_pane_width = right_pane_drag_width(
+            viewport,
+            sidebar,
+            f32::from(event.event.position.x),
+            details,
+        );
+        if details > 0.0 {
+            self.settings.details_sidebar_width = details;
+        }
+        self.details_tween = None;
         self.right_tween = None;
         self.right_takeover_content_tween = None;
         self.main_takeover_tween = None;
@@ -4841,20 +4875,8 @@ impl Shell {
             }
             let theme = Theme::of(cx).clone();
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            let (
-                workspace_path,
-                gallery_session_id,
-                gallery_pulsing,
-                show_session_gallery,
-                titlebar,
-            ) = {
+            let (gallery_session_id, gallery_pulsing, show_session_gallery, titlebar) = {
                 let model = self.workers_model.read(cx);
-                let workspace_path = model
-                    .launcher_project()
-                    .or_else(|| model.selected_project())
-                    .or_else(|| model.projects().iter().find(|project| !project.is_group))
-                    .or_else(|| model.projects().first())
-                    .map(|project| project.path.clone());
                 let project = model.selected_session().and_then(|session| {
                     model
                         .projects()
@@ -4879,7 +4901,6 @@ impl Shell {
                     model.gallery_pulse_session_id.as_ref() == Some(session_id)
                 });
                 (
-                    workspace_path,
                     gallery_session_id,
                     gallery_pulsing,
                     model.appearance_settings().show_session_gallery
@@ -4995,14 +5016,6 @@ impl Shell {
             } else {
                 10.0
             };
-            let workspace_action = workspace_path.map(|path| {
-                div()
-                    .absolute()
-                    .top(px(6.0))
-                    .right(px(action_right))
-                    .occlude()
-                    .child(self.render_workers_workspace_open_button(path, &theme, cx))
-            });
             let gallery_action =
                 gallery_session_id
                     .filter(|_| show_session_gallery)
@@ -5010,11 +5023,7 @@ impl Shell {
                         div()
                             .absolute()
                             .top(px(6.0))
-                            .right(px(if workspace_action.is_some() {
-                                action_right + 67.0
-                            } else {
-                                action_right
-                            }))
+                            .right(px(action_right))
                             .occlude()
                             .child(self.render_workers_session_gallery_button(
                                 session_id,
@@ -5031,8 +5040,7 @@ impl Shell {
             .right_pane
                 && !right_open)
                 .then(|| {
-                    let preceding = usize::from(workspace_action.is_some())
-                        + usize::from(gallery_action.is_some());
+                    let preceding = usize::from(gallery_action.is_some());
                     div()
                         .absolute()
                         .top(px(6.0))
@@ -5041,9 +5049,8 @@ impl Shell {
                         .child(self.render_workers_right_pane_button(&theme, cx))
                 });
             let details_action = (!details_open && self.details_context(cx).is_some()).then(|| {
-                let preceding = usize::from(workspace_action.is_some())
-                    + usize::from(gallery_action.is_some())
-                    + usize::from(panel_action.is_some());
+                let preceding =
+                    usize::from(gallery_action.is_some()) + usize::from(panel_action.is_some());
                 div()
                     .absolute()
                     .top(px(6.0))
@@ -5100,7 +5107,6 @@ impl Shell {
                 // Paint interactive chrome after the drag surface so its
                 // hitbox and pixels win inside the native titlebar.
                 .children(gallery_action)
-                .children(workspace_action)
                 .children(panel_action)
                 .children(details_action)
                 .children(panel_header);
@@ -5121,107 +5127,6 @@ impl Shell {
                     .into_any_element()
             }
         }
-    }
-
-    fn open_workers_workspace_menu(&mut self, path: String, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        {
-            let selection = native_workspace_open_menu::show_async();
-            cx.spawn(async move |this, cx| {
-                let Ok(Some(target)) = selection.await else {
-                    return;
-                };
-                this.update(cx, |this, cx| {
-                    this.workers_model.update(cx, |model, cx| {
-                        if target == WorkspaceOpenTarget::Finder {
-                            model.reveal_project(path, cx);
-                        } else {
-                            model.open_project_with_application(
-                                path,
-                                target
-                                    .bundle_ids()
-                                    .iter()
-                                    .map(|id| (*id).to_owned())
-                                    .collect(),
-                                target
-                                    .app_names()
-                                    .iter()
-                                    .map(|name| (*name).to_owned())
-                                    .collect(),
-                                cx,
-                            );
-                        }
-                    });
-                })
-                .ok();
-            })
-            .detach();
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (path, cx);
-        }
-    }
-
-    fn render_workers_workspace_open_button(
-        &mut self,
-        path: String,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let preferred_path = path.clone();
-        div()
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.text.opacity(0.08))
-            .bg(theme.surface_raised.opacity(0.92))
-            .overflow_hidden()
-            .child(
-                div()
-                    .id("workers-open-workspace-preferred")
-                    .w(px(32.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.workers_model.update(cx, |model, cx| {
-                            model.open_project_in_editor(preferred_path.clone(), cx)
-                        });
-                    }))
-                    .child(
-                        icon(icons::WORKER_OPEN_CODE)
-                            .size(px(18.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.text.opacity(0.10)))
-            .child(
-                div()
-                    .id("workers-open-workspace-menu")
-                    .w(px(25.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_workers_workspace_menu(path.clone(), cx)
-                    }))
-                    .child(
-                        icon(icons::ALT_ARROW_DOWN)
-                            .size(px(9.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn render_orchestrator_trajectory_button(
@@ -5258,10 +5163,9 @@ impl Shell {
             .h(px(26.0))
             .flex()
             .items_center()
+            // Flat like the neighboring titlebar icon buttons (no pill fill or
+            // border); the split segments keep their own rounded hover.
             .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.text.opacity(0.08))
-            .bg(theme.surface_raised.opacity(0.92))
             .overflow_hidden()
             .child(
                 div()
@@ -5376,10 +5280,9 @@ impl Shell {
             .h(px(28.0))
             .flex()
             .items_center()
+            // Flat like the neighboring titlebar icon buttons (no pill fill or
+            // border); the split segments keep their own rounded hover.
             .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.text.opacity(0.08))
-            .bg(theme.surface_raised.opacity(0.92))
             .overflow_hidden()
             .child(
                 div()
@@ -5643,9 +5546,11 @@ impl Shell {
             })
             .cursor_pointer()
             .when(selected, |el| {
-                el.bg(theme.bg)
+                // Translucent active plate (was opaque theme.bg): active over
+                // the glass without a solid black slab.
+                el.bg(theme.bg.opacity(0.6))
                     .border_1()
-                    .border_color(theme.border.opacity(0.7))
+                    .border_color(theme.border.opacity(0.5))
             })
             .hover(move |el| el.bg(hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -5686,7 +5591,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .rounded(px(SIDEBAR_MODE_SWITCHER_RADIUS))
-            .bg(theme.surface_raised.opacity(0.55))
+            .bg(theme.surface_raised.opacity(0.35))
             .child(orchestrator)
             .child(workers)
             .into_any_element()
@@ -8134,7 +8039,8 @@ impl Shell {
             RightSurface::Picker => gpui::Empty.into_any_element(),
         };
         // Flush panel (user request — the inset card is gone): full window
-        // height with a left hairline, glass-friendly for either utility
+        // height with matching hairlines toward the main column and Details,
+        // glass-friendly for either utility
         // (translucent over the frost; solid otherwise). The resize grabber
         // lives on the root seam, outside this clipped width container.
         let panel_bg = if theme.is_glass() {
@@ -8152,6 +8058,9 @@ impl Shell {
             // border there doubled up (user report).
             .when(!self.right_pane_expanded, |el| {
                 el.border_l_1().border_color(theme.border)
+            })
+            .when(self.details_target(cx) > 0.0, |el| {
+                el.border_r_1().border_color(theme.border)
             })
             .bg(panel_bg)
             .overflow_hidden()
@@ -10148,12 +10057,18 @@ mod tests {
 
     #[test]
     fn right_pane_ceiling_preserves_the_chat_floor() {
-        assert_eq!(right_pane_max_width(1200.0, 256.0), 644.0);
-        assert_eq!(1200.0 - 256.0 - 644.0, CHAT_PANEL_MIN);
+        assert_eq!(right_pane_max_width(1200.0, 256.0), 614.0);
+        assert_eq!(
+            1200.0 - 256.0 - 614.0,
+            RESPONSIVE_MAIN_PANE_MIN + RESPONSIVE_COLUMN_GUTTER
+        );
         // The chat floor wins over the right pane's preferred 360px minimum
         // when the whole window is unusually narrow.
-        assert_eq!(right_pane_max_width(800.0, 256.0), 244.0);
-        assert_eq!(800.0 - 256.0 - 244.0, CHAT_PANEL_MIN);
+        assert_eq!(right_pane_max_width(800.0, 256.0), 214.0);
+        assert_eq!(
+            800.0 - 256.0 - 214.0,
+            RESPONSIVE_MAIN_PANE_MIN + RESPONSIVE_COLUMN_GUTTER
+        );
     }
 
     #[test]
@@ -10922,6 +10837,57 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn pane_divider_drag_excludes_details_and_tracks_the_pointer() {
+        let viewport = 1800.0;
+        let sidebar = 260.0;
+        let (right, details) =
+            responsive_right_column_widths(viewport, sidebar, true, 520.0, true, 360.0);
+        let seam = viewport - right - details;
+        for delta in [-50.0, 0.0, 50.0] {
+            let width = right_pane_drag_width(viewport, sidebar, seam + delta, details);
+            let (painted_right, painted_details) =
+                responsive_right_column_widths(viewport, sidebar, true, width, true, details);
+            assert_eq!(painted_details, details);
+            assert_eq!(painted_right, right - delta);
+            assert_eq!(viewport - painted_right - painted_details, seam + delta);
+        }
+    }
+
+    #[test]
+    fn pane_divider_drag_reverses_immediately_at_compressed_limit() {
+        let viewport = 1300.0;
+        let sidebar = 260.0;
+        let (right, details) =
+            responsive_right_column_widths(viewport, sidebar, true, 900.0, true, 500.0);
+        let seam = viewport - right - details;
+        let pinned = right_pane_drag_width(viewport, sidebar, seam - 100.0, details);
+        assert!((pinned - right).abs() < 0.001);
+        let reversed = right_pane_drag_width(viewport, sidebar, seam + 10.0, details);
+        assert!((reversed - (right - 10.0)).abs() < 0.001);
+        let (painted_right, painted_details) =
+            responsive_right_column_widths(viewport, sidebar, true, reversed, true, details);
+        assert!((painted_right - reversed).abs() < 0.001);
+        assert!((painted_details - details).abs() < 0.001);
+    }
+
+    #[test]
+    fn pane_divider_drag_details_clamps_without_stealing_utility_width() {
+        let viewport = 1400.0;
+        let sidebar = 260.0;
+        let (right, details) =
+            responsive_right_column_widths(viewport, sidebar, true, 900.0, true, 500.0);
+        let seam = viewport - details;
+        let enlarged = details_sidebar_drag_width(viewport, sidebar, seam - 100.0, right, false);
+        assert!((enlarged - details).abs() < 0.001);
+        let smaller = details_sidebar_drag_width(viewport, sidebar, seam + 10.0, right, false);
+        assert!((smaller - (details - 10.0)).abs() < 0.001);
+        assert_eq!(
+            responsive_right_column_widths(viewport, sidebar, true, right, true, smaller),
+            (right, smaller)
+        );
     }
 
     #[test]

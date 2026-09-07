@@ -231,6 +231,14 @@ fn semantic_tool_icon(name: &str, input: Option<&Value>) -> ToolIconDescriptor {
             "javascript"
         });
     }
+    if lower == "hub" {
+        let op = value_string(input, &["op"]).to_ascii_lowercase();
+        return material(match op.as_str() {
+            "start" | "stop" | "restart" | "ps" | "logs" => "console",
+            "send" | "inbox" => "prompt",
+            _ => "settings",
+        });
+    }
     if lower.contains("grep") || lower.contains("search") {
         return material("search");
     }
@@ -410,6 +418,14 @@ mod tests {
             ToolCall::Unknown {
                 name: "browser_tool".into(),
                 input: None,
+            },
+            ToolCall::Unknown {
+                name: "hub".into(),
+                input: Some(json!({ "op": "start" })),
+            },
+            ToolCall::Unknown {
+                name: "hub".into(),
+                input: Some(json!({ "op": "send" })),
             },
         ];
         for call in calls {

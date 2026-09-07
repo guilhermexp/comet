@@ -156,6 +156,25 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
         };
     }
 
+    if normalized == "workers" {
+        return match input
+            .and_then(|value| value.get("action"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("wait_for_status") => ActivityBucket::Wait,
+            Some("send_text" | "send_keys") => ActivityBucket::Message,
+            Some("launch_worker" | "stop_worker" | "restart_worker" | "archive_worker") => {
+                ActivityBucket::Command
+            }
+            Some("read_output" | "read_transcript" | "inspect_worker" | "list_workers") => {
+                ActivityBucket::Read
+            }
+            _ => ActivityBucket::Tool,
+        };
+    }
+
     match normalized.as_str() {
         "agent" | "task" | "create_agent" | "spawn_agent" | "spawn_subagent" => {
             ActivityBucket::Agent
@@ -541,6 +560,36 @@ mod tests {
         assert_eq!(
             activity_breakdown(&parts),
             "3 commands, 1 wait, 1 message, 1 tool"
+        );
+    }
+
+    #[test]
+    fn activity_breakdown_classifies_each_workers_action() {
+        let parts = [
+            "launch_worker",
+            "wait_for_status",
+            "send_text",
+            "read_output",
+            "list_projects",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, action)| {
+            tool(
+                &format!("workers-{index}"),
+                ToolCall::Mcp {
+                    server: "comet-workers".into(),
+                    tool: "workers".into(),
+                    input: Some(serde_json::json!({ "action": action })),
+                },
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            activity_breakdown(&parts),
+            "1 read, 1 command, 1 wait, 1 message, 1 tool"
         );
     }
 

@@ -20,6 +20,7 @@ pub(crate) mod antigravity_usage;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
+pub(crate) mod cursor_usage;
 pub mod diff_sync;
 pub mod doc_host;
 pub(crate) mod grok_usage;
@@ -47,7 +48,7 @@ pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
+    CheckoutDiffSync, CheckoutPin, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
     read_diff_file_text, snapshot_tree, working_diff_base,
 };
@@ -251,6 +252,15 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        // Seed live statuses from the persisted workspace rows so a settled
+        // session's context-window usage survives an app restart: the merged
+        // WatchSessions lets the local live view win, and that map starts empty.
+        // Runs BEFORE recover_stale so its Idle transition keeps the seeded
+        // context_usage instead of inserting a fresh None entry.
+        match workspace.read_sessions() {
+            Ok(persisted) => sessions.hydrate_persisted_statuses(persisted),
+            Err(err) => tracing::warn!(error = %err, "session status hydration skipped"),
+        }
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),

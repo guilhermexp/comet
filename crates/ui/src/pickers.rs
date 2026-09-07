@@ -2629,6 +2629,7 @@ impl Pickers {
     pub fn render_footer(
         &mut self,
         window: &mut Window,
+        context_indicator: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -2707,7 +2708,8 @@ impl Pickers {
                         &theme,
                     ))
                 })
-                .child(composer_footer_right(model_controls));
+                .child(composer_footer_right(model_controls))
+                .when_some(context_indicator, |el, indicator| el.child(indicator));
             return Some(row().child(left).child(right_cluster).into_any_element());
         }
 
@@ -2762,7 +2764,8 @@ impl Pickers {
         } else {
             div()
         };
-        let right = composer_footer_right(model_controls);
+        let right = composer_footer_right(model_controls)
+            .when_some(context_indicator, |el, indicator| el.child(indicator));
         Some(row().child(left).child(right).into_any_element())
     }
 

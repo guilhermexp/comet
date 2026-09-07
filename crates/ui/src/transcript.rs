@@ -268,7 +268,7 @@ fn user_message_attachment_summary(
 }
 
 fn user_message_card_background(theme: &Theme) -> gpui::Hsla {
-    theme.input_glass_bg()
+    theme.composer_glass_bg()
 }
 
 #[derive(Clone, Copy)]
@@ -11531,7 +11531,10 @@ mod tests {
     #[test]
     fn user_message_card_matches_the_composer_background() {
         let theme = Theme::dark();
-        assert_eq!(user_message_card_background(&theme), theme.input_glass_bg());
+        assert_eq!(
+            user_message_card_background(&theme),
+            theme.composer_glass_bg()
+        );
     }
 
     #[test]

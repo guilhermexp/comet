@@ -1532,7 +1532,7 @@ impl WorkersContent {
             move |this, model, cx| {
                 // The read borrow has to end before `terminal.update` takes `cx`
                 // mutably, so every field this observer needs is copied out here.
-                let (session_id, live_ids, on_workspace) = {
+                let (session_id, live_ids, on_workspace, stopped) = {
                     let model = model.read(cx);
                     let live_ids: std::collections::HashSet<String> = model
                         .sessions()
@@ -1544,11 +1544,17 @@ impl WorkersContent {
                         model.selected_session_id.clone(),
                         live_ids,
                         matches!(model.route, WorkersRoute::Workspace),
+                        model
+                            .sessions()
+                            .iter()
+                            .find(|session| Some(&session.id) == model.selected_session_id.as_ref())
+                            .is_some_and(|session| !session.is_live()),
                     )
                 };
                 terminal.update(cx, |terminal, cx| {
                     terminal.retain_sessions(&live_ids);
                     terminal.set_session(session_id.clone(), cx);
+                    terminal.set_stopped(stopped, cx);
                 });
                 if this.gallery_session_id != session_id || !on_workspace {
                     this.close_session_gallery(cx);
@@ -3842,10 +3848,8 @@ fn workers_content_outlet() -> gpui::Div {
     div().flex_1().min_w_0().min_h_0().overflow_hidden()
 }
 
-fn workers_session_surface(theme: &Theme) -> gpui::Div {
-    div()
-        .size_full()
-        .bg(crate::terminal::view::terminal_panel_bg(theme))
+fn workers_session_surface(_theme: &Theme) -> gpui::Div {
+    div().size_full()
 }
 
 fn workers_viewport_layer() -> gpui::Div {
@@ -4162,6 +4166,10 @@ mod layout_tests {
         assert!(style.size.height.is_some());
         assert!(style.padding.top.is_none());
         assert!(style.inset.top.is_none());
+        assert!(
+            style.background.is_none(),
+            "Workers must inherit the Orchestrator canvas"
+        );
     }
 
     #[test]

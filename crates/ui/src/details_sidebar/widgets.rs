@@ -218,9 +218,9 @@ pub fn widget_card(
     div()
         .id(id)
         .w_full()
-        .rounded(px(10.0))
+        .rounded(px(8.0))
         .border_1()
-        .border_color(theme.border)
+        .border_color(theme.border.opacity(0.5))
         .overflow_hidden()
         .child(
             div()
@@ -229,7 +229,7 @@ pub fn widget_card(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .bg(crate::theme::ink(0.025))
+                .bg(crate::theme::ink(0.012))
                 .child(
                     icons::icon(icon_path)
                         .size(px(15.0))

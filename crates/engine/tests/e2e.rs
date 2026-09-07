@@ -3308,6 +3308,114 @@ async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
     );
 }
 
+/// The composer's context ring must show a settled session's real usage the
+/// instant the app reopens — not a zeroed gauge that only refills on the next
+/// turn. The live-status map starts empty at boot, so the fix seeds it from the
+/// persisted workspace rows; this proves the seeded usage reaches
+/// `watch_sessions` BEFORE any new run.
+#[tokio::test]
+async fn context_usage_survives_an_engine_restart() {
+    struct Measures;
+
+    #[async_trait]
+    impl Harness for Measures {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Measures"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let script = vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: format!("a-{}", request.prompt),
+                },
+                AgentEvent::Usage {
+                    input_tokens: 120_000,
+                    output_tokens: 512,
+                    context_usage: Some(zeron_proto::ContextUsage {
+                        tokens: 120_000,
+                        context_window: 200_000,
+                    }),
+                },
+                AgentEvent::TextDelta {
+                    text: "answering".into(),
+                },
+                done(DoneStatus::Completed),
+            ];
+            Ok(futures::stream::iter(script.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    let measured = zeron_proto::ContextUsage {
+        tokens: 120_000,
+        context_window: 200_000,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    // First boot: run one turn that measures usage, let it settle, shut down.
+    {
+        let core = assemble(dir.path(), Arc::new(Measures));
+        let watch = core.sessions.watch_sessions();
+        let handle = core.doc_host.open(CHAT).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            "cmd-usage-restart",
+            SessionCommandPayload::Run {
+                request: run_request("first"),
+                message_id: "m-usage-restart".into(),
+            },
+        );
+        wait_for(
+            || watch.borrow().first().and_then(|s| s.context_usage) == Some(measured),
+            "the turn to report a context measurement",
+        )
+        .await;
+        wait_for(
+            || watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle),
+            "the turn to settle",
+        )
+        .await;
+        core.shutdown().await;
+    }
+
+    // Second boot against the same data dir: the live-status watch must already
+    // carry the persisted usage, with no new turn dispatched.
+    let core = assemble(dir.path(), Arc::new(Measures));
+    let usage = core
+        .sessions
+        .watch_sessions()
+        .borrow()
+        .first()
+        .and_then(|s| s.context_usage);
+    assert_eq!(
+        usage,
+        Some(measured),
+        "context usage survives an engine restart"
+    );
+}
+
 #[tokio::test]
 async fn local_command_output_persists_and_survives_reopening_chat() {
     let dir = tempfile::tempdir().unwrap();

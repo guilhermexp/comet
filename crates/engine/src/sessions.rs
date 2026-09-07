@@ -442,6 +442,43 @@ impl SessionsEngine {
         self.inner.sessions_tx.subscribe()
     }
 
+    /// Seed live statuses from the persisted workspace rows at boot so a
+    /// settled session's context-window usage (and last status) survive an app
+    /// restart. The merged `WatchSessions` stream lets the local device's live
+    /// view win over its own persisted row, and that map starts EMPTY — without
+    /// this seed the composer's context ring reads zero until the next turn
+    /// measures again (user report: usage vanished after reopening the app).
+    ///
+    /// Only this device's rows matter; remote rows already flow through the
+    /// registry side of the merge. A row that a live run already claimed is left
+    /// untouched, and a persisted `Working`/`AwaitingInput` is normalized to
+    /// `Idle` — no run is live yet at boot, and `recover_stale` re-activates or
+    /// resumes the genuinely mid-flight ones immediately after.
+    pub fn hydrate_persisted_statuses(&self, persisted: Vec<Session>) {
+        let inner = &self.inner;
+        let mut statuses = lock(&inner.statuses);
+        let mut changed = false;
+        for mut session in persisted {
+            if session.device_id != inner.device_id || statuses.contains_key(&session.chat_id) {
+                continue;
+            }
+            if matches!(
+                session.status,
+                SessionStatus::Working | SessionStatus::AwaitingInput
+            ) {
+                session.status = SessionStatus::Idle;
+                session.started_at = None;
+            }
+            statuses.insert(session.chat_id.clone(), session);
+            changed = true;
+        }
+        if changed {
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            inner.sessions_tx.send_replace(list);
+        }
+    }
+
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }

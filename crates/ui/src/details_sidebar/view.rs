@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,7 @@ pub struct DetailsSidebarPreferences {
     pub idle_recaps: HashMap<String, super::idle_recap::IdleRecapEntry>,
     pub idle_recap_enabled: bool,
     pub idle_recap_delay_seconds: u64,
+    pub hidden_widgets: BTreeSet<String>,
 }
 
 impl Default for DetailsSidebarPreferences {
@@ -24,9 +25,21 @@ impl Default for DetailsSidebarPreferences {
             idle_recaps: HashMap::new(),
             idle_recap_enabled: true,
             idle_recap_delay_seconds: super::idle_recap::IDLE_RECAP_DEFAULT_SECONDS,
+            hidden_widgets: BTreeSet::new(),
         }
     }
 }
+
+/// The Details-tab widget cards the user can show/hide from the header gear
+/// (`SETTINGS_MINIMALISTIC`), in render order: `(stable id, menu label, icon)`.
+/// The id matches the `widget_card` id in [`DetailsSidebar::render_details`]
+/// and the key persisted in [`DetailsSidebarPreferences::hidden_widgets`].
+pub const TOGGLEABLE_WIDGETS: &[(&str, &str, &str)] = &[
+    ("workspace-widget", "Workspace", icons::DETAILS_BOX),
+    ("chat-workers-widget", "Workers", icons::DETAILS_WORKERS),
+    ("todos-widget", "To-dos", icons::CHECKLIST),
+    ("usage-widget", "Usage", icons::DETAILS_GAUGE),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkedProjectsCacheKey {
@@ -209,6 +222,18 @@ impl DetailsSidebarState {
         self.load_generation = self.load_generation.wrapping_add(1);
     }
 
+    pub fn widget_hidden(&self, widget_id: &str) -> bool {
+        self.preferences.hidden_widgets.contains(widget_id)
+    }
+
+    pub fn toggle_widget_hidden(&mut self, widget_id: &str) {
+        if !self.preferences.hidden_widgets.remove(widget_id) {
+            self.preferences
+                .hidden_widgets
+                .insert(widget_id.to_string());
+        }
+    }
+
     pub fn preferences(&self) -> DetailsSidebarPreferences {
         self.preferences.clone()
     }
@@ -288,6 +313,7 @@ use crate::{
     },
     icons,
     pickers::Pickers,
+    popover,
     state::AppState,
     theme::Theme,
     workers::{
@@ -428,6 +454,7 @@ pub struct DetailsSidebar {
     usage_fetched_at: Option<std::time::Instant>,
     search: Entity<ComposerInput>,
     search_visible: bool,
+    widgets_menu: popover::Popup<()>,
     active_file: Option<String>,
     usage_expanded: std::collections::HashSet<String>,
     material_icons: std::collections::HashMap<SharedString, std::sync::Arc<Image>>,
@@ -508,6 +535,7 @@ impl DetailsSidebar {
             usage_fetched_at: None,
             search,
             search_visible: false,
+            widgets_menu: popover::Popup::default(),
             active_file: None,
             usage_expanded: std::collections::HashSet::new(),
             material_icons: std::collections::HashMap::new(),
@@ -571,6 +599,95 @@ impl DetailsSidebar {
 
     fn emit_preferences(&self, cx: &mut Context<Self>) {
         cx.emit(DetailsSidebarEvent::PreferencesChanged(self.preferences()));
+    }
+
+    fn close_widgets_menu(&mut self, cx: &mut Context<Self>) {
+        if self.widgets_menu.begin_close() {
+            popover::reap_popup(cx, |this: &mut Self| &mut this.widgets_menu);
+            cx.notify();
+        }
+    }
+
+    fn render_widgets_gear(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mounted = self.widgets_menu.get().is_some();
+        let closing = self.widgets_menu.closing_since();
+        let mut trigger = div()
+            .id("details-widgets-menu-toggle")
+            .relative()
+            .size(px(28.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .when(mounted, |el| el.bg(crate::theme::ink(0.05)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.widgets_menu.note_trigger_press()),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.widgets_menu.take_press_was_open() {
+                    this.widgets_menu.open(());
+                    cx.notify();
+                }
+            }))
+            .child(
+                icons::icon(icons::SETTINGS_MINIMALISTIC)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
+        if mounted {
+            let menu = self.render_widgets_menu(theme, cx);
+            trigger = trigger.child(popover::anchored_menu_below_end(
+                "details-widgets-menu",
+                menu,
+                closing,
+            ));
+        }
+        trigger.into_any_element()
+    }
+
+    fn render_widgets_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows: Vec<AnyElement> = TOGGLEABLE_WIDGETS
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let (widget_id, label, icon_path) = *entry;
+                let visible = !self.sidebar.widget_hidden(widget_id);
+                popover::menu_row(theme, false, format!("details-widget-row-{ix}"))
+                    .id(("details-widget-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sidebar.toggle_widget_hidden(widget_id);
+                        this.emit_preferences(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        icons::icon(icon_path)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    )
+                    .child(div().flex_1().child(SharedString::from(label)))
+                    .child(div().w(px(14.0)).flex_none().when(visible, |el| {
+                        el.child(
+                            icons::icon(icons::CHECK)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        popover::popover_card(theme)
+            .w(px(200.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_widgets_menu(cx)))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(popover::menu_heading(theme, "Widgets"))
+            .children(rows)
+            .into_any_element()
     }
 
     fn set_tab(&mut self, tab: DetailsTab, cx: &mut Context<Self>) {
@@ -1089,7 +1206,9 @@ impl DetailsSidebar {
                 .justify_center()
                 .cursor_pointer()
                 .bg(if active {
-                    theme.bg
+                    // Translucent active plate (was opaque theme.bg): reads
+                    // active over the glass without a solid black slab.
+                    theme.bg.opacity(0.6)
                 } else {
                     gpui::transparent_black()
                 })
@@ -1133,7 +1252,7 @@ impl DetailsSidebar {
                         div()
                             .p(px(2.0))
                             .rounded(px(9.0))
-                            .bg(crate::theme::ink(0.045))
+                            .bg(crate::theme::ink(0.03))
                             .flex()
                             .items_center()
                             .child(
@@ -1210,6 +1329,15 @@ impl DetailsSidebar {
                                 cx.notify();
                             }),
                         )),
+                )
+            })
+            .when(tab == DetailsTab::Details, |header| {
+                header.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(self.render_widgets_gear(theme, cx)),
                 )
             })
     }
@@ -2002,6 +2130,10 @@ impl DetailsSidebar {
                 .text_color(theme.text_muted)
                 .child("No workspace selected");
         };
+        let hide_workspace = self.sidebar.widget_hidden("workspace-widget");
+        let hide_workers = self.sidebar.widget_hidden("chat-workers-widget");
+        let hide_todos = self.sidebar.widget_hidden("todos-widget");
+        let hide_usage = self.sidebar.widget_hidden("usage-widget");
         let folder = context
             .cwd
             .file_name()
@@ -2185,21 +2317,19 @@ impl DetailsSidebar {
                 workspace_body = workspace_body.child(recap_row);
             }
         }
-        let mut content = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .p(px(10.0))
-            .child(widget_card(
+        let mut content = div().w_full().flex().flex_col().gap(px(10.0)).p(px(10.0));
+        if !hide_workspace {
+            content = content.child(widget_card(
                 "workspace-widget",
                 icons::DETAILS_BOX,
                 "Workspace",
                 workspace_body,
                 theme,
             ));
+        }
 
-        if context.mode == super::context::DetailsMode::Orchestrator
+        if !hide_workers
+            && context.mode == super::context::DetailsMode::Orchestrator
             && let Some(chat_id) = context.chat_id.clone()
         {
             let (snapshot, workers_error) = self.current_chat_workers(&chat_id, cx);
@@ -2218,7 +2348,8 @@ impl DetailsSidebar {
             }
         }
 
-        if context.mode == super::context::DetailsMode::Orchestrator
+        if !hide_todos
+            && context.mode == super::context::DetailsMode::Orchestrator
             && let Some(todos) = latest_todos(&self.app_state.read(cx).transcript)
         {
             let status_layout = todo_status_layout();
@@ -2290,6 +2421,9 @@ impl DetailsSidebar {
             ));
         }
 
+        if hide_usage {
+            return content;
+        }
         let hidden = crate::settings::current(cx).usage_widget_hidden_account_ids;
         let usage_body = match (&self.usage, &self.usage_snapshot) {
             (_, Some(snapshot)) => {
@@ -2655,7 +2789,7 @@ impl DetailsSidebar {
                         .min_h_0()
                         .rounded(px(10.0))
                         .border_1()
-                        .border_color(theme.border)
+                        .border_color(theme.border.opacity(0.5))
                         .overflow_hidden()
                         .flex()
                         .flex_col()
@@ -2667,7 +2801,7 @@ impl DetailsSidebar {
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
-                                .bg(crate::theme::ink(0.025))
+                                .bg(crate::theme::ink(0.012))
                                 .child(
                                     icons::icon(icons::DETAILS_BOX)
                                         .size(px(15.0))
@@ -2939,6 +3073,28 @@ mod tests {
         assert_eq!(preferences.active_tab, DetailsTab::Files);
         assert_eq!(preferences.expanded.get("one").unwrap(), &["src"]);
         assert_eq!(preferences.hidden, HashMap::from([("one".into(), true)]));
+    }
+
+    #[test]
+    fn widget_visibility_toggles_and_persists() {
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        // Default: every toggleable widget is visible.
+        for entry in super::TOGGLEABLE_WIDGETS {
+            assert!(!state.widget_hidden(entry.0));
+        }
+        state.toggle_widget_hidden("usage-widget");
+        assert!(state.widget_hidden("usage-widget"));
+        assert!(!state.widget_hidden("workspace-widget"));
+        // Persists across a reload (boot path: preferences() -> stored -> new()).
+        let mut reloaded = DetailsSidebarState::new(state.preferences());
+        assert!(reloaded.widget_hidden("usage-widget"));
+        assert_eq!(
+            reloaded.preferences().hidden_widgets,
+            std::collections::BTreeSet::from(["usage-widget".to_string()])
+        );
+        // Toggling again clears it.
+        reloaded.toggle_widget_hidden("usage-widget");
+        assert!(!reloaded.widget_hidden("usage-widget"));
     }
 
     #[test]

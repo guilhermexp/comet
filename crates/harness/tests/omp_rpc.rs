@@ -2029,3 +2029,62 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
         "native runtimes' MCP client deadline is pinned to the controller ceiling plus slack"
     );
 }
+
+#[test]
+fn omp_normalizer_handles_web_tools_and_structured_clean_outputs() {
+    let mut normalizer = zeron_harness::omp::normalize::OmpNormalizer::new("/tmp", "test-model");
+
+    // web_search
+    let search_events = normalizer.push(json!({
+        "type": "tool_execution_start",
+        "toolCallId": "search_1",
+        "toolName": "web_search",
+        "args": { "query": "rust async patterns" }
+    }));
+    assert_eq!(search_events.len(), 1);
+    assert!(matches!(
+        &search_events[0],
+        AgentEvent::ToolCall {
+            id,
+            call: ToolCall::WebSearch { query }
+        } if id == "search_1" && query == "rust async patterns"
+    ));
+
+    // fetch
+    let fetch_events = normalizer.push(json!({
+        "type": "tool_execution_start",
+        "toolCallId": "fetch_1",
+        "toolName": "fetch",
+        "args": { "url": "https://crates.io", "prompt": "extract name" }
+    }));
+    assert_eq!(fetch_events.len(), 1);
+    assert!(matches!(
+        &fetch_events[0],
+        AgentEvent::ToolCall {
+            id,
+            call: ToolCall::WebFetch { url, prompt: Some(prompt) }
+        } if id == "fetch_1" && url == "https://crates.io" && prompt == "extract name"
+    ));
+
+    // tool_execution_end with structured JSON output containing text field
+    let end_events = normalizer.push(json!({
+        "type": "tool_execution_end",
+        "toolCallId": "search_1",
+        "toolName": "web_search",
+        "result": {
+            "text": "Top result: The Rust Programming Language",
+            "details": { "count": 1 }
+        },
+        "isError": false
+    }));
+    assert_eq!(end_events.len(), 1);
+    assert!(matches!(
+        &end_events[0],
+        AgentEvent::ToolResult {
+            id,
+            output: Some(out),
+            is_error: false,
+            ..
+        } if id == "search_1" && out == "Top result: The Rust Programming Language"
+    ));
+}

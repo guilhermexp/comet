@@ -1747,7 +1747,41 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
-                Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
+                // An optional `cwd` pins that checkout for the life of the
+                // stream. Entries are otherwise built from chat rows alone, so
+                // a pane opened on a checkout no chat points at (a Workers
+                // project) would wait on a diff that is never captured.
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(default)]
+                    cwd: Option<String>,
+                }
+                let cwd = parse_params::<P>(params).ok().and_then(|p| p.cwd);
+                let pin = match cwd {
+                    Some(cwd) => match self
+                        .diff_sync
+                        .pin_checkout(std::path::Path::new(&cwd))
+                        .await
+                    {
+                        Ok(pin) => Some(pin),
+                        Err(error) => {
+                            // Not a checkout (or git is unavailable): the
+                            // stream still carries every chat-backed diff.
+                            tracing::debug!(cwd = %cwd, %error, "diff watch: pin failed");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let stream = watch_stream(self.diff_sync.watch_diffs());
+                Ok(RpcReply::Stream(
+                    stream
+                        .map(move |value| {
+                            let _pin = &pin; // held for the stream's lifetime
+                            value
+                        })
+                        .boxed(),
+                ))
             }
             methods::WATCH_CHECKOUT_CHANGE_REQUEST => {
                 let p: CheckoutChangeRequestParams = parse_params(params)?;

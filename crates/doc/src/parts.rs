@@ -882,9 +882,10 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
 /// Keeps: command / path / pattern / url / query / todo items / server+tool names,
-/// and a subagent spawn's model/type (see [`spawn_badge`] — a couple of short
-/// identifiers the chip names the child by).
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// a subagent spawn's model/type (see [`spawn_badge`]), and a handful of short
+/// chip identifiers for OMP `hub` / `eval` / Workers MCP (see [`chip_badge`]).
+/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, code,
+/// prompts, message bodies, and any other Unknown/Mcp input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
@@ -904,25 +905,77 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
         ToolCall::Mcp { server, tool, .. } => ToolCall::Mcp {
             server: server.clone(),
             tool: tool.clone(),
-            input: spawn_badge(call),
+            input: chip_badge(call),
         },
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),
-            input: spawn_badge(call),
+            input: chip_badge(call),
         },
         other => other.clone(),
     }
 }
 
-/// The only slice of a tool input allowed into the doc: a subagent spawn's
+const HUB_INPUT_KEEP: [&str; 5] = ["op", "name", "to", "from", "application"];
+const EVAL_INPUT_KEEP: [&str; 2] = ["language", "title"];
+const WORKERS_INPUT_KEEP: [&str; 5] = ["action", "session_id", "project_id", "name", "project"];
+
+/// The only slice of a tool input allowed into the doc: either a subagent
+/// spawn's [`SUBAGENT_INPUT_KEEP`] keys, or the short chip identifiers for
+/// known OMP tools so the transcript can name the operation.
+///
+/// Everything else — prompts, code, IRC bodies — stays in the host's run
+/// journal. This stays a whitelist of identifiers rather than a size cap.
+/// `None` when nothing worth keeping was named, which keeps it idempotent:
+/// re-sanitizing a sanitized call is a fixpoint.
+fn chip_badge(call: &ToolCall) -> Option<serde_json::Value> {
+    if call.is_subagent_spawn() {
+        return spawn_badge(call);
+    }
+    let (kind, input) = match call {
+        ToolCall::Unknown { name, input } => (name.as_str(), input.as_ref()?),
+        ToolCall::Mcp { tool, input, .. } => (tool.as_str(), input.as_ref()?),
+        _ => return None,
+    };
+    let keys: &[&str] = match kind {
+        "hub" => &HUB_INPUT_KEEP,
+        "eval" => &EVAL_INPUT_KEEP,
+        "workers" => &WORKERS_INPUT_KEEP,
+        _ => return None,
+    };
+    let mut kept = keep_short_strings(input, keys);
+    if kind == "hub"
+        && let Some(ids) = input.get("ids").and_then(serde_json::Value::as_array)
+    {
+        let ids: Vec<serde_json::Value> = ids
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .take(8)
+            .map(serde_json::Value::from)
+            .collect();
+        if !ids.is_empty() {
+            kept.insert("ids".into(), serde_json::Value::Array(ids));
+        }
+    }
+    (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
+}
+
+fn keep_short_strings(
+    input: &serde_json::Value,
+    keys: &[&str],
+) -> serde_json::Map<String, serde_json::Value> {
+    keys.iter()
+        .filter_map(|key| {
+            let value = input.get(*key)?.as_str()?.trim();
+            (!value.is_empty()).then(|| ((*key).to_owned(), serde_json::Value::from(value)))
+        })
+        .collect()
+}
+
+/// The only slice of a spawn's input allowed into the doc: a subagent's
 /// [`SUBAGENT_INPUT_KEEP`] keys, so the chip can say WHICH model the child
 /// runs on (`Agent · haiku`) without the reader opening the subagent tab.
-///
-/// Everything else — the prompt above all — stays in the host's run journal,
-/// so this stays a whitelist of short identifiers rather than a size cap.
-/// `None` for anything that is not a spawn, and for a spawn that named
-/// neither, which keeps it idempotent: re-sanitizing a sanitized call is a
-/// fixpoint (the kept keys are themselves kept).
 fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
     if !call.is_subagent_spawn() {
         return None;
@@ -931,13 +984,7 @@ fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
         ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref()?,
         _ => return None,
     };
-    let kept: serde_json::Map<String, serde_json::Value> = SUBAGENT_INPUT_KEEP
-        .iter()
-        .filter_map(|key| {
-            let value = input.get(key)?.as_str()?.trim();
-            (!value.is_empty()).then(|| ((*key).to_owned(), serde_json::Value::from(value)))
-        })
-        .collect();
+    let kept = keep_short_strings(input, &SUBAGENT_INPUT_KEEP);
     (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
 }
 
@@ -1565,6 +1612,83 @@ mod tests {
             }
         );
         assert_eq!(clean.subagent_model(), None);
+    }
+
+    #[test]
+    fn sanitize_keeps_hub_eval_and_workers_chip_identifiers() {
+        let hub = ToolCall::Unknown {
+            name: "hub".into(),
+            input: Some(serde_json::json!({
+                "op": "start",
+                "name": "servico",
+                "text": "payload secreto",
+            })),
+        };
+        let hub_clean = sanitize_tool_call(&hub);
+        assert_eq!(
+            hub_clean,
+            ToolCall::Unknown {
+                name: "hub".into(),
+                input: Some(serde_json::json!({
+                    "op": "start",
+                    "name": "servico",
+                })),
+            }
+        );
+        assert_eq!(sanitize_tool_call(&hub_clean), hub_clean);
+        let hub_shown = zeron_proto::view::tool_presentation(&hub_clean, true, false);
+        assert_eq!(hub_shown.label, "Ran hub");
+        assert_eq!(hub_shown.detail, "start servico");
+
+        let eval = ToolCall::Unknown {
+            name: "eval".into(),
+            input: Some(serde_json::json!({
+                "language": "js",
+                "title": "Checking logs",
+                "code": "secret()",
+            })),
+        };
+        let eval_clean = sanitize_tool_call(&eval);
+        assert_eq!(
+            eval_clean,
+            ToolCall::Unknown {
+                name: "eval".into(),
+                input: Some(serde_json::json!({
+                    "language": "js",
+                    "title": "Checking logs",
+                })),
+            }
+        );
+        assert_eq!(sanitize_tool_call(&eval_clean), eval_clean);
+        let eval_shown = zeron_proto::view::tool_presentation(&eval_clean, false, false);
+        assert_eq!(eval_shown.label, "Evaluating");
+        assert_eq!(eval_shown.detail, "js · Checking logs");
+
+        let workers = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(serde_json::json!({
+                "action": "wait_for_status",
+                "session_id": "worker-1",
+                "initial_text": "briefing",
+            })),
+        };
+        let workers_clean = sanitize_tool_call(&workers);
+        assert_eq!(
+            workers_clean,
+            ToolCall::Mcp {
+                server: "comet-workers".into(),
+                tool: "workers".into(),
+                input: Some(serde_json::json!({
+                    "action": "wait_for_status",
+                    "session_id": "worker-1",
+                })),
+            }
+        );
+        assert_eq!(sanitize_tool_call(&workers_clean), workers_clean);
+        let workers_shown = zeron_proto::view::tool_presentation(&workers_clean, true, false);
+        assert_eq!(workers_shown.label, "Called workers");
+        assert_eq!(workers_shown.detail, "wait_for_status worker-1");
     }
 
     #[test]

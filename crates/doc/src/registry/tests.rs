@@ -371,6 +371,34 @@ fn rows_round_trip_and_upsert_refreshes() {
 }
 
 #[test]
+fn session_context_usage_persists_and_survives_a_snapshot_reload() {
+    // Regression: the live registry row dropped contextTokens/contextWindow,
+    // so the composer gauge zeroed after an app restart even though usage had
+    // been measured. The fields must round-trip through the persisted snapshot.
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut with_usage = session("chat-1", "dev-a", SessionStatus::Idle);
+    with_usage.context_usage = Some(zeron_proto::ContextUsage {
+        tokens: 392_000,
+        context_window: 828_000,
+    });
+    doc.upsert_session(&with_usage).unwrap();
+    assert_eq!(doc.read_sessions().unwrap(), vec![with_usage.clone()]);
+
+    let bytes = doc.to_bytes().unwrap();
+    let reloaded = RegistryDoc::from_bytes(&bytes, "dev-a").unwrap();
+    assert_eq!(
+        reloaded.read_sessions().unwrap(),
+        vec![with_usage.clone()],
+        "context usage must survive a snapshot reload (the restart path)"
+    );
+
+    // A later silent turn clears the measurement: the null write removes it.
+    let cleared = session("chat-1", "dev-a", SessionStatus::Idle);
+    doc.upsert_session(&cleared).unwrap();
+    assert_eq!(doc.read_sessions().unwrap()[0].context_usage, None);
+}
+
+#[test]
 fn own_push_ack_never_advances_the_cursor() {
     // Field incident: on the HTTPS transport, push ran before pull in one
     // cycle — the ack jumped the cursor to OUR batch's seq, and the pull

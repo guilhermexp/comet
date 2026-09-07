@@ -1472,19 +1472,6 @@ impl WorkersModel {
         self.run_unit_action(move |client| client.open_project_in_editor(&path), cx);
     }
 
-    pub fn open_project_with_application(
-        &mut self,
-        path: String,
-        bundle_ids: Vec<String>,
-        app_names: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_unit_action(
-            move |client| client.open_project_with_application(&path, bundle_ids, app_names),
-            cx,
-        );
-    }
-
     pub fn add_preset(&mut self, label: String, command: String, cx: &mut Context<Self>) {
         self.run_settings_action(move |client| client.add_preset(&label, &command), cx);
     }

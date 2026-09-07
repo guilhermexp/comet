@@ -3393,46 +3393,52 @@ struct ContextUsageTooltip {
 impl Render for ContextUsageTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
-            .w(px(220.0))
-            .px(px(14.0))
-            .py(px(12.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(3.0))
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_center()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child("Janela de contexto"),
-            )
-            .when_some(
-                self.state.used_percent.zip(self.state.remaining_percent),
-                |el, (used, remaining)| {
-                    el.child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(format!(
-                                "{used}% usado ({remaining}% restante)"
-                            ))),
-                    )
-                },
-            )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(theme.text_muted.opacity(0.82))
-                    .child(self.state.detail.clone()),
-            )
+        crate::frost::frosted(
+            10.0,
+            16.0,
+            div()
+                .w(px(220.0))
+                .px(px(14.0))
+                .py(px(12.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(3.0))
+                .rounded(px(10.0))
+                .border_1()
+                // Same tokens as the composer pill / user bubble: the shared
+                // glass fill and hairline, shadow only off frost.
+                .border_color(theme.border)
+                .bg(theme.composer_glass_bg())
+                .when(!theme.is_frost(), |el| el.shadow_md())
+                .text_center()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Janela de contexto"),
+                )
+                .when_some(
+                    self.state.used_percent.zip(self.state.remaining_percent),
+                    |el, (used, remaining)| {
+                        el.child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(format!(
+                                    "{used}% usado ({remaining}% restante)"
+                                ))),
+                        )
+                    },
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted.opacity(0.82))
+                        .child(self.state.detail.clone()),
+                ),
+        )
     }
 }
 
@@ -6426,7 +6432,7 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(theme.composer_glass_bg())
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
@@ -7113,7 +7119,7 @@ impl Composer {
             .rounded(px(COMPOSER_CORNER_RADIUS))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(theme.composer_glass_bg())
             .px(px(12.0))
             .py(px(10.0))
             .flex()
@@ -7486,7 +7492,10 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Attach and the
         // send circle live inside; model/effort now belong to the footer.
-        let pill_bg = theme.input_glass_bg();
+        // Shared with the sent user-message bubble (theme.composer_glass_bg):
+        // thinned to ~half the theme fill so the pill reads as a transparent,
+        // hairline-outlined input rather than a solid grey plate (user request).
+        let pill_bg = theme.composer_glass_bg();
         // No drop shadow on glass: it paints BEHIND the translucent fill and
         // shows through as an inner glow (theme.rs's card_selected_shadows
         // lesson; user report).
@@ -7548,7 +7557,6 @@ impl Render for Composer {
                         .pt(px(4.0))
                         .pb(px(10.0))
                         .child(div().flex_1().min_w_0())
-                        .child(context_indicator)
                         .children(self.render_live_voice_button(&live_voice, &theme, cx))
                         .child(attach)
                         .child(send_button),
@@ -7601,7 +7609,6 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(context_indicator)
                                 .children(self.render_live_voice_button(&live_voice, &theme, cx))
                                 .child(attach)
                                 .child(send_button),
@@ -7641,9 +7648,9 @@ impl Render for Composer {
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
-        let footer = self
-            .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(window, cx));
+        let footer = self.pickers.update(cx, |pickers, cx| {
+            pickers.render_footer(window, Some(context_indicator), cx)
+        });
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,

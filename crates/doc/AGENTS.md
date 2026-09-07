@@ -22,6 +22,7 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 - `SessionMessageEntry.duration_ms` é metadata aditiva de segmento assistant: `SegmentWriter::finish` só carimba quando a engine tem uma fronteira confiável; docs legados e recovery sem medição mantêm `None`.
 - Durante import incremental, Loro pode expor o map de uma part antes de seus escalares. Só map incompleto sem conteúdo e sem chaves além de `id`/`kind` é shell transitório (diagnóstico `debug`); shape com conteúdo ou chave desconhecida continua salvage com `warn`. O diagnóstico estrutural limita-se a path e kind allowlisted — nunca copia payload.
 - Mudança de nome/shape de container é **destrutiva cross-device** (foi o motivo do `2` em `ws2/{orgId}`). Vai por OpenSpec.
+- Row de sessão do `RegistryDoc` (`sessions`, kind) persiste `contextTokens`/`contextWindow` junto de status/`updatedAt` — a janela de contexto tem de sobreviver a restart do app (o gauge do composer lia zero até o próximo turno). `null` limpa o campo por LWW, mesma semântica de delete do row legado `WorkspaceDoc`. Ambos leem via `RawSession`; se um passar a gravar esses campos, o outro tem de acompanhar.
 
 ## Work Guidance
 

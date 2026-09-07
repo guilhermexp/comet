@@ -847,6 +847,16 @@ impl Theme {
             .opacity(self.contrast_checked_tint_alpha(self.input_bg, base, window))
     }
 
+    /// The composer pill fill thinned to ~half coverage, so the input reads as
+    /// a translucent hairline outline instead of a solid plate (user request).
+    /// The sent user-message bubble shares this exact fill: a message keeps the
+    /// same tone whether it is still being typed in the composer or already
+    /// pinned at the top of its turn.
+    pub fn composer_glass_bg(&self) -> Hsla {
+        let fill = self.input_glass_bg();
+        fill.opacity(fill.a * 0.5)
+    }
+
     /// Section-card fill (settings cards and similar in-panel cards). The
     /// opaque `surface` tone read as a harsh solid slab floating on the
     /// frosted blur (user report), so glass thins it to a translucent tint;

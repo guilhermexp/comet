@@ -59,6 +59,7 @@ use zeron_proto::{
 };
 
 use crate::antigravity_usage::AntigravityUsage;
+use crate::cursor_usage::CursorUsage;
 use crate::grok_usage::GrokUsage;
 use crate::kimi_usage::KimiUsage;
 use crate::repos::home_dir;
@@ -111,6 +112,9 @@ pub struct AgentAccountsConfig {
     pub cursor_sdk_auth_file: PathBuf,
     /// Grok home (`$GROK_HOME` or `~/.grok`) — holds `auth.json` from `grok login`.
     pub grok_home: PathBuf,
+    /// The Cursor desktop app's global state store (`state.vscdb`) — holds the
+    /// WorkOS session token the subscription Usage probe needs. Read-only.
+    pub cursor_state_db: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -134,7 +138,14 @@ impl AgentAccountsConfig {
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
             grok_home: env_dir("GROK_HOME").unwrap_or_else(|| home_dir().join(".grok")),
+            cursor_state_db: Self::cursor_state_db_default(),
         }
+    }
+    /// The Cursor desktop state store, per platform (macOS
+    /// `~/Library/Application Support/Cursor`, Linux `~/.config/Cursor`,
+    /// Windows `%APPDATA%/Cursor`).
+    pub fn cursor_state_db_default() -> PathBuf {
+        crate::cursor_usage::default_state_db_path()
     }
 
     fn claude_creds_file(&self) -> PathBuf {
@@ -162,6 +173,7 @@ impl AgentAccountsConfig {
             && self.codex_home == detected.codex_home
             && self.cursor_sdk_auth_file == detected.cursor_sdk_auth_file
             && self.grok_home == detected.grok_home
+            && self.cursor_state_db == detected.cursor_state_db
     }
 }
 
@@ -275,6 +287,8 @@ struct Inner {
     antigravity_setup_warning: Option<String>,
     grok_usage: Option<GrokUsage>,
     grok_setup_warning: Option<String>,
+    cursor_usage: Option<CursorUsage>,
+    cursor_setup_warning: Option<String>,
     /// `"{harness}:{accountKey}"` → last successfully probed windows. A failed
     /// or skipped forced probe serves these instead of rendering the failure
     /// as empty usage.
@@ -316,6 +330,14 @@ impl AgentAccounts {
         } else {
             (None, None)
         };
+        let (cursor_usage, cursor_setup_warning) = if config.uses_detected_paths() {
+            match CursorUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
         Self::new_inner(
             config,
             kimi_usage,
@@ -324,12 +346,24 @@ impl AgentAccounts {
             antigravity_setup_warning,
             grok_usage,
             grok_setup_warning,
+            cursor_usage,
+            cursor_setup_warning,
         )
     }
 
     #[cfg(test)]
     fn new_with_kimi_usage(config: AgentAccountsConfig, kimi_usage: KimiUsage) -> Self {
-        Self::new_inner(config, Some(kimi_usage), None, None, None, None, None)
+        Self::new_inner(
+            config,
+            Some(kimi_usage),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -345,12 +379,39 @@ impl AgentAccounts {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
     #[cfg(test)]
     fn new_with_grok_usage(config: AgentAccountsConfig, grok_usage: GrokUsage) -> Self {
-        Self::new_inner(config, None, None, None, None, Some(grok_usage), None)
+        Self::new_inner(
+            config,
+            None,
+            None,
+            None,
+            None,
+            Some(grok_usage),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_cursor_usage(config: AgentAccountsConfig, cursor_usage: CursorUsage) -> Self {
+        Self::new_inner(
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(cursor_usage),
+            None,
+        )
     }
 
     fn new_inner(
@@ -361,6 +422,8 @@ impl AgentAccounts {
         antigravity_setup_warning: Option<String>,
         grok_usage: Option<GrokUsage>,
         grok_setup_warning: Option<String>,
+        cursor_usage: Option<CursorUsage>,
+        cursor_setup_warning: Option<String>,
     ) -> Self {
         // Startup sweep: a previous process that crashed mid-login leaves
         // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
@@ -391,6 +454,8 @@ impl AgentAccounts {
                 antigravity_setup_warning,
                 grok_usage,
                 grok_setup_warning,
+                cursor_usage,
+                cursor_setup_warning,
                 last_good_usage: Mutex::new(HashMap::new()),
             }),
         }
@@ -429,6 +494,16 @@ impl AgentAccounts {
                     .cloned()
                     .map(|message| AgentAccountWarning {
                         harness: HarnessId::Grok,
+                        message,
+                    }),
+            )
+            .chain(
+                self.inner
+                    .cursor_setup_warning
+                    .iter()
+                    .cloned()
+                    .map(|message| AgentAccountWarning {
+                        harness: HarnessId::Cursor,
                         message,
                     }),
             )
@@ -472,8 +547,20 @@ impl AgentAccounts {
                 None => None,
             }
         };
-        let (local_usage, (claude, claude_warning), kimi, antigravity, grok) =
-            tokio::join!(local_usage, self.detect_claude(), kimi, antigravity, grok);
+        let cursor = async {
+            match &self.inner.cursor_usage {
+                Some(usage) => Some(usage.snapshot(force_usage).await),
+                None => None,
+            }
+        };
+        let (local_usage, (claude, claude_warning), kimi, antigravity, grok, cursor) = tokio::join!(
+            local_usage,
+            self.detect_claude(),
+            kimi,
+            antigravity,
+            grok,
+            cursor
+        );
         if let Some(message) = claude_warning {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::ClaudeCode,
@@ -605,6 +692,30 @@ impl AgentAccounts {
             }
         } else if let Some(account) = self.detect_grok_login() {
             accounts.push(account);
+        }
+        if let Some(usage) = cursor {
+            if let Some(message) = &usage.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Cursor,
+                    message: message.clone(),
+                });
+            }
+            if usage.present && !usage.usage_windows.is_empty() {
+                // The desktop session owns the quota: it attaches to the
+                // Cursor account with the same email, falling back to the
+                // active account when the session carries none. A mismatch
+                // attaches nothing rather than misattributing quota.
+                let target = accounts.iter_mut().find(|account| {
+                    account.harness == HarnessId::Cursor
+                        && match usage.email.as_deref() {
+                            Some(email) => account.email.as_deref() == Some(email),
+                            None => account.active,
+                        }
+                });
+                if let Some(account) = target {
+                    account.usage_windows = usage.usage_windows;
+                }
+            }
         }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
@@ -2349,6 +2460,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let credential = root
             .path()
@@ -2399,6 +2511,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let cred_dir = root.path().join("cli-proxy");
         std::fs::create_dir_all(&cred_dir).unwrap();
@@ -2445,6 +2558,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let cred_dir = root.path().join("cli-proxy");
         std::fs::create_dir_all(&cred_dir).unwrap();
@@ -2500,6 +2614,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let credential = root
             .path()
@@ -2566,6 +2681,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let credential = config.grok_auth_file();
         std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
@@ -2622,6 +2738,7 @@ mod tests {
             .iter()
             .find(|account| account.harness == HarnessId::Grok)
             .expect("Grok account present");
+
         assert_eq!(grok_account.usage_windows.len(), 1);
         assert_eq!(grok_account.usage_windows[0].label, "Weekly");
         assert_eq!(grok_account.email.as_deref(), Some("user@example.com"));
@@ -2629,6 +2746,86 @@ mod tests {
         let wire = serde_json::to_string(&snapshot).unwrap();
         assert!(!wire.contains("test-key-private"));
         assert!(!wire.contains("test-refresh-private"));
+    }
+
+    #[tokio::test]
+    async fn cursor_desktop_session_usage_attaches_to_matching_account() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("state.vscdb"),
+        };
+        std::fs::create_dir_all(config.cursor_sdk_auth_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config.cursor_sdk_auth_file,
+            serde_json::json!({
+                "version": 1,
+                "backendUrl": "https://api2.cursor.sh",
+                "apiKey": "crsr_test_private",
+                "apiKeyExpiresAtMs": 99999999999999_i64,
+                "email": "user@example.com",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&config.cursor_state_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+             INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', 'workos-token-private');
+             INSERT INTO ItemTable VALUES ('cursorAuth/cachedEmail', 'user@example.com');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0_u8; 1024];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            let body = r#"{"billingCycleEnd":"1791325989000","planUsage":{"totalSpend":4433,"limit":7000}}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let cursor = crate::cursor_usage::CursorUsage::from_paths(
+            config.cursor_state_db.clone(),
+            format!("http://{address}"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_cursor_usage(config, cursor);
+        let snapshot = accounts.list(true).await.unwrap();
+        server.await.unwrap();
+
+        let cursor_account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Cursor)
+            .expect("Cursor account present");
+        assert_eq!(cursor_account.usage_windows.len(), 1);
+        assert_eq!(cursor_account.usage_windows[0].label, "Monthly");
+        assert_eq!(cursor_account.email.as_deref(), Some("user@example.com"));
+        assert!(
+            (cursor_account.usage_windows[0].used_fraction - (4433.0 / 7000.0) as f32).abs()
+                < 0.001
+        );
+
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("crsr_test_private"));
+        assert!(!wire.contains("workos-token-private"));
     }
 
     #[tokio::test]
@@ -2673,8 +2870,10 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
-        let accounts = AgentAccounts::new_inner(config, None, None, None, None, None, None);
+        let accounts =
+            AgentAccounts::new_inner(config, None, None, None, None, None, None, None, None);
         let slot = Slot {
             id: "codex-test".into(),
             harness: HarnessId::Codex,
@@ -2921,6 +3120,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         std::fs::create_dir_all(&config.grok_home).unwrap();
         std::fs::write(
@@ -2970,6 +3170,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
             grok_home: root.path().join("missing-grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let empty_snapshot = AgentAccounts::new(empty).list(false).await.unwrap();
         assert!(

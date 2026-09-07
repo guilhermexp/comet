@@ -167,12 +167,19 @@ impl EventListener for EventCapture {
 }
 
 /// The emulator: a pure fold of PTY bytes into a renderable grid.
+#[derive(Default)]
+struct AlternateScreenRetention {
+    pending: Vec<u8>,
+    grid: Option<alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>>,
+}
+
 pub struct Emulator {
     term: Term<EventCapture>,
     parser: Processor,
     capture: EventCapture,
     title: Option<String>,
     bell: bool,
+    alternate_retention: Option<AlternateScreenRetention>,
 }
 
 impl Emulator {
@@ -189,13 +196,54 @@ impl Emulator {
             capture,
             title: None,
             bell: false,
+            alternate_retention: None,
         }
     }
 
     /// Advance the state machine over decoded PTY output. Returns bytes the
     /// terminal wants written back to the PTY (DSR/DA query responses etc.).
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.parser.advance(&mut self.term, bytes);
+        if let Some(mut retention) = self.alternate_retention.take() {
+            // Retain only DEC alternate-buffer exits. The pending suffix is
+            // bounded by a control sequence and never delays ordinary text.
+            const EXITS: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
+            retention.pending.extend_from_slice(bytes);
+            let data = std::mem::take(&mut retention.pending);
+            let mut start = 0;
+            while let Some((at, escape)) = (start..data.len()).find_map(|at| {
+                EXITS
+                    .iter()
+                    .find(|escape| data[at..].starts_with(escape))
+                    .map(|escape| (at, *escape))
+            }) {
+                self.parser.advance(&mut self.term, &data[start..at]);
+                let grid = self
+                    .alternate_screen_mode()
+                    .then(|| self.term.grid().clone());
+                self.parser.advance(&mut self.term, escape);
+                if !self.alternate_screen_mode() && grid.is_some() {
+                    retention.grid = grid;
+                }
+                start = at + escape.len();
+            }
+            let tail = &data[start..];
+            let pending_len = (1..=tail.len().min(7))
+                .rev()
+                .find(|len| {
+                    EXITS
+                        .iter()
+                        .any(|escape| escape.starts_with(&tail[tail.len() - len..]))
+                })
+                .unwrap_or(0);
+            self.parser
+                .advance(&mut self.term, &tail[..tail.len() - pending_len]);
+            retention
+                .pending
+                .extend_from_slice(&tail[tail.len() - pending_len..]);
+            self.alternate_retention = Some(retention);
+        } else {
+            self.parser.advance(&mut self.term, bytes);
+        }
         let mut responses = Vec::new();
         for event in self.capture.events.borrow_mut().drain(..) {
             match event {
@@ -207,6 +255,54 @@ impl Emulator {
             }
         }
         responses
+    }
+
+    /// Opt-in for stopped Worker inspection; generic terminals keep normal ANSI behavior.
+    pub fn retain_last_alternate_screen(&mut self) {
+        self.alternate_retention
+            .get_or_insert_with(Default::default);
+    }
+
+    /// The caller must establish that the Worker has stopped and replay is complete.
+    pub fn restore_last_alternate_screen_if_blank(&mut self) -> bool {
+        if self.alternate_screen_mode()
+            || self
+                .alternate_retention
+                .as_ref()
+                .is_none_or(|retention| retention.grid.is_none())
+            || !(0..self.rows()).all(|row| self.row_text(row).trim().is_empty())
+        {
+            return false;
+        }
+        let mut grid = self
+            .alternate_retention
+            .as_mut()
+            .and_then(|retention| retention.grid.take())
+            .unwrap();
+        grid.update_history(SCROLLBACK_LINES);
+        grid.resize(true, self.rows(), self.cols());
+        *self.term.grid_mut() = grid;
+        self.term.selection = None;
+        true
+    }
+
+    /// Once output has ended, the visible alternate screen is a read-only
+    /// document: preserve it in the primary grid so future resizes reflow
+    /// instead of cropping columns while waiting for a TUI that cannot redraw.
+    pub fn prepare_stopped_screen(&mut self) -> bool {
+        if self.alternate_screen_mode() {
+            let mut grid = self.term.grid().clone();
+            grid.update_history(SCROLLBACK_LINES);
+            self.term.swap_alt();
+            if let Some(retention) = self.alternate_retention.as_mut() {
+                retention.grid = None;
+            }
+            *self.term.grid_mut() = grid;
+            self.term.selection = None;
+            true
+        } else {
+            self.restore_last_alternate_screen_if_blank()
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -454,6 +550,31 @@ impl std::fmt::Debug for Emulator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stopped_alternate_screen_is_recoverable_across_every_chunk_boundary() {
+        let bytes = b"\x1b[?1049h\x1b[2J\x1b[HFinal result\x1b[?1049l\x1b[?25h";
+        for split in 0..=bytes.len() {
+            let mut e = super::Emulator::new(40, 8);
+            e.retain_last_alternate_screen();
+            e.feed(&bytes[..split]);
+            e.feed(&bytes[split..]);
+            assert!(!e.alternate_screen_mode());
+            assert!(e.restore_last_alternate_screen_if_blank(), "split {split}");
+            assert!(e.row_text(0).contains("Final result"));
+        }
+    }
+
+    #[test]
+    fn alternate_recovery_preserves_populated_primary_and_live_screen() {
+        let mut e = super::Emulator::new(40, 8);
+        e.retain_last_alternate_screen();
+        e.feed(b"shell prompt\x1b[?1049h\x1b[HFinal result");
+        assert!(!e.restore_last_alternate_screen_if_blank());
+        e.feed(b"\x1b[?1049l");
+        assert!(!e.restore_last_alternate_screen_if_blank());
+        assert!(e.row_text(0).contains("shell prompt"));
+    }
+
     use super::*;
 
     fn emu(cols: u16, rows: u16) -> Emulator {
@@ -642,6 +763,22 @@ mod tests {
         assert_eq!(e.cursor(), None);
         e.feed(b"\x1b[?25h");
         assert!(e.cursor().is_some());
+    }
+
+    #[test]
+    fn stopped_screen_resize_preserves_columns_on_round_trip() {
+        let mut e = emu(20, 5);
+        e.feed(b"\x1b[?1049habcdefghijklmnopqrst");
+        e.prepare_stopped_screen();
+        e.resize(8, 5);
+        e.resize(20, 5);
+        e.scroll(1000);
+        let rows: Vec<_> = (0..e.rows()).map(|row| e.row_text(row)).collect();
+        assert!(
+            rows.iter().any(|row| row == "abcdefghijklmnopqrst"),
+            "{rows:?}"
+        );
+        assert!(!e.alternate_screen_mode());
     }
 
     #[test]

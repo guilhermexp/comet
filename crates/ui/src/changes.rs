@@ -67,6 +67,8 @@ pub const HUNK_HEADER_HEIGHT: f32 = 28.0;
 pub const DIFF_LINE_HEIGHT: f32 = 21.0;
 pub const NOTICE_HEIGHT: f32 = 24.0;
 pub const BODY_BOTTOM_PAD: f32 = 8.0;
+/// The pane's options row (scope dropdown, ref selector, split, fold-all).
+const CONTROLS_ROW_HEIGHT: f32 = 36.0;
 /// Gutter width per line-number column.
 pub const GUTTER_WIDTH: f32 = 36.0;
 /// The +/−/· marker column between the gutters and the code.
@@ -1580,12 +1582,17 @@ impl Changes {
         }
         self.started = true;
         self.watch_target = target.clone();
-        self.watch_task = Some(Self::spawn_watch(engine, target, cx));
+        let cwd = self.explicit_cwd.clone();
+        self.watch_task = Some(Self::spawn_watch(engine, target, cwd, cx));
     }
 
+    /// `cwd` (Workers panes) pins that checkout on the engine for as long as
+    /// the stream lives — its entries come from chat rows otherwise, and a
+    /// Workers project has none, so nothing was ever captured for it.
     fn spawn_watch(
         engine: EngineHandle,
         target: Option<String>,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -1596,6 +1603,9 @@ impl Changes {
                         "targetDeviceId".into(),
                         serde_json::Value::String(target.clone()),
                     );
+                }
+                if let Some(cwd) = &cwd {
+                    params.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
                 }
                 let subscribed = engine
                     .client()
@@ -4430,12 +4440,29 @@ fn render_file_body_upto(
 
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        // The pane's own options row, under the shell's surface-tab strip:
+        // scope dropdown, base-ref selector, split toggle, fold-all. It sits
+        // above every state (History included) — without it a History pane
+        // has no way back to a diff scope.
+        let controls = div()
+            .flex_none()
+            .h(px(CONTROLS_ROW_HEIGHT))
+            .px(px(Theme::SPACE_MD))
+            .border_b_1()
+            .border_color(crate::theme::hairline(0.06))
+            .child(self.render_header_controls(cx));
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
-            return div().size_full().child(history).into_any_element();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(controls)
+                .child(div().flex_1().min_h_0().child(history))
+                .into_any_element();
         }
-        let theme = Theme::of(cx).clone();
         let active = self.active_diff(cx);
         let scope = self.scope;
         let base = self.base_ref.clone();
@@ -4584,6 +4611,7 @@ impl Render for Changes {
                         .child(message),
                 )
             })
+            .child(controls)
             .child(content)
             .into_any_element()
     }

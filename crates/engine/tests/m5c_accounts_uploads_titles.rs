@@ -37,6 +37,7 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         codex_home: root.join("codex"),
         cursor_sdk_auth_file: root.join("cursor-sdk").join("auth.json"),
         grok_home: root.join("grok"),
+        cursor_state_db: root.join("cursor-state.vscdb"),
     };
     (AgentAccounts::new(config.clone()), config)
 }

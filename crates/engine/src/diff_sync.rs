@@ -35,6 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -127,6 +128,12 @@ struct CheckoutEntry {
     orphaned_since: Mutex<Option<std::time::Instant>>,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
+    /// Live `WatchCheckoutDiffs` subscriptions that asked for this checkout by
+    /// path ([`CheckoutDiffSync::pin_checkout`]). Chats are not the only reason
+    /// a checkout must be watched: a Workers project has no chat row at all, so
+    /// without a pin its entry never exists and its pane sits on "Preparing
+    /// diff…" forever (user report). A pinned entry is never orphaned.
+    pins: AtomicUsize,
     /// Keeps the recursive fs watchers alive; dropped on entry close. Filled
     /// asynchronously — watcher setup (budget walk + FSEvents registration) can
     /// block for seconds, so [`add_entry`] does it off the runtime and attaches
@@ -169,6 +176,25 @@ struct DiffSyncInner {
     /// upgraded Arc — the token cuts it so no sidecar HTTP outlives shutdown.
     cancel: CancellationToken,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// Holds one [`CheckoutDiffSync::pin_checkout`] reference. Dropping it releases
+/// the checkout back to the chat-driven lifecycle: the next reconcile pass with
+/// no chats left starts the orphan grace, exactly as before.
+pub struct CheckoutPin {
+    inner: Weak<DiffSyncInner>,
+    checkout_id: String,
+}
+
+impl Drop for CheckoutPin {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if let Some(entry) = lock(&inner.entries).get(&self.checkout_id) {
+            entry.pins.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -246,6 +272,34 @@ impl CheckoutDiffSync {
     /// `WatchCheckoutDiffs` source: every tracked checkout's latest diff.
     pub fn watch_diffs(&self) -> watch::Receiver<Vec<CheckoutDiff>> {
         self.inner.diffs_tx.subscribe()
+    }
+
+    /// Track `cwd`'s checkout for as long as the returned guard lives, whether
+    /// or not any chat points at it. Entries are otherwise built purely from
+    /// this device's chat rows, so a checkout nothing chats about — a Workers
+    /// project, a worktree opened only in the right pane — was never captured
+    /// and never published. Idempotent: an existing entry just takes another
+    /// pin and its published diff is reused.
+    pub async fn pin_checkout(&self, cwd: &Path) -> Result<CheckoutPin, EngineError> {
+        let identity = self.inner.repos.checkout_identity(cwd).await?;
+        let checkout_id = identity.id.clone();
+        let existing = lock(&self.inner.entries).get(&checkout_id).cloned();
+        match existing {
+            Some(entry) => {
+                entry.pins.fetch_add(1, Ordering::Relaxed);
+                *lock(&entry.orphaned_since) = None;
+            }
+            None => {
+                add_entry(&self.inner, identity, Vec::new());
+                if let Some(entry) = lock(&self.inner.entries).get(&checkout_id) {
+                    entry.pins.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(CheckoutPin {
+            inner: Arc::downgrade(&self.inner),
+            checkout_id,
+        })
     }
 
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
@@ -408,7 +462,7 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
         let mut entries = lock(&inner.entries);
         let mut removed = Vec::new();
         for (id, entry) in entries.iter() {
-            if groups.contains_key(id) {
+            if groups.contains_key(id) || entry.pins.load(Ordering::Relaxed) > 0 {
                 *lock(&entry.orphaned_since) = None;
                 continue;
             }
@@ -522,6 +576,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         chats: Mutex::new(chats),
         checksum: Mutex::new(None),
         orphaned_since: Mutex::new(None),
+        pins: AtomicUsize::new(0),
         kick_tx: kick_tx.clone(),
         watchers: Mutex::new(Vec::new()),
     });
