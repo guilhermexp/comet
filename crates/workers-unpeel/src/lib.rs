@@ -363,6 +363,35 @@ pub struct WorkersProject {
     pub session_sort: WorkersSessionSort,
 }
 
+impl WorkersProject {
+    /// A branch a PR badge should follow, for a worktree only.
+    ///
+    /// `worktree_branch` is the branch the worktree was CREATED on and never
+    /// follows a `git switch` inside it — which is why the badge vanished. It
+    /// stays the GATE (only a worktree gets a badge); the VALUE comes from
+    /// `git_branch`, projected from disk on every bootstrap.
+    pub fn change_request_branch(&self) -> Option<&str> {
+        let registry = self.worktree_branch.as_deref()?;
+        if registry.trim().is_empty() {
+            return None;
+        }
+        Some(self.git_branch.as_deref().unwrap_or(registry))
+    }
+
+    /// Whether the app may tear this checkout down — the question the removal
+    /// route has to ask, and the one `worktree_branch` cannot answer.
+    ///
+    /// The projection publishes `worktreeBranch` for a worktree the user added
+    /// by hand in a terminal too, and `remove_worktree` refuses that one
+    /// because deleting the row deletes every session under it. Ownership is
+    /// the path: `worktrees::create` only ever builds under the worktrees
+    /// root, which is also the only place `worktrees::remove` accepts. A row
+    /// this returns `false` for is removed as a project.
+    pub fn owns_worktree_checkout(&self) -> bool {
+        self.worktree_branch.is_some() && unpeel_core::worktrees::is_managed(Path::new(&self.path))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkersSessionSort {
     #[default]
@@ -411,9 +440,9 @@ fn ensure_setup_succeeded(worktree: &WorkersWorktreeResult) -> Result<(), Worker
     let reason = worktree
         .setup_failed_reason
         .as_deref()
-        .unwrap_or("motivo não informado");
+        .unwrap_or("no reason reported");
     Err(WorkersError::State(format!(
-        "worktree criado, mas o setup falhou em `{command}`: {reason}"
+        "worktree created, but setup failed at `{command}`: {reason}"
     )))
 }
 
@@ -1095,6 +1124,79 @@ fn live_projects_for_ledger(bootstrap: &WorkersBootstrap) -> Vec<LiveProject> {
         .collect()
 }
 
+/// Espelha no ledger um projeto que acabou de entrar no working set, DENTRO
+/// do mesmo `app_state::edit` que o registrou: mesmo flock, mesmo rename
+/// atomico, entao nao existe janela em que `projects[]` tenha uma pasta que o
+/// ledger nunca viu. Sem isto, a chave `comet_projects` so nascia quando
+/// alguem abria Settings > Projects — e o menu `@` do composer, que le so o
+/// ledger, ficava vazio.
+///
+/// Delega para `reconcile`, a mesma funcao pura de Settings: normalizacao de
+/// path, "a primeira vista fixa o `added_at`" e a preservacao das entradas
+/// orfas continuam definidas em UM lugar. Grupos nao passam por aqui de
+/// proposito (ver [`live_projects_for_ledger`]).
+fn record_in_ledger(
+    state: &mut serde_json::Map<String, Value>,
+    project_id: &str,
+    path: &str,
+    name: &str,
+) -> Result<(), String> {
+    let ledger: Vec<LedgerProject> = state
+        .get(project_ledger::LEDGER_KEY)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let live = [LiveProject {
+        id: project_id.to_owned(),
+        path: path.to_owned(),
+        name: name.to_owned(),
+        last_activity_unix_ms: None,
+    }];
+    let outcome = project_ledger::reconcile(&ledger, &live, now_unix_ms());
+    if outcome.dirty {
+        state.insert(
+            project_ledger::LEDGER_KEY.to_owned(),
+            serde_json::to_value(&outcome.ledger).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
+/// Mirror the WHOLE working set into the ledger, once per process.
+///
+/// `record_in_ledger` only covers projects registered from here on, so an
+/// install that already had projects before the ledger existed would keep an
+/// empty `comet_projects` — and an empty `@` menu — until someone happened to
+/// open Settings > Projects, the only other route that reconciles everything.
+/// Once per process because `reconcile` goes dirty whenever activity moves and
+/// `bootstrap` is polled; a failure here must never fail the bootstrap.
+fn backfill_ledger_once(bootstrap: &WorkersBootstrap) {
+    static BACKFILL: std::sync::Once = std::sync::Once::new();
+    BACKFILL.call_once(|| {
+        backfill_ledger_at(&unpeel_core::app_paths::app_state_path(), bootstrap);
+    });
+}
+
+/// [`backfill_ledger_once`] against an explicit state file — the seam the test
+/// uses so it never touches this machine's registry. The `_at` variants also
+/// resolve the path once and skip the cross-frontend broadcast `save()` does:
+/// no other frontend renders this key live, Settings reads it when it opens.
+fn backfill_ledger_at(state_path: &Path, bootstrap: &WorkersBootstrap) {
+    let Ok(ledger) = project_ledger::read_at(state_path) else {
+        return;
+    };
+    let outcome =
+        project_ledger::reconcile(&ledger, &live_projects_for_ledger(bootstrap), now_unix_ms());
+    if outcome.dirty {
+        let _ = project_ledger::write_at(state_path, &outcome.ledger);
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalWorkersClient {
     next_request_id: Arc<AtomicU64>,
@@ -1244,6 +1346,7 @@ impl LocalWorkersClient {
         apply_runtime_capabilities(&mut bootstrap.sessions);
         apply_notify_when_done_overlay(&mut bootstrap.sessions);
         self.activity.enrich(&mut bootstrap.sessions);
+        backfill_ledger_once(&bootstrap);
         Ok(bootstrap)
     }
 
@@ -1660,21 +1763,29 @@ impl LocalWorkersClient {
             let projects = projects_value
                 .as_array_mut()
                 .ok_or_else(|| "projects must be an array".to_string())?;
-            if let Some(id) = projects.iter().find_map(|project| {
+            let existing = projects.iter().find_map(|project| {
                 (project.get("path").and_then(Value::as_str) == Some(canonical_string.as_str()))
                     .then(|| project.get("id")?.as_str().map(str::to_owned))
                     .flatten()
-            }) {
-                return Ok(id);
-            }
-            let id = format!("comet-{}", uuid::Uuid::new_v4().simple());
-            projects.push(json!({
-                "id": id,
-                "name": name,
-                "path": canonical_string,
-                "workspace_id": "personal",
-                "sort_order": projects.len() as u32,
-            }));
+            });
+            // Readicionar uma pasta ja registrada tambem passa pelo ledger: e
+            // como um registro anterior ao ledger (ou um `forget`) se cura,
+            // sem rota de leitura nenhuma escrever no arquivo.
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = format!("comet-{}", uuid::Uuid::new_v4().simple());
+                    projects.push(json!({
+                        "id": id,
+                        "name": name,
+                        "path": canonical_string,
+                        "workspace_id": "personal",
+                        "sort_order": projects.len() as u32,
+                    }));
+                    id
+                }
+            };
+            record_in_ledger(state, &id, &canonical_string, &name)?;
             Ok(id)
         })
         .map_err(WorkersError::State)
@@ -1755,9 +1866,22 @@ impl LocalWorkersClient {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| WorkersError::State("parent project path is missing".into()))?;
+        // `worktrees::create` ADOPTS a checkout that is already there instead
+        // of failing (`worktrees.rs`, "Already there? Adopt it rather than
+        // failing"), and the `Worktree` it hands back carries no mark of who
+        // made it — `managed` only says "lives under the worktrees root".
+        // Asking git BEFORE is the only way to tell the two apart, and the
+        // rollback below force-removes, which on an adopted checkout would
+        // take the user's uncommitted work with it.
+        let known_before: Vec<String> = unpeel_core::worktrees::list(parent_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|worktree| worktree.path)
+            .collect();
         let worktree =
             unpeel_core::worktrees::create(parent_path, branch, request.base_ref.as_deref())
                 .map_err(WorkersError::State)?;
+        let adopted = known_before.contains(&worktree.path);
         let project_id = format!("comet-worktree-{}", uuid::Uuid::new_v4().simple());
         let display_name = request
             .name
@@ -1782,10 +1906,15 @@ impl LocalWorkersClient {
                 "is_folder": true,
                 "worktree_branch": branch,
             }));
-            Ok(())
+            record_in_ledger(state, &project_id, &path, &display_name)
         });
         if let Err(error) = register {
-            let _ = unpeel_core::worktrees::remove(&worktree.path, true);
+            // Only undo what THIS call created. An adopted checkout predates
+            // us: it may hold months of uncommitted work, and rolling back a
+            // failed registration is no licence to delete it.
+            if !adopted {
+                let _ = unpeel_core::worktrees::remove(&worktree.path, true);
+            }
             return Err(WorkersError::State(error));
         }
         // O setup do projeto roda AQUI, depois do registro: um worktree que
@@ -1825,10 +1954,11 @@ impl LocalWorkersClient {
                 path: worktree.path,
                 branch: worktree.branch,
             }),
-            Err(error) => {
-                let _ = self.remove_worktree(&worktree.project_id, true);
-                Err(error)
-            }
+            // Falha de launch NAO desfaz o worktree, pela mesma razao que
+            // falha de setup nao desfaz (ver `create_worktree` acima): o
+            // checkout ja existe, ja foi registrado, e apaga-lo com `force`
+            // por causa de um preset invalido perde trabalho do usuario.
+            Err(error) => Err(error),
         }
     }
 
@@ -1856,15 +1986,15 @@ impl LocalWorkersClient {
             if display_name.is_empty() {
                 return Err(WorkersError::State("project name is required".into()));
             }
-            let is_worktree = project
-                .get("worktree_branch")
-                .and_then(Value::as_str)
-                .is_some();
-            if is_worktree {
-                rename_project_record(project_id, display_name)?;
-            } else {
+            // Pergunta o predicado de GRUPO, nao o complemento dele:
+            // `rename_group_project` exige pasta+pai+sem-branch, e um worktree
+            // adotado (sem branch no registro, mas tambem sem `is_folder`) caia no
+            // ramo errado e morria em "only plain groups can be renamed here".
+            if is_plain_group(project) {
                 unpeel_core::session_ops::rename_group_project(project_id, display_name)
                     .map_err(WorkersError::State)?;
+            } else {
+                rename_project_record(project_id, display_name)?;
             }
         }
         if let Some(folder_color_id) = patch.folder_color_id {
@@ -1941,19 +2071,35 @@ impl LocalWorkersClient {
                     .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
             })
             .ok_or_else(|| WorkersError::State(format!("unknown worktree id: {project_id}")))?;
-        if project
-            .get("worktree_branch")
-            .and_then(Value::as_str)
-            .is_none()
-        {
-            return Err(WorkersError::State("project is not a worktree".into()));
-        }
         let path = project
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| WorkersError::State("worktree path is missing".into()))?
             .to_owned();
-        unpeel_core::worktrees::remove(&path, force).map_err(WorkersError::State)?;
+        // The registry is what makes this OURS to tear down. The projection
+        // also derives `worktreeBranch` from disk, for a worktree the user
+        // added by hand in a terminal, and the menu offers "Remove worktree"
+        // off that projected value — but this call deletes every session under
+        // the project (transcripts and the runtime's managed storage), so when
+        // the two disagree it must refuse instead of quietly wiping months of
+        // history behind a label that promised to remove a checkout. Removing
+        // such a row is `remove_project`, and the caller has to say so.
+        if project
+            .get("worktree_branch")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(WorkersError::State(
+                "project is not a worktree this app created; remove it as a project".into(),
+            ));
+        }
+        // The checkout only goes when it still lives under the worktrees root —
+        // the same predicate `worktrees::remove` refuses on. A record whose
+        // checkout was moved or deleted by hand stays removable from the
+        // sidebar instead of erroring forever on a git call that cannot work.
+        if unpeel_core::worktrees::is_managed(Path::new(&path)) {
+            unpeel_core::worktrees::remove(&path, force).map_err(WorkersError::State)?;
+        }
         let removed = project_tree_ids(project_id)?;
         self.remove_sessions_in_projects(&removed)?;
         remove_project_tree(project_id)
@@ -1970,16 +2116,7 @@ impl LocalWorkersClient {
                     .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
             })
             .ok_or_else(|| WorkersError::State(format!("unknown group id: {project_id}")))?;
-        let is_group = project.get("is_folder").and_then(Value::as_bool) == Some(true)
-            && project
-                .get("worktree_branch")
-                .and_then(Value::as_str)
-                .is_none()
-            && project
-                .get("parent_project_id")
-                .and_then(Value::as_str)
-                .is_some();
-        if !is_group {
+        if !is_plain_group(project) {
             return Err(WorkersError::State("project is not a group".into()));
         }
         let parent_id = project
@@ -2690,6 +2827,28 @@ fn set_project_folder_color(project_id: &str, color_id: Option<&str>) -> Result<
         Ok(())
     })
     .map_err(WorkersError::State)
+}
+
+/// O predicado canonico de organizacao, lido do REGISTRO (`Models.swift:43`):
+/// pasta, com pai, sem branch. Mesma regra que a projecao usa para publicar
+/// `isGroup`, e a unica que `session_ops::rename_group_project` /
+/// `remove_group` aceitam. Um worktree ADOTADO tem pai PROJETADO do disco, e
+/// por isso a pergunta nao pode ser `parent_project_id.is_some()`.
+///
+/// Keys are snake_case, one spelling only: `unpeel_core::state::Project` is
+/// the on-disk shape and derives serde with no aliases, every writer here
+/// spells it that way, and `session_ops` reads it that way. The camelCase
+/// fallbacks in the projection's own parser answer no file anyone writes.
+fn is_plain_group(project: &Value) -> bool {
+    project.get("is_folder").and_then(Value::as_bool) == Some(true)
+        && project
+            .get("parent_project_id")
+            .and_then(Value::as_str)
+            .is_some()
+        && project
+            .get("worktree_branch")
+            .and_then(Value::as_str)
+            .is_none()
 }
 
 fn rename_project_record(project_id: &str, name: &str) -> Result<(), WorkersError> {
@@ -3609,26 +3768,34 @@ mod project_ledger_projection_tests {
         }
     }
 
-    /// Remover o filtro de `is_group` volta a produzir duas linhas com o path
-    /// do pai; remover worktrees do filtro apaga um projeto de filesystem real.
-    #[test]
-    fn ledger_projection_keeps_projects_and_worktrees_but_not_groups() {
-        let bootstrap = WorkersBootstrap {
+    fn bootstrap_with(projects: Vec<WorkersProject>) -> WorkersBootstrap {
+        WorkersBootstrap {
             mac_name: "Mac".into(),
             protocol: WorkersProtocol {
                 major_version: 1,
                 minor_version: 0,
                 capabilities: Vec::new(),
             },
-            projects: vec![
-                project("project", "/tmp/repo", false, None),
-                project("group", "/tmp/repo", true, None),
-                project("worktree", "/tmp/repo-wt", false, Some("change/fix")),
-            ],
+            projects,
             presets: Vec::new(),
             sessions: Vec::new(),
             activity_log: Vec::new(),
-        };
+        }
+    }
+
+    fn working_set() -> WorkersBootstrap {
+        bootstrap_with(vec![
+            project("project", "/tmp/repo", false, None),
+            project("group", "/tmp/repo", true, None),
+            project("worktree", "/tmp/repo-wt", false, Some("change/fix")),
+        ])
+    }
+
+    /// Remover o filtro de `is_group` volta a produzir duas linhas com o path
+    /// do pai; remover worktrees do filtro apaga um projeto de filesystem real.
+    #[test]
+    fn ledger_projection_keeps_projects_and_worktrees_but_not_groups() {
+        let bootstrap = working_set();
 
         let live = live_projects_for_ledger(&bootstrap);
         let ids = live
@@ -3636,6 +3803,106 @@ mod project_ledger_projection_tests {
             .map(|project| project.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["project", "worktree"]);
+    }
+
+    /// O gate e o registro de worktree; o VALOR e o que o disco diz agora.
+    /// Sem isso, um `git switch` dentro do worktree assinava o PR com a branch
+    /// de criacao e a badge sumia.
+    #[test]
+    fn change_request_branch_gates_on_the_registry_and_reads_disk() {
+        let mut worktree = project("worktree", "/tmp/wt", false, Some("fix/correios"));
+        assert_eq!(worktree.change_request_branch(), Some("fix/correios"));
+        worktree.git_branch = Some("fix/renamed".into());
+        assert_eq!(worktree.change_request_branch(), Some("fix/renamed"));
+
+        let mut plain = project("project", "/tmp/repo", false, None);
+        plain.git_branch = Some("main".into());
+        assert_eq!(plain.change_request_branch(), None);
+
+        let blank = project("blank", "/tmp/wt", false, Some("   "));
+        assert_eq!(blank.change_request_branch(), None);
+    }
+
+    /// A semantica pura do espelho: readicionar a mesma pasta nao reescreve o
+    /// `added_at` nem perde as outras entradas.
+    ///
+    /// Que os CALLSITES chamam isto e outro teste: `create_worktree_at` esta
+    /// coberto em `worktree_setup_wiring_tests`; `add_project` escreve no
+    /// `app-state.json` real da maquina e so da para provar de `tests/`, com
+    /// o sandbox de `UNPEEL_HOME`.
+    #[test]
+    fn re_recording_the_same_path_keeps_the_original_added_at() {
+        let mut state = serde_json::Map::new();
+        state.insert(
+            project_ledger::LEDGER_KEY.to_owned(),
+            json!([{
+                "path": "/tmp/other",
+                "name": "other",
+                "added_at_unix_ms": 7u64,
+                "last_seen_at_unix_ms": 9u64,
+            }]),
+        );
+
+        record_in_ledger(&mut state, "comet-1", "/tmp/repo", "repo").unwrap();
+        let after_first: Vec<LedgerProject> =
+            serde_json::from_value(state[project_ledger::LEDGER_KEY].clone()).unwrap();
+        let added_at = after_first
+            .iter()
+            .find(|entry| entry.path == "/tmp/repo")
+            .expect("o projeto novo entrou no ledger")
+            .added_at_unix_ms;
+        assert_eq!(after_first.len(), 2, "a entrada antiga sobrevive");
+
+        record_in_ledger(&mut state, "comet-2", "/tmp/repo", "repo").unwrap();
+        let after_second: Vec<LedgerProject> =
+            serde_json::from_value(state[project_ledger::LEDGER_KEY].clone()).unwrap();
+        assert_eq!(after_second.len(), 2, "o mesmo path nao duplica");
+        assert_eq!(
+            after_second
+                .iter()
+                .find(|entry| entry.path == "/tmp/repo")
+                .unwrap()
+                .added_at_unix_ms,
+            added_at,
+            "readicionar nao reescreve a data de entrada"
+        );
+    }
+
+    /// O backfill: uma instalacao que ja tinha projetos ANTES do ledger existir
+    /// ganha as linhas na primeira `bootstrap`, nao so quando alguem abre
+    /// Settings > Projects — que era a unica rota que varria o working set
+    /// inteiro. Grupos continuam de fora (reutilizam o path do pai).
+    #[test]
+    fn the_backfill_mirrors_the_whole_working_set() {
+        let state_path =
+            std::env::temp_dir().join(format!("comet-backfill-{}.json", uuid::Uuid::new_v4()));
+
+        backfill_ledger_at(&state_path, &working_set());
+
+        let ledger = project_ledger::read_at(&state_path).expect("o ledger escrito");
+        let _ = std::fs::remove_file(&state_path);
+        let paths = ledger
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/tmp/repo", "/tmp/repo-wt"]);
+    }
+
+    /// Um worktree ADOTADO ganha pai da projecao, entao `parent_project_id`
+    /// nao responde "isto e organizacao" — so o predicado do registro responde,
+    /// e e ele que `rename_group_project` e `remove_group` exigem.
+    #[test]
+    fn plain_group_predicate_separates_groups_from_adopted_worktrees() {
+        assert!(is_plain_group(&json!({
+            "is_folder": true,
+            "parent_project_id": "root",
+        })));
+        assert!(!is_plain_group(&json!({ "parent_project_id": "root" })));
+        assert!(!is_plain_group(&json!({
+            "is_folder": true,
+            "parent_project_id": "root",
+            "worktree_branch": "change/fix",
+        })));
     }
 }
 
@@ -3830,6 +4097,27 @@ mod worktree_setup_wiring_tests {
         assert_eq!(
             registered.get("parent_project_id").and_then(Value::as_str),
             Some("comet-parent")
+        );
+    }
+
+    /// O ledger nasce COM o worktree, no MESMO arquivo e na mesma edicao que
+    /// o registrou — e disso que o menu `@` do composer vive. Chama o callsite
+    /// de verdade: apagar `record_in_ledger` de `create_worktree_at` derruba
+    /// este teste, coisa que exercitar a funcao direto nao faz.
+    #[test]
+    fn creating_a_worktree_records_it_in_the_ledger() {
+        let fixture = Fixture::new(None);
+        let created = fixture.create().unwrap();
+
+        let state = unpeel_core::app_state::load_for_edit_at(&fixture.state()).unwrap();
+        let ledger: Vec<LedgerProject> = state
+            .get(project_ledger::LEDGER_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        assert!(
+            ledger.iter().any(|entry| entry.path == created.path),
+            "o worktree criado tem que entrar no ledger: {ledger:?}"
         );
     }
 }

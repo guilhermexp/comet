@@ -92,8 +92,19 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   worktree criado sem sessão sumia da sidebar inteira, porque a row sem sessão
   só sobrevive como projeto selecionado ou alvo do launcher e o flag barra os
   dois. O predicado canônico está no app upstream (`Models.swift:43`,
-  `acceptsSessionDrop`) e `remove_group` já o soletra aqui; quem divergia era só
-  a projeção de `controller_host.rs`. `worktree_lifecycle_registers_and_removes_the_child_project`
+  `acceptsSessionDrop`), e hoje ele é **um veredito por projeto**, decidido uma
+  vez no topo do laço de `DiskCatalog::capture` porque o catálogo de criação é
+  montado FORA do objeto de fio: o mesmo `is_group` publica `isGroup` no fio e
+  vira `HostCreateProject::is_folder`. O `is_folder` do registro sozinho não
+  chega mais a nenhum dos dois — ele é só uma das três cláusulas. Antes disso o
+  catálogo de criação perguntava `is_folder && parent`, e como `create_worktree`
+  registra o worktree com `is_folder: true` + pai, TODO worktree criado pelo app
+  era recusado no launch com `project is a folder`. Do lado do registro o gêmeo
+  é `is_plain_group` (`lib.rs`), e ele governa `remove_group` **e** o ramo de
+  rename de `set_project_organization`: perguntar o COMPLEMENTO ali
+  (`worktree_branch.is_none()` ⇒ grupo) mandava worktree adotado — que não tem
+  branch no registro — para `rename_group_project` e morria em "only plain
+  groups can be renamed here". `worktree_lifecycle_registers_and_removes_the_child_project`
   fixa o flag no bootstrap que a UI lê — teste que constrói `WorkersProject` à
   mão não prova nada sobre a rota `comet-local`, foi assim que isto passou
   despercebido (mesma classe do `git_branch` acima).
@@ -106,8 +117,14 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `worktree_branch`. O disco sabe sem ambiguidade — git so escreve `.git` como
   ARQUIVO (com o ponteiro `gitdir:`) dentro de worktree linkado, e o ponteiro
   soletra `<main>/.git/worktrees/<nome>`. `git_checkout` devolve os dois, e a
-  projeção PREENCHE o que faltava: `worktreeBranch` sempre, `parentProjectID`
-  quando o repositorio principal tambem e projeto registrado. O registro
+  projeção PREENCHE o que faltava: `parentProjectID` quando o repositorio
+  principal tambem e projeto registrado, e `worktreeBranch` sob DUAS portas —
+  `!is_group` (grupo herda o path do pai em `create_group`, então o disco o
+  chamaria de worktree e "remover o rótulo" apagaria a árvore de trabalho do
+  pai) e `!detached` (`GitCheckout::detached`, o mesmo ramo que trunca HEAD em
+  sha curto: sha nao nomeia branch para lançar nem para assinar PR).
+  `gitBranch` continua dizendo o que HEAD diz, sha inclusive — só a promoção a
+  `worktreeBranch` recusa HEAD destacado. O registro
   continua ganhando onde falou. Comparação de path passa por
   `canonicalize` — no macOS o gitdir grava `/private/var/...` e o registro
   guarda `/var/...`, e sem isso o parent nunca casa.
@@ -143,7 +160,20 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   drenado concorrentemente com cauda de 64 KiB; timeout encerra o process group
   inteiro. Falha mantém o worktree registrado, carrega comando + motivo em
   `WorkersWorktreeResult` e barra `create_worktree_and_launch` antes de iniciar
-  a Session.
+  a Session. **Falha de LAUNCH também não desfaz** — o rollback que chamava
+  `remove_worktree(force)` no braço de erro saiu: o checkout já existe e já está
+  registrado, e apagá-lo à força por causa de um preset inválido joga fora
+  trabalho do usuário. O único rollback que sobrou é o do registro que falhou,
+  onde o worktree ainda não é projeto de ninguém.
+- **`worktree_branch` no registro é POSSE, não identidade.** Identidade quem
+  responde é a projeção (bullet acima): worktree adotado é worktree e o registro
+  nunca ouviu falar dele. Por isso `remove_worktree` não recusa mais quem não
+  tem o campo — ele apaga do disco só quando o registro tem `worktree_branch`
+  (o app criou este checkout) **e** `worktrees::is_managed(path)`; qualquer
+  outra coisa é apenas desregistrada, com a pasta intacta. `is_managed` é o
+  predicado extraído de `worktrees::remove`, para quem PERGUNTA antes e quem
+  RECUSA depois fazerem a mesma pergunta — e é ele que impede um grupo (que
+  herda o path do pai) de derrubar o checkout do pai junto com o rótulo.
 - **Hook ingress não morre por sinal de filho.** O accept loop trata
   `WouldBlock` e `Interrupted` como transitórios; setup/Worker encerrando
   processos no mesmo host não pode fechar o endpoint e devolver BrokenPipe ao
@@ -414,7 +444,7 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (16 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
 | `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
 | `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |

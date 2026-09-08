@@ -24,6 +24,7 @@ use super::archive::{archived_sessions_for_project, restore_action};
 use super::notification_policy::{
     NotificationSample, NotificationState, WorkerNotification, reduce_notification,
 };
+use super::workspace::root_project_id;
 use crate::workers::presentation::compare_sessions_by_activity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,9 +157,9 @@ pub fn worktree_setup_failure_message(result: &WorkersWorktreeResult) -> Option<
     let reason = result
         .setup_failed_reason
         .as_deref()
-        .unwrap_or("motivo não informado");
+        .unwrap_or("no reason reported");
     Some(format!(
-        "Worktree criado, mas o setup falhou em `{command}`: {reason}"
+        "Worktree created, but setup failed at `{command}`: {reason}"
     ))
 }
 
@@ -422,6 +423,23 @@ pub fn filter_after_snapshot(
     projects: &[WorkersProject],
 ) -> Option<String> {
     filter.filter(|id| projects.iter().any(|project| &project.id == id))
+}
+
+/// Where the selection lands when the user picks a filter root, or `None` to
+/// leave it alone.
+///
+/// The sidebar never hides the selected project's tree and hides projects with
+/// no live session, so a selection left behind in another root keeps the list
+/// on the previous project — the pick would show nothing new. "All projects"
+/// re-aims nothing: it widens the view instead of naming one.
+fn selection_after_filter(
+    filter: Option<&str>,
+    selected_project_id: Option<&str>,
+    projects: &[WorkersProject],
+) -> Option<String> {
+    let root = filter?;
+    let selected_root = selected_project_id.map(|selected| root_project_id(selected, projects));
+    (selected_root != Some(root)).then(|| root.to_owned())
 }
 
 fn notification_settings_for_snapshot(
@@ -863,9 +881,28 @@ impl WorkersModel {
         self.project_filter.as_deref()
     }
 
+    /// Point the sidebar at one project root (`None` is "All projects").
+    ///
+    /// Picking a root is an explicit "I am looking at this one", so the
+    /// selection follows it. The sidebar keeps the SELECTED project's tree on
+    /// screen whatever the filter says, and hides projects with no live
+    /// session, so a selection left behind in another root would leave the list
+    /// on the previous project and turn the pick into a no-op. The twin
+    /// `set_space_filter` moves the Chat sidebar's context the same way.
     pub fn set_project_filter(&mut self, project_id: Option<String>, cx: &mut Context<Self>) {
         if self.project_filter == project_id {
             return;
+        }
+        if let Some(root) = selection_after_filter(
+            project_id.as_deref(),
+            self.selected_project_id.as_deref(),
+            self.projects(),
+        ) {
+            self.selected_project_id = Some(root);
+            // The session goes with it: `apply_snapshot` re-derives the
+            // selected project FROM the selected session, which would snap the
+            // tree back to the root the filter just left.
+            self.selected_session_id = None;
         }
         self.project_filter = project_id;
         cx.notify();
@@ -1456,7 +1493,10 @@ impl WorkersModel {
             move |client| {
                 if project.worktree_branch.is_some() {
                     client.remove_worktree(&project.id, false)
-                } else if project.parent_project_id.is_some() {
+                // `is_group` is the projection's verdict on organization;
+                // `parent_project_id` is not, because an adopted worktree gets
+                // its parent from disk and would fall in here.
+                } else if project.is_group {
                     client.remove_group(&project.id)
                 } else {
                     client.remove_project(&project.id)
@@ -1963,7 +2003,7 @@ impl WorkersModel {
         project: &WorkersProject,
         cx: &App,
     ) -> Option<zeron_proto::ChangeRequestSummary> {
-        let branch = project.worktree_branch.as_deref()?;
+        let branch = project.change_request_branch()?;
         self.state
             .read(cx)
             .change_request_for_checkout(&project.path, branch)
@@ -2245,10 +2285,52 @@ mod tests {
         WorkersSettingsTab, claim_parent_notification_delivery, note_parent_notification_failure,
         notification_settings_for_snapshot, parent_notification_retry_allowed,
         parent_notification_rpc_params, reconcile_selection, reconcile_selection_with_pending,
-        replacement_selection, resolve_session_target, selection_after_remove,
-        sessions_for_parent_chat_from_links, sessions_for_project, toggle_expanded,
-        worktree_setup_failure_message,
+        replacement_selection, resolve_session_target, selection_after_filter,
+        selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
+        toggle_expanded, worktree_setup_failure_message,
     };
+
+    fn project(id: &str, parent: Option<&str>) -> zeron_workers_unpeel::WorkersProject {
+        zeron_workers_unpeel::WorkersProject {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/tmp/{id}"),
+            folder_id: None,
+            parent_project_id: parent.map(str::to_owned),
+            is_group: false,
+            worktree_branch: None,
+            git_branch: None,
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: zeron_workers_unpeel::WorkersSessionSort::Custom,
+        }
+    }
+
+    #[test]
+    fn picking_a_filter_root_re_aims_a_selection_left_in_another_root() {
+        let projects = vec![
+            project("alpha", None),
+            project("beta", None),
+            project("beta-wt", Some("beta")),
+        ];
+
+        // The selection lives in another root: it follows the pick, or the
+        // sidebar keeps drawing the previous tree and the filter shows nothing.
+        assert_eq!(
+            selection_after_filter(Some("alpha"), Some("beta-wt"), &projects).as_deref(),
+            Some("alpha")
+        );
+        // Already inside the picked root: the worktree keeps the selection.
+        assert_eq!(
+            selection_after_filter(Some("beta"), Some("beta-wt"), &projects),
+            None
+        );
+        // "All projects" widens the view instead of naming one.
+        assert_eq!(
+            selection_after_filter(None, Some("beta-wt"), &projects),
+            None
+        );
+    }
 
     fn parent_notification() -> WorkerParentNotification {
         WorkerParentNotification {
@@ -2693,7 +2775,7 @@ mod tests {
 
         assert_eq!(
             worktree_setup_failure_message(&result).as_deref(),
-            Some("Worktree criado, mas o setup falhou em `bun install`: exit status: 1")
+            Some("Worktree created, but setup failed at `bun install`: exit status: 1")
         );
     }
 

@@ -4,7 +4,9 @@
 //! pull-request metadata is host-local, short-lived capability state and is
 //! deliberately never written back into a synced document.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
 use zeron_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
@@ -237,6 +239,11 @@ impl ChangeRequestClientState {
     /// no chat identity to re-verify, so the checkout IS the identity — and
     /// both halves must match: a snapshot left over from the branch this
     /// worktree used to be on would otherwise name the wrong pull request.
+    ///
+    /// Known hole: `snapshots` is multi-device and this lookup has no device to
+    /// filter by, so two devices sharing an absolute path *and* a branch name
+    /// collide. Closing it means threading the local device id down from
+    /// `AppState` (which owns `local_device_id`) into both callers.
     pub fn change_request_for_checkout(
         &self,
         cwd: &str,
@@ -255,10 +262,48 @@ pub(crate) fn change_request_for_checkout<'a>(
     if branch.is_empty() || cwd.is_empty() {
         return None;
     }
+    let canonical_cwd = OnceCell::new();
     snapshots
         .into_iter()
-        .find(|snapshot| snapshot.cwd == cwd && snapshot.branch == branch)
+        .find(|snapshot| {
+            snapshot.branch == branch && same_checkout(&snapshot.cwd, cwd, &canonical_cwd)
+        })
         .and_then(|snapshot| snapshot.change_request.as_ref())
+}
+
+/// Two checkout paths that name the same directory.
+///
+/// The host reports `git rev-parse --show-toplevel`, which resolves symlinks
+/// (`/private/var/...` on macOS), while an adopted worktree keeps the path as
+/// the user gave it (`/var/...`). Raw equality is tried first, so an exact
+/// match costs no syscall, and a path that no longer exists simply fails to
+/// match instead of erroring.
+///
+/// A raw miss is NOT free: it canonicalizes `cwd` once per call through the
+/// shared cell (and short-circuits every later snapshot when that fails), then
+/// `snapshot_cwd` for each snapshot that still reaches this point. Both are
+/// blocking `realpath` calls, so every caller tests its cheap scalar fields —
+/// device, branch, checkout — *before* this one. That ordering, not the cell,
+/// is what keeps the syscall out of the render loop.
+fn same_checkout(snapshot_cwd: &str, cwd: &str, canonical_cwd: &OnceCell<Option<PathBuf>>) -> bool {
+    snapshot_cwd == cwd
+        || canonical_cwd
+            .get_or_init(|| canonical_path(cwd))
+            .as_deref()
+            .is_some_and(|canonical| canonical_path(snapshot_cwd).as_deref() == Some(canonical))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `canonical_path` calls on this thread, so a test can prove the render
+    /// path made none.
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn canonical_path(path: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    std::fs::canonicalize(path).ok()
 }
 
 /// Active, fully identified checkouts that need host-side PR resolution.
@@ -293,7 +338,9 @@ pub(crate) fn desired_watch_targets(
 
 /// The Workers surface's checkouts: one per worktree project, on the local
 /// device. A project without a worktree branch is a repository on its default
-/// branch — nothing to resolve, and nowhere on the row to draw it.
+/// branch — nothing to resolve, and nowhere on the row to draw it. The branch
+/// watched is the one `change_request_branch` reports, so a worktree switched
+/// after creation subscribes to where it is now.
 pub(crate) fn workers_change_request_targets(
     projects: &[zeron_workers_unpeel::WorkersProject],
     local_device_id: &str,
@@ -301,7 +348,7 @@ pub(crate) fn workers_change_request_targets(
     projects
         .iter()
         .filter_map(|project| {
-            let branch = project.worktree_branch.as_deref()?.trim();
+            let branch = project.change_request_branch()?.trim();
             if branch.is_empty() || project.path.trim().is_empty() {
                 return None;
             }
@@ -355,15 +402,18 @@ pub fn change_request_for_chat<'a>(
         .map(|source| source.checkout_id.as_str())
         .or(chat.checkout_id.as_deref());
 
+    let canonical_cwd = OnceCell::new();
     snapshots
         .into_iter()
         .find(|snapshot| {
+            // Every cheap scalar first: `same_checkout` can hit the filesystem,
+            // and this runs per row per frame.
             snapshot.device_id == chat.device_id
-                && snapshot.cwd == cwd
                 && snapshot.branch == branch
                 && checkout_id.is_none_or(|checkout_id| {
                     !snapshot.checkout_id.is_empty() && snapshot.checkout_id == checkout_id
                 })
+                && same_checkout(&snapshot.cwd, cwd, &canonical_cwd)
         })
         .and_then(|snapshot| snapshot.change_request.as_ref())
 }
@@ -460,7 +510,7 @@ mod tests {
             parent_project_id: None,
             is_group: false,
             worktree_branch: branch.map(str::to_owned),
-            git_branch: Some("main".into()),
+            git_branch: Some("fix/renamed".into()),
             archived_session_count: 0,
             folder_color_id: None,
             session_sort: zeron_workers_unpeel::WorkersSessionSort::Custom,
@@ -482,7 +532,9 @@ mod tests {
         assert_eq!(targets.len(), 1);
         let target = targets.iter().next().expect("the worktree target");
         assert_eq!(target.cwd, "/repos/wt");
-        assert_eq!(target.branch, "fix/correios");
+        // Created on `fix/correios`, switched to `fix/renamed` on disk: the
+        // subscription follows the checkout, not the creation record.
+        assert_eq!(target.branch, "fix/renamed");
         assert_eq!(target.device_id, "local");
 
         // No worktree, no subscription — the empty set is what the model
@@ -502,6 +554,69 @@ mod tests {
         assert!(change_request_for_checkout("/repos/wt", "fix/other", [&stored]).is_none());
         assert!(change_request_for_checkout("/repos/other", "feature/pr", [&stored]).is_none());
         assert!(change_request_for_checkout("/repos/wt", "  ", [&stored]).is_none());
+    }
+
+    /// The host reports the symlink-resolved toplevel (`/private/var/...`),
+    /// an adopted worktree keeps the path the user gave (`/var/...`).
+    #[cfg(unix)]
+    #[test]
+    fn change_request_for_checkout_matches_across_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = temp.path().join("private/wt");
+        std::fs::create_dir_all(&resolved).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("private"), temp.path().join("var")).unwrap();
+        let linked = temp.path().join("var/wt");
+
+        let stored = snapshot("local", resolved.to_str().unwrap(), "checkout");
+        assert_eq!(
+            change_request_for_checkout(linked.to_str().unwrap(), "feature/pr", [&stored])
+                .map(|pr| pr.number),
+            Some(90)
+        );
+        // A different directory under the same symlinked parent still misses.
+        // It has to EXIST, or the miss proves nothing: canonicalization of a
+        // missing path fails and the comparison never runs.
+        std::fs::create_dir_all(temp.path().join("private/other")).unwrap();
+        assert!(
+            change_request_for_checkout(
+                temp.path().join("var/other").to_str().unwrap(),
+                "feature/pr",
+                [&stored]
+            )
+            .is_none()
+        );
+    }
+
+    /// The lookup runs per row per frame, so the blocking `realpath` must stay
+    /// behind the cheap scalar tests — and behind the shared cell.
+    #[test]
+    fn chat_lookup_keeps_canonicalization_off_the_render_path() {
+        let chat = with_source(
+            chat("chat", "local", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
+        let mut other_branch = snapshot("local", "/elsewhere", "checkout");
+        other_branch.branch = "feature/other".into();
+        let mut other_checkout = snapshot("local", "/elsewhere", "other-checkout");
+        other_checkout.branch = "feature/pr".into();
+        let other_device = snapshot("remote", "/elsewhere", "checkout");
+
+        // Device, branch and checkout each reject on their own: no syscall.
+        CANONICALIZE_CALLS.with(|calls| calls.set(0));
+        assert!(
+            change_request_for_chat(&chat, &[], [&other_branch, &other_checkout, &other_device])
+                .is_none()
+        );
+        assert_eq!(CANONICALIZE_CALLS.with(|calls| calls.get()), 0);
+
+        // Snapshots that do survive the cheap tests canonicalize `cwd` once,
+        // not once per snapshot — and `/repo` not existing ends it there.
+        let first = snapshot("local", "/a", "checkout");
+        let second = snapshot("local", "/b", "checkout");
+        let third = snapshot("local", "/c", "checkout");
+        CANONICALIZE_CALLS.with(|calls| calls.set(0));
+        assert!(change_request_for_chat(&chat, &[], [&first, &second, &third]).is_none());
+        assert_eq!(CANONICALIZE_CALLS.with(|calls| calls.get()), 1);
     }
 
     #[test]

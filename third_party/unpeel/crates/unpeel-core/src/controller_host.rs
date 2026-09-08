@@ -284,6 +284,28 @@ impl DiskCatalog {
                 "mcpBlocked": false,
                 "archivedSessionCount": archived_count,
             });
+            let checkout = git_checkout(&project.path);
+            // ONE verdict per project, decided here because the creation
+            // catalog below is built outside the wire object.
+            //
+            // `Models.swift:43` spells organization: a folder nested under a
+            // parent that names no branch. It is asked FIRST because a group
+            // inherits its parent's path (`create_group`), so disk would call
+            // it a worktree and "remove the label" would delete the parent's
+            // working tree.
+            let is_group = project.is_folder
+                && project.parent_id.is_some()
+                && project.worktree_branch.is_none();
+            // Registry first (what it was told at registration wins), then
+            // disk for the worktree added by hand in a terminal — but never
+            // on a record that IS organization, and never off a detached
+            // HEAD, whose short hash names no branch to launch or sign a PR
+            // with.
+            let worktree_branch = project.worktree_branch.clone().or_else(|| {
+                (!is_group && checkout.main_repo.is_some() && !checkout.detached)
+                    .then(|| checkout.branch.clone())
+                    .flatten()
+            });
             if let Some(object) = value.as_object_mut() {
                 if let Some(parent) = project.parent_id.as_deref() {
                     if folder_ids.contains(parent) {
@@ -292,7 +314,6 @@ impl DiskCatalog {
                         object.insert("parentProjectID".into(), parent.into());
                     }
                 }
-                let checkout = git_checkout(&project.path);
                 if let Some(branch) = checkout.branch.as_deref() {
                     object.insert("gitBranch".into(), branch.into());
                 }
@@ -302,16 +323,8 @@ impl DiskCatalog {
                 // reached the sidebar as a root folder beside the repository it
                 // is a checkout of. Disk knows; the registry still wins where it
                 // spoke.
-                match project.worktree_branch.as_deref() {
-                    Some(branch) => {
-                        object.insert("worktreeBranch".into(), branch.into());
-                    }
-                    None if checkout.main_repo.is_some() => {
-                        if let Some(branch) = checkout.branch.as_deref() {
-                            object.insert("worktreeBranch".into(), branch.into());
-                        }
-                    }
-                    None => {}
+                if let Some(branch) = worktree_branch.as_deref() {
+                    object.insert("worktreeBranch".into(), branch.into());
                 }
                 if project.parent_id.is_none() {
                     if let Some(parent) = checkout
@@ -327,10 +340,7 @@ impl DiskCatalog {
                 // `Models.swift:43` spells the canonical predicate with the
                 // branch clause, and `remove_group` already agrees; without it
                 // here the UI denied a worktree everything that names a path.
-                if project.is_folder
-                    && project.parent_id.is_some()
-                    && project.worktree_branch.is_none()
-                {
+                if is_group {
                     object.insert("isGroup".into(), true.into());
                 }
                 if date_sorted_projects.contains(&project.id) {
@@ -341,12 +351,13 @@ impl DiskCatalog {
             create_projects.push(HostCreateProject {
                 id: project.id.clone(),
                 path: project.path.clone(),
-                is_folder: project.is_folder && project.parent_id.is_some(),
-                worktree_path: project
-                    .worktree_branch
-                    .as_ref()
-                    .map(|_| project.path.clone()),
-                worktree_branch: project.worktree_branch.clone(),
+                // The creation catalog gets the SAME verdict the wire did:
+                // only organization is a folder (root folders never reach this
+                // loop), and a worktree carries the path/branch a launch has
+                // to echo back.
+                is_folder: is_group,
+                worktree_path: worktree_branch.as_ref().map(|_| project.path.clone()),
+                worktree_branch,
             });
         }
 
@@ -629,6 +640,8 @@ struct GitCheckout {
     /// `<main>/.git/worktrees/<name>`, so the main repository falls out of the
     /// path this reader already had to open.
     main_repo: Option<String>,
+    /// HEAD points at a commit, not a branch, so `branch` holds a short hash.
+    detached: bool,
 }
 
 /// Reads a checkout's HEAD. Follows a worktree `.git` file to the real
@@ -661,15 +674,20 @@ fn git_checkout(repo_path: &str) -> GitCheckout {
         checkout.main_repo = worktree_main_repo(&resolved);
         resolved.join("HEAD")
     };
+    let mut detached = false;
     checkout.branch = std::fs::read_to_string(head_path)
         .ok()
         .and_then(|head| match head.trim() {
             "" => None,
             head => Some(match head.strip_prefix("ref: refs/heads/") {
                 Some(branch) => branch.to_owned(),
-                None => head.chars().take(7).collect(),
+                None => {
+                    detached = true;
+                    head.chars().take(7).collect()
+                }
             }),
         });
+    checkout.detached = detached;
     checkout
 }
 
@@ -1630,6 +1648,7 @@ mod tests {
                 branch: Some("main".into()),
                 // An ordinary checkout belongs to no other project.
                 main_repo: None,
+                detached: false,
             }
         );
 
@@ -1648,13 +1667,20 @@ mod tests {
             GitCheckout {
                 branch: Some("feature/x".into()),
                 main_repo: Some(repo.to_string_lossy().into_owned()),
+                detached: false,
             }
         );
 
         std::fs::write(repo.join(".git/HEAD"), "abcdef1234567890\n").unwrap();
         assert_eq!(
-            git_checkout(repo.to_str().unwrap()).branch.as_deref(),
-            Some("abcdef1")
+            git_checkout(repo.to_str().unwrap()),
+            GitCheckout {
+                // `gitBranch` keeps saying what HEAD says; only `detached`
+                // tells the projection not to promote it to a worktree branch.
+                branch: Some("abcdef1".into()),
+                main_repo: None,
+                detached: true,
+            }
         );
 
         let empty = root.path().join("empty");

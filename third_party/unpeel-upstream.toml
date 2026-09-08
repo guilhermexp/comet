@@ -17,3 +17,13 @@ upstream_checked_at = "2026-09-07"
 upstream_head_observed = "7a0e18e"
 upstream_history_rewritten = true
 base_revision_resolves_upstream = false
+
+# 2026-09-08 — o cutover de identidade de worktree (openspec/changes/
+# unify-worktree-identity) tocou DOIS arquivos vendorizados:
+#   crates/unpeel-core/src/controller_host.rs  (já tinha modificação local)
+#   crates/unpeel-core/src/worktrees.rs        (primeira modificação local:
+#                                               extraiu `pub fn is_managed`)
+# `local_modifications_count = 31` acima NÃO foi recalculado: não achamos a
+# ferramenta que produziu esse número (não é a contagem de arquivos que diferem
+# de `216b61e8`, que hoje são 181), e chutar um valor aqui é pior que deixar o
+# antigo com esta nota. Quem retomar o sync recalcula pela ferramenta original.

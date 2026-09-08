@@ -30,9 +30,13 @@ pub fn workers_titlebar(
         };
     };
     let branch_is_worktree = project.worktree_branch.is_some();
+    // The registry's `worktree_branch` is the CREATION branch and never follows
+    // a `git switch` inside the worktree; `change_request_branch` is the same
+    // source the PR badge resolves from, so the title never names one branch
+    // while the badge points at another one's pull request.
     let branch = project
-        .worktree_branch
-        .clone()
+        .change_request_branch()
+        .map(str::to_owned)
         .or_else(|| project.git_branch.clone());
     let segments = match (parent, branch_is_worktree) {
         (Some(parent), true) => vec![parent.name.clone()],
@@ -585,6 +589,30 @@ mod tests {
         assert_eq!(titlebar.segments, [".orchestrator"]);
         assert_eq!(titlebar.branch.as_deref(), Some("master"));
         assert!(!titlebar.branch_is_worktree);
+    }
+
+    /// A `git switch` inside a worktree leaves `worktree_branch` on the branch
+    /// the worktree was created on. The badge already follows the disk, so the
+    /// title has to follow it too — otherwise the chrome names one branch and
+    /// the badge beside it opens another branch's pull request.
+    #[test]
+    fn workers_titlebar_follows_the_branch_checked_out_in_the_worktree() {
+        let project = WorkersProject {
+            id: "worktree".into(),
+            name: "fix".into(),
+            path: "/tmp/fix".into(),
+            folder_id: None,
+            parent_project_id: Some("project".into()),
+            is_group: false,
+            worktree_branch: Some("change/created".into()),
+            git_branch: Some("change/switched".into()),
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: Default::default(),
+        };
+        let titlebar = workers_titlebar(Some(&project), None);
+        assert_eq!(titlebar.branch.as_deref(), Some("change/switched"));
+        assert!(titlebar.branch_is_worktree);
     }
 
     #[test]

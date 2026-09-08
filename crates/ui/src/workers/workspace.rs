@@ -326,6 +326,72 @@ pub fn project_has_working_set(
         })
 }
 
+/// The project rows the sidebar draws, in the order given.
+///
+/// The three gates compose here rather than inline in the render so this can be
+/// exercised: the tree filter, the collapsed-parent walk, and the working set.
+///
+/// The selected project's tree survives the filter. Revealing a session from
+/// elsewhere (the Details widget, a worker notification) selects a project the
+/// filter may exclude, and a selection with no row is the one state the sidebar
+/// must never draw. Its ROOT, so the chain down to the selected worktree is
+/// drawn too — but only when something IS selected: `project_in_filter` with
+/// `None` means "no filter", which would pass every project and make the filter
+/// itself inert.
+pub fn sidebar_row_projects(
+    ordered: &[WorkersProject],
+    projects: &[WorkersProject],
+    sessions: &[WorkersSession],
+    expanded: &std::collections::HashSet<String>,
+    filter: Option<&str>,
+    selected_project_id: Option<&str>,
+    launcher_project_id: Option<&str>,
+) -> Vec<WorkersProject> {
+    let selected_root = selected_project_id.map(|id| root_project_id(id, projects));
+    ordered
+        .iter()
+        .filter(|project| {
+            (project_in_filter(project, projects, filter)
+                || selected_root
+                    .is_some_and(|root| project_in_filter(project, projects, Some(root))))
+                && project_visible(project, projects, expanded)
+                && project_has_working_set(
+                    project,
+                    projects,
+                    sessions,
+                    selected_project_id,
+                    launcher_project_id,
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The confirm the sidebar shows before removing a project row.
+///
+/// Each verb names what the host really does with the sessions, because that is
+/// the part the user cannot undo: `remove_worktree` DELETES the subtree's
+/// sessions and touches the checkout only while the app still owns it (for an
+/// adopted worktree the sessions are all it removes), `remove_project` deletes
+/// them too, and `remove_group` only archives them into the parent.
+pub fn remove_project_confirm_label(project: &WorkersProject, has_sessions: bool) -> &'static str {
+    if project.worktree_branch.is_some() {
+        if has_sessions {
+            "Remove worktree and sessions?"
+        } else {
+            "Remove worktree?"
+        }
+    // Same verdict the dispatch in `Model::remove_project` uses, so the label
+    // never promises a group removal the host would refuse.
+    } else if project.is_group {
+        "Remove group?"
+    } else if has_sessions {
+        "Remove project and sessions?"
+    } else {
+        "Remove project?"
+    }
+}
+
 /// Newest SETTLE per project, folded up the parent chain.
 ///
 /// A group owns no sessions of its own, so without the fold every folder would
@@ -959,15 +1025,7 @@ impl WorkersSidebar {
             .as_ref()
             .is_some_and(|candidate| candidate.id == project.id)
         {
-            let label = if project.worktree_branch.is_some() {
-                "Remove worktree?"
-            } else if project.parent_project_id.is_some() {
-                "Remove group?"
-            } else if sessions.is_empty() {
-                "Remove project?"
-            } else {
-                "Remove project and sessions?"
-            };
+            let label = remove_project_confirm_label(&project, !sessions.is_empty());
             return div()
                 .id(("workers-project-remove-confirm", index))
                 .min_h(px(30.0))
@@ -1205,30 +1263,38 @@ impl WorkersSidebar {
                             })
                             .child(project_name),
                     )
-                    .when_some(project.worktree_branch.clone(), |el, branch| {
-                        el.child(
-                            div()
-                                .max_w(px(110.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(3.0))
-                                .opacity(0.55)
-                                .child(
-                                    icon(icons::WORKER_BRANCH)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .when(branch != project.name, |el| {
-                                    el.child(
-                                        div()
-                                            .truncate()
-                                            .text_size(px(10.0))
-                                            .text_color(theme.text_muted)
-                                            .child(branch),
+                    // Same source the PR badge on this row resolves from: the
+                    // registry's `worktree_branch` is the creation branch and
+                    // never follows a `git switch` inside the worktree, so
+                    // reading it here labelled one branch next to another
+                    // branch's pull request.
+                    .when_some(
+                        project.change_request_branch().map(str::to_owned),
+                        |el, branch| {
+                            el.child(
+                                div()
+                                    .max_w(px(110.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .opacity(0.55)
+                                    .child(
+                                        icon(icons::WORKER_BRANCH)
+                                            .size(px(12.0))
+                                            .text_color(theme.text_muted),
                                     )
-                                }),
-                        )
-                    })
+                                    .when(branch != project.name, |el| {
+                                        el.child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(10.0))
+                                                .text_color(theme.text_muted)
+                                                .child(branch),
+                                        )
+                                    }),
+                            )
+                        },
+                    )
                     // Outside the branch chip on purpose: that container is
                     // faded to 0.55, and the badge's whole job is a state
                     // colour that has to read at full strength.
@@ -1669,46 +1735,33 @@ impl Render for WorkersSidebar {
         // Presentation-only projection: the snapshot keeps the host's order, so
         // the persisted sibling order and per-project session sort on disk are
         // untouched.
-        // The selected project's tree survives the filter. Revealing a session
-        // from elsewhere (the Details widget, a worker notification) selects a
-        // project the filter may exclude, and a selection with no row is the
-        // one state the sidebar must never draw. Its ROOT, so the chain down
-        // to the selected worktree is drawn too.
-        let selected_root = selected_project_id
-            .as_deref()
-            .map(|id| root_project_id(id, &projects).to_owned());
         let ordered_projects = projects_ordered_by_activity(&projects, &all_sessions);
-        let rows = ordered_projects
-            .iter()
-            .filter(|project| {
-                (project_in_filter(project, &projects, project_filter.as_deref())
-                    || project_in_filter(project, &projects, selected_root.as_deref()))
-                    && project_visible(project, &projects, &expanded)
-                    && project_has_working_set(
-                        project,
-                        &projects,
-                        &all_sessions,
-                        selected_project_id.as_deref(),
-                        launcher_project_id.as_deref(),
-                    )
-            })
-            .cloned()
-            .enumerate()
-            .map(|(index, project)| {
-                let sessions = project_sessions_sorted(&project, &all_sessions);
-                self.render_project(
-                    project.clone(),
-                    sessions,
-                    presets.clone(),
-                    expanded.contains(&project.id),
-                    selected_session_id.as_deref(),
-                    project_depth(&project, &projects),
-                    index,
-                    &theme,
-                    cx,
-                )
-            })
-            .collect::<Vec<_>>();
+        let rows = sidebar_row_projects(
+            &ordered_projects,
+            &projects,
+            &all_sessions,
+            &expanded,
+            project_filter.as_deref(),
+            selected_project_id.as_deref(),
+            launcher_project_id.as_deref(),
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, project)| {
+            let sessions = project_sessions_sorted(&project, &all_sessions);
+            self.render_project(
+                project.clone(),
+                sessions,
+                presets.clone(),
+                expanded.contains(&project.id),
+                selected_session_id.as_deref(),
+                project_depth(&project, &projects),
+                index,
+                &theme,
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
 
         let filter_row = self.render_projects_filter(&theme, cx);
 
@@ -4609,7 +4662,8 @@ mod ordering_tests {
         ProjectsMenuRow, SESSION_ROW_CAP, compare_sessions_by_activity, project_activity,
         project_has_working_set, project_in_filter, project_session_row_plan,
         project_sessions_sorted, project_visible, projects_menu_rows, projects_ordered_by_activity,
-        prune_revealed_projects, root_project_id,
+        prune_revealed_projects, remove_project_confirm_label, root_project_id,
+        sidebar_row_projects,
     };
     use zeron_workers_unpeel::{
         WorkersProject, WorkersSession, WorkersSessionCapabilities, WorkersSessionSort,
@@ -4638,6 +4692,31 @@ mod ordering_tests {
         project
     }
 
+    /// Removing a worktree row deletes every session under it, and for an
+    /// adopted checkout that is ALL it deletes — the confirm that used to be
+    /// silent about sessions was the one that only removed sessions.
+    #[test]
+    fn the_worktree_confirm_names_the_sessions_it_deletes() {
+        assert_eq!(
+            remove_project_confirm_label(&worktree("wt", "root"), true),
+            "Remove worktree and sessions?"
+        );
+        assert_eq!(
+            remove_project_confirm_label(&worktree("wt", "root"), false),
+            "Remove worktree?"
+        );
+        // A group only archives its sessions into the parent, so it keeps the
+        // shorter question.
+        assert_eq!(
+            remove_project_confirm_label(&project("group", Some("root")), true),
+            "Remove group?"
+        );
+        assert_eq!(
+            remove_project_confirm_label(&project("root", None), true),
+            "Remove project and sessions?"
+        );
+    }
+
     #[test]
     fn project_filter_keeps_the_subtree_of_the_picked_project() {
         // Filtering to a project must keep what hangs off it: dropping the
@@ -4664,28 +4743,85 @@ mod ordering_tests {
         assert_eq!(all.len(), projects.len());
     }
 
+    fn row_ids(rows: &[WorkersProject]) -> Vec<&str> {
+        rows.iter().map(|project| project.id.as_str()).collect()
+    }
+
     #[test]
     fn project_filter_never_hides_the_selected_project() {
         // Revealing a session from the Details widget or a notification
         // selects a project the filter may exclude; a selection with no row is
-        // the one state the sidebar must not draw.
+        // the one state the sidebar must not draw. Through the real gate, so
+        // the working set is part of the verdict.
         let projects = vec![
             project("alpha", None),
             project("beta", None),
             worktree("beta-wt", "beta"),
         ];
-        let selected_root = root_project_id("beta-wt", &projects).to_owned();
-        assert_eq!(selected_root, "beta");
+        assert_eq!(root_project_id("beta-wt", &projects), "beta");
+        let sessions = vec![
+            session("s-alpha", "alpha", 100, 100),
+            session("s-wt", "beta-wt", 100, 100),
+        ];
+        let expanded = std::collections::HashSet::from(["beta".to_owned()]);
 
-        let kept: Vec<&str> = projects
-            .iter()
-            .filter(|candidate| {
-                project_in_filter(candidate, &projects, Some("alpha"))
-                    || project_in_filter(candidate, &projects, Some(selected_root.as_str()))
-            })
-            .map(|candidate| candidate.id.as_str())
-            .collect();
-        assert_eq!(kept, vec!["alpha", "beta", "beta-wt"]);
+        let rows = sidebar_row_projects(
+            &projects,
+            &projects,
+            &sessions,
+            &expanded,
+            Some("alpha"),
+            Some("beta-wt"),
+            None,
+        );
+        assert_eq!(row_ids(&rows), vec!["alpha", "beta", "beta-wt"]);
+    }
+
+    #[test]
+    fn filtering_to_an_empty_root_draws_that_root_alone() {
+        // The pick re-aims the selection (`selection_after_filter`), and an
+        // empty root is exactly the project the user is about to launch into,
+        // so it keeps its row while the busy root it replaced drops out.
+        let projects = vec![
+            project("alpha", None),
+            project("beta", None),
+            worktree("beta-wt", "beta"),
+        ];
+        let sessions = vec![session("s-wt", "beta-wt", 100, 100)];
+        let expanded = std::collections::HashSet::from(["beta".to_owned()]);
+
+        let rows = sidebar_row_projects(
+            &projects,
+            &projects,
+            &sessions,
+            &expanded,
+            Some("alpha"),
+            Some("alpha"),
+            None,
+        );
+        assert_eq!(row_ids(&rows), vec!["alpha"]);
+    }
+
+    #[test]
+    fn a_filter_with_nothing_selected_still_filters() {
+        // `project_in_filter(_, None)` means "no filter": reusing it for the
+        // selected root would pass every project and make the pick inert.
+        let projects = vec![project("alpha", None), project("beta", None)];
+        let sessions = vec![
+            session("s-alpha", "alpha", 100, 100),
+            session("s-beta", "beta", 100, 100),
+        ];
+
+        let rows = sidebar_row_projects(
+            &projects,
+            &projects,
+            &sessions,
+            &std::collections::HashSet::new(),
+            Some("alpha"),
+            None,
+            None,
+        );
+        assert_eq!(row_ids(&rows), vec!["alpha"]);
     }
 
     #[test]
