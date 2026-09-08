@@ -39,6 +39,13 @@ const GIT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Hard wall-clock ceiling for a folder listing (the walk runs in a disposable
 /// blocking task; on expiry the caller unblocks and the task is abandoned).
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
+/// Ceiling on the fallback recursive delete of a worktree directory. It has to
+/// fit INSIDE the `DeleteWorktree` deadline (no `deadline_secs`, so the 30s
+/// default in `rpc::method`), which also has to cover the porcelain listing,
+/// the path resolution, `worktree remove`, the prune and the branch delete —
+/// on a forwarded call across devices. 10s leaves that headroom while still
+/// being generous for a large checkout on a healthy disk.
+const WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
 /// Cap on returned drives (a machine with more mounts than this is a server
@@ -565,25 +572,12 @@ impl Repos {
         }
 
         let current = self.current_branch(repo_path).await.ok();
-        let mut worktrees: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        if let Ok(out) = self
-            .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+        let worktrees: HashMap<String, String> = self
+            .linked_worktrees(repo_path)
             .await
-        {
-            let mut stanza = 0usize;
-            let mut path: Option<String> = None;
-            for line in out.lines().map(str::trim) {
-                if let Some(p) = line.strip_prefix("worktree ") {
-                    stanza += 1;
-                    path = (stanza > 1).then(|| p.to_string());
-                } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
-                    && let Some(path) = path.take()
-                {
-                    worktrees.insert(branch.to_string(), path);
-                }
-            }
-        }
+            .into_iter()
+            .filter_map(|entry| Some((entry.branch?, entry.path)))
+            .collect();
         Ok(names
             .into_iter()
             .map(|name| {
@@ -694,51 +688,70 @@ impl Repos {
     }
 
     /// Whether `candidate` is the repository root or one of its linked
-    /// worktrees. Filesystem resolution happens on a disposable thread because
-    /// user-selected paths may be dead mounts.
+    /// worktrees, and still exists. Filesystem resolution happens on a
+    /// disposable thread because user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
-        self.authorized_checkout(repo_path, candidate, true).await
+        self.resolve_checkout(repo_path, candidate, CheckoutQuery::Workspace)
+            .await
+            .map(|(path, _)| path)
     }
 
-    /// Whether `candidate` is one of the repository's linked worktrees — the
-    /// root is REJECTED. Deletion resolves through this: `git worktree remove`
-    /// refuses the main checkout and any unrelated folder, which is precisely
-    /// where a fallback that deletes the directory outright must never land.
-    pub async fn linked_worktree_checkout(
+    /// The linked worktrees of `repo_path` as git itself registers them — the
+    /// main checkout excluded. Read from `git worktree list --porcelain`, so a
+    /// detached checkout is listed too (it just has no branch), and so is one
+    /// whose directory has already vanished (until `worktree prune` runs).
+    async fn linked_worktrees(&self, repo_path: &Path) -> Vec<WorktreeEntry> {
+        self.git(&["worktree", "list", "--porcelain"], Some(repo_path))
+            .await
+            .map(|out| parse_worktree_list(&out).into_iter().skip(1).collect())
+            .unwrap_or_default()
+    }
+
+    /// Resolve `candidate` to a checkout of this repository, together with the
+    /// branch that checkout holds (`None` when detached, or for the root).
+    /// What counts as a hit depends on the [`CheckoutQuery`].
+    ///
+    /// Authorization follows the registration, never the branch: a worktree in
+    /// detached HEAD is still a worktree of this repository. Deletion resolves
+    /// through here, because `git worktree remove` refuses the main checkout
+    /// and any unrelated folder, which is precisely where a fallback that
+    /// deletes the directory outright must never land.
+    ///
+    /// Path resolution runs on a disposable thread under [`PATH_EXISTS_TIMEOUT`]
+    /// because user-selected paths may be dead mounts: the thread is isolated,
+    /// but the oneshot it answers on is not, so without the ceiling the FIRST
+    /// step of `DeleteWorktree` is the one that pins the RPC forever.
+    async fn resolve_checkout(
         &self,
         repo_path: &Path,
         candidate: &Path,
-    ) -> Option<PathBuf> {
-        self.authorized_checkout(repo_path, candidate, false).await
-    }
-
-    async fn authorized_checkout(
-        &self,
-        repo_path: &Path,
-        candidate: &Path,
-        allow_root: bool,
-    ) -> Option<PathBuf> {
+        query: CheckoutQuery,
+    ) -> Option<(PathBuf, Option<String>)> {
+        let worktrees = self.linked_worktrees(repo_path).await;
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
-        let worktrees: Vec<_> = self
-            .refs(&repo_path)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.worktree_path.map(PathBuf::from))
-            .collect();
-        disposable_worker("checkout-auth", move || {
-            let candidate = std::fs::canonicalize(candidate).ok()?;
-            allow_root
-                .then_some(repo_path)
+        let worker = disposable_worker("checkout-auth", move || {
+            // "Is this an authorized checkout that EXISTS": a path that no
+            // longer resolves is not one, and answering otherwise would widen
+            // the RPC boundary into an arbitrary path probe (see `rpc.rs`).
+            if query == CheckoutQuery::Workspace && std::fs::canonicalize(&candidate).is_err() {
+                return None;
+            }
+            let resolved = canonicalize_lossy(&candidate);
+            let same = |path: &Path| canonicalize_lossy(path) == resolved;
+            if query == CheckoutQuery::Workspace && same(&repo_path) {
+                return Some((resolved, None));
+            }
+            worktrees
                 .into_iter()
-                .chain(worktrees)
-                .filter_map(|path| std::fs::canonicalize(path).ok())
-                .any(|path| path == candidate)
-                .then_some(candidate)
-        })
-        .await
-        .flatten()
+                .find(|entry| same(Path::new(&entry.path)))
+                .map(|entry| (resolved, entry.branch))
+        });
+        tokio::time::timeout(PATH_EXISTS_TIMEOUT, worker)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     /// Switch the checkout at `cwd` (a main folder OR a linked worktree) to
@@ -917,54 +930,99 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
-    /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) — the
-    /// user may have checked out their own branch inside the worktree.
+    /// Remove one linked worktree, then prune stale refs. Fails when the
+    /// removal ran and did not succeed — a checkout still on disk is not a
+    /// deletion, and only the caller can act on that.
+    ///
+    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) —
+    /// the user may have checked out their own branch inside the worktree —
+    /// and only once the checkout is provably gone.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
-        // Nothing on disk means nothing to delete: skip straight to the prune,
-        // which touches only git's own bookkeeping.
-        let branch = if worktree_path.exists() {
-            // Resolve BEFORE removing. `git worktree remove` refuses the main
-            // checkout and any unrelated folder, and the fallback below would
-            // then delete that folder recursively — with `worktreePath` coming
-            // from the caller (the method is forwardable, so from another
-            // device too), that is the user's checkout.
-            let worktree_path = self
-                .linked_worktree_checkout(repo_path, worktree_path)
-                .await
-                .ok_or_else(|| {
-                    EngineError::Other("not a linked worktree of this repository".into())
-                })?;
-            let branch = self
-                .current_branch(&worktree_path)
-                .await
-                .unwrap_or_default();
-            let removed = self
-                .git(
-                    &[
-                        "worktree",
-                        "remove",
-                        "--force",
-                        &worktree_path.to_string_lossy(),
-                    ],
-                    Some(repo_path),
-                )
-                .await;
-            if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder
-                // directly. Safe now: the path is a resolved linked worktree.
-                let _ = std::fs::remove_dir_all(&worktree_path);
+        // Resolve BEFORE removing: with `worktree_path` coming from the caller
+        // (the method is forwardable, so from another device too), an unrelated
+        // folder must never reach the recursive delete below. The registration
+        // also carries the branch, which outlives the directory — that is how a
+        // `zeron/…` branch still gets pruned once the folder is already gone.
+        let resolved = self
+            .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
+            .await;
+        // A removal that never ran must not pass as a success: the folder is
+        // still there and only the caller can act on that.
+        let branch = match resolved {
+            Some((path, branch)) => {
+                let removed = self
+                    .git(
+                        &["worktree", "remove", "--force", &path.to_string_lossy()],
+                        Some(repo_path),
+                    )
+                    .await
+                    .is_ok();
+                // git reports success only after the checkout is gone; anything
+                // else has to be proven by the fallback below.
+                let removed = if removed {
+                    true
+                } else {
+                    // git refused (or the dir is half-gone) — delete the folder
+                    // directly. Safe now: the path is a resolved linked
+                    // worktree. Off the executor under a ceiling: a big
+                    // checkout takes a while, a dead mount takes forever.
+                    let target = path;
+                    let worker = disposable_worker("worktree-rm", move || {
+                        match std::fs::remove_dir_all(&target) {
+                            Ok(()) => Ok(true),
+                            // Nothing there — but "deleted" and "out of reach"
+                            // both read as NotFound, and an unmounted volume
+                            // reports it for the whole subtree. Only a missing
+                            // leaf under a parent that IS still there proves
+                            // the checkout is gone for good.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(target.parent().is_some_and(Path::exists))
+                            }
+                            // Permission, EIO, a file still in use: the removal
+                            // ran and failed. Say so instead of reporting ok.
+                            Err(e) => Err(format!("could not remove the worktree folder: {e}")),
+                        }
+                    });
+                    match tokio::time::timeout(WORKTREE_REMOVE_TIMEOUT, worker).await {
+                        Ok(Some(Ok(removed))) => removed,
+                        Ok(Some(Err(error))) => return Err(EngineError::Other(error)),
+                        Ok(None) => {
+                            return Err(EngineError::Other(
+                                "worktree removal worker could not run on the device".into(),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(EngineError::Other(
+                                "worktree removal timed out on the device".into(),
+                            ));
+                        }
+                    }
+                };
+                // The branch outlives the directory, but `-D` skips the
+                // unmerged check: dropping it while the checkout is merely
+                // unreachable (unmounted volume, moved folder) orphans every
+                // commit that was never pushed. Only delete it once the
+                // checkout is provably gone.
+                branch.filter(|_| removed)
             }
-            branch
-        } else {
-            String::new()
+            None => {
+                // Unregistered. A folder still on disk is somebody else's
+                // checkout: refuse. Nothing on disk is just stale bookkeeping —
+                // prune it. Probed under a ceiling, like every other path here.
+                if Self::path_exists(worktree_path).await {
+                    return Err(EngineError::Other(
+                        "not a linked worktree of this repository".into(),
+                    ));
+                }
+                None
+            }
         };
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("zeron/") {
+        if let Some(branch) = branch.filter(|branch| branch.starts_with("zeron/")) {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
@@ -1689,6 +1747,67 @@ fn parse_history_refs(output: &str) -> HashMap<String, Vec<GitHistoryRef>> {
     refs_by_sha
 }
 
+/// What a checkout lookup is asking — two different questions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckoutQuery {
+    /// "Is this an authorized checkout that exists?" The repository root
+    /// counts, and a path that no longer resolves does not: this answers a
+    /// forwardable RPC, which must never become an arbitrary path probe.
+    Workspace,
+    /// "Which linked-worktree registration does this path name?" The root is
+    /// rejected, and a registration whose directory is already gone still
+    /// matches — nothing to delete there, but its branch stays prunable.
+    Registration,
+}
+
+/// One checkout in git's worktree registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeEntry {
+    path: String,
+    /// The branch checked out there; `None` for a detached HEAD.
+    branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain`. Every stanza opens with
+/// `worktree <path>`; the last line is `branch refs/heads/<name>` OR `detached`
+/// (and a stale registration adds `prunable`), so the checkout is defined by
+/// its `worktree` line alone. The main checkout is always the first stanza.
+fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    for line in output.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            entries.push(WorktreeEntry {
+                path: path.to_string(),
+                branch: None,
+            });
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+            && let Some(entry) = entries.last_mut()
+        {
+            entry.branch = Some(branch.to_string());
+        }
+    }
+    entries
+}
+
+/// Canonicalize `path`, falling back to the deepest ancestor that still
+/// exists with the missing tail re-attached.
+///
+/// Comparing two spellings of the same directory is the whole job here: git
+/// records the fully resolved path in its worktree registry while the app
+/// hands back the raw join of the worktrees root, so any symlinked component
+/// (on macOS the temp/volume root itself) makes the literals differ. Falling
+/// back to the raw literal when the directory is already gone would therefore
+/// miss exactly the case that matters — an orphan registration to prune.
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_) => match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => canonicalize_lossy(parent).join(name),
+            _ => path.to_path_buf(),
+        },
+    }
+}
+
 /// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -1735,6 +1854,232 @@ mod tests {
         assert!(
             err.contains("not a git repository"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn worktree_list_keeps_detached_and_prunable_stanzas() {
+        let entries = parse_worktree_list(
+            "\
+worktree /repo
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /wt/detached
+HEAD 2222222222222222222222222222222222222222
+detached
+
+worktree /wt/gone
+HEAD 3333333333333333333333333333333333333333
+branch refs/heads/zeron/lucky-otter
+prunable gitdir file points to non-existent location
+",
+        );
+        let rows: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.branch.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("/repo", Some("main")),
+                ("/wt/detached", None),
+                ("/wt/gone", Some("zeron/lucky-otter")),
+            ]
+        );
+    }
+
+    /// Every git call answers with the same porcelain and records its argv.
+    /// `refuse` is an argv prefix this git fails on — without it every call
+    /// succeeds, and the `worktree remove` fallback is never reached.
+    struct FakeGit {
+        porcelain: String,
+        refuse: &'static [&'static str],
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl FakeGit {
+        fn new(porcelain: String, refuse: &'static [&'static str]) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                porcelain,
+                refuse,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn called(&self, argv: &[&str]) -> bool {
+            self.calls.lock().unwrap().iter().any(|args| args == argv)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for FakeGit {
+        async fn run(&self, r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+            self.calls.lock().unwrap().push(r.args.clone());
+            let refused = !self.refuse.is_empty()
+                && r.args.len() >= self.refuse.len()
+                && (self.refuse.iter())
+                    .zip(&r.args)
+                    .all(|(want, got)| *want == got.as_str());
+            Ok(ProcessOutput {
+                success: !refused,
+                stdout: if refused {
+                    Vec::new()
+                } else {
+                    self.porcelain.clone().into_bytes()
+                },
+                stderr: if refused {
+                    b"fatal: refused".to_vec()
+                } else {
+                    Vec::new()
+                },
+                stdout_truncated: false,
+            })
+        }
+    }
+
+    /// A detached worktree has no `branch` line, and a deleted one has no
+    /// directory left — neither may cost it its authorization or its branch.
+    /// The checkouts are reached through a symlinked parent, because that is
+    /// the real shape: git registers the fully resolved path while the app
+    /// hands back the raw join of the worktrees root.
+    #[tokio::test]
+    async fn detached_and_vanished_worktrees_stay_deletable() {
+        let data = tempfile::tempdir().unwrap();
+        let real = data.path().join("real");
+        let link = data.path().join("link");
+        std::fs::create_dir_all(real.join("repo")).unwrap();
+        std::fs::create_dir_all(real.join("detached")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = link.join("repo");
+        let detached = link.join("detached");
+        let gone = link.join("gone");
+        // What git actually emits: paths with every symlink resolved, the
+        // vanished stanza included.
+        // Spelled out with `std::fs` on purpose: building it through the
+        // production helper would make this test agree with itself.
+        let as_git_reports = |path: &Path| {
+            std::fs::canonicalize(path)
+                .unwrap_or_else(|_| {
+                    std::fs::canonicalize(path.parent().unwrap())
+                        .unwrap()
+                        .join(path.file_name().unwrap())
+                })
+                .display()
+                .to_string()
+        };
+        // `worktree remove` refuses a stanza whose directory is already gone,
+        // so the recursive-delete fallback is what actually runs here.
+        let git = FakeGit::new(
+            format!(
+                "worktree {}\nbranch refs/heads/main\n\nworktree {}\ndetached\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\nprunable gitdir file points to non-existent location\n",
+                as_git_reports(&root),
+                as_git_reports(&detached),
+                as_git_reports(&gone),
+            ),
+            &["worktree", "remove"],
+        );
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        assert!(
+            repos
+                .resolve_checkout(&root, &detached, CheckoutQuery::Registration)
+                .await
+                .is_some(),
+            "a detached worktree is still a linked worktree"
+        );
+        assert!(
+            repos
+                .resolve_checkout(&root, &root, CheckoutQuery::Registration)
+                .await
+                .is_none(),
+            "the main checkout is not a linked worktree"
+        );
+        assert!(
+            repos.workspace_checkout(&root, &root).await.is_some(),
+            "the repository root is a workspace checkout"
+        );
+        let dead = link.join("dead-mount");
+        assert!(
+            repos.workspace_checkout(&dead, &dead).await.is_none(),
+            "a path that no longer exists must never authorize itself"
+        );
+
+        repos.delete_worktree(&root, &gone).await.unwrap();
+        assert!(
+            git.called(&["branch", "-D", "zeron/lucky-otter"]),
+            "the orphan branch of a deleted worktree must still be pruned: {:?}",
+            git.calls.lock().unwrap()
+        );
+    }
+
+    /// A checkout that is merely UNREACHABLE — its whole parent subtree is
+    /// missing, as when the volume holding it is unmounted or the folder was
+    /// moved — is not a checkout that was deleted. `branch -D` skips the
+    /// unmerged check, so dropping the branch here strands every commit that
+    /// worktree never pushed, and remounting brings back a tree with no ref.
+    #[tokio::test]
+    async fn unreachable_worktree_keeps_its_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(data.path()).unwrap();
+        let root = data.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // Nothing under `volume/` exists — the mount is gone, not the checkout.
+        let unmounted = data.path().join("volume").join("wt");
+        let git = FakeGit::new(
+            format!(
+                "worktree {}\nbranch refs/heads/main\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\n",
+                base.join("repo").display(),
+                base.join("volume").join("wt").display(),
+            ),
+            &["worktree", "remove"],
+        );
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        repos.delete_worktree(&root, &unmounted).await.unwrap();
+        assert!(
+            !git.called(&["branch", "-D", "zeron/lucky-otter"]),
+            "an unreachable worktree must keep its branch: {:?}",
+            git.calls.lock().unwrap()
+        );
+    }
+
+    /// A recursive delete that RAN and FAILED is not a removal: report the
+    /// error rather than an ok, and touch neither the registration nor the
+    /// branch. A regular file at the registered path stands in for the
+    /// permission / EIO / still-in-use cases — `remove_dir_all` fails on it
+    /// with something other than `NotFound`.
+    #[tokio::test]
+    async fn failed_removal_is_reported_and_keeps_the_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(data.path()).unwrap();
+        let root = data.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked = data.path().join("wt");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let git = FakeGit::new(
+            format!(
+                "worktree {}\nbranch refs/heads/main\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\n",
+                base.join("repo").display(),
+                base.join("wt").display(),
+            ),
+            &["worktree", "remove"],
+        );
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        let error = repos
+            .delete_worktree(&root, &blocked)
+            .await
+            .expect_err("a removal that failed must not report success");
+        assert!(
+            error.to_string().contains("could not remove the worktree"),
+            "the real filesystem error must surface: {error}"
+        );
+        assert!(
+            !git.called(&["worktree", "prune"])
+                && !git.called(&["branch", "-D", "zeron/lucky-otter"]),
+            "nothing was removed, so nothing may be pruned: {:?}",
+            git.calls.lock().unwrap()
         );
     }
 
