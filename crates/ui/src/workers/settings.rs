@@ -390,6 +390,13 @@ pub fn format_model_label(raw: &str) -> String {
     capitalized.join(" ")
 }
 
+/// Cache key for a preset: the bare CLI binary, so presets sharing a CLI share
+/// one lookup.
+fn cli_head<'a>(cli_id: Option<&'a str>, command: &'a str) -> &'a str {
+    let raw = cli_id.unwrap_or(command);
+    raw.split_whitespace().next().unwrap_or(raw)
+}
+
 pub fn detect_cli_default_model(cli_or_cmd: &str) -> (String, String) {
     let head = cli_or_cmd.split_whitespace().next().unwrap_or(cli_or_cmd);
     let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
@@ -569,6 +576,11 @@ pub struct WorkersSettingsView {
     expanded_resource_sessions: HashSet<String>,
     open_model_menu_preset_id: Option<String>,
     dynamic_models: HashMap<String, Vec<(String, String)>>,
+    /// Default-model label per CLI head, filled on the first render of the
+    /// presets screen and dropped when that screen is left.
+    /// ponytail: no fs watcher — a CLI config edited on disk while the screen
+    /// is open shows the old label until the user navigates away and back.
+    cli_default_models: HashMap<String, String>,
     _model_fetch_task: Option<Task<()>>,
     _model_observation: Subscription,
     _resource_observation: Subscription,
@@ -585,11 +597,14 @@ impl WorkersSettingsView {
             }
         });
         let observed_monitor = resource_monitor.clone();
-        let model_observation = cx.observe(&model, move |_, model, cx| {
-            let details_requested = matches!(
-                model.read(cx).route,
-                WorkersRoute::Settings(WorkersSettingsTab::Resources)
-            );
+        let model_observation = cx.observe(&model, move |this: &mut Self, model, cx| {
+            let route = model.read(cx).route;
+            let details_requested =
+                matches!(route, WorkersRoute::Settings(WorkersSettingsTab::Resources));
+            if !matches!(route, WorkersRoute::Settings(WorkersSettingsTab::Presets)) {
+                // Drop the cached CLI defaults so the next visit re-reads the configs.
+                this.cli_default_models.clear();
+            }
             observed_monitor.update(cx, |monitor, cx| {
                 monitor.set_details_requested(details_requested, cx)
             });
@@ -616,6 +631,7 @@ impl WorkersSettingsView {
             expanded_resource_sessions: HashSet::new(),
             open_model_menu_preset_id: None,
             dynamic_models: HashMap::new(),
+            cli_default_models: HashMap::new(),
             _model_fetch_task: None,
             _model_observation: model_observation,
             _resource_observation: resource_observation,
@@ -797,6 +813,15 @@ impl WorkersSettingsView {
             .as_ref()
             .map(|settings| settings.runtimes.clone())
             .unwrap_or_default();
+        // One disk read per CLI per screen visit: fill the cache up front so the
+        // lazy row iterator below only looks labels up.
+        for preset in &presets {
+            let key = cli_head(preset.cli_id.as_deref(), &preset.command);
+            if !self.cli_default_models.contains_key(key) {
+                let (_, label) = detect_cli_default_model(key);
+                self.cli_default_models.insert(key.to_string(), label);
+            }
+        }
         let rows = presets.into_iter().enumerate().map(|(index, preset)| {
             let provider_icon =
                 runtime_icon_path(preset.cli_id.as_deref(), Some(preset.command.as_str()));
@@ -810,8 +835,11 @@ impl WorkersSettingsView {
             let enabled = preset.enabled;
 
             let current_model_id = extract_model_from_command(&preset.command);
-            let (_default_id, default_label) =
-                detect_cli_default_model(preset.cli_id.as_deref().unwrap_or(&preset.command));
+            let default_label = self
+                .cli_default_models
+                .get(cli_head(preset.cli_id.as_deref(), &preset.command))
+                .cloned()
+                .unwrap_or_else(|| "Default".to_string());
 
             let mut models =
                 self.available_models_for_preset(preset.cli_id.as_deref(), &preset.command);
@@ -2419,6 +2447,15 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id == "anthropic/claude-sonnet-5")
         );
+    }
+
+    #[test]
+    fn cli_head_collapses_presets_of_the_same_cli() {
+        use super::cli_head;
+
+        assert_eq!(cli_head(Some("claude"), "claude --plan"), "claude");
+        assert_eq!(cli_head(None, "claude --plan"), "claude");
+        assert_eq!(cli_head(None, "codex"), "codex");
     }
 
     #[test]
