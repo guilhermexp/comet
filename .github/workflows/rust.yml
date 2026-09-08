@@ -1,0 +1,81 @@
+name: rust
+
+# The Rust suite had no CI at all: deploy.yml only covers edge/ (npm), and
+# release.yml only builds binaries on tag. This job runs `cargo test
+# --workspace` on every push/PR to main so the suite stops depending on
+# whoever remembers to run it locally.
+#
+# Runner: ubuntu-24.04, with the apt recipe copied from release.yml's linux
+# job. This is an UNVERIFIED bet, not a proven setup: release.yml has never run
+# (no `v*` tag was ever pushed and `gh run list -R guilhermexp/comet` shows
+# only deploy runs), so no Linux build of this tree exists yet. What we do
+# know is static: every macOS-only dependency is behind
+# `[target.'cfg(target_os = "macos")'.dependencies]` (crates/ui, crates/sync),
+# `native_document` is a cfg-gated module, and the cfg branches in crates/ui
+# all carry Linux arms. The first run of this job is what turns that into
+# evidence — if the workspace does not build on Linux, move this job to
+# macos-latest (~10x the minutes) instead of patching around it.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "openspec/**"]
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "openspec/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    # Cold build is huge: 929 packages in Cargo.lock, gpui pinned to a zed fork
+    # by git rev, and `[profile.dev.package."*"] opt-level = 2` optimizes every
+    # dependency (a local target/debug is 34 GB). 45 min was not enough to ever
+    # reach a populated cache; give the first run room and let the cache make
+    # the later ones fast.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Without this the default (false) means a run that fails or hits the
+          # timeout saves no cache at all, so the next run starts cold again and
+          # the job can never establish itself.
+          cache-on-failure: true
+          # third_party/unpeel/crates is a separate workspace with its own
+          # target dir (see the vendored test step below).
+          workspaces: |
+            . -> target
+            third_party/unpeel/crates -> target
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: test
+        # crates/ui/tests/native_preview_focus.rs (harness = false) is a no-op
+        # on this runner no matter what: its real `main` is
+        # `#[cfg(target_os = "macos")]`, so on Linux the `not(macos)` main just
+        # prints "SKIPPED: native preview focus requires macOS" and
+        # ZERON_NATIVE_PREVIEW_FOCUS_TEST is never read. That env var only gates
+        # the macOS branch, which drives a real AppKit window and needs a
+        # logged-in window server session — so it is run by hand on a macOS
+        # desktop, not here.
+        run: cargo test --workspace
+      - name: test vendored unpeel
+        # The root Cargo.toml `exclude`s third_party/unpeel, so `--workspace`
+        # above does not see it — but crates/workers-unpeel depends on
+        # unpeel-core and we patch that tree. Its crates/ dir is its own
+        # workspace (669 tests in unpeel-core alone).
+        run: cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core
