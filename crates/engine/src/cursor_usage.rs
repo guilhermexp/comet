@@ -152,7 +152,13 @@ impl CursorUsage {
     }
 
     pub(crate) async fn snapshot(&self, force_usage: bool) -> CursorUsageSnapshot {
-        let session = match read_session(&self.state_db_path) {
+        // Blocking SQLite (with a 2s busy timeout) must not run on the async
+        // executor: the caller fans this out through `tokio::join!`.
+        let db_path = self.state_db_path.clone();
+        let session = tokio::task::spawn_blocking(move || read_session(&db_path))
+            .await
+            .unwrap_or(Err(CursorUsageError::StoreIo));
+        let session = match session {
             Ok(Some(session)) => session,
             Ok(None) => {
                 self.clear_usage_cache();
@@ -341,7 +347,10 @@ fn parse_usage_payload(payload: &Value) -> Option<Vec<AgentUsageWindow>> {
             let total_spend = plan.get("totalSpend")?.as_f64()?;
             let limit = plan.get("limit")?.as_f64()?;
             (limit > 0.0).then_some((total_spend / limit) as f32)
-        })?;
+        })
+        // Clamped at the source: an exhausted plan reports over 100%, and
+        // every consumer renders this as a bar width.
+        .map(|fraction| fraction.clamp(0.0, 1.0))?;
     let resets_at = parse_epoch_ms(payload.get("billingCycleEnd"));
     Some(vec![AgentUsageWindow {
         label: "Monthly".into(),
@@ -641,6 +650,14 @@ mod tests {
         });
         let windows = parse_usage_payload(&dashboard).unwrap();
         assert!((windows[0].used_fraction - 0.0602).abs() < 0.0001);
+        // Overage clamps to 1.0 on both paths.
+        let over = serde_json::json!({"planUsage": {"totalSpend": 7883, "limit": 7000}});
+        assert_eq!(parse_usage_payload(&over).unwrap()[0].used_fraction, 1.0);
+        let over_percent = serde_json::json!({"planUsage": {"totalPercentUsed": 112.6}});
+        assert_eq!(
+            parse_usage_payload(&over_percent).unwrap()[0].used_fraction,
+            1.0
+        );
         // Missing planUsage / non-positive limit / non-numeric spend fail.
         assert!(parse_usage_payload(&serde_json::json!({})).is_none());
         assert!(
