@@ -288,7 +288,7 @@ use zeron_proto::{
 };
 
 use crate::{
-    composer::{ComposerInput, ComposerInputEvent},
+    composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
@@ -446,6 +446,9 @@ pub struct DetailsSidebar {
     app_state: Entity<AppState>,
     workers_model: Entity<WorkersModel>,
     pickers: Entity<Pickers>,
+    /// Read-only, for one question: does the chat being shown have an unsent
+    /// draft? A draft is what tells the idle recap the user is not idle.
+    composer: Entity<Composer>,
     sidebar: DetailsSidebarState,
     chat_workers: ChatWorkersWidgetState,
     files: LoadState<Vec<FileNode>>,
@@ -459,6 +462,11 @@ pub struct DetailsSidebar {
     usage_expanded: std::collections::HashSet<String>,
     material_icons: std::collections::HashMap<SharedString, std::sync::Arc<Image>>,
     resolved_branch: Option<String>,
+    /// Memoized `<cwd>/.git` probe: without it the Workspace widget stats the
+    /// disk on every render. Re-probed when the context's cwd changes.
+    /// ponytail: a `git init` under an unchanged context is not noticed until
+    /// the sidebar switches context; add an fs watch if that ever matters.
+    has_git_dir: Option<(std::path::PathBuf, bool)>,
     file_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
     recency: FileRecency,
@@ -475,6 +483,7 @@ pub struct DetailsSidebar {
     _state_observe: Subscription,
     _workers_observe: Subscription,
     _pickers_observe: Subscription,
+    _composer_observe: Subscription,
     _search_events: Subscription,
 }
 
@@ -484,6 +493,7 @@ impl DetailsSidebar {
         workers_model: Entity<WorkersModel>,
         preferences: DetailsSidebarPreferences,
         pickers: Entity<Pickers>,
+        composer: Entity<Composer>,
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| ComposerInput::with_context("Search files…", "PaletteSearch", cx));
@@ -512,6 +522,12 @@ impl DetailsSidebar {
             cx.notify();
         });
         let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
+        // Every keystroke reaches the composer's own notify (`on_input_edited`),
+        // so this is where the draft gate learns the user stopped being idle.
+        // Re-arming is idempotent for an unchanged epoch, so the repeat is free
+        // and no repaint is requested here — `sync_idle_recap` notifies itself
+        // when it actually changes something.
+        let composer_observe = cx.observe(&composer, |this, _, cx| this.sync_idle_recap(cx));
         let pickers_observe = cx.observe(&pickers, |this, p, cx| {
             if let Some(target) = &p.read(cx).active_repo_target {
                 if let Some(branch) = &target.branch {
@@ -527,6 +543,7 @@ impl DetailsSidebar {
             app_state,
             workers_model,
             pickers,
+            composer,
             sidebar: DetailsSidebarState::new(preferences),
             chat_workers: ChatWorkersWidgetState::default(),
             files: LoadState::Idle,
@@ -540,6 +557,7 @@ impl DetailsSidebar {
             usage_expanded: std::collections::HashSet::new(),
             material_icons: std::collections::HashMap::new(),
             resolved_branch: None,
+            has_git_dir: None,
             file_task: None,
             branch_task: None,
             usage_task: None,
@@ -556,6 +574,7 @@ impl DetailsSidebar {
             _state_observe: state_observe,
             _workers_observe: workers_observe,
             _pickers_observe: pickers_observe,
+            _composer_observe: composer_observe,
             _search_events: search_events,
         };
         sidebar.load_usage(cx);
@@ -703,6 +722,18 @@ impl DetailsSidebar {
         self.load_files(false, cx);
     }
 
+    /// Cached `<cwd>/.git` probe — see the `has_git_dir` field.
+    fn git_dir_exists(&mut self, cwd: &std::path::Path) -> bool {
+        if let Some((cached_cwd, exists)) = &self.has_git_dir
+            && cached_cwd == cwd
+        {
+            return *exists;
+        }
+        let exists = cwd.join(".git").exists();
+        self.has_git_dir = Some((cwd.to_path_buf(), exists));
+        exists
+    }
+
     fn sync_idle_recap(&mut self, cx: &mut Context<Self>) {
         let Some(context) = self.sidebar.context() else {
             self.recap_task = None;
@@ -723,30 +754,37 @@ impl DetailsSidebar {
         };
         let context_key = context.key.clone();
 
-        let (is_working, message_count) = {
+        let (is_working, is_compacting, message_count, composer_shows_chat) = {
             let state = self.app_state.read(cx);
             let is_working = state.indicator_for(&chat_id, chrono::Utc::now())
                 == crate::state::Indicator::Working;
             let count = state.transcript.len();
-            (is_working, count)
+            // Compaction has its own flag: the indicator does not report it.
+            (
+                is_working,
+                state.is_compacting(&chat_id),
+                count,
+                state.selected_chat.as_deref() == Some(chat_id.as_str()),
+            )
         };
-
         let has_entry = self.sidebar.idle_recap_for(&context_key).is_some();
         let prefs = self.sidebar.preferences();
-        let failed_epoch = self.failed_epochs.get(&chat_id).copied();
 
-        let state = super::idle_recap::IdleRecapState {
+        let signals = super::idle_recap::IdleRecapSignals {
             enabled: prefs.idle_recap_enabled,
-            can_generate: failed_epoch != Some(message_count),
-            is_streaming: is_working,
-            is_compacting: false,
-            has_draft: false,
-            message_count,
-            entry: self.sidebar.idle_recap_for(&context_key),
             delay_seconds: prefs.idle_recap_delay_seconds,
+            is_streaming: is_working,
+            is_compacting,
+            message_count,
+            failed_epoch: self.failed_epochs.get(&chat_id).copied(),
+            composer_shows_chat,
+            composer_has_draft: self.composer.read(cx).has_draft(cx),
         };
 
-        let action = super::idle_recap::evaluate_idle_recap(&state);
+        let action = super::idle_recap::evaluate_idle_recap_signals(
+            &signals,
+            self.sidebar.idle_recap_for(&context_key),
+        );
         match action {
             super::idle_recap::IdleRecapAction::Clear => {
                 self.recap_task = None;
@@ -783,12 +821,17 @@ impl DetailsSidebar {
                             let state = this.app_state.read(cx);
                             let is_working = state.indicator_for(&chat_id_clone, chrono::Utc::now())
                                 == crate::state::Indicator::Working;
-                            let count_now = state.transcript.len();
-                            let active_chat =
-                                this.sidebar.context().and_then(|c| c.chat_id.as_deref());
-                            !is_working
-                                && count_now == epoch_at_arm
-                                && active_chat == Some(&chat_id_clone)
+                            let dispatch = super::idle_recap::IdleRecapDispatch {
+                                is_streaming: is_working,
+                                message_count: state.transcript.len(),
+                                epoch_at_arm,
+                                is_active_chat: this
+                                    .sidebar
+                                    .context()
+                                    .and_then(|c| c.chat_id.as_deref())
+                                    == Some(&chat_id_clone),
+                            };
+                            super::idle_recap::should_dispatch_idle_recap(&dispatch)
                         })
                         .unwrap_or(false);
 
@@ -2142,15 +2185,15 @@ impl DetailsSidebar {
             .to_string();
         let current_branch = self
             .resolved_branch
-            .as_deref()
-            .or(context.branch.as_deref());
-        let has_git = current_branch.is_some() || context.cwd.join(".git").exists();
+            .clone()
+            .or_else(|| context.branch.clone());
+        let has_git = current_branch.is_some() || self.git_dir_exists(&context.cwd);
         let disabled = !has_git;
         let repo_target = crate::pickers::RepoTarget {
             path: context.cwd.to_string_lossy().to_string(),
             device_id: context.target_device_id.clone(),
             chat_id: context.chat_id.clone(),
-            branch: current_branch.map(str::to_string),
+            branch: current_branch.clone(),
         };
         let branch_control: AnyElement = self.pickers.update(cx, |p, cx| {
             p.render_workspace_branch_control(repo_target, disabled, cx)

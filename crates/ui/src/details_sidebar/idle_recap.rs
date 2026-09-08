@@ -77,7 +77,7 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
     }
 
     // A turn in flight is replacing the state the line describes.
-    if state.is_streaming || state.is_compacting {
+    if state.is_streaming {
         return if has_entry {
             IdleRecapAction::Clear
         } else {
@@ -103,6 +103,21 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
         };
     }
 
+    // Compaction is rewriting the transcript under the line: never arm.
+    // Unlike streaming this SUPPRESSES without invalidating — `is_compacting`
+    // is a sticky flag whose clear path is one session edge away
+    // (`shell::finish_compaction`), so letting it drop the stored recap would
+    // turn a single missed edge into permanent, silent loss of the line for
+    // that chat. Compaction's own transcript marker bumps the epoch, which is
+    // what supersedes the entry.
+    if state.is_compacting {
+        return if has_entry {
+            IdleRecapAction::Keep
+        } else {
+            IdleRecapAction::None
+        };
+    }
+
     // Draft text: user is actively composing, don't arm.
     // Stored entry for a different epoch is stale and dropped.
     if state.has_draft {
@@ -119,6 +134,78 @@ pub fn evaluate_idle_recap(state: &IdleRecapState<'_>) -> IdleRecapAction {
     IdleRecapAction::Arm {
         delay_ms: clamped_seconds * 1000,
     }
+}
+
+/// Raw signals read off the live entities, before any policy applies. Keeping
+/// the assembly of [`IdleRecapState`] here (rather than inline in the render
+/// path) is what makes it testable: there is no gpui render harness.
+pub struct IdleRecapSignals {
+    /// User preference toggle (Settings).
+    pub enabled: bool,
+    /// Configured delay in seconds.
+    pub delay_seconds: u64,
+    /// Live turn in progress for this chat.
+    pub is_streaming: bool,
+    /// `AppState::is_compacting` for this chat.
+    pub is_compacting: bool,
+    /// Current transcript message count — the active epoch.
+    pub message_count: usize,
+    /// Epoch whose previous generation failed, if any.
+    pub failed_epoch: Option<usize>,
+    /// The composer is showing this chat, so its draft belongs to it.
+    pub composer_shows_chat: bool,
+    /// `Composer::has_draft` for whatever chat the composer is showing.
+    pub composer_has_draft: bool,
+}
+
+/// Assembles [`IdleRecapState`] from the raw entity reads and evaluates it.
+pub fn evaluate_idle_recap_signals(
+    signals: &IdleRecapSignals,
+    entry: Option<&IdleRecapEntry>,
+) -> IdleRecapAction {
+    evaluate_idle_recap(&IdleRecapState {
+        enabled: signals.enabled,
+        can_generate: signals.failed_epoch != Some(signals.message_count),
+        is_streaming: signals.is_streaming,
+        is_compacting: signals.is_compacting,
+        // `Composer::has_draft` answers for the chat the composer is SHOWING;
+        // a sidebar left on another chat must not read that draft as its own.
+        has_draft: signals.composer_shows_chat && signals.composer_has_draft,
+        message_count: signals.message_count,
+        entry,
+        delay_seconds: signals.delay_seconds,
+    })
+}
+
+/// State re-observed when the armed timer fires, right before the recap call
+/// spends real model quota: the chat may have moved on while the timer ran.
+///
+/// Compaction is deliberately absent. `AppState::begin_compaction` is a plain
+/// map insert that notifies nothing on its own, but the composer's
+/// `state.update` that calls it also pushes the echo message and ends in
+/// `cx.notify()`. That notify re-runs [`evaluate_idle_recap`], which returns
+/// `Keep`/`None` under `is_compacting` and drops the armed `Task`; a dropped
+/// gpui task never fires, so a compaction gate here would be unreachable
+/// rather than protective — and the pushed echo has already moved
+/// `message_count` past `epoch_at_arm` regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleRecapDispatch {
+    /// Live turn in progress. Re-checked because the indicator is clock-driven
+    /// (a session can change bucket with no state notify to re-evaluate on).
+    pub is_streaming: bool,
+    /// Transcript message count now.
+    pub message_count: usize,
+    /// Transcript message count when the timer was armed.
+    pub epoch_at_arm: usize,
+    /// The armed chat is still the one the sidebar is showing.
+    pub is_active_chat: bool,
+}
+
+/// Whether the armed timer may actually spend a model turn on the recap.
+pub fn should_dispatch_idle_recap(dispatch: &IdleRecapDispatch) -> bool {
+    !dispatch.is_streaming
+        && dispatch.message_count == dispatch.epoch_at_arm
+        && dispatch.is_active_chat
 }
 
 /// Read/write boundary for the persisted recap map: drops expired and malformed entries,
@@ -248,6 +335,102 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_idle_recap_signals_assembly() {
+        // Covers the assembly the sidebar used to do inline (draft, compaction
+        // and failed-epoch wiring), not just the policy it feeds.
+        let idle = IdleRecapSignals {
+            enabled: true,
+            delay_seconds: 240,
+            is_streaming: false,
+            is_compacting: false,
+            message_count: 5,
+            failed_epoch: None,
+            composer_shows_chat: true,
+            composer_has_draft: false,
+        };
+        assert_eq!(
+            evaluate_idle_recap_signals(&idle, None),
+            IdleRecapAction::Arm { delay_ms: 240_000 }
+        );
+
+        // Typing in the shown chat is the user not being idle: never arm.
+        assert_eq!(
+            evaluate_idle_recap_signals(
+                &IdleRecapSignals {
+                    composer_has_draft: true,
+                    ..idle
+                },
+                None
+            ),
+            IdleRecapAction::None
+        );
+
+        // Same draft, but the composer is on another chat: not this chat's.
+        assert_eq!(
+            evaluate_idle_recap_signals(
+                &IdleRecapSignals {
+                    composer_has_draft: true,
+                    composer_shows_chat: false,
+                    ..idle
+                },
+                None
+            ),
+            IdleRecapAction::Arm { delay_ms: 240_000 }
+        );
+
+        // Compaction suppresses arming without erasing the stored line.
+        let stale = sample_entry(4, 1000, 10_000);
+        assert_eq!(
+            evaluate_idle_recap_signals(
+                &IdleRecapSignals {
+                    is_compacting: true,
+                    ..idle
+                },
+                Some(&stale)
+            ),
+            IdleRecapAction::Keep
+        );
+
+        // A generation that already failed for this epoch is not retried.
+        assert_eq!(
+            evaluate_idle_recap_signals(
+                &IdleRecapSignals {
+                    failed_epoch: Some(5),
+                    ..idle
+                },
+                None
+            ),
+            IdleRecapAction::None
+        );
+    }
+
+    #[test]
+    fn test_evaluate_idle_recap_compaction_suppresses_without_erasing() {
+        // `is_compacting` is a sticky flag: if a stuck one could reach Clear it
+        // would erase the chat's recap and disable the feature there for good.
+        // Compaction may only suppress arming.
+        let stale = sample_entry(4, 1000, 10_000);
+        let compacting = IdleRecapState {
+            enabled: true,
+            can_generate: true,
+            is_streaming: false,
+            is_compacting: true,
+            has_draft: false,
+            message_count: 5,
+            entry: Some(&stale),
+            delay_seconds: 240,
+        };
+        assert_eq!(evaluate_idle_recap(&compacting), IdleRecapAction::Keep);
+        assert_eq!(
+            evaluate_idle_recap(&IdleRecapState {
+                entry: None,
+                ..compacting
+            }),
+            IdleRecapAction::None
+        );
+    }
+
+    #[test]
     fn test_evaluate_idle_recap_preserves_on_zero_messages_hydration() {
         let entry = sample_entry(5, 1000, 10_000);
         let state = IdleRecapState {
@@ -261,6 +444,30 @@ mod tests {
             delay_seconds: 240,
         };
         assert_eq!(evaluate_idle_recap(&state), IdleRecapAction::Keep);
+    }
+
+    #[test]
+    fn test_should_dispatch_idle_recap() {
+        let idle = IdleRecapDispatch {
+            is_streaming: false,
+            message_count: 5,
+            epoch_at_arm: 5,
+            is_active_chat: true,
+        };
+        assert!(should_dispatch_idle_recap(&idle));
+
+        assert!(!should_dispatch_idle_recap(&IdleRecapDispatch {
+            is_streaming: true,
+            ..idle
+        }));
+        assert!(!should_dispatch_idle_recap(&IdleRecapDispatch {
+            message_count: 6,
+            ..idle
+        }));
+        assert!(!should_dispatch_idle_recap(&IdleRecapDispatch {
+            is_active_chat: false,
+            ..idle
+        }));
     }
 
     #[test]

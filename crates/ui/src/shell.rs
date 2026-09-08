@@ -1654,6 +1654,9 @@ pub struct Shell {
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
+    /// When each in-flight `/compact` was first observed — the deadline half of
+    /// [`Shell::sweep_stuck_compactions`].
+    compaction_seen_at: std::collections::HashMap<String, std::time::Instant>,
     user_menu: popover::Popup<()>,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
@@ -1915,7 +1918,8 @@ impl Shell {
             let workers_model = workers_model.clone();
             let preferences = settings.details_sidebar_preferences.clone();
             let pickers = pickers.clone();
-            move |cx| DetailsSidebar::new(state, workers_model, preferences, pickers, cx)
+            let composer = composer.clone();
+            move |cx| DetailsSidebar::new(state, workers_model, preferences, pickers, composer, cx)
         });
         let file_preview = cx.new(|_| FilePreview::new());
         let details_sub = cx.subscribe(
@@ -2149,6 +2153,7 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
+            compaction_seen_at: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -2384,7 +2389,7 @@ impl Shell {
             for (chat_id, status, send_pending, title) in sessions {
                 let prev = self.sound_prev.insert(chat_id.clone(), status);
                 // A `/compact` in flight ends on the same edge the chime uses.
-                // Any exit from Working clears the "Compactando…" label — a run
+                // Any exit from Working clears the "Compacting…" label — a run
                 // that errored or stopped to ask something must not leave it
                 // spinning — but only a finished one earns the marker.
                 if prev == Some(zeron_proto::SessionStatus::Working)
@@ -2416,6 +2421,7 @@ impl Shell {
                 }
             }
         }
+        self.sweep_stuck_compactions(cx);
         // Boot: restore the last selected space once the first spaces frame
         // lands (a still-existing row wins over the auto-selected first one;
         // the boot-auto-selected chat's own space wins over both — selecting a
@@ -4064,7 +4070,57 @@ impl Shell {
         .detach();
     }
 
-    /// The compaction run ended: drop the composer's "Compactando…" label and,
+    /// Second, unconditional way out of `AppState::compacting`.
+    ///
+    /// The flag is set by the composer and cleared by exactly one edge: a run's
+    /// Working→non-Working transition seen over `state.sessions` in
+    /// [`Shell::on_state_changed`]. That edge never arrives when the session row
+    /// disappears (remote device drops, chat archived) or when the run never
+    /// reports Working at all — and the flag then stays true for the rest of the
+    /// process, pinning the composer's "Compacting…" label and suppressing that
+    /// chat's idle recap. Expire it on a deadline, and drop it outright once the
+    /// chat it belonged to is no longer on the roster.
+    fn sweep_stuck_compactions(&mut self, cx: &mut Context<Self>) {
+        /// Long enough for a slow compaction turn, short enough that a missed
+        /// edge is a pause instead of a permanent state.
+        const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+        let now = std::time::Instant::now();
+        let (roster_known, in_flight) = {
+            let state = self.state.read(cx);
+            let in_flight: Vec<String> = state
+                .chats
+                .iter()
+                .map(|chat| chat.id.clone())
+                .filter(|chat_id| state.is_compacting(chat_id))
+                .collect();
+            (!state.chats.is_empty(), in_flight)
+        };
+        for chat_id in &in_flight {
+            self.compaction_seen_at
+                .entry(chat_id.clone())
+                .or_insert(now);
+        }
+        let stuck: Vec<String> = self
+            .compaction_seen_at
+            .iter()
+            .filter(|&(chat_id, seen_at)| {
+                // An empty roster is a reconnect frame, not evidence the chat
+                // is gone — only the deadline may sweep across one.
+                (roster_known && !in_flight.contains(chat_id))
+                    || now.duration_since(*seen_at) >= STUCK_AFTER
+            })
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect();
+        for chat_id in stuck {
+            self.compaction_seen_at.remove(&chat_id);
+            // `completed: false`: a swept run earns no transcript marker, and
+            // the call is a no-op when the normal edge already cleared it.
+            self.finish_compaction(&chat_id, false, cx);
+        }
+    }
+
+    /// The compaction run ended: drop the composer's "Compacting…" label and,
     /// when the run actually finished, leave a marker in the transcript with
     /// the before→after context size. Fire-and-forget like the model-switch
     /// marker — a failed note never blocks anything.
@@ -4101,11 +4157,11 @@ impl Shell {
             });
             let text = match after.filter(|after| before > 0 && *after < before) {
                 Some(after) => format!(
-                    "Contexto compactado · {} → {}",
+                    "Context compacted · {} → {}",
                     crate::composer::compact_token_count(before),
                     crate::composer::compact_token_count(after)
                 ),
-                None => "Contexto compactado.".to_string(),
+                None => "Context compacted.".to_string(),
             };
             let params = serde_json::json!({
                 "op": "noteMarker",
