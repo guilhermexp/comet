@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_tone_neutral_when_no_usage_or_no_weekly_window() {
+    fn primary_window_summary_and_tone_stay_paired() {
         let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
         // Empty snapshot: no placeholder rows.
         let empty_snapshot = AgentAccountsSnapshot::default();
@@ -644,10 +644,13 @@ mod tests {
             )],
             warnings: Vec::new(),
         };
+        // NoUsage invents neither summary nor tone.
         let no_usage_rows = usage_rows(&no_usage_snapshot, now);
+        assert_eq!(no_usage_rows[0].weekly_summary, None);
         assert_eq!(no_usage_rows[0].weekly_tone, UsageTone::Neutral);
 
-        // Ready but with only non-weekly window (e.g. 5h)
+        // Only a non-weekly window (e.g. 5h): it becomes the primary window, so it
+        // drives summary and tone together — the widget paints the summary with the tone.
         let non_weekly_snapshot = AgentAccountsSnapshot {
             accounts: vec![account(
                 "kimi-active",
@@ -664,7 +667,8 @@ mod tests {
         let rows = usage_rows(&non_weekly_snapshot, now);
         let kimi = rows.iter().find(|r| r.harness == HarnessId::Kimi).unwrap();
         assert_eq!(kimi.state, ProviderUsageState::Ready);
-        assert_eq!(kimi.weekly_tone, UsageTone::Neutral);
+        assert_eq!(kimi.weekly_summary.as_deref(), Some("5h 10%"));
+        assert_eq!(kimi.weekly_tone, UsageTone::Danger);
     }
 
     #[test]
