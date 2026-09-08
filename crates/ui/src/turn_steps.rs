@@ -120,6 +120,10 @@ pub fn activity_breakdown(parts: &[MessagePart]) -> String {
 
 fn activity_bucket(call: &ToolCall) -> ActivityBucket {
     match call {
+        // O OMP nao tem tool `skill`: invocar uma skill vira um `read` do
+        // pseudo-path `skill://<nome>` (as leituras dos arquivos da skill que
+        // vem depois seguem sendo reads de verdade).
+        ToolCall::ReadFile { path } if is_skill_path(path) => ActivityBucket::Skill,
         ToolCall::ReadFile { .. } | ToolCall::Search { .. } | ToolCall::Glob { .. } => {
             ActivityBucket::Read
         }
@@ -132,6 +136,12 @@ fn activity_bucket(call: &ToolCall) -> ActivityBucket {
         ToolCall::Mcp { tool, input, .. } => named_activity_bucket(tool, input.as_ref()),
         ToolCall::Unknown { name, input } => named_activity_bucket(name, input.as_ref()),
     }
+}
+
+fn is_skill_path(path: &str) -> bool {
+    path.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("skill://")
 }
 
 fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> ActivityBucket {
@@ -530,6 +540,25 @@ mod tests {
             activity_breakdown(&parts),
             "1 agent, 1 skill, 2 reads, 1 search, 2 edits, 1 command, 2 waits, 1 message, 1 terminal, 1 capture, 2 tools"
         );
+    }
+
+    #[test]
+    fn omp_skill_reads_count_as_skills_not_reads() {
+        let parts = vec![
+            tool("skill", read("skill://to-brainstorm"), true),
+            tool("native", unknown("Skill", None), true),
+            // Os arquivos da skill lidos depois seguem sendo reads.
+            tool(
+                "glob",
+                ToolCall::Glob {
+                    pattern: ".agents/skills/to-brainstorm/**".into(),
+                },
+                true,
+            ),
+            tool("file", read(".agents/skills/to-brainstorm/SKILL.md"), true),
+        ];
+
+        assert_eq!(activity_breakdown(&parts), "2 skills, 2 reads");
     }
 
     #[test]
