@@ -118,7 +118,7 @@ fn context_indicator_state(usage: Option<zeron_proto::ContextUsage>) -> ContextI
             used_fraction: 0.0,
             used_percent: None,
             remaining_percent: None,
-            detail: "Aguardando primeiro turno".into(),
+            detail: "Waiting for the first turn".into(),
             level: ContextIndicatorLevel::Neutral,
         };
     };
@@ -3484,7 +3484,7 @@ impl Render for ContextUsageTooltip {
                     div()
                         .text_size(px(11.0))
                         .text_color(theme.text_muted)
-                        .child("Janela de contexto"),
+                        .child("Context window"),
                 )
                 .when_some(
                     self.state.used_percent.zip(self.state.remaining_percent),
@@ -3495,7 +3495,7 @@ impl Render for ContextUsageTooltip {
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from(format!(
-                                    "{used}% usado ({remaining}% restante)"
+                                    "{used}% used ({remaining}% left)"
                                 ))),
                         )
                     },
@@ -3511,7 +3511,7 @@ impl Render for ContextUsageTooltip {
                         div()
                             .text_size(px(11.0))
                             .text_color(theme.text_muted.opacity(0.6))
-                            .child("Clique para compactar"),
+                            .child("Click to compact"),
                     )
                 }),
         )
@@ -4481,6 +4481,13 @@ impl Composer {
 
     pub fn is_sending(&self) -> bool {
         self.sending
+    }
+
+    /// True while the input of the chat the composer is SHOWING holds text
+    /// that has not been sent (whitespace-only counts as empty); staged
+    /// attachments and drafts saved for other chats do not count.
+    pub fn has_draft(&self, cx: &App) -> bool {
+        !self.input.read(cx).text().trim().is_empty()
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -7042,7 +7049,7 @@ impl Composer {
                     div()
                         .text_size(px(11.5))
                         .text_color(theme.text_muted)
-                        .child("Compactando…"),
+                        .child("Compacting…"),
                 )
                 .into_any_element();
         }
@@ -8358,7 +8365,7 @@ mod tests {
         let neutral = context_indicator_state(None);
         assert_eq!(neutral.level, ContextIndicatorLevel::Neutral);
         assert_eq!(neutral.used_fraction, 0.0);
-        assert_eq!(neutral.detail.as_ref(), "Aguardando primeiro turno");
+        assert_eq!(neutral.detail.as_ref(), "Waiting for the first turn");
 
         let ready = context_indicator_state(Some(zeron_proto::ContextUsage {
             tokens: 392_000,

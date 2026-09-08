@@ -585,7 +585,7 @@ impl ProjectsPage {
         };
         let Some(project_id) = row.project_id.clone() else {
             self.error = Some(SharedString::from(
-                "Este projeto saiu da lista de trabalho; adicione a pasta de novo para renomear.",
+                "This project left the working set; add the folder again to rename it.",
             ));
             self.name_input.update(cx, |input, cx| {
                 input.set_text(&row.name, cx);
@@ -799,7 +799,7 @@ fn store_icon(
     source: &Path,
 ) -> Result<(), String> {
     if crate::attachments::format_by_extension(source).is_none() {
-        return Err("selecione uma imagem PNG, JPEG, GIF, WebP, SVG, BMP ou TIFF".to_owned());
+        return Err("Pick a PNG, JPEG, GIF, WebP, SVG, BMP or TIFF image".to_owned());
     }
     let extension = source
         .extension()
@@ -848,7 +848,7 @@ fn forget_project(project_path: &str, recorded: Option<&str>) -> Result<(), Stri
 fn icons_dir() -> Result<PathBuf, String> {
     dirs_home()
         .map(|home| home.join(".unpeel").join("comet-project-icons"))
-        .ok_or_else(|| "não consegui resolver o diretório de dados".to_owned())
+        .ok_or_else(|| "Could not resolve the app data directory".to_owned())
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -1182,7 +1182,7 @@ impl ProjectsPage {
                 .child(label_block(
                     theme,
                     "Repository",
-                    "A pasta deste projeto não existe mais",
+                    "This project's folder no longer exists",
                 ))
                 .into_any_element(),
             RepositoryState::NotARepo => {
@@ -1427,7 +1427,7 @@ impl ProjectsPage {
                         theme,
                         "Forget Project",
                         if confirming {
-                            "Isto apaga apenas os metadados. Os arquivos em disco e as sessões não são tocados."
+                            "This clears only the metadata. Files on disk and sessions are untouched."
                         } else {
                             "Remove this project's recorded metadata. Files on disk are kept."
                         },

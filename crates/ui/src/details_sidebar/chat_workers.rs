@@ -522,9 +522,9 @@ mod tests {
     fn activity_labels_collapse_multiline_whitespace_for_fixed_rows() {
         assert_eq!(
             compact_activity_label(
-                "Repo de referência de terceiro, read-only, em:\n  ~/Documents/Projetos",
+                "Third-party reference repo, read-only, at:\n  ~/Documents/Projetos",
             ),
-            "Repo de referência de terceiro, read-only, em: ~/Documents/Projetos"
+            "Third-party reference repo, read-only, at: ~/Documents/Projetos"
         );
     }
 
