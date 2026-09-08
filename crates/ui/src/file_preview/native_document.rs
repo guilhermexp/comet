@@ -70,10 +70,6 @@ fn navigation_policy(
 /// whoever was first responder. HTML/PDF/video previews put a descendant
 /// (`WKContentView`) there; removing the web view without restoring leaves
 /// the gpui composer looking focused while typing goes nowhere.
-fn should_restore_content_view_on_detach(first_responder_belongs_to_preview: bool) -> bool {
-    first_responder_belongs_to_preview
-}
-
 unsafe fn restore_key_view_if_preview_owns_it(view: *mut Object) {
     let window: *mut Object = msg_send![view, window];
     if window.is_null() {
@@ -93,14 +89,35 @@ unsafe fn restore_key_view_if_preview_owns_it(view: *mut Object) {
             false
         }
     };
-    if !should_restore_content_view_on_detach(belongs) {
+    if !belongs {
         return;
     }
     let content: *mut Object = msg_send![window, contentView];
     if content.is_null() {
         return;
     }
-    let _: BOOL = msg_send![window, makeFirstResponder: content];
+    // GPUI's native keyboard view is a child of contentView, not the
+    // container itself (gpui_macos::MacWindow::new). Logical Window::focus
+    // cannot repair AppKit first responder, so target that child explicitly.
+    let Some(gpui_class) = Class::get("GPUIView") else {
+        tracing::warn!("Cannot restore preview keyboard focus: GPUIView class unavailable");
+        return;
+    };
+    let children: *mut Object = msg_send![content, subviews];
+    let count: usize = msg_send![children, count];
+    for index in 0..count {
+        let child: *mut Object = msg_send![children, objectAtIndex: index];
+        let is_gpui: BOOL = msg_send![child, isKindOfClass: gpui_class];
+        if is_gpui == YES {
+            let accepted: BOOL = msg_send![window, makeFirstResponder: child];
+            let restored: *mut Object = msg_send![window, firstResponder];
+            if accepted != YES || restored != child {
+                tracing::warn!("AppKit did not restore GPUIView keyboard focus after preview");
+            }
+            return;
+        }
+    }
+    tracing::warn!("Cannot restore preview keyboard focus: GPUIView missing from owning window");
 }
 
 extern "C" fn decide_navigation(
@@ -329,9 +346,7 @@ impl Drop for NativeDocumentView {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DocumentKind, appkit_frame, navigation_policy, should_restore_content_view_on_detach,
-    };
+    use super::{DocumentKind, appkit_frame, navigation_policy};
 
     /// As duas chaves de JavaScript do WebKit governam coisas diferentes, e
     /// trocar uma pela outra da um bug silencioso: preview em branco de um
@@ -374,17 +389,5 @@ mod tests {
         assert_eq!(navigation_policy(Some("https"), false, false), (0, false));
         assert_eq!(navigation_policy(Some("file"), true, false), (1, true));
         assert_eq!(navigation_policy(Some("file"), true, true), (0, true));
-    }
-
-    #[test]
-    fn closing_native_preview_returns_keys_to_the_gpui_content_view() {
-        assert!(
-            should_restore_content_view_on_detach(true),
-            "WKWebView or WKContentView was first responder"
-        );
-        assert!(
-            !should_restore_content_view_on_detach(false),
-            "some other control owns keys — leave it"
-        );
     }
 }

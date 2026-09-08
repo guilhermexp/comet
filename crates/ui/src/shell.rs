@@ -1786,6 +1786,14 @@ impl Shell {
                 this.nav.push(NavEntry::Chat(this.active_chat.clone()));
             }
             this.workers_settings_open = workers_in_settings;
+            // The tree filter lives on the model (beside the rest of the
+            // selection state) and is persisted from here, on the observation
+            // this surface already runs — no second channel for one field.
+            let filter = model.read(cx).project_filter().map(str::to_owned);
+            if filter != this.settings.workers_project_filter {
+                this.settings.workers_project_filter = filter;
+                this.schedule_save(cx);
+            }
             cx.notify();
         });
         let workers_content = cx.new({
@@ -1894,6 +1902,13 @@ impl Shell {
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
+        // Restore the Workers tree filter. A filter naming a project the next
+        // bootstrap does not carry is dropped there, so a stale id is safe.
+        if let Some(filter) = settings.workers_project_filter.clone() {
+            workers_model.update(cx, |model, cx| {
+                model.set_project_filter(Some(filter), cx);
+            });
+        }
         let pickers = composer.read(cx).pickers().clone();
         let details_sidebar = cx.new({
             let state = state.clone();
@@ -2367,7 +2382,20 @@ impl Shell {
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
             for (chat_id, status, send_pending, title) in sessions {
-                let prev = self.sound_prev.insert(chat_id, status);
+                let prev = self.sound_prev.insert(chat_id.clone(), status);
+                // A `/compact` in flight ends on the same edge the chime uses.
+                // Any exit from Working clears the "Compactando…" label — a run
+                // that errored or stopped to ask something must not leave it
+                // spinning — but only a finished one earns the marker.
+                if prev == Some(zeron_proto::SessionStatus::Working)
+                    && status != zeron_proto::SessionStatus::Working
+                {
+                    self.finish_compaction(
+                        &chat_id,
+                        status == zeron_proto::SessionStatus::Idle,
+                        cx,
+                    );
+                }
                 if let Some(prev) = prev
                     && let Some(sound) = crate::sound::sound_for_transition(prev, status)
                     && !(send_pending && sound == crate::sound::Sound::Done)
@@ -4032,6 +4060,61 @@ impl Shell {
                 let completion_toast = crate::toast::Toast::update_complete(succeeded, failed);
                 shell.push_toast(completion_toast, cx);
             });
+        })
+        .detach();
+    }
+
+    /// The compaction run ended: drop the composer's "Compactando…" label and,
+    /// when the run actually finished, leave a marker in the transcript with
+    /// the before→after context size. Fire-and-forget like the model-switch
+    /// marker — a failed note never blocks anything.
+    fn finish_compaction(&mut self, chat_id: &str, completed: bool, cx: &mut Context<Self>) {
+        let Some(before) = self
+            .state
+            .update(cx, |state, cx| {
+                let taken = state.take_compaction(chat_id);
+                if taken.is_some() {
+                    cx.notify();
+                }
+                taken
+            })
+            .filter(|_| completed)
+        else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let chat_id = chat_id.to_string();
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            // The post-compaction usage rides the settling turn, a beat behind
+            // the Idle edge — reading it immediately would name the old size.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(800))
+                .await;
+            let after = state.read_with(cx, |state, _| {
+                state
+                    .session_for(&chat_id)
+                    .and_then(|session| session.context_usage)
+                    .map(|usage| usage.tokens)
+            });
+            let text = match after.filter(|after| before > 0 && *after < before) {
+                Some(after) => format!(
+                    "Contexto compactado · {} → {}",
+                    crate::composer::compact_token_count(before),
+                    crate::composer::compact_token_count(after)
+                ),
+                None => "Contexto compactado.".to_string(),
+            };
+            let params = serde_json::json!({
+                "op": "noteMarker",
+                "chatId": chat_id,
+                "text": text,
+            });
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                tracing::warn!(error = %err, "noteMarker mutate failed");
+            }
         })
         .detach();
     }

@@ -24,14 +24,21 @@ Test: engine unit table for missing database, missing key, and unreadable databa
 
 ### Requirement: Fetch managed Cursor quota windows
 
-The system SHALL request `POST {backend}/aiserver.v1.DashboardService/GetCurrentPeriodUsage` (production backend `https://api2.cursor.sh`) with bearer authentication, `Connect-Protocol-Version: 1`, a JSON `{}` body, and an 8-second timeout, SHALL reject cross-origin redirects, and SHALL normalize `planUsage.totalSpend` / `planUsage.limit` into a quota window labeled `Monthly` whose reset timestamp is `billingCycleEnd`.
+The system SHALL request `POST {backend}/aiserver.v1.DashboardService/GetCurrentPeriodUsage` (production backend `https://api2.cursor.sh`) with bearer authentication, `Connect-Protocol-Version: 1`, a JSON `{}` body, and an 8-second timeout, SHALL reject cross-origin redirects, and SHALL normalize `planUsage.totalPercentUsed` (falling back to `autoPercentUsed`, then `totalSpend / limit`) into a quota window labeled `Monthly` whose reset timestamp is `billingCycleEnd`.
 
 #### Scenario: Plan usage payload parses
 
 Test: parser unit table over recorded response shapes.
 
-- **WHEN** the response carries `planUsage` with `totalSpend` and a positive `limit`, plus `billingCycleEnd` in epoch milliseconds
-- **THEN** one `Monthly` window is produced with `used_fraction = totalSpend / limit` and `resets_at = billingCycleEnd`
+- **WHEN** the response carries `planUsage.totalPercentUsed` plus a disagreeing `totalSpend` / `limit`, and `billingCycleEnd` in epoch milliseconds
+- **THEN** one `Monthly` window is produced with `used_fraction = totalPercentUsed / 100` and `resets_at = billingCycleEnd`
+
+#### Scenario: Spend ratio is only a fallback
+
+Test: parser unit table over a payload that has spend/limit and no percent fields.
+
+- **WHEN** the response carries `planUsage` with `totalSpend` and a positive `limit`, and no `totalPercentUsed` / `autoPercentUsed`
+- **THEN** one `Monthly` window is produced with `used_fraction = totalSpend / limit`
 
 #### Scenario: Authentication or transport failure
 

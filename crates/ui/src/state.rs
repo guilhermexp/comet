@@ -645,6 +645,11 @@ pub struct AppState {
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// Chats with a `/compact` in flight → the context token count taken just
+    /// before it. The composer reads this to say "Compactando…" instead of the
+    /// usage ring, and the run's Working→Idle edge turns it into the
+    /// transcript's compaction marker (`shell::finish_compaction`).
+    compacting: HashMap<String, u64>,
     /// The in-flight send's attachment upload, when it has one.
     upload_progress: Option<UploadProgress>,
     /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
@@ -670,6 +675,12 @@ pub struct AppState {
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
     change_requests_visible: bool,
+    /// Checkouts the Workers surface wants resolved, published by
+    /// `WorkersModel` after each snapshot. A second SOURCE of targets, not a
+    /// second watcher: they are unioned into the chat-derived set so retention,
+    /// the unsupported-device filter, the visibility gate and task lifetime
+    /// stay in one place.
+    workers_change_request_targets: HashSet<ChangeRequestWatchKey>,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
     /// feed must survive chat switches — the tab itself is what scopes it.
@@ -707,6 +718,7 @@ impl AppState {
             transcript_replayed: false,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            compacting: HashMap::new(),
             upload_progress: None,
             transfers: HashMap::new(),
             diff_comments: HashMap::new(),
@@ -722,6 +734,7 @@ impl AppState {
             transcript_task: None,
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
+            workers_change_request_targets: HashSet::new(),
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
@@ -1086,6 +1099,21 @@ impl AppState {
         }
     }
 
+    /// A `/compact` just went out for this chat; `before` is the context size
+    /// it starts from (0 when the harness never reported one).
+    pub fn begin_compaction(&mut self, chat_id: &str, before: u64) {
+        self.compacting.insert(chat_id.to_string(), before);
+    }
+
+    pub fn is_compacting(&self, chat_id: &str) -> bool {
+        self.compacting.contains_key(chat_id)
+    }
+
+    /// The compaction run ended: hand back its `before` count, once.
+    pub fn take_compaction(&mut self, chat_id: &str) -> Option<u64> {
+        self.compacting.remove(chat_id)
+    }
+
     /// Attachment upload starting: expose its progress to the working label.
     pub fn begin_upload_progress(
         &mut self,
@@ -1406,6 +1434,18 @@ impl AppState {
             .change_request_for_chat(chat, &self.spaces)
     }
 
+    /// Latest valid PR for a device-local checkout — what a Workers worktree
+    /// row asks. A project has no chat identity to re-verify, so the checkout
+    /// itself is the identity.
+    pub fn change_request_for_checkout(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Option<&ChangeRequestSummary> {
+        self.change_requests
+            .change_request_for_checkout(cwd, branch)
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
@@ -1678,9 +1718,16 @@ impl AppState {
             return;
         };
         let targets = if self.change_requests_visible {
-            desired_watch_targets(&self.chats, &self.spaces, |device| {
+            let mut targets = desired_watch_targets(&self.chats, &self.spaces, |device| {
                 !self.change_requests.is_supported(device)
-            })
+            });
+            targets.extend(
+                self.workers_change_request_targets
+                    .iter()
+                    .filter(|target| self.change_requests.is_supported(&target.device_id))
+                    .cloned(),
+            );
+            targets
         } else {
             HashSet::new()
         };
@@ -1701,6 +1748,19 @@ impl AppState {
                 local_device_id.clone(),
             );
             self.change_request_tasks.insert(target, task);
+        }
+    }
+
+    /// Publish the Workers surface's checkouts. Cheap on a repeat: the snapshot
+    /// poll calls this every refresh and an unchanged set does no work.
+    pub(crate) fn set_workers_change_request_targets(
+        &mut self,
+        targets: HashSet<ChangeRequestWatchKey>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workers_change_request_targets != targets {
+            self.workers_change_request_targets = targets;
+            self.reconcile_change_request_watches(cx);
         }
     }
 

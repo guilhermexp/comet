@@ -1586,6 +1586,8 @@ impl Pickers {
         // Every explicit pick becomes the next Chat's last-used model,
         // including picks made inside an existing Chat. Keep the opaque id:
         // the same model offered by different providers is a different choice.
+        // The model in force until this click — the transcript marker names it.
+        let previous = self.selected_model(cx).cloned();
         if let Some(harness) = self.effective_harness(cx) {
             let label = self
                 .models
@@ -1594,6 +1596,9 @@ impl Pickers {
                 .and_then(|models| models.iter().find(|m| m.id == model_id))
                 .map(|m| m.label.clone())
                 .unwrap_or_else(|| model_id.clone());
+            if let Some(previous) = previous.filter(|p| p.id != model_id) {
+                self.note_model_switch(&previous.label, &label, cx);
+            }
             self.defaults
                 .remember_model(harness, model_id.clone(), label);
             self.save_defaults();
@@ -1606,6 +1611,30 @@ impl Pickers {
             self.config.model = Some(model_id);
         }
         cx.notify();
+    }
+
+    /// Leave the model change visible in the transcript itself (the engine
+    /// skips a chat with no entries yet). Fire-and-forget: the marker is a
+    /// note, never a gate on the pick.
+    fn note_model_switch(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let params = serde_json::json!({
+            "op": "noteModelSwitch",
+            "chatId": chat_id,
+            "from": from,
+            "to": to,
+        });
+        cx.spawn(async move |_, _| {
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                tracing::warn!(error = %err, "noteModelSwitch mutate failed");
+            }
+        })
+        .detach();
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {

@@ -420,6 +420,34 @@ fn grok_transcript_entries_parse_chat_history() {
 }
 
 #[test]
+fn grok_transcript_entries_skip_injections_and_unwrap_user_query() {
+    let raw = concat!(
+        r#"{"type":"system","content":"you are grok"}"#,
+        "\n",
+        r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: macos\n</user_info>"}]}"#,
+        "\n",
+        r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nThe following skills are available\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
+        "\n",
+        r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nleft align the panel titles\n</user_query>"}],"prompt_index":0}"#,
+        "\n",
+        r#"{"type":"assistant","content":"ok"}"#,
+        "\n",
+    );
+    let entries = collect_transcript_entries(provider("grok"), raw, false);
+    let users: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.role == "User")
+        .map(|entry| entry.text.as_str())
+        .collect();
+    assert_eq!(users, vec!["left align the panel titles"]);
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.text.contains("system-reminder")
+            || entry.text.contains("user_info")
+            || entry.text.contains("skills are available")));
+}
+
+#[test]
 fn kimi_transcript_entries_parse_reasoning_and_tools() {
     let raw = r#"
 {"role":"_system_prompt","content":"internal"}

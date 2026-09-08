@@ -3,7 +3,7 @@
 ## Engine: cursor_usage module
 
 - [ ] 1. Create `crates/engine/src/cursor_usage.rs` mirroring `grok_usage.rs`: `state.vscdb` read via rusqlite read-only (`cursorAuth/accessToken`, `cursorAuth/cachedEmail`), `CredentialFingerprint` over the token, 60s cache, redacted error enum, `CursorUsageSnapshot { present, usage_windows, warning, email }`. Token struct has no Debug/Display. Per-platform production path (macOS `~/Library/Application Support/Cursor/…`, Linux `~/.config/Cursor/…`, Windows `%APPDATA%\Cursor\…`).
-- [ ] 2. Quota fetch: `POST {backend}/aiserver.v1.DashboardService/GetCurrentPeriodUsage` with bearer, `Connect-Protocol-Version: 1`, `{}` body, 8s timeout, redirects disabled; map `planUsage.totalSpend`/`limit` → `used_fraction`, `billingCycleEnd` ms → `resets_at`, label `Monthly`.
+- [ ] 2. Quota fetch: `POST {backend}/aiserver.v1.DashboardService/GetCurrentPeriodUsage` with bearer, `Connect-Protocol-Version: 1`, `{}` body, 8s timeout, redirects disabled; map `planUsage.totalPercentUsed` (then `autoPercentUsed`, else `totalSpend`/`limit`) → `used_fraction`, `billingCycleEnd` ms → `resets_at`, label `Monthly`.
 - [ ] 3. Last-known-good: serve retained windows with a redacted warning when a forced fetch fails after a success for the same token fingerprint; invalidate on token change/removal. No token write-back ever — the desktop app owns the store.
 
 ## Engine: wiring

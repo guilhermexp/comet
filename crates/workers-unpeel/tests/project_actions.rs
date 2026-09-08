@@ -140,41 +140,86 @@ fn invalid_worktree_request_fails_before_registering_a_child_project()
     Ok(())
 }
 
+/// A one-commit repository on `main` — the least a `git worktree add` needs.
+fn fixture_repo(repo: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(repo)?;
+    fs::write(repo.join("README.md"), "fixture\n")?;
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "workers@example.test"],
+        vec!["config", "user.name", "Workers Tests"],
+        vec!["add", "README.md"],
+        vec!["commit", "-m", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()?
+                .success()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn worktree_registered_as_a_plain_project_is_projected_as_a_worktree()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let (home, _guard) = isolated_home()?;
+    let repo = home.path().join("repo");
+    fixture_repo(&repo)?;
+    let checkout = home.path().join("repo-wt-sidebar");
+    assert!(
+        Command::new("git")
+            .args(["worktree", "add", "-b", "feature/sidebar"])
+            .arg(&checkout)
+            .current_dir(&repo)
+            .status()?
+            .success()
+    );
+
+    // Registered the way "Add project…" registers any folder: a root project
+    // with no parent and no worktree branch. This is what `git worktree add`
+    // in a terminal leaves behind, and it is the majority of the real
+    // registry — the registry cannot know, only the checkout can.
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
+    state["projects"][0]["path"] = serde_json::json!(repo);
+    state["projects"]
+        .as_array_mut()
+        .expect("projects array")
+        .push(serde_json::json!({
+            "id": "checkout",
+            "name": "repo-wt-sidebar",
+            "path": checkout,
+            "sort_order": 1,
+        }));
+    fs::write(
+        home.path().join("app-state.json"),
+        serde_json::to_vec_pretty(&state)?,
+    )?;
+
+    let project = LocalWorkersClient::new()
+        .bootstrap()?
+        .projects
+        .iter()
+        .find(|project| project.id == "checkout")
+        .cloned()
+        .expect("the registered checkout");
+    assert_eq!(project.worktree_branch.as_deref(), Some("feature/sidebar"));
+    assert_eq!(project.parent_project_id.as_deref(), Some("root"));
+    assert!(!project.is_group);
+    Ok(())
+}
+
 #[test]
 fn worktree_lifecycle_registers_and_removes_the_child_project()
 -> Result<(), Box<dyn std::error::Error>> {
     let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
     let (home, _guard) = isolated_home()?;
     let repo = home.path().join("repo");
-    fs::create_dir_all(&repo)?;
-    for args in [
-        vec!["init", "-b", "main"],
-        vec!["config", "user.email", "workers@example.test"],
-        vec!["config", "user.name", "Workers Tests"],
-    ] {
-        assert!(
-            Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .status()?
-                .success()
-        );
-    }
-    fs::write(repo.join("README.md"), "fixture\n")?;
-    assert!(
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(&repo)
-            .status()?
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .args(["commit", "-m", "fixture"])
-            .current_dir(&repo)
-            .status()?
-            .success()
-    );
+    fixture_repo(&repo)?;
 
     let mut state: serde_json::Value =
         serde_json::from_slice(&fs::read(home.path().join("app-state.json"))?)?;
@@ -200,6 +245,11 @@ fn worktree_lifecycle_registers_and_removes_the_child_project()
         .expect("worktree child project");
     assert_eq!(child.parent_project_id.as_deref(), Some("root"));
     assert_eq!(child.worktree_branch.as_deref(), Some("feature/sidebar"));
+    // A worktree nests like a folder but owns a checkout, so the UI must not
+    // read it as organization: `is_group` gates selection, the launcher, the
+    // hover controls and ledger membership, and the projection used to set it
+    // from `is_folder` + parent alone.
+    assert!(!child.is_group, "a worktree must not project as a group");
 
     client.remove_worktree(&worktree.project_id, true)?;
     assert!(!std::path::Path::new(&worktree.path).exists());
@@ -223,6 +273,15 @@ fn removing_an_empty_group_preserves_the_parent_and_unknown_state()
         parent_project_id: "root".into(),
         name: "Temporary".into(),
     })?;
+
+    let group = client
+        .bootstrap()?
+        .projects
+        .iter()
+        .find(|project| project.id == group_id)
+        .cloned()
+        .expect("group project");
+    assert!(group.is_group, "a folder without a branch is still a group");
 
     client.remove_group(&group_id)?;
 

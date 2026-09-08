@@ -483,6 +483,37 @@ impl ChatDocHandle {
         })
     }
 
+    /// Mark a mid-conversation model switch in the transcript: a SYSTEM entry
+    /// whose text names both models. Deliberately a plain text part — an app
+    /// version that predates the notice row renders it as an ordinary line
+    /// instead of dropping the entry. No-op on an empty transcript: nothing to
+    /// divide, and the chat's first run already uses the new model.
+    pub fn write_model_switch(&self, from: &str, to: &str) -> Result<(), DocError> {
+        self.write_marker(&format!("Model changed from {from} to {to}."))
+    }
+
+    /// The shared marker write behind [`Self::write_model_switch`] and the
+    /// compaction marker: caller-composed text (only the UI knows model labels
+    /// or token counts), same system entry, same empty-transcript no-op.
+    pub fn write_marker(&self, text: &str) -> Result<(), DocError> {
+        if self.doc.read_entries()?.is_empty() {
+            return Ok(());
+        }
+        self.doc.push_message(&SessionMessageEntry {
+            id: crate::new_id(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }],
+            created_at: crate::now_ms(),
+            device_id: self.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        })
+    }
+
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
     /// `note` as a visible error part so the transcript says WHY the turn
     /// ended (zeron folded "Run interrupted by backend restart" the same

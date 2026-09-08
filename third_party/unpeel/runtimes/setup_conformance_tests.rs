@@ -517,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn all_hook_scripts_bypass_the_proxy_for_the_loopback_post() {
+        // A hook POSTs to 127.0.0.1. With HTTP_PROXY/ALL_PROXY set in the
+        // user's environment, curl honours it for loopback too, so the
+        // lifecycle event goes to the proxy and is lost — silently, since the
+        // POST is `>/dev/null 2>&1`. Every script that posts must opt out.
+        for (label, script) in [
+            ("claude", super::CLAUDE_HOOK_SCRIPT),
+            ("notify", super::NOTIFY_HOOK_SCRIPT),
+            ("gemini", super::GEMINI_HOOK_SCRIPT),
+            ("kimi", super::KIMI_HOOK_SCRIPT),
+            ("copilot", super::COPILOT_HOOK_SCRIPT),
+            ("cursor", super::CURSOR_HOOK_SCRIPT),
+            ("grok", super::GROK_HOOK_SCRIPT),
+            ("muse", super::MUSE_HOOK_SCRIPT),
+            ("cline", super::CLINE_HOOK_SCRIPT),
+            ("kiro", super::KIRO_HOOK_SCRIPT),
+        ] {
+            if !script.contains("127.0.0.1") {
+                continue;
+            }
+            for line in script.lines().filter(|line| line.contains("curl")) {
+                assert!(
+                    line.contains("--noproxy"),
+                    "{label} posts to loopback without --noproxy: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn all_hook_scripts_record_last_hook_event() {
         for (label, script) in [
             ("claude", super::CLAUDE_HOOK_SCRIPT),

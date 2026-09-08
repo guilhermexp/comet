@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use gpui::{Context, Entity, Task};
+use gpui::{App, Context, Entity, Task};
 use zeron_doc::SessionCommandPayload;
 use zeron_rpc::methods;
 use zeron_workers_unpeel::{
@@ -17,6 +17,7 @@ use zeron_workers_unpeel::{
     pending_worker_parent_notifications, run_runtime_update_blocking, worker_parent_links,
 };
 
+use crate::change_requests::workers_change_request_targets;
 use crate::state::AppState;
 
 use super::archive::{archived_sessions_for_project, restore_action};
@@ -413,6 +414,16 @@ fn is_permanent_parent_notification_failure(error: &zeron_rpc::RpcError) -> bool
     }
 }
 
+/// The tree filter that survives a snapshot. A filter naming a project that is
+/// gone (removed, or a worktree deleted) would draw an empty tree with no way
+/// back except reopening the dropdown, so it falls back to "All projects".
+pub fn filter_after_snapshot(
+    filter: Option<String>,
+    projects: &[WorkersProject],
+) -> Option<String> {
+    filter.filter(|id| projects.iter().any(|project| &project.id == id))
+}
+
 fn notification_settings_for_snapshot(
     settings: Option<&WorkersSettingsSnapshot>,
 ) -> Option<&WorkersNotificationSettings> {
@@ -425,6 +436,10 @@ pub struct WorkersModel {
     pub snapshot: Option<WorkersBootstrap>,
     pub selected_project_id: Option<String>,
     pub selected_session_id: Option<String>,
+    /// Sidebar tree filter: a root project id, or `None` for "All projects".
+    /// Mirrors the Orchestrator's `space_filter`; the Shell persists it from
+    /// its existing observation of this model.
+    project_filter: Option<String>,
     pub launcher_project_id: Option<String>,
     pub expanded_project_ids: HashSet<String>,
     pub loading: bool,
@@ -504,6 +519,7 @@ impl WorkersModel {
             snapshot: None,
             selected_project_id: None,
             selected_session_id: None,
+            project_filter: None,
             launcher_project_id: None,
             expanded_project_ids: HashSet::new(),
             loading: true,
@@ -843,6 +859,18 @@ impl WorkersModel {
             .map_err(|error| error.to_string())
     }
 
+    pub fn project_filter(&self) -> Option<&str> {
+        self.project_filter.as_deref()
+    }
+
+    pub fn set_project_filter(&mut self, project_id: Option<String>, cx: &mut Context<Self>) {
+        if self.project_filter == project_id {
+            return;
+        }
+        self.project_filter = project_id;
+        cx.notify();
+    }
+
     pub fn selected_project(&self) -> Option<&WorkersProject> {
         let selected = self.selected_project_id.as_deref().or_else(|| {
             self.selected_session()
@@ -1011,6 +1039,7 @@ impl WorkersModel {
                         }
                         let app_focused = cx.active_window().is_some();
                         model.apply_snapshot(snapshot, app_focused);
+                        model.publish_change_request_targets(cx);
                         model.hibernate_idle_workers(cx);
                         model.dispatch_parent_notifications(deliveries, cx);
                     }
@@ -1911,6 +1940,36 @@ impl WorkersModel {
         });
     }
 
+    /// Tell `AppState` which checkouts this surface wants a PR for. Only
+    /// worktrees: a repository sitting on its default branch has no pull
+    /// request to name, and the 46 projects a real registry holds would be 46
+    /// subscriptions serving a badge no row draws.
+    fn publish_change_request_targets(&mut self, cx: &mut Context<Self>) {
+        let visible = crate::settings::current(cx).sidebar_show_pull_request;
+        let state = self.state.clone();
+        let device_id = state.read(cx).local_device_id.clone();
+        let targets = match (visible, device_id) {
+            (true, Some(device_id)) => workers_change_request_targets(self.projects(), &device_id),
+            _ => std::collections::HashSet::new(),
+        };
+        state.update(cx, |state, cx| {
+            state.set_workers_change_request_targets(targets, cx)
+        });
+    }
+
+    /// The PR this project's checkout resolved to, if any.
+    pub fn change_request_for(
+        &self,
+        project: &WorkersProject,
+        cx: &App,
+    ) -> Option<zeron_proto::ChangeRequestSummary> {
+        let branch = project.worktree_branch.as_deref()?;
+        self.state
+            .read(cx)
+            .change_request_for_checkout(&project.path, branch)
+            .cloned()
+    }
+
     fn apply_snapshot(&mut self, snapshot: WorkersBootstrap, app_focused: bool) {
         let notification_settings = notification_settings_for_snapshot(self.settings.as_ref());
         // A worker can appear without this app launching it (the MCP sidecar,
@@ -2040,6 +2099,7 @@ impl WorkersModel {
                     .find(|project| !project.is_group)
                     .map(|project| project.id.clone())
             });
+        self.project_filter = filter_after_snapshot(self.project_filter.take(), &snapshot.projects);
         if self.selected_session_id.is_some() {
             self.launcher_project_id = None;
         } else {

@@ -215,21 +215,20 @@ pub fn widget_card(
     body: Div,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
+    // Header plate matches the composer input (`theme.composer_glass_bg`).
+    // The body stays on the pane — no card fill, no hairline.
     div()
         .id(id)
         .w_full()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(theme.border.opacity(0.5))
-        .overflow_hidden()
         .child(
             div()
                 .h(px(36.0))
                 .px(px(10.0))
+                .rounded(px(8.0))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .bg(crate::theme::ink(0.012))
+                .bg(theme.composer_glass_bg())
                 .child(
                     icons::icon(icon_path)
                         .size(px(15.0))

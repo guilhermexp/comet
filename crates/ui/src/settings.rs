@@ -144,6 +144,7 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.sidebar_show_pull_request = shell.sidebar_show_pull_request;
     current.last_space_id = shell.last_space_id.clone();
     current.space_filter = shell.space_filter.clone();
+    current.workers_project_filter = shell.workers_project_filter.clone();
     current.sound_enabled = shell.sound_enabled;
     current.notifications_enabled = shell.notifications_enabled;
     current.notifications_background_only = shell.notifications_background_only;
@@ -250,6 +251,10 @@ pub struct UiSettings {
     /// Sidebar session filter: a space id, or `None` for "All spaces".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
+    /// Workers sidebar tree filter: a root Workers project id, or `None` for
+    /// "All projects". Device-local like every other Workers state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_project_filter: Option<String>,
     /// Legacy: per-space tab order, from when tabs were the selected space's
     /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -320,6 +325,7 @@ impl Default for UiSettings {
             last_space_id: None,
             open_tabs: None,
             space_filter: None,
+            workers_project_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
@@ -839,6 +845,7 @@ mod tests {
             last_space_id: Some("space-1".into()),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
+            workers_project_filter: Some("comet-project".into()),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],

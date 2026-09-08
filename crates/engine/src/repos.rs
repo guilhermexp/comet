@@ -697,6 +697,27 @@ impl Repos {
     /// worktrees. Filesystem resolution happens on a disposable thread because
     /// user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
+        self.authorized_checkout(repo_path, candidate, true).await
+    }
+
+    /// Whether `candidate` is one of the repository's linked worktrees — the
+    /// root is REJECTED. Deletion resolves through this: `git worktree remove`
+    /// refuses the main checkout and any unrelated folder, which is precisely
+    /// where a fallback that deletes the directory outright must never land.
+    pub async fn linked_worktree_checkout(
+        &self,
+        repo_path: &Path,
+        candidate: &Path,
+    ) -> Option<PathBuf> {
+        self.authorized_checkout(repo_path, candidate, false).await
+    }
+
+    async fn authorized_checkout(
+        &self,
+        repo_path: &Path,
+        candidate: &Path,
+        allow_root: bool,
+    ) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
         let worktrees: Vec<_> = self
@@ -708,7 +729,9 @@ impl Repos {
             .collect();
         disposable_worker("checkout-auth", move || {
             let candidate = std::fs::canonicalize(candidate).ok()?;
-            std::iter::once(repo_path)
+            allow_root
+                .then_some(repo_path)
+                .into_iter()
                 .chain(worktrees)
                 .filter_map(|path| std::fs::canonicalize(path).ok())
                 .any(|path| path == candidate)
@@ -902,12 +925,24 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
+        // Nothing on disk means nothing to delete: skip straight to the prune,
+        // which touches only git's own bookkeeping.
         let branch = if worktree_path.exists() {
-            self.current_branch(worktree_path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if worktree_path.exists() {
+            // Resolve BEFORE removing. `git worktree remove` refuses the main
+            // checkout and any unrelated folder, and the fallback below would
+            // then delete that folder recursively — with `worktreePath` coming
+            // from the caller (the method is forwardable, so from another
+            // device too), that is the user's checkout.
+            let worktree_path = self
+                .linked_worktree_checkout(repo_path, worktree_path)
+                .await
+                .ok_or_else(|| {
+                    EngineError::Other("not a linked worktree of this repository".into())
+                })?;
+            let branch = self
+                .current_branch(&worktree_path)
+                .await
+                .unwrap_or_default();
             let removed = self
                 .git(
                     &[
@@ -920,10 +955,14 @@ impl Repos {
                 )
                 .await;
             if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
+                // git refused (or the dir is half-gone) — delete the folder
+                // directly. Safe now: the path is a resolved linked worktree.
+                let _ = std::fs::remove_dir_all(&worktree_path);
             }
-        }
+            branch
+        } else {
+            String::new()
+        };
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
         if branch.starts_with("zeron/") {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
@@ -1919,6 +1958,35 @@ tmpfs /run tmpfs rw 0 0
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_worktree_refuses_paths_that_are_not_linked_worktrees() {
+        // `git worktree remove` refuses both of these, and the direct-removal
+        // fallback used to delete them anyway.
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        std::fs::write(sibling.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(root.path().join("keep.txt"), "keep").unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+
+        assert!(
+            repos
+                .delete_worktree(root.path(), sibling.path())
+                .await
+                .is_err()
+        );
+        assert!(sibling.path().join("keep.txt").exists());
+
+        assert!(
+            repos
+                .delete_worktree(root.path(), root.path())
+                .await
+                .is_err()
+        );
+        assert!(root.path().join("keep.txt").exists());
     }
 
     #[tokio::test]

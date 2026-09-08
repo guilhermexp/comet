@@ -6,3 +6,14 @@ local_modifications_count = 31
 local_deletions = ["apps/website"]
 local_patch_available = false
 license = "MIT"
+
+# O repositório voltou a ser público, mas com OUTRO histórico: 254 commits, o
+# mais antigo de 2026-08-24, e `base_revision` acima NÃO resolve lá. Não há
+# ancestral comum — sync é triagem arquivo a arquivo, nunca merge. O upstream
+# também já não tem `unpeel-tui`/`unpeel-ui` (de onde `activity_bridge.rs`
+# inclui a máquina de estados por `#[path]`) e está em meio a uma reescrita do
+# core (`core_reactor`, `pty_core`, `direct_path*`, `crates/apps`).
+upstream_checked_at = "2026-09-07"
+upstream_head_observed = "7a0e18e"
+upstream_history_rewritten = true
+base_revision_resolves_upstream = false

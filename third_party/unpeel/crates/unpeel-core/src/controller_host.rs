@@ -253,6 +253,13 @@ impl DiskCatalog {
             .filter(|project| folder_ids.contains(&project.id))
             .map(|project| json!({ "id": project.id, "name": project.name }))
             .collect();
+        // Where a detected worktree's main repository lands, when it is itself
+        // a registered project. Duplicated paths keep the last record — the
+        // same one `known_ids` membership would resolve to.
+        let project_ids_by_path: HashMap<String, &str> = projects
+            .iter()
+            .map(|project| (real_path(&project.path), project.id.as_str()))
+            .collect();
         let mut wire_projects = Vec::new();
         let mut create_projects = Vec::new();
         for (display_rank, project) in projects
@@ -285,10 +292,45 @@ impl DiskCatalog {
                         object.insert("parentProjectID".into(), parent.into());
                     }
                 }
-                if let Some(branch) = project.worktree_branch.as_deref() {
-                    object.insert("worktreeBranch".into(), branch.into());
+                let checkout = git_checkout(&project.path);
+                if let Some(branch) = checkout.branch.as_deref() {
+                    object.insert("gitBranch".into(), branch.into());
                 }
-                if project.is_folder && project.parent_id.is_some() {
+                // The registry only knows what it was told at registration: a
+                // worktree created by `git worktree add` in a terminal and then
+                // added as a project carries neither branch nor parent, and
+                // reached the sidebar as a root folder beside the repository it
+                // is a checkout of. Disk knows; the registry still wins where it
+                // spoke.
+                match project.worktree_branch.as_deref() {
+                    Some(branch) => {
+                        object.insert("worktreeBranch".into(), branch.into());
+                    }
+                    None if checkout.main_repo.is_some() => {
+                        if let Some(branch) = checkout.branch.as_deref() {
+                            object.insert("worktreeBranch".into(), branch.into());
+                        }
+                    }
+                    None => {}
+                }
+                if project.parent_id.is_none() {
+                    if let Some(parent) = checkout
+                        .main_repo
+                        .as_deref()
+                        .and_then(|main| project_ids_by_path.get(&real_path(main)))
+                    {
+                        object.insert("parentProjectID".into(), (*parent).into());
+                    }
+                }
+                // A worktree is a checkout, not organization: it nests
+                // under its parent (`is_folder`) but owns a path of its own.
+                // `Models.swift:43` spells the canonical predicate with the
+                // branch clause, and `remove_group` already agrees; without it
+                // here the UI denied a worktree everything that names a path.
+                if project.is_folder
+                    && project.parent_id.is_some()
+                    && project.worktree_branch.is_none()
+                {
                     object.insert("isGroup".into(), true.into());
                 }
                 if date_sorted_projects.contains(&project.id) {
@@ -574,6 +616,83 @@ fn disk_protocol() -> HostProtocolDescriptor {
         )
     });
     protocol
+}
+
+/// What a project folder's checkout says about itself.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitCheckout {
+    /// Current HEAD branch, or the short hash when HEAD is detached.
+    branch: Option<String>,
+    /// The repository this folder is a LINKED WORKTREE of, `None` for an
+    /// ordinary checkout. Git writes `.git` as a file — holding the `gitdir:`
+    /// pointer — only inside a linked worktree, and that pointer spells
+    /// `<main>/.git/worktrees/<name>`, so the main repository falls out of the
+    /// path this reader already had to open.
+    main_repo: Option<String>,
+}
+
+/// Reads a checkout's HEAD. Follows a worktree `.git` file to the real
+/// gitdir, matching the native Host's `GitHeadReader`.
+fn git_checkout(repo_path: &str) -> GitCheckout {
+    let mut checkout = GitCheckout::default();
+    let git_entry = std::path::Path::new(repo_path).join(".git");
+    let Ok(meta) = std::fs::metadata(&git_entry) else {
+        return checkout;
+    };
+    let head_path = if meta.is_dir() {
+        git_entry.join("HEAD")
+    } else {
+        let Some(gitdir) = std::fs::read_to_string(&git_entry)
+            .ok()
+            .and_then(|contents| {
+                contents.lines().find_map(|line| {
+                    line.strip_prefix("gitdir:")
+                        .map(|rest| rest.trim().to_owned())
+                })
+            })
+        else {
+            return checkout;
+        };
+        let resolved = if std::path::Path::new(&gitdir).is_absolute() {
+            std::path::PathBuf::from(gitdir)
+        } else {
+            std::path::Path::new(repo_path).join(gitdir)
+        };
+        checkout.main_repo = worktree_main_repo(&resolved);
+        resolved.join("HEAD")
+    };
+    checkout.branch = std::fs::read_to_string(head_path)
+        .ok()
+        .and_then(|head| match head.trim() {
+            "" => None,
+            head => Some(match head.strip_prefix("ref: refs/heads/") {
+                Some(branch) => branch.to_owned(),
+                None => head.chars().take(7).collect(),
+            }),
+        });
+    checkout
+}
+
+/// A path in the one form two spellings of the same folder can be compared in.
+/// Not cosmetic on macOS: git records the resolved `/private/var/...` in the
+/// gitdir pointer while a registry records whatever `/var/...` the user gave.
+/// Falls back to the trimmed input for a folder that no longer exists.
+fn real_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.trim_end_matches('/').to_owned())
+}
+
+/// `<main>/.git/worktrees/<name>` -> `<main>`. Any other shape (a submodule's
+/// gitdir, a `--separate-git-dir` layout) names no main checkout and is left
+/// alone rather than guessed at.
+fn worktree_main_repo(gitdir: &std::path::Path) -> Option<String> {
+    let worktrees = gitdir.parent()?;
+    let dot_git = worktrees.parent()?;
+    (worktrees.file_name()? == "worktrees" && dot_git.file_name()? == ".git")
+        .then(|| dot_git.parent())
+        .flatten()
+        .map(|main| main.to_string_lossy().into_owned())
 }
 
 fn project_records(state: &Value) -> Vec<ProjectRecord> {
@@ -1497,6 +1616,67 @@ mod tests {
             200,
             "whitespace-only rename trims to a no-op"
         );
+    }
+
+    #[test]
+    fn git_head_branch_reads_checkout_worktree_and_detached_head() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(
+            git_checkout(repo.to_str().unwrap()),
+            GitCheckout {
+                branch: Some("main".into()),
+                // An ordinary checkout belongs to no other project.
+                main_repo: None,
+            }
+        );
+
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let gitdir = repo.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git_checkout(worktree.to_str().unwrap()),
+            GitCheckout {
+                branch: Some("feature/x".into()),
+                main_repo: Some(repo.to_string_lossy().into_owned()),
+            }
+        );
+
+        std::fs::write(repo.join(".git/HEAD"), "abcdef1234567890\n").unwrap();
+        assert_eq!(
+            git_checkout(repo.to_str().unwrap()).branch.as_deref(),
+            Some("abcdef1")
+        );
+
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            git_checkout(empty.to_str().unwrap()),
+            GitCheckout::default()
+        );
+
+        // A submodule's gitdir is not `<main>/.git/worktrees/<name>`; guessing
+        // a parent from it would nest the row under an unrelated project.
+        let submodule = root.path().join("submodule");
+        std::fs::create_dir_all(&submodule).unwrap();
+        let module_dir = repo.join(".git/modules/vendor");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            submodule.join(".git"),
+            format!("gitdir: {}\n", module_dir.display()),
+        )
+        .unwrap();
+        assert_eq!(git_checkout(submodule.to_str().unwrap()).main_repo, None);
     }
 
     #[test]

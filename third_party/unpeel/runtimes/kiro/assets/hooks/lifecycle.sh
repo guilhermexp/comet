@@ -54,7 +54,7 @@ post_hook_payload() {
   _hook_session_id="$2"
   _hook_port="$3"
   [ -n "$_hook_port" ] || return 1
-  printf '%s' "$_hook_payload" | curl -sS --max-time 2 -X POST -H "Content-Type: application/json" \
+  printf '%s' "$_hook_payload" | curl -sS --noproxy '*' --max-time 2 -X POST -H "Content-Type: application/json" \
     -d @- "http://127.0.0.1:$_hook_port/hook/$_hook_session_id" >/dev/null 2>&1
 }
 

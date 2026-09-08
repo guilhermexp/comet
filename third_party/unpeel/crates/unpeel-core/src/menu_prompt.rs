@@ -44,6 +44,24 @@ const CANCEL_MARKERS: &[&str] = &["esc to cancel", "escape to cancel"];
 /// both a nav and a select marker but nothing is waiting for a choice.
 const PASSIVE_MARKERS: &[&str] = &["to view"];
 
+/// Prefixes whose incomplete repaint is already identifiable as Claude's
+/// passive subagent selector. Claude paints this row progressively, so a scan
+/// can land after "↑/↓ to select" but before "Enter to view". Treat that
+/// ambiguous prefix as passive unless the same footer also advertises an
+/// action that only an answerable menu has.
+const PASSIVE_SELECTOR_PREFIXES: &[&str] = &["↑/↓ to select"];
+
+/// Phrases that disambiguate a `PASSIVE_SELECTOR_PREFIXES` footer as an
+/// answerable menu. Keep these narrower than `SELECT_MARKERS`: the bare
+/// "Enter to" prefix is exactly the partial-paint state we must not alert on.
+const INTERACTIVE_QUALIFIERS: &[&str] = &[
+    "to navigate",
+    "to confirm",
+    "to choose",
+    "esc to cancel",
+    "escape to cancel",
+];
+
 /// True when the visible screen text looks like an interactive select menu
 /// waiting for a keyboard choice. `screen_text` is the rendered viewport
 /// (visible rows only), newline-separated.
@@ -73,7 +91,14 @@ pub fn viewport_has_menu_prompt(screen_text: &str) -> bool {
         let has_select = SELECT_MARKERS.iter().any(|marker| window.contains(marker));
         let has_confirm = CONFIRM_MARKERS.iter().any(|marker| window.contains(marker));
         let has_cancel = CANCEL_MARKERS.iter().any(|marker| window.contains(marker));
-        let passive = PASSIVE_MARKERS.iter().any(|marker| window.contains(marker));
+        let passive_action = PASSIVE_MARKERS.iter().any(|marker| window.contains(marker));
+        let passive_selector_prefix = PASSIVE_SELECTOR_PREFIXES
+            .iter()
+            .any(|marker| window.contains(marker));
+        let interactive_qualifier = INTERACTIVE_QUALIFIERS
+            .iter()
+            .any(|marker| window.contains(marker));
+        let passive = passive_action || (passive_selector_prefix && !interactive_qualifier);
         if ((has_nav && has_select) || (has_confirm && has_cancel)) && !passive {
             return true;
         }
@@ -145,6 +170,24 @@ mod tests {
                    view\n\
              \u{23fa} general-purpose 55m 46s · ↓ 348.3k";
         assert!(!viewport_has_menu_prompt(screen));
+    }
+
+    #[test]
+    fn ignores_claude_subagent_footer_during_partial_repaint() {
+        // The Host and iOS renderer can scan between synchronized repaint
+        // chunks. This prefix must not create a brief false attention edge
+        // before the wrapped "view" continuation arrives.
+        let screen = "  ⏺ main           ↑/↓ to select · Enter to";
+        assert!(!viewport_has_menu_prompt(screen));
+    }
+
+    #[test]
+    fn detects_qualified_menu_with_same_arrow_select_prefix() {
+        // A real menu may use the same opening phrase; an explicit
+        // confirm/cancel action disambiguates it from Claude's subagent list.
+        let screen = "  1. Keep working\n  2. Stop\n\
+             ↑/↓ to select · Enter to confirm · Esc to cancel";
+        assert!(viewport_has_menu_prompt(screen));
     }
 
     #[test]

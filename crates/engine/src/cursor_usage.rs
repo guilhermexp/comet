@@ -329,15 +329,23 @@ fn parse_epoch_ms(value: Option<&Value>) -> Option<DateTime<Utc>> {
 
 fn parse_usage_payload(payload: &Value) -> Option<Vec<AgentUsageWindow>> {
     let plan = payload.get("planUsage")?;
-    let total_spend = plan.get("totalSpend")?.as_f64()?;
-    let limit = plan.get("limit")?.as_f64()?;
-    if limit <= 0.0 {
-        return None;
-    }
+    // The dashboard bar is `totalPercentUsed`, not `totalSpend / limit`.
+    // The included dollar cap can be exhausted while Auto included usage
+    // is still a few percent; the ratio made Comet show Monthly 0%.
+    let used_fraction = plan
+        .get("totalPercentUsed")
+        .and_then(Value::as_f64)
+        .or_else(|| plan.get("autoPercentUsed").and_then(Value::as_f64))
+        .map(|percent| (percent / 100.0) as f32)
+        .or_else(|| {
+            let total_spend = plan.get("totalSpend")?.as_f64()?;
+            let limit = plan.get("limit")?.as_f64()?;
+            (limit > 0.0).then_some((total_spend / limit) as f32)
+        })?;
     let resets_at = parse_epoch_ms(payload.get("billingCycleEnd"));
     Some(vec![AgentUsageWindow {
         label: "Monthly".into(),
-        used_fraction: (total_spend / limit) as f32,
+        used_fraction,
         resets_at,
     }])
 }
@@ -468,7 +476,7 @@ mod tests {
         assert_eq!(snapshot.usage_windows.len(), 1);
         let window = &snapshot.usage_windows[0];
         assert_eq!(window.label, "Monthly");
-        assert!((window.used_fraction - (4433.0 / 7000.0) as f32).abs() < 0.001);
+        assert!((window.used_fraction - 0.0338).abs() < 0.001);
         assert_eq!(
             window.resets_at,
             DateTime::<Utc>::from_timestamp_millis(1791325989000)
@@ -621,6 +629,18 @@ mod tests {
             windows[0].resets_at,
             DateTime::<Utc>::from_timestamp_millis(1791325989000)
         );
+        // Dashboard percent wins over an exhausted included dollar cap.
+        let dashboard = serde_json::json!({
+            "billingCycleEnd": 1791325989000_i64,
+            "planUsage": {
+                "totalSpend": 7883,
+                "limit": 7000,
+                "autoPercentUsed": 6.57,
+                "totalPercentUsed": 6.02
+            }
+        });
+        let windows = parse_usage_payload(&dashboard).unwrap();
+        assert!((windows[0].used_fraction - 0.0602).abs() < 0.0001);
         // Missing planUsage / non-positive limit / non-numeric spend fail.
         assert!(parse_usage_payload(&serde_json::json!({})).is_none());
         assert!(

@@ -429,6 +429,19 @@ enum MutateParams {
     /// so they survive restarts and reach every device.
     #[serde(rename_all = "camelCase")]
     SetChatConfig { chat_id: String, config: ChatConfig },
+    /// Transcript marker for a model change made mid-conversation. Carries the
+    /// catalog LABELS (the picker's own text) because only the UI holds the
+    /// model catalog; the engine just writes the line.
+    #[serde(rename_all = "camelCase")]
+    NoteModelSwitch {
+        chat_id: String,
+        from: String,
+        to: String,
+    },
+    /// Same system-entry marker with caller-composed text — the UI owns the
+    /// wording (it holds the token counts the compaction line names).
+    #[serde(rename_all = "camelCase")]
+    NoteMarker { chat_id: String, text: String },
     /// Tombstone: removes the chats-map row; the session doc remains.
     #[serde(rename_all = "camelCase")]
     DeleteChat { chat_id: String },
@@ -922,6 +935,18 @@ impl EngineRpc {
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
+            MutateParams::NoteModelSwitch { chat_id, from, to } => self
+                .doc_host
+                .open(&chat_id)
+                .map_err(failed)?
+                .write_model_switch(&from, &to)
+                .map_err(|e| RpcError::Failed(e.to_string())),
+            MutateParams::NoteMarker { chat_id, text } => self
+                .doc_host
+                .open(&chat_id)
+                .map_err(failed)?
+                .write_marker(&text)
+                .map_err(|e| RpcError::Failed(e.to_string())),
             MutateParams::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);

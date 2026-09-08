@@ -222,7 +222,7 @@ impl TitleGenerator {
 /// small-tier row only decides the FAMILY (provider prefix + tier word) and the
 /// newest member of that family wins. The provider stays pinned: the same
 /// family is also listed under providers we may hold no credentials for.
-fn cheapest_model(models: &[Model]) -> Option<String> {
+pub(crate) fn cheapest_model(models: &[Model]) -> Option<String> {
     let tier_of = |m: &Model| {
         let haystack = format!("{} {}", m.id, m.label).to_lowercase();
         SMALL_TIERS

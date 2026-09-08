@@ -34,7 +34,16 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **Request id é sequência única do processo.** O `REPLAY_CACHE` do host é global e chaveado por `(principal, request_id)`, e todo `LocalWorkersClient` fala pelo mesmo principal (`comet-local`). Um contador por instância fazia cada `new()` recomeçar em 1 — e a UI criava cinco (terminal, model, resource monitor, workspace, settings/projects). Hoje a UI passa por `crate::workers::client::shared()` e tem **uma** instância, mas o contador compartilhado permanece como segunda defesa: qualquer consumidor novo (controller MCP, teste, host) volta a criar clientes próprios. Colidir com payload diferente devolve `409: request id reused with different request`; colidir com payload **igual** é pior, porque o segundo cliente recebe a resposta do primeiro sem erro nenhum. `next_request_id` é `shared_next_request_id()`, no mesmo padrão `OnceLock` dos outros campos compartilhados.
 
 - **`third_party/unpeel` e codigo vendorizado, nao submodulo.** O upstream
-  `unpeel-com/unpeel` deixou de existir publicamente; enquanto foi submodulo,
+  `unpeel-com/unpeel` ficou um tempo fora do ar e **voltou em 2026-09-07 com
+  outro histórico** — 254 commits, o mais antigo de 2026-08-24, e o
+  `base_revision` que gravamos não resolve lá. Não existe ancestral comum:
+  trazer algo de lá é **triagem arquivo a arquivo**, nunca merge, e várias
+  áreas nossas estão à frente (`parse_procargs2` tolerante a título reescrito,
+  `embedded_conversation_id`/`forked` do resume, o marker de atividade em
+  `write_session_input`) — o que o upstream "corrigiu" nelas é remoção do que
+  nós adicionamos. O upstream também já não tem `unpeel-tui`/`unpeel-ui`, de
+  onde `activity_bridge.rs` inclui a máquina de estados por `#[path]`.
+  Enquanto foi submodulo,
   NENHUM clone limpo compilava (`unpeel-core` e dependencia path de
   `zeron-workers-unpeel`, que e dependencia de `zeron-ui`, entao o workspace
   inteiro falhava na resolucao) — foi o que fez o gate de push revisar cinco
@@ -74,6 +83,34 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   novo a cada entrada. Grupos organizacionais NAO entram: reutilizam o path do
   pai e violariam essa chave; worktrees entram porque têm path próprio. A
   projeção filtra `is_group` e `reconcile` deduplica path defensivamente.
+- **Grupo é `is_folder` + parent + SEM branch — worktree tem as duas primeiras.**
+  `create_worktree` registra o worktree com `is_folder: true` (ele aninha sob o
+  pai na sidebar), então marcar grupo por `is_folder && parent` sozinho fazia
+  todo worktree chegar na UI como organização. `is_group` é o portão de tudo
+  que nomeia um path: seleção da row, controles de hover, `open_launcher`,
+  linha de estado vazio, entrada no ledger e casamento em Worked Projects — um
+  worktree criado sem sessão sumia da sidebar inteira, porque a row sem sessão
+  só sobrevive como projeto selecionado ou alvo do launcher e o flag barra os
+  dois. O predicado canônico está no app upstream (`Models.swift:43`,
+  `acceptsSessionDrop`) e `remove_group` já o soletra aqui; quem divergia era só
+  a projeção de `controller_host.rs`. `worktree_lifecycle_registers_and_removes_the_child_project`
+  fixa o flag no bootstrap que a UI lê — teste que constrói `WorkersProject` à
+  mão não prova nada sobre a rota `comet-local`, foi assim que isto passou
+  despercebido (mesma classe do `git_branch` acima).
+- **Worktree se reconhece pelo checkout, nao so pelo registro.** O registro
+  guarda o que lhe foi dito na hora de adicionar: um `git worktree add` feito
+  no terminal e depois adicionado por "Add project…" nao tem `worktree_branch`
+  nem parent, e chegava na sidebar como projeto raiz com icone de pasta, ao
+  lado do repositorio de que e checkout. Medido em `~/.unpeel/app-state.json`
+  desta maquina: 46 projetos, 9 worktrees vivos no disco, ZERO com
+  `worktree_branch`. O disco sabe sem ambiguidade — git so escreve `.git` como
+  ARQUIVO (com o ponteiro `gitdir:`) dentro de worktree linkado, e o ponteiro
+  soletra `<main>/.git/worktrees/<nome>`. `git_checkout` devolve os dois, e a
+  projeção PREENCHE o que faltava: `worktreeBranch` sempre, `parentProjectID`
+  quando o repositorio principal tambem e projeto registrado. O registro
+  continua ganhando onde falou. Comparação de path passa por
+  `canonicalize` — no macOS o gitdir grava `/private/var/...` e o registro
+  guarda `/var/...`, e sem isso o parent nunca casa.
 - **`reconcile` e puro e `last_seen_at` so anda com atividade real.** Nunca
   carimbe `now` num projeto vivo e parado: `dirty` viraria true a cada passada
   e abrir a tela escreveria num arquivo compartilhado e travado a cada render.
@@ -82,11 +119,15 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   filtro. So `@<segundos> <offset>` e ISO 8601 filtram. Qualquer mexida em
   `project_git::commit_at` mantem
   `a_date_before_the_first_commit_has_no_anchor`, que e a rede desse silencio.
-- **Nada de estado de git no ledger.** `is_repo`, remote, branch e commits
-  ancora sao lidos frescos por projeto SELECIONADO. `WorkersProject::git_branch`
-  nao serve de fonte: o campo e desserializado de `gitBranch`, mas o
-  `controller_host.rs` que o comet usa nunca o emite (so o host TUI emite), entao
-  pela rota `comet-local` ele e sempre `None`.
+- **Nada de estado de git no ledger.** `is_repo`, remote e commits ancora sao
+  lidos frescos por projeto SELECIONADO. `WorkersProject::git_branch` **passou
+  a chegar preenchido** (2026-09-07, `git_head_branch` trazido do upstream): a
+  projeção lê `.git/HEAD` direto — seguindo o `gitdir:` de um worktree,
+  truncando HEAD destacado em sha curto — e nunca forka `git`, porque ela roda
+  a cada bootstrap. Continua sendo campo de PROJEÇÃO, não fonte para o ledger,
+  e `None` continua possível (path sem checkout, HEAD ilegível). O leitor
+  chama-se `git_checkout` desde que passou a devolver tambem o repositorio
+  principal de um worktree.
 - **`owner`/`repo` nao sao derivados aqui.** Isso e
   `zeron_engine::parse_git_remote`, e puxar `engine` (loro, tokio, rusqlite,
   reqwest) para dentro desta crate por um parser inflaria ate o `cargo test`

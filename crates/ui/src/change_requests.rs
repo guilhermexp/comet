@@ -232,6 +232,33 @@ impl ChangeRequestClientState {
     ) -> Option<&'a ChangeRequestSummary> {
         change_request_for_chat(chat, spaces, self.snapshots.values())
     }
+
+    /// The PR resolved for a device-local checkout. A Workers project carries
+    /// no chat identity to re-verify, so the checkout IS the identity — and
+    /// both halves must match: a snapshot left over from the branch this
+    /// worktree used to be on would otherwise name the wrong pull request.
+    pub fn change_request_for_checkout(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Option<&ChangeRequestSummary> {
+        change_request_for_checkout(cwd, branch, self.snapshots.values())
+    }
+}
+
+pub(crate) fn change_request_for_checkout<'a>(
+    cwd: &str,
+    branch: &str,
+    snapshots: impl IntoIterator<Item = &'a CheckoutChangeRequestStatus>,
+) -> Option<&'a ChangeRequestSummary> {
+    let branch = branch.trim();
+    if branch.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.cwd == cwd && snapshot.branch == branch)
+        .and_then(|snapshot| snapshot.change_request.as_ref())
 }
 
 /// Active, fully identified checkouts that need host-side PR resolution.
@@ -259,6 +286,30 @@ pub(crate) fn desired_watch_targets(
                 cwd: cwd.to_owned(),
                 branch: branch.to_owned(),
                 checkout_id,
+            })
+        })
+        .collect()
+}
+
+/// The Workers surface's checkouts: one per worktree project, on the local
+/// device. A project without a worktree branch is a repository on its default
+/// branch — nothing to resolve, and nowhere on the row to draw it.
+pub(crate) fn workers_change_request_targets(
+    projects: &[zeron_workers_unpeel::WorkersProject],
+    local_device_id: &str,
+) -> HashSet<ChangeRequestWatchKey> {
+    projects
+        .iter()
+        .filter_map(|project| {
+            let branch = project.worktree_branch.as_deref()?.trim();
+            if branch.is_empty() || project.path.trim().is_empty() {
+                return None;
+            }
+            Some(ChangeRequestWatchKey {
+                device_id: local_device_id.to_owned(),
+                cwd: project.path.clone(),
+                branch: branch.to_owned(),
+                checkout_id: None,
             })
         })
         .collect()
@@ -398,6 +449,59 @@ mod tests {
             observed_at: Utc.timestamp_opt(2, 0).unwrap(),
         });
         chat
+    }
+
+    fn workers_project(id: &str, branch: Option<&str>) -> zeron_workers_unpeel::WorkersProject {
+        zeron_workers_unpeel::WorkersProject {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/repos/{id}"),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: branch.map(str::to_owned),
+            git_branch: Some("main".into()),
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: zeron_workers_unpeel::WorkersSessionSort::Custom,
+        }
+    }
+
+    #[test]
+    fn workers_change_request_targets_cover_worktrees_only() {
+        // A repository on its default branch has no pull request to name, and
+        // a real registry holds dozens of them — watching those would be
+        // dozens of subscriptions serving a badge no row draws.
+        let projects = [
+            workers_project("plain", None),
+            workers_project("wt", Some("fix/correios")),
+            // A blank branch is not a checkout identity.
+            workers_project("blank", Some("   ")),
+        ];
+        let targets = workers_change_request_targets(&projects, "local");
+        assert_eq!(targets.len(), 1);
+        let target = targets.iter().next().expect("the worktree target");
+        assert_eq!(target.cwd, "/repos/wt");
+        assert_eq!(target.branch, "fix/correios");
+        assert_eq!(target.device_id, "local");
+
+        // No worktree, no subscription — the empty set is what the model
+        // publishes while the badge setting is off.
+        assert!(workers_change_request_targets(&projects[..1], "local").is_empty());
+    }
+
+    #[test]
+    fn change_request_for_checkout_requires_cwd_and_branch() {
+        let stored = snapshot("local", "/repos/wt", "checkout");
+        assert_eq!(
+            change_request_for_checkout("/repos/wt", "feature/pr", [&stored]).map(|pr| pr.number),
+            Some(90)
+        );
+        // The worktree moved to another branch: the snapshot left behind names
+        // the PR of the branch it USED to be on.
+        assert!(change_request_for_checkout("/repos/wt", "fix/other", [&stored]).is_none());
+        assert!(change_request_for_checkout("/repos/other", "feature/pr", [&stored]).is_none());
+        assert!(change_request_for_checkout("/repos/wt", "  ", [&stored]).is_none());
     }
 
     #[test]

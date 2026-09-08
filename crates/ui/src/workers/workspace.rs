@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, Image, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point, Render, SharedString,
-    StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Image,
+    IntoElement, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point, Render,
+    SharedString, StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
 };
 use zeron_workers_unpeel::{
     WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession,
@@ -124,6 +124,93 @@ fn project_visible(
         }
     }
     true
+}
+
+/// One row of the Workers project-filter dropdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectsMenuRow {
+    All,
+    Project(String),
+    AddProject,
+}
+
+/// The open dropdown's view state — the Orchestrator's `SpacesMenu` shape,
+/// minus the device tag that a device-local project never carries.
+struct ProjectsMenu {
+    search: Entity<ComposerInput>,
+    active: usize,
+    focus: gpui::FocusHandle,
+    list_scroll: gpui::ScrollHandle,
+    _search_events: Subscription,
+}
+
+/// The dropdown's rows: "All projects" (empty query only), the ROOT projects
+/// matching `query` ranked by [`popover::filter_indices`], then "New project…".
+///
+/// Roots only. A worktree or a group is a child in the tree, so filtering to
+/// one would hide the parent it hangs from — the row would name a project and
+/// draw a fragment of another.
+pub fn projects_menu_rows(projects: &[WorkersProject], query: &str) -> Vec<ProjectsMenuRow> {
+    let roots: Vec<&WorkersProject> = projects
+        .iter()
+        .filter(|project| project.parent_project_id.is_none())
+        .collect();
+    let names: Vec<&str> = roots.iter().map(|project| project.name.as_str()).collect();
+    let mut rows = Vec::with_capacity(roots.len() + 2);
+    if query.trim().is_empty() {
+        rows.push(ProjectsMenuRow::All);
+    }
+    rows.extend(
+        popover::filter_indices(query, &names)
+            .into_iter()
+            .map(|ix| ProjectsMenuRow::Project(roots[ix].id.clone())),
+    );
+    rows.push(ProjectsMenuRow::AddProject);
+    rows
+}
+
+/// The root of `project_id`'s chain — the project the filter names when this
+/// one is a worktree or a group.
+pub fn root_project_id<'a>(project_id: &'a str, projects: &'a [WorkersProject]) -> &'a str {
+    let mut current = project_id;
+    for _ in 0..MAX_PROJECT_DEPTH {
+        let Some(project) = projects.iter().find(|candidate| candidate.id == current) else {
+            return current;
+        };
+        match project.parent_project_id.as_deref() {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+    current
+}
+
+/// Whether `project` survives the tree filter: the filtered project itself and
+/// everything under it. Without the subtree, filtering to a project would drop
+/// its own worktrees and groups — the rows the user filtered in order to see.
+pub fn project_in_filter(
+    project: &WorkersProject,
+    projects: &[WorkersProject],
+    filter: Option<&str>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let mut current = Some(project);
+    // Same cycle guard the rest of the tree walks use.
+    for _ in 0..MAX_PROJECT_DEPTH {
+        let Some(node) = current else {
+            return false;
+        };
+        if node.id == filter {
+            return true;
+        }
+        current = node
+            .parent_project_id
+            .as_deref()
+            .and_then(|parent| projects.iter().find(|candidate| candidate.id == parent));
+    }
+    false
 }
 
 /// Session rows rendered for an expanded project before the reveal control
@@ -346,6 +433,9 @@ pub struct WorkersSidebar {
     /// View-local and volatile, like the Orchestrator's archived page size:
     /// collapsing the project drops the entry, so reopening it starts capped.
     revealed_projects: std::collections::HashSet<String>,
+    /// The project-filter dropdown. The filter itself lives on the model (the
+    /// Shell persists it from there); this is only the open card.
+    projects_menu: popover::Popup<ProjectsMenu>,
     _spinner_task: Task<()>,
     _model_observation: Subscription,
 }
@@ -375,9 +465,304 @@ impl WorkersSidebar {
             content,
             picker_task: None,
             revealed_projects: std::collections::HashSet::new(),
+            projects_menu: popover::Popup::default(),
             _spinner_task: spinner_task,
             _model_observation: model_observation,
         }
+    }
+
+    fn projects_menu_query(&self, cx: &App) -> String {
+        self.projects_menu
+            .get()
+            .map(|menu| menu.search.read(cx).text().to_string())
+            .unwrap_or_default()
+    }
+
+    fn projects_menu_rows(&self, cx: &App) -> Vec<ProjectsMenuRow> {
+        let query = self.projects_menu_query(cx);
+        projects_menu_rows(self.model.read(cx).projects(), &query)
+    }
+
+    fn open_projects_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
+        // to the card's key handler.
+        let search =
+            cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
+        let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                if let Some(menu) = this.projects_menu.open_mut() {
+                    menu.active = 0;
+                }
+                cx.notify();
+            }
+        });
+        let handle = search.read(cx).focus_handle(cx);
+        self.projects_menu.open(ProjectsMenu {
+            search,
+            active: 0,
+            focus: cx.focus_handle(),
+            list_scroll: gpui::ScrollHandle::new(),
+            _search_events: search_events,
+        });
+        // The highlight starts ON the current filter row.
+        let current = self.model.read(cx).project_filter().map(str::to_owned);
+        let rows = self.projects_menu_rows(cx);
+        let start = match current {
+            None => 0,
+            Some(id) => rows
+                .iter()
+                .position(|row| matches!(row, ProjectsMenuRow::Project(p) if p == &id))
+                .unwrap_or(0),
+        };
+        if let Some(menu) = self.projects_menu.open_mut() {
+            menu.active = start;
+        }
+        // Focusable before first paint (the spaces dropdown's proven order) —
+        // otherwise the search input never takes a keystroke and ↑↓/⏎ never
+        // reach the card's key handler.
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn close_projects_menu(&mut self, cx: &mut Context<Self>) {
+        if self.projects_menu.begin_close() {
+            // Without the reap the card never leaves the exit phase: it stays
+            // mounted, `menu_out` fades it to invisible, and the occluding
+            // overlay that exit phase paints keeps swallowing every click on
+            // the sidebar underneath (user report — "fica um fade e não
+            // consigo apertar mais").
+            popover::reap_popup(cx, |this: &mut Self| &mut this.projects_menu);
+            cx.notify();
+        }
+    }
+
+    fn activate_projects_menu_row(&mut self, row: ProjectsMenuRow, cx: &mut Context<Self>) {
+        match row {
+            ProjectsMenuRow::All => self
+                .model
+                .update(cx, |model, cx| model.set_project_filter(None, cx)),
+            ProjectsMenuRow::Project(id) => self
+                .model
+                .update(cx, |model, cx| model.set_project_filter(Some(id), cx)),
+            ProjectsMenuRow::AddProject => self.open_project_picker(cx),
+        }
+        self.close_projects_menu(cx);
+    }
+
+    fn projects_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        // The card stays mounted (and focused) through the exit animation —
+        // keys must not drive a dying menu.
+        if !self.projects_menu.is_open() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => self.close_projects_menu(cx),
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let count = self.projects_menu_rows(cx).len();
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                if let Some(menu) = self.projects_menu.open_mut() {
+                    menu.active = popover::menu_step(Some(menu.active), count, delta).unwrap_or(0);
+                    menu.list_scroll.scroll_to_item(menu.active);
+                    cx.notify();
+                }
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                let row = {
+                    let active = self
+                        .projects_menu
+                        .get()
+                        .map(|menu| menu.active)
+                        .unwrap_or(0);
+                    self.projects_menu_rows(cx).get(active).cloned()
+                };
+                if let Some(row) = row {
+                    self.activate_projects_menu_row(row, cx);
+                }
+            }
+            popover::MenuKey::Backspace | popover::MenuKey::Other => {}
+        }
+    }
+
+    /// The filter trigger: folder glyph, the filtered project's name (or "All
+    /// projects") and a chevron. Sits OUTSIDE the tree's scroll region so the
+    /// dropdown floats without being clipped by the list's overflow — the same
+    /// reason the Orchestrator puts its own filter there.
+    fn render_projects_filter(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label: SharedString = {
+            let model = self.model.read(cx);
+            model
+                .project_filter()
+                .and_then(|id| model.projects().iter().find(|project| project.id == id))
+                .map(|project| SharedString::from(project.name.clone()))
+                .unwrap_or_else(|| SharedString::from("All projects"))
+        };
+        let open = self.projects_menu.is_open();
+
+        let trigger = div()
+            .id("workers-projects-filter")
+            .w_full()
+            .h(px(29.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text.opacity(0.8))
+            .bg(if open {
+                theme.glass_hover()
+            } else {
+                theme.glass_hover().opacity(0.0)
+            })
+            .hover(|el| el.bg(theme.glass_hover()))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.projects_menu.note_trigger_press()),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                // A press that found the menu open closes it (the card's
+                // mouse-down-out already began the close) — never reopen.
+                if this.projects_menu.take_press_was_open() {
+                    this.close_projects_menu(cx);
+                } else {
+                    this.open_projects_menu(window, cx);
+                }
+            }))
+            .child(
+                icon(icons::WORKER_FOLDER_CLOSED)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.6)),
+            );
+
+        let trigger = if self.projects_menu.get().is_some() {
+            let closing = self.projects_menu.closing_since();
+            let menu = self.render_projects_menu(theme, cx);
+            trigger.relative().child(popover::anchored_menu_below(
+                "workers-projects-filter-menu",
+                menu,
+                closing,
+            ))
+        } else {
+            trigger
+        };
+
+        div()
+            .px(px(SIDEBAR_SIDE_PADDING))
+            .pt(px(6.0))
+            .pb(px(4.0))
+            .child(trigger)
+            .into_any_element()
+    }
+
+    /// The dropdown card: search on top, then the rows.
+    fn render_projects_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (search, active, focus, list_scroll) = {
+            let Some(menu) = self.projects_menu.get() else {
+                return div().into_any_element();
+            };
+            (
+                menu.search.clone(),
+                menu.active,
+                menu.focus.clone(),
+                menu.list_scroll.clone(),
+            )
+        };
+        let rows = self.projects_menu_rows(cx);
+        let filter = self.model.read(cx).project_filter().map(str::to_owned);
+        let labels: Vec<(ProjectsMenuRow, SharedString)> = {
+            let model = self.model.read(cx);
+            rows.iter()
+                .map(|row| {
+                    let label = match row {
+                        ProjectsMenuRow::All => SharedString::from("All projects"),
+                        ProjectsMenuRow::AddProject => SharedString::from("New project…"),
+                        ProjectsMenuRow::Project(id) => model
+                            .projects()
+                            .iter()
+                            .find(|project| &project.id == id)
+                            .map(|project| SharedString::from(project.name.clone()))
+                            .unwrap_or_else(|| SharedString::from("?")),
+                    };
+                    (row.clone(), label)
+                })
+                .collect()
+        };
+
+        let list = div()
+            .id("workers-projects-menu-list")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .track_scroll(&list_scroll)
+            .children(labels.into_iter().enumerate().map(|(ix, (row, label))| {
+                let is_selected = match &row {
+                    ProjectsMenuRow::All => filter.is_none(),
+                    ProjectsMenuRow::Project(id) => filter.as_deref() == Some(id.as_str()),
+                    ProjectsMenuRow::AddProject => false,
+                };
+                let leading = match &row {
+                    ProjectsMenuRow::AddProject => icons::PLUS,
+                    _ => icons::WORKER_FOLDER_CLOSED,
+                };
+                let activate = row.clone();
+                popover::menu_row_nav(
+                    theme,
+                    is_selected,
+                    ix == active,
+                    format!("workers-projects-menu-row-{ix}"),
+                )
+                .id(("workers-projects-menu-row", ix))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.activate_projects_menu_row(activate.clone(), cx);
+                }))
+                .child(
+                    icon(leading)
+                        .size(px(15.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.8)),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(label))
+            }));
+
+        popover::popover_card(theme)
+            .id("workers-projects-menu")
+            .role(gpui::Role::Menu)
+            // Match the trigger as the sidebar is resized: both live inside
+            // the same horizontal gutters.
+            .w(px(
+                crate::settings::current(cx).sidebar_width - 2.0 * SIDEBAR_SIDE_PADDING
+            ))
+            .track_focus(&focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.projects_menu_key(event, cx)
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_projects_menu(cx)))
+            .flex()
+            .flex_col()
+            .child(popover::search_input_frame(
+                theme,
+                search.into_any_element(),
+            ))
+            .child(list)
+            .into_any_element()
     }
 
     fn open_project_picker(&mut self, cx: &mut Context<Self>) {
@@ -643,6 +1028,7 @@ impl WorkersSidebar {
         let toggle_project_id = project.id.clone();
         let project_name: SharedString = project.name.clone().into();
         let is_group = project.is_group;
+        let change_request = self.model.read(cx).change_request_for(&project, cx);
         let is_child_folder = project.parent_project_id.is_some();
         let folder_tint = project_folder_tint(
             project.folder_color_id.as_deref(),
@@ -842,6 +1228,17 @@ impl WorkersSidebar {
                                     )
                                 }),
                         )
+                    })
+                    // Outside the branch chip on purpose: that container is
+                    // faded to 0.55, and the badge's whole job is a state
+                    // colour that has to read at full strength.
+                    .when_some(change_request, |el, summary| {
+                        el.child(crate::change_requests::pull_request_badge(
+                            format!("workers-project-pr-{index}").into(),
+                            summary,
+                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            theme,
+                        ))
                     })
                     .when(!is_group, |el| {
                         el.child(
@@ -1252,6 +1649,7 @@ impl Render for WorkersSidebar {
             projects,
             all_sessions,
             presets,
+            project_filter,
         ) = {
             let model = self.model.read(cx);
             (
@@ -1264,17 +1662,28 @@ impl Render for WorkersSidebar {
                 model.projects().to_vec(),
                 model.sessions().to_vec(),
                 model.presets().to_vec(),
+                model.project_filter().map(str::to_owned),
             )
         };
 
         // Presentation-only projection: the snapshot keeps the host's order, so
         // the persisted sibling order and per-project session sort on disk are
         // untouched.
+        // The selected project's tree survives the filter. Revealing a session
+        // from elsewhere (the Details widget, a worker notification) selects a
+        // project the filter may exclude, and a selection with no row is the
+        // one state the sidebar must never draw. Its ROOT, so the chain down
+        // to the selected worktree is drawn too.
+        let selected_root = selected_project_id
+            .as_deref()
+            .map(|id| root_project_id(id, &projects).to_owned());
         let ordered_projects = projects_ordered_by_activity(&projects, &all_sessions);
         let rows = ordered_projects
             .iter()
             .filter(|project| {
-                project_visible(project, &projects, &expanded)
+                (project_in_filter(project, &projects, project_filter.as_deref())
+                    || project_in_filter(project, &projects, selected_root.as_deref()))
+                    && project_visible(project, &projects, &expanded)
                     && project_has_working_set(
                         project,
                         &projects,
@@ -1301,10 +1710,13 @@ impl Render for WorkersSidebar {
             })
             .collect::<Vec<_>>();
 
+        let filter_row = self.render_projects_filter(&theme, cx);
+
         div()
             .size_full()
             .flex()
             .flex_col()
+            .child(filter_row)
             .child(
                 div()
                     .id("workers-project-list")
@@ -4194,9 +4606,10 @@ mod layout_tests {
 #[cfg(test)]
 mod ordering_tests {
     use super::{
-        SESSION_ROW_CAP, compare_sessions_by_activity, project_activity, project_has_working_set,
-        project_session_row_plan, project_sessions_sorted, project_visible,
-        projects_ordered_by_activity, prune_revealed_projects,
+        ProjectsMenuRow, SESSION_ROW_CAP, compare_sessions_by_activity, project_activity,
+        project_has_working_set, project_in_filter, project_session_row_plan,
+        project_sessions_sorted, project_visible, projects_menu_rows, projects_ordered_by_activity,
+        prune_revealed_projects, root_project_id,
     };
     use zeron_workers_unpeel::{
         WorkersProject, WorkersSession, WorkersSessionCapabilities, WorkersSessionSort,
@@ -4216,6 +4629,107 @@ mod ordering_tests {
             folder_color_id: None,
             session_sort: WorkersSessionSort::Custom,
         }
+    }
+
+    fn worktree(id: &str, parent: &str) -> WorkersProject {
+        let mut project = project(id, Some(parent));
+        project.is_group = false;
+        project.worktree_branch = Some(format!("feature/{id}"));
+        project
+    }
+
+    #[test]
+    fn project_filter_keeps_the_subtree_of_the_picked_project() {
+        // Filtering to a project must keep what hangs off it: dropping the
+        // subtree would hide the very worktrees the filter was opened to see.
+        let projects = vec![
+            project("alpha", None),
+            worktree("alpha-wt", "alpha"),
+            project("alpha-group", Some("alpha")),
+            project("beta", None),
+            worktree("beta-wt", "beta"),
+        ];
+        let kept: Vec<&str> = projects
+            .iter()
+            .filter(|candidate| project_in_filter(candidate, &projects, Some("alpha")))
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["alpha", "alpha-wt", "alpha-group"]);
+
+        let all: Vec<&str> = projects
+            .iter()
+            .filter(|candidate| project_in_filter(candidate, &projects, None))
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        assert_eq!(all.len(), projects.len());
+    }
+
+    #[test]
+    fn project_filter_never_hides_the_selected_project() {
+        // Revealing a session from the Details widget or a notification
+        // selects a project the filter may exclude; a selection with no row is
+        // the one state the sidebar must not draw.
+        let projects = vec![
+            project("alpha", None),
+            project("beta", None),
+            worktree("beta-wt", "beta"),
+        ];
+        let selected_root = root_project_id("beta-wt", &projects).to_owned();
+        assert_eq!(selected_root, "beta");
+
+        let kept: Vec<&str> = projects
+            .iter()
+            .filter(|candidate| {
+                project_in_filter(candidate, &projects, Some("alpha"))
+                    || project_in_filter(candidate, &projects, Some(selected_root.as_str()))
+            })
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["alpha", "beta", "beta-wt"]);
+    }
+
+    #[test]
+    fn project_filter_falls_back_when_its_project_is_gone() {
+        use super::super::model::filter_after_snapshot;
+        let projects = vec![project("alpha", None)];
+        assert_eq!(
+            filter_after_snapshot(Some("alpha".into()), &projects).as_deref(),
+            Some("alpha")
+        );
+        // Removed project, or a deleted worktree: an empty tree with no way
+        // back is worse than showing everything.
+        assert_eq!(filter_after_snapshot(Some("gone".into()), &projects), None);
+        assert_eq!(filter_after_snapshot(None, &projects), None);
+    }
+
+    #[test]
+    fn project_filter_menu_rows_rank_roots_and_hide_all_while_searching() {
+        let projects = vec![
+            project("comet", None),
+            worktree("comet-wt", "comet"),
+            project("comet-group", Some("comet")),
+            project("kanwas", None),
+        ];
+
+        assert_eq!(
+            projects_menu_rows(&projects, ""),
+            vec![
+                ProjectsMenuRow::All,
+                ProjectsMenuRow::Project("comet".into()),
+                ProjectsMenuRow::Project("kanwas".into()),
+                ProjectsMenuRow::AddProject,
+            ],
+            "empty query lists every root, never a worktree or a group"
+        );
+
+        assert_eq!(
+            projects_menu_rows(&projects, "kan"),
+            vec![
+                ProjectsMenuRow::Project("kanwas".into()),
+                ProjectsMenuRow::AddProject,
+            ],
+            "searching means hunting a project — All has no place in the result"
+        );
     }
 
     fn session(id: &str, project_id: &str, updated: u64, created: u64) -> WorkersSession {

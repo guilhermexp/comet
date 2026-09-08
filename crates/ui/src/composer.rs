@@ -97,7 +97,7 @@ struct ContextIndicatorState {
     level: ContextIndicatorLevel,
 }
 
-fn compact_token_count(tokens: u64) -> String {
+pub fn compact_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         let value = tokens as f64 / 1_000_000.0;
         if tokens.is_multiple_of(1_000_000) {
@@ -1037,6 +1037,10 @@ const MENTION_SIDE_PAD: &str = "\u{00A0}";
 /// A private URI scheme keeps file mentions distinguishable from ordinary
 /// Markdown links pasted into the composer.
 const FILE_MENTION_SCHEME: &str = "zeron-file:";
+/// Project mentions ride the same chip machinery under their own scheme: the
+/// path is absolute (a known project on its owning device, not a workspace
+/// entry) and the label is the project's name, not the folder basename.
+const PROJECT_MENTION_SCHEME: &str = "zeron-project:";
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -1110,6 +1114,39 @@ fn local_file_link(path: &str, is_dir: bool) -> String {
     )
 }
 
+fn unescape_mention_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut escaped = false;
+    for ch in label.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn project_mention_link(name: &str, path: &str) -> String {
+    let path = path.trim_end_matches('/');
+    format!(
+        "[{}]({}{})",
+        escape_mention_label(name),
+        PROJECT_MENTION_SCHEME,
+        percent_encode_path(&format!("{path}/"))
+    )
+}
+
+/// A project path is absolute by nature (the folder on its owning device), so
+/// [`local_path_is_safe`]'s workspace-relative rule applies to everything but
+/// the leading separator.
+fn project_path_is_safe(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(local_path_is_safe)
+}
+
 fn local_path_is_safe(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -1150,23 +1187,42 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         };
         let end = target_start + relative_end + 1;
         let label = &text[start + 1..label_end];
-        let Some(encoded) = text[target_start..end - 1].strip_prefix(FILE_MENTION_SCHEME) else {
+        let target = &text[target_start..end - 1];
+        // A project link labels itself (the project's name); a file link's
+        // label must still be its own basename.
+        let parsed = if let Some(encoded) = target.strip_prefix(PROJECT_MENTION_SCHEME) {
+            percent_decode_path(encoded).and_then(|target| {
+                let path = target.strip_suffix('/').unwrap_or(&target);
+                let name = unescape_mention_label(label);
+                (project_path_is_safe(path)
+                    && percent_encode_path(&target) == encoded
+                    && !name.is_empty()
+                    && escape_mention_label(&name) == label)
+                    .then(|| (name, path.to_string(), true))
+            })
+        } else if let Some(encoded) = target.strip_prefix(FILE_MENTION_SCHEME) {
+            percent_decode_path(encoded).and_then(|target| {
+                let is_dir = target.ends_with('/');
+                let path = target.strip_suffix('/').unwrap_or(&target);
+                (local_path_is_safe(path)
+                    && percent_encode_path(&target) == encoded
+                    && path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|basename| escape_mention_label(basename) == label))
+                .then(|| {
+                    (
+                        path.rsplit('/').next().unwrap_or_default().to_string(),
+                        path.to_string(),
+                        is_dir,
+                    )
+                })
+            })
+        } else {
             search = end;
             continue;
         };
-        let parsed = percent_decode_path(encoded).and_then(|target| {
-            let is_dir = target.ends_with('/');
-            let path = target.strip_suffix('/').unwrap_or(&target);
-            (local_path_is_safe(path)
-                && percent_encode_path(&target) == encoded
-                && path
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|basename| escape_mention_label(basename) == label))
-            .then(|| (path.to_string(), is_dir))
-        });
-        if let Some((path, is_dir)) = parsed {
-            let basename = path.rsplit('/').next().unwrap_or_default().to_string();
+        if let Some((basename, path, is_dir)) = parsed {
             links.push(FileMentionLink {
                 range: start..end,
                 basename,
@@ -1583,7 +1639,7 @@ pub struct SentMentionSpan {
 /// substring probe keeps ordinary prompts on the zero-allocation path, so this
 /// is safe to call for every user row.
 pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
-    if !raw.contains(FILE_MENTION_SCHEME) {
+    if !raw.contains(FILE_MENTION_SCHEME) && !raw.contains(PROJECT_MENTION_SCHEME) {
         return None;
     }
     let projection = TextProjection::new(raw);
@@ -1979,8 +2035,18 @@ impl ComposerInput {
         is_dir: bool,
         cx: &mut Context<Self>,
     ) {
+        self.replace_mention_link(range, &local_file_link(path, is_dir), cx);
+    }
+
+    /// Insert an already-formed mention link (file or project) over `range`.
+    pub fn replace_mention_link(
+        &mut self,
+        range: Range<usize>,
+        link: &str,
+        cx: &mut Context<Self>,
+    ) {
         self.invalidate_mention_tooltip();
-        let path = local_file_link(path, is_dir);
+        let path = link.to_string();
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
         let inserted = if existing_separator.is_some() {
@@ -3388,6 +3454,8 @@ struct MentionPathTooltip {
 
 struct ContextUsageTooltip {
     state: ContextIndicatorState,
+    /// Whether clicking the ring will run `/compact` right now.
+    compactable: bool,
 }
 
 impl Render for ContextUsageTooltip {
@@ -3437,7 +3505,15 @@ impl Render for ContextUsageTooltip {
                         .text_size(px(11.5))
                         .text_color(theme.text_muted.opacity(0.82))
                         .child(self.state.detail.clone()),
-                ),
+                )
+                .when(self.compactable, |el| {
+                    el.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child("Clique para compactar"),
+                    )
+                }),
         )
     }
 }
@@ -3931,6 +4007,14 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// Is this prompt the compaction command? One detector for both entry points
+/// — the context ring's click and a hand-typed `/compact [instructions]` —
+/// so the transcript marker never depends on which one fired it.
+fn is_compact_command(text: &str) -> bool {
+    let text = text.trim();
+    text == "/compact" || text.starts_with("/compact ")
+}
+
 /// Restart a popup's row stack at the top (fresh open / query / result set).
 fn reset_scroll_offset(scroll: &gpui::ScrollHandle) {
     scroll.set_offset(gpui::Point::new(px(0.0), px(0.0)));
@@ -3978,10 +4062,68 @@ struct SlashState {
     dismissed: Option<(Range<usize>, String)>,
 }
 
+/// One row of the popup's Projects section: a known project, referenced by
+/// name with its absolute path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectMention {
+    name: String,
+    path: String,
+}
+
+/// Projects matching the `@` query by name or path (case-insensitive); an
+/// empty query lists them all. Pure — filtering the ledger snapshot the
+/// composer already holds, so no IO per keystroke.
+fn filter_project_mentions(projects: &[ProjectMention], query: &str) -> Vec<ProjectMention> {
+    let needle = query.to_lowercase();
+    projects
+        .iter()
+        .filter(|project| {
+            needle.is_empty()
+                || project.name.to_lowercase().contains(&needle)
+                || project.path.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The project ledger — the same list Settings → Projects shows: every folder
+/// the app has ever seen, most recently active first. Read straight from
+/// `app-state.json` (no Workers daemon round-trip): mentioning a project must
+/// work whether or not the local Workers host is up.
+fn read_project_ledger() -> Vec<ProjectMention> {
+    let mut rows = match zeron_workers_unpeel::project_ledger::read() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "project ledger read failed");
+            return Vec::new();
+        }
+    };
+    rows.sort_by(|a, b| b.last_seen_at_unix_ms.cmp(&a.last_seen_at_unix_ms));
+    rows.into_iter()
+        .map(|row| ProjectMention {
+            name: row.name,
+            path: row.path,
+        })
+        .collect()
+}
+
+/// Which level of the `@` menu is showing: the root (a Projects entry over the
+/// file results) or the project list it opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum MentionLevel {
+    #[default]
+    Root,
+    Projects,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
     results: Vec<FileSearchMatch>,
+    /// Known projects matching the query — only shown (and only navigable)
+    /// once the root menu's Projects entry is opened.
+    projects: Vec<ProjectMention>,
+    level: MentionLevel,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3993,6 +4135,27 @@ struct FileMentionState {
     /// Full token text, not just the cursor-relative query: moving within a
     /// dismissed token keeps it closed, while any edit re-enables completion.
     dismissed: Option<(Range<usize>, String)>,
+}
+
+impl FileMentionState {
+    /// Rows the popup offers — the keyboard cursor's space. At the root that
+    /// is the Projects entry plus the file results; inside it, the projects.
+    fn row_count(&self) -> usize {
+        match self.level {
+            MentionLevel::Root => 1 + self.results.len(),
+            MentionLevel::Projects => self.projects.len(),
+        }
+    }
+
+    /// Where the active row sits in the rendered stack: the root's separator
+    /// takes a position of its own, so the keyboard cursor's index is not the
+    /// child index `scroll_to_item` wants.
+    fn scroll_index(&self, active: usize) -> usize {
+        match self.level {
+            MentionLevel::Root => active + usize::from(active > 0),
+            MentionLevel::Projects => active + 1,
+        }
+    }
 }
 
 fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
@@ -4052,6 +4215,10 @@ pub struct Composer {
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
+    /// Settings → Projects' ledger, snapshotted when the `@` menu opens; the
+    /// Projects level filters this, never disk.
+    project_ledger: Vec<ProjectMention>,
+    project_ledger_task: Option<Task<()>>,
     slash_task: Option<Task<()>>,
     slash: SlashState,
     /// Advertised commands per harness (one `ListCommands` per harness per
@@ -4229,6 +4396,8 @@ impl Composer {
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
+            project_ledger: Vec::new(),
+            project_ledger_task: None,
             slash_task: None,
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
@@ -4671,14 +4840,31 @@ impl Composer {
         // skeleton (and a different height) on every keystroke.
         let refining = self.mention.token.is_some() && token.is_some();
         self.mention.token = token.clone();
+        // The project list filters locally on every keystroke — no debounce,
+        // no waiting for the file search.
+        self.mention.projects = match &token {
+            Some(token) => filter_project_mentions(&self.project_ledger, &token.query),
+            None => Vec::new(),
+        };
         if !refining {
             self.mention.results.clear();
             self.mention.active = None;
-            // Fresh open: the row stack restarts at the top.
+            self.mention.level = MentionLevel::Root;
+            // Fresh open: the row stack restarts at the top, and the ledger is
+            // re-read once (a project added since the last `@` shows up).
             reset_scroll_offset(&self.mention_scroll);
+            if token.is_some() {
+                self.load_project_ledger(cx);
+            }
         }
         self.mention.error = None;
         self.mention.loading = token.is_some();
+        // A project row is selectable before the file search answers (and
+        // when it never does: no engine, no target device).
+        self.mention.active = match self.mention.active {
+            Some(active) if active < self.mention.row_count() => Some(active),
+            _ => (self.mention.row_count() > 0).then_some(0),
+        };
         self.sync_mention_controls(cx);
         let Some(token) = token else {
             cx.notify();
@@ -4749,8 +4935,9 @@ impl Composer {
                     Ok(value) => match serde_json::from_value::<Vec<FileSearchMatch>>(value) {
                         Ok(results) => {
                             composer.mention.error = None;
-                            composer.mention.active = (!results.is_empty()).then_some(0);
                             composer.mention.results = results;
+                            composer.mention.active =
+                                (composer.mention.row_count() > 0).then_some(0);
                             // New result set: the row stack restarts at the top.
                             reset_scroll_offset(&composer.mention_scroll);
                         }
@@ -4759,7 +4946,7 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(%err, "file mention search failed");
                         composer.mention.results.clear();
-                        composer.mention.active = None;
+                        composer.mention.active = (composer.mention.row_count() > 0).then_some(0);
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
@@ -4771,18 +4958,49 @@ impl Composer {
         cx.notify();
     }
 
+    /// Snapshot the project ledger off the UI thread. Cheap (one JSON read),
+    /// so it re-runs per `@` open instead of caching for the session.
+    fn load_project_ledger(&mut self, cx: &mut Context<Self>) {
+        self.project_ledger_task = Some(cx.spawn(async move |this, cx| {
+            let projects = cx
+                .background_executor()
+                .spawn(async move { read_project_ledger() })
+                .await;
+            this.update(cx, |composer, cx| {
+                composer.project_ledger = projects;
+                if let Some(token) = composer.mention.token.clone() {
+                    composer.mention.projects =
+                        filter_project_mentions(&composer.project_ledger, &token.query);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
-            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+            crate::popover::menu_step(self.mention.active, self.mention.row_count(), delta);
         if let Some(active) = self.mention.active {
             // Keep the keyboard cursor visible in the scrolled row stack.
-            self.mention_scroll.scroll_to_item(active);
+            self.mention_scroll
+                .scroll_to_item(self.mention.scroll_index(active));
         }
         self.sync_mention_controls(cx);
         cx.notify();
     }
 
     fn dismiss_mention(&mut self, cx: &mut Context<Self>) {
+        // Inside the project list, Escape walks back to the root menu — the
+        // whole popup closes only from there.
+        if self.mention.level == MentionLevel::Projects {
+            self.mention.level = MentionLevel::Root;
+            self.mention.active = Some(0);
+            reset_scroll_offset(&self.mention_scroll);
+            self.sync_mention_controls(cx);
+            cx.notify();
+            return;
+        }
         let dismissed = self.mention.token.as_ref().and_then(|token| {
             self.input
                 .read(cx)
@@ -4798,16 +5016,30 @@ impl Composer {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
-        let Some((path, is_dir)) = self
-            .mention
-            .active
-            .and_then(|active| self.mention.results.get(active))
-            .map(|result| (result.path.clone(), result.is_dir))
-        else {
+        let Some(active) = self.mention.active else {
             return;
         };
+        let link = match self.mention.level {
+            // Row 0 is the Projects entry: opening it is the whole action.
+            MentionLevel::Root if active == 0 => {
+                self.mention.level = MentionLevel::Projects;
+                self.mention.active = (!self.mention.projects.is_empty()).then_some(0);
+                reset_scroll_offset(&self.mention_scroll);
+                self.sync_mention_controls(cx);
+                cx.notify();
+                return;
+            }
+            MentionLevel::Root => match self.mention.results.get(active - 1) {
+                Some(result) => local_file_link(&result.path, result.is_dir),
+                None => return,
+            },
+            MentionLevel::Projects => match self.mention.projects.get(active) {
+                Some(project) => project_mention_link(&project.name, &project.path),
+                None => return,
+            },
+        };
         self.input.update(cx, |input, cx| {
-            input.replace_mention(token.range, &path, is_dir, cx)
+            input.replace_mention_link(token.range, &link, cx)
         });
         self.reset_mention(None, cx);
         cx.notify();
@@ -4827,40 +5059,82 @@ impl Composer {
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
-        if self.mention.loading && self.mention.results.is_empty() {
-            card = card.child(crate::popover::skeleton_rows(
-                "file-mention-loading",
-                theme,
-                3,
-                cx.entity_id(),
-                cx,
-            ));
-        } else if let Some(error) = self.mention.error.clone() {
-            card = card.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(10.0))
-                    .text_size(px(SLASH_DESCRIPTION_SIZE))
-                    .text_color(theme.danger_muted)
-                    .child(error),
-            );
-        } else if self.mention.results.is_empty() {
-            card = card.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(10.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .child(if token.query.is_empty() {
-                        "No files available"
-                    } else {
-                        "No matching files"
-                    }),
-            );
-        } else {
-            let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.mention.results.len());
+        let rows: Vec<gpui::AnyElement> = match self.mention.level {
+            MentionLevel::Projects => self.render_project_mention_rows(theme, cx),
+            MentionLevel::Root => self.render_root_mention_rows(token, theme, cx),
+        };
+        // Overflowing rows wheel-scroll inside a bounded viewport; the
+        // floating rail mirrors the model-list scrollbar treatment.
+        card = card.child(
+            div()
+                .id("mention-scroll-host")
+                .relative()
+                .on_hover(cx.listener(Self::on_popup_list_hover))
+                .child(
+                    div()
+                        .id("mention-list")
+                        .max_h(px(312.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.mention_scroll)
+                        .children(rows),
+                )
+                .children(self.popup_scrollbar(
+                    "mention-scrollbar",
+                    &self.mention_scroll,
+                    theme,
+                    cx,
+                )),
+        );
+        Some(crate::popover::full_width_menu_above(
+            "file-mention-popup",
+            card.into_any_element(),
+            None,
+        ))
+    }
+
+    /// The root level: the Projects entry over the file results.
+    fn render_root_mention_rows(
+        &self,
+        token: &MentionToken,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.mention.results.len() + 2);
+        rows.push(
+            crate::popover::menu_row(theme, self.mention.active == Some(0), "mention-projects")
+                .id("mention-projects")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.mention.active = Some(0);
+                    this.accept_mention(cx);
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::FOLDER)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child("Projects"),
+                )
+                .child(
+                    crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .into_any_element(),
+        );
+        rows.push(crate::popover::menu_separator().into_any_element());
+        if !self.mention.results.is_empty() {
             for (ix, result) in self.mention.results.iter().enumerate() {
-                let selected = self.mention.active == Some(ix);
+                let row_ix = ix + 1;
+                let selected = self.mention.active == Some(row_ix);
                 let (directory, name) = match result.path.rsplit_once('/') {
                     Some((directory, name)) => (directory.to_string(), name.to_string()),
                     None => (String::new(), result.path.clone()),
@@ -4869,7 +5143,7 @@ impl Composer {
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mention.active = Some(ix);
+                            this.mention.active = Some(row_ix);
                             this.accept_mention(cx);
                         }))
                         .child(
@@ -4912,36 +5186,106 @@ impl Composer {
                         .into_any_element(),
                 );
             }
-            // Overflowing rows wheel-scroll inside a bounded viewport; the
-            // floating rail mirrors the model-list scrollbar treatment.
-            card = card.child(
+        } else if self.mention.loading {
+            rows.push(crate::popover::skeleton_rows(
+                "file-mention-loading",
+                theme,
+                3,
+                cx.entity_id(),
+                cx,
+            ));
+        } else if let Some(error) = self.mention.error.clone() {
+            rows.push(
                 div()
-                    .id("mention-scroll-host")
-                    .relative()
-                    .on_hover(cx.listener(Self::on_popup_list_hover))
-                    .child(
-                        div()
-                            .id("mention-list")
-                            .max_h(px(312.0))
-                            .flex()
-                            .flex_col()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.mention_scroll)
-                            .children(rows),
-                    )
-                    .children(self.popup_scrollbar(
-                        "mention-scrollbar",
-                        &self.mention_scroll,
-                        theme,
-                        cx,
-                    )),
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(SLASH_DESCRIPTION_SIZE))
+                    .text_color(theme.danger_muted)
+                    .child(error)
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(if token.query.is_empty() {
+                        "No files available"
+                    } else {
+                        "No matching files"
+                    })
+                    .into_any_element(),
             );
         }
-        Some(crate::popover::full_width_menu_above(
-            "file-mention-popup",
-            card.into_any_element(),
-            None,
-        ))
+        rows
+    }
+
+    /// The Projects level: every project the app knows, filtered by the query.
+    fn render_project_mention_rows(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> =
+            vec![crate::popover::menu_heading(theme, "Projects").into_any_element()];
+        if self.mention.projects.is_empty() {
+            rows.push(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("No matching projects")
+                    .into_any_element(),
+            );
+            return rows;
+        }
+        for (ix, project) in self.mention.projects.iter().enumerate() {
+            let selected = self.mention.active == Some(ix);
+            rows.push(
+                crate::popover::menu_row(theme, selected, format!("project-mention-{ix}"))
+                    .id(("project-mention", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mention.active = Some(ix);
+                        this.accept_mention(cx);
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                crate::icons::icon(crate::icons::FOLDER)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(13.0))
+                                    .text_color(theme.text)
+                                    .child(project.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.text_muted)
+                                    .child(project.path.clone()),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 
     fn render_input_with_completion(&self) -> gpui::Div {
@@ -5588,6 +5932,15 @@ impl Composer {
             taken
         });
         let typed = text.clone();
+        // Pre-compaction size, captured before the run that shrinks it. New
+        // chats are skipped: there is nothing to compact yet.
+        let compaction_before = (!is_new && is_compact_command(&typed)).then(|| {
+            self.state
+                .read(cx)
+                .session_for(&chat_id)
+                .and_then(|session| session.context_usage)
+                .map_or(0, |usage| usage.tokens)
+        });
         let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -5704,6 +6057,9 @@ impl Composer {
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
+            }
+            if let Some(before) = compaction_before {
+                s.begin_compaction(&chat_id, before);
             }
             s.push_echo(&chat_id, echo);
             // Working overlay until the host executes the queued command —
@@ -6623,6 +6979,25 @@ impl Composer {
         }
     }
 
+    /// `/compact` needs a live chat and a quiet run — mid-run it would land as
+    /// a steer, which is not what clicking a usage ring means.
+    fn can_compact(&self, cx: &App) -> bool {
+        self.state.read(cx).selected_chat.is_some() && !self.run_live(cx)
+    }
+
+    fn compact_now(&mut self, cx: &mut Context<Self>) {
+        if !self.can_compact(cx) {
+            return;
+        }
+        // `send` clears the input; the half-typed prompt is not part of this
+        // gesture, so it goes straight back after the command is queued.
+        let draft = self.input.read(cx).text().to_string();
+        self.send("/compact".into(), false, cx);
+        if !draft.is_empty() {
+            self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        }
+    }
+
     fn render_context_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let usage = {
             let state = self.state.read(cx);
@@ -6639,7 +7014,42 @@ impl Composer {
             ContextIndicatorLevel::Warning => theme.warning.opacity(0.9),
             ContextIndicatorLevel::Critical => theme.danger.opacity(0.9),
         };
+        // While the command runs the ring has nothing true to show (the usage
+        // it plots is the pre-compaction one), so the slot says what is
+        // happening instead.
+        if self
+            .state
+            .read(cx)
+            .selected_chat
+            .as_deref()
+            .is_some_and(|chat_id| self.state.read(cx).is_compacting(chat_id))
+        {
+            return div()
+                .id("composer-compacting")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .pl(px(4.0))
+                .child(crate::loaders::mini_mono_spinner(
+                    "composer-compacting-spinner",
+                    3.0,
+                    theme.text_muted.opacity(0.82),
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .child("Compactando…"),
+                )
+                .into_any_element();
+        }
         let tooltip = indicator.clone();
+        // The ring IS the /compact affordance: one click runs the command on
+        // the selected chat, so nobody has to type it into the input.
+        let compactable = self.can_compact(cx);
         div()
             .id("composer-context-window")
             .size(px(28.0))
@@ -6647,9 +7057,14 @@ impl Composer {
             .flex()
             .items_center()
             .justify_center()
+            .when(compactable, |el| {
+                el.cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.compact_now(cx)))
+            })
             .tooltip(move |_, cx| {
                 cx.new(|_| ContextUsageTooltip {
                     state: tooltip.clone(),
+                    compactable,
                 })
                 .into()
             })
@@ -7636,7 +8051,7 @@ impl Render for Composer {
             div()
                 .relative()
                 .child(crate::frost::frosted(
-                    26.0,
+                    COMPOSER_CORNER_RADIUS,
                     16.0,
                     motion::fade_quick("composer-input", body),
                 ))
@@ -7956,6 +8371,15 @@ mod tests {
     }
 
     #[test]
+    fn compact_command_matches_bare_and_argument_forms() {
+        assert!(is_compact_command("/compact"));
+        assert!(is_compact_command("  /compact  "));
+        assert!(is_compact_command("/compact keep the repro steps"));
+        assert!(!is_compact_command("/compacted"));
+        assert!(!is_compact_command("rode /compact pra mim"));
+    }
+
+    #[test]
     fn context_indicator_clamps_and_uses_shared_thresholds() {
         let warning = context_indicator_state(Some(zeron_proto::ContextUsage {
             tokens: 800,
@@ -8180,6 +8604,89 @@ mod tests {
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
+    }
+
+    #[test]
+    fn project_mentions_carry_the_name_and_the_absolute_path() {
+        let raw = project_mention_link("Orchestrator", "/Users/x/.orchestrator");
+        assert_eq!(raw, "[Orchestrator](zeron-project:/Users/x/.orchestrator/)");
+        let links = file_mention_links(&raw);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].path, "/Users/x/.orchestrator");
+        assert_eq!(links[0].basename, "Orchestrator");
+        assert!(links[0].is_dir);
+        // The chip shows the project name, not the folder basename.
+        assert!(TextProjection::new(&raw).display.contains("@Orchestrator"));
+        // A sent message projects the same chip.
+        let (display, spans) = sent_mention_display(&raw).expect("project mention");
+        assert!(display.contains("@Orchestrator"));
+        assert_eq!(spans[0].path.as_ref(), "/Users/x/.orchestrator/");
+    }
+
+    #[test]
+    fn project_mentions_reject_relative_or_unsafe_paths() {
+        assert!(file_mention_links("[P](zeron-project:relative/path/)").is_empty());
+        assert!(file_mention_links("[P](zeron-project:/a/../b/)").is_empty());
+        assert!(file_mention_links("[P](zeron-project://a/)").is_empty());
+        assert!(file_mention_links("[](zeron-project:/a/)").is_empty());
+        assert!(file_mention_links("[P](zeron-project:/a%0A/)").is_empty());
+    }
+
+    #[test]
+    fn project_mentions_filter_by_name_or_path() {
+        let ledger = vec![
+            ProjectMention {
+                name: ".orchestrator".into(),
+                path: "/Users/x/.orchestrator".into(),
+            },
+            ProjectMention {
+                name: "comet".into(),
+                path: "/Users/x/Projects/comet".into(),
+            },
+        ];
+        assert_eq!(filter_project_mentions(&ledger, "").len(), 2);
+
+        let by_name = filter_project_mentions(&ledger, "orch");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].path, "/Users/x/.orchestrator");
+
+        // Path-only match: no project is named "Projects".
+        let by_path = filter_project_mentions(&ledger, "projects/");
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].name, "comet");
+
+        assert!(filter_project_mentions(&ledger, "nothing").is_empty());
+    }
+
+    #[test]
+    fn mention_menu_navigates_root_then_projects() {
+        let mut state = FileMentionState {
+            projects: vec![ProjectMention {
+                name: ".orchestrator".into(),
+                path: "/Users/x/.orchestrator".into(),
+            }],
+            results: vec![
+                FileSearchMatch {
+                    path: "src/main.rs".into(),
+                    is_dir: false,
+                },
+                FileSearchMatch {
+                    path: "src/lib.rs".into(),
+                    is_dir: false,
+                },
+            ],
+            ..FileMentionState::default()
+        };
+        // Root: the Projects entry plus the files — projects are not rows here.
+        assert_eq!(state.row_count(), 3);
+        // The separator sits between the entry and the first file.
+        assert_eq!(state.scroll_index(0), 0);
+        assert_eq!(state.scroll_index(1), 2);
+
+        state.level = MentionLevel::Projects;
+        assert_eq!(state.row_count(), 1);
+        // The "Projects" heading is the stack's first child.
+        assert_eq!(state.scroll_index(0), 1);
     }
 
     #[test]

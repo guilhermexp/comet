@@ -13,8 +13,8 @@ use crate::EngineError;
 use crate::registry::HarnessRegistry;
 use zeron_harness::{CancellationToken, RunControls, SteerMessage};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, UserInputAnswer,
+    UserInputQuestion,
 };
 
 /// Max characters of transcript fed to the model.
@@ -31,11 +31,6 @@ const RECAP_TIMEOUT_SECS: u64 = 45;
 
 /// Short retry delays between generation attempts.
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
-
-/// Priority order for small/cheap model tiers.
-const SMALL_TIERS: &[&str] = &[
-    "haiku", "mini", "nano", "flash", "small", "lite", "4o-mini", "3.5",
-];
 
 /// A selected transcript entry for recap generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,21 +235,6 @@ pub fn validate_recap(raw: Option<&str>) -> Option<String> {
     }
 }
 
-/// Pick the cheapest model available on the harness.
-fn cheapest_model(models: &[Model]) -> Option<String> {
-    let tier_of = |m: &Model| {
-        let haystack = format!("{} {}", m.id, m.label).to_lowercase();
-        SMALL_TIERS
-            .iter()
-            .find(move |&&tier| haystack.contains(tier))
-            .copied()
-    };
-    models
-        .iter()
-        .find_map(|m| tier_of(m).map(|_| m.id.clone()))
-        .or_else(|| models.last().map(|m| m.id.clone()))
-}
-
 async fn collect_text(
     harness: &dyn zeron_harness::Harness,
     chat_id: &str,
@@ -310,7 +290,7 @@ pub async fn run_recap_model(
             return Ok(None);
         }
     };
-    let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
+    let cheap = crate::titles::cheapest_model(&harness.models().await.unwrap_or_default());
 
     for attempt in 0..=RETRY_DELAYS_MS.len() {
         let request = RunRequest {

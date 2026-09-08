@@ -50,3 +50,8 @@ block2 = "0.6.2"
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+
+# AppKit requires the process main thread; opt in on a macOS desktop.
+[[test]]
+name = "native_preview_focus"
+harness = false

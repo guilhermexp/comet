@@ -330,6 +330,9 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
 pub(crate) const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
+/// Sticky cards meet the titlebar edge; the fresh-send breathing room would
+/// expose a strip of scrolling text between the chrome and the fixed card.
+const STICKY_TURN_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT;
 /// Epsilon of extra height under the reservation. The runway ends AT the
 /// app's bottom — this is not scroll room (24px of it read as a janky
 /// overshoot-and-fight zone, user report) — it exists only to keep the held
@@ -817,6 +820,11 @@ pub enum RowKind {
     },
     ErrorChip {
         message: SharedString,
+    },
+    /// A system marker between turns (today: the mid-conversation model
+    /// switch) — a centered line between hairlines, not a message.
+    Notice {
+        text: SharedString,
     },
 }
 
@@ -1372,6 +1380,16 @@ fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
     out
 }
 
+/// Back-to-back model switches (no turn between them) collapse to the last
+/// one: three dividers in a row is noise, and the newest already reads
+/// "changed from <what was in force> to <what is in force now>".
+fn is_superseded_notice(entries: &[SessionMessageEntry], ix: usize) -> bool {
+    entries[ix].role == MessageRole::System
+        && entries
+            .get(ix + 1)
+            .is_some_and(|next| next.role == MessageRole::System)
+}
+
 /// Build the block rows of one (already continuation-joined) entry.
 ///
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
@@ -1394,6 +1412,27 @@ fn rows_for_entry_with_todo_history(
     let mut todo_history = previous_todos.to_vec();
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
+
+    if entry.role == MessageRole::System {
+        let text: String = entry
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return vec![Row {
+            id: entry.id.clone().into(),
+            version: text.len() as u64,
+            turn_start: true,
+            kind: RowKind::Notice { text: text.into() },
+            entry_id,
+            timestamp: None,
+            copy_text: None,
+        }];
+    }
 
     if entry.role == MessageRole::User {
         let raw: String = entry
@@ -4316,7 +4355,10 @@ impl Transcript {
 
         let mut new_rows: Vec<Row> = Vec::new();
         let mut todo_history = Vec::new();
-        for entry in &entries {
+        for (ix, entry) in entries.iter().enumerate() {
+            if is_superseded_notice(&entries, ix) {
+                continue;
+            }
             new_rows.extend(self.rows_for(entry, false, &mut todo_history));
         }
         for echo in &echoes {
@@ -5525,7 +5567,7 @@ impl Transcript {
         {
             return None;
         }
-        let read_top = f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX + 0.5;
+        let read_top = f32::from(viewport.top()) + STICKY_TURN_TOP_INSET_PX + 0.5;
         let mut row_ix = self.list.logical_scroll_top().item_ix.min(last_ix);
         while row_ix < last_ix {
             let Some(bounds) = self.list.bounds_for_item(row_ix + 1) else {
@@ -5560,7 +5602,7 @@ impl Transcript {
         }
         let viewport = self.list.viewport_bounds();
         let viewport_top = f32::from(viewport.top());
-        let sticky_top = viewport_top + OWN_SEND_TOP_INSET_PX;
+        let sticky_top = viewport_top + STICKY_TURN_TOP_INSET_PX;
         if self.sticky_turn.update_viewport(
             f32::from(viewport.size.width),
             f32::from(viewport.size.height),
@@ -5670,13 +5712,12 @@ impl Transcript {
                 .left_0()
                 .right_0()
                 .top(px(overlay_top - viewport_top))
-                .px(px(COLUMN_GUTTER))
-                .flex()
-                .justify_center()
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(MAX_CONTENT_WIDTH))
+                        .max_w(px(MAX_CONTENT_WIDTH + Theme::SPACE_LG * 2.0))
+                        .mx_auto()
+                        .px(px(Theme::SPACE_LG))
                         .min_w_0()
                         .pb(px(GAP_TURN))
                         .when_some(surface.outer_background, |wrapper, background| {
@@ -6154,6 +6195,7 @@ impl Transcript {
                 input_chip(header.clone(), *resolved, &theme)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::Notice { text } => notice_divider(text.clone(), &theme),
         }
     }
 
@@ -8075,6 +8117,35 @@ fn user_message_dialog(
 /// message WRAPS instead of truncating: startup-crash errors carry the
 /// agent's exit status and stderr, and a one-line ellipsis was exactly what
 /// made zeronsh/comet#95 undiagnosable from the screenshot.
+/// The between-turns marker: hairline · glyph · muted label · hairline.
+fn notice_divider(text: SharedString, theme: &Theme) -> AnyElement {
+    let rule = || div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6));
+    div()
+        .py(px(10.0))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .child(rule())
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_muted)
+                .child(
+                    crate::icons::icon(crate::icons::INFO_CIRCLE)
+                        .size(px(13.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(text),
+        )
+        .child(rule())
+        .into_any_element()
+}
+
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
@@ -9530,6 +9601,42 @@ mod tests {
             duration_ms: None,
             continuation_of: None,
         }
+    }
+
+    fn model_switch(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::System,
+            parts: vec![text_part(&format!("{id}-text"), text)],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn model_switch_entry_projects_a_notice_row() {
+        let entry = model_switch("sw-1", "Model changed from A to B.");
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        match &rows[0].kind {
+            RowKind::Notice { text } => assert_eq!(text.as_ref(), "Model changed from A to B."),
+            _ => panic!("expected a notice row"),
+        }
+    }
+
+    #[test]
+    fn back_to_back_model_switches_collapse_to_the_last() {
+        let entries = vec![
+            user_entry("u1"),
+            model_switch("sw-1", "Model changed from A to B."),
+            model_switch("sw-2", "Model changed from B to C."),
+        ];
+        assert!(!is_superseded_notice(&entries, 0));
+        assert!(is_superseded_notice(&entries, 1));
+        assert!(!is_superseded_notice(&entries, 2));
     }
 
     #[test]
