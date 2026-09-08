@@ -436,6 +436,59 @@ enum ComposerFooterControl {
     Model,
 }
 
+/// The (device, repo path, chat) a `ListRefs` answer belongs to.
+///
+/// Path alone is not a key: the same absolute path on the local machine and
+/// on a remote space host are two different repos. The chat is part of it too
+/// because the rows carry live checkout state (`current`, `worktreePath`)
+/// that another chat's session may have moved or removed since.
+type RefsKey = (Option<String>, String, Option<String>);
+
+/// The key the refs slot has to answer for: the sidebar's live repo target
+/// when one is set, else the selected space's folder (`git_space`, passed
+/// only when it IS a repo). `None` = nothing gitful in scope, nothing to list.
+fn refs_target_key(
+    target: Option<&RepoTarget>,
+    git_space: Option<(&str, &str)>,
+) -> Option<RefsKey> {
+    match target {
+        Some(t) => Some((t.device_id.clone(), t.path.clone(), t.chat_id.clone())),
+        None => git_space.map(|(device, path)| (Some(device.to_string()), path.to_string(), None)),
+    }
+}
+
+/// What [`Pickers::ensure_refs`] must do with the refs slot.
+#[derive(Debug, PartialEq, Eq)]
+enum RefsFetch {
+    /// The slot already answers for this key (loaded, or in flight).
+    Skip,
+    /// Call `ListRefs`. `keep_rows` leaves the rows on screen while it runs —
+    /// only ever a forced refresh of the SAME key; rows listed for another
+    /// key must go, or a reader would resolve this target's checkout against
+    /// another repo/device/chat's refs.
+    Reload { keep_rows: bool },
+}
+
+fn refs_fetch(
+    loaded: Option<&RefsKey>,
+    slot: &Loadable<Vec<RepoRef>>,
+    key: &RefsKey,
+    force: bool,
+) -> RefsFetch {
+    if loaded != Some(key) {
+        return RefsFetch::Reload { keep_rows: false };
+    }
+    match slot {
+        Loadable::Loading => RefsFetch::Skip, // already in flight for this key
+        Loadable::Idle => RefsFetch::Reload { keep_rows: false },
+        // Ready/Error for this key: only an explicit refresh reloads.
+        _ if force => RefsFetch::Reload {
+            keep_rows: matches!(slot, Loadable::Ready(_)),
+        },
+        _ => RefsFetch::Skip,
+    }
+}
+
 fn composer_footer_right_order() -> [ComposerFooterControl; 1] {
     [ComposerFooterControl::Model]
 }
@@ -486,8 +539,11 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     refs: Loadable<Vec<RepoRef>>,
-    /// Space id the `refs` slot belongs to (invalidated on space change).
-    refs_space: Option<String>,
+    /// Key the `refs` slot was listed for (see [`RefsKey`]). The slot is
+    /// shared by the composer draft and the sidebar's workspace widget, so a
+    /// question about any other key reloads instead of being answered with
+    /// another repo's, device's or chat's rows.
+    refs_key: Option<RefsKey>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view.
@@ -568,6 +624,10 @@ impl Pickers {
             let selected = state.read(cx).selected_chat.clone();
             if selected != this.draft_owner {
                 this.draft_owner = selected;
+                // The sidebar's repo target belonged to the PREVIOUS chat; a
+                // pick made after the switch must not switch that chat's ref.
+                // (The sidebar writes the new one during its next render.)
+                this.active_repo_target = None;
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
@@ -582,7 +642,7 @@ impl Pickers {
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
-                this.refs_space = None;
+                this.refs_key = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -655,7 +715,7 @@ impl Pickers {
             models: HashMap::new(),
             refs: Loadable::Idle,
             active_repo_target: None,
-            refs_space: None,
+            refs_key: None,
             active: 0,
             model_scroll: gpui::UniformListScrollHandle::new(),
             model_rows_cache: std::cell::RefCell::new(None),
@@ -1178,45 +1238,47 @@ impl Pickers {
         .detach();
     }
 
-    /// ListRefs for the selected SPACE's folder — targeted at the space's
-    /// device (relay-forwarded when remote), keyed/invalidated by space id.
-    /// Rows carry checkout state (`current`, `worktreePath`) so the picker can
-    /// tag refs and the checkout-kind selector can offer worktree reuse.
+    /// ListRefs for the repo in scope — the sidebar's
+    /// [`Self::active_repo_target`] when one is set, else the selected
+    /// SPACE's folder — targeted at that repo's device (relay-forwarded when
+    /// remote). Rows carry checkout state (`current`, `worktreePath`) so the
+    /// picker can tag refs and the checkout-kind selector can offer worktree
+    /// reuse.
+    ///
+    /// The slot is keyed by [`RefsKey`] — the space's folder IS the target
+    /// path the sidebar passes for that space, so both surfaces share one
+    /// load; any other key reloads and drops the stale rows, so no reader can
+    /// resolve one target's checkout against another target's refs.
     fn ensure_refs(&mut self, force: bool, cx: &mut Context<Self>) {
-        let (repo_path, device_id, target_key) = if let Some(target) = &self.active_repo_target {
-            (
-                target.path.clone(),
-                target.device_id.clone(),
-                target.path.clone(),
-            )
-        } else if let Some(space) = self.state.read(cx).selected_space_row().cloned() {
-            if !space.git_detected {
-                return;
-            }
-            (
-                space.path.clone(),
-                Some(space.device_id.clone()),
-                space.id.clone(),
-            )
-        } else {
+        // The space is only consulted when there is no live target.
+        let space = self
+            .active_repo_target
+            .is_none()
+            .then(|| self.state.read(cx).selected_space_row().cloned())
+            .flatten()
+            .filter(|space| space.git_detected);
+        let Some(key) = refs_target_key(
+            self.active_repo_target.as_ref(),
+            space
+                .as_ref()
+                .map(|s| (s.device_id.as_str(), s.path.as_str())),
+        ) else {
             return;
         };
-
-        let fresh = self.refs_space.as_deref() == Some(target_key.as_str());
-        if fresh && matches!(self.refs, Loadable::Loading) {
+        let RefsFetch::Reload { keep_rows } =
+            refs_fetch(self.refs_key.as_ref(), &self.refs, &key, force)
+        else {
             return;
-        }
-        if !force && fresh && !matches!(self.refs, Loadable::Idle) {
-            return;
-        }
+        };
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
-        if !(force && fresh && matches!(self.refs, Loadable::Ready(_))) {
+        if !keep_rows {
             self.refs = Loadable::Loading;
         }
-        self.refs_space = Some(target_key);
+        let (device_id, repo_path, _) = key.clone();
+        self.refs_key = Some(key);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("repoPath".into(), serde_json::Value::String(repo_path));
@@ -2745,6 +2807,9 @@ impl Pickers {
         // New-session draft: checkout stays left; model + effort + optional
         // ref form the right context cluster. Device + project live above the
         // pill now.
+        // No target juggling here: `active_repo_target` is dropped where the
+        // selection changes (the state observer), not per-render — the
+        // sidebar re-renders after the composer and would just write it back.
         let git = space.as_ref().is_some_and(|s| s.git_detected);
         // Refs feed the draft labels — eager + idempotent.
         if git {
@@ -3188,19 +3253,12 @@ impl Pickers {
         let closing = self.open.closing_since();
         let kind = PickerKind::Branch;
 
-        let target_changed = self
-            .active_repo_target
-            .as_ref()
-            .is_none_or(|t| t.path != target.path || t.chat_id != target.chat_id);
-        if target_changed {
-            self.active_repo_target = Some(target.clone());
-            self.refs = Loadable::Idle;
-            self.refs_space = None;
-        } else {
-            self.active_repo_target = Some(target.clone());
-        }
-
-        if !disabled && matches!(self.refs, Loadable::Idle) {
+        // This is the live target every branch pick applies to while the
+        // widget is on screen. No manual invalidation: the refs slot is keyed
+        // by device+path+chat, so a moved target reloads on its own (and a
+        // slot loaded for another key is dropped instead of answering here).
+        self.active_repo_target = Some(target.clone());
+        if !disabled {
             self.ensure_refs(false, cx);
         }
 
@@ -4494,6 +4552,81 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo_target(device: Option<&str>, path: &str, chat: Option<&str>) -> RepoTarget {
+        RepoTarget {
+            path: path.into(),
+            device_id: device.map(str::to_string),
+            chat_id: chat.map(str::to_string),
+            branch: None,
+        }
+    }
+
+    #[test]
+    fn refs_key_follows_device_path_and_chat() {
+        let local = repo_target(None, "/w/app", None);
+        // Same absolute path, two machines (Workers local vs remote space).
+        assert_ne!(
+            refs_target_key(Some(&local), None),
+            refs_target_key(Some(&repo_target(Some("mac-2"), "/w/app", None)), None)
+        );
+        // Same repo, two chats: rows carry per-chat checkout state.
+        assert_ne!(
+            refs_target_key(Some(&repo_target(None, "/w/app", Some("chat-a"))), None),
+            refs_target_key(Some(&repo_target(None, "/w/app", Some("chat-b"))), None)
+        );
+        // A live target wins over the selected space...
+        assert_eq!(
+            refs_target_key(Some(&local), Some(("mac-2", "/w/other"))),
+            Some((None, "/w/app".into(), None))
+        );
+        // ...and the space fallback carries ITS device, so two spaces sharing
+        // a path on different hosts never share the slot.
+        assert_ne!(
+            refs_target_key(None, Some(("mac-1", "/w/app"))),
+            refs_target_key(None, Some(("mac-2", "/w/app")))
+        );
+        // Nothing in scope (no target, no git space) lists nothing.
+        assert_eq!(refs_target_key(None, None), None);
+    }
+
+    #[test]
+    fn loaded_refs_never_answer_for_another_key() {
+        let key_a = (None, "/repos/a".to_string(), None);
+        let key_b = (Some("mac-2".to_string()), "/repos/a".to_string(), None);
+        let refs_of_a = Loadable::Ready(vec![RepoRef {
+            name: "project-a-branch".into(),
+            current: true,
+            worktree_path: None,
+            is_remote: None,
+            is_default: None,
+        }]);
+        // Loaded for A: A's own question is served from the slot.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &refs_of_a, &key_a, false),
+            RefsFetch::Skip
+        );
+        // Another key asks next: reload, and drop A's rows meanwhile.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &refs_of_a, &key_b, false),
+            RefsFetch::Reload { keep_rows: false }
+        );
+        // Even an in-flight load for A does not stand in for B.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &Loadable::Loading, &key_b, false),
+            RefsFetch::Reload { keep_rows: false }
+        );
+        // ...while B's own in-flight load is not restarted every render.
+        assert_eq!(
+            refs_fetch(Some(&key_b), &Loadable::Loading, &key_b, false),
+            RefsFetch::Skip
+        );
+        // A forced refresh of the same key keeps its rows on screen.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &refs_of_a, &key_a, true),
+            RefsFetch::Reload { keep_rows: true }
+        );
+    }
 
     #[test]
     fn omp_uses_its_own_existing_worker_mark() {
