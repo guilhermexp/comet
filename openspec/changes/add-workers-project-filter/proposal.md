@@ -28,6 +28,9 @@ away.
   filter. Revealing a session from the Details widget or from a worker
   notification selects a project the filter may exclude, and a selection with
   no row is the one state the sidebar must not draw.
+- The filtered project keeps its row even when it owns no live session. The
+  sidebar otherwise drops an empty project, so filtering to an empty or fully
+  archived root would leave the tree unchanged and deliver nothing.
 - "New project…" runs the picker the sidebar's `+` already runs.
 
 ## What this does NOT change

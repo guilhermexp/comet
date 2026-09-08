@@ -18,7 +18,7 @@ Test: `worktree_lifecycle_registers_and_removes_the_child_project`
 
 #### Scenario: An organizational group stays a group
 
-Test: `worktree_lifecycle_registers_and_removes_the_child_project`
+Test: `removing_an_empty_group_preserves_the_parent_and_unknown_state`
 
 - **WHEN** a folder project with a parent carries no worktree branch
 - **THEN** it is still marked as a group

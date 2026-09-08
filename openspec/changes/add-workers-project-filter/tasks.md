@@ -24,6 +24,11 @@
 - [x] 2.6 Abrir o card foca o input de busca antes do primeiro paint
       (`window.focus`), a mesma ordem do dropdown de Spaces — senão a busca não
       recebe tecla e ↑↓/⏎ nunca chegam ao handler do card.
+- [ ] 2.7 Keep the filtered project's row through the working-set rule: the
+      filter is an explicit request for that project, the same standing the
+      selection and the launcher already have. Without it, filtering to an
+      empty or fully archived root leaves the tree exactly as it was and the
+      capability is not delivered.
 
 ## 3. Verification
 
@@ -34,9 +39,12 @@
 - [x] 3.4 `cargo test -p zeron-ui` (1159 passed, 1 failed: the pre-existing
       `weekly_tone_neutral_when_no_usage_or_no_weekly_window` from `804d83fc`)
       and `cargo fmt --all --check` clean.
-- [ ] 3.5 Visual check on `scripts/dev-demo.sh` (no render harness for gpui).
+- [ ] 3.5 Visual check on `scripts/dev-demo.sh` (no render harness for gpui):
+      filtering to a project with no sessions narrows the tree to it.
+- [ ] 3.6 Unit: filtering to a project with no live session draws that
+      project's row.
 
 ## 4. Closeout
 
 - [x] 4.1 Record the filter in `crates/ui/AGENTS.md`.
-- [ ] 4.2 Archive once 3.5 is confirmed.
+- [ ] 4.2 Archive once 3.5 and 3.6 are confirmed.

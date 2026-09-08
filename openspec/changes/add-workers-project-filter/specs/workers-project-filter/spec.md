@@ -62,3 +62,30 @@ Test: `project_filter_never_hides_the_selected_project`
 - **WHEN** the filter names one project and the selection is a worktree of another
 - **THEN** the filtered project, the selected project's root and that root's
   subtree are all drawn
+
+### Requirement: The filtered project always has a row
+
+Filtering to a project is an explicit request for that project, so the tree
+SHALL draw the filtered project even when it owns no live session — the same
+standing the selected and the launcher project already have. Filtering to an
+empty project, or to one whose sessions are all archived, SHALL therefore
+narrow the tree to that project's row instead of leaving the tree unchanged.
+Its descendants keep the ordinary rule: a child with nothing in it is still
+omitted.
+
+#### Scenario: Filtering to an empty project shows that project
+
+Test: `project_filter_keeps_the_row_of_a_project_with_no_sessions`
+
+- **WHEN** the filter names a project that owns no live session and the
+  selection is a session of another project
+- **THEN** the filtered project is drawn
+- **AND** every project outside that subtree and outside the selection's root
+  is not drawn
+
+#### Scenario: Filtering to an archived project reaches its archive
+
+Test: `project_filter_keeps_the_row_of_a_project_with_no_sessions`
+
+- **WHEN** the filter names a project whose sessions are all archived
+- **THEN** its row is drawn, so the archive stays reachable
