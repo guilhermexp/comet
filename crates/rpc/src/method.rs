@@ -275,8 +275,12 @@ rpc_methods! {
     /// Device-local unary lookup to reveal one raw field from Run Journal.
     REVEAL_TRAJECTORY_RAW / RevealTrajectoryRaw = "RevealTrajectoryRaw" { params: crate::RevealTrajectoryRawParams, reply: crate::TrajectoryRawRevealResult, local_only: true },
     /// Generate a one-line idle session recap for the chat. Strictly device-local,
-    /// rejected at relay ingress, never forwarded.
-    GENERATE_CHAT_RECAP / GenerateChatRecap = "GenerateChatRecap" { params: crate::GenerateChatRecapParams, reply: crate::GenerateChatRecapReply, local_only: true, deadline_secs: 45 },
+    /// rejected at relay ingress, never forwarded — so a `deadline_secs` here
+    /// would be dead config: `MethodInfo::deadline` is only read when the engine
+    /// forwards a call to another device, and `RpcClient::call` awaits the reply
+    /// with no timeout of its own. The engine's `recap::RUN_BUDGET_SECS` is the
+    /// only real ceiling; tune it there.
+    GENERATE_CHAT_RECAP / GenerateChatRecap = "GenerateChatRecap" { params: crate::GenerateChatRecapParams, reply: crate::GenerateChatRecapReply, local_only: true },
 }
 
 #[cfg(test)]

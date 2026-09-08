@@ -9,8 +9,10 @@
 //!    last listed model — zeron's `cheapestModel`);
 //! 3. run a one-shot, non-streaming-collected titling prompt through the
 //!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
-//!    retrying on zeron's short backoff ladder; fall back to the prompt's first
-//!    words when every attempt produces nothing;
+//!    retrying on zeron's short backoff ladder under one shared wall-clock
+//!    budget ([`crate::recap::with_retry_budget`], so a wedged agent cannot
+//!    hang titling forever); fall back to the prompt's first words when every
+//!    attempt produces nothing;
 //! 4. re-check the title (a user rename during generation wins);
 //! 5. when the chat sits in a zeron worktree (`zeron/<name>` branch), rename the
 //!    branch from the title and update the chat's branch row;
@@ -30,10 +32,6 @@ use crate::EngineError;
 use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
-
-/// Throwaway title runs are cheap but still cross a process boundary — retry a
-/// couple of times with a short backoff before falling back (zeron's ladder).
-const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 struct Inner {
     workspace: WorkspaceHost,
@@ -149,6 +147,10 @@ impl TitleGenerator {
         prompt: &str,
         cwd: &str,
     ) -> Option<String> {
+        // Anchor the budget before the catalog lookup: `models()` spawns the
+        // agent and runs discovery, none of which is bounded on its own.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(crate::recap::RUN_BUDGET_SECS);
         let harness = match self.inner.registry.resolve(harness_id) {
             Ok(harness) => harness,
             Err(err) => {
@@ -156,7 +158,7 @@ impl TitleGenerator {
                 return None;
             }
         };
-        let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
+        let cheap = cheapest_model_before(harness.as_ref(), deadline).await;
         // The title speaks the USER's language, and is capitalized the way that
         // language capitalizes titles. The old prompt asked for "Title Case"
         // with no language rule at all, so an English instruction wrapping a
@@ -174,40 +176,64 @@ impl TitleGenerator {
              first word and proper nouns.\n\n\
              Request:\n{prompt}"
         );
-        for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = RunRequest {
-                prompt: title_prompt.clone(),
-                harness: Some(harness_id),
-                model: cheap.clone(),
-                reasoning: Some(ReasoningLevel::Minimal),
-                model_options: serde_json::Map::new(),
-                cwd: cwd.to_string(),
-                sandbox: SandboxLevel::ReadOnly,
-                auto_approve: true,
-                enable_workers_mcp: false,
-                workers_parent_chat_id: None,
-                attachments: Vec::new(),
-                resume: None,
-                worktree: None,
-            };
-            match collect_text(harness.as_ref(), chat_id, request).await {
-                Ok(raw) => {
-                    let candidate = clean_title(&raw);
-                    if !candidate.is_empty() {
-                        return Some(candidate);
+        let cheap = &cheap;
+        let title_prompt = &title_prompt;
+        let harness = harness.as_ref();
+
+        crate::recap::with_retry_budget(
+            deadline,
+            std::time::Duration::from_secs(crate::recap::RUN_ATTEMPT_SECS),
+            move |attempt| async move {
+                let request = RunRequest {
+                    prompt: title_prompt.clone(),
+                    harness: Some(harness_id),
+                    model: cheap.clone(),
+                    reasoning: Some(ReasoningLevel::Minimal),
+                    model_options: serde_json::Map::new(),
+                    cwd: cwd.to_string(),
+                    sandbox: SandboxLevel::ReadOnly,
+                    auto_approve: true,
+                    enable_workers_mcp: false,
+                    workers_parent_chat_id: None,
+                    attachments: Vec::new(),
+                    resume: None,
+                    worktree: None,
+                };
+                match collect_text(harness, chat_id, request).await {
+                    Ok(raw) => Some(clean_title(&raw)).filter(|title| !title.is_empty()),
+                    Err(err) => {
+                        tracing::warn!(attempt = attempt + 1, error = %err,
+                            "automatic chat title generation attempt failed");
+                        None
                     }
                 }
-                Err(err) => {
-                    tracing::warn!(attempt = attempt + 1, error = %err,
-                        "automatic chat title generation attempt failed");
-                }
-            }
-            if let Some(delay) = RETRY_DELAYS_MS.get(attempt) {
-                tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
-            }
-        }
-        None
+            },
+        )
+        .await
     }
+}
+
+/// [`cheapest_model`] of the harness's catalog, given up on early enough to
+/// leave one full attempt of the run budget behind: `models()` spawns the agent
+/// process and runs discovery with no timeout of its own, so it is the likeliest
+/// thing to wedge, and a lookup that ate the whole budget would leave nothing to
+/// generate with. `None` (the harness's own default model) is a fine answer for
+/// a lookup that ran out of time.
+pub(crate) async fn cheapest_model_before(
+    harness: &dyn zeron_harness::Harness,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    let left = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_sub(std::time::Duration::from_secs(
+            crate::recap::RUN_ATTEMPT_SECS,
+        ));
+    let models = tokio::time::timeout(left, harness.models())
+        .await
+        .ok()
+        .and_then(|models| models.ok())
+        .unwrap_or_default();
+    cheapest_model(&models)
 }
 
 /// The cheapest model a harness offers (zeron's `cheapestModel` heuristic):
@@ -361,6 +387,60 @@ mod tests {
             reasoning_levels: vec![],
             options: vec![],
         }
+    }
+
+    /// Discovery that never answers — the `models()` hang the reserve exists for.
+    struct WedgedModelsHarness;
+
+    #[async_trait::async_trait]
+    impl zeron_harness::Harness for WedgedModelsHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Wedged"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Minimal]
+        }
+        async fn models(&self) -> Result<Vec<Model>, zeron_harness::HarnessError> {
+            std::future::pending().await
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            unreachable!("the catalog lookup never gets far enough to run")
+        }
+    }
+
+    #[tokio::test]
+    async fn cheapest_model_lookup_leaves_an_attempt_of_budget_behind() {
+        // Budget = one attempt plus a sliver: the lookup may only have the
+        // sliver, so it must give up almost at once instead of spending the
+        // attempt's share. Without the reserve this waits `RUN_ATTEMPT_SECS`.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(crate::recap::RUN_ATTEMPT_SECS)
+            + std::time::Duration::from_millis(200);
+
+        let picked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cheapest_model_before(&WedgedModelsHarness, deadline),
+        )
+        .await
+        .expect("the lookup must give up with an attempt's worth of budget left");
+
+        assert_eq!(picked, None);
     }
 
     #[test]

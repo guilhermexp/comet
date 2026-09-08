@@ -26,8 +26,20 @@ pub const RECAP_ENTRY_MAX_CHARS: usize = 800;
 /// Max characters of the final recap line.
 pub const RECAP_MAX_CHARS: usize = 280;
 
-/// Default timeout for one-shot recap execution.
-const RECAP_TIMEOUT_SECS: u64 = 45;
+/// Wall-clock ceiling for a whole throwaway-run ladder (recap or title): the
+/// model-catalog lookup, every attempt and every retry delay share it.
+///
+/// Nothing else bounds these runs. `GenerateChatRecap` is `local_only`, so its
+/// `deadline_secs` is never applied (that field only feeds relay forwarding),
+/// and `RpcClient::call` awaits the reply with no timeout of its own. This
+/// budget is the only thing that stops a wedged agent from pinning the caller
+/// and burning model quota on answers nobody reads any more.
+pub(crate) const RUN_BUDGET_SECS: u64 = 100;
+
+/// Per-attempt cap inside that budget — the old per-attempt timeout, kept so a
+/// slow-but-alive model answering at 42s still counts, while leaving room for a
+/// retry after a wedged attempt.
+pub(crate) const RUN_ATTEMPT_SECS: u64 = 45;
 
 /// Short retry delays between generation attempts.
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
@@ -275,6 +287,44 @@ async fn collect_text(
     Ok(text)
 }
 
+/// Run `attempt` on the retry ladder under one shared `deadline`: at most
+/// `RETRY_DELAYS_MS.len() + 1` tries, each capped by `per_attempt` or by
+/// whatever is left of the budget, whichever is shorter, retry delays included.
+/// Returns the first `Some`, or `None` once the attempts or the budget run out.
+pub(crate) async fn with_retry_budget<F, Fut, T>(
+    deadline: tokio::time::Instant,
+    per_attempt: Duration,
+    mut attempt: F,
+) -> Option<T>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for ix in 0..=RETRY_DELAYS_MS.len() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(per_attempt.min(left), attempt(ix)).await {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            // A wedged attempt is worth retrying: what bounds the ladder is the
+            // budget, not this one attempt.
+            Err(_) => tracing::warn!(attempt = ix + 1, "throwaway run attempt timed out"),
+        }
+        let Some(delay) = RETRY_DELAYS_MS.get(ix).copied().map(Duration::from_millis) else {
+            break;
+        };
+        // Sleeping out the remainder would only wake up to a dead budget: stop
+        // now instead of burning it.
+        if deadline.saturating_duration_since(tokio::time::Instant::now()) <= delay {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+    }
+    None
+}
+
 /// Run a throwaway one-shot recap generation through the harness.
 pub async fn run_recap_model(
     chat_id: &str,
@@ -283,6 +333,9 @@ pub async fn run_recap_model(
     cwd: &str,
     registry: &Arc<HarnessRegistry>,
 ) -> Result<Option<String>, EngineError> {
+    // Anchor the budget before the catalog lookup: `models()` spawns the agent
+    // and runs discovery, none of which is bounded on its own.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(RUN_BUDGET_SECS);
     let harness = match registry.resolve(harness_id) {
         Ok(h) => h,
         Err(err) => {
@@ -290,47 +343,42 @@ pub async fn run_recap_model(
             return Ok(None);
         }
     };
-    let cheap = crate::titles::cheapest_model(&harness.models().await.unwrap_or_default());
+    let cheap = crate::titles::cheapest_model_before(harness.as_ref(), deadline).await;
+    let cheap = &cheap;
+    let harness = harness.as_ref();
 
-    for attempt in 0..=RETRY_DELAYS_MS.len() {
-        let request = RunRequest {
-            prompt: prompt.to_string(),
-            harness: Some(harness_id),
-            model: cheap.clone(),
-            reasoning: Some(ReasoningLevel::Minimal),
-            model_options: serde_json::Map::new(),
-            cwd: cwd.to_string(),
-            sandbox: SandboxLevel::ReadOnly,
-            auto_approve: true,
-            enable_workers_mcp: false,
-            workers_parent_chat_id: None,
-            attachments: Vec::new(),
-            resume: None,
-            worktree: None,
-        };
+    let recap = with_retry_budget(
+        deadline,
+        Duration::from_secs(RUN_ATTEMPT_SECS),
+        move |attempt| async move {
+            let request = RunRequest {
+                prompt: prompt.to_string(),
+                harness: Some(harness_id),
+                model: cheap.clone(),
+                reasoning: Some(ReasoningLevel::Minimal),
+                model_options: serde_json::Map::new(),
+                cwd: cwd.to_string(),
+                sandbox: SandboxLevel::ReadOnly,
+                auto_approve: true,
+                enable_workers_mcp: false,
+                workers_parent_chat_id: None,
+                attachments: Vec::new(),
+                resume: None,
+                worktree: None,
+            };
 
-        let run_fut = collect_text(harness.as_ref(), chat_id, request);
-
-        match tokio::time::timeout(Duration::from_secs(RECAP_TIMEOUT_SECS), run_fut).await {
-            Ok(Ok(raw)) => {
-                if let Some(candidate) = validate_recap(Some(&raw)) {
-                    return Ok(Some(candidate));
+            match collect_text(harness, chat_id, request).await {
+                Ok(raw) => validate_recap(Some(&raw)),
+                Err(err) => {
+                    tracing::warn!(attempt = attempt + 1, error = %err, "recap attempt failed");
+                    None
                 }
             }
-            Ok(Err(err)) => {
-                tracing::warn!(attempt = attempt + 1, error = %err, "recap attempt failed");
-            }
-            Err(_) => {
-                tracing::warn!(attempt = attempt + 1, "recap attempt timed out");
-            }
-        }
+        },
+    )
+    .await;
 
-        if let Some(delay) = RETRY_DELAYS_MS.get(attempt) {
-            tokio::time::sleep(Duration::from_millis(*delay)).await;
-        }
-    }
-
-    Ok(None)
+    Ok(recap)
 }
 
 #[cfg(test)]
@@ -435,6 +483,56 @@ mod tests {
 
         let prompt_no_goal = build_recap_prompt(&entries, None);
         assert!(!prompt_no_goal.contains("Overall goal:"));
+    }
+
+    // Real clock: this crate does not enable tokio's `test-util`, so there is no
+    // virtual clock to pause. Both tests therefore assert on the ATTEMPT COUNT,
+    // which the budget alone decides, instead of on elapsed wall clock: a loaded
+    // machine can only run late, and running late never adds an attempt.
+
+    #[tokio::test]
+    async fn test_retry_budget_stops_before_a_delay_that_outlasts_it() {
+        // 800ms covers the 250ms delay after the first attempt but not the 1s
+        // one after the second, so the ladder must stop two attempts in. Only
+        // the budget can stop it here: the attempts and the per-attempt cap are
+        // nowhere near it.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let calls = std::cell::Cell::new(0usize);
+
+        let out = with_retry_budget(deadline, Duration::from_secs(RUN_ATTEMPT_SECS), |_| async {
+            calls.set(calls.get() + 1);
+            None::<()>
+        })
+        .await;
+
+        assert_eq!(out, None);
+        assert_eq!(
+            calls.get(),
+            2,
+            "the ladder must stop once the next retry delay outlasts the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_budget_caps_a_wedged_attempt_at_the_remaining_budget() {
+        // The attempt never answers and its per-attempt cap sits far past the
+        // budget, so only the remaining budget can cut it off. The outer timeout
+        // is the assertion: without the cap this waits `RUN_ATTEMPT_SECS`.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let calls = std::cell::Cell::new(0usize);
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_retry_budget(deadline, Duration::from_secs(RUN_ATTEMPT_SECS), |_| async {
+                calls.set(calls.get() + 1);
+                std::future::pending::<Option<()>>().await
+            }),
+        )
+        .await
+        .expect("a wedged attempt must be cut off by the remaining budget");
+
+        assert_eq!(out, None);
+        assert_eq!(calls.get(), 1, "the budget was spent, so no retry is due");
     }
 
     #[test]
