@@ -39,6 +39,13 @@ use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
+/// Opening of the marker text written by [`ChatDocHandle::write_model_switch`].
+/// The marker is a plain text system entry, so this prefix is the only thing
+/// telling it apart from the other system notices — the UI matches on it to
+/// collapse back-to-back switches, so keep the two in step by using this const
+/// on both sides.
+pub const MODEL_SWITCH_MARKER_PREFIX: &str = "Model changed from ";
+
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
@@ -489,7 +496,7 @@ impl ChatDocHandle {
     /// instead of dropping the entry. No-op on an empty transcript: nothing to
     /// divide, and the chat's first run already uses the new model.
     pub fn write_model_switch(&self, from: &str, to: &str) -> Result<(), DocError> {
-        self.write_marker(&format!("Model changed from {from} to {to}."))
+        self.write_marker(&format!("{MODEL_SWITCH_MARKER_PREFIX}{from} to {to}."))
     }
 
     /// The shared marker write behind [`Self::write_model_switch`] and the

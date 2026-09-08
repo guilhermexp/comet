@@ -1380,14 +1380,28 @@ fn tool_image_paths(tools: &[ToolItem]) -> Vec<String> {
     out
 }
 
+/// The marker written by `ChatDocHandle::write_model_switch` is a plain text
+/// part by design (older clients render it as a line), so its opening text is
+/// all we have to tell it apart from the other system notices — compaction
+/// markers ride the same entry shape. Matched against the engine's own const so
+/// rewording the marker cannot silently turn the collapse off.
+fn is_model_switch_notice(entry: &SessionMessageEntry) -> bool {
+    entry.role == MessageRole::System
+        && entry.parts.iter().any(|part| match part {
+            MessagePart::Text { text, .. } => {
+                text.starts_with(zeron_engine::doc_host::MODEL_SWITCH_MARKER_PREFIX)
+            }
+            _ => false,
+        })
+}
+
 /// Back-to-back model switches (no turn between them) collapse to the last
 /// one: three dividers in a row is noise, and the newest already reads
-/// "changed from <what was in force> to <what is in force now>".
+/// "changed from <what was in force> to <what is in force now>". Only model
+/// switches collapse — any other system notice (a compaction marker, say)
+/// carries information the user would lose silently.
 fn is_superseded_notice(entries: &[SessionMessageEntry], ix: usize) -> bool {
-    entries[ix].role == MessageRole::System
-        && entries
-            .get(ix + 1)
-            .is_some_and(|next| next.role == MessageRole::System)
+    is_model_switch_notice(&entries[ix]) && entries.get(ix + 1).is_some_and(is_model_switch_notice)
 }
 
 /// Build the block rows of one (already continuation-joined) entry.
@@ -9603,7 +9617,7 @@ mod tests {
         }
     }
 
-    fn model_switch(id: &str, text: &str) -> SessionMessageEntry {
+    fn system_notice(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
             id: id.into(),
             role: MessageRole::System,
@@ -9616,27 +9630,53 @@ mod tests {
         }
     }
 
+    /// Mirrors `ChatDocHandle::write_model_switch`'s text off the shared const,
+    /// so a reworded marker fails here instead of quietly dropping the collapse.
+    fn model_switch_text(from: &str, to: &str) -> String {
+        format!(
+            "{}{from} to {to}.",
+            zeron_engine::doc_host::MODEL_SWITCH_MARKER_PREFIX
+        )
+    }
+
     #[test]
     fn model_switch_entry_projects_a_notice_row() {
-        let entry = model_switch("sw-1", "Model changed from A to B.");
+        let entry = system_notice("sw-1", &model_switch_text("A", "B"));
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert_eq!(rows.len(), 1);
         match &rows[0].kind {
-            RowKind::Notice { text } => assert_eq!(text.as_ref(), "Model changed from A to B."),
+            RowKind::Notice { text } => assert_eq!(text.as_ref(), model_switch_text("A", "B")),
             _ => panic!("expected a notice row"),
         }
     }
 
     #[test]
-    fn back_to_back_model_switches_collapse_to_the_last() {
+    fn only_back_to_back_model_switches_collapse() {
+        // Two switches in a row: the first is superseded by the second.
         let entries = vec![
             user_entry("u1"),
-            model_switch("sw-1", "Model changed from A to B."),
-            model_switch("sw-2", "Model changed from B to C."),
+            system_notice("sw-1", &model_switch_text("A", "B")),
+            system_notice("sw-2", &model_switch_text("B", "C")),
         ];
         assert!(!is_superseded_notice(&entries, 0));
         assert!(is_superseded_notice(&entries, 1));
         assert!(!is_superseded_notice(&entries, 2));
+
+        // A switch followed by an ordinary notice keeps both.
+        let entries = vec![
+            system_notice("sw-1", &model_switch_text("A", "B")),
+            system_notice("mk-1", "Contexto compactado."),
+        ];
+        assert!(!is_superseded_notice(&entries, 0));
+        assert!(!is_superseded_notice(&entries, 1));
+
+        // Two ordinary notices in a row keep both.
+        let entries = vec![
+            system_notice("mk-1", "Contexto compactado · 120k → 30k"),
+            system_notice("mk-2", "Contexto compactado."),
+        ];
+        assert!(!is_superseded_notice(&entries, 0));
+        assert!(!is_superseded_notice(&entries, 1));
     }
 
     #[test]
