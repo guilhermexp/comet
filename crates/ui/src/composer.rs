@@ -1896,6 +1896,10 @@ pub struct ComposerInput {
     /// Normally keeps the caret visible through edits and rewraps. Manual
     /// wheel scrolling pauses it until the next caret move or edit.
     follow_cursor: bool,
+    text_size: f32,
+    configured_line_height: f32,
+    single_line: bool,
+    scroll_left: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     last_layout_key: Option<InputLayoutKey>,
@@ -1984,6 +1988,10 @@ impl ComposerInput {
             last_notified_layout: None,
             #[cfg(test)]
             layout_rebuilds: 0,
+            text_size: INPUT_TEXT_SIZE,
+            configured_line_height: INPUT_LINE_HEIGHT,
+            single_line: false,
+            scroll_left: 0.0,
             line_starts: vec![0],
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
@@ -2009,6 +2017,22 @@ impl ComposerInput {
             mention_tooltip_task: None,
             mention_tooltip_view: None,
         }
+    }
+
+    /// Override the text metrics for compact one-line surfaces such as
+    /// toolbar searches without changing the main composer typography.
+    pub fn with_text_metrics(mut self, text_size: f32, line_height: f32) -> Self {
+        self.text_size = text_size;
+        self.configured_line_height = line_height;
+        self.line_height = px(line_height);
+        self.content_height = line_height;
+        self
+    }
+
+    /// Keep compact fields on one row and reveal the caret horizontally.
+    pub fn with_single_line(mut self) -> Self {
+        self.single_line = true;
+        self
     }
 
     /// Reset the caret blink phase (solid again) — called on every edit and
@@ -2189,12 +2213,16 @@ impl ComposerInput {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.invalidate_mention_tooltip();
         self.content = text.into();
+        if self.single_line {
+            self.content = self.content.replace(['\r', '\n'], " ");
+        }
         self.refresh_projection();
         let end = self.content.len();
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_top = 0.0;
+        self.scroll_left = 0.0;
         self.follow_cursor = true;
         // Programmatic replacement (draft load, clear-on-submit) is a new
         // document, not an edit — undo must not reach back past it.
@@ -2922,7 +2950,7 @@ impl ComposerInput {
             return 0;
         };
         let local = point(
-            position.x - bounds.left(),
+            position.x - bounds.left() + px(self.scroll_left),
             position.y - bounds.top() + px(self.scroll_top),
         );
         self.index_for_point(local)
@@ -3163,7 +3191,7 @@ impl ComposerInput {
             (SharedString::from(self.projection.display.clone()), false)
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        self.line_height = px(INPUT_LINE_HEIGHT);
+        self.line_height = px(self.configured_line_height);
 
         let plans = if is_placeholder {
             vec![ComposerRunPlan {
@@ -3253,7 +3281,13 @@ impl ComposerInput {
         // mono widths cannot cause decorate→measure→flip feedback.
         let base_lines = window
             .text_system()
-            .shape_text(display.clone(), font_size, &base_runs, Some(width), None)
+            .shape_text(
+                display.clone(),
+                font_size,
+                &base_runs,
+                (!self.single_line).then_some(width),
+                None,
+            )
             .map(|small| small.into_vec())
             .unwrap_or_default();
         let has_sized_heading = plans.iter().any(|plan| plan.decor.heading.is_some());
@@ -3341,6 +3375,17 @@ impl ComposerInput {
 
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
+        if self.single_line {
+            let previous = self.scroll_left;
+            let width = (self.last_width - 2.0).max(1.0);
+            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
+                let x = f32::from(cursor.x);
+                self.scroll_left = self.scroll_left.min(x).max(x - width).max(0.0);
+            }
+            self.scroll_left = self.scroll_left.min((self.max_line_width - width).max(0.0));
+            self.scroll_top = 0.0;
+            return self.scroll_left != previous;
+        }
         let previous = self.scroll_top;
         if self.follow_cursor {
             if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
@@ -3415,6 +3460,13 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let single_line_text;
+        let new_text = if self.single_line {
+            single_line_text = new_text.replace(['\r', '\n'], " ");
+            single_line_text.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -3448,6 +3500,13 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let single_line_text;
+        let new_text = if self.single_line {
+            single_line_text = new_text.replace(['\r', '\n'], " ");
+            single_line_text.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -3496,7 +3555,7 @@ impl EntityInputHandler for ComposerInput {
             .normalize_range(self.range_from_utf16(&range_utf16));
         let start = self.point_for_index(range.start)?;
         let origin = point(
-            bounds.left() + start.x,
+            bounds.left() + start.x - px(self.scroll_left),
             bounds.top() + start.y - px(self.scroll_top),
         );
         Some(Bounds::new(origin, size(px(2.0), self.line_height)))
@@ -3697,7 +3756,7 @@ impl gpui::Element for ComposerTextElement {
         });
         let input = self.input.read(cx);
         let scroll = px(input.scroll_top);
-        let origin = point(bounds.left(), bounds.top() - scroll);
+        let origin = point(bounds.left() - px(input.scroll_left), bounds.top() - scroll);
         let selection_color = Theme::of(cx).selection;
         let caret_color = Theme::of(cx).caret;
         // The inline-code recipe: chips wash violet like `code` spans do.
@@ -3877,11 +3936,12 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, line_height, scroll) = self.input.update(cx, |input, _| {
+        let (lines, line_height, scroll, scroll_left) = self.input.update(cx, |input, _| {
             (
                 std::mem::take(&mut input.last_lines),
                 input.line_height,
                 input.scroll_top,
+                input.scroll_left,
             )
         });
 
@@ -3890,7 +3950,7 @@ impl gpui::Element for ComposerTextElement {
             for line in &lines {
                 let height = line.size(line_height).height;
                 let _ = line.paint_background(
-                    point(bounds.left(), y),
+                    point(bounds.left() - px(scroll_left), y),
                     line_height,
                     gpui::TextAlign::Left,
                     Some(bounds),
@@ -3909,7 +3969,7 @@ impl gpui::Element for ComposerTextElement {
             for line in &lines {
                 let height = line.size(line_height).height;
                 let _ = line.paint(
-                    point(bounds.left(), y),
+                    point(bounds.left() - px(scroll_left), y),
                     line_height,
                     gpui::TextAlign::Left,
                     Some(bounds),
@@ -3972,7 +4032,9 @@ impl Render for ComposerInput {
             // whole window instead of the field (gpui logs it every focus
             // change) — an id + role is what puts it in the AccessKit tree.
             .id(("composer-input", cx.entity_id()))
-            .role(if self.key_context == "PaletteSearch" {
+            .role(if self.single_line {
+                gpui::Role::TextInput
+            } else if self.key_context == "PaletteSearch" {
                 gpui::Role::SearchInput
             } else {
                 gpui::Role::MultilineTextInput
@@ -4024,8 +4086,8 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
-            .text_size(px(INPUT_TEXT_SIZE))
-            .line_height(px(INPUT_LINE_HEIGHT))
+            .text_size(px(self.text_size))
+            .line_height(px(self.configured_line_height))
             .text_color(text_color)
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {
@@ -8301,6 +8363,67 @@ impl Render for Composer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_line_address_reveals_caret_and_maps_scrolled_pointer() {
+        gpui_platform::headless().run(|cx| {
+            cx.set_global(Theme::dark());
+            let handle = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|cx| {
+                        ComposerInput::new("Address", cx)
+                            .with_single_line()
+                            .with_text_metrics(11.0, 16.0)
+                    })
+                })
+                .unwrap();
+            handle
+                .update(cx, |input, window, cx| {
+                    let style = window.text_style();
+                    input.set_text(
+                        "http://device.a-very-long-project-name.localhost:7331/path",
+                        cx,
+                    );
+                    input.layout_text(px(100.0), &style, window, cx);
+                    assert_eq!(input.content_height, 16.0, "long hostnames must not wrap");
+                    input.clamp_scroll(16.0);
+                    assert!(input.scroll_left > 0.0);
+                    let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(100.0), px(16.0)));
+                    input.last_bounds = Some(bounds);
+                    let caret = input
+                        .bounds_for_range(
+                            input.content.len()..input.content.len(),
+                            bounds,
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    assert!(caret.left() >= bounds.left() && caret.right() <= bounds.right());
+                    assert_eq!(
+                        input.index_for_mouse_position(caret.origin),
+                        input.content.len()
+                    );
+                    input.selected_range = 0..0;
+                    input.clamp_scroll(16.0);
+                    assert_eq!(input.scroll_left, 0.0, "Home must reveal the URL start");
+                    input.replace_text_in_range(None, "one\r\ntwo", window, cx);
+                    assert!(!input.content.contains(['\r', '\n']));
+                    input.set_text("short", cx);
+                    input.layout_text(px(100.0), &style, window, cx);
+                    input.clamp_scroll(16.0);
+                    assert_eq!(
+                        input.scroll_left, 0.0,
+                        "short replacement must reset scrolling"
+                    );
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    }
+
     use super::*;
 
     #[gpui::test]

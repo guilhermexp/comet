@@ -16,6 +16,7 @@ pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
 pub mod badges;
+pub mod browser;
 mod capture;
 pub mod change_requests;
 pub mod changes;
@@ -299,3 +300,5 @@ fn open_main_window(
     .detach();
     appearance::reapply_window_background(cx);
 }
+
+mod surface_chrome;

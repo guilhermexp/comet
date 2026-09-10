@@ -5,6 +5,7 @@ members = [
     "crates/syntax",
     "crates/theme",
     "crates/proto",
+    "crates/preview",
     "crates/doc",
     "crates/sync",
     "crates/harness",
@@ -19,6 +20,7 @@ exclude = [
     "third_party/unpeel",
     "third_party/rust/block-0.1.6",
     "third_party/rust/proc-macro-error2-2.0.1",
+    "third_party/rust/rtc-sctp-0.20.5",
 ]
 
 [workspace.package]
@@ -28,6 +30,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+zeron-preview = { path = "crates/preview" }
 zeron-proto = { path = "crates/proto" }
 zeron-doc = { path = "crates/doc" }
 zeron-sync = { path = "crates/sync" }
@@ -125,12 +128,30 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ignore = "0.4"
 nucleo-matcher = "0.3"
 
+# Preview transport and native browser dependencies.
+bytes = "1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+webrtc = "0.20.2"
+url = "2"
+wry = { version = "0.56", default-features = false, features = ["os-webview"] }
+raw-window-handle = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", "NSEvent", "NSView", "NSWindow"] }
+objc2-foundation = "0.3.2"
+objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKNavigationDelegate", "WKNavigationAction", "WKSnapshotConfiguration"] }
+image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "webp"] }
+
 [patch.crates-io]
 # Both crates are transitive dependencies of the pinned gpui revision. These
 # local, licensed source patches only address Rust future-incompatibility
 # lints; they do not change either dependency's public API or version.
 block = { path = "third_party/rust/block-0.1.6" }
 proc-macro-error2 = { path = "third_party/rust/proc-macro-error2-2.0.1" }
+
+# Keep SCTP + DTLS + UDP/IP within a 1280-byte tunnel MTU. See PATCHES.md.
+rtc-sctp = { path = "third_party/rust/rtc-sctp-0.20.5" }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

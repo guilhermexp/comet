@@ -25,8 +25,8 @@
 
 ## 6. P7 development previews
 
-- [ ] 6.1 Port discovery, stable local proxy URLs and live HTTP/WebSocket forwarding with upstream regression fixtures; verify preview crate and engine tests.
-- [ ] 6.2 Port authenticated PreviewRoom pairing and cross-device transport with compatibility/error states; verify Rust and edge pairing/authorization tests.
+- [x] 6.1 Port discovery, stable local proxy URLs and live HTTP/WebSocket forwarding with upstream regression fixtures; verify preview crate and engine tests.
+- [x] 6.2 Port authenticated PreviewRoom pairing and cross-device transport with compatibility/error states; verify Rust and edge pairing/authorization tests.
 - [ ] 6.3 Integrate native browser tabs into the existing shell without changing document previews; verify navigation, resize, HTTP loading and HMR through BCU with local fixtures.
 
 ## 7. P8 Git history

@@ -41,6 +41,13 @@
     <string>Comet uses the microphone for realtime voice conversations with your coding agent.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- Browser tabs load user-selected HTTP dev servers. Keep the exception
+         scoped to WebKit; other app connections retain their ATS policy. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+    </dict>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026</string>
     <!-- gpui renders via Metal. -->

@@ -12,6 +12,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- `EngineCore.previews` é device-local: boot observa cwds dos Chats locais, disconnect cancela sinalização/proxy e shutdown aguarda. `WatchPreviews` consulta o catálogo do viewer e filtra pelo Chat/device dono; `targetDeviceId` aqui seleciona dados e não provoca relay RPC. Auth fornece token fresco na conexão, sem copiá-lo para o catálogo.
+
 - `workspace_files.rs` é o acesso de leitura da árvore Files por checkout autorizado: diretório paginado (500 entradas/página), busca limitada, texto bounded e watcher compartilhado/cancelável. Toda operação valida ownership do Chat/Space e path relativo; nunca usa esse contrato para restringir links locais absolutos do Chat. A baseline do watcher e publicação usam o mesmo lock de sequência, inclusive no recovery por lag. Salvamento/editor do upstream não foi importado.
 
 - `EngineChatSink` só persiste cursor de row cuja história causal foi aplicada. Import com dependências pendentes pede checkpoint ao cliente; checkpoint incompleto falha sem gravar cursor. Operações estacionadas pelo Loro não entram no snapshot, então cursor contíguo da room sozinho não prova durabilidade.

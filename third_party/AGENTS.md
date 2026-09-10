@@ -10,13 +10,13 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - `cmux/` — checkout local-only do terminal macOS baseado em Ghostty, usado
   apenas como referência de pesquisa.
 - `unpeel-upstream.toml` — proveniência verificável do snapshot vendorizado.
-- `rust/` — snapshots licenciados de crates.io com patches mínimos de compatibilidade do toolchain, documentados em `rust/PATCHES.md` e consumidos por `[patch.crates-io]`.
+- `rust/` — snapshots licenciados de crates.io com patches mínimos de compatibilidade do toolchain e transporte, documentados em `rust/PATCHES.md` e consumidos por `[patch.crates-io]`.
 
 ## Ownership
 
 - O projeto mantém o snapshot exato de `unpeel/` e suas patches de
   compatibilidade locais, preservando a licença MIT e atribuição upstream.
-- O projeto mantém os snapshots em `rust/` apenas enquanto a resolução transitiva do GPUI pinado exigir as versões incompatíveis, preservando versão, API, licença, checksum de origem e justificativa do patch.
+- O projeto mantém os snapshots em `rust/` apenas enquanto as dependências pinadas exigirem as correções documentadas, preservando versão, API, licença, checksum de origem e justificativa do patch.
 - `cmux/` não é propriedade nem dependência do projeto e permanece untracked.
 
 ## Local Contracts
@@ -49,9 +49,9 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   downstream e atualização simultânea de `vendored_tree` na metadata.
 - `cmux/` não é rastreado, está excluído em `.git/info/exclude`, e nenhum build,
   CI ou documento operacional pode depender da sua presença.
-- O fork gpui (`wingleeio/zed`) continua uma dependência Git do Cargo, não um
+- O renderer gpui (`zeronsh/zui`) continua uma dependência Git do Cargo, não um
   diretório desta árvore. Crates GPL do Zed permanecem proibidas.
-- Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico futuro que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
+- Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico documentado que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
 
 ## Work Guidance
 

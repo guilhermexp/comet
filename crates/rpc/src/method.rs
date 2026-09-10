@@ -130,6 +130,7 @@ macro_rules! rpc_methods {
 // worktree creation checks out a full tree; everything else is interactive
 // and must fail fast on the default 30s.
 rpc_methods! {
+    WATCH_PREVIEWS / WatchPreviews = "WatchPreviews" { params: zeron_proto::WatchPreviewsParams, reply: zeron_proto::PreviewSnapshot },
     LIST_HARNESSES / ListHarnesses = "ListHarnesses" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
