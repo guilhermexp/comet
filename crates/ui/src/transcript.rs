@@ -341,12 +341,10 @@ const OWN_SEND_GLIDE_RETAIN: f32 = 0.85;
 /// The anchor glide snaps to its hold position within this error.
 const OWN_SEND_GLIDE_SNAP_PX: f32 = 1.0;
 
-/// The reservation a held turn still needs: the room under the prompt's
-/// top-inset position (`usable` = viewport minus inset and bottom chrome)
-/// not yet consumed by the turn's own content. Zero once the reply has
-/// filled the reserved space — the notes-app `minHeight` analogue.
-fn own_turn_reservation(usable: f32, turn_height: f32) -> f32 {
-    (usable - turn_height).max(0.0)
+/// Prevent an unmeasured prompt glide from overshooting its row.
+fn own_turn_glide_crossed(offset: ListOffset, anchor_ix: usize, inset: f32) -> bool {
+    offset.item_ix > anchor_ix
+        || (offset.item_ix == anchor_ix && f32::from(offset.offset_in_item) > -inset)
 }
 
 fn runway_owns_user_position(held: bool, positioned: bool, has_landed: bool) -> bool {
@@ -2777,8 +2775,8 @@ struct FoldState {
 
 /// Layout state for the most recent locally-sent turn (notes-app parity):
 /// EVERY send glides the prompt to the viewport top and reserves the space
-/// below it for the reply — a trailing runway pad sized `usable − turn
-/// height`, i.e. a min-height for the turn. The pad shrinks 1:1 as the reply
+/// below it for the reply. ListState reserves the remaining viewport in the
+/// same layout pass that measures rows. The reservation shrinks as the reply
 /// grows (zero net motion), so the hold is stable across steers and finished
 /// turns until the reply overflows the reservation — at which point the pad
 /// is ~0 and the bottom spring takes over with no height jump. Cleared by
@@ -2787,8 +2785,6 @@ struct FoldState {
 struct OwnTurnAnchor {
     chat_id: String,
     message_id: SharedString,
-    /// Current reservation pad on the last row (`usable − turn_height`).
-    runway: f32,
     /// Whether the own-turn step still owns the viewport position.
     held: bool,
     /// The send glide has landed; the anchor now holds position exactly.
@@ -3277,9 +3273,6 @@ pub struct Transcript {
     own_turn_scheduled: bool,
     /// Wall-clock of the previous own-turn glide tick (`None` = not gliding).
     own_turn_last_tick: Option<Instant>,
-    /// The runway was removed on the previous frame; engage the bottom spring
-    /// only after layout has incorporated that removal.
-    own_turn_release_pending: bool,
     spring: StickSpring,
     /// Wall-clock of the previous spring tick (`None` = parked).
     spring_last_tick: Option<Instant>,
@@ -3598,7 +3591,6 @@ impl Transcript {
             own_turn_kick: false,
             own_turn_scheduled: false,
             own_turn_last_tick: None,
-            own_turn_release_pending: false,
             spring: StickSpring::new(),
             spring_last_tick: None,
             spring_settled_at: None,
@@ -3796,11 +3788,11 @@ impl Transcript {
     /// explicit user navigation supersedes the automatic own-turn behavior.
     fn remove_own_turn_runway(&mut self) {
         if self.own_turn.take().is_some() {
+            self.list.set_tail_reservation(None);
             self.remeasure_last_row();
         }
         self.own_turn_kick = false;
         self.own_turn_last_tick = None;
-        self.own_turn_release_pending = false;
     }
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
@@ -3818,6 +3810,18 @@ impl Transcript {
     }
 
     fn handle_scroll(&mut self, _event: &ListScrollEvent, cx: &mut Context<Self>) {
+        // Cancel synchronously, before a queued animation frame can undo the
+        // wheel/touch input. Neither operation reads the borrowed ListState.
+        self.scroll_anim = None;
+        let released_own_turn = self.own_turn.as_ref().is_some_and(|anchor| anchor.held);
+        self.release_own_turn_hold();
+        if self.own_turn.is_some() {
+            // Cancel any tail spring synchronously too; the deferred input
+            // decision below may re-engage it after reading the new offset.
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+        }
         // The list invokes this handler ONLY from its wheel/touch input path
         // (programmatic scroll_by/scroll_to never re-enter it), while holding
         // its internal RefCell borrow — reading the ListState back
@@ -3827,64 +3831,45 @@ impl Transcript {
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
                 this.discard_pending_viewport();
-                // While a landed own-turn anchor holds, everything already
-                // fits on screen — the prompt at the top, the whole reply
-                // below, and under that only reserved runway. Wheel/touch has
-                // nothing to reveal in either direction, so clamp back to the
-                // anchor instead of handing over the viewport (cancelling
-                // here collapses the runway and teleports the layout by up to
-                // a viewport). The runway retires when the reply outgrows it;
-                // explicit navigation (jump pill, rail clicks, chat switches)
-                // still cancels it. During the send glide the step fn owns
-                // the offset — input just waits the ~200ms out.
+                // Input owns the viewport immediately, including wheel-down
+                // after background streaming. A held turn can be stale while
+                // frame callbacks are paused; reasserting its old prompt here
+                // made scrolling down impossible until an upward gesture.
                 if this.own_turn.is_some() {
                     let distance = this.distance_from_bottom();
                     let previous = this.last_scroll_distance;
                     this.last_scroll_distance = distance;
-                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
-                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
-                        // Input moving away from the bottom breaks the hold.
-                        if let Some(anchor) = this.own_turn.as_mut() {
-                            anchor.held = false;
-                        }
-                        this.own_turn_last_tick = None;
-                        this.pinned = false;
-                        this.spring.reset();
-                        this.spring_last_tick = None;
-                    } else if !held
-                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
-                    {
-                        // Returning to the bottom returns to the RUNWAY: the
-                        // glide re-lands the prompt at its inset.
+                    // Reaching the end preserves normal tail-follow intent
+                    // without reasserting a possibly stale prompt hold.
+                    this.pinned =
+                        distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous);
+                    this.spring.reset();
+                    this.spring_last_tick = None;
+                    // Re-stick only when returning to a short turn's actual
+                    // hold. An off-screen prompt belongs to an overflowing
+                    // reply, even if reservation refinement hasn't run yet.
+                    let at_hold = this.own_turn_anchor_ix().is_some_and(|ix| {
+                        this.list.bounds_for_item(ix).is_some_and(|bounds| {
+                            f32::from(bounds.top() - this.list.viewport_bounds().top())
+                                >= Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - 2.0
+                        })
+                    });
+                    if !released_own_turn && at_hold && Self::should_restick(distance, previous) {
                         if let Some(anchor) = this.own_turn.as_mut() {
                             anchor.held = true;
                             anchor.positioned = false;
                         }
-                        this.own_turn_last_tick = None;
+                        this.pinned = false;
                         this.own_turn_kick = true;
-                    } else if held {
-                        // Wheel-down while held: the bottom is a HARD STOP.
-                        // The pad runs one frame behind a streaming commit,
-                        // so the list's own end-clamp can briefly admit
-                        // travel into the transient surplus — re-assert the
-                        // hold in the same effect cycle, before anything
-                        // paints, and the sink never reaches the screen.
-                        // (scroll_to is bounds-free, so this also covers the
-                        // wheel gluing the offset at the end.)
-                        if let Some(ix) = this.own_turn_anchor_ix() {
-                            this.list.scroll_to(ListOffset {
-                                item_ix: ix,
-                                offset_in_item: px(0.0),
-                            });
-                            this.list.scroll_by(px(-Self::own_send_inset(ix)));
-                        }
-                        this.last_scroll_distance = this.distance_from_bottom();
                     }
-                    this.last_scroll_distance = this.distance_from_bottom();
+                    if this.pinned {
+                        this.wake_spring();
+                    }
+                    this.show_jump_button = distance > SCROLL_BUTTON_THRESHOLD_PX
+                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
+                    cx.notify();
                     return;
                 }
-                // User input supersedes a pending post-handoff re-pin.
-                this.own_turn_release_pending = false;
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
@@ -3933,7 +3918,6 @@ impl Transcript {
         self.spring_last_tick = None;
         self.spring_settled_at = None;
         self.spring_kick = false;
-        self.own_turn_release_pending = false;
         self.selection_drag_position = Some(event.position);
         self.materialize_scroll_anchor();
         cx.notify();
@@ -4039,8 +4023,8 @@ impl Transcript {
     /// Glide a locally-sent prompt to the viewport top and reserve the space
     /// below it for the reply — EVERY send, not just the first (a steer or a
     /// post-turn send used to collapse the previous reservation and drop the
-    /// messages back down — user report). [`Self::step_own_turn`] sizes the
-    /// reservation, drives the glide, and hands off to the bottom spring
+    /// messages back down — user report). ListState sizes the reservation during
+    /// layout; [`Self::step_own_turn`] drives the glide and hands off to the bottom spring
     /// once the reply outgrows the reserved space.
     pub fn on_own_send(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
         self.discard_pending_viewport();
@@ -4062,13 +4046,11 @@ impl Transcript {
         self.own_turn = Some(OwnTurnAnchor {
             chat_id,
             message_id: SharedString::from(message_id),
-            runway: 0.0,
             held: true,
             positioned: false,
             has_landed: false,
             seen_prompt,
         });
-        self.own_turn_release_pending = false;
         self.own_turn_last_tick = None;
         self.own_turn_kick = true;
         self.remeasure_last_row();
@@ -4136,15 +4118,32 @@ impl Transcript {
         self.viewport_finalize_pending = true;
     }
 
-    /// One post-layout own-turn step: install the runway, position the prompt,
-    /// then watch the real content bottom until it consumes the visible room.
+    /// Install the reservation before layout; advance the prompt after layout.
+    fn update_runway_minimum(&mut self) {
+        if let Some(ix) = self.own_turn_anchor_ix() {
+            self.list.set_tail_reservation(Some((
+                ix,
+                px(Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX),
+            )));
+        } else if self.own_turn.is_none() {
+            self.list.set_tail_reservation(None);
+        }
+    }
+
+    fn scroll_own_turn_by(&self, delta: f32) {
+        let offset = self.list.logical_scroll_top();
+        if offset.item_ix == 0 && offset.offset_in_item < px(0.0) {
+            self.list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: offset.offset_in_item + px(delta),
+            });
+        } else {
+            self.list.scroll_by(px(delta));
+        }
+    }
+
     fn step_own_turn(&mut self, cx: &mut Context<Self>) {
         self.own_turn_kick = false;
-        if self.own_turn_release_pending {
-            self.own_turn_release_pending = false;
-            self.engage_pin(cx);
-            return;
-        }
         // Layout moves the bottom too (pad refinement, streaming growth):
         // refresh the wheel handler's escape baseline every frame so only a
         // WHEEL's own delta registers as user intent. Without this, the pad
@@ -4166,124 +4165,32 @@ impl Transcript {
             cx.notify();
             return;
         }
-        let Some(last_ix) = self.rows.len().checked_sub(1) else {
-            return;
-        };
-        let base_pad = self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0;
         let inset = Self::own_send_inset(anchor_ix);
-        // A glued offset hard-tracks a GROWING end — streamed text visually
-        // pushes everything above it up while the runway blank persists
-        // below (user report; the glued representation also hides every
-        // item's bounds, so the sizing that would consume the runway goes
-        // blind). Dissolve it for HELD and RELEASED views alike. The glued
-        // sentinel resolves NUMERICALLY to the total content height (a
-        // viewport top past the last item), so a small nudge lands in an
-        // absurd overscroll that layout's under-fill normalizer re-glues on
-        // the very next frame — an invisible wedge loop (rig-traced).
-        // Stepping back a FULL viewport from the sentinel is exactly "end
-        // at the screen bottom": the same visual position, concrete.
-        if self.is_glued() {
+        if self.is_glued() && self.own_turn.as_ref().is_some_and(|anchor| anchor.held) {
             self.list.scroll_by(px(-viewport_height));
         }
-        // The slack keeps the held layout scrollable (see the constant) —
-        // the reservation deliberately over-fills by this much.
-        let usable = viewport_height - inset - base_pad + OWN_SEND_SCROLL_SLACK_PX;
-        let current = self.own_turn.as_ref().map_or(0.0, |a| a.runway);
-
-        // ---- reservation: a min-height for the turn, on the last row -------
-        // A fresh anchor installs a full-viewport pad BEFORE anything needs
-        // bounds: the just-sent rows sit below the fold, unmeasured, and
-        // without the pad there is no scroll room to bring them into the
-        // measured window (gating the pad on their bounds deadlocked — the
-        // clamped scroll kept them unmeasured forever). It refines to the
-        // true reservation as soon as the turn measures.
-        let fresh = self
-            .own_turn
-            .as_ref()
-            .is_some_and(|anchor| anchor.runway <= 0.0 && !anchor.positioned);
-        if fresh {
-            if let Some(anchor) = self.own_turn.as_mut() {
-                anchor.runway = viewport_height;
+        let anchor_bounds = self.list.bounds_for_item(anchor_ix);
+        // The list consumes the reservation in the same layout that measures
+        // new rows. The height tree remains available when the prompt or tail
+        // is outside the viewport, so neither can block the handoff.
+        if self.list.tail_reservation_filled() {
+            let held = self.own_turn.take().is_some_and(|a| a.held);
+            self.own_turn_last_tick = None;
+            self.list.set_tail_reservation(None);
+            if held || self.pinned || self.distance_from_bottom() <= AT_BOTTOM_PX {
+                self.engage_pin(cx);
+            } else {
+                cx.notify();
             }
-            self.remeasure_last_row();
-            self.own_turn_kick = true;
-            cx.notify();
             return;
         }
+
+        // ---- entry glide, then absolute hold -------------------------------
         let (held, positioned) = self
             .own_turn
             .as_ref()
-            .map_or((false, false), |anchor| (anchor.held, anchor.positioned));
-        if let (Some(anchor_bounds), Some(last_bounds)) = (
-            self.list.bounds_for_item(anchor_ix),
-            self.list.bounds_for_item(last_ix),
-        ) {
-            // Content height of the turn, excluding the pads on the last row.
-            let turn_height = f32::from(last_bounds.bottom())
-                - f32::from(anchor_bounds.top())
-                - current
-                - base_pad;
-            let target = own_turn_reservation(usable, turn_height);
-            // FLOOR: never shrink the pad faster than the viewport allows.
-            // The step runs a frame behind content growth, so a wheel that
-            // lands inside that window can sink the view toward the stale
-            // end; snapping the pad straight to `target` then pulls the end
-            // UP THROUGH the viewport (the list clamps instantly — a visible
-            // yank, user report "stutter push back"). Shrinking is capped so
-            // the end never rises above the current view; deferred surplus
-            // burns off as the view moves away from the stop.
-            let dist = self.distance_from_bottom();
-            let floor = current - (dist - OWN_SEND_SCROLL_SLACK_PX).max(0.0);
-            let target = target.max(floor.min(current));
-            if target <= 0.5 {
-                // The reply has outgrown the reserved space (or the prompt
-                // alone overfills it): the pad is ~0, so releasing to the
-                // bottom spring is height-neutral — continuous, not a
-                // one-viewport jump. Before the glide has landed, skip the
-                // anchor entirely rather than gliding to the top only to be
-                // yanked back down.
-                self.own_turn = None;
-                self.remeasure_last_row();
-                if !held {
-                    cx.notify();
-                } else if positioned {
-                    self.own_turn_release_pending = true;
-                    self.own_turn_kick = true;
-                    cx.notify();
-                } else {
-                    self.engage_pin(cx);
-                }
-                return;
-            }
-            if (target - current).abs() > 0.5 {
-                if let Some(anchor) = self.own_turn.as_mut() {
-                    anchor.runway = target;
-                }
-                // Growth into the reservation shrinks the pad 1:1 — the
-                // turn's total height (and the held viewport) never moves.
-                self.remeasure_last_row();
-                self.own_turn_kick = true;
-                cx.notify();
-            }
-        }
-
-        // ---- glide to the hold, then hold exactly --------------------------
-        // A released view keeps its reservation SIZED above, but owns its own
-        // offset: only the hold moves the viewport.
+            .map_or((false, false), |a| (a.held, a.positioned));
         if !held {
-            return;
-        }
-        if self.list.bounds_for_item(anchor_ix).is_none() {
-            // The anchor is outside the measured window (a send fired while
-            // scrolled deep into history): teleport onto it; the glide covers
-            // the remaining error once it measures.
-            self.list.scroll_to(ListOffset {
-                item_ix: anchor_ix,
-                offset_in_item: px(0.0),
-            });
-            self.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
-            self.own_turn_kick = true;
-            cx.notify();
             return;
         }
         if positioned {
@@ -4298,7 +4205,7 @@ impl Transcript {
             // there made the bottom bounce/stutter on every scroll event
             // (user report). Way-below-slack (impossible short of a bug)
             // still re-asserts.
-            let moved = match self.list.bounds_for_item(anchor_ix) {
+            let moved = match anchor_bounds {
                 Some(b) => {
                     let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
                     // The legal rest zone below the hold is the epsilon plus
@@ -4320,7 +4227,7 @@ impl Transcript {
                 // rubber-banding where an instant re-assert read as stutter
                 // (user report). Bounds-less flicker still snaps — there is
                 // nothing to ease against.
-                match self.list.bounds_for_item(anchor_ix) {
+                match anchor_bounds {
                     Some(b) => {
                         let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
                         let now = Instant::now();
@@ -4336,16 +4243,15 @@ impl Transcript {
                             self.list.scroll_by(px(err));
                             self.own_turn_last_tick = None;
                         } else {
-                            self.list.scroll_by(px(err * ease));
+                            self.scroll_own_turn_by(err * ease);
                         }
                         self.own_turn_kick = true;
                     }
                     None => {
                         self.list.scroll_to(ListOffset {
                             item_ix: anchor_ix,
-                            offset_in_item: px(0.0),
+                            offset_in_item: px(-inset),
                         });
-                        self.list.scroll_by(px(-inset));
                         self.own_turn_last_tick = None;
                     }
                 }
@@ -4363,38 +4269,40 @@ impl Transcript {
         };
         self.own_turn_last_tick = Some(now);
         let ease = 1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames);
-        // Remaining travel: the anchor's own error once it measures; the
-        // bottom distance while it is still below the measured window (the
-        // undershot provisional pad guarantees the bottom stops short of the
-        // prompt, so this leg can never overshoot it).
-        // The two error legs mean DIFFERENT things at zero: on the bounds
-        // leg, err 0 is AT the hold (no correction needed); on the bounds-
-        // less leg, err is the distance to the pad's bottom — arrival there
-        // still needs the absolute snap onto the anchor (the short-chat/
-        // glued landing, where bounds never appear). Conflating them once
-        // marked entries "positioned" at the pad bottom without ever
-        // landing (rig-caught: sends parked deep in blank runway).
-        let (err, anchored) = match self.list.bounds_for_item(anchor_ix) {
+        // Prefer the prompt geometry. When it is being remeasured but is
+        // already the scroll anchor, its logical offset is equally exact.
+        // Otherwise approach through the unmeasured rows, capping every step
+        // at the prompt so the provisional minimum can never cause overshoot.
+        let (err, anchored) = match anchor_bounds {
             Some(bounds) => (
                 f32::from(bounds.top()) - (f32::from(viewport.top()) + inset),
                 true,
             ),
-            None => (self.distance_from_bottom(), false),
+            None if self.list.logical_scroll_top().item_ix == anchor_ix => (
+                -f32::from(self.list.logical_scroll_top().offset_in_item) - inset,
+                true,
+            ),
+            None => {
+                // Remeasurement retains preceding row heights as hints. Read
+                // the prompt's coordinate from that same height tree rather
+                // than aiming at the provisional minimum's (larger) bottom.
+                let current = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+                let target = -f32::from(self.list.offset_for_item(anchor_ix)) + inset;
+                (current - target, false)
+            }
         };
         let glide_max = GLIDE_MAX_VIEWPORTS * viewport_height;
-        let err = if err.abs() > glide_max {
-            let teleport = err - err.signum() * glide_max;
-            self.list.scroll_by(px(teleport));
-            err - teleport
+        let err = if err > glide_max {
+            self.list.scroll_by(px(err - glide_max));
+            glide_max
         } else {
             err
         };
         let land = |list: &ListState| {
             list.scroll_to(ListOffset {
                 item_ix: anchor_ix,
-                offset_in_item: px(0.0),
+                offset_in_item: px(-inset),
             });
-            list.scroll_by(px(-inset));
         };
         if motion::reduced_motion(cx) {
             land(&self.list);
@@ -4419,8 +4327,8 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else if !anchored && err <= OWN_SEND_GLIDE_SNAP_PX {
-            // Arrived at the bottom with the anchor still unmeasured: the
-            // absolute, bounds-free snap IS the landing.
+            // The height hints put us at the prompt. Land by row identity
+            // so its final measurement cannot leave us in the reservation.
             land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
@@ -4428,7 +4336,10 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else {
-            self.list.scroll_by(px(err * ease));
+            self.scroll_own_turn_by(err * ease);
+            if own_turn_glide_crossed(self.list.logical_scroll_top(), anchor_ix, inset) {
+                land(&self.list);
+            }
         }
         self.own_turn_kick = true;
         cx.notify();
@@ -4603,7 +4514,6 @@ impl Transcript {
             if !keep_own_turn {
                 self.own_turn = None;
                 self.own_turn_kick = false;
-                self.own_turn_release_pending = false;
                 self.own_turn_last_tick = None;
             }
             self.chat_id = selected;
@@ -4785,6 +4695,17 @@ impl Transcript {
         }
         self.rows = new_rows;
         self.sticky_turn_rows = new_sticky_turn_rows;
+        if old_last != self.rows.len().checked_sub(1) {
+            if let Some(ix) = old_last.filter(|&ix| ix < self.rows.len()) {
+                self.list.remeasure_items(ix..ix + 1);
+            }
+            if was_empty && self.own_turn.is_some() && !self.rows.is_empty() {
+                self.list.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: -self.list.viewport_bounds().size.height,
+                });
+            }
+        }
         self.refresh_protected_attachments(cx);
         self.reconcile_own_turn_prompt();
         self.restore_pending_viewport(replay);
@@ -4799,13 +4720,6 @@ impl Transcript {
             self.list.scroll_to_end();
         }
         if self.own_turn.is_some() {
-            // Appending a reply moves the runway from the previous last row to
-            // the new one. Both measurements must be invalidated because the
-            // row diff itself only knows that rows were appended at the tail.
-            if let Some(old_last) = old_last.filter(|&ix| ix < self.rows.len()) {
-                self.list.remeasure_items(old_last..old_last + 1);
-            }
-            self.remeasure_last_row();
             self.own_turn_kick = true;
         }
         if self.pinned {
@@ -6094,16 +6008,7 @@ impl Transcript {
         // (the row's lowest content) renders half-faded (or hidden) when the
         // transcript is pinned to the bottom.
         let bottom_pad = if ix + 1 == self.rows.len() {
-            let runway = self
-                .own_turn
-                .as_ref()
-                .filter(|anchor| {
-                    self.rows
-                        .iter()
-                        .any(|candidate| candidate.entry_id == anchor.message_id)
-                })
-                .map_or(0.0, |anchor| anchor.runway);
-            self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0 + runway
+            self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0
         } else {
             0.0
         };
@@ -9811,6 +9716,7 @@ impl Render for Transcript {
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
         // outlet — an overlay here would be tinted by the fade.
+        self.update_runway_minimum();
         let list_el = list(self.list.clone(), cx.processor(Self::render_row))
             .size_full()
             .with_sizing_behavior(gpui::ListSizingBehavior::Auto);
@@ -9944,6 +9850,70 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn runway_append_consumes_reservation_before_first_paint(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| AppState::new());
+        let (view, cx) = cx.add_window_view(|_, cx| Transcript::new(state, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.rows = vec![viewport_row("prompt", "prompt")];
+                view.list.reset(1);
+                view.rail_enabled = false;
+                view.on_own_send("chat".into(), "prompt".into(), cx);
+                view.list.scroll_to(ListOffset::default());
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+            let before = view.read(cx).list.max_offset_for_scrollbar().y;
+            view.update(cx, |view, cx| {
+                let start = view.rows.len();
+                for ix in 0..3 {
+                    view.rows
+                        .push(viewport_row(&format!("reply-{ix}"), "reply"));
+                }
+                view.list.splice(start..start, 3);
+                view.list.remeasure_items(0..1);
+                cx.notify();
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+            let after = view.read(cx).list.max_offset_for_scrollbar().y;
+            assert!(
+                (after - before).abs() <= px(1.0),
+                "append exposed a temporary gap: {before:?} -> {after:?}"
+            );
+            assert!(!view.read(cx).list.tail_reservation_filled());
+        });
+    }
+
+    #[gpui::test]
+    fn runway_wheel_cancels_hold_before_deferred_layout(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let view = cx.new(|cx| Transcript::new(state, cx));
+        view.update(cx, |view, cx| {
+            view.on_own_send("chat".into(), "prompt".into(), cx);
+            view.pinned = true;
+            view.handle_scroll(
+                &ListScrollEvent {
+                    visible_range: 0..1,
+                    count: 1,
+                    is_scrolled: true,
+                    is_following_tail: false,
+                },
+                cx,
+            );
+            assert!(
+                !view.own_turn.as_ref().unwrap().held,
+                "wheel input must win before the next animation frame"
+            );
+            assert!(!view.pinned);
+        });
+    }
 
     #[gpui::test]
     fn selection_start_stops_stream_follow_before_motion(cx: &mut gpui::TestAppContext) {
@@ -10334,16 +10304,31 @@ mod tests {
     }
 
     #[test]
-    fn own_turn_reservation_is_a_min_height_for_the_turn() {
-        let usable = 700.0;
-        // A short turn reserves the rest of the usable viewport below it.
-        assert_eq!(own_turn_reservation(usable, 100.0), 600.0);
-        // Growth consumes the reservation 1:1 — total held height is stable.
-        assert_eq!(own_turn_reservation(usable, 450.0), 250.0);
-        // At/past the fill line nothing is reserved (bottom spring takes
-        // over with no height jump).
-        assert_eq!(own_turn_reservation(usable, 700.0), 0.0);
-        assert_eq!(own_turn_reservation(usable, 1_200.0), 0.0);
+    fn own_turn_glide_never_targets_the_provisional_tail() {
+        assert!(!own_turn_glide_crossed(
+            ListOffset {
+                item_ix: 2,
+                offset_in_item: px(-20.0)
+            },
+            2,
+            10.0
+        ));
+        assert!(own_turn_glide_crossed(
+            ListOffset {
+                item_ix: 2,
+                offset_in_item: px(0.0)
+            },
+            2,
+            10.0
+        ));
+        assert!(own_turn_glide_crossed(
+            ListOffset {
+                item_ix: 3,
+                offset_in_item: px(-100.0)
+            },
+            2,
+            10.0
+        ));
     }
 
     fn viewport_row(id: &str, entry_id: &str) -> Row {

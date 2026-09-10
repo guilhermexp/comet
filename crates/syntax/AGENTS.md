@@ -51,6 +51,8 @@ in per fenced block via `fence_tag`).
   injected configurations initialize only when encountered. Source/span limits
   remain per request, never bypassed by the configuration cache.
 
+- JavaScript-family queries compose base JavaScript, JSX where applicable and TypeScript extensions. Kotlin uses the project-owned query in `queries/kotlin/highlights.scm`. Dockerfile injections allow only Bash, JSON, YAML and TOML. Existing OnceLock compilation and lazy injection caching remain unchanged.
+
 ## Work Guidance
 
 - Adding a language: pin the grammar crate exactly, register it in detection

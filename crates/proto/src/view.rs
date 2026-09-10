@@ -84,6 +84,7 @@ mod failure_text_tests {
 
     fn errored(reason: Option<&str>) -> Session {
         Session {
+            last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "dev-1".into(),
             status: SessionStatus::Errored,

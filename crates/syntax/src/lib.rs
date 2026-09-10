@@ -356,6 +356,7 @@ fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
     use LanguageId::*;
     match parent {
         Html => vec![JavaScript, Css, Json],
+        Dockerfile => vec![Bash, Json, Yaml, Toml],
         Markdown => vec![
             Rust, JavaScript, Jsx, TypeScript, Tsx, Python, Go, Json, Jsonc, Bash, Toml, Html, Css,
             Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Dockerfile, Nix, Make,
@@ -426,42 +427,70 @@ fn configuration(language: LanguageId) -> Result<&'static HighlightConfiguration
     )
 }
 
+fn javascript_family_highlights(language: LanguageId) -> String {
+    use LanguageId::*;
+
+    let queries = match language {
+        JavaScript => &[tree_sitter_javascript::HIGHLIGHT_QUERY][..],
+        Jsx => &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+        ][..],
+        TypeScript => &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        ][..],
+        Tsx => &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        ][..],
+        _ => unreachable!("JavaScript query composition requires a JavaScript-family language"),
+    };
+    queries.join("\n")
+}
+
+fn javascript_family_configuration(
+    language: LanguageId,
+) -> Result<HighlightConfiguration, HighlightError> {
+    use LanguageId::*;
+
+    let highlights = javascript_family_highlights(language);
+    let (grammar, name, injections, locals) = match language {
+        JavaScript => (
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_javascript::LOCALS_QUERY,
+        ),
+        Jsx => (
+            tree_sitter_javascript::LANGUAGE.into(),
+            "jsx",
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_javascript::LOCALS_QUERY,
+        ),
+        TypeScript => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        ),
+        Tsx => (
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        ),
+        _ => unreachable!("JavaScript configuration requires a JavaScript-family language"),
+    };
+    make_configuration(grammar, name, &highlights, injections, locals)
+}
+
 fn compile_configuration(language: LanguageId) -> Result<HighlightConfiguration, HighlightError> {
     use LanguageId::*;
     match language {
         Rust => rust_configuration(),
-        JavaScript => make_configuration(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "javascript",
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
-            tree_sitter_javascript::INJECTIONS_QUERY,
-            tree_sitter_javascript::LOCALS_QUERY,
-        ),
-        Jsx => make_configuration(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "jsx",
-            &format!(
-                "{}\n{}",
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
-            ),
-            tree_sitter_javascript::INJECTIONS_QUERY,
-            tree_sitter_javascript::LOCALS_QUERY,
-        ),
-        TypeScript => make_configuration(
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescript",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
-            tree_sitter_typescript::LOCALS_QUERY,
-        ),
-        Tsx => make_configuration(
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "tsx",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
-            tree_sitter_typescript::LOCALS_QUERY,
-        ),
+        JavaScript | Jsx | TypeScript | Tsx => javascript_family_configuration(language),
         Python => make_configuration(
             tree_sitter_python::LANGUAGE.into(),
             "python",
@@ -560,7 +589,7 @@ fn compile_configuration(language: LanguageId) -> Result<HighlightConfiguration,
         Kotlin => make_configuration(
             tree_sitter_kotlin_ng::LANGUAGE.into(),
             "kotlin",
-            "[(line_comment) (block_comment)] @comment [(string_literal) (multiline_string_literal)] @string [(number_literal) (float_literal)] @number",
+            include_str!("../queries/kotlin/highlights.scm"),
             "",
             "",
         ),
@@ -617,7 +646,7 @@ fn compile_configuration(language: LanguageId) -> Result<HighlightConfiguration,
             tree_sitter_containerfile::LANGUAGE.into(),
             "dockerfile",
             tree_sitter_containerfile::HIGHLIGHTS_QUERY,
-            "",
+            tree_sitter_containerfile::INJECTIONS_QUERY,
             "",
         ),
     }

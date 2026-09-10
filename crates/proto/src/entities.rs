@@ -208,6 +208,11 @@ pub enum SessionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
+    /// Last successfully completed assistant turn. Retained while the next turn
+    /// runs so coalesced status watches do not lose normal queue completions.
+    /// Interrupts, failures and liveness expiry never advance this marker.
+    #[serde(default)]
+    pub last_completed_turn: Option<String>,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -921,6 +926,7 @@ mod tests {
         assert_eq!(old.context_usage, None);
 
         let session = Session {
+            last_completed_turn: None,
             context_usage: Some(crate::ContextUsage {
                 tokens: 392_000,
                 context_window: 828_000,

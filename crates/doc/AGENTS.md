@@ -28,6 +28,8 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 - Mudança de nome/shape de container é **destrutiva cross-device** (foi o motivo do `2` em `ws2/{orgId}`). Vai por OpenSpec.
 - Row de sessão do `RegistryDoc` (`sessions`, kind) persiste `contextTokens`/`contextWindow` junto de status/`updatedAt` — a janela de contexto tem de sobreviver a restart do app (o gauge do composer lia zero até o próximo turno). `null` limpa o campo por LWW, mesma semântica de delete do row legado `WorkspaceDoc`. Ambos leem via `RawSession`; se um passar a gravar esses campos, o outro tem de acompanhar.
 
+- Both RegistryDoc and WorkspaceDoc preserve optional `lastCompletedTurn` in Session rows; absent legacy fields decode as None. Context usage and error metadata retain their existing contracts.
+
 ## Work Guidance
 
 - Bug de "a UI não atualizou" quase sempre é diff não aplicado no mirror, não render — comece por aqui antes de `zeron-ui`.

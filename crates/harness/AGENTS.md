@@ -12,6 +12,8 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 ## Local Contracts
 
+- Codex mantém fronteiras de parágrafo por thread e item de reasoning: `summaryPartAdded` e novos itens separam texto com duas quebras, sem duplicar quebras já recebidas nem misturar subagentes.
+
 - Cancelamentos de perguntas emitem `InputResolved` sem `answers`; a engine é dona das respostas submetidas pela bridge, evitando sobrescrever o histórico com um cancelamento tardio.
 
 - ACP só encerra um prompt por resposta autoritativa, erro, cancelamento ou EOF; silêncio após texto, usage ou resultado de tool não emite `Done`. `authoritative_prompt_end` informa esse contrato à engine sem remover o fallback de atividade autônoma. Erros JSON-RPC preservam código e detalhe estruturado do agente.
@@ -41,6 +43,8 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 - **`find_on_paths` (`lib.rs`) é o único resolvedor de binário do crate.** A ordem é contrato de máquina de usuário: PATH → PATH do login shell (`shell_env`) → `extra` → bins de node version manager. `d.join(exe)` vale só para PATH e node managers; entradas de `extra` são caminhos completos e entram como estão. Claude, Codex, Cursor, opencode, OMP, os specs do ACP e `adapter_install.rs` passam todos por ela — varredura manual de PATH em um adapter novo é bug.
 
 - `ZERON_MOCK_ELEMENTS=1` acrescenta a fixture offline `src/mock_elements.rs` ao harness mock: comando, eval, MCP, hub wait, Skill com nome, busca, Write/Edit, Todo no-op e falha de escrita. Inclui dois comandos consecutivos com linhas longas e caminhos sem espaços para conferir reflow e separação de cards. Inclui também Write de 80 linhas e Edit com linhas longas, indentação e Unicode para conferir wrapping, gutters e virtualização. Write/Edit dessa fixture também emitem inputs parciais antes do payload final, para conferir a cauda de digitação e a transição para highlight. São eventos sintéticos; nenhum comando exibido é executado. `ZERON_MOCK_SUBAGENT` inclui dois filhos de uma chamada task registrada, com IDs compostos e docs separados, para validar agrupamento e navegação individual. Combinar com `ZERON_MOCK_CODE`, `ZERON_MOCK_SUBAGENT` e pacing para a aceitação nativa P1–P6.
+
+- `run_title` is opt-in and never falls back to a coding run. Claude disables tools/MCP/settings and denies permission requests; Codex uses read-only ephemeral threads, replacement instructions and explicit MCP/feature disablement. Workers MCP is disabled on this path.
 
 ## Work Guidance
 

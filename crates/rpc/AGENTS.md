@@ -27,6 +27,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.
 - `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded — rejeitados no ingresso de conexões virtuais de peer relay pelo wrapper de transporte `RelayPeerService` antes do dispatch, além do gate de `targetDeviceId` no engine como defesa em profundidade). `TrajectoryCursor` é `(source_seq, sub_seq, rev)`: a tupla de posição desambigua o terminal Interrupted legado que compartilha `source_seq` com o prefixo em `sub_seq = u32::MAX`, e `rev` é a revisão de commit do store — sem ela, resume por posição perde a substituição in-place de partial→final. `rev` é `#[serde(default)]` e `0` significa "sem conhecimento de revisão"; `Ord` continua position-first, com `rev` só como desempate.
 
+- `GetTitleSettings` and `SetTitleSettings` are device-forwardable registry methods; title preferences are device-local and not CRDT data.
+
 ## Work Guidance
 
 - RPC novo = tipo em `zeron-proto` + linha no `rpc_methods!` de `method.rs` + handler na engine. Os três no mesmo commit, senão a UI compila contra um contrato que não existe.

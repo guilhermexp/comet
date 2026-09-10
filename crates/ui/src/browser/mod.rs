@@ -84,6 +84,8 @@ pub struct BrowserSurface {
     #[cfg(feature = "browser-fixture")]
     fixture_preview_open: std::rc::Rc<std::cell::Cell<Option<gpui::Point<gpui::Pixels>>>>,
     presentation: Presentation,
+    #[cfg(target_os = "macos")]
+    resize_inset: gpui::Pixels,
     _input_sub: Subscription,
     #[cfg(target_os = "macos")]
     native: Option<macos::NativePage>,
@@ -157,6 +159,8 @@ impl BrowserSurface {
             #[cfg(feature = "browser-fixture")]
             fixture_preview_open: Default::default(),
             presentation: Presentation::Hidden,
+            #[cfg(target_os = "macos")]
+            resize_inset: gpui::px(0.0),
             _input_sub: input_sub,
             #[cfg(target_os = "macos")]
             native: None,
@@ -198,6 +202,15 @@ impl BrowserSurface {
         }
         window.focus(&self.address.focus_handle(cx), cx);
         window.dispatch_action(Box::new(crate::composer::SelectAll), cx);
+    }
+
+    /// Reserve the overlapping part of the shell divider for GPUI hit testing.
+    #[cfg(target_os = "macos")]
+    pub fn set_resize_inset(&mut self, inset: gpui::Pixels, cx: &mut Context<Self>) {
+        if self.resize_inset != inset {
+            self.resize_inset = inset;
+            cx.notify();
+        }
     }
 
     pub fn set_presentation(&mut self, presentation: Presentation, cx: &mut Context<Self>) {

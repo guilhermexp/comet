@@ -825,6 +825,18 @@ impl zeron_harness::Harness for InventoryHarness {
             })
             .collect())
     }
+    async fn run_title(
+        &self,
+        request: zeron_proto::RunRequest,
+        controls: zeron_harness::RunControls,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+        zeron_harness::HarnessError,
+    > {
+        assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
+        assert!(!request.enable_workers_mcp);
+        self.run(request, controls).await
+    }
     async fn run(
         &self,
         request: zeron_proto::RunRequest,
@@ -835,7 +847,7 @@ impl zeron_harness::Harness for InventoryHarness {
     > {
         let titling = request
             .prompt
-            .starts_with("Write a title for a coding session");
+            .starts_with(zeron_harness::TITLE_INSTRUCTIONS);
         if titling {
             self.titling_models
                 .lock()

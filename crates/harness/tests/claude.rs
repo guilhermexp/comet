@@ -663,3 +663,43 @@ async fn live_commands_discovery() {
     assert!(!commands.is_empty());
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }
+
+#[tokio::test]
+async fn title_run_disables_tools_and_denies_unexpected_permissions() {
+    let (controls, _steer, token) = controls("Yes");
+    let mut stream = harness()
+        .run_title(request("scenario:title"), controls)
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .unwrap();
+    token.cancel();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Fix Login Flow")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}

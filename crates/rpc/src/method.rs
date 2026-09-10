@@ -131,6 +131,8 @@ macro_rules! rpc_methods {
 // and must fail fast on the default 30s.
 rpc_methods! {
     WATCH_PREVIEWS / WatchPreviews = "WatchPreviews" { params: zeron_proto::WatchPreviewsParams, reply: zeron_proto::PreviewSnapshot },
+    GET_TITLE_SETTINGS / GetTitleSettings = "GetTitleSettings" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SET_TITLE_SETTINGS / SetTitleSettings = "SetTitleSettings" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_HARNESSES / ListHarnesses = "ListHarnesses" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.

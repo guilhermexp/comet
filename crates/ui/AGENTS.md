@@ -12,6 +12,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Local Contracts
 
+- A reserva de espaço do turno usa `ListState::set_tail_reservation` antes do layout; nunca padding recalculado após paint. Wheel/touch libera o hold sincronamente; retorno ao fim mantém follow, e scroll para cima preserva a posição quando a resposta cresce. O estado `has_landed` mantém o handoff com o sticky do fork.
+
 - History tem aba própria no painel de utilitários: busca com debounce e geração, navegação/colapso no grafo, pontas de branches e colunas persistidas (visibilidade, largura, ordem e autor). Preservar âncora/seleção ao trocar visualização. Perder foco na busca não limpa o filtro: o clique deve selecionar a mesma linha que estava visível. Workers usam cwd local explícito; Chat remoto mantém targetDeviceId. Preferências são gravadas no store atual, nunca por cópia stale do Shell.
 
 - `browser/` é uma surface própria de páginas HTTP(S), com WebKit no macOS e abertura externa nos demais sistemas. Abas pertencem ao Chat, compartilham store efêmero só dentro do perfil e liberam páginas/subscriptions ao fechar. Browser não substitui `file_preview/`: documentos continuam no loader nativo existente. Browser usa proxy local apenas para hosts de preview registrados e conserva atalhos personalizados. Geometria da animação é avaliada uma vez por frame para o native clip acompanhar o painel.
@@ -219,6 +221,11 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
   janela primária (semanal se houver, senão a primeira), permitindo que ciclos
   mensais como o do Cursor exibam seu próprio label (`Monthly N%`) sem cair no
   placeholder `—`.
+
+- Browser native frames retain fractional points; the overlapping five points at the left edge yield to the shell divider. The divider paints after its pane while Details remains a separate adjacent column.
+- Composer focus is requested once on navigation, attachment completion/cancel and picker completion/Escape. Clicking away keeps a neutral mounted shortcut target; repaint must not return the caret. Preview lightbox focus remains independent. Terminal selection requests focus after mounting.
+
+- Completion sounds/banners consume new Session completion markers, never infer success from Idle. First observations, stale updates and pending sends update the baseline silently. AwaitingInput notifications remain independent; compaction uses the same completion evidence.
 
 ## Work Guidance
 

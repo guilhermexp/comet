@@ -8,7 +8,8 @@
 //!
 //! One dispatch starts TWO runs: the user's turn, and the auto-titling run the
 //! executor fires off the first prompt. Both cross the same boundary and both
-//! must carry the id, so the assertions wait for both rather than stopping at
+//! must carry the id, including the separate restricted `run_title` entry point.
+//! The assertions wait for both rather than stopping at
 //! whichever lands first. They are told apart by their sandbox level, which is
 //! the one field the two paths set differently (`titles.rs` runs read-only).
 
@@ -60,6 +61,15 @@ impl Harness for RecordingHarness {
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])
+    }
+    async fn run_title(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
+        assert!(!request.enable_workers_mcp);
+        self.run(request, controls).await
     }
     async fn run(
         &self,

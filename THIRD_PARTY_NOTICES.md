@@ -1,7 +1,7 @@
 # Third-party notices
 
 Comet bundles the following syntax-highlighting components. Their parsers and
-queries are consumed from the pinned Rust crates listed in `Cargo.lock`.
+queries are consumed from the pinned Rust crates listed in `Cargo.lock`, except the project-owned Kotlin query adapted from zeronsh/comet (MIT), stored at `crates/syntax/queries/kotlin/highlights.scm`.
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
