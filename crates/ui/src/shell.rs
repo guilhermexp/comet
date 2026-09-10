@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, IntoElement,
-    KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window, WindowControlArea,
-    actions, div, img, prelude::*, px,
+    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
+    IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseUpEvent, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window,
+    WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -1745,6 +1745,7 @@ pub struct Shell {
     /// with nothing focused they go dead. Initial focus lands on the composer
     /// and focus lost with no successor routes back there.
     focus_sub: Option<Subscription>,
+    shortcut_focus: FocusHandle,
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
@@ -2196,6 +2197,7 @@ impl Shell {
             splash: SplashPhase::Visible,
             splash_task: None,
             focus_sub: None,
+            shortcut_focus: cx.focus_handle(),
             activation_sub: None,
             _ticker: ticker,
             _state_observation: observation,
@@ -9556,32 +9558,28 @@ impl Render for Shell {
             ));
         }
 
-        // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
-        // chain — with nothing focused they go dead. Land initial focus on the
-        // composer, and whenever focus is lost with no successor (e.g. the
-        // focused element unmounted), route it back there.
+        // Recover only after the mounted focus tree has settled. A retained
+        // handle from a closed preview is not a keyboard destination.
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
-                match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                    // No composer here — clear the stale handle so `focused()`
-                    // reads None (the render hook below re-lands focus when the
-                    // route returns to Chat; a lingering unmounted handle would
-                    // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
-                }
+                let root = this.shortcut_focus.clone();
+                let preferred = this.composer.focus_handle(cx);
+                window.on_next_frame(move |window, cx| {
+                    restore_mounted_focus(&root, &preferred, window, cx);
+                });
+                cx.notify();
             }));
         }
-        if !restart_required
-            && matches!(gate, GatePhase::Ready)
-            && matches!(self.route, Route::Chat)
-            && window.focused(cx).is_none()
-        {
-            window.focus(&self.composer.focus_handle(cx), cx);
-        }
+        let shortcut_focus = self.shortcut_focus.clone();
+        let preferred_focus = self.composer.focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            restore_mounted_focus(&shortcut_focus, &preferred_focus, window, cx);
+        });
 
         let root = div()
             .id("shell-root")
+            .role(gpui::accesskit::Role::Group)
+            .track_focus(&self.shortcut_focus)
             .relative()
             .flex()
             .flex_row()
@@ -11398,5 +11396,162 @@ mod tests {
         tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
         assert_eq!(tween.current(), 0.0);
         assert!(!tween.animating());
+    }
+}
+
+// Regression fixtures adapted from upstream #285.
+#[cfg(test)]
+mod shortcut_focus_regressions {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    struct ShortcutHost {
+        root: FocusHandle,
+        editor: FocusHandle,
+        show_editor: bool,
+        jumps: usize,
+    }
+
+    impl Render for ShortcutHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let root = self.root.clone();
+            let preferred = self.editor.clone();
+            window.defer(cx, move |window, cx| {
+                restore_mounted_focus(&root, &preferred, window, cx);
+            });
+            div()
+                .size_full()
+                .id("focus-test-root")
+                .role(gpui::accesskit::Role::Group)
+                .track_focus(&self.root)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        // Exercise mouse focus handoffs, hiding a focused pane,
+                        // and clicking a control that explicitly clears focus.
+                        this.show_editor = event.position.x < px(100.0);
+                        if event.position.x < px(200.0) {
+                            window.focus(&this.editor, cx);
+                        } else {
+                            window.blur();
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &JumpSession, _, _| this.jumps += 1))
+                .when(self.show_editor, |el| {
+                    el.child(
+                        div()
+                            .id("focus-test-editor")
+                            .role(gpui::accesskit::Role::TextInput)
+                            .track_focus(&self.editor),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn shortcuts_recover_from_retained_editor_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                &platform_combo("mod-2"),
+                JumpSession(1),
+                None,
+            )]);
+        });
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        for show_editor in [true, false, true, false] {
+            host.update(cx, |host, window, cx| {
+                host.show_editor = show_editor;
+                // Keep the editor handle alive and focused even when hidden.
+                window.focus(&host.editor, cx);
+                cx.notify();
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            host.update(cx, |host, window, cx| {
+                restore_mounted_focus(&host.root, &host.editor, window, cx);
+                assert!(host.root.contains_focused(window, cx));
+                assert_eq!(host.editor.is_focused(window), show_editor);
+            })
+            .unwrap();
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-2"));
+        }
+        host.update(cx, |host, window, cx| {
+            assert_eq!(host.jumps, 4);
+            window.blur();
+            restore_mounted_focus(&host.root, &host.editor, window, cx);
+            assert!(host.root.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn shortcuts_work_after_mouse_focus_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                &platform_combo("mod-2"),
+                JumpSession(1),
+                None,
+            )]);
+        });
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        for (index, x) in [50.0, 150.0, 250.0, 50.0, 150.0, 250.0]
+            .into_iter()
+            .enumerate()
+        {
+            cx.update_window(host.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        position: gpui::point(px(x), px(20.0)),
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            // Dispatch immediately after the mouse event; no manual recovery.
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-2"));
+            host.update(cx, |host, window, cx| {
+                assert_eq!(
+                    host.jumps,
+                    index + 1,
+                    "shortcut failed after mouse click at {x}"
+                );
+                assert!(host.root.contains_focused(window, cx));
+                assert_eq!(host.editor.is_focused(window), x < 100.0);
+            })
+            .unwrap();
+        }
+    }
+}
+
+// Adapted from upstream #285; native WebKit responder restoration stays in
+// native_document.rs. This restores the GPUI dispatch tree only.
+fn restore_mounted_focus(
+    root: &FocusHandle,
+    preferred: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let preferred_mounted = root.contains(preferred, window);
+    if !root.contains_focused(window, cx) || (root.is_focused(window) && preferred_mounted) {
+        window.focus(if preferred_mounted { preferred } else { root }, cx);
     }
 }

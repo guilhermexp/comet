@@ -123,7 +123,7 @@ pub struct HighlightRequest<'a> {
     pub fence_tag: Option<&'a str>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum HighlightError {
     #[error("the source language is not registered")]
     UnknownLanguage,
@@ -310,32 +310,20 @@ pub fn highlight_with_limits(
         return Err(HighlightError::GrammarUnavailable(language));
     }
 
-    let mut primary_configuration = configuration(language)?;
-    primary_configuration.configure(CAPTURE_NAMES);
-    let injected = if matches!(language, LanguageId::Html | LanguageId::Markdown) {
-        injected_languages(language)
-            .into_iter()
-            .filter_map(|language| {
-                let mut config = configuration(language).ok()?;
-                config.configure(CAPTURE_NAMES);
-                Some((language, config))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let primary_configuration = configuration(language)?;
+    let injected = injected_languages(language);
     let mut highlighter = Highlighter::new();
     let events = highlighter
         .highlight(
-            &primary_configuration,
+            primary_configuration,
             request.source.as_bytes(),
             cancellation_flag,
             |name| {
                 let language = language_for_alias(name)?;
-                injected
-                    .iter()
-                    .find(|(candidate, _)| *candidate == language)
-                    .map(|(_, config)| config)
+                if !injected.contains(&language) {
+                    return None;
+                }
+                configuration(language).ok()
             },
         )
         .map_err(|error| HighlightError::Parser(error.to_string()))?;
@@ -413,7 +401,32 @@ fn make_configuration(
         .map_err(|error| HighlightError::Parser(error.to_string()))
 }
 
-fn configuration(language: LanguageId) -> Result<HighlightConfiguration, HighlightError> {
+// Adapted from upstream #255. Configured queries are immutable and contain
+// no document or theme state. Independent cells compile used languages once;
+// injected grammars are requested lazily by the per-document highlighter.
+fn configuration(language: LanguageId) -> Result<&'static HighlightConfiguration, HighlightError> {
+    macro_rules! registry {
+        ($($variant:ident),+ $(,)?) => {
+            match language {
+                $(LanguageId::$variant => {
+                    static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> = std::sync::OnceLock::new();
+                    CONFIG.get_or_init(|| {
+                        let mut config = compile_configuration(language)?;
+                        config.configure(CAPTURE_NAMES);
+                        Ok(config)
+                    }).as_ref().map_err(Clone::clone)
+                }),+
+            }
+        };
+    }
+    registry!(
+        Rust, JavaScript, Jsx, TypeScript, Tsx, Python, Go, Json, Jsonc, Bash, Toml, Markdown,
+        Html, Css, Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Dockerfile, Nix,
+        Make
+    )
+}
+
+fn compile_configuration(language: LanguageId) -> Result<HighlightConfiguration, HighlightError> {
     use LanguageId::*;
     match language {
         Rust => rust_configuration(),
@@ -751,6 +764,36 @@ fn language_for_shebang(line: &str) -> Option<LanguageId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_queries_are_shared_across_concurrent_documents() {
+        let primary = configuration(LanguageId::Rust).unwrap();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|index| {
+                    scope.spawn(move || {
+                        let config = configuration(LanguageId::Rust).unwrap();
+                        let source = format!("fn value_{index}() -> usize {{ {index} }}");
+                        let doc = highlight(HighlightRequest {
+                            source: &source,
+                            path: Some("file.rs"),
+                            fence_tag: None,
+                        })
+                        .unwrap();
+                        assert!(doc.lines.iter().any(|line| !line.is_empty()));
+                        config
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let config = worker.join().unwrap();
+                assert!(
+                    std::ptr::eq(&primary.query, &config.query),
+                    "compiled queries must be reused"
+                );
+            }
+        });
+    }
 
     #[test]
     fn aliases_keep_language_variants_distinct() {

@@ -313,7 +313,7 @@ pub fn word_range(text: &str, ix: usize) -> Range<usize> {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn elems<'a>() -> Vec<(&'a str, &'a str)> {

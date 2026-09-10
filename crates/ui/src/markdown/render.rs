@@ -154,6 +154,15 @@ pub struct CachedCode {
 }
 
 impl RenderCache {
+    /// Keep preparation for the last painted viewport/overdraw. Derived tree
+    /// keys share their owner prefix, just like content invalidation.
+    pub fn retain_rows(&mut self, rows: &std::collections::HashSet<SharedString>) {
+        self.flats
+            .retain(|(key, _, _), _| rows.iter().any(|row| key.starts_with(row.as_ref())));
+        self.code
+            .retain(|(key, _, _), _| rows.iter().any(|row| key.starts_with(row.as_ref())));
+    }
+
     /// Drop every cached entry for `row`, INCLUDING the derived keys a row
     /// renders its secondary trees under (`"{row}-reasoning"`,
     /// `"{row}#mermaid-code"`). Callers only know the row id, so an exact
@@ -1340,6 +1349,40 @@ pub fn runs_for_syntax_line_with_plain(
 mod tests {
     use super::*;
     use crate::markdown::parser::InlineStyle;
+
+    #[test]
+    fn viewport_cache_regressions_keep_secondary_trees_and_evict_departed_rows() {
+        let mut cache = RenderCache::default();
+        let flat = Rc::new(flatten_runs(&[], &Theme::dark(), false));
+        for row in [
+            "visible",
+            "visible-reasoning",
+            "visible#mermaid-code",
+            "departed",
+        ] {
+            cache.flats.insert((row.into(), 0, 0), flat.clone());
+            cache.code.insert(
+                (row.into(), 0, 0),
+                Rc::new(CachedCode {
+                    code_len: 0,
+                    hl_key: (0, 0),
+                    lines: Vec::new(),
+                }),
+            );
+        }
+        cache.retain_rows(&[SharedString::from("visible")].into_iter().collect());
+        assert_eq!(cache.flats.len(), 3);
+        assert_eq!(cache.code.len(), 3);
+        assert!(
+            cache
+                .flats
+                .keys()
+                .all(|(row, _, _)| row.starts_with("visible"))
+        );
+        cache.invalidate_row("visible");
+        assert!(cache.flats.is_empty());
+        assert!(cache.code.is_empty());
+    }
 
     #[gpui::test]
     fn markdown_link_opens_without_a_frame_between_press_and_release(

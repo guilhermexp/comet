@@ -1,4 +1,4 @@
-# AGENTS.md — crates/syntax (`zeron-syntax`)
+# AGENTS.md — crates/syntax (`comet-syntax`)
 
 Syntax-highlighting contracts shared by Zeron's desktop surfaces — a
 tree-sitter-based (syntect-class) tokenizer producing paint-only text runs.
@@ -46,6 +46,10 @@ in per fenced block via `fence_tag`).
 - Unknown language / missing grammar → `UnknownLanguage` /
   `GrammarUnavailable`; callers fall back to plain text. Highlighting must
   never make content unreadable.
+- Compiled grammar configurations (including compilation errors) are shared
+  once per language with `OnceLock`. Each document keeps its own highlighter;
+  injected configurations initialize only when encountered. Source/span limits
+  remain per request, never bypassed by the configuration cache.
 
 ## Work Guidance
 
@@ -56,12 +60,13 @@ in per fenced block via `fence_tag`).
 
 ## Verification
 
-`cargo test -p zeron-syntax` — 15 unit + 4 integration.
+`cargo test -p comet-syntax` — includes concurrent configuration reuse and
+reference-span integration tests; the timing benchmark is opt-in.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (span splitting/normalization, precedence, detection, limits, per-grammar basics) | unit | `cargo test -p zeron-syntax --lib` |
-| `tests/quality.rs` (reference-span snapshots, unicode/incomplete-source invariants, timing guard) | integration | `cargo test -p zeron-syntax --test quality` |
+| `src/lib.rs` (span splitting/normalization, precedence, detection, limits, per-grammar basics, concurrent configuration reuse) | unit | `cargo test -p comet-syntax --lib` |
+| `tests/quality.rs` (reference-span snapshots, unicode/incomplete-source invariants, timing guard) | integration | `cargo test -p comet-syntax --test quality` |
 
 ## Child DOX Index
 

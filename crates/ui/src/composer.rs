@@ -1856,6 +1856,25 @@ pub struct PastedLongText(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PasteNoticeEvent(pub PasteNotice);
 
+// Adapted from upstream #271. All paint/shaping inputs, excluding caret,
+// selection and scrolling. Text is compared separately without cloning per frame.
+#[derive(PartialEq)]
+struct InputLayoutKey {
+    width: Pixels,
+    font: gpui::Font,
+    font_size: Pixels,
+    color: gpui::Hsla,
+    mono: SharedString,
+    code_text: gpui::Hsla,
+    code_wash: gpui::Hsla,
+    text_faint: gpui::Hsla,
+    text_muted: gpui::Hsla,
+    accent: gpui::Hsla,
+    marked_range: Option<Range<usize>>,
+    placeholder: SharedString,
+    mentions_enabled: bool,
+}
+
 /// Multiline input entity: content + selection + IME marked text + measured
 /// layout (wrapped lines) for mouse mapping and auto-grow.
 pub struct ComposerInput {
@@ -1879,6 +1898,11 @@ pub struct ComposerInput {
     follow_cursor: bool,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
+    last_layout_key: Option<InputLayoutKey>,
+    last_layout_content: String,
+    last_notified_layout: Option<(f32, f32, f32)>,
+    #[cfg(test)]
+    layout_rebuilds: usize,
     line_starts: Vec<usize>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
@@ -1955,6 +1979,11 @@ impl ComposerInput {
             scroll_top: 0.0,
             follow_cursor: true,
             last_lines: Vec::new(),
+            last_layout_key: None,
+            last_layout_content: String::new(),
+            last_notified_layout: None,
+            #[cfg(test)]
+            layout_rebuilds: 0,
             line_starts: vec![0],
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
@@ -3098,6 +3127,31 @@ impl ComposerInput {
         window: &mut Window,
         cx: &App,
     ) -> f32 {
+        let theme = Theme::of(cx);
+        let key = InputLayoutKey {
+            width,
+            font: style.font(),
+            font_size: style.font_size.to_pixels(window.rem_size()),
+            color: style.color,
+            mono: theme.font_mono.clone(),
+            code_text: theme.code_text,
+            code_wash: theme.code_wash,
+            text_faint: theme.text_faint,
+            text_muted: theme.text_muted,
+            accent: theme.accent,
+            marked_range: self.marked_range.clone(),
+            placeholder: self.placeholder.clone(),
+            mentions_enabled: self.mentions_enabled,
+        };
+        if self.last_layout_content == self.content && self.last_layout_key.as_ref() == Some(&key) {
+            // A measurement still completes for compact/expanded hysteresis.
+            self.layout_epoch += 1;
+            return self.content_height;
+        }
+        #[cfg(test)]
+        {
+            self.layout_rebuilds += 1;
+        }
         // Rebuild this even for an empty draft. Otherwise deleting the final
         // mention can leave its previous paint geometry alive while the
         // placeholder is already being shaped, tinting "Do anything" for a
@@ -3269,6 +3323,8 @@ impl ComposerInput {
             },
         );
 
+        self.last_layout_key = Some(key);
+        self.last_layout_content.clone_from(&self.content);
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
@@ -3625,10 +3681,17 @@ impl gpui::Element for ComposerTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let style = window.text_style();
         self.input.update(cx, |input, cx| {
+            // The layout engine may probe provisional widths. Publish only the
+            // final width/metrics to prevent a measure-notify feedback loop.
+            input.layout_text(bounds.size.width, &style, window, cx);
+            let layout = (input.last_width, input.max_line_width, input.content_height);
+            let changed = input.last_notified_layout != Some(layout);
+            input.last_notified_layout = Some(layout);
             let scrolled = input.clamp_scroll(f32::from(bounds.size.height));
             input.last_bounds = Some(bounds);
-            if scrolled {
+            if scrolled || changed {
                 cx.emit(ComposerInputEvent::ViewportChanged);
             }
         });
@@ -4638,6 +4701,8 @@ impl Composer {
             return None;
         }
         let mut strip = div()
+            .w_full()
+            .flex_none()
             .flex()
             .flex_row()
             .flex_wrap()
@@ -4682,6 +4747,7 @@ impl Composer {
                 };
                 div()
                     .group(group.clone())
+                    .flex_none()
                     .relative()
                     .child(
                         div()
@@ -8236,6 +8302,114 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn resolved_input_geometry_does_not_notify_on_unchanged_frames(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            cx.set_global(Theme::dark());
+        });
+        let (input, cx) = cx.add_window_view(|_, cx| ComposerInput::new("Draft", cx));
+        let changes = Rc::new(std::cell::Cell::new(0));
+        let count = changes.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event, _| {
+                if matches!(event, ComposerInputEvent::ViewportChanged) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_text(
+                    "Text whose wrapping changes between provisional and resolved widths.\n"
+                        .repeat(20),
+                    cx,
+                );
+                input.last_notified_layout = None;
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let settled = changes.get();
+        assert!(settled > 0, "resolved layout must be published");
+        for _ in 0..30 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+        assert_eq!(
+            changes.get(),
+            settled,
+            "stable geometry must not schedule another layout"
+        );
+    }
+
+    #[gpui::test]
+    fn unchanged_input_reuses_shaping_and_edits_invalidate(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            cx.set_global(Theme::dark());
+        });
+        let (input, cx) = cx.add_window_view(|_, cx| ComposerInput::new("Draft", cx));
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                let mut style = window.text_style();
+                input.enable_mentions();
+                input.set_text(
+                    "# Heading **bold**\nUnicode ação 中文 and `code` with a long paragraph.\n"
+                        .repeat(20),
+                    cx,
+                );
+                input.layout_text(px(400.0), &style, window, cx);
+                let first = input.layout_rebuilds;
+                let height = input.content_height;
+                for frame in 0..120 {
+                    input.scroll_top = frame as f32;
+                    input.selected_range = 2..8;
+                    assert_eq!(input.layout_text(px(400.0), &style, window, cx), height);
+                }
+                assert_eq!(
+                    input.layout_rebuilds, first,
+                    "caret/selection/scroll frames must reuse shaping"
+                );
+                input.set_text("Edited draft", cx);
+                input.layout_text(px(400.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 1);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 2, "width must rewrap");
+                style.font_size = px(18.0).into();
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 3);
+                input.marked_range = Some(0..2);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 4, "IME marks must repaint");
+                input.unmark_text(window, cx);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 5);
+                input.set_text("", cx);
+                input.layout_text(px(200.0), &style, window, cx);
+                input.set_placeholder("New placeholder", cx);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 7);
+                assert!(input.projection.mentions.is_empty());
+                style.color = gpui::rgb(0xff0000).into();
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 8);
+                input.mentions_enabled = false;
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 9);
+                cx.set_global(Theme::light());
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(
+                    input.layout_rebuilds,
+                    first + 10,
+                    "theme decoration must invalidate"
+                );
+            })
+        });
+    }
 
     fn planned_run_at(runs: &[ComposerRunPlan], offset: usize) -> &ComposerRunPlan {
         let mut at = 0;

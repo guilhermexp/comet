@@ -37,9 +37,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
-    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
-    Point, ScrollHandle, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
+    ListScrollEvent, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, Pixels, Point, ScrollHandle, SharedString, StyledImage as _, StyledText,
+    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{
@@ -143,10 +143,9 @@ const CHIPS_TOP_PAD: f32 = 0.0;
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 /// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
-/// a FIXED-height strip (load-state flips never shift the virtualizer).
+/// a wrapping strip (fixed thumbnail sizes keep load-state flips stable).
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
-pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
 /// Non-image attachment chips size to their file name between these bounds
 /// (the composer's staged chip bounds, widened for a full name).
 pub const FILE_CHIP_MIN_WIDTH: f32 = 140.0;
@@ -171,9 +170,9 @@ fn attachment_ref_is_image(path: &str) -> bool {
 /// The sent-message chip for a non-image attachment — the transcript twin of
 /// the composer's staged text chip (`composer::staged_text_chip`), so a file
 /// looks the same before and after the send. Sized to the file name and
-/// capped, but always [`ATT_THUMB_H`] tall: the strip's height is fixed so
-/// load-state flips never shift the virtualizer, and a shorter chip would
-/// leave the row visibly ragged next to real thumbnails.
+/// capped, but always [`ATT_THUMB_H`] tall: fixed item sizes keep load-state
+/// flips stable while the strip wraps to its available width. A shorter chip
+/// would leave the row visibly ragged next to real thumbnails.
 fn file_attachment_chip(
     row_id: &SharedString,
     aix: usize,
@@ -3173,6 +3172,7 @@ impl StickyTurnState {
 }
 
 pub struct Transcript {
+    synced_revision: Option<u64>,
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
@@ -3246,6 +3246,7 @@ pub struct Transcript {
     /// frames reuse settled blocks' text+runs; the incremental parser's stable
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
+    rendered_rows: std::collections::HashSet<SharedString>,
     highlights: HighlightStore,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
@@ -3551,6 +3552,7 @@ impl Transcript {
         // wheel-up, and resticks/jumps exactly like the main transcript.
         let pinned = follow;
         let mut this = Self {
+            synced_revision: None,
             state,
             list,
             rows: Vec::new(),
@@ -3584,6 +3586,7 @@ impl Transcript {
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
+            rendered_rows: Default::default(),
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
@@ -3911,6 +3914,31 @@ impl Transcript {
         });
     }
 
+    fn on_selection_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Selection listeners on text descendants run first in the bubble
+        // phase. Stop following on press, before a stream can move the anchor.
+        if !crate::markdown::selection::is_dragging() {
+            return;
+        }
+        self.scroll_anim = None;
+        self.discard_pending_viewport();
+        self.release_own_turn_hold();
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.spring_settled_at = None;
+        self.spring_kick = false;
+        self.own_turn_release_pending = false;
+        self.selection_drag_position = Some(event.position);
+        self.materialize_scroll_anchor();
+        cx.notify();
+    }
+
     fn on_selection_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -3932,15 +3960,24 @@ impl Transcript {
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.stop_selection_scroll();
         if let Some(_text) = crate::markdown::selection::end_active_drag() {
             // X11 middle-click paste parity, including the case where the
             // anchor row has virtualized away and cannot receive mouse-up.
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            _cx.write_to_primary(ClipboardItem::new_string(_text));
+            cx.write_to_primary(ClipboardItem::new_string(_text));
         }
+        if crate::markdown::selection::selected_text().is_none()
+            && self.distance_from_bottom() <= AT_BOTTOM_PX
+        {
+            self.pinned = true;
+        }
+        self.last_scroll_distance = self.distance_from_bottom();
+        self.show_jump_button =
+            self.last_scroll_distance > SCROLL_BUTTON_THRESHOLD_PX && !self.pinned;
+        cx.notify();
     }
 
     fn stop_selection_scroll(&mut self) {
@@ -4511,16 +4548,26 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        let s = state.read(cx);
+        if self.synced_revision == Some(s.transcript_revision)
+            && self.doc_override.as_ref().or(s.selected_chat.as_ref()) == self.chat_id.as_ref()
+        {
+            // Transfer, device and run status may still change painted chrome.
+            self.refresh_protected_attachments(cx);
+            cx.notify();
+            return;
+        }
+        self.synced_revision = Some(s.transcript_revision);
         let (selected, entries, echoes, replay) = {
-            let s = self.state.read(cx);
             match &self.doc_override {
                 // Pinned to a subagent doc: `selected` equals `chat_id` by
                 // construction, so the attach/reset branch below never fires,
                 // and echoes stay empty (nothing is ever sent from here).
                 Some(doc_id) => (
                     Some(doc_id.clone()),
-                    s.sub_transcript(doc_id).to_vec(),
-                    Vec::new(),
+                    s.sub_transcript(doc_id),
+                    &[][..],
                     TranscriptReplayState::Populated,
                 ),
                 None => {
@@ -4533,8 +4580,8 @@ impl Transcript {
                     };
                     (
                         s.selected_chat.clone(),
-                        s.transcript.clone(),
-                        s.pending_echoes().to_vec(),
+                        s.transcript.as_slice(),
+                        s.pending_echoes(),
                         replay,
                     )
                 }
@@ -4623,12 +4670,12 @@ impl Transcript {
         let mut new_rows: Vec<Row> = Vec::new();
         let mut todo_history = Vec::new();
         for (ix, entry) in entries.iter().enumerate() {
-            if is_superseded_notice(&entries, ix) {
+            if is_superseded_notice(entries, ix) {
                 continue;
             }
             new_rows.extend(self.rows_for(entry, false, &mut todo_history));
         }
-        for echo in &echoes {
+        for echo in echoes {
             new_rows.extend(self.rows_for(echo, true, &mut todo_history));
         }
         let new_sticky_turn_rows = sticky_turn_rows(&new_rows);
@@ -4797,7 +4844,11 @@ impl Transcript {
     ) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
         let next_todos = last_todo_snapshot(entry).map(<[TodoItem]>::to_vec);
-        let mut fingerprint = entry_fingerprint(entry, pending);
+        let mut fingerprint = if streaming {
+            0
+        } else {
+            entry_fingerprint(entry, pending)
+        };
         if next_todos.is_some() {
             let mut context = Vec::new();
             append_todo_snapshot_bytes(&mut context, todo_history);
@@ -5501,22 +5552,21 @@ impl Transcript {
         use crate::attachments::AttachmentSnapshot;
         let glyph = Theme::of(cx).glyph;
         let device_ids = self.attachment_device_ids(cx);
-        // Fixed height (a load-state flip must never shift the virtualizer),
-        // but scrollable across: a send of seven files runs past the bubble
-        // and `overflow_hidden` simply ate the tail — invisibly, so the row
-        // read as "that's all of them".
+        // Fixed chip/thumb sizes, wrapping to the available Chat width.
         let mut strip = div()
             .id(SharedString::from(format!("{row_id}#atts")))
             .w_full()
-            .h(px(ATT_STRIP_H))
+            .min_w_0()
+            .flex_none()
+            .flex_wrap()
             .flex()
             .flex_row()
             .justify_start()
             .items_start()
             .gap(px(8.0))
-            .overflow_x_scroll()
             .px(px(4.0))
-            .pt(px(4.0));
+            .pt(px(4.0))
+            .pb(px(6.0));
         let theme = Theme::of(cx).clone();
         for (aix, att) in atts.iter().enumerate() {
             // Not every ref is an image. The composer stages text files too
@@ -6029,6 +6079,9 @@ impl Transcript {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
+        visit_row_ids(&row, &mut |id| {
+            self.rendered_rows.insert(id.clone());
+        });
         let theme = Theme::of(cx).clone();
         // The viewport spans the full window (under the titlebar): the first
         // row's gap adds the titlebar's height so a top-scrolled transcript
@@ -9679,6 +9732,10 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_cache
+            .borrow_mut()
+            .retain_rows(&self.rendered_rows);
+        self.rendered_rows.clear();
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
@@ -9785,6 +9842,10 @@ impl Render for Transcript {
             .relative()
             .size_full()
             .min_h_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::on_selection_mouse_down),
+            )
             .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
@@ -9883,6 +9944,74 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn selection_start_stops_stream_follow_before_motion(cx: &mut gpui::TestAppContext) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| AppState::new());
+        let (view, cx) = cx.add_window_view(|_, cx| Transcript::new(state, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.pinned = true;
+                view.spring_kick = true;
+                crate::markdown::selection::begin("anchor", 0);
+                view.on_selection_mouse_down(&MouseDownEvent::default(), window, cx);
+                assert!(!view.pinned, "selection must interrupt following on press");
+                assert!(!view.spring_kick);
+                assert!(crate::markdown::selection::is_dragging());
+                crate::markdown::selection::end_active_drag();
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn status_only_notifications_preserve_rows_but_content_updates_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.selected_chat = Some("c".into());
+            state.apply_transcript(vec![assistant(
+                "a",
+                MessageStatus::Streaming,
+                vec![MessagePart::Text {
+                    id: "t".into(),
+                    text: "first".into(),
+                }],
+            )]);
+            state
+        });
+        let view = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let before = view.read_with(cx, |view, _| view.rows.as_ptr() as usize);
+        state.update(cx, |state, cx| {
+            state.apply_transfers(Vec::new());
+            cx.notify();
+        });
+        view.update(cx, |view, cx| {
+            view.sync(cx);
+            assert_eq!(
+                view.rows.as_ptr() as usize,
+                before,
+                "unrelated status must not derive replacement rows"
+            );
+        });
+        state.update(cx, |state, _| {
+            state.apply_transcript(vec![assistant(
+                "a",
+                MessageStatus::Complete,
+                vec![MessagePart::Text {
+                    id: "t".into(),
+                    text: "final reply".into(),
+                }],
+            )])
+        });
+        view.update(cx, |view, cx| { view.sync(cx); let row = view.rows.iter().find_map(|row| match &row.kind { RowKind::Markdown { tree, block_ix } => Some(&tree.blocks[*block_ix].block), _ => None }).expect("completed markdown");
+            assert!(matches!(row, Block::Paragraph { runs } if runs.iter().map(|run| run.text.as_str()).collect::<String>() == "final reply")); });
+    }
+
     use zeron_doc::MessagePart;
 
     #[test]
