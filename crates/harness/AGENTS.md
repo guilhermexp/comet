@@ -14,6 +14,7 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 - Cancelamentos de perguntas emitem `InputResolved` sem `answers`; a engine é dona das respostas submetidas pela bridge, evitando sobrescrever o histórico com um cancelamento tardio.
 
+- ACP só encerra um prompt por resposta autoritativa, erro, cancelamento ou EOF; silêncio após texto, usage ou resultado de tool não emite `Done`. `authoritative_prompt_end` informa esse contrato à engine sem remover o fallback de atividade autônoma. Erros JSON-RPC preservam código e detalhe estruturado do agente.
 - Catálogo de modelo/opção é dado do harness, não constante espalhada na UI.
 - Steering é mailbox: comando chega enquanto o run está vivo e é entregue no ponto de corte; sem run vivo, vira o próximo turno.
 - Resolução de ambiente de shell (`shell_env_resolution.rs`) existe porque o agente herda o ambiente errado quando invocado fora de um shell de login — mudanças aqui quebram o spawn em máquinas reais sem quebrar teste.
@@ -54,6 +55,7 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 |---|---|---|
 | `src/**` (parse, mailbox, catálogos, composição do system prompt) | unit | `cargo test -p zeron-harness` |
 | `tests/{claude,codex}.rs` | integration — contra fixtures | `cargo test -p zeron-harness` |
+| `tests/acp_quiet.rs` | integration — subprocesso ACP, silêncio, cancelamento e erro | `cargo test -p zeron-harness --test acp_quiet` |
 | `tests/omp_rpc.rs` | integration — launch, handshake, catálogo, RPC | `cargo test -p zeron-harness` |
 | `tests/shell_env_resolution.rs` | integration | `cargo test -p zeron-harness` |
 

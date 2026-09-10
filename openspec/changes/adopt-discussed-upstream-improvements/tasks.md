@@ -9,8 +9,8 @@
 
 ## 3. P5 ACP lifecycle
 
-- [ ] 3.1 Port slow-model/tool-completion ACP subprocess regressions, remove premature silence settlement and honor authoritative lifecycle in the engine; verify harness/engine lifecycle tests.
-- [ ] 3.2 Preserve JSON-RPC error code and structured detail with error-formatting tests and existing ACP/OMP regression checks.
+- [x] 3.1 Port slow-model/tool-completion ACP subprocess regressions, remove premature silence settlement and honor authoritative lifecycle in the engine; verify harness/engine lifecycle tests.
+- [x] 3.2 Preserve JSON-RPC error code and structured detail with error-formatting tests and existing ACP/OMP regression checks.
 
 ## 4. P2 desktop efficiency
 

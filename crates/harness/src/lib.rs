@@ -163,6 +163,11 @@ pub trait Harness: Send + Sync {
     fn deterministic_turn_end(&self) -> bool {
         false
     }
+    /// User-prompted turns with a protocol completion cannot settle by silence.
+    /// Autonomous activity may still need the independent quiesce fallback.
+    fn authoritative_prompt_end(&self) -> bool {
+        self.deterministic_turn_end()
+    }
     async fn probe_live_voice(&self, _cwd: &Path) -> Result<LiveVoiceSupport, HarnessError> {
         Ok(LiveVoiceSupport::default())
     }

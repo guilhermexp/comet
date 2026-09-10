@@ -66,6 +66,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Work Guidance
 
+- O watchdog de quietude respeita `authoritative_prompt_end` em turnos com prompt: ACP permanece `Working` até o sinal autoritativo e aceita o próximo steer. Atividade autônoma mantém o fallback, coberto por `tests/acp_lifecycle.rs`.
 - Recovery e restart são contrato testado (`restart_resume.rs`): mudança em journal ou watchdog reprova ali antes de reprovar em produção.
 - Feature nova de backend normalmente é: RPC em `zeron-rpc` + handler aqui + comando no ledger de `zeron-doc`. Os três no mesmo commit.
 
@@ -87,6 +88,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/diff_sync.rs` (`DiffMode::parse`, teto de frame) | unit | `cargo test -p zeron-engine diff_sync` |
 | `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p zeron-engine` |
 | `tests/{auth,device_routing,run_controls_chat_id,m5_*,m5c_*}.rs` | integration | `cargo test -p zeron-engine` |
+| `tests/acp_lifecycle.rs` | integration — prompt ACP lento, steering e atividade autônoma | `cargo test -p zeron-engine --test acp_lifecycle` |
 | `tests/queued_attachments.rs` | integration — bytes + path local no prompt do run | `cargo test -p zeron-engine --test queued_attachments` |
 | Superfície multi-device real | e2e manual | `scripts/e2e-smoke.sh` |
 
