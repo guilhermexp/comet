@@ -37,7 +37,5 @@
 
 - [x] 8.1 Update owner DOX contracts and validate OpenSpec.
 - [x] 8.2 Run formatting, full workspace tests and app build with one Cargo process.
-- [ ] 8.3 Validate native browser, focus, transcript and preview interactions with BCU.
-- [ ] 8.4 Review final diff, archive this change and integrate locally without push.
-
-Native interaction gate: BCU captured the production QA window in background, but rejected both coordinate clicks as stale even after immediate recapture. No click was dispatched. Native AppKit focus and browser geometry checks passed; BCU interaction validation and local promotion remain pending. See validation.md.
+- [x] 8.3 Validate native browser, focus, transcript and preview interactions with BCU (scope and limitations recorded in validation.md).
+- [x] 8.4 Review final diff, archive this change and integrate locally without push.

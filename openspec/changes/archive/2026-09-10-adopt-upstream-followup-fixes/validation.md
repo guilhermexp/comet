@@ -28,10 +28,15 @@ All Cargo calls were serialized with `CARGO_BUILD_JOBS=2`, `nice -n 10` and the 
 
 Logs: `/tmp/comet-followups-workspace-tests-final.log`, `/tmp/comet-followups-native-build.log`, `/tmp/comet-followups-native-focus.log`, `/tmp/comet-followups-browser-final/result.txt`.
 
-## Pending native interaction gate
+## Native interaction evidence
 
-BCU runtime `2026-04-20-window-motion-runtime` captured the isolated production preview fixture in background with the user's foreground application preserved. The screenshot shows Markdown, HTML and outside-checkout links plus the History pane. Both click attempts were rejected before dispatch by `stale_coordinate_guard`, including an immediate state recapture. No successful click, typing, preview open or latency measurement is claimed.
+BCU runtime `2026-04-20-window-motion-runtime` exercised the isolated production preview fixture. Earlier stale-coordinate attempts were not dispatched; a fresh QA instance was used after the user confirmed manual interaction in the previous instance.
 
-Evidence: `/tmp/comet-followups-preview-state.json`, `/tmp/comet-followups-preview-click.json`, `/tmp/comet-followups-preview-click2.json`, `/tmp/comet-followups-preview-after-click.json`.
+- One dispatched click each opened Markdown (`report.md`), HTML (`index.html`) and an absolute Markdown path outside the checkout (`outside.md`). Subsequent screenshots confirmed the intended content. The runtime initially returned `effect_not_verified` before asynchronous navigation settled; no duplicate click was needed.
+- Clicking the composer after the previews accepted `QA focus check`. Opening the model picker and pressing Escape removed the picker; a subsequent `x` key, without another click, produced `QA focus checkx` in the composer.
+- A separate offline mock run used 60 repetitions with 150 ms event pacing. BCU snapshots at 9, 25 and 41 seconds retained the visible transcript position while the working indicator advanced. The window-level scroll route reported targeted wheel dispatch. This is a native smoke check, not proof of precise wheel targeting, continuous flicker absence or end-to-end latency. Synchronous cancellation, selection interruption and first-paint geometry are covered by the focused automated tests above.
+- Browser fractional geometry and divider exclusion are covered by the production native fixture; responder lifecycle is covered by the opt-in AppKit test.
 
-QA processes launched for these checks were stopped or exited. No installed app was replaced, no push/deploy occurred. Keep this change unarchived and the branch isolated until native interactions can be verified and local promotion completed.
+Evidence JSON: `/tmp/comet-confirm-click.json`, `/tmp/comet-confirm-after.json`, `/tmp/comet-confirm-html-click.json`, `/tmp/comet-confirm-html-settled.json`, `/tmp/comet-confirm-outside-click.json`, `/tmp/comet-confirm-outside-after.json`, `/tmp/comet-confirm-input-after.json`, `/tmp/comet-confirm-picker-final.json`, `/tmp/comet-stream-before.json`, `/tmp/comet-stream-scroll.json`, `/tmp/comet-stream-later.json`. Streaming screenshots: `/tmp/comet-stream-before.png`, `/tmp/comet-stream-after-scroll.png`, `/tmp/comet-stream-later.png`.
+
+No installed app was replaced and no push/deploy occurred. Native QA processes are stopped at closeout. Local integration includes the approved R1–R7 scope only.
