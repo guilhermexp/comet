@@ -13,8 +13,8 @@ local OAuth credential through snapshots or sync.
 
 ## Tech Stack
 
-- **Rust** edition 2024, workspace `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel}` + `apps/zeron`.
-- **UI**: gpui, fork do Zed (`wingleeio/zed`) pinado por rev. Sem as crates GPL do Zed.
+- **Rust** edition 2024, workspace `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,preview}` + `apps/zeron`.
+- **UI**: gpui, extração `zeronsh/zui` pinada por rev. Sem as crates GPL do Zed.
 - **Sync**: `loro` 1.13 + `loro-protocol` 0.3.
 - **Edge**: TypeScript no Cloudflare Workers — Worker + SessionRoom DO + DeviceRoom DO + R2 + auth WorkOS.
 - **Terminal**: `alacritty_terminal` + `portable-pty`. **MCP**: `rmcp` 3.x sobre stdio.
@@ -73,5 +73,5 @@ local OAuth credential through snapshots or sync.
 
 - **Cloudflare** — Workers, Durable Objects, R2 (releases em `comet.zeron.sh`).
 - **WorkOS** — auth (JWKS, code exchange, refresh), via edge.
-- **wingleeio/zed** — fork do gpui pinado por rev; bump exige rebase da branch `comet/line-wrap-closing-punctuation`.
+- **zeronsh/zui** — extração do gpui pinada por rev; bumps preservam a regressão de pontuação/quebra de linha do fork.
 - **Claude Code / Codex** — CLIs externas dirigidas pelos harnesses; mudança de formato de saída delas quebra o parse.

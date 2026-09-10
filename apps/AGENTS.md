@@ -12,6 +12,9 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 
 ## Local Contracts
 
+- A feature Cargo `browser-fixture` de `zeron` expõe os binários opt-in `browser-fixture` e `preview-fixture` em `zeron/src/fixtures/`. Não empacotar nem publicar. Dev deps de `zeron-ui` ativam `gpui/test-support`, cujo flush desenha sem apresentação nativa; por isso esses rigs são binários do app, nunca exemplos/test targets da UI. Build nativa deve selecionar só `-p zeron --bin <fixture>`, sem `--workspace` que unificaria as features de teste.
+
+
 - **Modo headed**: se já existe daemon escutando na porta IPC, conecta nele; senão roda a engine **in-process** (RPC sobre duplex em memória — mesmo protocolo) **e serve essa engine na porta IPC**. A engine embutida não é privada: outro viewport pode se anexar ao app rodando.
 - Bind da porta é best-effort: porta ocupada não impede a janela de abrir, só perde a capacidade de hospedar peers.
 - **Modo headless**: só engine; imprime URL de sign-in no TTY (fluxo de paste-code), serve IPC em localhost e hospeda o próprio DeviceRoom.

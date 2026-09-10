@@ -67,6 +67,7 @@ fn port() -> u16 {
 }
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
+    let history_mode = std::env::args().any(|arg| arg == "--bcu-history");
     let output = PathBuf::from(std::env::args().nth(1).expect("capture directory"));
     std::fs::create_dir_all(&output)?;
     let temp = tempfile::tempdir()?;
@@ -78,7 +79,48 @@ fn main() -> anyhow::Result<()> {
         project.join("api.js"),
         "require('http').createServer((q,s)=>{s.setHeader('Content-Type','application/json');s.end(JSON.stringify({status:'ok'}))}).listen(Number(process.argv[2]),'127.0.0.1')",
     )?;
-    let vite = std::env::var("VITE_BINARY").expect("VITE_BINARY is the installed vite/bin/vite.js");
+    if history_mode {
+        let git = |args: &[&str]| -> anyhow::Result<()> {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        git(&["init", "-b", "main"])?;
+        git(&["config", "user.name", "Native QA"])?;
+        git(&["config", "user.email", "qa@example.invalid"])?;
+        for (i, title) in [
+            "Create reports",
+            "Improve preview content",
+            "Verify history search",
+        ]
+        .iter()
+        .enumerate()
+        {
+            std::fs::write(
+                project.join("report.md"),
+                format!("# Native Markdown report\n\nRevision {i}.\n"),
+            )?;
+            git(&["add", "."])?;
+            git(&["commit", "-m", title])?;
+        }
+        git(&["branch", "feature/native-qa"])?;
+        std::fs::write(
+            temp.path().join("outside.md"),
+            "# Outside checkout\n\nAbsolute Chat links remain available.\n",
+        )?;
+    }
+    let vite = std::env::var("VITE_BINARY").unwrap_or_default();
+    anyhow::ensure!(
+        history_mode || !vite.is_empty(),
+        "VITE_BINARY is the installed vite/bin/vite.js"
+    );
     let start = |port: u16| -> anyhow::Result<Child> {
         Ok(Child(
             std::process::Command::new("node")
@@ -97,14 +139,22 @@ fn main() -> anyhow::Result<()> {
         ))
     };
     let first_port = port();
-    let vite_child = start(first_port)?;
-    let api = Child(
-        std::process::Command::new("node")
-            .arg("api.js")
-            .arg(port().to_string())
-            .current_dir(&project)
-            .spawn()?,
-    );
+    let vite_child = if history_mode {
+        None
+    } else {
+        Some(start(first_port)?)
+    };
+    let api = if history_mode {
+        None
+    } else {
+        Some(Child(
+            std::process::Command::new("node")
+                .arg("api.js")
+                .arg(port().to_string())
+                .current_dir(&project)
+                .spawn()?,
+        ))
+    };
     let runtime = tokio::runtime::Runtime::new()?;
     let core = runtime.block_on(async {
         zeron_engine::EngineCore::assemble(
@@ -137,6 +187,7 @@ fn main() -> anyhow::Result<()> {
     );
     let ipc_port = port();
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, core.rpc_service()))?;
+    let outside = temp.path().join("outside.md");
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
     let boot = EngineBootConfig {
@@ -157,23 +208,37 @@ fn main() -> anyhow::Result<()> {
     let second_port = port();
     let vite_restart = vite.clone();
     let restart_root = project.clone();
+    let history_root = project.clone();
     gpui_platform::application().with_assets(icons::Assets).run(move |cx| {
         gpui_tokio::init(cx);
         let settings = settings::UiSettings::default(); settings::init(settings.clone(), data.clone(), cx);
         let fonts = typography::register_fonts(cx); typography::init(settings.ui_font_family.clone(), settings.ui_font_size, fonts, cx);
         theme_library::init(data.clone(), cx); appearance::init(appearance::AppearanceMode::Dark, settings.theme_selection, settings.accent, settings.surface, cx);
+        history::init(settings.git_history_columns, settings.git_history_column_widths, settings.git_history_column_order, settings.git_history_author_display, cx);
         composer::init(cx); terminal::panel::init(cx); app_menus::init(cx);
         let state = cx.new(|_| { let mut s = state::AppState::new(); s.connection = zeron_proto::view::ConnectionStatus::Ready; s.workspace_scope = Some(zeron_proto::WorkspaceScope::Development); s.local_device_id = Some(device.clone()); s.devices = vec![serde_json::from_value(serde_json::json!({"id":device,"name":"This device","platform":std::env::consts::OS,"lastSeenAt":null})).unwrap()]; s.chats = chats; s.spaces = spaces; s.selected_chat = Some("preview-fixture".into()); s.selected_space = Some("project".into()); s.auto_selected = true; s.chats_synced = true; s.spaces_synced = true; s });
+        if history_mode { state::AppState::bootstrap(state.clone(), boot.clone(), cx); }
         let window = cx.open_window(WindowOptions { window_background: theme::Theme::of(cx).window_background_appearance(), window_bounds: Some(WindowBounds::Windowed(Bounds::new(gpui::point(px(12.),px(30.)),size(px(1100.),px(760.))))), ..Default::default() }, |_,cx| { let workers = cx.new(|cx| workers::model::WorkersModel::new(state.clone(), cx)); let monitor = cx.new(|cx| workers::resource_monitor::WorkersResourceMonitor::new(workers.clone(), cx)); cx.set_global(workers::resource_monitor::WorkersResourceGlobal { monitor }); let controller = cx.new(|cx| workers::menu_bar::WorkersMenuBarController::new(workers.clone(), cx)); cx.set_global(workers::menu_bar::WorkersMenuBarGlobal { controller }); cx.new(|cx| shell::Shell::new(state.clone(), boot, workers, cx)) }).unwrap();
         state.update(cx, |_,cx| cx.notify()); cx.activate(true);
         cx.spawn(async move |cx| {
             let run: anyhow::Result<()> = async {
-                let mut vite_child = Some(vite_child); let mut api = Some(api);
+                let mut vite_child = vite_child; let mut api = api;
                 pause(cx,1200).await;
                 state.update(cx, |s,cx| { s.apply_transcript_frame(zeron_doc::TranscriptFrame::Reset { reset: serde_json::from_value(serde_json::json!([
                     {"id":"user","role":"user","parts":[{"id":"text","kind":"text","text":"Let’s preview Fieldnotes while we work on the landing page."}],"createdAt":1788900000000_i64,"deviceId":"local"},
                     {"id":"assistant","role":"assistant","parts":[{"id":"text","kind":"text","text":"The development server is running. Open **Vite** in the browser tab to see your project.\n\nYour preview keeps the same address when the server restarts, and updates appear live as we edit."}],"createdAt":1788900001000_i64,"deviceId":"local","status":"complete"}
                 ])).unwrap() }).unwrap(); cx.notify(); });
+                if history_mode {
+                    for _ in 0..100 { if state.read_with(cx, |s, _| s.engine().is_some()) { break; } pause(cx,100).await; }
+                    state.update(cx, |s,cx| {
+                        s.apply_transcript_frame(zeron_doc::TranscriptFrame::Reset { reset: serde_json::from_value(serde_json::json!([
+                            {"id":"qa-links","role":"assistant","parts":[{"id":"text","kind":"text","text":format!("[Markdown report]({}/report.md)\n\n[HTML report]({}/index.html)\n\n[Outside checkout]({})", history_root.display(), history_root.display(), outside.display())}],"createdAt":1788900001000_i64,"deviceId":"local","status":"complete"}
+                        ])).unwrap() }).unwrap(); cx.notify();
+                    });
+                    window.update(cx, |shell,w,cx| shell.fixture_open_history(w,cx))?;
+                    std::fs::write(output.join("bcu-fixture.json"),serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"project":history_root,"settings":data}))?)?;
+                    futures::future::pending::<()>().await;
+                }
                 let (_, browser) = window.update(cx,|shell,w,cx|shell.fixture_open_browser(None,w,cx))?;
                 browser.update(cx,|browser,cx|browser.watch_previews(handle.clone(),"preview-fixture".into(),cx));
                 for _ in 0..100 { if browser.read_with(cx,|b,_|b.fixture_previews().services.len()==2) { break; } pause(cx,100).await; }

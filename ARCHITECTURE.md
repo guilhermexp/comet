@@ -202,7 +202,7 @@ feature spec `docs/research/feature-inventory.md` §1.
   toggle) as gpui popovers with `menu-in` scale/fade. `@` file completion uses the engine's
   checkout index; `@` and `/` menus span the pill, scroll internally, and keep keyboard selection
   visible. Double-click selects the complete field value.
-- **Right-side surfaces**: one tab host owns Trajectory preview, Terminal, Git diff, native Browser tabs, and file-preview
+- **Right-side surfaces**: one tab host owns Trajectory preview, Terminal, Git diff/history, native Browser tabs, and file-preview
   surfaces while a separate `Details / Files` column owns workspace metadata and
   the checkout tree. Both columns are available in Orchestrator and Workers;
   their normal responsive layout preserves a minimum conversation width. The

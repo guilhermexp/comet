@@ -101,7 +101,7 @@ redirects, WebSocket traffic, and a real WebRTC pair in both directions.
 organization authorization, stamped signaling, disconnect cleanup and binary
 traffic rejection. Local evidence and any unexecuted platform gates are recorded in the adoption change validation report.
 
-Build `cargo build -p zeron-ui --example preview-fixture --features browser-fixture`.
+Build `cargo build -p zeron --bin preview-fixture --features browser-fixture`.
 Run the fixture with an output directory, an available display and `VITE_BINARY`
 pointing to an installed `vite/bin/vite.js`. It starts real Vite/API processes in
 an isolated project, discovers them through daemon RPC and waits for a native

@@ -9,6 +9,14 @@ Tracks local/private fork changes against upstream.
 - Last synced upstream commit: `04b08ea2712e98ec0c4b7e302dc4985a79223b16`
 - Note: behavioral baseline through `v0.2.18`; fork ancestry was rewritten.
 
+## 2026-09-10 — Upstream P1–P9, com contratos do fork preservados
+
+- Integração seletiva da comparação até `a1adfde2` (v0.2.59): caches e renderer, composer/seleção/foco, recuperação causal, lifecycle ACP, Files remoto, previews de desenvolvimento, histórico Git e interações iOS.
+- Histórico usa ProcessRunner, busca persistente ao perder foco, grafo/pontas de branches e colunas configuráveis; conserva o contexto de Workers e do host remoto.
+- Files mantém nosso preview nativo e links absolutos fora do checkout. Browser HTTP/HMR é uma aba separada. Fixtures nativas usam o loop GPUI de produção e dados temporários.
+- OMP, Live Voice/steering, Workers, aparência e quebra de linha do Chat mantidos. Nenhum merge geral, bump de release ou publicação foi realizado.
+- Evidências desktop/engine/edge e o gate iOS pendente estão em `openspec/changes/adopt-discussed-upstream-improvements/validation.md`.
+
 ## 2026-09-03 — PR #7: Chat Trajectory Preview (commit `c99834d8`)
 
 - Integrated `feat/chat-trajectory-preview` (PR #7) to provide a local analytical and inspection surface for agent execution trajectories.

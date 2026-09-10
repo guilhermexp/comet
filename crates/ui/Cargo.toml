@@ -11,14 +11,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 [features]
 browser-fixture = []
 
-[[example]]
-name = "browser-fixture"
-required-features = ["browser-fixture"]
-
-[[example]]
-name = "preview-fixture"
-required-features = ["browser-fixture"]
-
 [dependencies]
 url.workspace = true
 

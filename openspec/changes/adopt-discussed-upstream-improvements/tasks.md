@@ -15,31 +15,37 @@
 ## 4. P2 desktop efficiency
 
 - [x] 4.1 Filter presentation-equivalent session/device heartbeat notifications while retaining fresh values; verify status/membership/error changes still notify.
-- [ ] 4.2 Reconcile the pinned wrapping patch with the reviewed zui renderer, adopt idle/wake/display registration and macOS allocator changes, and verify dependency licenses plus build/wrapping tests.
-- [ ] 4.3 Exercise idle/resume, resizing, blur/transparency, native previews, focus and input through BCU; record actual observations and measurement limits.
+- [x] 4.2 Reconcile the pinned wrapping patch with the reviewed zui renderer, adopt idle/wake/display registration and macOS allocator changes, and verify dependency licenses plus build/wrapping tests.
+- [x] 4.3 Exercise idle/resume, resizing, blur/transparency, native previews, focus and input through BCU; record actual observations and measurement limits.
 
 ## 5. P6 Files RPC
 
 - [x] 5.1 Adapt bounded directory listing/pagination and file read/watch RPCs, including checkout validation, old-peer compatibility and lifecycle cleanup; verify engine/proto/RPC tests.
-- [ ] 5.2 Connect the existing Files tree to incremental local/remote directory reconciliation, preserving expansion and scroll; verify state tests and BCU native preview/link opening.
+- [x] 5.2 Connect the existing Files tree to incremental local/remote directory reconciliation, preserving expansion and scroll; verify state tests and BCU native preview/link opening.
 
 ## 6. P7 development previews
 
 - [x] 6.1 Port discovery, stable local proxy URLs and live HTTP/WebSocket forwarding with upstream regression fixtures; verify preview crate and engine tests.
 - [x] 6.2 Port authenticated PreviewRoom pairing and cross-device transport with compatibility/error states; verify Rust and edge pairing/authorization tests.
-- [ ] 6.3 Integrate native browser tabs into the existing shell without changing document previews; verify navigation, resize, HTTP loading and HMR through BCU with local fixtures.
+- [x] 6.3 Integrate native browser tabs into the existing shell without changing document previews; verify navigation, resize, HTTP loading and HMR through BCU with local fixtures.
 
 ## 7. P8 Git history
 
-- [ ] 7.1 Adapt history search and branch-tip queries through ProcessRunner with paging/selection tests; run engine and UI focused checks.
-- [ ] 7.2 Add configurable persisted columns to the existing history panel; verify settings tests and native search/selection/column behavior.
+- [x] 7.1 Adapt history search and branch-tip queries through ProcessRunner with paging/selection tests; run engine and UI focused checks.
+- [x] 7.2 Add configurable persisted columns to the existing history panel; verify settings tests and native search/selection/column behavior.
 
 ## 8. P9 iOS
 
-- [ ] 8.1 Port reviewed streaming, scroll/keyboard and composer clearing changes while preserving peer sync constraints; verify Swift tests and Xcode build.
-- [ ] 8.2 Port local tool disclosure animation and long-message folding; verify Swift state tests and available simulator acceptance.
+- [x] 8.1 Port reviewed streaming, scroll/keyboard and composer clearing changes while preserving peer sync constraints; verify Swift parsing (native gates tracked in 8.3).
+- [x] 8.2 Port local tool disclosure animation, long-message folding and their Swift state tests.
+- [ ] 8.3 Execute XCTest, Xcode build and simulator acceptance for 8.1/8.2; blocked by absent Xcode/UIKit SDK.
 
 ## 9. Integration and closeout
 
-- [ ] 9.1 Run one final serialized workspace suite/build, edge checks and iOS gates; review fork-preservation invariants and record P1–P9 results with native/remote evidence distinguished.
-- [ ] 9.2 Update owning DOX, validate/sync/archive specs, commit the isolated branch and promote locally after reconciling concurrent main work; verify clean status and stop owned QA processes.
+- [x] 9.1 Run one final serialized workspace suite/build and edge checks; review fork-preservation invariants and record P1–P9 results with native/remote evidence distinguished. iOS execution remains tracked in 8.3.
+- [x] 9.2 Update owning DOX, validate/sync specs, commit the isolated branch and promote locally after reconciling concurrent main work; verify clean status and stop owned QA processes.
+- [ ] 9.3 Archive after the remaining iOS execution gate 8.3 passes.
+
+## Remaining environment acceptance
+
+P9 sources and Swift parser checks are complete; task 8.3 remains open because Xcode/XCTest/simulator are unavailable. The main specs are synchronized with implemented contracts, but this change remains unarchived until those gates can run. Native desktop QA does not claim real machine sleep/wake, physical remote-device networking or a measured FPS gain.

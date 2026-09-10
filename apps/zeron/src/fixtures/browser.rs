@@ -166,6 +166,7 @@ fn main() -> anyhow::Result<()> {
         typography::init(settings.ui_font_family.clone(), settings.ui_font_size, fonts, cx);
         theme_library::init(data.clone(), cx);
         appearance::init(appearance::AppearanceMode::Dark, settings.theme_selection, settings.accent, settings.surface, cx);
+        history::init(settings.git_history_columns, settings.git_history_column_widths, settings.git_history_column_order, settings.git_history_author_display, cx);
         composer::init(cx); terminal::panel::init(cx); app_menus::init(cx);
         let state = cx.new(|_| {
             let mut s = state::AppState::new();
@@ -200,13 +201,13 @@ fn main() -> anyhow::Result<()> {
                 });
                 let (first_id, first) = window.update(cx, |shell, w, cx| shell.fixture_open_browser(None, w, cx))?;
                 pause(cx, 500).await;
-                capture(&output, "browser-empty-dark")?;
                 // BCU owns every interaction in this mode; the fixture only
                 // provides the real Shell, native browser and loopback page.
                 if bcu {
                     std::fs::write(output.join("bcu-fixture.json"), serde_json::to_vec(&serde_json::json!({"origin": _origin, "pid": std::process::id()}))?)?;
                     futures::future::pending::<()>().await;
                 }
+                capture(&output, "browser-empty-dark")?;
                 #[cfg(target_os = "macos")]
                 {
                     window.update(cx, |_, w, cx| first.update(cx, |b, cx| b.navigate(&_origin, w, cx)))?;
