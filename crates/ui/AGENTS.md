@@ -12,6 +12,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Local Contracts
 
+- History tem aba própria no painel de utilitários: busca com debounce e geração, navegação/colapso no grafo, pontas de branches e colunas persistidas (visibilidade, largura, ordem e autor). Preservar âncora/seleção ao trocar visualização. Perder foco na busca não limpa o filtro: o clique deve selecionar a mesma linha que estava visível. Workers usam cwd local explícito; Chat remoto mantém targetDeviceId. Preferências são gravadas no store atual, nunca por cópia stale do Shell.
+
 - `browser/` é uma surface própria de páginas HTTP(S), com WebKit no macOS e abertura externa nos demais sistemas. Abas pertencem ao Chat, compartilham store efêmero só dentro do perfil e liberam páginas/subscriptions ao fechar. Browser não substitui `file_preview/`: documentos continuam no loader nativo existente. Browser usa proxy local apenas para hosts de preview registrados e conserva atalhos personalizados. Geometria da animação é avaliada uma vez por frame para o native clip acompanhar o painel.
 
 - Files de um Chat/Space registrado usa RPC no device dono e `DirectoryCache` para reconciliar só diretórios afetados, sem descartar expansão/scroll. Paginação tem ação Load more. Requests incluem ignored para preservar a política local de mostrar pastas operacionais, filtrando apenas hidden conforme preferência e saídas estruturais já negadas. Contextos locais de Workers e Chats sem Space mantêm seu scanner local. Trocar contexto cancela fetch/watch; versões antigas exibem estado de atualização necessária, sem fallback local para path remoto.

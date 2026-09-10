@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- GitHistoryPage inclui branchTips com default vazio e comparison opcional. SearchGitHistoryParams e ResolveGitAvatarsParams definem as novas requests aditivas; versões antigas podem continuar lendo páginas sem esses campos.
+
 - `preview.rs` define catálogo de serviços, porta estável e snapshot do browser. Metadados de descoberta não entram no documento Loro; pertencem ao catálogo de previews do device.
 
 - `WorkspaceTarget` ancora listagem, busca, leitura e watcher de Files em Chat/Space no device dono. Diretórios retornam cursor opaco; mudanças carregam sequência e `resyncRequired`. Estes contratos são aditivos e não alteram os links locais absolutos de Chat.

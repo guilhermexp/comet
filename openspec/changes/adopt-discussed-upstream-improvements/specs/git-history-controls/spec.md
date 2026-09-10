@@ -12,6 +12,11 @@ Test: unit + integration — ProcessRunner fixtures and history projection; none
 - **WHEN** a user searches history and selects a matching commit or branch tip
 - **THEN** the selected commit and graph correspond to that query and repository
 
+#### Scenario: Select a result after leaving the search input
+Test: unit — history search blur regression; none — BCU native click.
+- **WHEN** clicking a matching commit moves focus out of the search input
+- **THEN** the query and filtered rows remain stable and the clicked commit opens
+
 ### Requirement: Configurable history columns
 Git history SHALL allow users to choose visible columns and preserve that preference without changing commit identity or navigation.
 

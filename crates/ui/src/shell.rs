@@ -97,6 +97,23 @@ actions!(
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
 
+/// Restore a default focus only after an in-flight handoff has had a frame to
+/// claim the window. A synchronous focus-lost fallback can otherwise steal
+/// focus from controls that are mounting in response to the same input event.
+#[cfg(test)]
+pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
+    focus: FocusHandle,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    window.on_next_frame(move |window, cx| {
+        if window.focused(cx).is_none() {
+            window.focus(&focus, cx);
+        }
+    });
+    cx.notify();
+}
+
 #[derive(Clone, Copy)]
 enum ChatMenuPage {
     Root,
@@ -1565,7 +1582,7 @@ pub struct Shell {
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
     right_terminal: Option<Entity<TerminalPanel>>,
-    /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
+    /// The surface-tab strip's `+` menu (Terminal / Diffs / History rows).
     right_plus: popover::Popup<()>,
     /// Last surface the strip scrolled into view — reveals a newly selected
     /// chip exactly once, leaving manual scrolling alone.
@@ -3083,6 +3100,21 @@ impl Shell {
         self.register_diff_surface(changes, cx);
     }
 
+    /// The dedicated History surface. Keeping it as its own tab preserves its
+    /// graph/search state while Diff tabs retain their ordinary scope picker.
+    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
+        let from = self.eval_tween(self.right_tween, self.right_target(cx));
+        let key = self.panel_key(cx);
+        self.panels.show(&key);
+        let cwd = (self.sidebar_mode == SidebarMode::Workers)
+            .then(|| self.worker_panel_context(cx))
+            .flatten()
+            .map(|context| context.cwd);
+        let history = cx.new(|cx| Changes::for_history(self.state.clone(), cwd, cx));
+        self.register_diff_surface(history, cx);
+        self.finish_right_transition(from, cx);
+    }
+
     /// A History row click: the commit opens as its own pinned diff tab
     /// (user request).
     fn add_commit_diff_surface(
@@ -3090,7 +3122,11 @@ impl Shell {
         commit: zeron_proto::GitHistoryCommit,
         cx: &mut Context<Self>,
     ) {
-        let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
+        let cwd = (self.sidebar_mode == SidebarMode::Workers)
+            .then(|| self.worker_panel_context(cx))
+            .flatten()
+            .map(|context| context.cwd);
+        let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cwd, cx));
         self.register_diff_surface(changes, cx);
     }
 
@@ -8235,6 +8271,26 @@ impl Shell {
                     )
                     .child("Changes"),
             )
+            .child(
+                popover::menu_row(&theme, false, "utility-history")
+                    .id("utility-history-row")
+                    .role(gpui::Role::Button)
+                    .aria_label("Open Git history")
+                    .when(!git_detected, |el| el.opacity(0.35).cursor_default())
+                    .when(git_detected, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.utility_add_menu_open = false;
+                            this.add_history_surface(cx);
+                        }))
+                    })
+                    .child(
+                        icon(icons::GIT_BRANCH)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("History"),
+            )
             .into_any_element()
     }
 
@@ -8505,10 +8561,20 @@ impl Shell {
         for (ix, (surface, title)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let surface_icon: AnyElement = match surface {
-                RightSurface::Diff(_) => icon(icons::GIT_BRANCH)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
+                RightSurface::Diff(id) => icon(
+                    if self
+                        .diffs
+                        .get(&id)
+                        .is_some_and(|changes| changes.read(cx).is_history())
+                    {
+                        icons::GIT_BRANCH
+                    } else {
+                        icons::LIST
+                    },
+                )
+                .size(px(12.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
                 RightSurface::Terminal(_) => icon(icons::TERMINAL)
                     .size(px(12.0))
                     .text_color(theme.text_muted)
@@ -8719,7 +8785,7 @@ impl Shell {
             };
             strip = strip.child(wrapped);
         }
-        // The `+` — a small menu offering the two surfaces (t3 "Add panel
+        // The `+` — a small menu offering the available surfaces (t3 "Add panel
         // surface"); mirrors the picker cards.
         let plus_open = self.right_plus.get().is_some();
         let plus_fade = "right-surface-add-fade";
@@ -8773,6 +8839,8 @@ impl Shell {
                         .child(
                             popover::menu_row(&theme, false, "right-plus-browser")
                                 .id("right-plus-browser-row")
+                                .role(gpui::Role::Button)
+                                .aria_label("Open browser")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.add_browser_surface(None, window, cx);
                                     this.close_right_plus(cx);
@@ -8807,14 +8875,27 @@ impl Shell {
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
+                                        icon(icons::LIST)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(SharedString::from("Diffs")),
+                            )
+                            .child(
+                                popover::menu_row(&theme, false, "right-plus-history")
+                                    .id("right-plus-history-row")
+                                    .role(gpui::Role::Button)
+                                    .aria_label("Open Git history")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_history_surface(cx);
+                                        this.close_right_plus(cx);
+                                    }))
+                                    .child(
                                         icon(icons::GIT_BRANCH)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )
-                                    // "Git", not "Git diff" — the surface hosts
-                                    // history and per-commit views too (user
-                                    // request; matches the picker card).
-                                    .child(SharedString::from("Git")),
+                                    .child(SharedString::from("History")),
                             )
                         }),
                 )
@@ -11794,6 +11875,12 @@ impl Shell {
         }
         self.add_browser_surface(url, window, cx);
         (self.browser_seq, self.browsers[&self.browser_seq].clone())
+    }
+    pub fn fixture_open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if f32::from(window.viewport_size().width) < 1200.0 {
+            self.settings.sidebar_collapsed = true;
+        }
+        self.add_history_surface(cx);
     }
     pub fn fixture_select_browser(&mut self, id: u64, cx: &mut Context<Self>) {
         self.set_right_active(RightSurface::Browser(id), cx);

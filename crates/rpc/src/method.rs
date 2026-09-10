@@ -221,6 +221,8 @@ rpc_methods! {
     LIST_BRANCHES / ListBranches = "ListBranches" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_REFS / ListRefs = "ListRefs" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_GIT_HISTORY / ListGitHistory = "ListGitHistory" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SEARCH_GIT_HISTORY / SearchGitHistory = "SearchGitHistory" { params: zeron_proto::SearchGitHistoryParams, reply: zeron_proto::GitHistoryPage, forwardable: true },
+    RESOLVE_GIT_AVATARS / ResolveGitAvatars = "ResolveGitAvatars" { params: zeron_proto::ResolveGitAvatarsParams, reply: std::collections::HashMap<String, String>, forwardable: true },
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     FETCH_ALL / FetchAll = "FetchAll" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
     SWITCH_REF / SwitchRef = "SwitchRef" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },

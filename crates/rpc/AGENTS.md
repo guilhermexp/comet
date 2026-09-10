@@ -12,6 +12,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Local Contracts
 
+- SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.
+
 - `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
 
 - `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile` e `WatchWorkspaceFiles` são tipados e relay-forwardable; só o último é stream. Ownership e limites de filesystem são validados pela engine de destino.

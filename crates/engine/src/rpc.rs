@@ -51,6 +51,7 @@
 //! routed: `ListHarnesses`, `ListModels`, `QueueCommand`, and `WatchDocMessages`.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
@@ -2053,6 +2054,57 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&history)
             }
+            methods::SEARCH_GIT_HISTORY => {
+                let p: zeron_proto::SearchGitHistoryParams = parse_params(params)?;
+                if p.query.len() > 1024 {
+                    return Err(RpcError::Failed("History query is too long".into()));
+                }
+                let history = self
+                    .repos
+                    .search_history(std::path::Path::new(&p.cwd), &p.query, p.cursor, p.limit)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&history)
+            }
+            methods::RESOLVE_GIT_AVATARS => {
+                let p: zeron_proto::ResolveGitAvatarsParams = parse_params(params)?;
+                let authors: Vec<_> = p
+                    .authors
+                    .into_iter()
+                    .take(crate::repos::GIT_HISTORY_MAX_LIMIT)
+                    .filter(|author| author.sha.len() <= 64 && author.email.len() <= 512)
+                    .map(|author| (author.sha, author.email))
+                    .collect();
+                let avatar_paths = self
+                    .repos
+                    .history_avatar_urls(std::path::Path::new(&p.cwd), &authors, p.cursor, p.limit)
+                    .await;
+                let mut avatars = std::collections::HashMap::new();
+                let mut remaining = 512 * 1024_usize;
+                for (email, path) in avatar_paths {
+                    use tokio::io::AsyncReadExt;
+                    let Ok(file) = tokio::fs::File::open(path).await else {
+                        continue;
+                    };
+                    let mut bytes = Vec::new();
+                    if file
+                        .take(remaining as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .is_err()
+                        || bytes.is_empty()
+                        || bytes.len() > remaining
+                    {
+                        continue;
+                    }
+                    remaining -= bytes.len();
+                    avatars.insert(
+                        email,
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    );
+                }
+                RpcReply::value(&avatars)
+            }
             methods::FETCH_ALL => {
                 let p: RepoPathParams = parse_params(params)?;
                 self.repos
@@ -2589,6 +2641,8 @@ mod tests {
         assert!(is_forwardable(methods::QUEUE_COMMAND));
         assert!(is_forwardable(methods::QUEUE_WORKER_NOTIFICATION));
         assert!(is_forwardable(methods::SEARCH_FILES));
+        assert!(is_forwardable(methods::SEARCH_GIT_HISTORY));
+        assert!(is_forwardable(methods::RESOLVE_GIT_AVATARS));
         assert!(is_forwardable(methods::FETCH_ALL));
         assert!(is_forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_forwardable(methods::FETCH_TOOL_INPUT));

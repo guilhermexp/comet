@@ -44,7 +44,10 @@ use zeron_rpc::methods;
 
 use crate::comments::{self, CommentSide, DiffComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
+use crate::history::{
+    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton, GitHistorySearchControl,
+    GitHistoryViewButton,
+};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -730,7 +733,9 @@ pub enum DiffScope {
     Branch,
     /// Changes since the current chat's last turn started.
     LatestTurn,
-    /// Repository commit graph. Hosted here until the right pane becomes tabs.
+    /// Repository commit graph. History owns this scope in its own right-pane
+    /// surface tab; it remains a `Changes` variant so commit rows can open
+    /// their corresponding diff tabs through the existing event path.
     History,
     /// One commit's own changes (parent vs commit) — the per-commit tab a
     /// History row click opens. Never listed in the scope menu
@@ -739,12 +744,9 @@ pub enum DiffScope {
 }
 
 impl DiffScope {
-    pub const ALL: [DiffScope; 4] = [
-        Self::WorkingTree,
-        Self::Branch,
-        Self::LatestTurn,
-        Self::History,
-    ];
+    /// Scopes available from a Diff tab. History is selected from the surface
+    /// picker instead, so it can keep its own tab and toolbar state.
+    pub const ALL: [DiffScope; 3] = [Self::WorkingTree, Self::Branch, Self::LatestTurn];
     pub const WORKERS: [DiffScope; 2] = [Self::WorkingTree, Self::Branch];
 
     pub fn label(self) -> &'static str {
@@ -1453,7 +1455,9 @@ pub struct Changes {
     comment_key: u64,
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
+    history_search_control: Option<Entity<GitHistorySearchControl>>,
     history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
+    history_view_button: Option<Entity<GitHistoryViewButton>>,
     history_events: Option<Subscription>,
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
     /// the fetch and the surface-tab title).
@@ -1509,7 +1513,9 @@ impl Changes {
             comment_key: 0,
             history: None,
             history_count: None,
+            history_search_control: None,
             history_fetch_button: None,
+            history_view_button: None,
             history_events: None,
             commit: None,
             _observe: observe,
@@ -1527,12 +1533,31 @@ impl Changes {
     pub fn for_commit(
         state: Entity<AppState>,
         commit: GitHistoryCommit,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut changes = Self::new(state, cx);
+        changes.explicit_cwd = cwd;
         changes.scope = DiffScope::Commit;
         changes.commit = Some(commit);
         changes
+    }
+
+    /// A dedicated History surface. It shares the commit-opening event path
+    /// with diffs, but is never offered as an item in a Diff tab's scope menu.
+    pub fn for_history(
+        state: Entity<AppState>,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.explicit_cwd = cwd;
+        changes.scope = DiffScope::History;
+        changes
+    }
+
+    pub fn is_history(&self) -> bool {
+        self.scope == DiffScope::History
     }
 
     /// The surface-tab title (contextual, user request): the pinned commit's
@@ -1905,7 +1930,10 @@ impl Changes {
         if let Some(history) = &self.history {
             return history.clone();
         }
-        let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
+        let history = cx.new(|cx| match &self.explicit_cwd {
+            Some(cwd) => GitHistory::for_cwd(self.state.clone(), cwd.clone(), cx),
+            None => GitHistory::new(self.state.clone(), cx),
+        });
         self.history_events =
             Some(
                 cx.subscribe(&history, |this: &mut Self, _, event, cx| match event {
@@ -1950,6 +1978,29 @@ impl Changes {
         let history = self.history_pane(cx);
         let button = cx.new(|cx| GitHistoryFetchButton::new(history, cx));
         self.history_fetch_button = Some(button.clone());
+        button
+    }
+
+    fn history_search_control(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<GitHistorySearchControl> {
+        if let Some(control) = &self.history_search_control {
+            return control.clone();
+        }
+        let history = self.history_pane(cx);
+        let control = cx.new(|cx| GitHistorySearchControl::new(history, cx));
+        self.history_search_control = Some(control.clone());
+        control
+    }
+
+    fn history_view_button(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryViewButton> {
+        if let Some(button) = &self.history_view_button {
+            return button.clone();
+        }
+        let history = self.history_pane(cx);
+        let button = cx.new(|cx| GitHistoryViewButton::new(history, cx));
+        self.history_view_button = Some(button.clone());
         button
     }
 
@@ -3307,10 +3358,21 @@ impl Changes {
                 .into_any_element();
         }
         let scope = self.scope;
+        let history_branch = (scope == DiffScope::History).then(|| {
+            self.state
+                .read(cx)
+                .selected_chat_row()
+                .and_then(|chat| chat.branch.clone())
+                .unwrap_or_else(|| "HEAD".to_string())
+        });
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
+        let history_search_control =
+            (scope == DiffScope::History).then(|| self.history_search_control(cx));
         let history_fetch_button =
             (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
-        let trigger = div()
+        let history_view_button =
+            (scope == DiffScope::History).then(|| self.history_view_button(cx));
+        let scope_trigger = div()
             .id("changes-scope-trigger")
             .h(px(24.0))
             .px(px(8.0))
@@ -3347,6 +3409,7 @@ impl Changes {
             .child(
                 div()
                     .text_size(px(12.0))
+                    .line_height(px(14.0))
                     .text_color(theme.text)
                     .child(SharedString::from(scope.label())),
             )
@@ -3355,17 +3418,36 @@ impl Changes {
                     .size(px(12.0))
                     .text_color(theme.text_muted.opacity(0.7)),
             );
-        let trigger = if self.scope_menu.get().is_some() {
+        let trigger = if scope == DiffScope::History {
+            // The tab already identifies this as History; use the fixed title
+            // slot for the current branch instead of repeating the surface name.
+            div()
+                .id("history-surface-title")
+                .h(px(24.0))
+                .px(px(8.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .line_height(px(14.0))
+                .text_color(theme.text_dim)
+                .child(SharedString::from(history_branch.unwrap_or_default()))
+                .into_any_element()
+        } else if self.scope_menu.get().is_some() {
             let closing = self.scope_menu.closing_since();
             let menu = self.render_scope_menu(&theme, cx);
-            trigger.relative().child(popover::anchored_menu_below_gap(
-                "changes-scope-menu",
-                menu,
-                closing,
-                10.0,
-            ))
+            scope_trigger
+                .relative()
+                .child(popover::anchored_menu_below_gap(
+                    "changes-scope-menu",
+                    menu,
+                    closing,
+                    10.0,
+                ))
+                .into_any_element()
         } else {
-            trigger
+            scope_trigger.into_any_element()
         };
 
         let trailing: AnyElement = if scope == DiffScope::History {
@@ -3374,7 +3456,9 @@ impl Changes {
                 .flex()
                 .items_center()
                 .gap(px(2.0))
+                .children(history_search_control)
                 .children(history_fetch_button)
+                .children(history_view_button)
                 .child(
                     Self::header_button("history-refresh", crate::icons::REFRESH, &theme).on_click(
                         cx.listener(|this, _, _, cx| {
@@ -3410,7 +3494,15 @@ impl Changes {
             .gap(px(6.0))
             .child(trigger)
             .when_some(history_count, |element, count| {
-                element.child(div().flex_1().min_w_0().h_full().child(count))
+                element.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .child(count),
+                )
             })
             .children(self.render_ref_selector(&theme, cx))
             .when(scope != DiffScope::History, |element| {
@@ -5408,6 +5500,19 @@ rename to new_name.rs
         assert_eq!(DiffScope::Branch.mode(), "branch");
         assert_eq!(DiffScope::LatestTurn.mode(), "turn");
         assert_eq!(DiffScope::default(), DiffScope::WorkingTree);
+    }
+
+    #[test]
+    fn diff_scope_menu_keeps_history_as_a_separate_surface() {
+        assert_eq!(
+            DiffScope::ALL,
+            [
+                DiffScope::WorkingTree,
+                DiffScope::Branch,
+                DiffScope::LatestTurn,
+            ]
+        );
+        assert!(!DiffScope::ALL.contains(&DiffScope::History));
     }
 
     #[test]
