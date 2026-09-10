@@ -17,6 +17,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - **Modo headless**: só engine; imprime URL de sign-in no TTY (fluxo de paste-code), serve IPC em localhost e hospeda o próprio DeviceRoom.
 - Subcomandos vivem em arquivos separados (`auth_cli.rs`, `update_cli.rs`, `daemon.rs`) — `main.rs` só despacha.
 - O allocator customizado do binário é mimalloc v2 apenas no macOS; Linux e demais plataformas mantêm o allocator de sistema.
+- No iOS, `NativeTranscriptTable` preserva identidade/posição de células e aplica keyboard inset com a animação nativa. `SessionStore.lastSubmittedMessageId` distingue envio local de entradas remotas; folding de mensagem vive no store quente. `ComposerEditorController` confirma IME antes do envio e aplica o draft resultante imediatamente. Disclosure de tools é local à célula, sem reconfigurar todo o transcript.
 - `apps/ios` não entra no `cargo build`; build e teste são pelo Xcode.
 
 ## Work Guidance
@@ -30,6 +31,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `zeron/src/**` (wiring, dispatch) | none — casca fina; o comportamento é testado nas crates | `cargo build -p zeron` |
+| `ios/ZeronTests/{TranscriptFollow,TranscriptLayout,TranscriptPresentation,ComposerEditor}Tests.swift` e `ios/ZeronUITests/MobilePolishTests.swift` | unit / integration / e2e — UIKit real; exige Xcode + simulador | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` |
 | Fluxo headed/headless real | e2e | `scripts/e2e-smoke.sh` · `scripts/dev-demo.sh` |
 | `ios/**` (`apps/ios/ZeronTests/`) | unit / integration (XCTest: tracking de PRs/checkout, RPC/stream de device relay, gates de versão/resiliência de rede, wire layout de chat frames, merge/conformance de registry e persistência/HLC de RegistryDoc) | `xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` ou Product → Test no Xcode |
 

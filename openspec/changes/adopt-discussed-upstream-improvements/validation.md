@@ -25,3 +25,9 @@ Source selection: discussed upstream a1adfde2. Local base b2e41d4c. P1/P3 eviden
 - Adopted reviewed zui 07fd941a and macOS-only mimalloc v2. Verified both punctuation fixes and their upstream tests remain in line_wrapper/line_layout. Resolved metadata contains no GPL tracing dependency; zui's unrelated GPL path crate is not in the dependency graph (`/tmp/comet-upstream-p2-metadata.json`).
 - GREEN: all 1236 UI unit tests passed against zui (`/tmp/comet-upstream-p2-zui-ui.log`). This includes existing Chat wrapping, links, selection, theme and Workers regressions.
 - Native frame recovery test must run from the dependency workspace: Cargo correctly rejects testing an external dependency's dev target from this workspace (`/tmp/comet-upstream-p2-frame-recovery.log`). Native app build, BCU idle/resize/preview/focus and renderer recovery acceptance remain open. No CPU or FPS improvement is claimed from upstream benchmarks.
+
+## P9 — iOS source port (Xcode validation pending)
+
+- Three-way adaptation of e182a006, c2c5d5ec, 34c9c29a and f9fbca6e applied cleanly against the fork. Added the upstream UIKit transcript table/composer and test suites without importing unrelated harness catalog, sync schema or desktop styling changes. Kept the local Theme bubble radius and production signing settings.
+- `swiftc -frontend -parse -enable-bare-slash-regex` passed for all 59 Swift sources (`/tmp/comet-upstream-p9-swift-parse.log`); `plutil -lint` passed for project.pbxproj. Parsing is not Swift type checking, XCTest, a build, or simulator proof.
+- Xcode is absent from /Applications and the selected developer directory is CommandLineTools; `xcodebuild -version` reports that Xcode is required. Build, unit/integration and simulator acceptance in tasks 8.1/8.2 remain pending; no signing, deployment or TestFlight was attempted.
