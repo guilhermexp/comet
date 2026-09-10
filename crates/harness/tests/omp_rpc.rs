@@ -1572,7 +1572,7 @@ async fn remote_ui_cancel_does_not_block_following_events() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::InputResolved { request_id } if request_id == "question-pending"
+        AgentEvent::InputResolved { request_id, .. } if request_id == "question-pending"
     )));
 }
 
@@ -1590,7 +1590,7 @@ async fn interactive_timeout_cancels_the_host_question_and_resumes_omp() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::InputResolved { request_id } if request_id == "question-timeout"
+        AgentEvent::InputResolved { request_id, .. } if request_id == "question-timeout"
     )));
 }
 

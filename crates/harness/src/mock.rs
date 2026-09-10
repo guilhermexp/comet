@@ -11,6 +11,9 @@ use zeron_proto::{
 
 use crate::{Harness, HarnessError, RunControls};
 
+#[path = "mock_elements.rs"]
+mod elements;
+
 pub struct MockHarness {
     pub script: Vec<AgentEvent>,
 }
@@ -347,38 +350,43 @@ impl Harness for MockHarness {
                     AgentEvent::TextDelta {
                         text: "\n### Subagent check\n\nFanning out two scouts before the fold rewrite.\n\n".into(),
                     },
+                    AgentEvent::ToolCall {
+                        id: "mock-task".into(),
+                        call: zeron_proto::ToolCall::Unknown { name: "task".into(), input: None },
+                    },
+                    resolve("mock-task"),
                     spawn(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         "Audit the fold path",
                         "Read crates/doc and list every call site of fold_event_into_parts, checking each holds the byte cap.",
                     ),
                     spawn(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         "Verify the commit cadence",
                         "Measure the 120ms coalesced commit cadence under a scripted delta burst.",
                     ),
                     // The spawn prompts seed each subagent's opening user
                     // entry (like the claude driver's Task-prompt seeding).
                     tag(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         AgentEvent::UserMessage {
                             text: "Read crates/doc and list every call site of fold_event_into_parts, checking each holds the byte cap.".into(),
                         },
                     ),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::UserMessage {
                             text: "Measure the 120ms coalesced commit cadence under a scripted delta burst.".into(),
                         },
                     ),
                     tag(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         AgentEvent::TextDelta {
                             text: "Scanning `crates/doc` for fold call sites.\n\n".into(),
                         },
                     ),
                     tag(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         AgentEvent::ToolCall {
                             id: "sub1-grep".into(),
                             call: zeron_proto::ToolCall::Exec {
@@ -386,41 +394,41 @@ impl Harness for MockHarness {
                             },
                         },
                     ),
-                    tag("mock-sub-1", resolve("sub1-grep")),
+                    tag("mock-task--sub-1", resolve("sub1-grep")),
                     tag(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         AgentEvent::TextDelta {
                             text: "Three call sites: the live fold, the rebuild, and the subagent sink — every one applies the byte cap before persisting.".into(),
                         },
                     ),
-                    resolve("mock-sub-1"),
-                    tag("mock-sub-1", done.clone()),
+                    resolve("mock-task--sub-1"),
+                    tag("mock-task--sub-1", done.clone()),
                     // A steer AFTER the subagent settled (claude's queued
                     // SendMessage shape): resurrects the chip and reopens
                     // the frozen transcript for the resumed segment.
                     tag(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         AgentEvent::UserMessage {
                             text: "One more: confirm the rebuild path holds the byte cap too."
                                 .into(),
                         },
                     ),
                     tag(
-                        "mock-sub-1",
+                        "mock-task--sub-1",
                         AgentEvent::TextDelta {
                             text: "Rebuild path checked — same cap, applied before persisting."
                                 .into(),
                         },
                     ),
-                    tag("mock-sub-1", done.clone()),
+                    tag("mock-task--sub-1", done.clone()),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::TextDelta {
                             text: "Driving a 2k-delta burst through the writer.\n\n".into(),
                         },
                     ),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::ToolCall {
                             id: "sub2-burst".into(),
                             call: zeron_proto::ToolCall::Exec {
@@ -428,10 +436,10 @@ impl Harness for MockHarness {
                             },
                         },
                     ),
-                    resolve("mock-sub-2"),
-                    tag("mock-sub-2", resolve("sub2-burst")),
+                    resolve("mock-task--sub-2"),
+                    tag("mock-task--sub-2", resolve("sub2-burst")),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::TextDelta {
                             text: "Commits land on the 120ms cadence; no commit carried more than one burst.".into(),
                         },
@@ -440,19 +448,19 @@ impl Harness for MockHarness {
                     // user entry + fresh assistant segment (like the claude
                     // driver's tagged user text blocks).
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::UserMessage {
                             text: "Also verify the cadence holds while a steer lands mid-burst.".into(),
                         },
                     ),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::TextDelta {
                             text: "Re-running with a mid-burst steer injected.\n\n".into(),
                         },
                     ),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::ToolCall {
                             id: "sub2-steer-burst".into(),
                             call: zeron_proto::ToolCall::Exec {
@@ -461,25 +469,25 @@ impl Harness for MockHarness {
                             },
                         },
                     ),
-                    tag("mock-sub-2", resolve("sub2-steer-burst")),
+                    tag("mock-task--sub-2", resolve("sub2-steer-burst")),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::TextDelta {
                             text: "Watching the commit log while the burst drains: ".into(),
                         },
                     ),
-                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 1 clean, ".into() }),
-                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 2 clean, ".into() }),
-                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 3 clean, ".into() }),
-                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 4 clean, ".into() }),
-                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 5 clean — ".into() }),
+                    tag("mock-task--sub-2", AgentEvent::TextDelta { text: "batch 1 clean, ".into() }),
+                    tag("mock-task--sub-2", AgentEvent::TextDelta { text: "batch 2 clean, ".into() }),
+                    tag("mock-task--sub-2", AgentEvent::TextDelta { text: "batch 3 clean, ".into() }),
+                    tag("mock-task--sub-2", AgentEvent::TextDelta { text: "batch 4 clean, ".into() }),
+                    tag("mock-task--sub-2", AgentEvent::TextDelta { text: "batch 5 clean — ".into() }),
                     tag(
-                        "mock-sub-2",
+                        "mock-task--sub-2",
                         AgentEvent::TextDelta {
                             text: "every window under 120ms.\n\nSteer landed between commits; the cadence held.".into(),
                         },
                     ),
-                    tag("mock-sub-2", done),
+                    tag("mock-task--sub-2", done),
                 ]
             })
             .into_iter()
@@ -507,11 +515,18 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Opt-in offline fixture for the full native tool-component review.
+        let element_events = std::env::var("ZERON_MOCK_ELEMENTS")
+            .ok()
+            .filter(|value| value == "1")
+            .map(|_| elements::script())
+            .unwrap_or_default();
         let events: Vec<Result<AgentEvent, HarnessError>> = body
             .iter()
             .cycle()
             .take(body.len() * repeat)
             .cloned()
+            .chain(element_events)
             .chain(code_tool_events)
             .chain(subagent_events)
             .chain(code_event)

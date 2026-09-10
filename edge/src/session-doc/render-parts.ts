@@ -6,9 +6,9 @@
  *
  * Keep: tool tag, id, status, and the rendered display data — Exec `command`,
  * Read/Write/Edit/ApplyPatch `path`(s), Search/Glob patterns, WebFetch `url`,
- * WebSearch `query`, Todo items (plan text), Mcp `server`/`tool`.
+ * WebSearch `query`, Todo items (plan text), Mcp `server`/`tool`, Skill identifiers.
  * Drop: non-rendered args — WriteFile `content`, EditFile `oldString`/
- * `newString`, WebFetch `prompt`, Mcp/Unknown `input`.
+ * `newString`, WebFetch `prompt`, Mcp/Unknown `input` except Skill identifier keys.
  *
  * This generalizes two existing precedents: tool *outputs* are already
  * discarded at the event layer (harness ToolResult carries only `isError`),
@@ -40,7 +40,7 @@ export type RenderToolCall =
       readonly items: ReadonlyArray<{ readonly text: string; readonly done: boolean }>;
     }
   | { readonly _tag: "Mcp"; readonly server?: string; readonly tool: string }
-  | { readonly _tag: "Unknown"; readonly name: string };
+  | { readonly _tag: "Unknown"; readonly name: string; readonly input?: Readonly<Record<string, string>> };
 
 /** A message part as stored in the session doc: identical to the app-layer
  * {@link MessagePart} except tool calls are render-only. */
@@ -109,8 +109,18 @@ export const sanitizeToolCall = (call: ToolCall | RenderToolCall): RenderToolCal
       const { server, tool } = call as { server?: string; tool: string };
       return server === undefined ? { _tag: "Mcp", tool } : { _tag: "Mcp", server, tool };
     }
-    case "Unknown":
-      return { _tag: "Unknown", name: (call as { name: string }).name };
+    case "Unknown": {
+      const { name, input } = call;
+      if (name.toLowerCase() === "skill" && input && typeof input === "object") {
+        const identifiers: Record<string, string> = {};
+        for (const key of ["skill", "path", "name"]) {
+          const value = (input as Record<string, unknown>)[key];
+          if (typeof value === "string" && value.trim()) identifiers[key] = value.trim();
+        }
+        if (Object.keys(identifiers).length) return { _tag: "Unknown", name, input: identifiers };
+      }
+      return { _tag: "Unknown", name };
+    }
     default:
       // Future tool tag this build doesn't know: keep it verbatim rather than
       // lose the call. Size discipline for new tags belongs to the harness

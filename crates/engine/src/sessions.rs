@@ -508,6 +508,33 @@ impl SessionsEngine {
         })
     }
 
+    /// Probe the installed OMP without a Chat. Draft Live uses this so the
+    /// composer never synthesizes availability — the ready frame is the gate.
+    pub async fn probe_live_voice_at_cwd(
+        &self,
+        cwd: &str,
+    ) -> Result<LiveVoiceAvailability, EngineError> {
+        let cwd = expand_home(cwd.trim());
+        if cwd.is_empty() {
+            return Err(EngineError::Other(
+                "Live Voice requires a working directory".into(),
+            ));
+        }
+        if self.inner.live_voice.is_active() {
+            return Ok(LiveVoiceAvailability {
+                available: false,
+                reason: Some(LiveVoiceUnavailableReason::AnotherLiveCall),
+            });
+        }
+        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
+        let support = harness.probe_live_voice(std::path::Path::new(&cwd)).await?;
+        let gap = support.gap(false);
+        Ok(LiveVoiceAvailability {
+            available: gap.is_none(),
+            reason: gap,
+        })
+    }
+
     pub async fn start_live_voice(&self, chat_id: &str) -> Result<(), EngineError> {
         let (reason, cwd) = self.live_voice_precondition(chat_id)?;
         if let Some(reason) = reason {
@@ -1271,10 +1298,11 @@ impl SessionsEngine {
         let Some(pending_input) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = pending_input.resolver.send(answers);
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
+            answers: Some(answers.clone()),
         });
+        let _ = pending_input.resolver.send(answers);
         Ok(true)
     }
 
@@ -2947,7 +2975,11 @@ async fn drive_run(
         // `extension_ui_request.cancel` and timeout). Translate that runtime
         // question id back to the engine-owned request id, remove the parked
         // resolver, and let the normal InputResolved fold close the UI chip.
-        if let AgentEvent::InputResolved { request_id } = &event {
+        if let AgentEvent::InputResolved {
+            request_id,
+            answers,
+        } = &event
+        {
             let pending = lock(&inner.runs)
                 .get(&chat_id)
                 .map(|handle| handle.pending_inputs.clone());
@@ -2955,7 +2987,10 @@ async fn drive_run(
                 .as_ref()
                 .and_then(|pending| resolve_pending_question(pending, request_id))
             {
-                event = AgentEvent::InputResolved { request_id };
+                event = AgentEvent::InputResolved {
+                    request_id,
+                    answers: answers.clone(),
+                };
             }
         }
         // The engine's input bridge is the sole authority on input requests:

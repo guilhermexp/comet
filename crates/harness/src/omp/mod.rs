@@ -965,6 +965,7 @@ async fn run_session(
                     if resolution.cancel_host_input {
                         let _ = emit(&event_tx, AgentEvent::InputResolved {
                             request_id: resolution.id.clone(),
+                            answers: None,
                         }).await;
                     }
                     if let Err(error) = process.send_control(resolution.response) {
@@ -1142,6 +1143,7 @@ async fn run_session(
                                 token.cancel();
                                 let _ = emit(&event_tx, AgentEvent::InputResolved {
                                     request_id: target_id.to_owned(),
+                            answers: None,
                                 }).await;
                             }
                         } else if matches!(method, "select" | "confirm" | "input" | "editor") {
@@ -1153,6 +1155,7 @@ async fn run_session(
                                         let _ = process.send_control(cancelled_interactive_response(&id, false));
                                         let _ = emit(&event_tx, AgentEvent::InputResolved {
                                             request_id: id.clone(),
+                            answers: None,
                                         }).await;
                                         let _ = emit(&event_tx, AgentEvent::Error { message }).await;
                                     } else if pending_interactive.len() >= MAX_PENDING_INTERACTIVE_REQUESTS {

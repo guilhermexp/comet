@@ -9,10 +9,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DAEMON_DIR=/tmp/zeron-demo-daemon
-UI_DIR=/tmp/zeron-demo-ui
-WORKERS_DIR=/tmp/zeron-demo-workers
-IPC=27921
+# Sessões concorrentes no mesmo checkout precisam de porta e dirs próprios,
+# senão o daemon novo perde o bind e o seed vai parar no daemon alheio.
+TAG=${ZERON_DEMO_TAG:-}
+DAEMON_DIR=/tmp/zeron-demo-daemon$TAG
+UI_DIR=/tmp/zeron-demo-ui$TAG
+WORKERS_DIR=/tmp/zeron-demo-workers$TAG
+IPC=${ZERON_DEMO_IPC:-27921}
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 

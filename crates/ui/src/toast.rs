@@ -198,6 +198,11 @@ impl Toast {
     }
 }
 
+/// Shared with the composer pill / ContextUsageTooltip: thinned glass fill.
+pub(crate) fn toast_card_background(theme: &Theme) -> gpui::Hsla {
+    theme.composer_glass_bg()
+}
+
 /// Render a single toast card matching Orchestrator.dev's styling.
 pub fn render_toast_card<S: 'static>(
     toast: &Toast,
@@ -209,13 +214,6 @@ pub fn render_toast_card<S: 'static>(
     let toast_id = toast.id;
     let is_progress = matches!(toast.kind, ToastKind::UpdatingProgress { .. });
 
-    let border_color = match toast.kind {
-        ToastKind::Error => theme.danger.opacity(0.7),
-        ToastKind::Warning => theme.warning.opacity(0.7),
-        ToastKind::Success => theme.success.opacity(0.6),
-        _ => theme.border.opacity(0.85),
-    };
-
     let leading_icon = match toast.kind {
         ToastKind::Error => Some((icons::CLOSE_CIRCLE, theme.danger)),
         ToastKind::Warning => Some((icons::INFO_CIRCLE, theme.warning)),
@@ -223,15 +221,18 @@ pub fn render_toast_card<S: 'static>(
         _ => None,
     };
 
+    // Same plate as ContextUsageTooltip: frost 10/16, 10px radius, shared
+    // composer glass fill and hairline. Semantic tone lives on the icon,
+    // not on a tinted border — the green success edge read as an alert.
     let mut card = div()
         .id(("toast-item", toast.id))
         .w(px(320.0))
         .p(px(14.0))
         .rounded(px(10.0))
         .border_1()
-        .border_color(border_color)
-        .bg(theme.surface_overlay)
-        .shadow_md()
+        .border_color(theme.border)
+        .bg(toast_card_background(theme))
+        .when(!theme.is_frost(), |el| el.shadow_md())
         .flex()
         .flex_col()
         .gap(px(6.0));
@@ -240,7 +241,16 @@ pub fn render_toast_card<S: 'static>(
     let mut header = div().flex().items_start().justify_between().gap(px(8.0));
 
     let mut title_content = div().flex().items_center().gap(px(6.0));
-    if let Some((ico, color)) = leading_icon {
+    if is_progress {
+        title_content =
+            title_content.child(div().flex_none().child(crate::loaders::mini_mono_spinner(
+                format!("toast-progress-{}", toast.id),
+                2.0,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            )));
+    } else if let Some((ico, color)) = leading_icon {
         title_content =
             title_content.child(crate::icons::icon(ico).size(px(13.0)).text_color(color));
     }
@@ -341,7 +351,7 @@ pub fn render_toast_card<S: 'static>(
         card = card.child(actions);
     }
 
-    card.into_any_element()
+    crate::frost::frosted(10.0, 16.0, card).into_any_element()
 }
 
 /// Render the bottom-right toast container holding all active toasts.
@@ -414,5 +424,12 @@ mod tests {
         );
         assert_eq!(complete_with_failures.kind, ToastKind::Warning);
         assert!(complete_with_failures.primary_action.is_some());
+    }
+
+    #[test]
+    fn toast_card_matches_the_context_tooltip_glass() {
+        for theme in [Theme::dark(), Theme::light()] {
+            assert_eq!(toast_card_background(&theme), theme.composer_glass_bg());
+        }
     }
 }

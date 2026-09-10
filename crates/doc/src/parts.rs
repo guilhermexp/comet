@@ -345,6 +345,8 @@ pub enum MessagePart {
         id: String,
         request_id: String,
         questions: Vec<UserInputQuestion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<zeron_proto::UserInputAnswer>>,
         #[serde(default)]
         resolved: bool,
     },
@@ -400,9 +402,9 @@ impl MessagePart {
                         .as_ref()
                         .map_or(0, |p| serde_json::to_vec(p).map_or(0, |v| v.len()))
             }
-            MessagePart::Input { questions, .. } => {
-                serde_json::to_vec(questions).map_or(0, |v| v.len())
-            }
+            MessagePart::Input {
+                questions, answers, ..
+            } => serde_json::to_vec(&(questions, answers)).map_or(0, |v| v.len()),
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::WorkflowTask { task, .. } => {
                 serde_json::to_vec(task).map_or(0, |value| value.len())
@@ -711,20 +713,28 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     id,
                     request_id: request_id.clone(),
                     questions: questions.clone(),
+                    answers: None,
                     resolved: false,
                 });
             }
         }
-        AgentEvent::InputResolved { request_id } => {
+        AgentEvent::InputResolved {
+            request_id,
+            answers,
+        } => {
             for p in out.iter_mut() {
                 if let MessagePart::Input {
                     request_id: rid,
+                    answers: stored_answers,
                     resolved,
                     ..
                 } = p
                     && rid == request_id
                 {
                     *resolved = true;
+                    if answers.is_some() {
+                        stored_answers.clone_from(answers);
+                    }
                 }
             }
         }
@@ -883,7 +893,7 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 ///
 /// Keeps: command / path / pattern / url / query / todo items / server+tool names,
 /// a subagent spawn's model/type (see [`spawn_badge`]), and a handful of short
-/// chip identifiers for OMP `hub` / `eval` / Workers MCP (see [`chip_badge`]).
+/// chip identifiers for OMP `hub` / `eval` / Skill / Workers MCP (see [`chip_badge`]).
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, code,
 /// prompts, message bodies, and any other Unknown/Mcp input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
@@ -916,6 +926,7 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
 }
 
 const HUB_INPUT_KEEP: [&str; 5] = ["op", "name", "to", "from", "application"];
+const SKILL_INPUT_KEEP: [&str; 3] = ["skill", "path", "name"];
 const EVAL_INPUT_KEEP: [&str; 2] = ["language", "title"];
 const WORKERS_INPUT_KEEP: [&str; 5] = ["action", "session_id", "project_id", "name", "project"];
 
@@ -939,6 +950,7 @@ fn chip_badge(call: &ToolCall) -> Option<serde_json::Value> {
     let keys: &[&str] = match kind {
         "hub" => &HUB_INPUT_KEEP,
         "eval" => &EVAL_INPUT_KEEP,
+        kind if kind.eq_ignore_ascii_case("skill") => &SKILL_INPUT_KEEP,
         "workers" => &WORKERS_INPUT_KEEP,
         _ => return None,
     };
@@ -1085,6 +1097,24 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_answers_survive_fold_and_serde() {
+        let requested: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "inputRequested", "requestId": "r",
+            "questions": [{"id":"q", "header":"Choice", "question":"Pick one", "options":["A"]}]
+        }))
+        .unwrap();
+        let resolution: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type":"inputResolved", "requestId":"r", "answers":[{"questionId":"q", "labels":["A"]}]
+        }))
+        .unwrap();
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &requested);
+        fold_event_into_parts(&mut parts, &resolution);
+        let value = serde_json::to_value(&parts[0]).unwrap();
+        assert_eq!(value["answers"][0]["labels"][0], "A");
+    }
+
     use super::*;
     use zeron_proto::{
         WorkflowProgressNode, WorkflowTaskStatus, WorkflowTaskUpdate, WorkflowUsage,
@@ -1612,6 +1642,30 @@ mod tests {
             }
         );
         assert_eq!(clean.subagent_model(), None);
+    }
+
+    #[test]
+    fn sanitize_keeps_only_skill_identifiers() {
+        for name in ["Skill", "skill"] {
+            let call = ToolCall::Unknown {
+                name: name.into(),
+                input: Some(serde_json::json!({
+                    "skill": " implement ", "path": "brainstorming", "name": "review",
+                    "args": "private arguments", "prompt": "private prompt", "content": "private content"
+                })),
+            };
+            let clean = sanitize_tool_call(&call);
+            assert_eq!(
+                clean,
+                ToolCall::Unknown {
+                    name: name.into(),
+                    input: Some(serde_json::json!({
+                        "skill": "implement", "path": "brainstorming", "name": "review"
+                    }))
+                }
+            );
+            assert_eq!(sanitize_tool_call(&clean), clean);
+        }
     }
 
     #[test]

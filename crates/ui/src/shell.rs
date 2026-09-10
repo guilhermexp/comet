@@ -7962,6 +7962,10 @@ impl Shell {
     fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
+        let view = cx.entity_id();
+        let working = self.transcript.update(cx, |transcript, cx| {
+            transcript.render_working_trailer(view, false, cx)
+        });
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
@@ -7975,35 +7979,20 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(Theme::SPACE_SM))
-            .px(px(Theme::SPACE_LG + 8.0))
+            .px(px(Theme::SPACE_LG))
             .text_size(px(11.0));
 
         let Some(chat_id) = state.selected_chat.clone() else {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
-        // Timer base: the freshest of the session row's turn start and the
-        // in-flight send. During the send→ack window the row (if any) still
-        // carries the PREVIOUS turn's start, and using it opened the timer at
-        // the old turn's elapsed instead of 0:00.
-        let started = state
-            .session_for(&chat_id)
-            .and_then(|s| s.started_at)
-            .into_iter()
-            .chain(state.pending_send_started(&chat_id, now))
-            .max();
-        let elapsed_secs = started
-            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-            .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
-
-        // Unused here since the Working loader moved into the transcript
-        // (its trailer computes its own elapsed).
-        let _ = elapsed_secs;
+        if let Some(working) = working {
+            return strip.child(working).into_any_element();
+        }
         match indicator {
-            // The working loader lives in the TRANSCRIPT now, under the
-            // streaming reply (user request) — the strip stays empty (its
-            // reserved height still steadies the composer).
+            // The shared presenter above owns active timing and delivery
+            // states. Keep the reserved strip when it has nothing to show.
             Indicator::Working => strip.into_any_element(),
             // No label: the QuestionPanel right below IS the awaiting-input
             // surface — a strip caption above it was redundant (user request).
@@ -8398,10 +8387,20 @@ impl Shell {
                             .text_color(theme.text_muted)
                             .into_any_element()
                     }),
-                RightSurface::Subagent(_) => icon(icons::BOT)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
+                RightSurface::Subagent(id) => self
+                    .subagent_tabs
+                    .get(&id)
+                    .map(|tab| {
+                        img(
+                            crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
+                                &tab.doc_id,
+                            ),
+                        )
+                        .size(px(18.0))
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element()
+                    })
+                    .unwrap_or_else(|| gpui::Empty.into_any_element()),
                 RightSurface::Worker(_) => icon(icons::TERMINAL)
                     .size(px(12.0))
                     .text_color(theme.text_muted)
@@ -8412,10 +8411,7 @@ impl Shell {
                     .into_any_element(),
                 RightSurface::Picker => gpui::Empty.into_any_element(),
             };
-            // A live subagent tab swaps its icon for the mini working
-            // spinner (the history fetch button's in-flight recipe) — the
-            // doc's streaming tail entry IS the run's liveness, so the swap
-            // settles by itself when the subagent finishes.
+            // Keep the doc-keyed avatar visible; activity has its own trailing slot.
             let subagent_running = match surface {
                 RightSurface::Subagent(id) => self.subagent_tabs.get(&id).is_some_and(|tab| {
                     self.state
@@ -8505,33 +8501,7 @@ impl Shell {
                                 .items_center()
                                 .justify_center()
                                 .group_hover(group.clone(), |s| s.opacity(0.0))
-                                .child(if subagent_running {
-                                    loaders::mini_glyph_spinner(
-                                        format!("subagent-tab-{ix}"),
-                                        2.0,
-                                        theme.glyph,
-                                        cx.entity_id(),
-                                        cx,
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    surface_icon
-                                }),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(0.0)
-                                .group_hover(group.clone(), |s| s.opacity(1.0))
-                                .child(
-                                    icon(icons::CLOSE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
+                                .child(surface_icon),
                         ),
                 )
                 .child(
@@ -8545,7 +8515,16 @@ impl Shell {
                             theme.text_muted
                         })
                         .child(title),
-                );
+                )
+                .when(subagent_running, |chip| {
+                    chip.child(loaders::mini_glyph_spinner(
+                        format!("subagent-tab-{ix}"),
+                        2.0,
+                        theme.glyph,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                });
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the

@@ -531,6 +531,8 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     InputResolved {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<UserInputAnswer>>,
     },
     #[serde(rename_all = "camelCase")]
     Steered {

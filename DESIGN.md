@@ -203,7 +203,7 @@ Tabela consolidada com os componentes fundamentais de `crates/ui`:
 | **Question Panel** | `composer.rs` | Overlay no composer, lista de opções (1-9), campo de texto livre, botões Submit/Skip | Paged, single-select, multi-select, submitting | `surface_card`, `border`, `text`, `accent`, `element_hover` |
 | **Popover / Picker** | `popover.rs`, `pickers.rs` | Card flutuante com blur, search input, lista de itens com teclado, key caps | Closed, opening (`MENU_IN`), item hover, active | `surface_overlay`, `glass_overlay`, `border`, `element_hover`, `text_muted` |
 | **Badges e Chips** | `badges.rs`, `url_chips.rs` | Pill de altura fixa (24px) com ícone (12px), rótulo e popover hover opcional | Normal, hover, clicked | `surface_raised`, `text_muted`, `text`, `border`, `accent` |
-| **Cards de Tool** | `transcript.rs`, `turn_steps.rs` | Slot de guia contínuo (38px) com chip centralizado (30px), ícone semântico e toggle | Running, resolved, error, expanded (diff/output) | `surface_raised`, `border`, `text_muted`, `danger`, `success`, `syntax` |
+| **Stream de Tool** | `transcript.rs`, `turn_steps.rs` | Timeline 28px: slot de ícone 18px, verbo+objeto numa linha, sem card | Running, resolved, error, expanded (invocação + resultado em painel de código com scroll) | `text`, `text_muted`, `danger`, `ink(0.10)` |
 | **Turn Steps** | `turn_steps.rs` | Cabeçalho resumido com contagem de atividades de ferramentas e chevron de dobra | Collapsed, expanded | `surface_card`, `text_muted`, `text_faint`, `border` |
 | **Transcript Rows** | `transcript.rs` | Lista virtualizada baseada em blocos estáveis (`msgId#blockId`) com follow-tail | Normal, hovering, selected | `bg`, `text`, `text_muted`, `code_text`, `syntax` |
 | **Sticky User Message** | `transcript.rs` | Clone do cabeçalho do turno do usuário fixado no topo do runway durante scroll | Docked, sliding, unpinned | `surface_card`, `surface_raised`, `border`, `text` |
@@ -249,11 +249,11 @@ Indicadores compactos inline para metadados, links e referências git.
 - **Estados**: Normal, Hover (com hover card de detalhes após `280 ms`, `crates/ui/src/badges.rs:64`).
 - **Roles**: `surface_raised`, `text_muted`, `text`, `border`.
 
-#### Cards de Tool e Turn Steps (`crates/ui/src/transcript.rs`, `crates/ui/src/turn_steps.rs`)
-Representação de execuções de ferramentas e agregações de turnos.
-- **Anatomia**: linha guia vertical com altura de `38.0 px` (`CHIP_HEIGHT`, `crates/ui/src/transcript.rs:107`), card interno de `30.0 px`. O `TurnSteps` agrupa chamadas resolvidas em um fold único com chevron e contadores agregados de atividades.
-- **Estados**: Executando (`busy`), Sucesso (`success`), Falha (`danger`), Expandido (exibe diff interno ou saída stdout).
-- **Roles**: `surface_raised`, `border`, `text_muted`, `danger`, `success`.
+#### Stream de Tool e Turn Steps (`crates/ui/src/transcript.rs`, `crates/ui/src/turn_steps.rs`)
+Eventos compactos com geometria única em `stream_event_row`, sem cards nem conectores verticais. Grupos de tools, raciocínio e tarefas iniciam fechados; raciocínio mostra prévia textual em vez de repetir Thought. O clique revela o conteúdo completo.
+- **Anatomia**: row de `28.0 px` (`CHIP_HEIGHT`) com ícone de `14.0 px` num slot de `18.0 px` e copy verbo+objeto em sans regular 14px/22px, como o corpo da conversa; gaps entre blocos de 4px. Sem card interno, sem hairline. `TurnSteps` agrupa o prefixo resolvido num fold com chevron junto ao conteúdo e contadores (`Ran 3 commands · read 2 files`).
+- **Estados**: Executando (spinner no trailing), pendente, falha (tint `danger` na linha), expandido (stdout/diff alinhados sob o texto, sem conectores verticais).
+- **Roles**: `text`, `text_muted`, `text_faint`, `danger`.
 
 #### Rows do Transcript (`crates/ui/src/transcript.rs`)
 Lista virtualizada de blocos Markdown e chamadas do agente.
@@ -386,7 +386,7 @@ A iconografia do Comet combina ícones vetoriais embutidos com bibliotecas exter
 - `13.0 px`: Ícone de harness ativo na sidebar (`crates/ui/src/shell.rs:959`).
 - `14.0 px`: Ícone de harness arquivado na sidebar (`crates/ui/src/shell.rs:961`).
 - `16.0 px`: Ações padrão de barra de título, controles e botões de header.
-- `18.0 px`: Tiles de tool chip e avatares dentro de chips de execução (`crates/ui/src/transcript.rs:8422`).
+- `18.0 px`: Slot de ícone no stream de tools e avatares de subagente (`crates/ui/src/transcript.rs`).
 - `24.0 px`: Botões do cluster de navegação principal da barra de título (`crates/ui/src/shell.rs:232`).
 
 ### Ícones contextuais de tool e provedores

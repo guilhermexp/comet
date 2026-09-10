@@ -138,6 +138,53 @@ fn split_shell_commands(command: &str) -> Vec<&str> {
     segments
 }
 
+/// Display-only summary; the invocation remains verbatim in the payload.
+/// Reuse the icon scanner so quoted pipes do not invent extra commands.
+pub(crate) fn command_summary(command: &str) -> String {
+    let first_line = command.lines().next().unwrap_or_default();
+    let heredoc = first_line.contains("<<");
+    let segments = split_shell_commands(if heredoc { first_line } else { command });
+    if segments.len() == 1 && !command.contains('\n') && command.chars().count() <= 60 {
+        return zeron_proto::view::single_line(command);
+    }
+    let mut names = Vec::new();
+    for segment in segments {
+        let mut rest = segment.trim();
+        while !rest.is_empty() {
+            let end = if rest.starts_with(['\'', '"']) {
+                let quote = rest.chars().next().unwrap();
+                rest[1..].find(quote).map_or(rest.len(), |index| index + 2)
+            } else {
+                rest.find(char::is_whitespace).unwrap_or(rest.len())
+            };
+            let token = &rest[..end];
+            rest = rest[end..].trim_start();
+            if is_environment_assignment(token) {
+                continue;
+            }
+            let name = token
+                .trim_matches(['\'', '"'])
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            if !name.is_empty() && !name.starts_with('#') {
+                names.push(name.chars().take(24).collect::<String>());
+            }
+            break;
+        }
+        if names.len() > 4 {
+            break;
+        }
+    }
+    let more = names.len() > 4 || heredoc;
+    names.truncate(4);
+    let mut summary = names.join(", ");
+    if more {
+        summary.push('…');
+    }
+    summary
+}
+
 fn normalized_executable(token: &str) -> String {
     let unquoted = token.trim_matches(|character| matches!(character, '\'' | '"'));
     Path::new(unquoted)

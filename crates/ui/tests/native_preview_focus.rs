@@ -19,7 +19,12 @@ mod native {
             let is_gpui: BOOL = msg_send![gpui, isKindOfClass: Class::get("GPUIView").unwrap()];
             assert_eq!(is_gpui, YES);
             for descendant in [false, true] {
+                let started = std::time::Instant::now();
                 let mut preview = NativeDocumentView::open_html("<p>Focus regression</p>").unwrap();
+                println!(
+                    "HTML_HOST_CREATE_MS {:.2}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
                 let _: () = msg_send![content, addSubview: preview.view];
                 let child: *mut Object = msg_send![class!(NSTextView), new];
                 let target = if descendant {

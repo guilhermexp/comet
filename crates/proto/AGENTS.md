@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `InputResolved.answers` é aditivo e opcional: `None` preserva compatibilidade com journals antigos/cancelamentos; `Some` contém as respostas submetidas, identificadas por `question_id`.
+
 - Todo tipo que cruza processo (UI↔engine, engine↔engine via DeviceRoom, engine↔edge) mora aqui.
 - Mudar shape de tipo serializado é **breaking cross-device**: dois devices em versões diferentes falam o mesmo fio. Campo novo entra opcional/`#[serde(default)]`; remoção exige change no OpenSpec.
 - `view` e `trajectory` são puros: sem I/O, sem tokio, sem gpui. É o que permite testar as regras sem subir engine nem janela.

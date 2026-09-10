@@ -131,7 +131,7 @@ impl Default for IncrementalFileFields {
 pub(crate) struct PartialFileToolInput {
     kind: FileToolKind,
     fields: IncrementalFileFields,
-    bytes_since_emit: usize,
+    last_emit_at: Option<std::time::Instant>,
     emission_count: u32,
     last_emitted: Option<ToolCall>,
 }
@@ -146,21 +146,26 @@ impl PartialFileToolInput {
         Some(Self {
             kind,
             fields: IncrementalFileFields::default(),
-            bytes_since_emit: 0,
+            last_emit_at: None,
             emission_count: 0,
             last_emitted: None,
         })
     }
 
     pub(crate) fn push(&mut self, delta: &str) -> Option<ToolCall> {
-        self.bytes_since_emit = self.bytes_since_emit.saturating_add(delta.len());
+        let now = std::time::Instant::now();
         let had_body = self.has_body();
         self.fields.push(delta);
         let first = self.last_emitted.is_none();
         let body_started = !had_body && self.has_body();
         let first_semantic_followup =
             self.emission_count == 1 && (body_started || has_line_boundary(delta));
-        if !first && !first_semantic_followup && self.bytes_since_emit < PARTIAL_REFRESH_BYTES {
+        if !first
+            && !first_semantic_followup
+            && self
+                .last_emit_at
+                .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_millis(100))
+        {
             return None;
         }
         let call = self.preview_call()?;
@@ -168,7 +173,7 @@ impl PartialFileToolInput {
             return None;
         }
         self.last_emitted = Some(call.clone());
-        self.bytes_since_emit = 0;
+        self.last_emit_at = Some(std::time::Instant::now());
         self.emission_count = self.emission_count.saturating_add(1);
         Some(call)
     }
@@ -179,7 +184,7 @@ impl PartialFileToolInput {
             return None;
         }
         self.last_emitted = Some(call.clone());
-        self.bytes_since_emit = 0;
+        self.last_emit_at = Some(std::time::Instant::now());
         self.emission_count = self.emission_count.saturating_add(1);
         Some(call)
     }
@@ -490,6 +495,22 @@ fn has_line_boundary(delta: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_chunks_refresh_after_time_budget_and_flush_the_final_tail() {
+        let mut parser = PartialFileToolInput::new("Write").unwrap();
+        parser.push(r#"{"file_path":"a.rs","content":"first"#);
+        parser.push(r#"\nsecond"#); // initial semantic follow-up
+        assert!(parser.push(" token").is_none());
+        std::thread::sleep(std::time::Duration::from_millis(110));
+        assert!(matches!(parser.push(" third"),
+            Some(ToolCall::WriteFile { content: Some(content), .. })
+                if content == "first\nsecond token third"));
+        assert!(parser.push(" final").is_none());
+        assert!(matches!(parser.force_preview(),
+            Some(ToolCall::WriteFile { content: Some(content), .. })
+                if content.ends_with("third final")));
+    }
 
     #[test]
     fn decodes_complete_and_unterminated_file_strings_without_general_json_repair() {

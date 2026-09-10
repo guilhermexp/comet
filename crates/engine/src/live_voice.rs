@@ -1792,6 +1792,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_voice_cwd_probe_follows_the_installed_omp_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = Arc::new(FakeLiveHarness::supported());
+        let registry = crate::registry::HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            crate::EngineCore::assemble(temp.path(), Arc::new(registry), HarnessId::Omp, None)
+                .unwrap();
+
+        assert!(
+            core.sessions
+                .probe_live_voice_at_cwd("/tmp")
+                .await
+                .unwrap()
+                .available
+        );
+
+        harness.set_supported(false);
+        assert_eq!(
+            core.sessions
+                .probe_live_voice_at_cwd("/tmp")
+                .await
+                .unwrap()
+                .reason,
+            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
+        );
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn live_voice_reuses_existing_and_created_sessions_for_live_and_text_runs() {
         let temp = tempfile::tempdir().unwrap();
         let harness = Arc::new(FakeLiveHarness::supported());

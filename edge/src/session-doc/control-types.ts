@@ -51,6 +51,11 @@ export interface UserInputQuestion {
   readonly multiSelect?: boolean;
 }
 
+export interface UserInputAnswer {
+  readonly questionId: string;
+  readonly labels: ReadonlyArray<string>;
+}
+
 /** Message parts — the structured view of an assistant turn (parts.ts). */
 export type MessagePart =
   | {
@@ -83,6 +88,7 @@ export type MessagePart =
       readonly requestId: string;
       readonly questions: ReadonlyArray<UserInputQuestion>;
       readonly resolved?: boolean;
+      readonly answers?: ReadonlyArray<UserInputAnswer>;
     }
   | {
       /** The run ended abnormally (harness failure, stall, interrupt). */

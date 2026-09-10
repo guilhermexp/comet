@@ -26,13 +26,13 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, LiveVoiceAvailability, RunRequest, SandboxLevel, SlashCommand,
-    UserInputAnswer, UserInputQuestion,
+    FileSearchMatch, HarnessId, LiveVoiceAvailability, LiveVoiceUnavailableReason, RunRequest,
+    SandboxLevel, SlashCommand, UserInputAnswer, UserInputQuestion,
 };
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
-use crate::live_voice::{LiveVoiceTooltip, LiveVoiceViewModel};
+use crate::live_voice::{self, LiveVoiceTooltip, LiveVoiceViewModel};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
 use crate::state::{AppState, Indicator};
@@ -195,6 +195,25 @@ fn draft_live_voice_available(
 ) -> bool {
     let local_target = target_device_id.is_none_or(|target| local_device_id == Some(target));
     engine_connected && local_target && harness == Some(HarnessId::Omp)
+}
+
+fn draft_live_voice_probe_cwd(plan: &NewChatLiveCheckout) -> &str {
+    match plan {
+        NewChatLiveCheckout::Ready { cwd, .. } => cwd,
+        NewChatLiveCheckout::CreateWorktree { repo_path, .. } => repo_path,
+    }
+}
+
+fn draft_live_voice_ready(availability: Option<&LiveVoiceAvailability>) -> bool {
+    availability.is_some_and(|availability| availability.available)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DraftLiveVoiceProbeKey {
+    cwd: String,
+    target_device_id: Option<String>,
+    local_device_id: Option<String>,
+    harness: Option<HarnessId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4253,6 +4272,9 @@ pub struct Composer {
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
     live_start_task: Option<Task<()>>,
+    draft_live_availability: Option<LiveVoiceAvailability>,
+    draft_live_probe_key: Option<DraftLiveVoiceProbeKey>,
+    draft_live_probe_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -4414,6 +4436,9 @@ impl Composer {
             advance_task: None,
             send_task: None,
             live_start_task: None,
+            draft_live_availability: None,
+            draft_live_probe_key: None,
+            draft_live_probe_task: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -7110,7 +7135,8 @@ impl Composer {
             target_device_id.as_deref(),
             local_device_id.as_deref(),
             resolved.harness,
-        ) {
+        ) || !draft_live_voice_ready(self.draft_live_availability.as_ref())
+        {
             return;
         }
         let Some(engine) = engine else {
@@ -7120,6 +7146,7 @@ impl Composer {
             &self.pickers.read(cx).checkout_plan(),
             space.as_ref().map(|space| space.path.as_str()),
         );
+        let probe_cwd = draft_live_voice_probe_cwd(&plan).to_owned();
         let chat_config = resolved
             .chat_config()
             .expect("an OMP draft always resolves a Chat config");
@@ -7134,7 +7161,32 @@ impl Composer {
         self.live_start_task = Some(cx.spawn(async move |this, cx| {
             let mut created_worktree: Option<(String, String)> = None;
             let mut live_started = false;
+            let mut chat_created = false;
+            let mut probed_availability: Option<LiveVoiceAvailability> = None;
             let result: Result<(), String> = async {
+                let availability = match engine
+                    .client()
+                    .call_as::<LiveVoiceAvailability>(
+                        methods::PROBE_LIVE_VOICE,
+                        serde_json::json!({ "cwd": probe_cwd }),
+                    )
+                    .await
+                {
+                    Ok(availability) => availability,
+                    Err(RpcError::UnknownMethod(_)) => LiveVoiceAvailability {
+                        available: false,
+                        reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
+                    },
+                    Err(error) => return Err(error.to_string()),
+                };
+                probed_availability = Some(availability);
+                if !availability.available {
+                    return Err(availability
+                        .reason
+                        .map(live_voice::unavailable_message)
+                        .unwrap_or("Live Voice is unavailable")
+                        .to_owned());
+                }
                 let (cwd, branch) = match plan {
                     NewChatLiveCheckout::Ready { cwd, branch } => (cwd, branch),
                     NewChatLiveCheckout::CreateWorktree { repo_path, base } => {
@@ -7178,6 +7230,7 @@ impl Composer {
                     Duration::from_secs(30),
                 )
                 .await?;
+                chat_created = true;
                 engine
                     .client()
                     .call(
@@ -7218,14 +7271,16 @@ impl Composer {
                     )
                     .await;
                 }
-                let _ = attachments::call_with_timeout(
-                    &engine,
-                    cx.background_executor(),
-                    methods::MUTATE,
-                    serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
-                    Duration::from_secs(5),
-                )
-                .await;
+                if chat_created {
+                    let _ = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                }
                 if let Some((repo_path, worktree_path)) = created_worktree {
                     let _ = attachments::call_with_timeout(
                         &engine,
@@ -7243,6 +7298,9 @@ impl Composer {
 
             this.update(cx, |composer, cx| {
                 composer.live_start_task = None;
+                if let Some(availability) = probed_availability {
+                    composer.draft_live_availability = Some(availability);
+                }
                 match result {
                     Ok(()) => {
                         composer.failure = None;
@@ -7260,28 +7318,99 @@ impl Composer {
         cx.notify();
     }
 
-    fn live_voice_model(&self, cx: &App) -> LiveVoiceViewModel {
+    fn refresh_draft_live_voice_availability(&mut self, cx: &mut Context<Self>) {
+        let (is_draft, engine, target_device_id, local_device_id, space_path) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_chat.is_none(),
+                state.engine().cloned(),
+                state.effective_device_id(),
+                state.local_device_id.clone(),
+                state.selected_space_row().map(|space| space.path.clone()),
+            )
+        };
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let eligible = draft_live_voice_available(
+            engine.is_some(),
+            target_device_id.as_deref(),
+            local_device_id.as_deref(),
+            harness,
+        );
+        let key = if is_draft && eligible {
+            let plan = new_chat_live_checkout(
+                &self.pickers.read(cx).checkout_plan(),
+                space_path.as_deref(),
+            );
+            Some(DraftLiveVoiceProbeKey {
+                cwd: draft_live_voice_probe_cwd(&plan).to_owned(),
+                target_device_id,
+                local_device_id,
+                harness,
+            })
+        } else {
+            None
+        };
+        if self.draft_live_probe_key == key {
+            return;
+        }
+        self.draft_live_probe_key = key.clone();
+        self.draft_live_availability = None;
+        self.draft_live_probe_task = None;
+        let (Some(key), Some(engine)) = (key, engine) else {
+            return;
+        };
+        self.draft_live_probe_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<LiveVoiceAvailability>(
+                    methods::PROBE_LIVE_VOICE,
+                    serde_json::json!({ "cwd": key.cwd }),
+                )
+                .await;
+            let availability = match result {
+                Ok(availability) => Some(availability),
+                Err(RpcError::UnknownMethod(_)) => Some(LiveVoiceAvailability {
+                    available: false,
+                    reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
+                }),
+                Err(error) => {
+                    tracing::debug!(%error, "draft Live Voice probe failed");
+                    None
+                }
+            };
+            let _ = this.update(cx, |composer, cx| {
+                if composer.draft_live_probe_key.as_ref() == Some(&key) {
+                    composer.draft_live_availability = availability;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn live_voice_model(&mut self, cx: &mut Context<Self>) -> LiveVoiceViewModel {
+        self.refresh_draft_live_voice_availability(cx);
         let state = self.state.read(cx);
         let is_draft = state.selected_chat.is_none();
-        let draft_availability = (is_draft
+        let eligible = is_draft
             && draft_live_voice_available(
                 state.engine().is_some(),
                 state.effective_device_id().as_deref(),
                 state.local_device_id.as_deref(),
                 self.pickers.read(cx).resolved(cx).harness,
-            ))
-        .then(|| LiveVoiceAvailability {
-            available: true,
-            reason: None,
-        });
-        let mut model = LiveVoiceViewModel::derive(
-            state.selected_chat.as_deref(),
-            state
-                .live_voice_availability
-                .as_ref()
-                .or(draft_availability.as_ref()),
-            &state.live_voice,
-        );
+            );
+        let mut model = if is_draft {
+            LiveVoiceViewModel::derive_draft(
+                self.draft_live_availability.as_ref(),
+                &state.live_voice,
+                eligible,
+            )
+        } else {
+            LiveVoiceViewModel::derive(
+                state.selected_chat.as_deref(),
+                state.live_voice_availability.as_ref(),
+                &state.live_voice,
+            )
+        };
         if is_draft && self.live_start_task.is_some() {
             model.microphone_enabled = false;
             model.microphone_tooltip = "Starting Live Voice…".to_owned();
@@ -8139,6 +8268,40 @@ mod tests {
             Some("local-device"),
             Some(HarnessId::Codex),
         ));
+        assert!(!draft_live_voice_ready(None));
+        assert!(!draft_live_voice_ready(Some(&LiveVoiceAvailability {
+            available: false,
+            reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
+        })));
+        assert!(draft_live_voice_ready(Some(&LiveVoiceAvailability {
+            available: true,
+            reason: None,
+        })));
+    }
+
+    #[test]
+    fn live_voice_new_chat_probes_checkout_or_repo_path() {
+        assert_eq!(
+            draft_live_voice_probe_cwd(&NewChatLiveCheckout::Ready {
+                cwd: "/repo".into(),
+                branch: Some("main".into()),
+            }),
+            "/repo"
+        );
+        assert_eq!(
+            draft_live_voice_probe_cwd(&NewChatLiveCheckout::CreateWorktree {
+                repo_path: "/repo".into(),
+                base: "HEAD".into(),
+            }),
+            "/repo"
+        );
+        assert_eq!(
+            draft_live_voice_probe_cwd(&NewChatLiveCheckout::Ready {
+                cwd: "~".into(),
+                branch: None,
+            }),
+            "~"
+        );
     }
 
     #[test]
@@ -9371,6 +9534,7 @@ mod tests {
             id: "in-r1".into(),
             request_id: "r1".into(),
             questions: vec![question("q", &["a"], false)],
+            answers: None,
             resolved: false,
         };
         let entry = |status: Option<MessageStatus>, parts: Vec<MessagePart>| SessionMessageEntry {
@@ -9427,6 +9591,7 @@ mod tests {
             id: "in-r1".into(),
             request_id: "r1".into(),
             questions: vec![],
+            answers: None,
             resolved: true,
         };
         let t = vec![entry(

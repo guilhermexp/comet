@@ -9,8 +9,8 @@ use std::{
 use comet_syntax::HighlightedDocument;
 use gpui::{
     AnyElement, ClipboardItem, Context, EventEmitter, Image, InteractiveElement, IntoElement,
-    ListHorizontalSizingBehavior, ObjectFit, Render, SharedString, StyledText, Task,
-    UniformListScrollHandle, Window, div, font, img, prelude::*, px, uniform_list,
+    ListHorizontalSizingBehavior, ListState, ObjectFit, Render, SharedString, StyledText, Task,
+    UniformListScrollHandle, Window, div, font, img, list, prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -92,6 +92,8 @@ pub struct FilePreview {
     display_mode: PreviewDisplayMode,
     load_task: Option<Task<()>>,
     scroll_handles: HashMap<(String, String), UniformListScrollHandle>,
+    markdown_lists: HashMap<(String, String), (ListState, u32)>,
+    markdown_cache: Rc<RefCell<markdown_render::RenderCache>>,
     #[cfg(target_os = "macos")]
     native_document: Option<(
         PathBuf,
@@ -110,6 +112,8 @@ impl FilePreview {
             display_mode: PreviewDisplayMode::SidePeek,
             load_task: None,
             scroll_handles: HashMap::new(),
+            markdown_lists: HashMap::new(),
+            markdown_cache: Rc::default(),
             #[cfg(target_os = "macos")]
             native_document: None,
         }
@@ -177,6 +181,8 @@ impl FilePreview {
         let was_active_tab =
             is_active_context && self.tabs.active_path(context_key) == Some(relative_path);
         self.tabs.close(context_key, relative_path);
+        self.markdown_lists
+            .remove(&(context_key.to_owned(), relative_path.to_owned()));
         self.scroll_handles
             .remove(&(context_key.to_string(), relative_path.to_string()));
         if is_active_context {
@@ -197,6 +203,8 @@ impl FilePreview {
         let paths = self.tabs.paths(&context_key).to_vec();
         for path in paths {
             self.tabs.close(&context_key, &path);
+            self.markdown_lists
+                .remove(&(context_key.clone(), path.clone()));
             self.scroll_handles.remove(&(context_key.clone(), path));
         }
         self.load_active(cx);
@@ -208,6 +216,7 @@ impl FilePreview {
 
     fn load_active(&mut self, cx: &mut Context<Self>) {
         self.clear_native_document();
+        self.markdown_cache.borrow_mut().clear();
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let Some(context_key) = self.active_context.clone() else {
@@ -229,6 +238,7 @@ impl FilePreview {
         let font_mono = Theme::of(cx).font_mono.clone();
         let font_size = px(12.5);
         let text_system = cx.text_system().clone();
+        let viewport_key = (context_key, relative_path.clone());
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -250,6 +260,18 @@ impl FilePreview {
                     Ok(preview) => PreviewLoadState::Ready(preview),
                     Err(error) => PreviewLoadState::Error(load_error_message(&error).into()),
                 };
+                if let PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) = &this.loaded {
+                    let (state, _) = this.markdown_lists.entry(viewport_key).or_insert_with(|| {
+                        (
+                            ListState::new(0, gpui::ListAlignment::Top, px(200.0)),
+                            crate::theme::theme_generation(),
+                        )
+                    });
+                    let mut position = state.logical_scroll_top();
+                    position.item_ix = position.item_ix.min(tree.len().saturating_sub(1));
+                    state.reset(tree.len());
+                    state.scroll_to(position);
+                }
                 this.ensure_native_document();
                 cx.notify();
             });
@@ -275,11 +297,11 @@ impl FilePreview {
         let reveal = absolute.clone();
         let copy = absolute;
         div()
-            .h(px(44.0))
+            .h(px(36.0))
             .flex_none()
-            .px(px(14.0))
+            .px(px(Theme::SPACE_MD))
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(crate::theme::hairline(0.06))
             .flex()
             .items_center()
             .justify_between()
@@ -311,12 +333,12 @@ impl FilePreview {
                                     .text_color(theme.text_muted),
                             ),
                     )
-                    .child(img(image).size(px(16.0)).object_fit(ObjectFit::Contain))
+                    .child(img(image).size(px(14.0)).object_fit(ObjectFit::Contain))
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(14.0))
+                            .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(name),
@@ -415,26 +437,47 @@ impl FilePreview {
             PreviewLoadState::Ready(LoadedPreview::Unsupported) => {
                 centered_message("Cannot view this file", theme)
             }
-            // Scroll offset is element state keyed by id: a shared id handed
-            // the next file the previous file's offset, so a short document
-            // opened parked past its own end (user report: "opens in the
-            // middle, shows nothing"). One id per path, one offset per file.
-            PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => div()
-                .id(SharedString::from(format!(
-                    "file-preview-markdown-scroll:{path}"
-                )))
+            PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => {
+                if tree.is_empty() {
+                    return centered_message("Empty file", theme);
+                }
+                let (state, generation) = self
+                    .markdown_lists
+                    .get_mut(&(context_key.to_owned(), path.clone()))
+                    .expect("Markdown viewport is prepared when loading completes");
+                let current_generation = crate::theme::theme_generation();
+                if *generation != current_generation {
+                    state.remeasure();
+                    *generation = current_generation;
+                }
+                let mut options = markdown_render::RenderOptions::settled(
+                    format!("file-preview:{context_key}:{path}").into(),
+                );
+                options.cache = Some(self.markdown_cache.clone());
+                let theme = theme.clone();
+                list(state.clone(), move |ix, window, _cx| {
+                    div()
+                        .px(px(28.0))
+                        .pt(px(if ix == 0 {
+                            24.0
+                        } else {
+                            markdown_render::MD_BLOCK_GAP
+                        }))
+                        .when(ix + 1 == tree.len(), |row| row.pb(px(24.0)))
+                        .child(markdown_render::render_block(
+                            &tree.blocks[ix].block,
+                            ix,
+                            ix,
+                            &options,
+                            &theme,
+                            window,
+                            None,
+                        ))
+                        .into_any_element()
+                })
                 .size_full()
-                .overflow_y_scroll()
-                .px(px(28.0))
-                .py(px(24.0))
-                .child(markdown_render::render_tree(
-                    tree.as_ref(),
-                    &markdown_render::RenderOptions::settled(format!("file-preview:{path}").into()),
-                    theme,
-                    window,
-                    &|_| None,
-                ))
-                .into_any_element(),
+                .into_any_element()
+            }
             PreviewLoadState::Ready(LoadedPreview::Code {
                 lines,
                 highlights,
@@ -577,7 +620,7 @@ impl Render for FilePreview {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.bg)
+            // The shell owns the themed utility-pane surface, as for Changes.
             .child(self.render_header(&theme, cx))
             .child(
                 div()

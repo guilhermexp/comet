@@ -1995,7 +1995,7 @@ async fn respond_input_resolves_pending_question() {
     assert!(entries(&core).iter().any(|e| {
         e.parts
             .iter()
-            .any(|p| matches!(p, MessagePart::Input { resolved: true, .. }))
+            .any(|p| matches!(p, MessagePart::Input { resolved: true, answers: Some(answers), .. } if answers.iter().any(|answer| answer.question_id == "q1" && answer.labels == ["b"])))
     }));
     // The run task writes the Complete entry BEFORE settling the status row —
     // wait for the transition instead of asserting the instant in between.

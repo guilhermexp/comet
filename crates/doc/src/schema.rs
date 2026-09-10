@@ -78,6 +78,8 @@ struct DocPartJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     questions: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    answers: Option<Vec<zeron_proto::UserInputAnswer>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution: Option<zeron_proto::ToolExecutionMeta>,
@@ -194,11 +196,13 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             id: _,
             request_id,
             questions,
+            answers,
             resolved,
         } => DocPartJson {
             id: request_id.clone(),
             kind: "input".into(),
             questions: Some(serde_json::to_value(questions)?),
+            answers: answers.clone(),
             resolved: Some(*resolved),
             ..Default::default()
         },
@@ -265,6 +269,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 .and_then(|q| serde_json::from_value(q).ok())
                 .unwrap_or_default(),
             resolved: p.resolved.unwrap_or(false),
+            answers: p.answers,
         },
         "error" => MessagePart::Error {
             id: p.id,
@@ -660,7 +665,11 @@ impl SessionDoc {
     /// resolves through the entry fold; this direct write is for answers to a
     /// question whose run already died — no fold owns the entry anymore.
     /// Returns `false` when no such part exists.
-    pub fn resolve_input(&self, request_id: &str) -> Result<bool, DocError> {
+    pub fn resolve_input(
+        &self,
+        request_id: &str,
+        answers: &[zeron_proto::UserInputAnswer],
+    ) -> Result<bool, DocError> {
         let messages = self.doc.get_list("messages");
         for i in 0..messages.len() {
             let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
@@ -688,6 +697,10 @@ impl SessionDoc {
                     Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == request_id
                 );
                 if is_input && id_matches {
+                    part.insert(
+                        "answers",
+                        loro_value_from_json(&serde_json::to_value(answers)?),
+                    )?;
                     part.insert("resolved", true)?;
                     self.doc.commit();
                     return Ok(true);
@@ -832,6 +845,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(questions) = &doc_part.questions {
         map.insert("questions", loro_value_from_json(questions))?;
+    }
+    if let Some(answers) = &doc_part.answers {
+        map.insert(
+            "answers",
+            loro_value_from_json(&serde_json::to_value(answers)?),
+        )?;
     }
     if let Some(resolved) = doc_part.resolved {
         map.insert("resolved", resolved)?;
@@ -1421,6 +1440,12 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(questions) = &doc_part.questions {
         map.insert("questions", loro_value_from_json(questions))?;
     }
+    if let Some(answers) = &doc_part.answers {
+        map.insert(
+            "answers",
+            loro_value_from_json(&serde_json::to_value(answers)?),
+        )?;
+    }
     if let Some(resolved) = doc_part.resolved {
         map.insert("resolved", resolved)?;
     }
@@ -1976,6 +2001,33 @@ mod tests {
     }
 
     #[test]
+    fn input_answers_roundtrip_and_incremental_update() {
+        let doc = SessionDoc::init("chat-answers").unwrap();
+        let mut entry: SessionMessageEntry = serde_json::from_value(serde_json::json!({
+            "id":"m", "role":"assistant", "createdAt":1, "deviceId":"d",
+            "parts":[{"kind":"input", "id":"r", "requestId":"r", "questions":[], "resolved":false}]
+        }))
+        .unwrap();
+        doc.push_message(&entry).unwrap();
+        let resolution: zeron_proto::AgentEvent = serde_json::from_value(serde_json::json!({
+            "type":"inputResolved", "requestId":"r", "answers":[{"questionId":"q", "labels":["Café"]}]
+        })).unwrap();
+        let mut writer = SegmentWriter::resume(&doc, 0, entry.parts.clone());
+        crate::parts::fold_event_into_parts(&mut entry.parts, &resolution);
+        writer.sync(&entry.parts).unwrap();
+        let value = serde_json::to_value(&doc.read_entries().unwrap()[0].parts[0]).unwrap();
+        assert_eq!(value["answers"][0]["labels"][0], "Café");
+        // Orphan resolution writes the same field as a live stream.
+        let answers = vec![zeron_proto::UserInputAnswer {
+            question_id: "q".into(),
+            labels: vec!["Other".into()],
+        }];
+        doc.resolve_input("r", &answers).unwrap();
+        let value = serde_json::to_value(&doc.read_entries().unwrap()[0].parts[0]).unwrap();
+        assert_eq!(value["answers"][0]["labels"][0], "Other");
+    }
+
+    #[test]
     fn resolve_input_stamps_the_part_in_place() {
         let doc = SessionDoc::init("chat-1").unwrap();
         doc.push_message(&SessionMessageEntry {
@@ -1985,6 +2037,7 @@ mod tests {
                 id: "r1".into(),
                 request_id: "r1".into(),
                 questions: vec![],
+                answers: None,
                 resolved: false,
             }],
             created_at: 1,
@@ -1995,8 +2048,8 @@ mod tests {
             continuation_of: None,
         })
         .unwrap();
-        assert!(!doc.resolve_input("nope").unwrap());
-        assert!(doc.resolve_input("r1").unwrap());
+        assert!(!doc.resolve_input("nope", &[]).unwrap());
+        assert!(doc.resolve_input("r1", &[]).unwrap());
         let entries = doc.read_entries().unwrap();
         assert!(matches!(
             &entries[0].parts[0],
@@ -2345,6 +2398,7 @@ mod tests {
                 id: "i0".into(),
                 request_id: "req".into(),
                 questions: Vec::new(),
+                answers: None,
                 resolved: false,
             },
         ];

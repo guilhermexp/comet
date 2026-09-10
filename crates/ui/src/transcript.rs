@@ -28,8 +28,8 @@
 //! While that anchor holds, wheel/touch is clamped rather than obeyed — the
 //! whole turn is already visible, so there is nothing to scroll to.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
@@ -39,7 +39,7 @@ use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
     ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
     Point, ScrollHandle, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    UniformListScrollHandle, Window, canvas, div, img, list, prelude::*, px, quad, uniform_list,
+    Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{
@@ -90,9 +90,9 @@ const MERMAID_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MERMAID_CACHE_MAX_TOTAL: usize = 20;
 const MERMAID_MAX_INFLIGHT: usize = 2;
 /// Vertical gap opening a new turn (new message entry).
-pub const GAP_TURN: f32 = 14.0;
+pub const GAP_TURN: f32 = 12.0;
 /// Vertical gap between blocks within a turn.
-pub const GAP_BLOCK: f32 = 8.0;
+pub const GAP_BLOCK: f32 = 4.0;
 /// Transcript column max width (zeron 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// Gutter each row keeps outside the column (zeron `px-4 @3xl:px-12`). A block
@@ -100,18 +100,14 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 /// the row's padding is the only free space there, so `-COLUMN_GUTTER` is a
 /// full-bleed breakout that can never leave the transcript's own bounds.
 pub const COLUMN_GUTTER: f32 = 48.0;
-/// Tool chip row height / gap — analytic, so fold heights need no measurement.
-/// A row is the guide rail + a 30px chip card centered in it (zeron
-/// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
-/// gap so the rail reads continuous.
-pub const CHIP_HEIGHT: f32 = 38.0;
+/// Tool stream row height / gap — analytic, so fold heights need no measurement.
+/// Event headers share a compact 28px slot and one label baseline.
+/// Details expand only on request; no nested cards or connector spines.
+pub const CHIP_HEIGHT: f32 = 28.0;
 pub const CHIP_GAP: f32 = 0.0;
-pub const CHIP_CARD_HEIGHT: f32 = 30.0;
-/// Inner height of the chip header: [`CHIP_CARD_HEIGHT`] is the card's
-/// border-box (explicit `h` in gpui includes the 1px border), so a 30px
-/// header inside a 30px bordered card clips 2px off the bottom and every
-/// glyph/icon reads high (user report).
-const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
+pub const CHIP_CARD_HEIGHT: f32 = CHIP_HEIGHT;
+const CHIP_HEADER_HEIGHT: f32 = CHIP_HEIGHT;
+const STREAM_ICON: f32 = 18.0;
 
 /// Signed list scroll step for a pointer near a viewport edge.
 ///
@@ -141,7 +137,7 @@ fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32
         0.0
     }
 }
-const CHIPS_TOP_PAD: f32 = 2.0;
+const CHIPS_TOP_PAD: f32 = 0.0;
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
@@ -207,13 +203,12 @@ fn file_attachment_chip(
         .bg(crate::theme::ink(0.035))
         .child(
             div()
-                .size(px(36.0))
+                .size(px(28.0))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(7.0))
-                .bg(crate::theme::ink(0.06))
                 .child(
                     crate::icons::icon(crate::icons::DOCUMENT)
                         .size(px(17.0))
@@ -229,9 +224,9 @@ fn file_attachment_chip(
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(12.0))
-                        .line_height(px(15.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(render::MD_TEXT_SIZE))
+                        .line_height(px(render::MD_LINE_HEIGHT))
+                        .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(theme.text)
                         .child(name),
                 )
@@ -441,6 +436,8 @@ impl StickSpring {
 /// One tool invocation inside a group row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolItem {
+    /// Recorded task invocation owning an OMP synthetic sibling spawn.
+    pub subagent_batch: Option<SharedString>,
     pub id: SharedString,
     pub call: ToolCall,
     pub is_error: bool,
@@ -498,10 +495,10 @@ fn is_spawn_link(item: &ToolItem) -> bool {
     is_agent_call(&item.call) && item.subagent_ref.is_some()
 }
 
-/// Ordinary tool groups fold behind a summary header; agent/spawn chips
-/// render as their own always-open row.
-fn tool_group_collapses(tools: &[ToolItem]) -> bool {
-    tools.iter().any(|t| !is_agent_tool(t))
+/// Aggregate counts belong only to the completed TurnSteps summary.
+/// Every intermediate call stays directly visible; payloads fold independently.
+fn tool_group_collapses(_tools: &[ToolItem]) -> bool {
+    false
 }
 
 /// A chip's expandable detail payload.
@@ -543,9 +540,14 @@ pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
 
 /// Vertical padding of an output detail body (py(6) × 2).
 const OUTPUT_BODY_PAD: f32 = 12.0;
+const TOOL_PAYLOAD_MAX_HEIGHT: f32 = 360.0;
+// Two 6px outer margins and two 1px borders, outside the scroll viewport.
+const TOOL_PAYLOAD_CHROME: f32 = 14.0;
 
-/// The hairline between an expanded chip's header row and its detail body.
-const DETAIL_SEPARATOR: f32 = 1.0;
+/// No separator between a stream row and its open detail — the timeline is
+/// borderless; this stays in the analytic height so open/close math is one
+/// addition.
+const DETAIL_SEPARATOR: f32 = 0.0;
 
 /// Build a tool part's expandable detail. A diff wins over raw output (it is
 /// the more structured record of the same action); post-strip docs carry diff
@@ -594,24 +596,6 @@ pub fn tool_detail(
         lines,
         truncated_by,
     })
-}
-
-/// Columns at which an invocation line soft-wraps into continuation lines.
-/// The wrap is char-counted, not measured — block heights must be analytic —
-/// so the budget is sized to fit the narrowest useful transcript pane.
-pub const CALL_WRAP_COLS: usize = 80;
-
-/// Soft-wrap one raw line into [`CALL_WRAP_COLS`]-char chunks so a long
-/// single-line command stays fully readable instead of ellipsizing.
-fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
-    if line.chars().count() <= cols {
-        return vec![SharedString::from(line.to_owned())];
-    }
-    line.chars()
-        .collect::<Vec<_>>()
-        .chunks(cols)
-        .map(|chunk| SharedString::from(chunk.iter().collect::<String>()))
-        .collect()
 }
 
 /// Build a chip's full-invocation block — the complete tool call the header
@@ -664,7 +648,7 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
     };
     let mut lines: Vec<SharedString> = text
         .lines()
-        .flat_map(|l| wrap_cols(l, CALL_WRAP_COLS))
+        .map(|line| SharedString::from(line.to_owned()))
         .collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
@@ -784,6 +768,7 @@ pub enum RowKind {
     },
     Reasoning {
         tree: Arc<BlockTree>,
+        label: SharedString,
         active: bool,
         duration_ms: Option<u64>,
     },
@@ -809,14 +794,8 @@ pub enum RowKind {
         resolved: bool,
         is_error: bool,
     },
-    InputChip {
-        /// First question's header (chat-view.tsx `InputChip`: the resolved
-        /// chip shows it; unresolved shows "Awaiting your answer…" — which
-        /// stays TRUE even across a run death: the composer keeps the panel
-        /// up until the user answers, and the engine delivers a dead run's
-        /// answer as a resumed turn).
-        header: SharedString,
-        resolved: bool,
+    Question {
+        history: Arc<crate::questions::QuestionHistory>,
     },
     ErrorChip {
         message: SharedString,
@@ -1031,33 +1010,30 @@ fn task_snapshot_items(
             .collect();
     }
 
-    let previous_by_text: HashMap<&str, &TodoItem> = previous
-        .iter()
-        .map(|item| (item.text.as_str(), item))
-        .collect();
-    let current_by_text: HashMap<&str, &TodoItem> = current
-        .iter()
-        .map(|item| (item.text.as_str(), item))
-        .collect();
-    let previous_current = previous
-        .iter()
-        .find(|item| !item.done)
-        .map(|item| item.text.as_str());
-    let current_current = current_index.map(|index| current[index].text.as_str());
-
+    // The wire has no task id. Match equal titles by occurrence, so duplicate
+    // labels cannot overwrite each other in a map. Renames remain delete/add.
+    let mut remaining: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, item) in previous.iter().enumerate() {
+        remaining.entry(&item.text).or_default().push_back(index);
+    }
+    let previous_current = previous.iter().position(|item| !item.done);
+    let mut matched = vec![false; previous.len()];
     let mut changes = Vec::new();
     for (index, item) in current.iter().enumerate() {
-        let change = match previous_by_text.get(item.text.as_str()) {
+        let previous_index = remaining
+            .get_mut(item.text.as_str())
+            .and_then(VecDeque::pop_front);
+        if let Some(previous_index) = previous_index {
+            matched[previous_index] = true;
+        }
+        let change = match previous_index {
             None => Some(TaskChange::Created),
-            Some(previous) if previous.done != item.done => Some(if item.done {
+            Some(i) if previous[i].done != item.done => Some(if item.done {
                 TaskChange::Completed
             } else {
                 TaskChange::Started
             }),
-            Some(_)
-                if current_current == Some(item.text.as_str())
-                    && previous_current != current_current =>
-            {
+            Some(i) if current_index == Some(index) && previous_current != Some(i) => {
                 Some(TaskChange::Started)
             }
             Some(_) => None,
@@ -1067,13 +1043,13 @@ fn task_snapshot_items(
                 ordinal: index + 1,
                 text: item.text.clone(),
                 done: item.done,
-                current: current_current == Some(item.text.as_str()),
+                current: current_index == Some(index),
                 change: Some(change),
             });
         }
     }
     for (index, item) in previous.iter().enumerate() {
-        if !current_by_text.contains_key(item.text.as_str()) {
+        if !matched[index] {
             changes.push(TaskSnapshotItem {
                 ordinal: index + 1,
                 text: item.text.clone(),
@@ -1091,6 +1067,8 @@ fn last_todo_snapshot(entry: &SessionMessageEntry) -> Option<&[TodoItem]> {
     entry.parts.iter().rev().find_map(|part| match part {
         MessagePart::Tool {
             call: ToolCall::Todo { items },
+            resolved: true,
+            is_error: false,
             ..
         } => Some(items.as_slice()),
         _ => None,
@@ -1188,6 +1166,10 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool, detail_auto_open: bool)
                 acc.push(0);
             }
         }
+        if let Some(batch) = &t.subagent_batch {
+            acc.extend_from_slice(batch.as_bytes());
+        }
+        acc.push(0);
         // Subagent lifecycle mutates the chip in place (status flips, the
         // live tail grows) — hash it so the row re-splices on every change.
         acc.push(
@@ -1249,10 +1231,9 @@ fn settle_turn_steps_child(row: &mut Row) {
         ..
     } = &mut row.kind
     {
-        // TurnSteps is already the disclosure for the completed prefix. Keep
-        // its tool cards visible by default without opening command output,
-        // diffs, or other per-card detail bodies.
-        *auto_open = true;
+        // Opening the turn exposes event summaries. Their details remain
+        // independently closed until the user asks for them.
+        *auto_open = false;
         *detail_auto_open = false;
     }
 }
@@ -1507,11 +1488,6 @@ fn rows_for_entry_with_todo_history(
         .then(|| plan_turn_steps(&entry.parts, entry.status))
         .flatten();
     let mut rows: Vec<ProjectedRow> = Vec::new();
-    let last_part_ix = entry
-        .parts
-        .iter()
-        .rposition(|part| !matches!(part, MessagePart::WorkflowTask { .. }))
-        .unwrap_or_default();
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
     let mut group_first_part_ix = 0usize;
@@ -1527,8 +1503,8 @@ fn rows_for_entry_with_todo_history(
         }
         let tools = std::mem::take(group);
         let image_paths = tool_image_paths(&tools);
-        let auto_open = streaming;
-        let detail_auto_open = streaming && last_ix == last_part_ix;
+        let auto_open = false;
+        let detail_auto_open = false;
         let current_group = *group_ix;
         rows.push(ProjectedRow {
             source_start: first_ix,
@@ -1567,6 +1543,18 @@ fn rows_for_entry_with_todo_history(
         *group_ix += 1;
     };
 
+    let question_inputs: HashMap<usize, Vec<usize>> = entry
+        .parts
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, part)| match part {
+            MessagePart::Tool { call, .. } if crate::questions::is_question(call) => {
+                Some((ix, crate::questions::associated_inputs(&entry.parts, ix)))
+            }
+            _ => None,
+        })
+        .collect();
+    let linked_inputs: HashSet<usize> = question_inputs.values().flatten().copied().collect();
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
             MessagePart::Tool {
@@ -1599,7 +1587,36 @@ fn rows_for_entry_with_todo_history(
                         group_last_part_ix,
                     );
                 }
+                if let Some(linked) = question_inputs.get(&part_ix) {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_first_part_ix,
+                        group_last_part_ix,
+                    );
+                    let history =
+                        crate::questions::tool_history(&entry.parts, part_ix, linked, streaming);
+                    rows.push(ProjectedRow {
+                        source_start: part_ix,
+                        source_end: linked.last().copied().unwrap_or(part_ix),
+                        row: Row {
+                            id: format!("{}#{}", entry.id, tool_id).into(),
+                            version: fnv1a(format!("{history:?}").as_bytes()),
+                            turn_start: false,
+                            kind: RowKind::Question {
+                                history: Arc::new(history),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                        },
+                    });
+                    continue;
+                }
                 if let ToolCall::Todo { items } = call
+                    && !*is_error
+                    && (streaming || *resolved)
                     && !items.is_empty()
                 {
                     flush_group(
@@ -1613,6 +1630,10 @@ fn rows_for_entry_with_todo_history(
                     let version =
                         todo_snapshot_version(&todo_history, items, *resolved, *is_error, created);
                     let display_items = task_snapshot_items(&todo_history, items, created);
+                    if display_items.is_empty() && *resolved {
+                        todo_history.clone_from(items);
+                        continue;
+                    }
                     rows.push(ProjectedRow {
                         source_start: part_ix,
                         source_end: part_ix,
@@ -1634,7 +1655,10 @@ fn rows_for_entry_with_todo_history(
                     todo_history.clone_from(items);
                     continue;
                 }
-                if matches!(call, ToolCall::Todo { .. }) {
+                if matches!(call, ToolCall::Todo { items } if items.is_empty())
+                    && !*is_error
+                    && *resolved
+                {
                     todo_history.clear();
                 }
                 // A turn that has stopped cannot still be running a tool.
@@ -1644,26 +1668,55 @@ fn rows_for_entry_with_todo_history(
                 // the run was interrupted. Forced settling reads as an error
                 // because that is what it is: the tool never returned.
                 let stalled = !streaming && !*resolved;
+                let subagent_batch = is_agent_call(call)
+                    .then(|| {
+                        entry
+                            .parts
+                            .iter()
+                            .filter_map(|part| {
+                                let MessagePart::Tool {
+                                    id,
+                                    call: ToolCall::Unknown { name, .. },
+                                    ..
+                                } = part
+                                else {
+                                    return None;
+                                };
+                                (name == "task"
+                                    && tool_id.strip_prefix(id.as_str()).is_some_and(|suffix| {
+                                        suffix.starts_with("--") && suffix.len() > 2
+                                    }))
+                                .then_some(id.as_str())
+                            })
+                            .max_by_key(|id| id.len())
+                            .map(SharedString::from)
+                    })
+                    .flatten();
                 let item = ToolItem {
+                    subagent_batch,
                     id: tool_id.clone().into(),
                     call: call.clone(),
                     is_error: *is_error || stalled,
                     resolved: *resolved || stalled,
                     execution: *execution,
-                    detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
-                        .map(Arc::new),
+                    detail: if *is_error || stalled {
+                        tool_detail(output.as_deref(), None, None)
+                            .or_else(|| tool_detail(None, diff.as_ref(), diff_stats.as_deref()))
+                    } else {
+                        tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
+                    }
+                    .map(Arc::new),
                     invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
                     file_preview: file_preview.clone().map(Arc::new),
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
-                    // Same reasoning one level down: a spawn chip left
-                    // `running` by a dead turn watches a doc nobody is
-                    // writing to.
+                    // A linked child has its own lifecycle; completing the
+                    // parent is not evidence that the child failed.
                     subagent_status: match subagent_status {
-                        Some(zeron_doc::SubagentStatus::Running) if !streaming => {
-                            Some(zeron_doc::SubagentStatus::Failed)
+                        Some(SubagentStatus::Running) if !streaming && subagent_ref.is_none() => {
+                            Some(SubagentStatus::Failed)
                         }
                         other => *other,
                     },
@@ -1671,7 +1724,7 @@ fn rows_for_entry_with_todo_history(
                 };
                 let is_file_change =
                     matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
-                if is_file_change {
+                if is_file_change && !item.is_error {
                     flush_group(
                         &mut rows,
                         &mut pending_group,
@@ -1697,10 +1750,10 @@ fn rows_for_entry_with_todo_history(
                 }
                 // Agent chips don't share a fold with ordinary tools: flush
                 // whenever the genus flips so each group is uniform.
-                if pending_group
-                    .first()
-                    .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
-                {
+                if pending_group.first().is_some_and(|head| {
+                    is_agent_tool(head) != is_agent_tool(&item)
+                        || head.subagent_batch != item.subagent_batch
+                }) {
                     flush_group(
                         &mut rows,
                         &mut pending_group,
@@ -1795,27 +1848,27 @@ fn rows_for_entry_with_todo_history(
                     MessagePart::Input {
                         id: part_id,
                         questions,
+                        answers,
                         resolved,
                         ..
                     } => {
-                        // Model-generated header onto the one-line chip.
-                        let header: SharedString = single_line(
-                            &questions
-                                .first()
-                                .map(|q| q.header.clone())
-                                .unwrap_or_else(|| "Question".to_string()),
-                        )
-                        .into();
+                        if linked_inputs.contains(&part_ix) {
+                            continue;
+                        }
+                        let history = crate::questions::QuestionHistory::input(
+                            questions,
+                            answers.as_deref(),
+                            *resolved,
+                        );
                         rows.push(ProjectedRow {
                             source_start: part_ix,
                             source_end: part_ix,
                             row: Row {
                                 id: format!("{}#{}", entry.id, part_id).into(),
-                                version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                                version: fnv1a(format!("{history:?}").as_bytes()),
                                 turn_start: false,
-                                kind: RowKind::InputChip {
-                                    header,
-                                    resolved: *resolved,
+                                kind: RowKind::Question {
+                                    history: Arc::new(history),
                                 },
                                 entry_id: entry_id.clone(),
                                 timestamp: None,
@@ -1866,6 +1919,7 @@ fn rows_for_entry_with_todo_history(
                                 version,
                                 turn_start: false,
                                 kind: RowKind::Reasoning {
+                                    label: reasoning_label(active).into(),
                                     tree,
                                     active,
                                     duration_ms: *duration_ms,
@@ -1889,6 +1943,26 @@ fn rows_for_entry_with_todo_history(
         group_first_part_ix,
         group_last_part_ix,
     );
+
+    let mut seen_errors = HashSet::new();
+    let mut seen_images = HashSet::new();
+    rows.retain_mut(|projected| match &mut projected.row.kind {
+        RowKind::ErrorChip { message } => seen_errors.insert(message.clone()),
+        RowKind::InlineImages { paths } => {
+            let unique: Vec<_> = paths
+                .iter()
+                .filter(|path| seen_images.insert((*path).clone()))
+                .cloned()
+                .collect();
+            if unique.is_empty() {
+                return false;
+            }
+            projected.row.version = inline_image_version(&unique);
+            *paths = Arc::new(unique);
+            true
+        }
+        _ => true,
+    });
 
     if let Some(first) = rows.first_mut() {
         first.row.turn_start = true;
@@ -2083,7 +2157,7 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     let same_part_markdown = prev.is_some_and(|p| {
         is_md(&p.kind) && is_md(&row.kind) && part_prefix(&p.id) == part_prefix(&row.id)
     });
-    if same_part_markdown {
+    if same_part_markdown || prev.is_some_and(|p| is_md(&p.kind) || is_md(&row.kind)) {
         render::MD_BLOCK_GAP
     } else {
         GAP_BLOCK
@@ -2114,13 +2188,19 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 // Tool summaries / chips (pure)
 // ---------------------------------------------------------------------------
 
-/// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
-///
-/// The rule lives in `zeron_proto::view` so the terminal viewport reports the
-/// same summary; this only adapts the row model's [`ToolItem`] to it.
+/// Same call categories and units in streaming groups and settled TurnSteps.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
-    let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
-    zeron_proto::view::tool_group_summary(&pairs)
+    let mut summary =
+        crate::turn_steps::activity_breakdown_for_calls(tools.iter().map(|tool| &tool.call));
+    let pending = tools.iter().filter(|tool| !tool.resolved).count();
+    let failed = tools.iter().filter(|tool| tool.is_error).count();
+    if pending > 0 {
+        summary.push_str(&format!(" · {pending} running"));
+    }
+    if failed > 0 {
+        summary.push_str(&format!(" · {failed} failed"));
+    }
+    summary
 }
 
 fn tool_detail_default_open(
@@ -2162,6 +2242,135 @@ fn tool_header_state(resolved: bool, is_error: bool, show_outcome_label: bool) -
     }
 }
 
+/// Basename for stream copy: "Read src/foo.rs" becomes "Read foo.rs".
+fn stream_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+}
+
+/// Verb + object as painted on a timeline row. File tools show the basename;
+/// search-like tools take a colon so the query reads as "Searched: foo".
+fn stream_copy(call: &ToolCall, label: &str, detail: &str) -> (String, String) {
+    match call {
+        ToolCall::ReadFile { path }
+        | ToolCall::WriteFile { path, .. }
+        | ToolCall::EditFile { path, .. } => (label.to_owned(), stream_file_name(path).to_owned()),
+        ToolCall::ApplyPatch { path } => (
+            label.to_owned(),
+            stream_file_name(path.as_deref().unwrap_or("workspace")).to_owned(),
+        ),
+        ToolCall::Exec { command } => {
+            let verb = if label.eq_ignore_ascii_case("running command")
+                || label.eq_ignore_ascii_case("running")
+                || label.eq_ignore_ascii_case("run")
+            {
+                "Running command"
+            } else {
+                "Ran command"
+            };
+            (verb.to_owned(), crate::tool_icons::command_summary(command))
+        }
+        ToolCall::Unknown { name, input } if name.eq_ignore_ascii_case("skill") => {
+            let skill = input
+                .as_ref()
+                .and_then(|input| {
+                    ["skill", "path", "name"].into_iter().find_map(|key| {
+                        input
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+                })
+                .unwrap_or("");
+            ("Skill".into(), zeron_proto::view::single_line(skill))
+        }
+        ToolCall::Unknown { name, .. } if name == "hub" => (String::new(), detail.to_owned()),
+        ToolCall::Mcp { .. } => (String::new(), detail.to_owned()),
+        ToolCall::Unknown { .. } if matches!(label, "Ran tool" | "Running tool") => {
+            (String::new(), detail.to_owned())
+        }
+        ToolCall::Unknown { name, input } if name == "eval" => {
+            let language = input
+                .as_ref()
+                .and_then(|input| input.get("language"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim);
+            let detail = match language {
+                Some(language)
+                    if language.eq_ignore_ascii_case("js")
+                        || language.eq_ignore_ascii_case("javascript")
+                        || language.eq_ignore_ascii_case("py")
+                        || language.eq_ignore_ascii_case("python") =>
+                {
+                    detail
+                        .strip_prefix(&format!("{language} · "))
+                        .unwrap_or(detail)
+                }
+                _ => detail,
+            };
+            (String::new(), detail.to_owned())
+        }
+        ToolCall::Search { .. }
+        | ToolCall::Glob { .. }
+        | ToolCall::WebSearch { .. }
+        | ToolCall::WebFetch { .. } => (format!("{label}:"), detail.to_owned()),
+        _ => (label.to_owned(), detail.to_owned()),
+    }
+}
+
+fn stream_event_row(theme: &Theme) -> gpui::Div {
+    div()
+        .group("stream-event-header")
+        .w_full()
+        .min_w_0()
+        .h(px(CHIP_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .font_family(theme.font_sans.clone())
+        .font_weight(gpui::FontWeight::NORMAL)
+        .text_size(px(render::MD_TEXT_SIZE))
+        .line_height(px(render::MD_LINE_HEIGHT))
+}
+
+/// Detail content shares the label's left edge; no separate timeline spine.
+fn stream_disclosure(open: bool, theme: &Theme) -> gpui::Div {
+    div()
+        .size(px(14.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .opacity(0.0)
+        .group_hover("stream-event-header", |style| style.opacity(1.0))
+        .child(
+            crate::icons::icon(if open {
+                crate::icons::ALT_ARROW_DOWN
+            } else {
+                crate::icons::ALT_ARROW_RIGHT
+            })
+            .size(px(12.0))
+            .text_color(theme.text_muted),
+        )
+}
+
+fn stream_detail_slot(indented: bool, body: AnyElement) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .when(indented, |row| row.pl(px(STREAM_ICON + 8.0)))
+        .child(body)
+        .into_any_element()
+}
+
+fn reasoning_label(active: bool) -> &'static str {
+    if active { "Thinking" } else { "Thought" }
+}
+
 fn format_execution_duration(duration_ms: u64) -> String {
     if duration_ms < 60_000 {
         format!("{:.1}s", duration_ms as f64 / 1_000.0)
@@ -2173,6 +2382,10 @@ fn format_execution_duration(duration_ms: u64) -> String {
 
 fn format_reasoning_elapsed(duration_ms: u64) -> String {
     format_execution_duration(duration_ms)
+}
+
+fn reasoning_has_detail(tree: &BlockTree) -> bool {
+    !tree.blocks.is_empty()
 }
 
 fn reasoning_is_open(pinned: Option<bool>, _active: bool) -> bool {
@@ -2262,6 +2475,16 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
         ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
     };
     DETAIL_SEPARATOR + body
+}
+
+/// Combined payload budget; keeps group and per-tool fold geometry in sync.
+fn tool_payload_height(invocation: Option<&ToolDetail>, result: Option<&ToolDetail>) -> f32 {
+    if invocation.is_none() && result.is_none() {
+        return 0.0;
+    }
+    (invocation.map_or(0.0, detail_height) + result.map_or(0.0, detail_height))
+        .min(TOOL_PAYLOAD_MAX_HEIGHT)
+        + TOOL_PAYLOAD_CHROME
 }
 
 /// Height of the "Show full output/diff" affordance row appended below an
@@ -2410,6 +2633,18 @@ impl HighlightStore {
         code: &str,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<comet_syntax::HighlightedDocument>> {
+        self.request_after(row_id, block_ix, lang, code, Duration::ZERO, cx)
+    }
+
+    fn request_after(
+        &mut self,
+        row_id: SharedString,
+        block_ix: usize,
+        lang: Lang,
+        code: &str,
+        delay: Duration,
+        cx: &mut Context<Transcript>,
+    ) -> Option<Arc<comet_syntax::HighlightedDocument>> {
         let slot_key = (row_id.clone(), block_ix);
         let document_key = DocumentHighlightKey::new(lang, code);
         if let Some(entry) = self.entries.get(&slot_key)
@@ -2434,6 +2669,9 @@ impl HighlightStore {
         let code = code.to_string();
         let source_bytes = code.len();
         let task = cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
             let started = Instant::now();
             let document = cx
                 .background_executor()
@@ -2829,6 +3067,12 @@ fn sticky_turn_overlay_top(
     )
 }
 
+// An end anchor can temporarily report the entire content height before
+// prepaint resolves it to content height minus viewport height.
+fn sticky_scroll_offset(offset: f32, max_offset: f32) -> f32 {
+    offset.clamp(-max_offset.max(0.0), 0.0)
+}
+
 #[derive(Default)]
 struct StickyTurnState {
     chat_id: Option<String>,
@@ -2968,6 +3212,7 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
+    tool_payload_scrolls: HashMap<SharedString, ScrollHandle>,
     /// Render-local epochs for live reasoning rows.
     reasoning_started: HashMap<SharedString, Instant>,
     /// Independent of motion settings: Reduced Motion stops the spinner,
@@ -3021,9 +3266,9 @@ pub struct Transcript {
     /// changes. Scroll frames binary-search this list instead of walking a
     /// long transcript.
     sticky_turn_rows: Vec<usize>,
-    /// Scrollbar offset sampled by the outer `Render` before GPUI mutably
-    /// borrows `ListState` to run the row processor. `render_row` must never
-    /// read the list back from inside that processor.
+    /// Offset from the last completed list layout. Pending stream splices
+    /// may temporarily expose unmeasured heights or a past-end anchor;
+    /// sticky projection must never combine those with painted user bounds.
     sticky_scroll_y: f32,
     /// A layout-affecting change needs one post-layout own-turn measurement.
     own_turn_kick: bool,
@@ -3132,6 +3377,7 @@ enum FileInputLoad {
 }
 
 struct FileInputReady {
+    line_numbers: Arc<Vec<(Option<u32>, Option<u32>)>>,
     snapshot: Arc<zeron_proto::FileToolInputSnapshot>,
     preview: Arc<FileChangePreview>,
     highlight: Option<Arc<comet_syntax::HighlightedDocument>>,
@@ -3139,14 +3385,18 @@ struct FileInputReady {
 
 struct FileChangeScroll {
     plain: ScrollHandle,
-    virtualized: UniformListScrollHandle,
+    virtualized: ListState,
+    virtualized_key: Option<(usize, usize, SharedString)>,
+    measured_height: Rc<Cell<f32>>,
 }
 
 impl Default for FileChangeScroll {
     fn default() -> Self {
         Self {
             plain: ScrollHandle::new(),
-            virtualized: UniformListScrollHandle::new(),
+            virtualized: ListState::new(0, gpui::ListAlignment::Top, px(100.0)),
+            virtualized_key: None,
+            measured_height: Rc::new(Cell::new(0.0)),
         }
     }
 }
@@ -3322,6 +3572,7 @@ impl Transcript {
             folds: HashMap::new(),
             turn_steps_open: HashMap::new(),
             tool_details: HashMap::new(),
+            tool_payload_scrolls: HashMap::new(),
             reasoning_started: HashMap::new(),
             reasoning_tick: None,
             inline_images: HashMap::new(),
@@ -4297,6 +4548,7 @@ impl Transcript {
                 .and_then(|chat_id| self.saved_viewports.get_cloned_and_touch(chat_id));
             self.remember_current_viewport();
             self.sticky_turn.attach_chat(selected.as_deref());
+            self.sticky_scroll_y = 0.0;
             let keep_own_turn = self
                 .own_turn
                 .as_ref()
@@ -4318,6 +4570,7 @@ impl Transcript {
             self.file_change_open.clear();
             self.file_change_inputs.clear();
             self.file_change_scrolls.clear();
+            self.tool_payload_scrolls.clear();
             self.reasoning_started.clear();
             self.reasoning_tick = None;
             self.inline_images.clear();
@@ -4433,9 +4686,7 @@ impl Transcript {
 
         // Capture this before the row splice changes the list's measured end.
         // When the user is truly live-following, retaining the end anchor
-        // keeps the in-flow working trailer at the same viewport position as
-        // transcript lines grow above it. Nothing about the trailer's layout
-        // or coordinates changes.
+        // keeps the transcript's tail steady as lines grow above it.
         let live_following = should_anchor_live_stream(
             self.pinned,
             self.distance_from_bottom(),
@@ -4704,7 +4955,13 @@ impl Transcript {
                                 .map(Arc::new)
                             })
                         });
+                        let line_numbers = if derived.source.is_some() {
+                            crate::file_change::file_diff_line_numbers(&derived.preview)
+                        } else {
+                            vec![(None, None); derived.preview.lines.len()]
+                        };
                         Some(FileInputReady {
+                            line_numbers: Arc::new(line_numbers),
                             snapshot: Arc::new(snapshot),
                             preview: Arc::new(derived.preview),
                             highlight,
@@ -5405,11 +5662,6 @@ impl Transcript {
 
     // ---- rendering ----
 
-    /// The working loader, INSIDE the conversation flow: appended under the
-    /// last row while the run is live (moved out of the shell's status strip
-    /// — user request), so it reads as part of the streaming reply and
-    /// scrolls away with it. The spinner drives this entity's frames, which
-    /// keeps the elapsed timer ticking through delta-quiet tool runs.
     /// The failed-send retry (trailer affordance): re-kick every delivery
     /// road engine-side (fresh chat2 socket, host nudge, delivery escorts)
     /// and restart the grace clock so the trailer returns to Sending/Queued
@@ -5438,7 +5690,15 @@ impl Transcript {
         }
     }
 
-    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Shared activity presenter: the shell docks the main Chat above its
+    /// composer; subagent panes keep it under their last transcript row.
+    /// Animate the entity that owns the rendered surface.
+    pub(crate) fn render_working_trailer(
+        &self,
+        view: gpui::EntityId,
+        reserve_space: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let now = chrono::Utc::now();
         let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
             // A subagent doc has no Session row — `indicator_for` would read
@@ -5472,7 +5732,10 @@ impl Transcript {
                         .flex_row()
                         .items_center()
                         .gap(px(Theme::SPACE_SM))
-                        .pt(px(10.0))
+                        .when(self.doc_override.is_some() || reserve_space, |row| {
+                            row.pt(px(10.0))
+                        })
+                        .when(reserve_space, |row| row.invisible())
                         .text_size(px(12.0))
                         .text_color(theme.danger)
                         .cursor_pointer()
@@ -5491,7 +5754,10 @@ impl Transcript {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .pt(px(10.0))
+                                .when(self.doc_override.is_some() || reserve_space, |row| {
+                                    row.pt(px(10.0))
+                                })
+                                .when(reserve_space, |row| row.invisible())
                                 .text_size(px(12.0))
                                 .text_color(theme.text_faint)
                                 .child(SharedString::from("Queued — waiting for connection…"))
@@ -5517,6 +5783,18 @@ impl Transcript {
             };
             (sending, queued, elapsed, flavour_seed(&chat_id))
         };
+        if reserve_space {
+            // Keep the previous in-flow footprint without painting another
+            // indicator or registering an animation lease. The blank text
+            // inherits exactly the same font/line metrics as its old label.
+            return Some(
+                div()
+                    .pt(px(24.0))
+                    .text_size(px(11.0))
+                    .child(div().text_size(px(12.0)).child("\u{00a0}"))
+                    .into_any_element(),
+            );
+        }
         let word = if queued {
             "Queued — will send automatically".to_string()
         } else if sending {
@@ -5531,13 +5809,13 @@ impl Transcript {
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM))
-                .pt(px(10.0))
+                .when(self.doc_override.is_some(), |row| row.pt(px(24.0)))
                 .text_size(px(11.0))
                 .child(crate::loaders::gradient_spinner(
                     "working-indicator",
                     &theme,
                     2.5,
-                    cx.entity_id(),
+                    view,
                     cx,
                 ))
                 .child(
@@ -5776,14 +6054,14 @@ impl Transcript {
         } else {
             0.0
         };
-        // Live-run loader rides under the LAST row's content (above its
-        // clearance pad), so it sits right beneath the working reply.
+        // The main Chat's indicator is docked above the composer by Shell.
+        // Reserve its old footprint so only the indicator moves, not the
+        // content. Subagent panes keep their visible indicator in-flow.
         let trailer = (ix + 1 == self.rows.len())
-            .then(|| self.render_working_trailer(cx))
+            .then(|| self.render_working_trailer(cx.entity_id(), self.doc_override.is_none(), cx))
             .flatten();
 
-        let user_geometry = matches!(row.kind, RowKind::User { .. })
-            .then(|| (row.id.clone(), self.sticky_scroll_y));
+        let user_geometry = matches!(row.kind, RowKind::User { .. }).then(|| row.id.clone());
         let inner = self.render_row_body(&row, user_geometry, window, &theme, cx);
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -5912,7 +6190,7 @@ impl Transcript {
     fn render_row_body(
         &mut self,
         row: &Row,
-        user_geometry: Option<(SharedString, f32)>,
+        user_geometry: Option<SharedString>,
         window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -5981,7 +6259,6 @@ impl Transcript {
                         .border_1()
                         .border_color(theme.border)
                         .bg(user_message_card_background(&theme))
-                        .when(!theme.is_frost(), |el| el.shadow_lg())
                         .px(px(12.0))
                         .py(px(USER_MESSAGE_CARD_PAD_Y))
                         .text_size(px(14.0))
@@ -6046,7 +6323,6 @@ impl Transcript {
                             .border_1()
                             .border_color(theme.border)
                             .bg(user_message_card_background(&theme))
-                            .when(!theme.is_frost(), |el| el.shadow_lg())
                             .px(px(12.0))
                             .py(px(USER_MESSAGE_CARD_PAD_Y))
                             .text_size(px(14.0))
@@ -6056,7 +6332,7 @@ impl Transcript {
                             .child(summary),
                     );
                 }
-                if let Some((geometry_id, scroll_y)) = user_geometry {
+                if let Some(geometry_id) = user_geometry {
                     let weak = cx.weak_entity();
                     column
                         .on_children_prepainted(move |bounds, _, cx| {
@@ -6073,17 +6349,28 @@ impl Transcript {
                             if height <= 0.0 {
                                 return;
                             }
-                            weak.update(cx, |this, cx| {
-                                if this.sticky_turn.record_geometry(
-                                    geometry_id.clone(),
-                                    top,
-                                    height,
-                                    scroll_y,
-                                ) {
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
+                            let weak = weak.clone();
+                            let geometry_id = geometry_id.clone();
+                            // The list resolves pending scroll anchors during
+                            // prepaint. Pair this top with that same layout's
+                            // offset after the list releases its mutable borrow.
+                            cx.defer(move |cx| {
+                                weak.update(cx, |this, cx| {
+                                    let scroll_y = sticky_scroll_offset(
+                                        f32::from(this.list.scroll_px_offset_for_scrollbar().y),
+                                        f32::from(this.list.max_offset_for_scrollbar().y),
+                                    );
+                                    if this.sticky_turn.record_geometry(
+                                        geometry_id,
+                                        top,
+                                        height,
+                                        scroll_y,
+                                    ) {
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            });
                         })
                         .into_any_element()
                 } else {
@@ -6182,9 +6469,19 @@ impl Transcript {
             }
             RowKind::Reasoning {
                 tree,
+                label,
                 active,
                 duration_ms,
-            } => self.render_reasoning(&row.id, tree, *active, *duration_ms, window, &theme, cx),
+            } => self.render_reasoning(
+                &row.id,
+                tree,
+                label,
+                *active,
+                *duration_ms,
+                window,
+                &theme,
+                cx,
+            ),
             RowKind::InlineImages { paths } => {
                 self.render_inline_image_gallery(&row.id, paths, &theme, cx)
             }
@@ -6204,9 +6501,28 @@ impl Transcript {
                 created,
                 resolved,
                 is_error,
-            } => task_snapshot_card(items, *created, *resolved, *is_error, &theme),
-            RowKind::InputChip { header, resolved } => {
-                input_chip(header.clone(), *resolved, &theme)
+            } => {
+                let open = self
+                    .folds
+                    .get(&row.id)
+                    .and_then(|fold| fold.open)
+                    .unwrap_or(false);
+                let toggle_id = row.id.clone();
+                div()
+                    .id(SharedString::from(format!("{}-tasks", row.id)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.invalidate_sticky_users_after_row(&toggle_id);
+                        this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
+                        cx.notify();
+                    }))
+                    .child(task_snapshot_card(
+                        items, *created, *resolved, *is_error, open, &theme,
+                    ))
+                    .into_any_element()
+            }
+            RowKind::Question { history } => {
+                crate::questions::render(history, &theme, cx.entity_id(), cx)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::Notice { text } => notice_divider(text.clone(), &theme),
@@ -6221,10 +6537,10 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::file_change::{
-            FILE_CARD_HEADER_HEIGHT, effective_file_path, file_card_action, file_card_body_height,
-            file_card_can_expand, file_card_should_contain_wheel,
-            file_card_should_occlude_outer_scroll, file_card_should_virtualize,
-            file_card_virtualized_footer_index, file_card_virtualized_item_count,
+            effective_file_path, file_card_action, file_card_body_height, file_card_can_expand,
+            file_card_should_contain_wheel, file_card_should_occlude_outer_scroll,
+            file_card_should_virtualize, file_card_virtualized_footer_index,
+            file_card_virtualized_item_count,
         };
 
         let Some(call_path) = file_change_path(&tool.call) else {
@@ -6247,12 +6563,16 @@ impl Transcript {
             call_path,
             ready.as_ref().map(|ready| ready.snapshot.as_ref()),
         );
-        let preview = ready
-            .as_ref()
-            .map(|ready| ready.preview.as_ref())
-            .or_else(|| tool.file_preview.as_deref());
-        let can_expand = file_card_can_expand(tool.resolved, preview.is_some());
+        let can_expand = file_card_can_expand(
+            tool.resolved,
+            ready.is_some() || tool.file_preview.is_some(),
+        );
         let open = can_expand && self.file_change_open.get(row_id).copied().unwrap_or(false);
+        let preview = crate::file_change::file_card_preview(
+            open,
+            tool.file_preview.as_deref(),
+            ready.as_ref().map(|ready| ready.preview.as_ref()),
+        );
         let filename = std::path::Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -6268,15 +6588,18 @@ impl Transcript {
         let row_toggle = row_id.clone();
         let tool_id = tool.id.to_string();
         let toggle_preview = tool.file_preview.clone();
-        let mut header = div()
-            .id(SharedString::from(format!("{row_id}#file-header")))
-            .h(px(FILE_CARD_HEADER_HEIGHT))
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(7.0))
+        // Native EditToolDiffCard: one frame owns the header and unified diff.
+        let mut header = stream_event_row(theme)
+            .h(px(28.0))
             .px(px(10.0))
+            .gap(px(6.0))
+            .text_size(px(12.0))
+            // GPUI overflow masks are rectangular. The header paints its own
+            // inner radius (outer 8px minus the 1px border), or its fill leaks
+            // behind the card's rounded top corners.
+            .rounded_t(px(7.0))
+            .when(preview.is_none(), |header| header.rounded_b(px(7.0)))
+            .id(SharedString::from(format!("{row_id}#file-header")))
             .cursor(if can_expand {
                 gpui::CursorStyle::PointingHand
             } else {
@@ -6293,18 +6616,56 @@ impl Transcript {
                 )
             }))
             .child(
-                crate::icons::icon(crate::icons::DOCUMENT_ADD)
-                    .size(px(14.0))
-                    .text_color(theme.text_muted),
+                div()
+                    .w(px(STREAM_ICON))
+                    .flex_none()
+                    .child(tool_icon(&tool.call, theme)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text_muted)
+                    .child(file_card_action(kind, tool.resolved, tool.is_error)),
             );
+        let filename_text = if !tool.resolved {
+            let phase = motion::pulse_delta(
+                &motion::MotionSpec::new(1200, motion::EASE),
+                cx.entity_id(),
+                cx,
+            );
+            let count = filename.chars().count().max(1) as f32;
+            let runs = filename
+                .chars()
+                .enumerate()
+                .map(|(ix, ch)| TextRun {
+                    len: ch.len_utf8(),
+                    font: gpui::font(theme.font_sans.clone()),
+                    color: if !motion::reduced_motion(cx)
+                        && (ix as f32 / count - (phase * 1.6 - 0.3)).abs() < 0.18
+                    {
+                        theme.text
+                    } else {
+                        theme.text_faint
+                    },
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                })
+                .collect::<Vec<_>>();
+            gpui::StyledText::new(filename.clone())
+                .with_runs(runs)
+                .into_any_element()
+        } else {
+            div().child(filename.clone()).into_any_element()
+        };
         let file_label = div()
             .id(SharedString::from(format!("{row_id}#filename")))
             .min_w_0()
-            .flex_1()
+            .flex_shrink(1.0)
             .truncate()
             .text_size(px(12.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text)
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_color(theme.text_faint)
             .cursor_pointer()
             .when_some(open_target, |label, (context_key, root, relative_path)| {
                 label.on_click(cx.listener(move |_this, _, _, cx| {
@@ -6316,8 +6677,12 @@ impl Transcript {
                     });
                 }))
             })
-            .child(filename);
+            .child(filename_text);
         header = header.child(file_label);
+        if can_expand {
+            header = header.child(stream_disclosure(open, theme));
+        }
+        header = header.child(div().flex_1());
         if tool.resolved {
             if let Some(preview) = preview {
                 header = header
@@ -6349,40 +6714,93 @@ impl Transcript {
                 cx,
             ));
         }
-        header = header.child(
-            div()
-                .flex_none()
-                .text_size(px(10.0))
-                .text_color(if tool.is_error {
-                    theme.danger_muted
-                } else {
-                    theme.text_muted
-                })
-                .child(file_card_action(kind, tool.resolved, tool.is_error)),
-        );
-        if can_expand {
-            header = header.child(
-                crate::icons::icon(if open {
-                    crate::icons::ALT_ARROW_DOWN
-                } else {
-                    crate::icons::ALT_ARROW_RIGHT
-                })
-                .size(px(13.0))
-                .text_color(theme.text_muted),
-            );
-        }
-
         let mut card = div()
             .w_full()
             .min_w_0()
-            .overflow_hidden()
-            .rounded(px(9.0))
             .border_1()
-            .border_color(crate::theme::hairline(0.09))
-            .bg(crate::theme::ink(0.025))
+            .border_color(theme.border)
+            .rounded(px(8.0))
+            .overflow_hidden()
+            .bg(crate::theme::ink(0.035))
             .child(header);
 
+        if !tool.resolved {
+            if let Some(preview) = preview {
+                let lines = crate::file_change::streaming_file_lines(preview);
+                let viewport = Rc::new(Cell::new(Bounds::<Pixels>::default()));
+                let measure = viewport.clone();
+                let body = div()
+                    .h(px(crate::file_change::FILE_CARD_COLLAPSED_BODY_HEIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .relative()
+                    .overflow_hidden()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(render::CODE_TEXT_SIZE))
+                    .line_height(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .when(lines.len() > 3 || preview.truncated_before > 0, |body| {
+                        body.justify_end()
+                    })
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                measure.set(bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .children(lines.iter().map(|line| {
+                                file_change_line_row(
+                                    line,
+                                    (None, None),
+                                    [None, None],
+                                    &[],
+                                    theme,
+                                    viewport.clone(),
+                                    true,
+                                    true,
+                                )
+                            })),
+                    );
+                return card.child(body).into_any_element();
+            }
+            return card.into_any_element();
+        }
+
         if let Some(preview) = preview {
+            let scroll = self.file_change_scrolls.entry(row_id.clone()).or_default();
+            let plain_scroll = scroll.plain.clone();
+            let virtualized_scroll = scroll.virtualized.clone();
+            let measured_height = scroll.measured_height.clone();
+            let line_numbers = ready
+                .as_ref()
+                .filter(|_| open)
+                .map(|ready| ready.line_numbers.clone())
+                .unwrap_or_else(|| Arc::new(crate::file_change::file_diff_line_numbers(preview)));
+            // Keep only the numbered sides present in this preview. A write
+            // needs one column; a truncated tail has no reliable line numbers.
+            let gutter_widths = [0, 1].map(|side| {
+                line_numbers
+                    .iter()
+                    .filter_map(|numbers| if side == 0 { numbers.0 } else { numbers.1 })
+                    .max()
+                    .map(|number| number.to_string().len() as f32 * 7.0)
+            });
             let line_height = 20.0;
             let marker_height = if !open && preview.truncated_before > 0 {
                 line_height
@@ -6403,13 +6821,14 @@ impl Transcript {
                 None
             };
             let status_height = if status.is_some() { 24.0 } else { 0.0 };
-            let scroll_content_height = content_height + status_height;
+            let scroll_content_height = (content_height + status_height).max(measured_height.get());
             let body_height = file_card_body_height(open, scroll_content_height);
+            let viewport_bounds = Rc::new(Cell::new(Bounds::<Pixels>::default()));
             let contain_wheel =
                 file_card_should_contain_wheel(open, scroll_content_height, body_height);
             let occlude_outer_scroll =
                 file_card_should_occlude_outer_scroll(open, scroll_content_height, body_height);
-            let bounded_source = (ready.is_none() && tool.resolved).then(|| {
+            let bounded_source = ((!open || ready.is_none()) && tool.resolved).then(|| {
                 preview
                     .lines
                     .iter()
@@ -6417,146 +6836,157 @@ impl Transcript {
                     .collect::<Vec<_>>()
                     .join("\n")
             });
-            let highlights = if let Some(ready) = &ready {
+            let highlights = if let Some(ready) = ready.as_ref().filter(|_| open) {
                 ready.highlight.clone()
             } else if let Some(source) = bounded_source.as_deref() {
                 comet_syntax::language_for_path(path).and_then(|language| {
-                    self.highlights
-                        .request(row_id.clone(), 0, language, source, cx)
+                    self.highlights.request_after(
+                        row_id.clone(),
+                        0,
+                        language,
+                        source,
+                        Duration::from_millis(50),
+                        cx,
+                    )
                 })
             } else {
                 None
             };
-            let (plain_scroll, virtualized_scroll) = {
-                let scroll = self.file_change_scrolls.entry(row_id.clone()).or_default();
-                (scroll.plain.clone(), scroll.virtualized.clone())
-            };
-            let body_toggle = row_id.clone();
+            let body_row = row_id.clone();
             let body_tool = tool.id.to_string();
             let body_preview = tool.file_preview.clone();
             let mut body = div()
                 .id(SharedString::from(format!("{row_id}#file-body")))
-                .h(px(body_height))
+                .max_h(px(if open {
+                    crate::file_change::FILE_CARD_EXPANDED_MAX_HEIGHT
+                } else {
+                    crate::file_change::FILE_CARD_COLLAPSED_BODY_HEIGHT
+                }))
                 .min_h_0()
                 .w_full()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .border_t_1()
-                .border_color(crate::theme::hairline(0.07))
+                .border_color(theme.border)
                 .font_family(theme.font_mono.clone())
-                .text_size(px(11.5))
+                .text_size(px(render::CODE_TEXT_SIZE))
                 .line_height(px(line_height))
-                .when(can_expand, |body| {
+                .when(contain_wheel, |body| {
+                    body.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                })
+                .when(occlude_outer_scroll, |body| body.occlude())
+                .overflow_hidden()
+                .when(can_expand && !open, |body| {
                     body.cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_file_change(
-                                body_toggle.clone(),
+                                body_row.clone(),
                                 body_tool.clone(),
                                 true,
                                 kind,
                                 body_preview.clone(),
                                 cx,
-                            )
+                            );
                         }))
-                })
-                .when(contain_wheel, |body| {
-                    body.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                })
-                .when(occlude_outer_scroll, |body| body.occlude())
-                .overflow_hidden();
+                });
             let virtualized =
                 open && ready.is_some() && file_card_should_virtualize(preview.lines.len());
             if virtualized {
                 let lines = ready.as_ref().unwrap().preview.clone();
                 let highlights = highlights.clone();
+                let line_numbers = line_numbers.clone();
+                let viewport_bounds = viewport_bounds.clone();
                 let theme = theme.clone();
                 let footer_index =
                     file_card_virtualized_footer_index(lines.lines.len(), status.is_some());
                 let item_count =
                     file_card_virtualized_item_count(lines.lines.len(), status.is_some());
+                let key = (
+                    Arc::as_ptr(&lines) as usize,
+                    item_count,
+                    theme.font_mono.clone(),
+                );
+                let scroll = self.file_change_scrolls.get_mut(row_id).unwrap();
+                if scroll.virtualized_key.as_ref() != Some(&key) {
+                    virtualized_scroll.reset_with_uniform_height(item_count, px(line_height));
+                    scroll.virtualized_key = Some(key);
+                }
                 let weak = cx.weak_entity();
                 let retry_target = self.file_fetch_target(cx);
                 let retry_row = row_id.clone();
                 let retry_tool = tool.id.to_string();
                 let retry_preview = tool.file_preview.clone();
                 body = body.child(
-                    uniform_list(
-                        SharedString::from(format!("{row_id}#file-lines")),
-                        item_count,
-                        move |range, _, _cx| {
-                            range
-                                .map(|index| {
-                                    if footer_index == Some(index) {
-                                        let (label, retry) = status.unwrap();
-                                        let mut footer = div()
-                                            .id(SharedString::from(format!(
-                                                "{retry_row}#file-status"
-                                            )))
-                                            .h(px(line_height))
-                                            .flex_none()
-                                            .px(px(10.0))
-                                            .flex()
-                                            .items_center()
-                                            .text_size(px(10.5))
-                                            .text_color(if retry {
-                                                theme.danger_muted
-                                            } else {
-                                                theme.text_faint
-                                            });
-                                        if retry {
-                                            let weak = weak.clone();
-                                            let retry_target = retry_target.clone();
-                                            let retry_row = retry_row.clone();
-                                            let retry_tool = retry_tool.clone();
-                                            let retry_preview = retry_preview.clone();
-                                            footer = footer.cursor_pointer().on_click(
-                                                move |_, _, cx| {
-                                                    cx.stop_propagation();
-                                                    if let Some((
-                                                        chat_id,
-                                                        target_device_id,
-                                                        parent_tool_use_id,
-                                                    )) = retry_target.clone()
-                                                    {
-                                                        weak.update(cx, |this, cx| {
-                                                            this.spawn_file_input_fetch(
-                                                                retry_row.clone(),
-                                                                chat_id,
-                                                                retry_tool.clone(),
-                                                                target_device_id,
-                                                                parent_tool_use_id,
-                                                                kind,
-                                                                retry_preview.clone(),
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                    }
-                                                },
+                    list(virtualized_scroll, move |index, _, _cx| {
+                        if footer_index == Some(index) {
+                            let (label, retry) = status.unwrap();
+                            let mut footer = div()
+                                .id(SharedString::from(format!("{retry_row}#file-status")))
+                                .h(px(line_height))
+                                .flex_none()
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .text_size(px(10.5))
+                                .text_color(if retry {
+                                    theme.danger_muted
+                                } else {
+                                    theme.text_faint
+                                });
+                            if retry {
+                                let weak = weak.clone();
+                                let retry_target = retry_target.clone();
+                                let retry_row = retry_row.clone();
+                                let retry_tool = retry_tool.clone();
+                                let retry_preview = retry_preview.clone();
+                                footer = footer.cursor_pointer().on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some((chat_id, target_device_id, parent_tool_use_id)) =
+                                        retry_target.clone()
+                                    {
+                                        weak.update(cx, |this, cx| {
+                                            this.spawn_file_input_fetch(
+                                                retry_row.clone(),
+                                                chat_id,
+                                                retry_tool.clone(),
+                                                target_device_id,
+                                                parent_tool_use_id,
+                                                kind,
+                                                retry_preview.clone(),
+                                                cx,
                                             );
-                                        }
-                                        return footer.child(label).into_any_element();
+                                        })
+                                        .ok();
                                     }
-                                    let spans = highlights
-                                        .as_ref()
-                                        .and_then(|document| document.lines.get(index))
-                                        .map(Vec::as_slice)
-                                        .unwrap_or_default();
-                                    file_change_line_row(&lines.lines[index], spans, &theme)
-                                })
-                                .collect()
-                        },
-                    )
+                                });
+                            }
+                            return footer.child(label).into_any_element();
+                        }
+                        let spans = highlights
+                            .as_ref()
+                            .and_then(|document| document.lines.get(index))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        file_change_line_row(
+                            &lines.lines[index],
+                            line_numbers[index],
+                            gutter_widths,
+                            spans,
+                            &theme,
+                            viewport_bounds.clone(),
+                            true,
+                            false,
+                        )
+                    })
                     .h(px(body_height))
-                    .w_full()
-                    .track_scroll(&virtualized_scroll),
+                    .w_full(),
                 );
             } else {
                 body = body
-                    .when(open, |body| {
-                        body.overflow_y_scroll().track_scroll(&plain_scroll)
-                    })
-                    .when(!open, |body| body.overflow_hidden());
+                    .when(open, |body| body.overflow_y_scroll())
+                    .when(!open, |body| body.overflow_hidden())
+                    .track_scroll(&plain_scroll);
                 if !open && preview.truncated_before > 0 {
                     body = body.child(
                         div()
@@ -6574,7 +7004,16 @@ impl Transcript {
                         .and_then(|document| document.lines.get(index))
                         .map(Vec::as_slice)
                         .unwrap_or_default();
-                    file_change_line_row(line, spans, theme)
+                    file_change_line_row(
+                        line,
+                        line_numbers[index],
+                        gutter_widths,
+                        spans,
+                        theme,
+                        viewport_bounds.clone(),
+                        true,
+                        false,
+                    )
                 }));
             }
 
@@ -6621,7 +7060,50 @@ impl Transcript {
                     body = body.child(status_row.child(label));
                 }
             }
-            card = card.child(body);
+            // Measure only after the scroller has prepainted. Scheduling a
+            // next frame from every paint kept idle cards rendering forever.
+            let weak = cx.weak_entity();
+            let measured_row = row_id.clone();
+            card = card.child(
+                div()
+                    .relative()
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                viewport_bounds.set(bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .child(body)
+                    .on_children_prepainted(move |_, _, cx| {
+                        if virtualized {
+                            return;
+                        }
+                        let height = f32::from(
+                            plain_scroll.bounds().size.height + plain_scroll.max_offset().y,
+                        );
+                        if (height - measured_height.get()).abs() > 0.5 {
+                            measured_height.set(height);
+                            let weak = weak.clone();
+                            let measured_row = measured_row.clone();
+                            // The outer list holds its layout borrow during
+                            // prepaint. Remeasure only after that borrow ends.
+                            cx.defer(move |cx| {
+                                weak.update(cx, |this, cx| {
+                                    // A card cannot move the user row preceding it.
+                                    this.remeasure_row_containing(&measured_row);
+                                    cx.notify();
+                                })
+                                .ok();
+                            });
+                        }
+                    }),
+            );
         }
         card.into_any_element()
     }
@@ -6638,18 +7120,9 @@ impl Transcript {
     ) -> AnyElement {
         let open = turn_steps_is_open(&self.turn_steps_open, row_id.as_ref());
         let toggle_id = row_id.clone();
-        let mut header = div()
+        let mut header = stream_event_row(theme)
             .id(SharedString::from(format!("{row_id}-hdr")))
-            .h(px(26.0))
-            .w_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(4.0))
             .cursor_pointer()
-            .text_size(px(12.0))
-            .line_height(px(18.0))
             .text_color(theme.text_muted)
             .hover(|style| style.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -6658,12 +7131,27 @@ impl Transcript {
                 cx.notify();
             }))
             .child(
-                crate::icons::icon(crate::icons::CHECKLIST)
-                    .size(px(14.0))
+                div()
+                    .w(px(STREAM_ICON))
+                    .h_full()
                     .flex_none()
-                    .text_color(theme.text_muted.opacity(0.72)),
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(crate::icons::CHECKLIST)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted.opacity(0.72)),
+                    ),
             )
-            .child(div().min_w_0().flex_1().truncate().child(summary.clone()));
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_shrink(1.0)
+                    .truncate()
+                    .child(SharedString::from(format!("Activity · {summary}"))),
+            );
         if let Some(duration) = turn_steps_duration_label(duration_ms) {
             header = header.child(
                 div()
@@ -6674,39 +7162,43 @@ impl Transcript {
                     .child(SharedString::from(duration)),
             );
         }
-        header = header.child(
-            div()
-                .size(px(18.0))
-                .flex_none()
-                .rounded(px(5.0))
-                .bg(crate::theme::ink(0.06))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(10.0))
-                .text_color(theme.text_muted.opacity(0.7))
-                .child(SharedString::from(if open { "▾" } else { "▸" })),
-        );
+        header = header.child(stream_disclosure(open, theme));
 
         let mut disclosure = div().w_full().flex().flex_col().child(header);
         if open {
             let children = visible_turn_step_children(open, rows)
                 .iter()
-                .map(|child| {
+                .enumerate()
+                .map(|(index, child)| {
                     let body = self.render_row_body(child, None, window, theme, cx);
-                    div().id(child.id.clone()).w_full().min_w_0().child(body)
+                    let gap = if index == 0 {
+                        render::MD_BLOCK_GAP
+                    } else {
+                        top_gap_for(rows.get(index - 1), child)
+                    };
+                    div()
+                        .id(child.id.clone())
+                        .w_full()
+                        .min_w_0()
+                        .pt(px(gap))
+                        .child(body)
                 })
                 .collect::<Vec<_>>();
             disclosure = disclosure.child(
                 div()
                     .w_full()
+                    .pl(px(STREAM_ICON))
                     .flex()
                     .flex_col()
-                    .gap(px(6.0))
                     .children(children),
             );
         }
-        disclosure.into_any_element()
+        // One boundary below the entire activity disclosure, open or closed.
+        // The final answer is the next projected row, never a nested child.
+        disclosure
+            .child(div().mt(px(12.0)).h(px(1.0)).w_full().bg(theme.border))
+            .pb(px(8.0))
+            .into_any_element()
     }
 
     fn copy_message(&mut self, entry_id: SharedString, text: SharedString, cx: &mut Context<Self>) {
@@ -6862,6 +7354,7 @@ impl Transcript {
         &mut self,
         row_id: &SharedString,
         tree: &Arc<BlockTree>,
+        label: &SharedString,
         active: bool,
         duration_ms: Option<u64>,
         window: &Window,
@@ -6869,82 +7362,75 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.folds.get(row_id).and_then(|fold| fold.open);
-        let open = reasoning_is_open(open, active);
-        let label = if active {
+        let has_detail = reasoning_has_detail(tree);
+        let open = has_detail && reasoning_is_open(open, active);
+        let duration_label = if active {
             let started = *self
                 .reasoning_started
                 .entry(row_id.clone())
                 .or_insert_with(Instant::now);
             self.ensure_reasoning_tick(cx);
-            format!(
-                "Thinking · {}",
-                format_reasoning_elapsed(started.elapsed().as_millis() as u64)
-            )
+            format_reasoning_elapsed(started.elapsed().as_millis() as u64)
         } else {
             self.reasoning_started.remove(row_id);
             format_thought_duration(duration_ms).unwrap_or_else(|| "Thought".into())
         };
         let toggle_id = row_id.clone();
-        let header = div()
+        let header = stream_event_row(theme)
             .id(SharedString::from(format!("{row_id}-reasoning-header")))
-            .w_full()
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .px(px(4.0))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .hover(|style| style.bg(crate::theme::ink(0.035)))
+            .cursor(if has_detail {
+                gpui::CursorStyle::PointingHand
+            } else {
+                gpui::CursorStyle::Arrow
+            })
+            .hover(|style| style.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
+                if !has_detail {
+                    return;
+                }
                 this.invalidate_sticky_users_after_row(&toggle_id);
                 this.folds.entry(toggle_id.clone()).or_default().open = Some(!open);
                 cx.notify();
             }))
             .child(
-                crate::icons::icon(crate::icons::THOUGHT_SPARKLE)
-                    .size(px(13.0))
-                    .text_color(if active {
-                        theme.text_muted
-                    } else {
-                        theme.text_faint
+                div()
+                    .w(px(STREAM_ICON))
+                    .h_full()
+                    .flex_none()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(active, |slot| {
+                        slot.child(crate::loaders::gradient_spinner(
+                            "reasoning-indicator",
+                            &theme,
+                            2.5,
+                            cx.entity_id(),
+                            cx,
+                        ))
                     }),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .min_w_0()
+                    .flex_shrink(1.0)
+                    .truncate()
                     .text_color(theme.text_muted)
-                    .child(SharedString::from(label)),
+                    .child(label.clone()),
             )
             .when(active, |row| {
-                row.child(crate::loaders::mini_mono_spinner(
-                    format!("{row_id}-reasoning"),
-                    1.8,
-                    theme.text_muted,
-                    cx.entity_id(),
-                    cx,
-                ))
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(duration_label)),
+                )
             })
-            .child(div().flex_1())
-            .child(
-                div()
-                    .size(px(18.0))
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.05))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        crate::icons::icon(if open {
-                            crate::icons::ALT_ARROW_DOWN
-                        } else {
-                            crate::icons::ALT_ARROW_RIGHT
-                        })
-                        .size(px(11.0))
-                        .text_color(theme.text_faint),
-                    ),
-            );
+            .when(has_detail, |row| {
+                row.child(stream_disclosure(open, theme).opacity(1.0))
+            });
 
         let mut column = div().w_full().flex().flex_col().child(header);
         if open {
@@ -6958,20 +7444,27 @@ impl Transcript {
             };
             let highlights = self.code_highlight_for(row_id, tree, None, cx);
             let mut trace_theme = theme.clone();
-            trace_theme.text = theme.text_muted;
+            trace_theme.text = theme.text_faint;
             trace_theme.text_muted = theme.text_faint;
             let content = render::render_tree(tree, &opts, &trace_theme, window, &|ix| {
                 highlights.get(&ix).cloned().flatten()
             });
+            let scroll = self
+                .tool_payload_scrolls
+                .entry(row_id.clone())
+                .or_insert_with(ScrollHandle::new)
+                .clone();
             column = column.child(
                 div()
-                    .ml(px(7.0))
-                    .mt(px(3.0))
-                    .pl(px(18.0))
-                    .py(px(4.0))
+                    .id(SharedString::from(format!("{row_id}-reasoning-body")))
+                    .max_h(px(240.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .ml(px(STREAM_ICON / 2.0))
+                    .pl(px(24.0))
                     .border_l_1()
-                    .border_color(crate::theme::hairline(0.08))
-                    .text_size(px(12.5))
+                    .border_color(theme.border)
+                    .py(px(GAP_BLOCK))
                     .child(content),
             );
         }
@@ -7366,6 +7859,118 @@ impl Transcript {
         }));
     }
 
+    fn render_subagent_batch(
+        &self,
+        row_id: &SharedString,
+        tools: &[ToolItem],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .w_full()
+            .min_w_0()
+            .min_h(px(32.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(12.0))
+            .font_family(theme.font_sans.clone())
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_size(px(render::MD_TEXT_SIZE))
+            .line_height(px(CHIP_HEIGHT));
+        for (ix, tool) in tools.iter().enumerate() {
+            let title = subagent_tab_title(&tool.call);
+            let doc_id = tool.subagent_ref.clone().expect("linked sibling");
+            let chat_id = self
+                .journal_chat_id
+                .clone()
+                .or_else(|| self.chat_id.clone())
+                .unwrap_or_default();
+            let parent_tool_use_id = tool.id.clone();
+            let frozen = matches!(
+                tool.subagent_status,
+                Some(SubagentStatus::Done | SubagentStatus::Failed)
+            );
+            let failed = tool.is_error || tool.subagent_status == Some(SubagentStatus::Failed);
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("{row_id}#s{ix}")))
+                    .min_w_0()
+                    .max_w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .text_color(if failed {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    })
+                    .hover(|style| style.text_color(theme.text))
+                    .child(
+                        img(
+                            crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
+                                &doc_id,
+                            ),
+                        )
+                        .size(px(28.0))
+                        .flex_none()
+                        .object_fit(ObjectFit::Contain),
+                    )
+                    .child(div().min_w_0().child(title.clone()))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(TranscriptEvent::OpenSubagent {
+                            chat_id: chat_id.clone(),
+                            doc_id: doc_id.to_string(),
+                            parent_tool_use_id: parent_tool_use_id.to_string(),
+                            title: title.to_string(),
+                            frozen,
+                        });
+                    })),
+            );
+        }
+        let running = tools
+            .iter()
+            .any(|tool| tool.subagent_status == Some(SubagentStatus::Running));
+        let failed = tools
+            .iter()
+            .any(|tool| tool.is_error || tool.subagent_status == Some(SubagentStatus::Failed));
+        let completed = tools.iter().all(|tool| {
+            matches!(
+                tool.subagent_status,
+                Some(SubagentStatus::Done | SubagentStatus::Failed)
+            )
+        });
+        let status = match (running, failed, completed) {
+            (true, true, _) => "Working · some failed",
+            (true, false, _) => "Working",
+            (false, true, true) => "Completed with failures",
+            (false, false, true) => "Completed",
+            (false, true, false) => "Starting · some failed",
+            _ => "Starting",
+        };
+        let mut summary = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_color(if failed {
+                theme.danger
+            } else {
+                theme.text_faint
+            })
+            .child(status);
+        if running {
+            summary = summary.child(crate::loaders::mini_mono_spinner(
+                format!("{row_id}#batch-spinner"),
+                2.0,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ));
+        }
+        row.child(summary).into_any_element()
+    }
+
     fn render_tool_group(
         &mut self,
         row_id: &SharedString,
@@ -7375,9 +7980,17 @@ impl Transcript {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if tools.len() > 1
+            && tools[0].subagent_batch.is_some()
+            && tools
+                .iter()
+                .all(|tool| is_spawn_link(tool) && tool.subagent_batch == tools[0].subagent_batch)
+        {
+            return self.render_subagent_batch(row_id, tools, theme, cx);
+        }
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
-        // Agent/spawn chips never fold: they are their own row, always open,
-        // no "Called N tools" header — a running subagent stays visible.
+        // Calls stay directly visible. Only TurnSteps owns an aggregate header;
+        // each invocation/output below still has its own detail disclosure.
         let collapses = tool_group_collapses(tools);
         let open = !collapses || fold.open.unwrap_or(auto_open);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
@@ -7514,6 +8127,44 @@ impl Transcript {
                     .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
             })
             .collect();
+        let invocation_highlights: Vec<_> = tools
+            .iter()
+            .enumerate()
+            .map(|(ix, tool)| {
+                if !detail_opens[ix] {
+                    return None;
+                }
+                let language = match &tool.call {
+                    ToolCall::Exec { .. } => Lang::Bash,
+                    ToolCall::Mcp { input: Some(_), .. }
+                    | ToolCall::Unknown { input: Some(_), .. } => Lang::Json,
+                    _ => return None,
+                };
+                let ToolDetail::Output { lines, .. } = invocations[ix].as_deref()? else {
+                    return None;
+                };
+                // Keep the operation label outside the JSON grammar while retaining line offsets.
+                let source = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(line_ix, line)| {
+                        if language == Lang::Json && line_ix == 0 {
+                            ""
+                        } else {
+                            line.as_ref()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.highlights.request(
+                    SharedString::from(format!("{row_id}#invocation")),
+                    ix,
+                    language,
+                    &source,
+                    cx,
+                )
+            })
+            .collect();
         let open_height = chips_height(tools.len())
             + details
                 .iter()
@@ -7522,8 +8173,7 @@ impl Transcript {
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
                 .map(|(((detail, invocation), affordance), _)| {
-                    invocation.as_deref().map_or(0.0, detail_height)
-                        + detail.as_deref().map_or(0.0, detail_height)
+                    tool_payload_height(invocation.as_deref(), detail.as_deref())
                         + if affordance.is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
@@ -7535,24 +8185,18 @@ impl Transcript {
         let summary = tool_group_summary(tools);
 
         let toggle_id = row_id.clone();
-        // Header (zeron tool-group.tsx): a small chevron tile centered over the
-        // chips' guide rail, then the quiet 12px summary.
-        let header = div()
+        let group_icon = crate::icons::icon(crate::icons::CHECKLIST)
+            .size(px(14.0))
+            .text_color(theme.text_muted)
+            .into_any_element();
+        // Group summary uses the same row geometry as reasoning and task events.
+        let header = stream_event_row(theme)
             .id(SharedString::from(format!("{row_id}-hdr")))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(4.0))
-            .h(px(26.0))
             .cursor_pointer()
-            .text_size(px(12.0))
-            .line_height(px(18.0))
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
-            // chips (destructive tint, zeron tool-chip.tsx) and in the
-            // summary's "· N failed" count.
+            // rows (destructive tint) and in the summary's "· N failed" count.
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -7561,28 +8205,29 @@ impl Transcript {
             }))
             .child(
                 div()
-                    .size(px(18.0))
+                    .w(px(STREAM_ICON))
+                    .h_full()
                     .flex_none()
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.06))
+                    .relative()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(10.0))
-                    .text_color(theme.text_muted.opacity(0.7))
-                    .child(SharedString::from(if open { "▾" } else { "▸" })),
+                    .child(group_icon),
             )
             .child(
                 div()
                     .min_w_0()
-                    .h(px(18.0))
+                    .flex_shrink(1.0)
+                    .h(px(render::MD_LINE_HEIGHT))
                     .flex()
                     .items_center()
                     .truncate()
                     .child(SharedString::from(summary)),
-            );
+            )
+            .child(stream_disclosure(open, theme));
 
         let chips = div()
+            .when(collapses, |column| column.pl(px(STREAM_ICON + 8.0)))
             .pt(px(CHIPS_TOP_PAD))
             .flex()
             .flex_col()
@@ -7615,7 +8260,6 @@ impl Transcript {
                                 frozen,
                             });
                         }),
-                        collapses,
                         theme,
                         cx.entity_id(),
                         cx,
@@ -7624,7 +8268,7 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, collapses, theme, cx.entity_id(), cx);
+                    return tool_chip(tool, theme, cx.entity_id(), cx);
                 }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
@@ -7634,43 +8278,29 @@ impl Transcript {
                 };
                 let open = detail_opens[ix];
                 let default_open = detail_defaults[ix];
-                let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
-                // Expandable chip: ONE card whose header row is the chip and
-                // whose body is the detail — not a floating card below it.
-                // The guide rail stretches with the row, so an open detail
-                // never breaks the rail.
-                //
-                // The card's height is EXPLICIT (border-box), not intrinsic:
-                // an auto-height card adds its 2px of borders on top of the
-                // 30px header, and with N chips that overflowed the group's
-                // analytic height by 2N px — the last chips rendered clipped
-                // (user report: "tool calls cut off at the bottom"). The
-                // explicit height is also what the open/close tween animates.
+                // Expandable stream row: header is the timeline line, with a
+                // naturally wrapped payload below it when open.
                 let closed_h = CHIP_CARD_HEIGHT;
                 let open_h = CHIP_CARD_HEIGHT
-                    + invocation.as_deref().map_or(0.0, detail_height)
-                    + detail.as_deref().map_or(0.0, detail_height)
+                    + tool_payload_height(invocation.as_deref(), detail.as_deref())
                     + affordance_h;
-                let card_target = if open { open_h } else { closed_h };
-                let animating = dfold.epoch > 0
-                    && dfold
-                        .toggled_at
-                        .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
                 let toggle_key = key.clone();
                 let group_key = row_id.clone();
+                let framed_command = matches!(tool.call, ToolCall::Exec { .. }) && open;
                 let mut card = div()
-                    .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
-                    .when(collapses, |el| el.ml(px(12.0)))
                     .min_w_0()
                     .flex_1()
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .rounded(px(9.0))
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.07))
-                    .bg(crate::theme::ink(0.03))
+                    .when(framed_command, |card| {
+                        card.border_1()
+                            .border_color(theme.border)
+                            .rounded(px(8.0))
+                            .bg(crate::theme::ink(0.035))
+                            .pb(px(TOOL_PAYLOAD_CHROME - 2.0))
+                    })
                     .child(
                         div()
                             .id(key.clone())
@@ -7678,9 +8308,12 @@ impl Transcript {
                             .flex_none()
                             .flex()
                             .items_center()
+                            .when(framed_command, |header| {
+                                header.px(px(8.0)).border_b_1().border_color(theme.border)
+                            })
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.invalidate_sticky_users_after_row(&group_key);
+                                this.remeasure_row_containing(&group_key);
                                 let entry =
                                     this.tool_details.entry(toggle_key.clone()).or_default();
                                 let currently_open = entry.open.unwrap_or(default_open);
@@ -7688,19 +8321,9 @@ impl Transcript {
                                 entry.open = Some(!currently_open);
                                 entry.epoch += 1;
                                 entry.toggled_at = Some(Instant::now());
-                                // Arm the GROUP body's height tween too (open
-                                // state untouched): the body's height is
-                                // analytic over the final detail state, so
-                                // without a tween the row snaps to the target
-                                // height while the card is still mid-tween —
-                                // content below teleported on expand and the
-                                // shrinking card clipped on collapse (user
-                                // report). `open_height` was computed with
-                                // the detail still in its pre-click state,
-                                // which is exactly the tween's start; both
-                                // tweens share the click instant and the
-                                // RESIZE curve, so the row tracks the card's
-                                // bottom edge frame-for-frame.
+                                // Keep the enclosing group's height transition
+                                // anchored to its pre-click size. The detail
+                                // itself mounts/unmounts directly.
                                 let group = this.folds.entry(group_key.clone()).or_default();
                                 group.from = open_height;
                                 group.epoch += 1;
@@ -7709,42 +8332,63 @@ impl Transcript {
                             }))
                             .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
                     );
-                // The body stays mounted while the close tween shrinks over it.
-                if open || animating {
+                // Wrapped bodies use their natural height, without a close
+                // tween. Retaining one here would wait for an unrelated repaint.
+                if open {
+                    let scroll = self
+                        .tool_payload_scrolls
+                        .entry(key.clone())
+                        .or_insert_with(ScrollHandle::new)
+                        .clone();
+                    let mut payload = div().w_full().min_w_0().flex_none().flex().flex_col();
                     if let Some(invocation) = invocation.as_deref() {
-                        card = card
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
-                            )
-                            .child(detail_body(
-                                invocation,
-                                None,
-                                DetailRole::Invocation {
-                                    command: matches!(tool.call, ToolCall::Exec { .. }),
-                                },
-                                theme,
-                            ));
+                        payload = payload.child(detail_body(
+                            invocation,
+                            None,
+                            invocation_highlights[ix].clone(),
+                            DetailRole::Invocation {
+                                command: matches!(tool.call, ToolCall::Exec { .. }),
+                            },
+                            theme,
+                        ));
                     }
                     if let Some(detail) = detail.as_deref() {
-                        card = card
+                        payload = payload.child(detail_body(
+                            detail,
+                            detail_highlights[ix].clone(),
+                            None,
+                            DetailRole::Result {
+                                failed: tool.is_error,
+                            },
+                            theme,
+                        ));
+                    }
+                    card = card.child(stream_detail_slot(
+                        !framed_command,
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .when(!framed_command, |body| {
+                                body.my(px(6.0))
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(crate::theme::ink(0.035))
+                            })
+                            .overflow_hidden()
                             .child(
                                 div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
+                                    .id(SharedString::from(format!("{key}-payload-scroll")))
+                                    .max_h(px(TOOL_PAYLOAD_MAX_HEIGHT))
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&scroll)
+                                    .child(payload),
                             )
-                            .child(detail_body(
-                                detail,
-                                detail_highlights[ix].clone(),
-                                DetailRole::Result {
-                                    failed: tool.is_error,
-                                },
-                                theme,
-                            ));
-                    }
+                            .into_any_element(),
+                    ));
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
                         let loading = matches!(
                             self.blob_details.get(&blob_ref),
@@ -7754,7 +8398,7 @@ impl Transcript {
                             .id(SharedString::from(format!("{key}-blob")))
                             .h(px(BLOB_AFFORDANCE_HEIGHT))
                             .flex_none()
-                            .px(px(12.0))
+                            .px(px(8.0))
                             .flex()
                             .items_center()
                             .text_size(px(10.5))
@@ -7769,38 +8413,15 @@ impl Transcript {
                                     cx.notify();
                                 }));
                         }
-                        card = card.child(row);
+                        card = card.child(stream_detail_slot(true, row.into_any_element()));
                     }
                 }
-                let card: AnyElement = if animating {
-                    let from = dfold.from;
-                    card.with_animation(
-                        SharedString::from(format!("{key}-tween{}", dfold.epoch)),
-                        RESIZE.animation(),
-                        move |el, t| el.h(px(motion::lerp(from, card_target, t))),
-                    )
-                    .into_any_element()
-                } else {
-                    card.h(px(card_target)).into_any_element()
-                };
-                let card = div().min_w_0().flex_1().child(card);
+                // Wrapped text determines height at layout time. Fixed line-count
+                // tweens would clip wrapped rows or leave a blank tail.
                 div()
                     .w_full()
                     .flex_none()
-                    .flex()
-                    .flex_row()
-                    // Guide rail: no fixed height — stretches to the card,
-                    // detail included. Agent-only groups skip it (no header
-                    // chevron for the rail to sit under).
-                    .when(collapses, |row| {
-                        row.child(
-                            div()
-                                .ml(px(12.0))
-                                .w(px(1.0))
-                                .flex_none()
-                                .bg(crate::theme::ink(0.08)),
-                        )
-                    })
+                    .when(open, |row| row.mb(px(8.0)))
                     .child(card)
                     .into_any_element()
             }));
@@ -8174,13 +8795,14 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                 .items_center()
                 .gap(px(8.0))
                 .overflow_hidden()
-                .rounded(px(10.0))
+                .rounded(px(8.0))
                 .border_1()
                 .border_color(danger.opacity(0.16))
                 .bg(danger.opacity(0.05))
                 .px(px(8.0))
                 .py(px(7.0))
-                .text_size(px(12.0))
+                .text_size(px(render::MD_TEXT_SIZE))
+                .line_height(px(render::MD_LINE_HEIGHT))
                 .child(
                     div()
                         .flex_none()
@@ -8199,7 +8821,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                 .child(
                     div()
                         .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(red_300.opacity(0.8))
                         .child(SharedString::from("Error")),
                 )
@@ -8214,70 +8836,6 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A passive one-line chip marking a question the agent asked — the
-/// interactive controls live in the composer (chat-view.tsx `InputChip`):
-/// 34px row, `rounded-[10px] border-white/[0.08] bg-white/[0.045] px-2
-/// text-[12px]`, a 20px `bg-white/[0.09]` icon tile with a 12px
-/// ChatRoundLine, the medium "Question" label, then the truncating value —
-/// the first question's header once resolved, "Awaiting your answer…" while
-/// pending. Neutral tones throughout; resolution never recolors the chip.
-fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement {
-    let value: SharedString = if resolved {
-        header
-    } else {
-        "Awaiting your answer…".into()
-    };
-    div()
-        .py(px(4.0))
-        .w_full()
-        .child(
-            div()
-                .h(px(34.0))
-                .w_full()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .overflow_hidden()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.08))
-                .bg(crate::theme::ink(0.045))
-                .px(px(8.0))
-                .text_size(px(12.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(20.0))
-                        .rounded(px(6.0))
-                        .bg(crate::theme::ink(0.09))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Question")),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_color(theme.text.opacity(0.9))
-                        .child(value),
-                ),
-        )
-        .into_any_element()
-}
-
 fn tool_icon(call: &ToolCall, theme: &Theme) -> AnyElement {
     let descriptor = crate::tool_icons::tool_icon_descriptor(call);
     match &descriptor {
@@ -8286,13 +8844,13 @@ fn tool_icon(call: &ToolCall, theme: &Theme) -> AnyElement {
                 .material_image()
                 .expect("resolved tool icon is embedded");
             img(image)
-                .size(px(12.0))
+                .size(px(14.0))
                 .object_fit(ObjectFit::Contain)
                 .flex_none()
                 .into_any_element()
         }
         crate::tool_icons::ToolIconDescriptor::Solar(path) => crate::icons::icon(*path)
-            .size(px(12.0))
+            .size(px(14.0))
             .text_color(theme.text_muted)
             .into_any_element(),
     }
@@ -8313,10 +8871,11 @@ enum DetailRole {
 fn detail_body(
     detail: &ToolDetail,
     diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    syntax: Option<Arc<comet_syntax::HighlightedDocument>>,
     role: DetailRole,
     theme: &Theme,
 ) -> AnyElement {
-    let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
+    let body = div().w_full().min_w_0().flex_none().flex().flex_col();
     match detail {
         // No comment layer: an inline tool diff is a record of what the
         // agent already did, not a review surface.
@@ -8330,13 +8889,13 @@ fn detail_body(
         ToolDetail::Stats { stats } => body
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
+            .text_size(px(render::CODE_TEXT_SIZE))
             .children(stats.iter().map(|stat| {
                 div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
-                    .px(px(12.0))
+                    .px(px(8.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -8374,15 +8933,18 @@ fn detail_body(
             let command = matches!(role, DetailRole::Invocation { command: true });
             body.py(px(6.0))
                 .font_family(theme.font_mono.clone())
-                .text_size(px(11.5))
+                .text_size(px(render::CODE_TEXT_SIZE))
+                .line_height(px(OUTPUT_LINE_HEIGHT))
+                .whitespace_normal()
                 .children(lines.iter().enumerate().map(|(ix, line)| {
                     div()
-                        .h(px(OUTPUT_LINE_HEIGHT))
+                        .min_h(px(OUTPUT_LINE_HEIGHT))
                         .w_full()
                         .min_w_0()
-                        .px(px(12.0))
+                        .flex_none()
+                        .px(px(8.0))
                         .flex()
-                        .items_center()
+                        .items_start()
                         .gap(px(6.0))
                         .text_color(text_color)
                         .when(command && ix == 0, |row| {
@@ -8393,13 +8955,30 @@ fn detail_body(
                                     .child(SharedString::from("$")),
                             )
                         })
-                        .child(div().w_full().min_w_0().truncate().child(line.clone()))
+                        .child(
+                            div().min_w_0().flex_1().child(
+                                StyledText::new(line.clone()).with_runs(
+                                    render::runs_for_syntax_line_with_plain(
+                                        line,
+                                        syntax
+                                            .as_ref()
+                                            .and_then(|document| document.lines.get(ix))
+                                            .map(Vec::as_slice)
+                                            .unwrap_or_default(),
+                                        &gpui::font(theme.font_mono.clone()),
+                                        text_color,
+                                        theme,
+                                    ),
+                                ),
+                            ),
+                        )
                 }))
                 .when(*truncated_by > 0, |block| {
                     block.child(
                         div()
                             .h(px(OUTPUT_LINE_HEIGHT))
-                            .px(px(12.0))
+                            .flex_none()
+                            .px(px(8.0))
                             .flex()
                             .items_center()
                             .text_size(px(10.5))
@@ -8438,16 +9017,20 @@ fn chip_header_row(
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let presentation = tool_presentation(&tool.call, tool.resolved, tool.is_error);
-    let (label, detail) = if is_agent_tool(tool) {
+    let (raw_label, raw_detail) = if is_agent_tool(tool) {
         tool_chip_content(&tool.call)
     } else {
         (presentation.label, presentation.detail)
     };
+    let (mut label, detail) = stream_copy(&tool.call, raw_label, &raw_detail);
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
         || (tool.subagent_ref.is_some()
             && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+    if failed {
+        label = "Failed".into();
+    }
     let tint = if failed {
         theme.danger
     } else {
@@ -8475,30 +9058,15 @@ fn chip_header_row(
         .subagent_ref
         .as_deref()
         .map(crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path);
-    div()
-        .h(px(CHIP_HEADER_HEIGHT))
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .px(px(8.0))
-        .text_size(px(12.0))
-        .line_height(px(18.0))
+    let standalone_name = label.is_empty();
+    stream_event_row(theme)
         .child(
-            // Icon tile (`rounded-[5px] bg-white/[0.08]`). A blobatar face gets a
-            // bigger tile than a tool glyph: at 18/14 the agent avatars read as
-            // specks next to the label. Tool chips keep the original 18px.
+            // Fixed icon slot shares the label baseline across event types.
             div()
-                .size(px(if subagent_avatar.is_some() {
-                    22.0
-                } else {
-                    18.0
-                }))
+                .w(px(STREAM_ICON))
+                .h_full()
                 .flex_none()
-                .rounded(px(5.0))
-                .bg(crate::theme::ink(0.08))
+                .relative()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -8511,28 +9079,31 @@ fn chip_header_row(
                     None => tool_icon(&tool.call, theme),
                 }),
         )
+        .when(!label.is_empty(), |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .h(px(render::MD_LINE_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .text_color(tint)
+                    .child(SharedString::from(label)),
+            )
+        })
         .child(
             div()
-                .flex_none()
-                .h(px(18.0))
-                .flex()
-                .items_center()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(tint)
-                .child(SharedString::from(label)),
-        )
-        .child(
-            div()
-                .flex_1()
+                .flex_shrink(1.0)
                 .min_w_0()
-                .h(px(18.0))
+                .h(px(render::MD_LINE_HEIGHT))
                 .flex()
                 .items_center()
                 .truncate()
                 .text_color(if failed {
                     theme.danger
+                } else if standalone_name {
+                    theme.text_muted
                 } else {
-                    theme.text.opacity(0.85)
+                    theme.text_faint
                 })
                 .child(SharedString::from(detail)),
         )
@@ -8552,10 +9123,10 @@ fn chip_header_row(
             row.child(
                 div()
                     .flex_none()
-                    .h(px(18.0))
+                    .h(px(render::MD_LINE_HEIGHT))
                     .flex()
                     .items_center()
-                    .text_size(px(11.0))
+                    .text_size(px(render::MD_TEXT_SIZE))
                     .text_color(theme.text_faint)
                     .child(SharedString::from(model.to_owned())),
             )
@@ -8574,6 +9145,26 @@ fn chip_header_row(
                 cx,
             )))
         })
+        .when_some(
+            tool.subagent_status
+                .filter(|_| tool.subagent_ref.is_some() && !running),
+            |row, status| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_color(if status == SubagentStatus::Failed {
+                            theme.danger_muted
+                        } else {
+                            theme.text_faint
+                        })
+                        .child(if status == SubagentStatus::Failed {
+                            "Failed"
+                        } else {
+                            "Completed"
+                        }),
+                )
+            },
+        )
         .when(
             header_state == ToolHeaderState::Pending && !running,
             |row| {
@@ -8594,54 +9185,18 @@ fn chip_header_row(
                 )
             },
         )
-        .when(
-            matches!(
-                header_state,
-                ToolHeaderState::Success | ToolHeaderState::Failed
-            ),
-            |row| {
-                let failed = header_state == ToolHeaderState::Failed;
-                let color = if failed {
-                    theme.danger
-                } else {
-                    theme.text_muted
-                };
+        .when_some(
+            tool.execution
+                .and_then(|meta| meta.duration_ms)
+                .filter(|_| header_state != ToolHeaderState::Pending),
+            |row, duration_ms| {
                 row.child(
                     div()
                         .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .text_size(px(12.0))
-                        .text_color(color)
-                        .child(
-                            crate::icons::icon(if failed {
-                                crate::icons::CLOSE
-                            } else {
-                                crate::icons::CHECK
-                            })
-                            .size(px(11.0))
-                            .text_color(color),
-                        )
-                        .child(SharedString::from(if failed {
-                            "Failed"
-                        } else {
-                            "Success"
-                        }))
-                        .when_some(
-                            tool.execution.and_then(|meta| meta.duration_ms),
-                            |status, duration_ms| {
-                                status.child(
-                                    div()
-                                        .font_family(theme.font_mono.clone())
-                                        .text_size(px(10.5))
-                                        .text_color(theme.text_faint)
-                                        .child(SharedString::from(format_execution_duration(
-                                            duration_ms,
-                                        ))),
-                                )
-                            },
-                        ),
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format_execution_duration(duration_ms))),
                 )
             },
         )
@@ -8651,16 +9206,12 @@ fn chip_header_row(
             let tile = div()
                 .size(px(18.0))
                 .flex_none()
-                .rounded(px(5.0))
-                .bg(crate::theme::ink(0.06))
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(theme.text_muted.opacity(0.8));
+                .text_color(theme.text_muted.opacity(0.7));
             row.child(match trail {
-                ChipTrail::Chevron { open } => tile
-                    .text_size(px(10.0))
-                    .child(SharedString::from(if open { "▾" } else { "▸" })),
+                ChipTrail::Chevron { open } => stream_disclosure(open, theme),
                 ChipTrail::OpenArrow => tile.child(
                     crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
                         .size(px(11.0))
@@ -8747,52 +9298,53 @@ fn task_snapshot_card(
     created: bool,
     resolved: bool,
     is_error: bool,
+    open: bool,
     theme: &Theme,
 ) -> AnyElement {
     let title = task_snapshot_title(items, created, resolved, is_error);
 
-    // Mesma plate do card de tool group (ink/hairline sobre o fundo), nao um
-    // `surface_card` solido: a cor fixa ignorava o frost e o card de todo
-    // aparecia como uma placa opaca no meio do transcript.
+    // Timeline block, same as tool rows: no plate, no hairline.
     div()
         .w_full()
         .overflow_hidden()
-        .rounded(px(9.0))
-        .border_1()
-        .border_color(crate::theme::hairline(0.09))
-        .bg(crate::theme::ink(0.025))
         .child(
-            div()
-                .h(px(36.0))
-                .px(px(12.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
+            stream_event_row(theme)
                 .child(
-                    crate::icons::icon(crate::icons::CHECKLIST)
-                        .size(px(15.0))
-                        .text_color(if is_error {
-                            theme.danger
-                        } else {
-                            theme.text_muted
-                        }),
+                    div()
+                        .w(px(STREAM_ICON))
+                        .h_full()
+                        .flex_none()
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::CHECKLIST)
+                                .size(px(15.0))
+                                .text_color(if is_error {
+                                    theme.danger
+                                } else {
+                                    theme.text_muted
+                                }),
+                        ),
                 )
                 .child(
                     div()
                         .min_w_0()
-                        .flex_1()
+                        .flex_shrink(1.0)
                         .truncate()
-                        .text_size(px(12.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(render::MD_TEXT_SIZE))
+                        .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(if is_error {
                             theme.danger_muted
                         } else {
                             theme.text
                         })
                         .child(title),
-                ),
+                )
+                .child(stream_disclosure(open, theme)),
         )
-        .children(items.iter().map(|item| {
+        .children(items.iter().filter(|_| open).map(|item| {
             let change_label = item.change.map(|change| match change {
                 TaskChange::Created => "Created",
                 TaskChange::Started => "Started",
@@ -8800,10 +9352,8 @@ fn task_snapshot_card(
                 TaskChange::Deleted => "Deleted",
             });
             div()
-                .h(px(36.0))
-                .px(px(12.0))
-                .border_t_1()
-                .border_color(crate::theme::hairline(0.06))
+                .h(px(CHIP_HEIGHT))
+                .pl(px(STREAM_ICON + 8.0))
                 .flex()
                 .items_center()
                 .gap(px(9.0))
@@ -8839,9 +9389,9 @@ fn task_snapshot_card(
                 .child(
                     div()
                         .min_w_0()
-                        .flex_1()
+                        .flex_shrink(1.0)
                         .truncate()
-                        .text_size(px(12.0))
+                        .text_size(px(render::MD_TEXT_SIZE))
                         .text_color(if item.done {
                             theme.text_muted
                         } else {
@@ -8898,18 +9448,23 @@ fn task_snapshot_title(
 
 fn file_change_line_row(
     line: &zeron_doc::FileChangeLine,
+    numbers: (Option<u32>, Option<u32>),
+    gutter_widths: [Option<f32>; 2],
     spans: &[comet_syntax::HighlightSpan],
     theme: &Theme,
+    viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
+    round_bottom: bool,
+    streaming: bool,
 ) -> AnyElement {
     let line_height = 20.0;
     let (wash, rail, text_color) = match line.kind {
         zeron_doc::FileChangeLineKind::Added => (
-            theme.success_muted.opacity(0.055),
+            theme.success_muted.opacity(0.13),
             theme.success_muted.opacity(0.75),
             theme.success_muted,
         ),
         zeron_doc::FileChangeLineKind::Removed => (
-            theme.danger_muted.opacity(0.055),
+            theme.danger_muted.opacity(0.13),
             theme.danger_muted.opacity(0.75),
             theme.danger_muted,
         ),
@@ -8923,29 +9478,102 @@ fn file_change_line_row(
         &line.text,
         spans,
         &gpui::font(theme.font_mono.clone()),
-        text_color,
+        if streaming {
+            theme.success_muted
+        } else {
+            theme.text
+        },
         theme,
     );
     div()
-        .h(px(line_height))
+        .min_h(px(line_height))
         .flex_none()
         .w_full()
+        .min_w_0()
         .flex()
-        .items_center()
-        .border_l_1()
-        .border_color(rail)
-        .bg(wash)
-        .px(px(9.0))
-        .overflow_hidden()
-        .child(StyledText::new(line.text.clone()).with_runs(runs))
+        .items_start()
+        .relative()
+        .pl(px(8.0))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |line_bounds, _, window, _| {
+                    // Each line reveals one strip of the same rounded viewport.
+                    // A radius on the row itself would break at scroll offsets and
+                    // could curve every line; rectangular overflow cannot clip it.
+                    let radius = if round_bottom { px(7.0) } else { px(0.0) };
+                    window.with_content_mask(
+                        Some(gpui::ContentMask {
+                            bounds: line_bounds,
+                        }),
+                        |window| {
+                            window.paint_quad(quad(
+                                viewport_bounds.get(),
+                                gpui::Corners {
+                                    top_left: px(0.0),
+                                    top_right: px(0.0),
+                                    bottom_left: radius,
+                                    bottom_right: radius,
+                                },
+                                wash,
+                                gpui::Edges {
+                                    left: px(1.0),
+                                    ..Default::default()
+                                },
+                                rail,
+                                BorderStyle::default(),
+                            ));
+                        },
+                    );
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
+        .pr(px(10.0))
+        .gap(px(4.0))
+        .children(
+            [numbers.0, numbers.1]
+                .into_iter()
+                .zip(gutter_widths)
+                .filter_map(|(number, width)| {
+                    Some(
+                        div()
+                            .w(px(width?))
+                            .flex_none()
+                            .text_right()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child(number.map(|n| n.to_string()).unwrap_or_default()),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .w(px(12.0))
+                .flex_none()
+                .text_color(text_color)
+                .child(match line.kind {
+                    zeron_doc::FileChangeLineKind::Added => "+",
+                    zeron_doc::FileChangeLineKind::Removed => "−",
+                    zeron_doc::FileChangeLineKind::Context => "",
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .child(StyledText::new(line.text.clone()).with_runs(runs)),
+        )
         .into_any_element()
 }
 
-/// A plain (non-expandable) chip: bordered card, plus the group guide rail
-/// when the chip lives under a collapsible header.
+/// A plain (non-expandable) event row: icon, verb + object.
 fn tool_chip(
     tool: &ToolItem,
-    rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -8954,93 +9582,37 @@ fn tool_chip(
         .h(px(CHIP_HEIGHT))
         .w_full()
         .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .when(rail, |row| {
-            row.child(
-                div()
-                    .ml(px(12.0))
-                    .h_full()
-                    .w(px(1.0))
-                    .flex_none()
-                    .bg(crate::theme::ink(0.08)),
-            )
-        })
-        .child(
-            div()
-                .when(rail, |el| el.ml(px(12.0)))
-                .h(px(CHIP_CARD_HEIGHT))
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .rounded(px(9.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
-                .child(chip_header_row(tool, None, theme, view, cx)),
-        )
+        .child(chip_header_row(tool, None, theme, view, cx))
         .into_any_element()
 }
 
-/// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
-/// "open the subagent tab" click (open-arrow tile in the trailing slot).
+/// A spawn row: same timeline as [`tool_chip`], but the WHOLE row is the
+/// "open the subagent tab" click (open-arrow in the trailing slot).
 /// No accordion — an inline body would only repeat the subagent's own
-/// transcript. The group guide rail is omitted for agent-only rows (no
-/// collapse header for it to hang from).
+/// transcript.
 fn subagent_chip(
     tool: &ToolItem,
     id: SharedString,
     on_open: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-    rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> AnyElement {
     div()
+        .id(id)
         .h(px(CHIP_HEIGHT))
         .w_full()
         .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .when(rail, |row| {
-            row.child(
-                div()
-                    .ml(px(12.0))
-                    .h_full()
-                    .w(px(1.0))
-                    .flex_none()
-                    .bg(crate::theme::ink(0.08)),
-            )
-        })
-        .child(
-            div()
-                .id(id)
-                .when(rail, |el| el.ml(px(12.0)))
-                .h(px(CHIP_CARD_HEIGHT))
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .rounded(px(9.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
-                .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::ink(0.05)))
-                .on_click(on_open)
-                .child(chip_header_row(
-                    tool,
-                    Some(ChipTrail::OpenArrow),
-                    theme,
-                    view,
-                    cx,
-                )),
-        )
+        .cursor_pointer()
+        .hover(|s| s.bg(crate::theme::ink(0.04)))
+        .on_click(on_open)
+        .child(chip_header_row(
+            tool,
+            Some(ChipTrail::OpenArrow),
+            theme,
+            view,
+            cx,
+        ))
         .into_any_element()
 }
 
@@ -9091,8 +9663,15 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 acc.extend_from_slice(tail.as_bytes());
             }
         }
-        if let MessagePart::Input { resolved, .. } = part {
+        if let MessagePart::Input {
+            questions,
+            answers,
+            resolved,
+            ..
+        } = part
+        {
             acc.push(0x10 | *resolved as u8);
+            acc.extend(serde_json::to_vec(&(questions, answers)).unwrap_or_default());
         }
     }
     fnv1a(&acc)
@@ -9103,9 +9682,6 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
-        // The row processor runs later under ListState's mutable prepaint
-        // borrow, so capture every list-derived scalar it needs now.
-        self.sticky_scroll_y = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
         // Own-turn driver: measurements are only authoritative after layout,
         // so reservation sizing, the send glide, and the outgrown-handoff
         // each advance at most once per requested frame. Scheduled on every
@@ -9204,6 +9780,7 @@ impl Render for Transcript {
             list_el.into_any_element()
         };
         let sticky_turn = self.render_sticky_turn(window, cx);
+        let sticky_layout = cx.weak_entity();
         let root = div()
             .relative()
             .size_full()
@@ -9217,7 +9794,24 @@ impl Render for Transcript {
             .child(crate::markdown::render::selection_frame_reset())
             .child(content)
             .children(sticky_turn)
-            .child(rail);
+            .child(rail)
+            .on_children_prepainted(move |_, _, cx| {
+                let sticky_layout = sticky_layout.clone();
+                cx.defer(move |cx| {
+                    sticky_layout
+                        .update(cx, |this, cx| {
+                            let scroll_y = sticky_scroll_offset(
+                                f32::from(this.list.scroll_px_offset_for_scrollbar().y),
+                                f32::from(this.list.max_offset_for_scrollbar().y),
+                            );
+                            if (scroll_y - this.sticky_scroll_y).abs() > 0.5 {
+                                this.sticky_scroll_y = scroll_y;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                });
+            });
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -9292,7 +9886,93 @@ mod tests {
     use zeron_doc::MessagePart;
 
     #[test]
-    fn reasoning_defaults_open() {
+    fn reasoning_preview_keeps_full_markdown_in_the_disclosure() {
+        let entry = assistant(
+            "preview",
+            MessageStatus::Streaming,
+            vec![MessagePart::Reasoning {
+                id: "r".into(),
+                text: "**Checking Chrome executable**\n\nLaunching Chrome app".into(),
+                completed: false,
+                duration_ms: None,
+            }],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::Reasoning {
+            tree,
+            label: preview,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!()
+        };
+        assert_eq!(preview.as_ref(), "Thinking");
+        assert_eq!(
+            tree.blocks.len(),
+            2,
+            "full details survive the compact preview"
+        );
+        assert!(reasoning_is_open(None, true));
+        assert!(reasoning_is_open(Some(true), true));
+    }
+
+    #[test]
+    fn completed_reasoning_uses_thought_label_and_retains_short_content() {
+        for status in [MessageStatus::Streaming, MessageStatus::Complete] {
+            let entry = assistant(
+                "thought",
+                status,
+                vec![MessagePart::Reasoning {
+                    id: "r".into(),
+                    text: "Reviewing component coverage and preview density.".into(),
+                    completed: true,
+                    duration_ms: Some(4000),
+                }],
+            );
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::Reasoning {
+                tree,
+                label: preview,
+                active,
+                ..
+            } = &rows[0].kind
+            else {
+                panic!("reasoning")
+            };
+            assert_eq!(preview.as_ref(), "Thought");
+            assert!(!active);
+            assert!(reasoning_has_detail(tree));
+            assert_eq!(tree.blocks.len(), 1);
+            assert!(reasoning_is_open(None, *active));
+        }
+    }
+
+    #[test]
+    fn compact_events_keep_details_closed_until_requested() {
+        assert!(reasoning_is_open(None, true));
+        assert!(reasoning_is_open(None, false));
+        assert!(reasoning_is_open(Some(true), false));
+        let entry = assistant(
+            "compact",
+            MessageStatus::Streaming,
+            vec![tool_part("a", "ls"), tool_part("b", "pwd")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ToolGroup {
+            tools,
+            auto_open,
+            detail_auto_open,
+        } = &rows[0].kind
+        else {
+            panic!("tool group expected");
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(!auto_open);
+        assert!(!detail_auto_open);
+    }
+
+    #[test]
+    fn reasoning_defaults_open_and_respects_explicit_choices() {
         for (pinned, active, expected) in [
             (None, true, true),
             (None, false, true),
@@ -9762,6 +10442,7 @@ mod tests {
     #[test]
     fn tool_fingerprint_changes_when_same_length_invocation_content_changes() {
         let mut tool = ToolItem {
+            subagent_batch: None,
             id: "exec".into(),
             call: ToolCall::Exec {
                 command: "echo".into(),
@@ -9792,6 +10473,19 @@ mod tests {
     }
 
     #[test]
+    fn file_measurement_keeps_current_sticky_geometry_and_invalidates_following_turns() {
+        let mut state = StickyTurnState::default();
+        state.attach_chat(Some("chat"));
+        state.record_geometry("current".into(), -100.0, 40.0, -200.0);
+        state.record_geometry("next".into(), 700.0, 40.0, -200.0);
+        state.invalidate_user_ids([SharedString::from("next")]);
+        assert_eq!(state.projected_top("current", -200.0), Some(-100.0));
+        assert!(!state.consume_layout_suppression("current"));
+        assert_eq!(state.projected_top("next", -200.0), None);
+        assert!(state.consume_layout_suppression("next"));
+    }
+
+    #[test]
     fn sticky_turn_state_resets_on_chat_switch_and_accepts_streaming_remeasurement() {
         let mut state = StickyTurnState::default();
         assert!(state.attach_chat(Some("chat-a")));
@@ -9809,6 +10503,19 @@ mod tests {
         assert!(state.attach_chat(Some("chat-b")));
         assert_eq!(state.height("user-a"), None);
         assert!(!state.attach_chat(Some("chat-b")));
+    }
+
+    #[test]
+    fn sticky_projection_does_not_jump_by_a_viewport_at_the_pending_end_anchor() {
+        let mut state = StickyTurnState::default();
+        state.record_geometry("current".into(), -100.0, 40.0, -389.5);
+        // Native trace: pending past-end offset includes the 1170px viewport.
+        let settled = sticky_scroll_offset(-389.5, 389.5);
+        let pending = sticky_scroll_offset(-1559.5, 389.5);
+        assert_eq!(pending, settled);
+        assert_eq!(state.projected_top("current", pending), Some(-100.0));
+        assert_eq!(sticky_scroll_offset(0.0, 0.0), 0.0);
+        assert_eq!(sticky_scroll_offset(-100.0, 389.5), -100.0);
     }
 
     #[test]
@@ -10081,7 +10788,7 @@ mod tests {
             &rows[1].kind,
             RowKind::ToolGroup {
                 tools,
-                auto_open: true,
+                auto_open: false,
                 ..
             } if tools.len() == 3 && tools.iter().filter(|tool| !tool.resolved).count() == 2
         ));
@@ -10097,6 +10804,53 @@ mod tests {
         let rows = rows_for_entry(&latest_text, false, &mut parse);
         assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[1].kind, RowKind::LiveMarkdown { .. }));
+    }
+
+    #[test]
+    fn question_tool_and_input_render_once_through_resolution() {
+        let tool: MessagePart = serde_json::from_value(serde_json::json!({
+            "kind":"tool", "id":"ask", "call":{"kind":"unknown", "name":"ask", "input":{"question":"Choose?"}}
+        })).unwrap();
+        let input: MessagePart = serde_json::from_value(serde_json::json!({
+            "kind":"input", "id":"r", "requestId":"r", "questions":[{"id":"q", "header":"Choice", "question":"Choose?", "options":[]}]
+        })).unwrap();
+        let mut entry = assistant("question", MessageStatus::Streaming, vec![tool]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&rows[0].kind, RowKind::Question { history } if history.loading));
+        entry.parts.push(input);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            matches!(&rows[0].kind, RowKind::Question { history } if !history.loading && history.waiting.as_deref() == Some("Choose?"))
+        );
+        if let MessagePart::Input {
+            answers, resolved, ..
+        } = &mut entry.parts[1]
+        {
+            *resolved = true;
+            *answers = Some(vec![zeron_proto::UserInputAnswer {
+                question_id: "q".into(),
+                labels: vec!["A".into()],
+            }]);
+        }
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            matches!(&rows[0].kind, RowKind::Question { history } if history.entries == [("Choose?".into(), "A".into())])
+        );
+        let previous = entry_fingerprint(&entry, false);
+        if let MessagePart::Input {
+            answers: Some(answers),
+            ..
+        } = &mut entry.parts[1]
+        {
+            answers[0].labels[0] = "B".into();
+        }
+        assert_ne!(
+            previous,
+            entry_fingerprint(&entry, false),
+            "same-length answer updates invalidate cached rows"
+        );
     }
 
     #[test]
@@ -10130,19 +10884,14 @@ mod tests {
                     id: "input".into(),
                     request_id: "request".into(),
                     questions: Vec::new(),
+                    answers: None,
                     resolved: false,
                 },
             ],
         );
         let rows = rows_for_entry(&unresolved_input, false, &mut parse);
         assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
-        assert!(matches!(
-            rows[1].kind,
-            RowKind::InputChip {
-                resolved: false,
-                ..
-            }
-        ));
+        assert!(matches!(rows[1].kind, RowKind::Question { .. }));
 
         let running_subagent = assistant(
             "assistant-live-agent",
@@ -10411,11 +11160,70 @@ mod tests {
             crate::file_change::snapshot_preview(zeron_doc::FileChangeKind::Write, &snapshot)
                 .unwrap();
         let ready = FileInputLoad::Ready(Arc::new(FileInputReady {
+            line_numbers: Arc::new(crate::file_change::file_diff_line_numbers(&preview)),
             snapshot: Arc::new(snapshot),
             preview: Arc::new(preview),
             highlight: None,
         }));
         assert!(!file_input_should_fetch(Some(&ready)));
+    }
+
+    #[test]
+    fn chat_file_links_load_reports_from_another_directory() {
+        use crate::file_preview::loader::{LoadedPreview, load_preview};
+        use crate::markdown::{Block, parse_full};
+        use std::{fs, path::Path};
+
+        // Catch rebasing an absolute link onto the Chat checkout, losing
+        // spaces/Unicode while parsing, or restricting reads to that checkout.
+        let checkout = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        let cwd = checkout.path().to_str().unwrap();
+        for (name, content, kind) in [
+            ("report.html", "<h1>External HTML</h1>", "html"),
+            ("situação atual.md", "# External Markdown", "md"),
+            ("report.txt", "External text", "txt"),
+        ] {
+            let path = reports.path().join(name);
+            fs::write(&path, content).unwrap();
+            // The same basename in the checkout must never win.
+            fs::write(checkout.path().join(name), "Wrong file").unwrap();
+            let mut messages = vec![format!("[Abrir relatório](<{}>)", path.display())];
+            if !name.contains(' ') {
+                messages.push(path.display().to_string());
+                messages.push(format!("`{}`", path.display()));
+            }
+            for message in messages {
+                let tree = parse_full(&message);
+                let Block::Paragraph { runs } = &tree.blocks[0].block else {
+                    panic!("expected a linked paragraph: {message}");
+                };
+                let links: Vec<_> = runs
+                    .iter()
+                    .filter_map(|run| run.style.link.as_deref())
+                    .collect();
+                assert_eq!(links, [path.to_str().unwrap()], "{message}");
+                let (context, root, target) = file_open_target("chat", cwd, links[0]).unwrap();
+                assert_eq!(context, "chat");
+                assert_eq!(root, checkout.path());
+                assert_eq!(Path::new(&target), path);
+                match (kind, load_preview(&root, Path::new(&target)).unwrap()) {
+                    ("html", LoadedPreview::Html(document)) => {
+                        assert!(document.contains("External HTML"))
+                    }
+                    ("md", LoadedPreview::Markdown(document)) => {
+                        assert_eq!(*document, parse_full(content))
+                    }
+                    ("txt", LoadedPreview::Code { lines, .. }) => {
+                        assert_eq!(
+                            lines.iter().map(|line| line.as_ref()).collect::<Vec<_>>(),
+                            [content]
+                        );
+                    }
+                    _ => panic!("wrong preview type for {name}"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -10770,7 +11578,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_workflow_activity_keeps_last_tool_group_auto_open() {
+    fn trailing_workflow_activity_keeps_tool_group_compact() {
         let workflow = MessagePart::WorkflowTask {
             id: "workflow-wf-1".into(),
             task: zeron_proto::WorkflowTaskUpdate {
@@ -10795,7 +11603,7 @@ mod tests {
         assert!(matches!(
             &rows[0].kind,
             RowKind::ToolGroup {
-                auto_open: true,
+                auto_open: false,
                 ..
             }
         ));
@@ -11247,8 +12055,11 @@ mod tests {
         );
         // Markdown → tool group inside the disclosure and disclosure → final
         // answer retain the ordinary block gap.
-        assert_eq!(top_gap_for(Some(&children[2]), &children[3]), GAP_BLOCK);
-        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), GAP_BLOCK);
+        assert_eq!(
+            top_gap_for(Some(&children[2]), &children[3]),
+            render::MD_BLOCK_GAP
+        );
+        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
         // Turn starts get the turn gap regardless.
         assert_eq!(top_gap_for(None, &rows[0]), GAP_TURN);
     }
@@ -11339,7 +12150,7 @@ mod tests {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 2);
-        assert!(tool_group_collapses(tools));
+        assert!(!tool_group_collapses(tools));
         assert!(!*auto_open);
 
         let RowKind::ToolGroup { tools, .. } = &rows[2].kind else {
@@ -11353,7 +12164,7 @@ mod tests {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 1);
-        assert!(tool_group_collapses(tools));
+        assert!(!tool_group_collapses(tools));
 
         let RowKind::ToolGroup { tools, .. } = &rows[4].kind else {
             panic!("consecutive agents share a group")
@@ -11361,6 +12172,55 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert!(!tool_group_collapses(tools));
         assert!(tools.iter().all(is_agent_tool));
+    }
+
+    #[test]
+    fn sibling_subagents_group_by_recorded_task_not_adjacency() {
+        let task = |id: &str| {
+            let mut part = tool_part(id, "ignored");
+            if let MessagePart::Tool { call, .. } = &mut part {
+                *call = ToolCall::Unknown {
+                    name: "task".into(),
+                    input: None,
+                };
+            }
+            part
+        };
+        for status in [MessageStatus::Streaming, MessageStatus::Complete] {
+            let entry = assistant(
+                "batch",
+                status,
+                vec![
+                    text_part("before", "before"),
+                    task("call-a"),
+                    task("call-b"),
+                    agent_part("call-a--one", "One"),
+                    agent_part("call-a--two", "Two"),
+                    agent_part("call-b--one", "Three"),
+                    agent_part("call-b--two", "Four"),
+                    agent_part("unrelated", "Independent"),
+                    text_part("after", "after"),
+                ],
+            );
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let groups: Vec<Vec<&str>> = rows
+                .iter()
+                .filter_map(|row| match &row.kind {
+                    RowKind::ToolGroup { tools, .. } if tools.iter().all(is_agent_tool) => {
+                        Some(tools.iter().map(|tool| tool.id.as_ref()).collect())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                groups,
+                vec![
+                    vec!["call-a--one", "call-a--two"],
+                    vec!["call-b--one", "call-b--two"],
+                    vec!["unrelated"]
+                ]
+            );
+        }
     }
 
     #[test]
@@ -11391,9 +12251,75 @@ mod tests {
             panic!("tool group expected")
         };
         assert_eq!(tools.len(), 3);
-        assert!(tool_group_collapses(tools));
+        assert!(!tool_group_collapses(tools));
         assert!(tools.iter().all(|t| !is_agent_tool(t)));
         assert!(tools.iter().all(|t| !is_spawn_link(t)));
+    }
+
+    #[test]
+    fn command_counts_appear_only_in_the_completed_turn_summary() {
+        for status in [MessageStatus::Streaming, MessageStatus::Complete] {
+            let entry = assistant(
+                "counts",
+                status,
+                vec![
+                    tool_part("a", "ls"),
+                    tool_part("b", "pwd"),
+                    text_part("between", "Checking results"),
+                    tool_part("c", "git status"),
+                    tool_part("d", "git diff"),
+                    text_part("final", "Done"),
+                ],
+            );
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let activity = if status == MessageStatus::Complete {
+                let RowKind::TurnSteps {
+                    rows: children,
+                    summary,
+                    ..
+                } = &rows[0].kind
+                else {
+                    panic!("completed turn keeps its aggregate summary");
+                };
+                assert_eq!(summary.as_ref(), "4 commands");
+                children.as_slice()
+            } else {
+                rows.as_slice()
+            };
+            let mut calls = Vec::new();
+            for row in activity {
+                if let RowKind::ToolGroup {
+                    tools,
+                    detail_auto_open,
+                    ..
+                } = &row.kind
+                {
+                    assert!(!tool_group_collapses(tools), "no intermediate count header");
+                    assert!(!detail_auto_open, "individual payloads remain closed");
+                    for tool in tools.iter() {
+                        assert!(tool.invocation.is_some(), "recorded detail survives");
+                        calls.push(tool.id.as_ref());
+                    }
+                }
+            }
+            assert_eq!(calls, ["a", "b", "c", "d"]);
+        }
+    }
+
+    #[test]
+    fn single_tool_has_no_redundant_group_disclosure() {
+        for status in [MessageStatus::Streaming, MessageStatus::Complete] {
+            let entry = assistant("single", status, vec![tool_part("a", "ls")]);
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+                panic!("expected tool row");
+            };
+            assert!(
+                !tool_group_collapses(tools),
+                "single tool is directly visible"
+            );
+            assert!(tools[0].invocation.is_some(), "detail remains accessible");
+        }
     }
 
     #[test]
@@ -11444,7 +12370,7 @@ mod tests {
         let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
             panic!()
         };
-        assert!(tool_group_collapses(tools));
+        assert!(!tool_group_collapses(tools));
         let RowKind::ToolGroup { tools, .. } = &rows[1].kind else {
             panic!()
         };
@@ -11453,7 +12379,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tail_and_earlier_groups_show_cards_without_opening_details() {
+    fn active_tail_and_earlier_groups_keep_details_closed() {
         let parts = vec![text_part("t0", "hi"), tool_part("a", "ls")];
         let streaming = assistant("m3", MessageStatus::Streaming, parts.clone());
         let rows = rows_for_entry(&streaming, false, &mut parse);
@@ -11465,11 +12391,8 @@ mod tests {
         else {
             panic!()
         };
-        assert!(auto_open, "tool group opens while streaming");
-        assert!(
-            detail_auto_open,
-            "current tool detail keeps its old default"
-        );
+        assert!(!auto_open, "streaming group starts compact");
+        assert!(!detail_auto_open, "tool details open only on request");
 
         let complete = assistant("m3", MessageStatus::Complete, parts);
         let rows = rows_for_entry(&complete, false, &mut parse);
@@ -11500,7 +12423,7 @@ mod tests {
         else {
             panic!("earlier group stays a top-level row while streaming")
         };
-        assert!(auto_open, "earlier tool cards remain visible");
+        assert!(!auto_open, "earlier groups stay compact");
         assert!(
             !detail_auto_open,
             "only the current group opens its command output"
@@ -11861,6 +12784,7 @@ mod tests {
     #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
+            subagent_batch: None,
             id: format!("exec-{c}").into(),
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
@@ -11877,6 +12801,7 @@ mod tests {
             subagent_tail: None,
         };
         let edit = |p: &str| ToolItem {
+            subagent_batch: None,
             id: format!("edit-{p}").into(),
             call: ToolCall::EditFile {
                 path: p.into(),
@@ -11903,20 +12828,18 @@ mod tests {
             edit("a.rs"),
             edit("b.rs"),
         ];
-        assert_eq!(
-            tool_group_summary(&tools),
-            "Ran 3 commands · edited 2 files"
-        );
-        // Distinct-path dedupe: editing one file twice counts once.
+        assert_eq!(tool_group_summary(&tools), "2 edits, 3 commands");
+        // Counts are calls in both group and turn summaries, including repeated edits.
         let tools = vec![edit("a.rs"), edit("a.rs")];
-        assert_eq!(tool_group_summary(&tools), "Edited 1 file");
+        assert_eq!(tool_group_summary(&tools), "2 edits");
         // Failures append.
         let mut failing = exec("boom");
         failing.is_error = true;
-        assert_eq!(tool_group_summary(&[failing]), "Ran 1 command · 1 failed");
+        assert_eq!(tool_group_summary(&[failing]), "1 command · 1 failed");
         // Reads / searches / misc.
         let tools = vec![
             ToolItem {
+                subagent_batch: None,
                 id: "read-x".into(),
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
@@ -11933,6 +12856,7 @@ mod tests {
                 subagent_tail: None,
             },
             ToolItem {
+                subagent_batch: None,
                 id: "glob-rs".into(),
                 call: ToolCall::Glob {
                     pattern: "*.rs".into(),
@@ -11951,6 +12875,7 @@ mod tests {
                 subagent_tail: None,
             },
             ToolItem {
+                subagent_batch: None,
                 id: "web-q".into(),
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
@@ -11967,7 +12892,7 @@ mod tests {
                 subagent_tail: None,
             },
         ];
-        assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
+        assert_eq!(tool_group_summary(&tools), "2 reads, 1 search");
     }
 
     #[test]
@@ -12147,6 +13072,234 @@ mod tests {
     }
 
     #[test]
+    fn tool_code_surface_fits_short_content_and_bounds_large_payloads() {
+        let invocation = ToolDetail::Output {
+            lines: vec!["command".into(); 2],
+            truncated_by: 0,
+        };
+        let output = ToolDetail::Output {
+            lines: vec!["result".into(); 3],
+            truncated_by: 0,
+        };
+        assert_eq!(tool_payload_height(Some(&invocation), Some(&output)), 128.0);
+        let large = ToolDetail::Output {
+            lines: vec!["result".into(); 400],
+            truncated_by: 0,
+        };
+        assert_eq!(tool_payload_height(Some(&invocation), Some(&large)), 374.0);
+        assert_eq!(tool_payload_height(None, None), 0.0);
+    }
+
+    #[test]
+    fn eval_icon_replaces_the_redundant_known_language_prefix() {
+        for (language, detail, expected) in [
+            ("js", "js · Checking logs", "Checking logs"),
+            (
+                "javascript",
+                "javascript · document.title",
+                "document.title",
+            ),
+            ("python", "python · Checking logs", "Checking logs"),
+        ] {
+            let call = ToolCall::Unknown {
+                name: "eval".into(),
+                input: Some(serde_json::json!({"language":language})),
+            };
+            assert_eq!(
+                stream_copy(&call, "Evaluated", detail),
+                (String::new(), expected.into())
+            );
+        }
+        let call = ToolCall::Unknown {
+            name: "other".into(),
+            input: None,
+        };
+        assert_eq!(
+            stream_copy(&call, "Called", "js · literal title").1,
+            "js · literal title"
+        );
+    }
+
+    #[test]
+    fn stream_copy_uses_basename_and_search_colon() {
+        assert_eq!(
+            stream_file_name("crates/ui/src/transcript.rs"),
+            "transcript.rs"
+        );
+        assert_eq!(
+            stream_file_name("download-documentos.mjs"),
+            "download-documentos.mjs"
+        );
+        assert_eq!(stream_file_name(""), "");
+        let (verb, object) = stream_copy(
+            &ToolCall::ReadFile {
+                path: "src/lib.rs".into(),
+            },
+            "Read",
+            "src/lib.rs",
+        );
+        assert_eq!((verb.as_str(), object.as_str()), ("Read", "lib.rs"));
+        let (verb, object) = stream_copy(
+            &ToolCall::WebSearch {
+                query: "foo".into(),
+            },
+            "Searched web",
+            "foo",
+        );
+        assert_eq!((verb.as_str(), object.as_str()), ("Searched web:", "foo"));
+        let (verb, object) = stream_copy(
+            &ToolCall::Exec {
+                command: "ls /tmp".into(),
+            },
+            "Ran command",
+            "ls /tmp",
+        );
+        assert_eq!((verb.as_str(), object.as_str()), ("Ran command", "ls /tmp"));
+    }
+
+    #[test]
+    fn command_header_summary_preserves_full_invocation() {
+        for (command, expected) in [
+            (
+                "ls -1 .orchestrator/.agents/skills",
+                "ls -1 .orchestrator/.agents/skills",
+            ),
+            (
+                "git status -sb | head -40 && echo \"---\" && ls scripts/",
+                "git, head, echo, ls",
+            ),
+            (
+                "cd . && git status --porcelain | wc -l && sleep 12 && echo done",
+                "cd, git, wc, sleep…",
+            ),
+            (
+                "mkdir -p /tmp/render-demo && cat > /tmp/render-demo/demo.py <<'EOF'\ndef slug(s):\n    return s\nEOF\npython3 /tmp/render-demo/demo.py",
+                "mkdir, cat…",
+            ),
+            (
+                "cat /Users/example/Documents/Projects/very-long-workspace/crates/ui/src/transcript.rs",
+                "cat",
+            ),
+            ("printf '%s|%s' olá mundo", "printf '%s|%s' olá mundo"),
+        ] {
+            let call = ToolCall::Exec {
+                command: command.into(),
+            };
+            let (_, detail) = tool_chip_content(&call);
+            assert_eq!(
+                stream_copy(&call, "Ran command", &detail),
+                ("Ran command".into(), expected.into())
+            );
+            assert_eq!(
+                stream_copy(&call, "Running command", &detail).0,
+                "Running command"
+            );
+            let Some(ToolDetail::Output { lines, .. }) = call_block(&call) else {
+                panic!("missing invocation")
+            };
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|line| line.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn generic_tool_header_uses_name_in_both_lifecycle_states() {
+        for resolved in [false, true] {
+            for name in ["ask", "ToolSearch", "custom tool", "eval"] {
+                let call = ToolCall::Unknown {
+                    name: name.into(),
+                    input: None,
+                };
+                let presentation = tool_presentation(&call, resolved, false);
+                assert_eq!(
+                    stream_copy(&call, presentation.label, &presentation.detail),
+                    (String::new(), name.to_owned())
+                );
+            }
+            let call = ToolCall::Mcp {
+                server: "local-demo".into(),
+                tool: "inspect_report".into(),
+                input: None,
+            };
+            let presentation = tool_presentation(&call, resolved, false);
+            assert_eq!(
+                stream_copy(&call, presentation.label, &presentation.detail),
+                (String::new(), "local-demo · inspect_report".into())
+            );
+            for name in ["Agent"] {
+                let call = ToolCall::Unknown {
+                    name: name.into(),
+                    input: None,
+                };
+                let presentation = tool_presentation(&call, resolved, false);
+                assert!(
+                    !stream_copy(&call, presentation.label, &presentation.detail)
+                        .0
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn specific_skill_and_hub_headers_identify_the_invocation() {
+        let cases = [
+            (
+                "Skill",
+                Some(serde_json::json!({"path":"brainstorming"})),
+                "Skill",
+                "brainstorming",
+            ),
+            (
+                "skill",
+                Some(serde_json::json!({"skill":"implement"})),
+                "Skill",
+                "implement",
+            ),
+            (
+                "Skill",
+                Some(serde_json::json!({"name":"review"})),
+                "Skill",
+                "review",
+            ),
+            ("Skill", None, "Skill", ""),
+            (
+                "hub",
+                Some(serde_json::json!({"op":"wait", "ids":["job-1","job-2"]})),
+                "",
+                "wait 2 jobs",
+            ),
+            (
+                "hub",
+                Some(serde_json::json!({"op":"stop", "name":"report-qa"})),
+                "",
+                "stop report-qa",
+            ),
+            ("hub", None, "", "hub"),
+        ];
+        for resolved in [false, true] {
+            for (name, input, label, detail) in &cases {
+                let call = ToolCall::Unknown {
+                    name: (*name).into(),
+                    input: input.clone(),
+                };
+                let presentation = tool_presentation(&call, resolved, false);
+                assert_eq!(
+                    stream_copy(&call, presentation.label, &presentation.detail),
+                    ((*label).into(), (*detail).into()),
+                    "{name} resolved={resolved}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tool_chip_labels_per_kind() {
         assert_eq!(
             tool_chip_content(&ToolCall::Exec {
@@ -12190,9 +13343,9 @@ mod tests {
 
     #[test]
     fn multiline_command_flattens_to_one_chip_line() {
-        // The user's breaker: a multi-line script in a Run chip. The detail
-        // must come out as ONE sanitized line — the chip's fixed 30px card
-        // then truncates it with an ellipsis like the original's CSS.
+        // The user's breaker: a multi-line script in a Run row. The detail
+        // must come out as ONE sanitized line — the stream row then truncates
+        // it with an ellipsis.
         let (label, detail) = tool_chip_content(&ToolCall::Exec {
             command: "set -e\nfixture_in_original=0\n\tgrep -c  \"x\"".into(),
         });
@@ -12226,14 +13379,14 @@ mod tests {
             vec!["set -e", "cargo test"]
         );
 
-        // A long single-line command soft-wraps instead of ellipsizing.
+        // A long command stays verbatim for horizontal scrolling.
         let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Exec {
-            command: "x".repeat(CALL_WRAP_COLS * 2 + 10),
+            command: "x".repeat(240),
         }) else {
             panic!("expected an output block")
         };
-        assert_eq!(lines.len(), 3);
-        assert!(lines.iter().all(|l| l.chars().count() <= CALL_WRAP_COLS));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].as_ref(), "x".repeat(240));
 
         // MCP input pretty-prints under the `server · tool` line.
         let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Mcp {
@@ -12390,5 +13543,253 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+    #[test]
+    fn adoption_deduplicates_errors_per_entry_without_losing_distinct_errors() {
+        let parts = ["boom", "boom", "other"]
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MessagePart::Error {
+                id: format!("e{i}"),
+                message: (*m).into(),
+            })
+            .collect();
+        let entry = assistant("errors", MessageStatus::Streaming, parts);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r.kind, RowKind::ErrorChip { .. }))
+                .count(),
+            2
+        );
+        let replay = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(
+            rows.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            replay.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn adoption_deduplicates_images_across_tool_and_text_in_one_entry() {
+        let mut tool = tool_part("render", "python render.py");
+        if let MessagePart::Tool { output, .. } = &mut tool {
+            *output = Some("saved artifacts/chart.png".into());
+        }
+        let entry = assistant(
+            "images",
+            MessageStatus::Streaming,
+            vec![
+                tool,
+                text_part("text", "artifacts/chart.png and artifacts/other.png"),
+            ],
+        );
+        let paths: Vec<String> = rows_for_entry(&entry, false, &mut parse)
+            .iter()
+            .flat_map(|r| match &r.kind {
+                RowKind::InlineImages { paths } => paths.iter().cloned().collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(paths, ["artifacts/chart.png", "artifacts/other.png"]);
+        let later = assistant(
+            "later",
+            MessageStatus::Streaming,
+            vec![text_part("t", "artifacts/chart.png")],
+        );
+        assert!(
+            rows_for_entry(&later, false, &mut parse)
+                .iter()
+                .any(|r| matches!(r.kind, RowKind::InlineImages { .. }))
+        );
+    }
+
+    #[test]
+    fn adoption_failed_specialized_tools_keep_diagnostics() {
+        for call in [
+            ToolCall::WriteFile {
+                path: "x.rs".into(),
+                content: None,
+            },
+            ToolCall::Todo {
+                items: vec![TodoItem {
+                    text: "task".into(),
+                    done: false,
+                }],
+            },
+        ] {
+            let mut part = tool_part("failed", "test");
+            if let MessagePart::Tool {
+                call: c,
+                output,
+                is_error,
+                resolved,
+                ..
+            } = &mut part
+            {
+                *c = call;
+                *output = Some("Permission denied".into());
+                *is_error = true;
+                *resolved = true;
+            }
+            let rows = rows_for_entry(
+                &assistant("failed", MessageStatus::Streaming, vec![part]),
+                false,
+                &mut parse,
+            );
+            assert!(
+                matches!(&rows[0].kind, RowKind::ToolGroup { tools, .. } if tools[0].is_error && tools[0].detail.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_successful_unchanged_todo_has_no_empty_disclosure() {
+        let items = vec![TodoItem {
+            text: "task".into(),
+            done: false,
+        }];
+        let mut part = tool_part("todo", "test");
+        if let MessagePart::Tool { call, .. } = &mut part {
+            *call = ToolCall::Todo {
+                items: items.clone(),
+            };
+        }
+        let rows = rows_for_entry_with_todo_history(
+            &assistant("todo", MessageStatus::Streaming, vec![part]),
+            false,
+            &items,
+            &mut parse,
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn adoption_duplicate_task_titles_keep_occurrence_identity() {
+        let previous = vec![
+            TodoItem {
+                text: "verify".into(),
+                done: true,
+            },
+            TodoItem {
+                text: "verify".into(),
+                done: false,
+            },
+        ];
+        assert!(task_snapshot_items(&previous, &previous, false).is_empty());
+        let current = vec![previous[0].clone()];
+        let changes = task_snapshot_items(&previous, &current, false);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].ordinal, 2);
+        assert_eq!(changes[0].change, Some(TaskChange::Deleted));
+    }
+
+    #[test]
+    fn adoption_eval_omits_python_language_already_in_icon() {
+        let call = ToolCall::Unknown {
+            name: "eval".into(),
+            input: Some(serde_json::json!({"language":"py", "title":"Inspect source"})),
+        };
+        assert_eq!(
+            stream_copy(&call, "Evaluated", "py · Inspect source"),
+            (String::new(), "Inspect source".into())
+        );
+    }
+
+    #[test]
+    fn adoption_group_and_turn_use_same_categories() {
+        let parts = vec![tool_part("a", "cargo test"), tool_part("b", "cargo check")];
+        let rows = rows_for_entry(
+            &assistant("groups", MessageStatus::Streaming, parts.clone()),
+            false,
+            &mut parse,
+        );
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("group");
+        };
+        assert_eq!(
+            tool_group_summary(tools),
+            crate::turn_steps::activity_breakdown(&parts)
+        );
+    }
+
+    #[test]
+    fn adoption_subagent_lifecycle_survives_parent_completion() {
+        let mut part = tool_part("child", "test");
+        if let MessagePart::Tool {
+            call,
+            subagent_ref,
+            subagent_status,
+            ..
+        } = &mut part
+        {
+            *call = ToolCall::Unknown {
+                name: "Agent: Review".into(),
+                input: None,
+            };
+            *subagent_ref = Some("child-doc".into());
+            *subagent_status = Some(SubagentStatus::Running);
+        }
+        let rows = rows_for_entry(
+            &assistant("parent", MessageStatus::Complete, vec![part]),
+            false,
+            &mut parse,
+        );
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("group");
+        };
+        assert_eq!(tools[0].subagent_status, Some(SubagentStatus::Running));
+    }
+
+    #[test]
+    fn adoption_nonempty_reasoning_remains_expandable() {
+        for (text, detail) in [
+            ("Inspecting files", true),
+            ("Thought", true),
+            ("**Inspecting** files", true),
+            ("Inspecting files\n\nMore context", true),
+            ("[source](https://example.com)", true),
+        ] {
+            let tree = parse_full(text);
+            assert_eq!(reasoning_has_detail(&tree), detail, "{text}");
+        }
+        let text = "long reasoning ".repeat(30);
+        let tree = parse_full(&text);
+        assert!(reasoning_has_detail(&tree));
+    }
+
+    #[test]
+    fn adoption_failed_todo_does_not_replace_last_successful_snapshot() {
+        let items = vec![TodoItem {
+            text: "keep".into(),
+            done: false,
+        }];
+        let mut good = tool_part("good", "test");
+        let mut bad = tool_part("bad", "test");
+        if let MessagePart::Tool { call, .. } = &mut good {
+            *call = ToolCall::Todo {
+                items: items.clone(),
+            };
+        }
+        if let MessagePart::Tool { call, is_error, .. } = &mut bad {
+            *call = ToolCall::Todo { items: vec![] };
+            *is_error = true;
+        }
+        let entry = assistant("tasks", MessageStatus::Complete, vec![good, bad]);
+        assert_eq!(last_todo_snapshot(&entry), Some(items.as_slice()));
+    }
+    #[test]
+    fn adoption_narrative_boundaries_have_more_space_than_tool_rows() {
+        let entry = assistant(
+            "rhythm",
+            MessageStatus::Streaming,
+            vec![
+                text_part("intro", "Inspecting."),
+                tool_part("exec", "cargo test"),
+                text_part("result", "Tests passed."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
+        assert_eq!(top_gap_for(Some(&rows[1]), &rows[2]), render::MD_BLOCK_GAP);
     }
 }

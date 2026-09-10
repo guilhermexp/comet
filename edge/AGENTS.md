@@ -12,6 +12,10 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 
 ## Local Contracts
 
+- Skill/skill preserva apenas os identificadores `skill`, `path` e `name` no input renderizável, com trim e strings vazias omitidas. Args, prompt e conteúdo continuam fora do transcript; sanitizer permanece idempotente.
+
+- O campo opcional `answers` de input parts preserva `questionId` + `labels` nos dois sentidos de `toDocParts`/`fromDocParts`, em paridade com `zeron-doc`.
+
 - Decisão registrada em `docs/research/durable-objects-language.md`: **os DOs ficam em TypeScript**. Tudo device-side é Rust. Não portar DO pra Rust sem revisitar essa decisão.
 - `edge/src/session-doc/` é o gêmeo do schema de `crates/doc` — nome e shape de container casam byte a byte. Mudou lá, muda aqui, no mesmo commit.
 - Fala `loro-protocol` no fio; o lado Rust usa a crate oficial equivalente. Frames são idênticos por contrato, não por coincidência.

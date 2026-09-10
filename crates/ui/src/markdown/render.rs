@@ -16,9 +16,8 @@ use std::time::Instant;
 
 use comet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 use gpui::{
-    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
-    StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
-    size,
+    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, SharedString, StyledText,
+    TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad, size,
 };
 
 use crate::theme::Theme;
@@ -553,9 +552,9 @@ pub struct FlatText {
     pub links: Vec<(Range<usize>, String)>,
 }
 
-/// Inline-code tint: violet text without a separate background surface.
+/// Inline-code tint follows the selected accent.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
-    theme.code_text // violet-300
+    theme.code_text
 }
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
@@ -602,7 +601,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // theme underlines in the text color; indigo is reserved for primary
         // actions).
         let is_link = run.style.link.is_some();
-        // Inline code reads violet (see `inline_code_text`); everything else
+        // Inline code follows the accent (see `inline_code_text`); everything else
         // stays the monochrome foreground.
         let color = if run.style.code {
             inline_code_text(theme)
@@ -627,8 +626,12 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             len: run.text.len(),
             font: f,
             color,
-            // Inline code is distinguished by font and text color only.
-            background_color: None,
+            // The neutral preset needs a surface to distinguish code from
+            // prose. Paint its rounded wash below, without affecting shaping.
+            background_color: (run.style.code
+                && theme.accent_selection
+                    == zeron_theme::AccentSelection::Preset(crate::theme::AccentColor::Gray))
+            .then_some(theme.code_wash),
             underline: is_link.then_some(UnderlineStyle {
                 color: Some(theme.text_muted),
                 thickness: px(1.0),
@@ -682,13 +685,29 @@ fn flat_text_element(
     // Streaming veil: opacity-only recolor of the runs covering newly appended
     // chunks. Same text, same fonts, same lengths — layout is untouched.
     // Settled elements return no spans and reuse the cached runs unsplit.
-    let text_runs = match &opts.veil {
+    let mut text_runs = match &opts.veil {
         Some(veil) => {
             let spans = veil.borrow_mut().advance(ix, &flat.text, opts.now);
             apply_veil(flat.runs.clone(), &spans)
         }
         None => flat.runs.clone(),
     };
+    // GPUI's built-in TextRun backgrounds are square and fill the whole line
+    // height. Move them to the existing underlay for rounded, inset surfaces.
+    // Merge contiguous pieces so style boundaries do not create little pills.
+    let mut code_backgrounds: Vec<(Range<usize>, Hsla)> = Vec::new();
+    let mut offset = 0;
+    for run in &mut text_runs {
+        if let Some(color) = run.background_color.take() {
+            match code_backgrounds.last_mut() {
+                Some((range, previous)) if range.end == offset && *previous == color => {
+                    range.end += run.len;
+                }
+                _ => code_backgrounds.push((offset..offset + run.len, color)),
+            }
+        }
+        offset += run.len;
+    }
     let styled = StyledText::new(flat.text.clone()).with_runs(text_runs);
     let layout = styled.layout().clone();
     let text_el: AnyElement = if flat.links.is_empty() {
@@ -697,18 +716,65 @@ fn flat_text_element(
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
         let open_file = opts.open_file.clone();
-        InteractiveText::new(id, styled)
-            .on_click(ranges, move |clicked_ix, window, cx| {
-                if let Some(url) = urls.get(clicked_ix) {
+        let click_layout = layout.clone();
+        let cursor_layout = layout.clone();
+        let cursor_ranges = ranges.clone();
+        // Standard controls register press AND release in the same frame.
+        // InteractiveText in our pinned GPUI waits for another paint before
+        // installing release, losing fast clicks while the UI is busy.
+        div()
+            .id(id)
+            .relative()
+            .on_click(move |event, window, cx| {
+                let gpui::ClickEvent::Mouse(event) = event else {
+                    return;
+                };
+                if (event.up.position - event.down.position).magnitude() > 2.0 {
+                    return; // Selecting text must not open its link.
+                }
+                let (Ok(down), Ok(up)) = (
+                    click_layout.index_for_position(event.down.position),
+                    click_layout.index_for_position(event.up.position),
+                ) else {
+                    return;
+                };
+                if let Some(clicked_ix) = ranges
+                    .iter()
+                    .position(|r| r.contains(&down) && r.contains(&up))
+                {
+                    let url = &urls[clicked_ix];
                     match open_file.as_ref().filter(|_| is_previewable_file_link(url)) {
                         Some(open) => open(url, window, cx),
                         None => cx.open_url(url),
                     }
                 }
             })
+            .child(styled)
+            // Paint after text so glyph positions are available in prepaint.
+            // Cursor hitboxes cover links only, including soft-wrapped lines.
+            .child(
+                canvas(
+                    move |_, window, _| {
+                        cursor_ranges
+                            .iter()
+                            .flat_map(|range| range_rects(&cursor_layout, range, 0.0, 0.0))
+                            .map(|bounds| {
+                                window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    |_, hitboxes, window, _| {
+                        for hitbox in &hitboxes {
+                            window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .into_any_element()
     };
-    // Underlay canvas: selection wash painted BEFORE the text (earlier sibling
+    // Underlay canvas: code and selection washes BEFORE the text (earlier sibling
     // ⇒ underneath), reading glyph geometry from the text's own layout handle.
     // The same paint pass re-registers the frame-scoped window mouse listeners
     // that drive text selection (round 18; see markdown/selection.rs).
@@ -718,6 +784,18 @@ fn flat_text_element(
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
+            for (range, color) in &code_backgrounds {
+                for rect in range_rects(&layout, range, 3.0, 2.0) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(4.0),
+                        *color,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
+            }
             if let Some(range) = super::selection::wash_range(&sel_key) {
                 for rect in range_rects(&layout, &range, 0.0, 0.0) {
                     window.paint_quad(quad(
@@ -1153,7 +1231,7 @@ fn render_code_block(
             .when(copied, |el| el.child(SharedString::from("Copied")))
     });
     div()
-        .rounded(px(10.0))
+        .rounded(px(8.0))
         // Faint white wash over the near-black panel ≈ #101010 (zeron's code
         // surface), with the hairline border.
         .bg(crate::theme::ink(0.035))
@@ -1263,6 +1341,109 @@ mod tests {
     use super::*;
     use crate::markdown::parser::InlineStyle;
 
+    #[gpui::test]
+    fn markdown_link_opens_without_a_frame_between_press_and_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _selection_state = crate::markdown::selection::tests::state_lock();
+        use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+        struct LinkFixture(Rc<RefCell<Vec<String>>>);
+        impl gpui::Render for LinkFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let calls = self.0.clone();
+                let mut opts = RenderOptions::settled("first-click".into());
+                opts.open_file = Some(Rc::new(move |url, _, _| {
+                    calls.borrow_mut().push(url.into())
+                }));
+                let flat = flatten_runs(
+                    &[InlineRun {
+                        text: "Abrir relatório".into(),
+                        style: InlineStyle {
+                            link: Some("report.html".into()),
+                            ..Default::default()
+                        },
+                    }],
+                    Theme::of(cx),
+                    false,
+                );
+                div()
+                    .size_full()
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .child(flat_text_element(&flat, 0, &opts, Theme::of(cx)))
+            }
+        }
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view(|_, _| LinkFixture(calls.clone()));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let position = point(px(12.0), px(10.0));
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            // Deliberately no draw here: fast clicks can share a display frame.
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        assert_eq!(&*calls.borrow(), &["report.html"]);
+        // A normal slower click still works after a repaint. Non-links,
+        // selection drags and secondary-button gestures must not dispatch.
+        for (down_x, up_x, button, repaint, expected) in [
+            (12.0, 12.0, MouseButton::Left, true, 2),
+            (300.0, 300.0, MouseButton::Left, false, 2),
+            (12.0, 44.0, MouseButton::Left, false, 2),
+            (12.0, 300.0, MouseButton::Left, false, 2),
+            (12.0, 12.0, MouseButton::Right, false, 2),
+        ] {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        position: point(px(down_x), px(10.0)),
+                        button,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                if repaint {
+                    let _ = window.draw(cx);
+                }
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        position: point(px(up_x), px(10.0)),
+                        button,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            assert_eq!(
+                calls.borrow().len(),
+                expected,
+                "gesture {down_x}->{up_x}, {button:?}"
+            );
+        }
+    }
+
     /// Model GPUI's upstream affinity at a soft-wrap boundary: byte 5 is
     /// reported at the end of row 0, while byte 6 is after the first glyph on
     /// row 1.
@@ -1354,6 +1535,48 @@ mod tests {
         let runs = runs_for_syntax_line("plain text", &[], &mono, &theme);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, 10);
+    }
+
+    #[test]
+    fn gray_inline_code_background_follows_accent_in_both_appearances() {
+        use crate::theme::{AccentColor, Appearance};
+        let runs = [
+            InlineRun {
+                text: "O ".into(),
+                style: InlineStyle::default(),
+            },
+            InlineRun {
+                text: "SOUL.md".into(),
+                style: InlineStyle {
+                    code: true,
+                    link: Some("/tmp/SOUL.md".into()),
+                    ..Default::default()
+                },
+            },
+            InlineRun {
+                text: " está aqui.".into(),
+                style: InlineStyle::default(),
+            },
+        ];
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            for accent in AccentColor::ALL {
+                let theme = Theme::for_preferences(appearance, accent);
+                let flat = flatten_runs(&runs, &theme, false);
+                assert_eq!(flat.text.as_ref(), "O SOUL.md está aqui.");
+                assert_eq!(flat.links, [(2..9, "/tmp/SOUL.md".into())]);
+                assert_eq!(flat.runs[0].background_color, None);
+                assert_eq!(flat.runs[2].background_color, None);
+                assert_eq!(flat.runs[1].color, theme.code_text);
+                assert_eq!(
+                    flat.runs[1].background_color,
+                    (accent == AccentColor::Gray).then_some(theme.code_wash),
+                    "{appearance:?}/{accent:?}"
+                );
+                let fenced =
+                    runs_for_syntax_line("SOUL.md", &[], &font(theme.font_mono.clone()), &theme);
+                assert!(fenced.iter().all(|run| run.background_color.is_none()));
+            }
+        }
     }
 
     #[test]

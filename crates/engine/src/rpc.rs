@@ -97,6 +97,13 @@ struct SetLiveVoiceMutedParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ProbeLiveVoiceParams {
+    chat_id: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
 }
@@ -1548,12 +1555,22 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::PROBE_LIVE_VOICE => {
-                let p: ChatParams = parse_params(params)?;
-                let availability = self
-                    .sessions
-                    .probe_live_voice(&p.chat_id)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let p: ProbeLiveVoiceParams = parse_params(params)?;
+                let availability =
+                    if let Some(chat_id) = p.chat_id.as_deref().filter(|id| !id.is_empty()) {
+                        self.sessions
+                            .probe_live_voice(chat_id)
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    } else {
+                        let cwd = p.cwd.filter(|cwd| !cwd.trim().is_empty()).ok_or_else(|| {
+                            RpcError::Failed("ProbeLiveVoice requires chatId or cwd".into())
+                        })?;
+                        self.sessions
+                            .probe_live_voice_at_cwd(&cwd)
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    };
                 RpcReply::value(&availability)
             }
             methods::START_LIVE_VOICE => {

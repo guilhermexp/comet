@@ -95,11 +95,16 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
 }
 
 pub fn activity_breakdown(parts: &[MessagePart]) -> String {
-    let mut counts = HashMap::<ActivityBucket, usize>::new();
-    for call in parts.iter().filter_map(|part| match part {
+    activity_breakdown_for_calls(parts.iter().filter_map(|part| match part {
         MessagePart::Tool { call, .. } => Some(call),
         _ => None,
-    }) {
+    }))
+}
+
+/// Shared categories and units for both live tool groups and settled turns.
+pub fn activity_breakdown_for_calls<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> String {
+    let mut counts = HashMap::<ActivityBucket, usize>::new();
+    for call in calls {
         *counts.entry(activity_bucket(call)).or_default() += 1;
     }
 
@@ -307,6 +312,7 @@ mod tests {
             id: id.into(),
             request_id: format!("request-{id}"),
             questions: Vec::new(),
+            answers: None,
             resolved,
         }
     }

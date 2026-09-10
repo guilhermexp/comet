@@ -42,6 +42,7 @@ pub mod motion;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
+mod questions;
 pub mod rail;
 pub mod settings;
 pub mod shell;
