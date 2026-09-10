@@ -123,3 +123,9 @@ The common MIT permission notice for the adaptations above follows:
 
 The pinned Shades of Purple license additionally says that anything built with
 it should also be MIT licensed. Zeron is distributed under MIT terms.
+
+## GPUI / zui
+
+GPUI is consumed from zeronsh/zui at 07fd941ad72e7edc812fed317aab66adb69fa8cc, an extraction of the Apache-2.0 GPUI renderer and supporting crates from wingleeio/zed. The source retains its licenses and attribution in LICENSE-APACHE and NOTICE. GPL Zed application crates and tracing crates are not linked into Comet.
+
+Source: https://github.com/zeronsh/zui/tree/07fd941ad72e7edc812fed317aab66adb69fa8cc

@@ -11,7 +11,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 ## Stack
 
 - **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel}` + `apps/zeron` (membro padrão do workspace).
-- **UI = gpui**, pinado num fork do Zed (`wingleeio/zed`, rev fixado em `Cargo.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
+- **UI = gpui**, pinado num fork do Zed (`zeronsh/zui`, extração Apache-2.0 de `wingleeio/zed`, rev fixado em `Cargo.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
 - **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres, sem Hono server, sem WebRTC.
 - **apps/ios** — cliente iOS (projeto Xcode), fora do workspace Cargo.
@@ -46,7 +46,7 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 - `crates/tui` / `apps/tui` foram **deletados** (upstream removeu o viewport ratatui). Isso **não** é o painel de terminal dentro do app — esse vive em `crates/ui/src/terminal/` e está intacto.
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.
 - Build do gpui é caro; `[profile.dev]` já usa `opt-level = 2` pras deps. Primeira build leva minutos.
-- Bump do rev do gpui exige rebase da branch `comet/line-wrap-closing-punctuation` no fork do Zed.
+- Bump do rev do gpui exige verificar ambas as regras de `comet/line-wrap-closing-punctuation` (`line_wrapper` e `line_layout`); o pin zui 07fd941a já incorpora essas correções.
 - **Live Voice pertence à engine host, não à surface selecionada.** Trocar/limpar o Chat, perder foco ou minimizar não encerra a call. Em `Working`/`AwaitingInput`, start exige que o OMP anuncie contexto operacional silencioso; a engine projeta só status/texto visível/label de tool/espera/erro e coalesce o último snapshot. Delegação vocal confirmada entra como comando durável `Steer`, com fallback único para novo turno se o run assentar; comando durável alheio, End/Escape no Chat ativo, falha de transporte, shutdown ou quit encerram. Run OMP estacionado em `Idle` continua quente e requer só Live básico.
 - Este é um repo de terceiro sob MIT. Preservar licença e atribuição.
 

@@ -16,6 +16,7 @@ Os executáveis. `apps/zeron` é o binário único (headed por padrão, `headles
 - Bind da porta é best-effort: porta ocupada não impede a janela de abrir, só perde a capacidade de hospedar peers.
 - **Modo headless**: só engine; imprime URL de sign-in no TTY (fluxo de paste-code), serve IPC em localhost e hospeda o próprio DeviceRoom.
 - Subcomandos vivem em arquivos separados (`auth_cli.rs`, `update_cli.rs`, `daemon.rs`) — `main.rs` só despacha.
+- O allocator customizado do binário é mimalloc v2 apenas no macOS; Linux e demais plataformas mantêm o allocator de sistema.
 - `apps/ios` não entra no `cargo build`; build e teste são pelo Xcode.
 
 ## Work Guidance

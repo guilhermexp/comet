@@ -18,3 +18,10 @@ Source selection: discussed upstream a1adfde2. Local base b2e41d4c. P1/P3 eviden
 - GREEN: engine `acp_lifecycle` passed in 7.20s, covering Working, subsequent steer, final turns and autonomous fallback (`/tmp/comet-upstream-p5-engine-green.log`).
 - GREEN: all 156 harness unit tests passed, including progressive previews and Live Voice defaults (`/tmp/comet-upstream-p5-unit-green.log`). Full integration coverage remains in the final workspace gate.
 - Adapted 32fd7070 with three-way reconciliation; preserved fork ToolCallPreview tracking, UpdateNormalizer finish_turn, RunControls, OMP and Live Voice interfaces. No live provider request was used.
+
+## P2 — desktop efficiency (native acceptance pending)
+
+- RED: both session/device heartbeat regressions failed before notification filtering (`/tmp/comet-upstream-p2-heartbeat-red.log`). GREEN: all 50 AppState tests passed (`/tmp/comet-upstream-p2-state-green.log`). Fork Live Voice refresh remains outside the presentation notification gate.
+- Adopted reviewed zui 07fd941a and macOS-only mimalloc v2. Verified both punctuation fixes and their upstream tests remain in line_wrapper/line_layout. Resolved metadata contains no GPL tracing dependency; zui's unrelated GPL path crate is not in the dependency graph (`/tmp/comet-upstream-p2-metadata.json`).
+- GREEN: all 1236 UI unit tests passed against zui (`/tmp/comet-upstream-p2-zui-ui.log`). This includes existing Chat wrapping, links, selection, theme and Workers regressions.
+- Native frame recovery test must run from the dependency workspace: Cargo correctly rejects testing an external dependency's dev target from this workspace (`/tmp/comet-upstream-p2-frame-recovery.log`). Native app build, BCU idle/resize/preview/focus and renderer recovery acceptance remain open. No CPU or FPS improvement is claimed from upstream benchmarks.

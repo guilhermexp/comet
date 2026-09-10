@@ -12,6 +12,8 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Local Contracts
 
+- `AppState` retém timestamps frescos de Sessions/Devices, mas o watcher só notifica quando metadata visível, status, erro, contexto ou presença efetiva muda. Heartbeats idênticos não redesenham a árvore; ticks de device ainda aposentam indicadores de sessões remotas stale.
+
 - Headers de eval mostram apenas o título (ou nome da tool), sem Evaluating/Evaluated; MCP mostra servidor e tool sem Calling tool/Called tool. Skill mostra o identificador recebido em `skill`/`path`/`name` ao lado do label; hub mostra a operação/alvo já derivados, sem Ran/Running hub. Preservar ícones, erros e detalhes expansíveis.
 
 - `questions.rs` é o presenter nativo do histórico de perguntas: `Asking question…` em carregamento, pergunta + espera enquanto o composer coleta input, e card `Answer/Answers` com perguntas e respostas por id. `ask`/`AskUserQuestion`/`request_user_input` passam por ele; requests com texto exato no intervalo da tool substituem sua apresentação sem duplicação. Histórico sem resposta persistida indica `Answer not recorded`; seleção pulada indica `Skipped`. A UI não reconstrói respostas por índice nem cria outro painel interativo.

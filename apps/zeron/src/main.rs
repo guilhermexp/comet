@@ -96,9 +96,9 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     }
 }
 
-/// mimalloc: system malloc (macOS libmalloc especially) never returns the
-/// streaming churn's high-water pages, so transient allocation became
-/// permanent RSS (docs/memory-plan.md §1).
+/// Use mimalloc v2 on macOS to return transient streaming allocations.
+/// Other platforms retain their system allocator.
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

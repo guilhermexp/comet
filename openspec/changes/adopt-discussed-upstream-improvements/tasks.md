@@ -14,7 +14,7 @@
 
 ## 4. P2 desktop efficiency
 
-- [ ] 4.1 Filter presentation-equivalent session/device heartbeat notifications while retaining fresh values; verify status/membership/error changes still notify.
+- [x] 4.1 Filter presentation-equivalent session/device heartbeat notifications while retaining fresh values; verify status/membership/error changes still notify.
 - [ ] 4.2 Reconcile the pinned wrapping patch with the reviewed zui renderer, adopt idle/wake/display registration and macOS allocator changes, and verify dependency licenses plus build/wrapping tests.
 - [ ] 4.3 Exercise idle/resume, resizing, blur/transparency, native previews, focus and input through BCU; record actual observations and measurement limits.
 
