@@ -27,13 +27,36 @@ use super::presentation::{
     HOSTED_SIDEBAR_TOP_PADDING, PROJECT_ROW_BASE_LEADING, SESSION_ROW_BASE_LEADING,
     SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
     SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
-    SessionIndicator, compare_sessions_by_activity, relative_age, runtime_icon_path,
-    runtime_spinner_tint, session_indicator, session_title_truncate, spinner_frame,
+    SessionBranchMarker, SessionIndicator, compare_sessions_by_activity, relative_age,
+    runtime_icon_path, runtime_spinner_tint, session_branch_marker, session_indicator,
+    session_title_truncate, spinner_frame,
 };
 
 /// Deepest parent chain the sidebar walks. Same guard as [`project_depth`] and
 /// [`project_visible`]: a cycle in `parent_project_id` must not hang the render.
 const MAX_PROJECT_DEPTH: usize = 8;
+
+struct SessionBranchTooltip {
+    branch: SharedString,
+}
+
+impl Render for SessionBranchTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.branch.clone())
+    }
+}
+
 use super::project_menu::{WorkersProjectMenuItem as ProjectMenuItem, project_menu_items};
 use super::recent::recent_activity_sections;
 use super::resource_monitor::{PressureAction, WorkersResourceGlobal};
@@ -1102,12 +1125,17 @@ impl WorkersSidebar {
         let revealed = self.revealed_projects.contains(&project.id);
         let (visible_indices, hidden_sessions) =
             project_session_row_plan(sessions.len(), selected_index, revealed);
+        let show_branch = crate::settings::current(cx).sidebar_show_branch;
         let rows = visible_indices
             .into_iter()
             .map(|session_index| {
                 let session = sessions[session_index].clone();
+                let branch = show_branch
+                    .then(|| session_branch_marker(&project, &session))
+                    .flatten();
                 self.render_session(
                     session,
+                    branch,
                     selected_session_id,
                     depth,
                     index * 10_000 + session_index,
@@ -1450,6 +1478,7 @@ impl WorkersSidebar {
     fn render_session(
         &self,
         session: WorkersSession,
+        branch: Option<SessionBranchMarker>,
         selected_session_id: Option<&str>,
         depth: usize,
         index: usize,
@@ -1656,6 +1685,32 @@ impl WorkersSidebar {
                 SessionIndicator::Idle | SessionIndicator::Exited => {
                     div().w(px(16.0)).flex().justify_center()
                 }
+            })
+            .when_some(branch, |el, marker| {
+                let branch_name: SharedString = marker.branch.clone().into();
+                el.child(
+                    div()
+                        .id(("workers-session-branch", index))
+                        .flex_none()
+                        .opacity(0.55)
+                        .child(
+                            icon(if marker.is_worktree {
+                                icons::WORKER_BRANCH
+                            } else {
+                                icons::WORKER_GIT_BRANCH
+                            })
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                        )
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| SessionBranchTooltip {
+                                branch: branch_name.clone(),
+                            })
+                            .into()
+                        })
+                        .tooltip_show_delay(Duration::from_millis(350)),
+                )
             })
             .child(
                 div()
