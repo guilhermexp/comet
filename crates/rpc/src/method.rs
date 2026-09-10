@@ -228,6 +228,10 @@ rpc_methods! {
     LIST_DRIVES / ListDrives = "ListDrives" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     SEARCH_FILES / SearchFiles = "SearchFiles" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    LIST_WORKSPACE_DIRECTORY / ListWorkspaceDirectory = "ListWorkspaceDirectory" { params: zeron_proto::ListWorkspaceDirectoryRequest, reply: zeron_proto::WorkspaceDirectoryPage, forwardable: true },
+    SEARCH_WORKSPACE_FILES / SearchWorkspaceFiles = "SearchWorkspaceFiles" { params: zeron_proto::SearchWorkspaceFilesRequest, reply: Vec<zeron_proto::WorkspaceFileSearchMatch>, forwardable: true },
+    READ_WORKSPACE_FILE / ReadWorkspaceFile = "ReadWorkspaceFile" { params: zeron_proto::ReadWorkspaceFileRequest, reply: zeron_proto::WorkspaceFileText, forwardable: true },
+    WATCH_WORKSPACE_FILES / WatchWorkspaceFiles = "WatchWorkspaceFiles" { params: zeron_proto::WatchWorkspaceFilesRequest, reply: zeron_proto::WorkspaceFileChanges, forwardable: true, stream: true },
     CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 120 },
     DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     // Terminals (ControlRpc, relay-forwardable — a terminal lives on the chat's

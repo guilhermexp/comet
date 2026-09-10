@@ -12,6 +12,9 @@ Dona de tudo que é pixel. **Não** é dona de comportamento que precisa sobrevi
 
 ## Local Contracts
 
+- Files de um Chat/Space registrado usa RPC no device dono e `DirectoryCache` para reconciliar só diretórios afetados, sem descartar expansão/scroll. Paginação tem ação Load more. Requests incluem ignored para preservar a política local de mostrar pastas operacionais, filtrando apenas hidden conforme preferência e saídas estruturais já negadas. Contextos locais de Workers e Chats sem Space mantêm seu scanner local. Trocar contexto cancela fetch/watch; versões antigas exibem estado de atualização necessária, sem fallback local para path remoto.
+- Documentos remotos de texto usam o mesmo loader e renderer do preview nativo (Markdown, HTML isolado, código, CSV/TSV). Fonte remota fica presa ao contexto/device; Open in local fica oculto, e erro remoto não tenta ler o mesmo path na máquina local. Links locais absolutos externos ao checkout continuam no resolvedor anterior. Fechar a última aba libera a fonte remota.
+
 - `AppState` retém timestamps frescos de Sessions/Devices, mas o watcher só notifica quando metadata visível, status, erro, contexto ou presença efetiva muda. Heartbeats idênticos não redesenham a árvore; ticks de device ainda aposentam indicadores de sessões remotas stale.
 
 - Headers de eval mostram apenas o título (ou nome da tool), sem Evaluating/Evaluated; MCP mostra servidor e tool sem Calling tool/Called tool. Skill mostra o identificador recebido em `skill`/`path`/`name` ao lado do label; hub mostra a operação/alvo já derivados, sem Ran/Running hub. Preservar ícones, erros e detalhes expansíveis.

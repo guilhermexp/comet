@@ -374,6 +374,7 @@ pub enum DetailsSidebarEvent {
         context_key: String,
         root: std::path::PathBuf,
         relative_path: String,
+        remote_target: Option<(zeron_proto::WorkspaceTarget, String)>,
     },
     OpenSubagent {
         chat_id: String,
@@ -452,6 +453,9 @@ pub struct DetailsSidebar {
     sidebar: DetailsSidebarState,
     chat_workers: ChatWorkersWidgetState,
     files: LoadState<Vec<FileNode>>,
+    directory_cache: super::file_tree::DirectoryCache,
+    workspace_watch: Option<Task<()>>,
+    workspace_watch_key: Option<String>,
     usage: LoadState<Vec<ProviderUsageRow>>,
     usage_snapshot: Option<AgentAccountsSnapshot>,
     usage_fetched_at: Option<std::time::Instant>,
@@ -547,6 +551,9 @@ impl DetailsSidebar {
             sidebar: DetailsSidebarState::new(preferences),
             chat_workers: ChatWorkersWidgetState::default(),
             files: LoadState::Idle,
+            directory_cache: super::file_tree::DirectoryCache::default(),
+            workspace_watch: None,
+            workspace_watch_key: None,
             usage: LoadState::Idle,
             usage_snapshot: None,
             usage_fetched_at: None,
@@ -593,6 +600,12 @@ impl DetailsSidebar {
         let before = self.sidebar.load_generation();
         let after = self.sidebar.set_context(context);
         if before != after {
+            self.stop_recency_watch();
+            self.directory_cache = super::file_tree::DirectoryCache::default();
+            self.workspace_watch = None;
+            self.workspace_watch_key = None;
+            self.file_task = None;
+            self.files = LoadState::Idle;
             self.chat_workers
                 .sync_context(self.sidebar.context().map(|context| context.key.as_str()));
             self.active_file = None;
@@ -906,6 +919,10 @@ impl DetailsSidebar {
     }
 
     fn load_files(&mut self, silent: bool, cx: &mut Context<Self>) {
+        if self.workspace_file_source(cx).is_some() {
+            self.load_workspace_files(silent, None, None, cx);
+            return;
+        }
         let Some(context) = self.sidebar.context().cloned() else {
             self.files = LoadState::Idle;
             return;
@@ -957,6 +974,301 @@ impl DetailsSidebar {
             });
         }));
         cx.notify();
+    }
+
+    fn workspace_file_source(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(
+        crate::state::EngineHandle,
+        zeron_proto::WorkspaceTarget,
+        String,
+    )> {
+        let context = self.sidebar.context()?;
+        let state = self.app_state.read(cx);
+        let device = context.target_device_id.clone()?;
+        let engine = state.engine()?.clone();
+        let target = if let Some(chat_id) = &context.chat_id {
+            // Project-less local Chats retain the existing local-folder surface.
+            if state
+                .chats
+                .iter()
+                .find(|chat| &chat.id == chat_id)?
+                .space_id
+                .is_none()
+            {
+                return None;
+            }
+            zeron_proto::WorkspaceTarget {
+                chat_id: Some(chat_id.clone()),
+                space_id: None,
+                checkout_path: None,
+            }
+        } else {
+            let space = state.spaces.iter().find(|space| {
+                space.device_id == device && std::path::Path::new(&space.path) == context.cwd
+            })?;
+            zeron_proto::WorkspaceTarget {
+                chat_id: None,
+                space_id: Some(space.id.clone()),
+                checkout_path: None,
+            }
+        };
+        Some((engine, target, device))
+    }
+
+    fn load_workspace_files(
+        &mut self,
+        silent: bool,
+        only: Option<Vec<String>>,
+        append: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, target, device)) = self.workspace_file_source(cx) else {
+            return;
+        };
+        let Some(context) = self.sidebar.context().cloned() else {
+            return;
+        };
+        self.ensure_workspace_watch(
+            context.key.clone(),
+            engine.clone(),
+            target.clone(),
+            device.clone(),
+            cx,
+        );
+        if self.recency_root.is_some() {
+            self.stop_recency_watch();
+        }
+        let generation = self.sidebar.load_generation();
+        let context_key = context.key;
+        let show_hidden = self.sidebar.show_hidden();
+        let query = self.search.read(cx).text().trim().to_string();
+        let mut cache = self.directory_cache.clone();
+        let mut directories = only.unwrap_or_else(|| {
+            let mut dirs = cache.loaded_directories();
+            dirs.push(String::new());
+            dirs
+        });
+        if !cache.contains("") {
+            directories.push(String::new());
+        }
+        // A rapid second expansion can cancel the previous fetch; include all
+        // still-missing expanded directories so neither click gets lost.
+        directories.extend(
+            self.sidebar
+                .expanded_paths()
+                .into_iter()
+                .filter(|path| !cache.contains(path)),
+        );
+        directories.sort();
+        directories.dedup();
+        if !silent && !matches!(self.files, LoadState::Ready(_)) {
+            self.files = LoadState::Loading;
+        }
+        self.file_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<Vec<FileNode>, zeron_rpc::RpcError> = async {
+                if !query.is_empty() {
+                    let request = zeron_proto::SearchWorkspaceFilesRequest {
+                        target: target.clone(),
+                        query: query.clone(),
+                        include_ignored: true,
+                        limit: Some(200),
+                    };
+                    let mut params = serde_json::to_value(request).unwrap();
+                    params["targetDeviceId"] = device.clone().into();
+                    let matches: Vec<zeron_proto::WorkspaceFileSearchMatch> = engine
+                        .client()
+                        .call_as(zeron_rpc::methods::SEARCH_WORKSPACE_FILES, params)
+                        .await?;
+                    return Ok(super::file_tree::search_result_nodes(&matches, show_hidden));
+                }
+                for directory in directories {
+                    if !directory.is_empty() && !cache.can_expand(&directory) {
+                        continue;
+                    }
+                    let is_append = append.as_deref() == Some(directory.as_str());
+                    let retained = cache.loaded_count(&directory).max(500);
+                    let mut cursor = if is_append {
+                        cache.cursor(&directory).map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    let mut page = zeron_proto::WorkspaceDirectoryPage {
+                        directory: directory.clone(),
+                        entries: Vec::new(),
+                        next_cursor: None,
+                        truncated: false,
+                    };
+                    loop {
+                        let request = zeron_proto::ListWorkspaceDirectoryRequest {
+                            target: target.clone(),
+                            directory: directory.clone(),
+                            include_ignored: true,
+                            cursor,
+                        };
+                        let mut params = serde_json::to_value(request).unwrap();
+                        params["targetDeviceId"] = device.clone().into();
+                        let next: zeron_proto::WorkspaceDirectoryPage = engine
+                            .client()
+                            .call_as(zeron_rpc::methods::LIST_WORKSPACE_DIRECTORY, params)
+                            .await?;
+                        if next.directory != directory {
+                            return Err(zeron_rpc::RpcError::Failed(
+                                "Files returned a different directory".into(),
+                            ));
+                        }
+                        page.entries.extend(next.entries);
+                        page.next_cursor = next.next_cursor;
+                        page.truncated = next.truncated;
+                        if is_append || page.entries.len() >= retained || page.next_cursor.is_none()
+                        {
+                            break;
+                        }
+                        cursor = page.next_cursor.clone();
+                    }
+                    cache.apply(page, is_append);
+                }
+                Ok(cache.nodes(show_hidden))
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.sidebar.accept_file_load(generation, &context_key)
+                    || this.search.read(cx).text().trim() != query
+                {
+                    return;
+                }
+                match result {
+                    Ok(nodes) => {
+                        let changed = this.directory_cache != cache
+                            || !matches!(&this.files, LoadState::Ready(old) if old == &nodes);
+                        this.directory_cache = cache;
+                        this.files = LoadState::Ready(nodes);
+                        if changed {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        let message: SharedString = match error {
+                            zeron_rpc::RpcError::UnknownMethod(_) => {
+                                "Update the project device to enable Files browsing.".into()
+                            }
+                            other => format!("Files: {other}").into(),
+                        };
+                        let changed =
+                            !matches!(&this.files, LoadState::Error(old) if old == &message);
+                        this.files = LoadState::Error(message);
+                        if changed {
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        }));
+        if !silent {
+            cx.notify();
+        }
+    }
+
+    fn ensure_workspace_watch(
+        &mut self,
+        key: String,
+        engine: crate::state::EngineHandle,
+        target: zeron_proto::WorkspaceTarget,
+        device: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_watch_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.workspace_watch_key = Some(key.clone());
+        self.workspace_watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let mut params = serde_json::to_value(zeron_proto::WatchWorkspaceFilesRequest {
+                    target: target.clone(),
+                })
+                .unwrap();
+                params["targetDeviceId"] = device.clone().into();
+                let mut last_sequence = None;
+                let subscription = engine
+                    .client()
+                    .subscribe(zeron_rpc::methods::WATCH_WORKSPACE_FILES, params)
+                    .await;
+                if matches!(&subscription, Err(zeron_rpc::RpcError::UnknownMethod(_))) {
+                    return;
+                }
+                if let Ok(mut stream) = subscription {
+                    while let Some(value) = stream.recv().await {
+                        let Ok(batch) =
+                            serde_json::from_value::<zeron_proto::WorkspaceFileChanges>(value)
+                        else {
+                            continue;
+                        };
+                        let initial = last_sequence.is_none();
+                        let gap = last_sequence.is_some_and(|last| batch.sequence != last + 1);
+                        last_sequence = Some(batch.sequence);
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.sidebar.context().map(|c| c.key.as_str())
+                                    != Some(key.as_str())
+                                {
+                                    return;
+                                }
+                                if initial || gap || batch.resync_required {
+                                    this.load_workspace_files(true, None, None, cx);
+                                    return;
+                                }
+                                let mut parents = std::collections::BTreeSet::new();
+                                let now = std::time::Instant::now();
+                                for change in batch.changes {
+                                    for path in std::iter::once(change.path).chain(change.old_path)
+                                    {
+                                        if super::file_tree::is_denied_relative(
+                                            std::path::Path::new(&path),
+                                        ) {
+                                            continue;
+                                        }
+                                        this.recency.mark(path.clone(), now);
+                                        if let Some(parent) = std::path::Path::new(&path)
+                                            .parent()
+                                            .and_then(|p| p.to_str())
+                                        {
+                                            if this.directory_cache.contains(parent) {
+                                                parents.insert(parent.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                if !parents.is_empty() {
+                                    this.ensure_recency_tick(cx);
+                                    cx.notify();
+                                    this.load_workspace_files(
+                                        true,
+                                        Some(parents.into_iter().collect()),
+                                        None,
+                                        cx,
+                                    );
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.load_workspace_files(true, None, None, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+            }
+        }));
     }
 
     fn stop_recency_watch(&mut self) {
@@ -2890,6 +3202,44 @@ impl DetailsSidebar {
                                             self.render_file_row(index, row, theme, cx)
                                         }),
                                 )
+                                .children(
+                                    self.directory_cache
+                                        .loaded_directories()
+                                        .into_iter()
+                                        .filter(|directory| {
+                                            (directory.is_empty()
+                                                || self
+                                                    .sidebar
+                                                    .expanded_paths()
+                                                    .contains(directory))
+                                                && self.directory_cache.cursor(directory).is_some()
+                                        })
+                                        .map(|directory| {
+                                            let label = if directory.is_empty() {
+                                                "Load more files".to_string()
+                                            } else {
+                                                format!("Load more in {directory}")
+                                            };
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "files-more-{directory}"
+                                                )))
+                                                .px(px(8.0))
+                                                .py(px(6.0))
+                                                .text_size(px(11.0))
+                                                .text_color(theme.text_muted)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.load_workspace_files(
+                                                        true,
+                                                        Some(vec![directory.clone()]),
+                                                        Some(directory.clone()),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child(label)
+                                        }),
+                                )
                                 .when(truncated, |list| {
                                     list.child(
                                         div()
@@ -2919,6 +3269,10 @@ impl DetailsSidebar {
         let absolute = self
             .sidebar
             .context()
+            .filter(|context| {
+                context_file_access(context, self.app_state.read(cx).local_device_id.as_deref())
+                    == ContextFileAccess::Local
+            })
             .map(|context| context.cwd.join(&relative));
         let expanded = self.sidebar.expanded_paths().contains(&relative);
         let active = self.active_file.as_deref() == Some(relative.as_str());
@@ -2954,6 +3308,11 @@ impl DetailsSidebar {
             .on_click(cx.listener(move |this, _, _, cx| {
                 if is_dir {
                     this.sidebar.toggle_expanded(&relative);
+                    if this.sidebar.expanded_paths().contains(&relative)
+                        && this.workspace_file_source(cx).is_some()
+                    {
+                        this.load_workspace_files(true, Some(vec![relative.clone()]), None, cx);
+                    }
                     this.emit_preferences(cx);
                 } else {
                     this.active_file = Some(relative.clone());
@@ -2962,6 +3321,16 @@ impl DetailsSidebar {
                             context_key: context.key.clone(),
                             root: context.cwd.clone(),
                             relative_path: relative.clone(),
+                            remote_target: if context_file_access(
+                                context,
+                                this.app_state.read(cx).local_device_id.as_deref(),
+                            ) == ContextFileAccess::Remote
+                            {
+                                this.workspace_file_source(cx)
+                                    .map(|(_, target, device)| (target, device))
+                            } else {
+                                None
+                            },
                         });
                     }
                 }
@@ -3314,11 +3683,13 @@ mod tests {
             context_key: "project".into(),
             root: PathBuf::from("/tmp/project"),
             relative_path: "README.md".into(),
+            remote_target: None,
         };
         let DetailsSidebarEvent::OpenFile {
             context_key,
             root,
             relative_path,
+            remote_target,
         } = event
         else {
             panic!("expected open file event");
@@ -3326,6 +3697,7 @@ mod tests {
         assert_eq!(context_key, "project");
         assert_eq!(root, PathBuf::from("/tmp/project"));
         assert_eq!(relative_path, "README.md");
+        assert!(remote_target.is_none());
     }
 
     #[test]

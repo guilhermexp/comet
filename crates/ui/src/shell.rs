@@ -1941,7 +1941,20 @@ impl Shell {
                     context_key,
                     root,
                     relative_path,
+                    remote_target,
                 } => {
+                    if let Some((target, device)) = remote_target {
+                        if let Some(engine) = this.state.read(cx).engine().cloned() {
+                            this.file_preview.update(cx, |preview, _| {
+                                preview.set_remote_source(
+                                    context_key.clone(),
+                                    engine,
+                                    target.clone(),
+                                    device.clone(),
+                                )
+                            });
+                        }
+                    }
                     this.open_preview_surface(
                         context_key.clone(),
                         root.clone(),

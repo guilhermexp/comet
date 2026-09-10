@@ -83,9 +83,17 @@ pub enum FilePreviewEvent {
     DisplayModeChanged(PreviewDisplayMode),
 }
 
+#[derive(Clone)]
+struct RemoteFileSource {
+    engine: crate::state::EngineHandle,
+    target: zeron_proto::WorkspaceTarget,
+    device: String,
+}
+
 pub struct FilePreview {
     tabs: PreviewTabs,
     roots: HashMap<String, PathBuf>,
+    remote_sources: HashMap<String, RemoteFileSource>,
     active_context: Option<String>,
     loaded: PreviewLoadState,
     generation: u64,
@@ -106,6 +114,7 @@ impl FilePreview {
         Self {
             tabs: PreviewTabs::default(),
             roots: HashMap::new(),
+            remote_sources: HashMap::new(),
             active_context: None,
             loaded: PreviewLoadState::Idle,
             generation: 0,
@@ -117,6 +126,23 @@ impl FilePreview {
             #[cfg(target_os = "macos")]
             native_document: None,
         }
+    }
+
+    pub fn set_remote_source(
+        &mut self,
+        context_key: String,
+        engine: crate::state::EngineHandle,
+        target: zeron_proto::WorkspaceTarget,
+        device: String,
+    ) {
+        self.remote_sources.insert(
+            context_key,
+            RemoteFileSource {
+                engine,
+                target,
+                device,
+            },
+        );
     }
 
     pub fn active_path(&self, context_key: &str) -> Option<&str> {
@@ -181,6 +207,9 @@ impl FilePreview {
         let was_active_tab =
             is_active_context && self.tabs.active_path(context_key) == Some(relative_path);
         self.tabs.close(context_key, relative_path);
+        if self.tabs.paths(context_key).is_empty() {
+            self.remote_sources.remove(context_key);
+        }
         self.markdown_lists
             .remove(&(context_key.to_owned(), relative_path.to_owned()));
         self.scroll_handles
@@ -200,6 +229,7 @@ impl FilePreview {
         let Some(context_key) = self.active_context.clone() else {
             return;
         };
+        self.remote_sources.remove(&context_key);
         let paths = self.tabs.paths(&context_key).to_vec();
         for path in paths {
             self.tabs.close(&context_key, &path);
@@ -238,20 +268,61 @@ impl FilePreview {
         let font_mono = Theme::of(cx).font_mono.clone();
         let font_size = px(12.5);
         let text_system = cx.text_system().clone();
+        let remote = self.remote_sources.get(&context_key).cloned();
         let viewport_key = (context_key, relative_path.clone());
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    load_preview_with_typography(
-                        &root,
-                        std::path::Path::new(&relative_path),
-                        font_mono,
-                        font_size,
-                        Some(text_system),
+            let result = if let Some(remote) = remote {
+                let request = zeron_proto::ReadWorkspaceFileRequest {
+                    target: remote.target,
+                    path: relative_path.clone(),
+                };
+                let mut params = serde_json::to_value(request).unwrap();
+                params["targetDeviceId"] = remote.device.into();
+                match remote
+                    .engine
+                    .client()
+                    .call_as::<zeron_proto::WorkspaceFileText>(
+                        zeron_rpc::methods::READ_WORKSPACE_FILE,
+                        params,
                     )
-                })
-                .await;
+                    .await
+                {
+                    Ok(file) => match file.text {
+                        Some(source) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    super::loader::load_text_preview(
+                                        Path::new(&relative_path),
+                                        source,
+                                        font_mono,
+                                        font_size,
+                                        Some(text_system),
+                                    )
+                                })
+                                .await
+                        }
+                        None => Err(PreviewLoadError::Remote(
+                            "This remote file is not available as a text preview.".into(),
+                        )),
+                    },
+                    Err(zeron_rpc::RpcError::UnknownMethod(_)) => Err(PreviewLoadError::Remote(
+                        "Update the project device to enable file previews.".into(),
+                    )),
+                    Err(error) => Err(PreviewLoadError::Remote(format!("Remote file: {error}"))),
+                }
+            } else {
+                cx.background_executor()
+                    .spawn(async move {
+                        load_preview_with_typography(
+                            &root,
+                            std::path::Path::new(&relative_path),
+                            font_mono,
+                            font_size,
+                            Some(text_system),
+                        )
+                    })
+                    .await
+            };
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -294,6 +365,7 @@ impl FilePreview {
             .expect("material file icon is embedded");
         let close_path = relative_path.clone();
         let close_context = context_key.to_string();
+        let remote = self.remote_sources.contains_key(context_key);
         let reveal = absolute.clone();
         let copy = absolute;
         div()
@@ -366,35 +438,38 @@ impl FilePreview {
                                     .text_color(theme.text_muted),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("file-preview-reveal")
-                            .h(px(28.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::ink(0.05)))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .on_click(move |_, _, cx| {
-                                let path = reveal.clone();
-                                cx.background_executor()
-                                    .spawn(async move {
-                                        let _ =
-                                            std::process::Command::new("open").arg(path).status();
-                                    })
-                                    .detach();
-                            })
-                            .child("Open in")
-                            .child(
-                                icons::icon(icons::WORKER_OPEN_CODE)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    )
+                    .when(!remote, |row| {
+                        row.child(
+                            div()
+                                .id("file-preview-reveal")
+                                .h(px(28.0))
+                                .px(px(10.0))
+                                .rounded(px(6.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .on_click(move |_, _, cx| {
+                                    let path = reveal.clone();
+                                    cx.background_executor()
+                                        .spawn(async move {
+                                            let _ = std::process::Command::new("open")
+                                                .arg(path)
+                                                .status();
+                                        })
+                                        .detach();
+                                })
+                                .child("Open in")
+                                .child(
+                                    icons::icon(icons::WORKER_OPEN_CODE)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("file-preview-copy-path")
@@ -635,12 +710,13 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn load_error_message(error: &PreviewLoadError) -> &'static str {
+fn load_error_message(error: &PreviewLoadError) -> &str {
     match error {
         PreviewLoadError::OutsideCheckout => "This file is outside the project.",
         PreviewLoadError::Missing => "This file no longer exists.",
         PreviewLoadError::TooLarge => "This file is too large to preview safely.",
         PreviewLoadError::InvalidUtf8 => "This text file is not valid UTF-8.",
+        PreviewLoadError::Remote(message) => message,
         PreviewLoadError::Io(_) => "The file could not be read.",
     }
 }

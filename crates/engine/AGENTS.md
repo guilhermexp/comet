@@ -12,6 +12,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- `workspace_files.rs` é o acesso de leitura da árvore Files por checkout autorizado: diretório paginado (500 entradas/página), busca limitada, texto bounded e watcher compartilhado/cancelável. Toda operação valida ownership do Chat/Space e path relativo; nunca usa esse contrato para restringir links locais absolutos do Chat. A baseline do watcher e publicação usam o mesmo lock de sequência, inclusive no recovery por lag. Salvamento/editor do upstream não foi importado.
+
 - `EngineChatSink` só persiste cursor de row cuja história causal foi aplicada. Import com dependências pendentes pede checkpoint ao cliente; checkpoint incompleto falha sem gravar cursor. Operações estacionadas pelo Loro não entram no snapshot, então cursor contíguo da room sozinho não prova durabilidade.
 
 - `respond_input` enfileira `InputResolved` com as respostas antes de liberar o runtime; a resolução órfã grava as mesmas respostas no documento antes de retomar o Chat.
@@ -84,6 +86,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/workspace_host.rs` (lifecycle de Chat, Space cascade, sync deletion e retenção serializada de Trajectory) | unit | `cargo test -p zeron-engine trajectory_workspace_host` |
 | `src/change_requests.rs` (cache, backoff e classificação de provider) | unit | `cargo test -p zeron-engine change_requests` |
 | `src/chat2_host.rs` (dependências causais, snapshot e reinício) | unit — Loro + SQLite reais | `cargo test -p zeron-engine --lib chat2_host` |
+| `src/workspace_files.rs` + `tests/workspace_files.rs` + Files em `tests/device_routing.rs` | unit / integration — filesystem temporário, memória e relay entre engines | `cargo test -p zeron-engine workspace_files` · `cargo test -p zeron-engine --test device_routing workspace_file_surface` |
 | `src/process.rs` (teto de saída, kill, spawn) | unit | `cargo test -p zeron-engine process::` |
 | `src/diff_sync.rs` (`DiffMode::parse`, teto de frame) | unit | `cargo test -p zeron-engine diff_sync` |
 | `tests/e2e.rs`, `tests/restart_resume.rs`, `tests/workspace_sync.rs` | e2e | `cargo test -p zeron-engine` |

@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `WorkspaceTarget` ancora listagem, busca, leitura e watcher de Files em Chat/Space no device dono. Diretórios retornam cursor opaco; mudanças carregam sequência e `resyncRequired`. Estes contratos são aditivos e não alteram os links locais absolutos de Chat.
+
 - `InputResolved.answers` é aditivo e opcional: `None` preserva compatibilidade com journals antigos/cancelamentos; `Some` contém as respostas submetidas, identificadas por `question_id`.
 
 - Todo tipo que cruza processo (UI↔engine, engine↔engine via DeviceRoom, engine↔edge) mora aqui.

@@ -545,3 +545,220 @@ mod tests {
         assert!(!root.path().join("target/renamed.txt").exists());
     }
 }
+
+/// Cached directory pages. Refreshing one folder retains sibling snapshots.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryCache {
+    pages: std::collections::BTreeMap<String, zeron_proto::WorkspaceDirectoryPage>,
+}
+
+impl DirectoryCache {
+    pub fn apply(&mut self, mut page: zeron_proto::WorkspaceDirectoryPage, append: bool) -> bool {
+        page.entries.retain(|entry| {
+            let path = Path::new(&entry.path);
+            checked_relative(&entry.path).is_ok()
+                && path.parent().unwrap_or(Path::new("")) == Path::new(&page.directory)
+                && path.file_name().and_then(|name| name.to_str()) == Some(entry.name.as_str())
+        });
+        if append && let Some(previous) = self.pages.get(&page.directory) {
+            let mut entries = previous.entries.clone();
+            for entry in page.entries {
+                if let Some(old) = entries.iter_mut().find(|old| old.path == entry.path) {
+                    *old = entry;
+                } else {
+                    entries.push(entry);
+                }
+            }
+            page.entries = entries;
+        }
+        if self.pages.get(&page.directory) == Some(&page) {
+            return false;
+        }
+        if page.next_cursor.is_none() {
+            let removed: Vec<_> = self
+                .pages
+                .keys()
+                .filter(|path| {
+                    *path != &page.directory
+                        && Path::new(path).parent() == Some(Path::new(&page.directory))
+                        && !page.entries.iter().any(|entry| {
+                            &entry.path == *path
+                                && entry.kind == zeron_proto::WorkspaceEntryKind::Directory
+                        })
+                })
+                .cloned()
+                .collect();
+            self.pages.retain(|path, _| {
+                !removed
+                    .iter()
+                    .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+            });
+        }
+        self.pages.insert(page.directory.clone(), page);
+        true
+    }
+    pub fn contains(&self, directory: &str) -> bool {
+        self.pages.contains_key(directory)
+    }
+    pub fn can_expand(&self, directory: &str) -> bool {
+        if directory.is_empty() {
+            return true;
+        }
+        let Some(parent) = Path::new(directory).parent().and_then(|p| p.to_str()) else {
+            return false;
+        };
+        self.can_expand(parent)
+            && self.pages.get(parent).is_some_and(|page| {
+                page.entries.iter().any(|entry| {
+                    entry.path == directory
+                        && entry.kind == zeron_proto::WorkspaceEntryKind::Directory
+                })
+            })
+    }
+    pub fn loaded_directories(&self) -> Vec<String> {
+        self.pages
+            .keys()
+            .filter(|path| self.can_expand(path))
+            .cloned()
+            .collect()
+    }
+    pub fn cursor(&self, directory: &str) -> Option<&str> {
+        self.pages
+            .get(directory)
+            .and_then(|page| page.next_cursor.as_deref())
+    }
+    pub fn loaded_count(&self, directory: &str) -> usize {
+        self.pages
+            .get(directory)
+            .map_or(0, |page| page.entries.len())
+    }
+    pub fn nodes(&self, show_hidden: bool) -> Vec<FileNode> {
+        fn children(cache: &DirectoryCache, directory: &str, show_hidden: bool) -> Vec<FileNode> {
+            let Some(page) = cache.pages.get(directory) else {
+                return Vec::new();
+            };
+            let mut nodes: Vec<_> = page
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !is_denied_relative(Path::new(&entry.path))
+                        && (show_hidden || !entry.name.starts_with('.'))
+                })
+                .map(|entry| {
+                    let is_dir = entry.kind == zeron_proto::WorkspaceEntryKind::Directory;
+                    FileNode {
+                        name: entry.name.clone(),
+                        relative_path: entry.path.clone(),
+                        is_dir,
+                        children: if is_dir {
+                            children(cache, &entry.path, show_hidden)
+                        } else {
+                            Vec::new()
+                        },
+                    }
+                })
+                .collect();
+            sort_nodes(&mut nodes);
+            nodes
+        }
+        children(self, "", show_hidden)
+    }
+}
+
+pub(crate) fn search_result_nodes(
+    matches: &[zeron_proto::WorkspaceFileSearchMatch],
+    show_hidden: bool,
+) -> Vec<FileNode> {
+    let mut tree = Vec::new();
+    for item in matches {
+        if checked_relative(&item.path).is_err() || is_denied_relative(Path::new(&item.path)) {
+            continue;
+        }
+        let components: Vec<_> = item.path.split('/').collect();
+        if !show_hidden && components.iter().any(|part| part.starts_with('.')) {
+            continue;
+        }
+        insert_path(
+            &mut tree,
+            &components,
+            item.kind == zeron_proto::WorkspaceEntryKind::Directory,
+        );
+    }
+    sort_nodes(&mut tree);
+    tree
+}
+
+#[cfg(test)]
+mod directory_cache_tests {
+    use super::*;
+    use zeron_proto::{WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind};
+    fn page(dir: &str, entries: &[(&str, bool)], more: bool) -> WorkspaceDirectoryPage {
+        WorkspaceDirectoryPage {
+            directory: dir.into(),
+            entries: entries
+                .iter()
+                .map(|(name, is_dir)| WorkspaceEntry {
+                    path: if dir.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{dir}/{name}")
+                    },
+                    name: name.to_string(),
+                    kind: if *is_dir {
+                        WorkspaceEntryKind::Directory
+                    } else {
+                        WorkspaceEntryKind::File
+                    },
+                    size: None,
+                    modified_at: None,
+                    ignored: true,
+                    read_only: false,
+                })
+                .collect(),
+            next_cursor: more.then(|| "next".into()),
+            truncated: false,
+        }
+    }
+    #[test]
+    fn refreshing_one_directory_keeps_loaded_siblings_and_expansion() {
+        let mut cache = DirectoryCache::default();
+        assert!(cache.apply(page("", &[("src", true), ("docs", true)], false), false));
+        cache.apply(page("src", &[("main.rs", false)], false), false);
+        cache.apply(page("docs", &[("report.md", false)], false), false);
+        assert!(!cache.apply(page("", &[("src", true), ("docs", true)], false), false));
+        cache.apply(page("src", &[("new.rs", false)], false), false);
+        let rows = flatten_visible_rows(
+            &cache.nodes(true),
+            &HashSet::from(["src".into(), "docs".into()]),
+        );
+        let paths: Vec<_> = rows.iter().map(|r| r.node.relative_path.as_str()).collect();
+        assert!(paths.contains(&"docs/report.md"));
+        assert!(paths.contains(&"src/new.rs"));
+        assert!(!paths.contains(&"src/main.rs"));
+        cache.apply(page("", &[("docs", true)], false), false);
+        assert!(!cache.nodes(true).iter().any(|n| n.name == "src"));
+        assert!(!cache.contains("src"));
+        assert!(!cache.can_expand("src"));
+    }
+    #[test]
+    fn pagination_preserves_rows_and_filters_hidden_structural_and_invalid_entries() {
+        let mut cache = DirectoryCache::default();
+        cache.apply(page("", &[("a.md", false)], true), false);
+        let mut next = page(
+            "",
+            &[
+                ("b.md", false),
+                (".config", false),
+                ("node_modules", true),
+                ("../escape", false),
+            ],
+            false,
+        );
+        next.entries[1].ignored = true;
+        cache.apply(next, true);
+        let names: Vec<_> = cache.nodes(false).into_iter().map(|n| n.name).collect();
+        assert_eq!(names, ["a.md", "b.md"]);
+        let names: Vec<_> = cache.nodes(true).into_iter().map(|n| n.name).collect();
+        assert_eq!(names, [".config", "a.md", "b.md"]);
+    }
+}

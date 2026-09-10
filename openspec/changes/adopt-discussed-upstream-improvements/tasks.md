@@ -20,7 +20,7 @@
 
 ## 5. P6 Files RPC
 
-- [ ] 5.1 Adapt bounded directory listing/pagination and file read/watch RPCs, including checkout validation, old-peer compatibility and lifecycle cleanup; verify engine/proto/RPC tests.
+- [x] 5.1 Adapt bounded directory listing/pagination and file read/watch RPCs, including checkout validation, old-peer compatibility and lifecycle cleanup; verify engine/proto/RPC tests.
 - [ ] 5.2 Connect the existing Files tree to incremental local/remote directory reconciliation, preserving expansion and scroll; verify state tests and BCU native preview/link opening.
 
 ## 6. P7 development previews

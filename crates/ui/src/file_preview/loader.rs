@@ -37,6 +37,7 @@ pub enum PreviewLoadError {
     Missing,
     TooLarge,
     InvalidUtf8,
+    Remote(String),
     Io(String),
 }
 
@@ -278,50 +279,7 @@ pub fn load_preview_with_typography(
         ))));
     }
     let source = String::from_utf8(bytes).map_err(|_| PreviewLoadError::InvalidUtf8)?;
-    let path = path.to_string_lossy();
-    match kind {
-        PreviewKind::Markdown => Ok(LoadedPreview::Markdown(Arc::new(
-            crate::markdown::parse_full(&source),
-        ))),
-        PreviewKind::Code => {
-            let lines: Arc<[SharedString]> = source
-                .split('\n')
-                .map(SharedString::from)
-                .collect::<Vec<_>>()
-                .into();
-            let widest_line_ix = {
-                let ts = text_system.unwrap_or_else(|| PREVIEW_TEXT_SYSTEM.clone());
-                let wts = WindowTextSystem::new(ts);
-                let font = font(font_family);
-                find_widest_line_index_with_system(&lines, &wts, &font, font_size)
-            };
-            Ok(LoadedPreview::Code {
-                lines,
-                highlights: comet_syntax::highlight(comet_syntax::HighlightRequest {
-                    source: &source,
-                    path: Some(path.as_ref()),
-                    fence_tag: None,
-                })
-                .ok()
-                .map(Arc::new),
-                widest_line_ix,
-            })
-        }
-        PreviewKind::Html => Ok(LoadedPreview::Html(isolated_html_document(&source).into())),
-        PreviewKind::Data => {
-            let separator = if path.to_ascii_lowercase().ends_with(".tsv") {
-                '\t'
-            } else {
-                ','
-            };
-            Ok(LoadedPreview::Table(
-                parse_delimited_table(&source, separator, 2_000, 100).into(),
-            ))
-        }
-        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video | PreviewKind::Unsupported => {
-            Ok(LoadedPreview::Unsupported)
-        }
-    }
+    load_text_preview(&path, source, font_family, font_size, text_system)
 }
 
 pub fn workbook_rows(range: &Range<Data>, max_rows: usize, max_columns: usize) -> Vec<Vec<String>> {
@@ -684,6 +642,87 @@ mod tests {
                 gpui::SharedString::from("Line 1\r\nLine 2"),
                 gpui::SharedString::from("42"),
             ]
+        );
+    }
+}
+
+// Shared by local files and text received through the owning device's RPC.
+pub(crate) fn load_text_preview(
+    path: &Path,
+    source: String,
+    font_family: SharedString,
+    font_size: Pixels,
+    text_system: Option<Arc<TextSystem>>,
+) -> Result<LoadedPreview, PreviewLoadError> {
+    if source.len() as u64 > MAX_TEXT_BYTES {
+        return Err(PreviewLoadError::TooLarge);
+    }
+    let kind = classify_preview_kind(&path.to_string_lossy());
+    let path = path.to_string_lossy();
+    match kind {
+        PreviewKind::Markdown => Ok(LoadedPreview::Markdown(Arc::new(
+            crate::markdown::parse_full(&source),
+        ))),
+        PreviewKind::Code => {
+            let lines: Arc<[SharedString]> = source
+                .split('\n')
+                .map(SharedString::from)
+                .collect::<Vec<_>>()
+                .into();
+            let widest_line_ix = {
+                let ts = text_system.unwrap_or_else(|| PREVIEW_TEXT_SYSTEM.clone());
+                let wts = WindowTextSystem::new(ts);
+                let font = font(font_family);
+                find_widest_line_index_with_system(&lines, &wts, &font, font_size)
+            };
+            Ok(LoadedPreview::Code {
+                lines,
+                highlights: comet_syntax::highlight(comet_syntax::HighlightRequest {
+                    source: &source,
+                    path: Some(path.as_ref()),
+                    fence_tag: None,
+                })
+                .ok()
+                .map(Arc::new),
+                widest_line_ix,
+            })
+        }
+        PreviewKind::Html => Ok(LoadedPreview::Html(isolated_html_document(&source).into())),
+        PreviewKind::Data => {
+            let separator = if path.to_ascii_lowercase().ends_with(".tsv") {
+                '\t'
+            } else {
+                ','
+            };
+            Ok(LoadedPreview::Table(
+                parse_delimited_table(&source, separator, 2_000, 100).into(),
+            ))
+        }
+        PreviewKind::Image | PreviewKind::Pdf | PreviewKind::Video | PreviewKind::Unsupported => {
+            Ok(LoadedPreview::Unsupported)
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_text_tests {
+    use super::*;
+    #[test]
+    fn remote_documents_use_native_renderers_without_touching_a_local_path() {
+        let path = Path::new("/remote-only/does-not-exist/report.md");
+        assert!(
+            matches!(load_text_preview(path, "# Relatório\n\nconteúdo".into(), "Geist Mono".into(), px(12.5), None).unwrap(), LoadedPreview::Markdown(tree) if tree.len() > 0)
+        );
+        let html = load_text_preview(
+            Path::new("/remote-only/report.html"),
+            "<h1>Remote</h1><script>fetch('/secret')</script>".into(),
+            "Geist Mono".into(),
+            px(12.5),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(html, LoadedPreview::Html(source) if source.contains("iframe sandbox") && source.contains("connect-src 'none'"))
         );
     }
 }
