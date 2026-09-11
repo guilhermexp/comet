@@ -1623,7 +1623,7 @@ fn tool_list_sessions(_args: &Value) -> Result<String, String> {
         manifest.state == HostedSessionState::Running
             && security.permits_manifest(caller.as_ref(), manifest)
     });
-    manifests.sort_by(|a, b| b.session.created_at.cmp(&a.session.created_at));
+    manifests.sort_by_key(|entry| std::cmp::Reverse(entry.session.created_at));
 
     let sessions: Vec<Value> = manifests
         .iter()
@@ -2566,7 +2566,7 @@ fn group_peer_manifests_for_caller(
                 && security.permits_manifest(Some(&caller), manifest)
         })
         .collect();
-    peers.sort_by(|a, b| b.session.created_at.cmp(&a.session.created_at));
+    peers.sort_by_key(|entry| std::cmp::Reverse(entry.session.created_at));
 
     if let Some(only_ids) = only_ids {
         let found: HashSet<String> = peers

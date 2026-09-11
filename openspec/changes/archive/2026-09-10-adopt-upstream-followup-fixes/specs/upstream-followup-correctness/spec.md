@@ -73,4 +73,3 @@ The transcript SHALL preserve user scroll and selection intent while streaming g
 - **WHEN** a user scrolls or begins selection during automatic following or own-turn alignment
 - **THEN** automatic movement stops or resumes only according to user intent without crossing the prompt during remeasurement
 - **Test:** unit; native BCU
-

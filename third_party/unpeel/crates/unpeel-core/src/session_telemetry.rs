@@ -220,12 +220,9 @@ pub fn refresh(manifest: &HostedSessionManifest) -> Result<Option<SessionTelemet
             return Err(error);
         }
     };
-    refresh_at(&session_dir, binding.as_ref(), || {
-        let telemetry = match reader {
-            Some(_) => result,
-            None => Ok(None),
-        };
-        telemetry
+    refresh_at(&session_dir, binding.as_ref(), || match reader {
+        Some(_) => result,
+        None => Ok(None),
     })
 }
 

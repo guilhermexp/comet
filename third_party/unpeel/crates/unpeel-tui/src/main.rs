@@ -2625,7 +2625,7 @@ impl App {
             .iter()
             .filter(|r| r.archived && (r.group_id == group || r.project_id == group))
             .collect();
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
         rows
     }
 
@@ -3389,13 +3389,13 @@ impl App {
             .into_iter()
             .filter_map(|item| palette::best_score(trimmed, &item).map(|s| (item, s)))
             .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         if scored.is_empty() {
             let mut fallback: Vec<(palette::Item, i32)> = archived
                 .into_iter()
                 .filter_map(|item| palette::best_score(trimmed, &item).map(|s| (item, s)))
                 .collect();
-            fallback.sort_by(|a, b| b.1.cmp(&a.1));
+            fallback.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             return fallback.into_iter().take(MAX).map(|(i, _)| i).collect();
         }
         scored.into_iter().take(MAX).map(|(i, _)| i).collect()
@@ -3416,10 +3416,10 @@ impl App {
                         return true;
                     }
                 }
-                SidebarItem::WorktreeHeader { project_id, .. } if current == Some(header) => {
-                    if self.worktree_is_busy(project_id) {
-                        return true;
-                    }
+                SidebarItem::WorktreeHeader { project_id, .. }
+                    if current == Some(header) && self.worktree_is_busy(project_id) =>
+                {
+                    return true;
                 }
                 _ => {}
             }

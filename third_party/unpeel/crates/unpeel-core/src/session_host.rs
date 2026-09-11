@@ -7208,7 +7208,7 @@ fn persist_task_submission_receipt_at(directory: &Path, episode: u64) -> Result<
         .write(true)
         .open(&temporary)
         .map_err(|error| format!("Failed to stage task submission receipt: {error}"))?;
-    write!(file, "{episode}\n")
+    writeln!(file, "{episode}")
         .map_err(|error| format!("Failed to write task submission receipt: {error}"))?;
     file.sync_data()
         .map_err(|error| format!("Failed to persist task submission receipt: {error}"))?;

@@ -77,10 +77,10 @@ GENERATE_CHAT_RECAP / GenerateChatRecap = "GenerateChatRecap" {
     * Skip root-cause narrative, internals, secondary to-dos, and em-dash tangents.
     * Write in the **exact same language** used in the conversation.
 * **`run_recap_model`:**
-  * Resolves the chat's harness from `HarnessRegistry`.
-  * Selects `cheapest_model` (Haiku, Flash, Mini, Nano) matching the existing pattern in `crates/engine/src/titles.rs`.
-  * Runs a `RunRequest` with `SandboxLevel::ReadOnly`, `ReasoningLevel::Minimal`, `auto_approve: true`, and 45s timeout.
-  * Retries on short backoff delays (250ms, 1000ms).
+  * Uses the Chat's harness when it supports isolated execution; otherwise selects an enabled Claude Code, Codex, or Mock harness. Without an eligible harness, returns no recap.
+  * Selects `cheapest_model` using the existing title-generation policy.
+  * Runs `Harness::run_isolated` in a temporary directory with tools, autoapproval, Workers MCP and project configuration disabled. The recap prompt remains distinct from title instructions; the active Chat is never resumed or mutated.
+  * Model discovery, attempts and retry delays share one deadline. The authoritative limits and retry policy live in `crates/engine/src/recap.rs` (`RUN_BUDGET_SECS`, `RUN_ATTEMPT_SECS`, `with_retry_budget`).
 * **`validate_recap`:**
   * Strips code fences, markdown asterisks/underscores, bullet markers, and surrounding quotes.
   * Iteratively strips model preambles (*"Sure:"*, *"Here's a recap:"*, *"Summary -"*, etc.).

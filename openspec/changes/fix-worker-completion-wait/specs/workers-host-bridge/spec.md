@@ -88,5 +88,3 @@ Test: `duplicate_host_tool_id_delivers_one_result`
 - **WHEN** the harness delivers `host_tool_result`s
 - **THEN** OMP receives exactly one result for that id
 - **AND** a late outcome from the original call does not send a second result
-
-
