@@ -893,3 +893,48 @@ async fn title_run_preserves_read_only_and_replaces_coding_instructions() {
         "{events:?}"
     );
 }
+
+#[tokio::test]
+async fn isolated_recap_preserves_read_only_and_replaces_coding_instructions() {
+    let (controls, _steer, token) = controls("Yes");
+    let stream = harness()
+        .run_isolated(
+            request("scenario:recap"),
+            controls,
+            "Summarize this conversation.",
+        )
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = stream;
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .unwrap();
+    token.cancel();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Login fixed; next run tests.")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}

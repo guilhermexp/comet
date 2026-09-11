@@ -59,3 +59,17 @@ The map SHALL be capped at the 50 newest entries.
 - **GIVEN** a recap entry generated 25 hours ago
 - **WHEN** `prune_idle_recaps` runs
 - **THEN** the entry SHALL be removed from the map.
+
+### Requirement: Isolated recap execution
+Recaps SHALL reuse the tool-free isolated execution used by automatic titles, with recap-specific instructions and the original recap prompt. The process SHALL run in a temporary directory with autoapproval and Workers MCP disabled. An unsupported harness SHALL use an enabled compatible harness or return no recap. Tool events, incomplete streams and timeout SHALL never yield a successful recap.
+
+#### Scenario: Recap stays outside the project
+- **WHEN** a recap is generated for a project Chat
+- **THEN** the isolated harness receives the recap prompt unchanged and a temporary cwd
+- **AND** the cleaned recap is returned without creating a Chat turn
+- **Test:** unit — `recap_uses_isolated_execution_and_preserves_prompt`
+
+#### Scenario: Native isolated harness restrictions
+- **WHEN** Claude or Codex executes a recap
+- **THEN** it receives recap instructions with the same tool and permission restrictions as title generation
+- **Test:** integration — `isolated_recap_disables_tools_and_denies_unexpected_permissions`, `isolated_recap_preserves_read_only_and_replaces_coding_instructions`

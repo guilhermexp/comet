@@ -86,6 +86,16 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
   ;;
 
+*scenario:recap*)
+  for want in '"sandbox":"read-only"' '"ephemeral":true' '"baseInstructions":"Summarize this conversation.' '"features.shell_tool":false' '"mcp_servers.test.enabled":false'; do
+    has "$thread_line" "$want" || { fail_turn "$tid" "title restriction missing"; exit 0; }
+  done
+  has "$turnline" '"sandboxPolicy":{"type":"readOnly"}' || { fail_turn "$tid" "title turn not read-only"; exit 0; }
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"item/agentMessage/delta","params":{"threadId":"th-1","delta":"Login fixed; next run tests."}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  ;;
+
 
 
 *scenario:happy*)

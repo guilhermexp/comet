@@ -45,7 +45,7 @@ Dona de tudo que é específico de vendor. A engine acima só conhece o trait �
 
 - `ZERON_MOCK_ELEMENTS=1` acrescenta a fixture offline `src/mock_elements.rs` ao harness mock: comando, eval, MCP, hub wait, Skill com nome, busca, Write/Edit, Todo no-op e falha de escrita. Inclui dois comandos consecutivos com linhas longas e caminhos sem espaços para conferir reflow e separação de cards. Inclui também Write de 80 linhas e Edit com linhas longas, indentação e Unicode para conferir wrapping, gutters e virtualização. Write/Edit dessa fixture também emitem inputs parciais antes do payload final, para conferir a cauda de digitação e a transição para highlight. São eventos sintéticos; nenhum comando exibido é executado. `ZERON_MOCK_SUBAGENT` inclui dois filhos de uma chamada task registrada, com IDs compostos e docs separados, para validar agrupamento e navegação individual. Combinar com `ZERON_MOCK_CODE`, `ZERON_MOCK_SUBAGENT` e pacing para a aceitação nativa P1–P6.
 
-- `run_title` is opt-in and never falls back to a coding run. Claude disables tools/MCP/settings and denies permission requests; Codex uses read-only ephemeral threads, replacement instructions and explicit MCP/feature disablement. Workers MCP is disabled on this path.
+- `run_isolated` is opt-in and never falls back to a coding run. `run_title` delegates with title instructions; recaps supply summary instructions while sharing the same restrictions. Claude disables tools/MCP/settings and denies permission requests; Codex uses read-only ephemeral threads, replacement instructions and explicit MCP/feature disablement. Workers MCP is disabled on this path.
 
 ## Work Guidance
 

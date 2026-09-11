@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "5099054a5650aa92cf5674031af8b5fed1bf68b3"
+vendored_tree = "bf68bb59b0cbea2396de7a454985a77b063b9bfa"
 vendored_from = "working-tree"
 local_modifications_count = 31
 local_deletions = ["apps/website"]

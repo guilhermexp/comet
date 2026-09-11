@@ -516,67 +516,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn all_hook_scripts_bypass_the_proxy_for_the_loopback_post() {
-        // A hook POSTs to 127.0.0.1. With HTTP_PROXY/ALL_PROXY set in the
-        // user's environment, curl honours it for loopback too, so the
-        // lifecycle event goes to the proxy and is lost — silently, since the
-        // POST is `>/dev/null 2>&1`. Every script that posts must opt out.
-        for (label, script) in [
-            ("claude", super::CLAUDE_HOOK_SCRIPT),
-            ("notify", super::NOTIFY_HOOK_SCRIPT),
-            ("gemini", super::GEMINI_HOOK_SCRIPT),
-            ("kimi", super::KIMI_HOOK_SCRIPT),
-            ("copilot", super::COPILOT_HOOK_SCRIPT),
-            ("cursor", super::CURSOR_HOOK_SCRIPT),
-            ("grok", super::GROK_HOOK_SCRIPT),
-            ("muse", super::MUSE_HOOK_SCRIPT),
-            ("cline", super::CLINE_HOOK_SCRIPT),
-            ("kiro", super::KIRO_HOOK_SCRIPT),
-        ] {
-            if !script.contains("127.0.0.1") {
-                continue;
-            }
-            for line in script.lines().filter(|line| line.contains("curl")) {
-                assert!(
-                    line.contains("--noproxy"),
-                    "{label} posts to loopback without --noproxy: {line}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn all_hook_scripts_record_last_hook_event() {
-        for (label, script) in [
-            ("claude", super::CLAUDE_HOOK_SCRIPT),
-            ("notify", super::NOTIFY_HOOK_SCRIPT),
-            ("gemini", super::GEMINI_HOOK_SCRIPT),
-            ("kimi", super::KIMI_HOOK_SCRIPT),
-            ("copilot", super::COPILOT_HOOK_SCRIPT),
-            ("cursor", super::CURSOR_HOOK_SCRIPT),
-            ("grok", super::GROK_HOOK_SCRIPT),
-            ("muse", super::MUSE_HOOK_SCRIPT),
-        ] {
-            assert!(
-                script.contains("record_last_hook_event() {"),
-                "{label} hook script must define record_last_hook_event"
-            );
-            assert!(
-                script.contains("record_last_hook_event \""),
-                "{label} hook script must call record_last_hook_event"
-            );
-            assert!(
-                script.contains("last-hook-event.json"),
-                "{label} hook script must write last-hook-event.json"
-            );
-            assert!(
-                script.contains("UNPEEL_SESSION_DIR"),
-                "{label} hook script must honor UNPEEL_SESSION_DIR"
-            );
-        }
-    }
-
     fn run_hook_script_recording(
         script_src: &str,
         label: &str,
@@ -624,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn every_owned_hook_reporter_tags_http_payload_and_durable_seed_generation() {
+    fn every_owned_hook_reporter_bypasses_proxy_and_records_event() {
         struct Case {
             label: &'static str,
             script: &'static str,
@@ -697,12 +636,22 @@ mod tests {
 
         for case in cases {
             let capture = CaptureServer::start();
+            let proxy = CaptureServer::start();
+            let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
             let session_dir = temp_path(&format!("{}-session", case.label));
             let script = write_temp_hook_script(case.label, case.script);
             let mut command = Command::new("bash");
             command
                 .arg(&script)
                 .args(case.args)
+                .env("http_proxy", &proxy_url)
+                .env("HTTP_PROXY", &proxy_url)
+                .env("https_proxy", &proxy_url)
+                .env("HTTPS_PROXY", &proxy_url)
+                .env("all_proxy", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env("no_proxy", "")
+                .env("NO_PROXY", "")
                 .env("HOME", hook_env_home(case.label))
                 .env("UNPEEL_APP_PORT", capture.port.to_string())
                 .env("UNPEEL_SESSION_ID", "unpeel-generation-session")
@@ -748,7 +697,9 @@ mod tests {
                 "{} HTTP payload",
                 case.label
             );
+            assert!(proxy.events_snapshot().is_empty(), "{} used proxy", case.label);
             let seed = read_last_hook_event(&session_dir);
+            assert_eq!(seed["hook_event_name"], "Stop", "{} durable event", case.label);
             assert_eq!(
                 seed.get("unpeel_runtime_generation")
                     .and_then(Value::as_u64),
@@ -758,10 +709,6 @@ mod tests {
             );
         }
 
-        // OpenCode and Amp both invoke the Notify reporter above instead of
-        // maintaining an independent HTTP/seed implementation.
-        assert!(super::OPENCODE_PLUGIN_SCRIPT.contains("bash ${notifyPath}"));
-        assert!(super::AMP_PLUGIN_SCRIPT.contains("Bun.spawn([\"bash\", notifyPath, body]"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! device before accepting a workspace-relative path.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -1162,8 +1163,12 @@ fn read_file_blocking(
             return Err(WorkspaceFilesError::Io("file read cancelled".into()));
         }
         let before = checked_file_metadata(root, relative)?;
-        let bytes =
-            std::fs::read(&path).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        let file = std::fs::File::open(&path)
+            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        let bytes = match read_preview_attempt(file, wire_path.clone(), &before)? {
+            Ok(bytes) => bytes,
+            Err(too_large) => return Ok(too_large),
+        };
         let after = checked_file_metadata(root, relative)?;
         if same_file_revision(&before, &after) && bytes.len() as u64 == after.len() {
             return Ok(classify_file_text(wire_path, bytes, &after));
@@ -1175,6 +1180,24 @@ fn read_file_blocking(
         }
     }
     unreachable!("read retry loop always returns")
+}
+
+fn read_preview_attempt(
+    file: std::fs::File,
+    wire_path: String,
+    metadata: &std::fs::Metadata,
+) -> Result<Result<Vec<u8>, WorkspaceFileText>, WorkspaceFilesError> {
+    let mut bytes = Vec::new();
+    file.take(MAX_PREVIEW_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    if bytes.len() as u64 > MAX_PREVIEW_FILE_BYTES {
+        let mut result = non_text_file(wire_path, metadata, WorkspaceReadOnlyReason::TooLarge);
+        result.size = result.size.max(bytes.len() as u64);
+        result.truncated = true;
+        return Ok(Err(result));
+    }
+    Ok(Ok(bytes))
 }
 
 fn checked_file_metadata(
@@ -1518,6 +1541,30 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_read_caps_each_attempt_after_file_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.txt");
+        std::fs::write(&path, "small").unwrap();
+        let stale = std::fs::metadata(&path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_PREVIEW_FILE_BYTES * 2)
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let result = read_preview_attempt(file, "growing.txt".into(), &stale)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            result.read_only_reason,
+            Some(WorkspaceReadOnlyReason::TooLarge)
+        );
+        assert!(result.truncated);
+        assert!(result.text.is_none());
+    }
 
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)

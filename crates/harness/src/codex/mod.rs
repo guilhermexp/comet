@@ -327,13 +327,14 @@ impl Harness for CodexHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        self.run_with_mode(request, controls, false).await
+        self.run_with_mode(request, controls, None).await
     }
 
-    async fn run_title(
+    async fn run_isolated(
         &self,
         mut request: RunRequest,
         controls: RunControls,
+        instructions: &'static str,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         request.resume = None;
         request.worktree = None;
@@ -342,7 +343,8 @@ impl Harness for CodexHarness {
         request.auto_approve = false;
         request.enable_workers_mcp = false;
         request.workers_parent_chat_id = None;
-        self.run_with_mode(request, controls, true).await
+        self.run_with_mode(request, controls, Some(instructions))
+            .await
     }
 }
 
@@ -351,8 +353,9 @@ impl CodexHarness {
         &self,
         mut request: RunRequest,
         controls: RunControls,
-        title_only: bool,
+        instructions: Option<&'static str>,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let title_only = instructions.is_some();
         let exe = self.resolve_executable()?;
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
         // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
@@ -398,7 +401,7 @@ impl CodexHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
-            title_only,
+            instructions,
             child,
             client,
             incoming,
@@ -422,7 +425,7 @@ impl CodexHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
-    title_only: bool,
+    instructions: Option<&'static str>,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -513,7 +516,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 /// steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
-        title_only,
+        instructions,
         mut child,
         client,
         mut incoming,
@@ -524,6 +527,7 @@ async fn run_session(session: Session) {
         kill_grace,
         stderr_tail,
     } = session;
+    let title_only = instructions.is_some();
     let RunControls {
         request_input,
         mut steering,
@@ -554,11 +558,8 @@ async fn run_session(session: Session) {
     let start_params = {
         let mut p = serde_json::Map::new();
         if title_only {
-            p.insert("baseInstructions".into(), crate::TITLE_INSTRUCTIONS.into());
-            p.insert(
-                "developerInstructions".into(),
-                crate::TITLE_INSTRUCTIONS.into(),
-            );
+            p.insert("baseInstructions".into(), instructions.unwrap().into());
+            p.insert("developerInstructions".into(), instructions.unwrap().into());
             p.insert("ephemeral".into(), true.into());
             p.insert(
                 "config".into(),

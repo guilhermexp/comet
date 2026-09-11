@@ -1704,3 +1704,44 @@ async fn dial_slots_cap_concurrent_acquires() {
     );
     assert!(observed >= 1, "semaphore never admitted a dial");
 }
+
+#[tokio::test]
+async fn established_chats_release_dial_slots() {
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..=MAX_CONCURRENT_DIALS {
+        let (pipe, mut end) = pipe_pair();
+        let server = tokio::spawn(async move {
+            serve_join(
+                &mut end,
+                serde_json::json!({"headSeq": 0, "seqFloor": 0, "checkpointSeq": 0,
+                    "checkpointSize": 0, "rowCount": 0, "rowBytes": 0}),
+                &[],
+                vec![],
+                false,
+            )
+            .await;
+            end
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            ChatClient::connect_with_tuned(
+                connector(vec![pipe]),
+                Arc::new(RecordingSink::default()),
+                fetcher(&[]).0,
+                "dev-a",
+                0,
+                ChatTuning::default(),
+            ),
+        )
+        .await
+        .expect("established chats must not block a new dial")
+        .unwrap();
+        servers.push(server.await.unwrap());
+        clients.push(client);
+    }
+    assert!(clients.iter().all(|client| client.stats().connected));
+    for client in clients {
+        client.shutdown().await;
+    }
+}

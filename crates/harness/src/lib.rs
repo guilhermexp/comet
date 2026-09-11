@@ -190,11 +190,21 @@ pub trait Harness: Send + Sync {
     /// instructions and restrictions; never fall back to an ordinary coding run.
     async fn run_title(
         &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_isolated(request, controls, TITLE_INSTRUCTIONS)
+            .await
+    }
+
+    async fn run_isolated(
+        &self,
         _request: RunRequest,
         _controls: RunControls,
+        _instructions: &'static str,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Err(HarnessError::Protocol(
-            "title generation is not supported by this harness".into(),
+            "isolated generation is not supported by this harness".into(),
         ))
     }
 

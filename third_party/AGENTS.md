@@ -151,4 +151,6 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 ## Child DOX Index
 
-None — flat domain.
+| Domínio | Doc | Papel |
+|---|---|---|
+| Unpeel | [`unpeel/AGENTS.md`](unpeel/AGENTS.md) | Contratos upstream e verificação executável de hooks do fork |
