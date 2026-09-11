@@ -1163,14 +1163,19 @@ fn read_file_blocking(
             return Err(WorkspaceFilesError::Io("file read cancelled".into()));
         }
         let before = checked_file_metadata(root, relative)?;
-        let file = std::fs::File::open(&path)
-            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
-        let bytes = match read_preview_attempt(file, wire_path.clone(), &before)? {
+        let file = open_preview_file(root, relative, &before)?;
+        let bytes = match read_preview_attempt(&file, wire_path.clone(), &before)? {
             Ok(bytes) => bytes,
             Err(too_large) => return Ok(too_large),
         };
-        let after = checked_file_metadata(root, relative)?;
-        if same_file_revision(&before, &after) && bytes.len() as u64 == after.len() {
+        let after = file
+            .metadata()
+            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        let current = checked_file_metadata(root, relative)?;
+        if same_file_revision(&before, &after)
+            && same_file_revision(&after, &current)
+            && bytes.len() as u64 == after.len()
+        {
             return Ok(classify_file_text(wire_path, bytes, &after));
         }
         if attempt == 1 {
@@ -1182,8 +1187,85 @@ fn read_file_blocking(
     unreachable!("read retry loop always returns")
 }
 
+#[cfg(unix)]
+fn open_preview_file(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+    expected: &std::fs::Metadata,
+) -> Result<std::fs::File, WorkspaceFilesError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if !root.is_absolute() {
+        return Err(bad_path("workspace root is not absolute"));
+    }
+    let mut directory =
+        std::fs::File::open("/").map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    let path = root.join(relative.as_path());
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => std::ffi::CString::new(name.as_bytes())
+                .map_err(|_| bad_path("invalid file component"))?,
+            _ => return Err(bad_path("invalid file component")),
+        };
+        let leaf = components.peek().is_none();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if leaf { 0 } else { libc::O_DIRECTORY };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(libc::ELOOP) => WorkspaceFilesError::Unsupported(
+                    if leaf {
+                        "path is a symlink"
+                    } else {
+                        "path traverses a symlink"
+                    }
+                    .into(),
+                ),
+                Some(libc::ENOTDIR) => {
+                    WorkspaceFilesError::Unsupported("file parent is not a directory".into())
+                }
+                Some(libc::ENOENT) => WorkspaceFilesError::NotFound("file not found".into()),
+                _ => WorkspaceFilesError::Io(error.to_string()),
+            });
+        }
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let metadata = directory
+        .metadata()
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(WorkspaceFilesError::Unsupported(
+            "path is not a regular file".into(),
+        ));
+    }
+    if !same_file_revision(expected, &metadata) {
+        return Err(WorkspaceFilesError::Io(
+            "file changed while it was being read; retry".into(),
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_preview_file(
+    _root: &Path,
+    _relative: &WorkspaceRelativePath,
+    _expected: &std::fs::Metadata,
+) -> Result<std::fs::File, WorkspaceFilesError> {
+    Err(WorkspaceFilesError::Unsupported(
+        "secure file opening is unavailable on this platform".into(),
+    ))
+}
+
 fn read_preview_attempt(
-    file: std::fs::File,
+    file: &std::fs::File,
     wire_path: String,
     metadata: &std::fs::Metadata,
 ) -> Result<Result<Vec<u8>, WorkspaceFileText>, WorkspaceFilesError> {
@@ -1555,7 +1637,7 @@ mod tests {
             .set_len(MAX_PREVIEW_FILE_BYTES * 2)
             .unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let result = read_preview_attempt(file, "growing.txt".into(), &stale)
+        let result = read_preview_attempt(&file, "growing.txt".into(), &stale)
             .unwrap()
             .unwrap_err();
         assert_eq!(
@@ -1564,6 +1646,70 @@ mod tests {
         );
         assert!(result.truncated);
         assert!(result.text.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_open_rejects_replacements_after_validation() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
+
+        for replacement in ["leaf-link", "parent-link", "fifo", "regular"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            std::fs::create_dir(root.join("inside")).unwrap();
+            std::fs::create_dir(root.join("outside")).unwrap();
+            let path = root.join("inside/file.txt");
+            std::fs::write(&path, "original").unwrap();
+            std::fs::write(root.join("outside/file.txt"), "secret").unwrap();
+            let relative = WorkspaceRelativePath::file("inside/file.txt").unwrap();
+            let before = checked_file_metadata(&root, &relative).unwrap();
+            let mutation_root = root.clone();
+            std::thread::spawn(move || {
+                let path = mutation_root.join("inside/file.txt");
+                if replacement == "parent-link" {
+                    std::fs::rename(mutation_root.join("inside"), mutation_root.join("saved"))
+                        .unwrap();
+                    symlink(mutation_root.join("outside"), mutation_root.join("inside")).unwrap();
+                } else {
+                    std::fs::rename(&path, mutation_root.join("original.txt")).unwrap();
+                    match replacement {
+                        "leaf-link" => {
+                            symlink(mutation_root.join("outside/file.txt"), path).unwrap()
+                        }
+                        "fifo" => {
+                            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                        }
+                        "regular" => std::fs::write(path, "replaced").unwrap(),
+                        _ => unreachable!(),
+                    }
+                }
+            })
+            .join()
+            .unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let result = open_preview_file(&root, &relative, &before);
+                tx.send(result.map(|_| ())).unwrap();
+            });
+            let received = rx.recv_timeout(Duration::from_secs(2));
+            if received.is_err() && replacement == "fifo" {
+                let _writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                    .unwrap();
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+            }
+            reader.join().unwrap();
+            assert!(
+                received
+                    .expect("opening a FIFO must not wait for a writer")
+                    .is_err(),
+                "accepted {replacement} after validation"
+            );
+        }
     }
 
     fn no_cancel() -> AtomicBool {
