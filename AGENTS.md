@@ -30,6 +30,8 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Edge | `npm -C edge run dev\|test\|typecheck\|deploy` |
 | Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` |
 
+O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
+
 ## Remotes e publicação
 
 - `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/comet` (terceiro, MIT).
