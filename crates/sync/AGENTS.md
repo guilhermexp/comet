@@ -24,6 +24,8 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 
 ## Verification
 
+- Testes async de ChatClient compartilham a trava `PATH_AND_TIMING`: o estado de rede e o orçamento de dials são globais; um runtime não pode reter permits enquanto outro avança seu relógio virtual.
+
 - Comandos: `cargo test -p zeron-sync --features mock-server` — a feature **não** é implícita: `tests/registry_client.rs` importa `zeron_sync::registry::mock_server`, então a invocação sem ela nem compila.
 
 | Camada / path | Tier exigido | Como rodar |

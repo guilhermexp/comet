@@ -233,6 +233,7 @@ fn catch_up_plan_covers_the_decision_table() {
 
 #[tokio::test(start_paused = true)]
 async fn fresh_join_backfills_rows_and_advances_cursor() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, fetch_calls) = fetcher(b"");
@@ -277,6 +278,7 @@ async fn fresh_join_backfills_rows_and_advances_cursor() {
 
 #[tokio::test(start_paused = true)]
 async fn contained_frontier_skips_the_checkpoint_download() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     sink.frontier_contained
@@ -324,6 +326,7 @@ async fn contained_frontier_skips_the_checkpoint_download() {
 
 #[tokio::test(start_paused = true)]
 async fn missing_frontier_fetches_and_imports_the_checkpoint_first() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, fetch_calls) = fetcher(b"checkpoint-bytes");
@@ -365,6 +368,7 @@ async fn missing_frontier_fetches_and_imports_the_checkpoint_first() {
 
 #[tokio::test(start_paused = true)]
 async fn unacked_pushes_survive_reconnect_and_acks_retire_them() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe1, mut end1) = pipe_pair();
     let (pipe2, mut end2) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
@@ -453,6 +457,7 @@ impl CheckpointFetcher for PendingFetcher {
 /// retry clock without waiting for a new enqueue.
 #[tokio::test(start_paused = true)]
 async fn permanent_rejection_retires_transient_keeps_and_retries() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -534,6 +539,7 @@ async fn permanent_rejection_retires_transient_keeps_and_retries() {
 /// immediate full-queue replay before the retry deadline.
 #[tokio::test(start_paused = true)]
 async fn quota_rejection_blocks_enqueue_nudges_until_retry_deadline() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -590,6 +596,7 @@ async fn quota_rejection_blocks_enqueue_nudges_until_retry_deadline() {
 /// rejected head, and only its acknowledgement unlocks the following batch.
 #[tokio::test(start_paused = true)]
 async fn quota_retry_sends_one_head_then_ack_drains_next() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -674,6 +681,7 @@ async fn quota_retry_sends_one_head_then_ack_drains_next() {
 /// F2: batches over the row cap never enter the replay queue.
 #[tokio::test(start_paused = true)]
 async fn oversized_enqueue_is_refused_at_the_door() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -710,6 +718,7 @@ async fn oversized_enqueue_is_refused_at_the_door() {
 /// actor is parked inside a hung checkpoint fetch.
 #[tokio::test(start_paused = true)]
 async fn shutdown_interrupts_a_hung_checkpoint_fetch() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe1, mut end1) = pipe_pair();
     let (pipe2, mut end2) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
@@ -758,6 +767,7 @@ async fn shutdown_interrupts_a_hung_checkpoint_fetch() {
 /// SURFACED — counted in stats, honest head_seq — not silently absorbed.
 #[tokio::test(start_paused = true)]
 async fn server_reset_is_counted_and_head_seq_stays_honest() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -801,6 +811,7 @@ async fn server_reset_is_counted_and_head_seq_stays_honest() {
 /// the deadline instead of hanging the actor (and shutdown) forever.
 #[tokio::test(start_paused = true)]
 async fn hung_checkpoint_fetch_fails_the_join_within_deadline() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
     let server = tokio::spawn(async move {
@@ -836,6 +847,7 @@ async fn hung_checkpoint_fetch_fails_the_join_within_deadline() {
 /// EMPTY transcript.
 #[tokio::test(start_paused = true)]
 async fn seeded_at_zero_room_fetches_the_checkpoint() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
     let (fetch, fetch_calls) = fetcher(b"seed-checkpoint-bytes");
@@ -904,6 +916,7 @@ impl CheckpointFetcher for GatedFetcher {
 /// the join must not serialize download → request → backfill.
 #[tokio::test]
 async fn checkpoint_fetch_overlaps_row_backfill() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
     let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
@@ -978,6 +991,7 @@ async fn checkpoint_fetch_overlaps_row_backfill() {
 /// backfill AFTER seeing (and acking) the push; the old order deadlocks here.
 #[tokio::test(start_paused = true)]
 async fn pending_push_flushes_before_backfill_completes() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe_a, mut end_a) = pipe_pair();
     let (pipe_b, mut end_b) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
@@ -1074,9 +1088,9 @@ fn empty_frontier_with_real_checkpoint_is_not_contained() {
 // virtual clock. The contract under test: every send delivers exactly once
 // or surfaces a visible degraded state — silence is a failure.
 
-/// Tests that flip the process-global OS-path flag or assert precise dial
-/// timing serialize through this: a park triggered by one test inflates
-/// another's measured backoff gaps.
+/// Async client tests share the process-global OS-path flag and dial budget.
+/// Serialize them so a different runtime cannot hold a dial slot while a
+/// paused clock advances through its deadlines or backoff measurements.
 static PATH_AND_TIMING: Mutex<()> = Mutex::new(());
 
 struct FlakyConnector {
@@ -1372,6 +1386,7 @@ async fn os_offline_parks_dials_and_the_online_event_unparks_immediately() {
 /// close the gap.
 #[tokio::test(start_paused = true)]
 async fn live_row_gap_holds_cursor_and_repairs() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -1465,6 +1480,7 @@ async fn live_row_gap_holds_cursor_and_repairs() {
 /// checkpoint threshold policy, and re-imports are no-ops.
 #[tokio::test(start_paused = true)]
 async fn checkpointless_amnesty_refetches_from_zero() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -1512,6 +1528,7 @@ async fn checkpointless_amnesty_refetches_from_zero() {
 
 #[tokio::test(start_paused = true)]
 async fn causal_gap_refetches_checkpoint_without_skipping_parked_row() {
+    let _serial = lock(&PATH_AND_TIMING);
     use std::sync::atomic::Ordering::Relaxed;
     let (first_pipe, mut first_end) = pipe_pair();
     let (second_pipe, mut second_end) = pipe_pair();
@@ -1606,6 +1623,7 @@ impl ChatTransport for FixedHttpRows {
 
 #[tokio::test(start_paused = true)]
 async fn http_catchup_crosses_a_contained_checkpoint_and_repairs_causal_gaps() {
+    let _serial = lock(&PATH_AND_TIMING);
     use std::sync::atomic::Ordering::Relaxed;
     for pending_dependencies in [false, true] {
         let sink = Arc::new(RecordingSink::default());
@@ -1676,6 +1694,7 @@ async fn http_catchup_crosses_a_contained_checkpoint_and_repairs_causal_gaps() {
 
 #[tokio::test]
 async fn dial_slots_cap_concurrent_acquires() {
+    let _serial = lock(&PATH_AND_TIMING);
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::time::Duration;
@@ -1707,6 +1726,7 @@ async fn dial_slots_cap_concurrent_acquires() {
 
 #[tokio::test]
 async fn established_chats_release_dial_slots() {
+    let _serial = lock(&PATH_AND_TIMING);
     let mut clients = Vec::new();
     let mut servers = Vec::new();
     for _ in 0..=MAX_CONCURRENT_DIALS {
@@ -1748,6 +1768,7 @@ async fn established_chats_release_dial_slots() {
 
 #[tokio::test(start_paused = true)]
 async fn shutdown_cancels_dial_wait_without_releasing_occupied_slots() {
+    let _serial = lock(&PATH_AND_TIMING);
     let mut occupied = Vec::new();
     for _ in 0..MAX_CONCURRENT_DIALS {
         occupied.push(acquire_dial_slot().await.unwrap());
