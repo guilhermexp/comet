@@ -160,10 +160,7 @@ struct DiffSyncInner {
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
-    /// Serializes [`reconcile`] passes. Concurrent passes (chat-watch task vs.
-    /// `reconcile_now`) can both observe a checkout as missing and both
-    /// `add_entry` it — the second insert silently replaces the first entry,
-    /// discarding its checksum state and kicking a redundant full capture.
+    /// Serializes [`reconcile`] passes.
     reconcile_gate: tokio::sync::Mutex<()>,
     /// cwd → resolved checkout identity. See [`resolve_identity`].
     identities: Mutex<HashMap<String, CheckoutIdentity>>,
@@ -283,19 +280,10 @@ impl CheckoutDiffSync {
     pub async fn pin_checkout(&self, cwd: &Path) -> Result<CheckoutPin, EngineError> {
         let identity = self.inner.repos.checkout_identity(cwd).await?;
         let checkout_id = identity.id.clone();
-        let existing = lock(&self.inner.entries).get(&checkout_id).cloned();
-        match existing {
-            Some(entry) => {
-                entry.pins.fetch_add(1, Ordering::Relaxed);
-                *lock(&entry.orphaned_since) = None;
-            }
-            None => {
-                add_entry(&self.inner, identity, Vec::new());
-                if let Some(entry) = lock(&self.inner.entries).get(&checkout_id) {
-                    entry.pins.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
+        let mut entries = lock(&self.inner.entries);
+        let entry = add_entry(&self.inner, &mut entries, identity, Vec::new());
+        entry.pins.fetch_add(1, Ordering::Relaxed);
+        *lock(&entry.orphaned_since) = None;
         Ok(CheckoutPin {
             inner: Arc::downgrade(&self.inner),
             checkout_id,
@@ -485,22 +473,18 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
     }
 
     // Update surviving entries; add new ones (initial sync kicked on add).
-    for (checkout_id, (identity, chats)) in groups {
-        let existing = lock(&inner.entries).get(&checkout_id).cloned();
-        match existing {
-            Some(entry) => {
-                let has_new = {
-                    let mut held = lock(&entry.chats);
-                    let previous: HashSet<String> = held.iter().map(|c| c.id.clone()).collect();
-                    let has_new = chats.iter().any(|c| !previous.contains(&c.id));
-                    *held = chats;
-                    has_new
-                };
-                if has_new {
-                    let _ = entry.kick_tx.send(()); // new chat needs a sidecar now
-                }
-            }
-            None => add_entry(inner, identity, chats),
+    for (_, (identity, chats)) in groups {
+        let mut entries = lock(&inner.entries);
+        let entry = add_entry(inner, &mut entries, identity, Vec::new());
+        let has_new = {
+            let mut held = lock(&entry.chats);
+            let previous: HashSet<String> = held.iter().map(|c| c.id.clone()).collect();
+            let has_new = chats.iter().any(|c| !previous.contains(&c.id));
+            *held = chats;
+            has_new
+        };
+        if has_new {
+            let _ = entry.kick_tx.send(());
         }
     }
 }
@@ -569,7 +553,15 @@ fn watch_targets(identity: &CheckoutIdentity) -> Vec<PathBuf> {
     targets
 }
 
-fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
+fn add_entry(
+    inner: &Arc<DiffSyncInner>,
+    entries: &mut HashMap<String, Arc<CheckoutEntry>>,
+    identity: CheckoutIdentity,
+    chats: Vec<Chat>,
+) -> Arc<CheckoutEntry> {
+    if let Some(entry) = entries.get(&identity.id) {
+        return entry.clone();
+    }
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
     let entry = Arc::new(CheckoutEntry {
         identity,
@@ -580,7 +572,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         kick_tx: kick_tx.clone(),
         watchers: Mutex::new(Vec::new()),
     });
-    lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
+    entries.insert(entry.identity.id.clone(), entry.clone());
     tokio::spawn(entry_task(
         Arc::downgrade(inner),
         Arc::downgrade(&entry),
@@ -605,6 +597,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         *lock(&entry.watchers) = watchers;
         let _ = kick_tx.send(());
     });
+    entry
 }
 
 /// Recursive watchers on the worktree root (budget permitting) and the git
@@ -1726,6 +1719,69 @@ pub(crate) async fn recapture_for_mode(
         DiffMode::Commit { sha } => Box::pin(capture_commit_diff(repos, root, sha)).await,
         DiffMode::Turn { .. } => Box::pin(capture_turn_diff(repos, root, base)).await,
         DiffMode::WorkingTree => Box::pin(capture_diff(repos, root)).await,
+    }
+}
+
+#[cfg(test)]
+mod pin_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_creation_preserves_pins_through_reconcile_and_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let output = tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let core = crate::EngineCore::assemble(
+            &temp.path().join("data"),
+            Arc::new(crate::HarnessRegistry::new()),
+            zeron_proto::HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let sync = core.diff_sync.clone();
+        sync.shutdown().await;
+        let identity = sync.inner.repos.checkout_identity(&root).await.unwrap();
+        let id = identity.id.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let inner = sync.inner.clone();
+        let pending_creation = tokio::spawn(async move {
+            assert!(!lock(&inner.entries).contains_key(&identity.id));
+            ready_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            let mut entries = lock(&inner.entries);
+            add_entry(&inner, &mut entries, identity, Vec::new())
+        });
+        ready_rx.await.unwrap();
+        let first_pin = sync.pin_checkout(&root).await.unwrap();
+        let original = lock(&sync.inner.entries).get(&id).unwrap().clone();
+        *lock(&original.orphaned_since) = Some(std::time::Instant::now() - REPAIR_INTERVAL * 2);
+        reconcile(&sync.inner, Vec::new(), false).await;
+        assert!(lock(&sync.inner.entries).contains_key(&id));
+        assert!(lock(&original.orphaned_since).is_none());
+        resume_tx.send(()).unwrap();
+        let reused = pending_creation.await.unwrap();
+        assert!(Arc::ptr_eq(&original, &reused));
+        let second_pin = sync.pin_checkout(&root).await.unwrap();
+        assert_eq!(original.pins.load(Ordering::Relaxed), 2);
+        drop(first_pin);
+        reconcile(&sync.inner, Vec::new(), false).await;
+        assert_eq!(original.pins.load(Ordering::Relaxed), 1);
+        assert!(lock(&sync.inner.entries).contains_key(&id));
+        drop(second_pin);
+        reconcile(&sync.inner, Vec::new(), false).await;
+        assert!(lock(&sync.inner.entries).contains_key(&id));
+        assert!(lock(&original.orphaned_since).is_some());
+        *lock(&original.orphaned_since) = Some(std::time::Instant::now() - REPAIR_INTERVAL * 2);
+        reconcile(&sync.inner, Vec::new(), false).await;
+        assert!(!lock(&sync.inner.entries).contains_key(&id));
     }
 }
 
