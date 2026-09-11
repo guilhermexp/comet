@@ -12,6 +12,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 ## Local Contracts
 
+- O catálogo `Repos::refs` exclui `HEAD` remoto, preservando branches locais/remotas normais e a marcação da branch padrão pelo destino de `origin/HEAD`.
+
 - Git History pesquisa apenas refs públicas em ordem topológica, com paginação e pontas de branches independentes da página. Comparação ahead/behind consulta refs locais e nunca faz fetch implícito. Toda chamada Git continua no ProcessRunner. Metadados/avatar GitHub são best-effort, com timeout e limites durante a leitura; RPC de imagens limita o total bruto a 512 KiB.
 
 - `EngineCore.previews` é device-local: boot observa cwds dos Chats locais, disconnect cancela sinalização/proxy e shutdown aguarda. `WatchPreviews` consulta o catálogo do viewer e filtra pelo Chat/device dono; `targetDeviceId` aqui seleciona dados e não provoca relay RPC. Auth fornece token fresco na conexão, sem copiá-lo para o catálogo.

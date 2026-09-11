@@ -531,7 +531,7 @@ impl Repos {
         let mut seen = std::collections::HashSet::new();
         let mut local_set = std::collections::HashSet::new();
         let mut push = |name: &str| {
-            if seen.insert(name.to_string()) {
+            if !name.is_empty() && name != "HEAD" && seen.insert(name.to_string()) {
                 names.push(name.to_string());
             }
         };
@@ -2454,6 +2454,61 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::process::ProcessOutput;
+
+    #[tokio::test]
+    async fn refs_excludes_origin_head_and_preserves_normal_branches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let repos = Repos::new(temp.path(), "dev");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "initial",
+            ],
+            vec!["branch", "feature/local"],
+            vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            vec!["update-ref", "refs/remotes/origin/feature/remote", "HEAD"],
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        ] {
+            repos.git(&args, Some(&root)).await.unwrap();
+        }
+        let refs = repos.refs(&root).await.unwrap();
+        let actual: Vec<_> = refs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.as_str(),
+                    entry.current,
+                    entry.is_remote,
+                    entry.is_default,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("main", true, Some(false), Some(true)),
+                ("feature/local", false, Some(false), Some(false)),
+                ("feature/remote", false, Some(true), Some(false)),
+            ]
+        );
+        assert!(refs.iter().all(|entry| entry.worktree_path.is_none()));
+    }
 
     /// The runner seam: `Repos` never spawns git itself, so a failure is
     /// whatever the runner reports — stderr and all.
