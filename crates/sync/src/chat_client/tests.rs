@@ -1745,3 +1745,43 @@ async fn established_chats_release_dial_slots() {
         client.shutdown().await;
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_dial_wait_without_releasing_occupied_slots() {
+    let mut occupied = Vec::new();
+    for _ in 0..MAX_CONCURRENT_DIALS {
+        occupied.push(acquire_dial_slot().await.unwrap());
+    }
+    let (pipe, _server) = pipe_pair();
+    let connector = connector(vec![pipe]);
+    let client = ChatClient::connect_with_transport(
+        connector.clone(),
+        Arc::new(RecordingSink::default()),
+        fetcher(&[]).0,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(Arc::new(FixedHttpRows {
+            body: Vec::new(),
+            requests: Mutex::new(Vec::new()),
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .flags
+            .dial_seq
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(1), client.shutdown())
+        .await
+        .expect("shutdown must finish while all dial slots remain occupied");
+    assert_eq!(occupied.len(), MAX_CONCURRENT_DIALS);
+    assert_eq!(
+        lock(&connector.pipes).len(),
+        1,
+        "cancelled Chat attempted to connect"
+    );
+}

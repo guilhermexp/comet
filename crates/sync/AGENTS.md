@@ -14,7 +14,7 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 
 - O par de crates `loro` / `loro-protocol` é o twin Rust do pacote npm que o edge fala — frames byte-idênticos. Bump de versão exige revalidar a convergência contra o edge, não só compilar.
 - Join é **supervisionado**: falha de sync não pode ficar silenciosa. Retry, probe e escalonamento existem porque o modo de falha real era "trava sem dizer nada".
-- Dials chat2 (WS handshake e HTTPS pull/push) compartilham um semáforo de processo (`MAX_CONCURRENT_DIALS` = 8). O permit é liberado ao terminar o handshake, antes de sucesso, erro ou backoff. Socket já conectado não segura o slot. Sem isso o boot abria dezenas de rooms de uma vez, esgotava FDs e o Metal abortava (2026-09-11).
+- Dials chat2 (WS handshake e HTTPS pull/push) compartilham um semáforo de processo (`MAX_CONCURRENT_DIALS` = 8). A espera pelo permit observa shutdown e o cancelamento é rechecado antes de conectar. O permit é liberado ao terminar o handshake, antes de sucesso, erro ou backoff. Socket já conectado não segura o slot. Sem isso o boot abria dezenas de rooms de uma vez, esgotava FDs e o Metal abortava (2026-09-11).
 - Presença é efêmera por design — substitui escrita de heartbeat a cada 15s. Não persistir presença no doc.
 - Chat row import distingue operações aplicadas de dependências causais pendentes. Row pendente segura o cursor e força checkpoint mesmo com frontier aparentemente contida; HTTP e WebSocket usam a mesma regra. Reparo inclui rows próprias e uma geração impede que catch-up antigo limpe um gap mais novo. `CaughtUp` não é emitido enquanto faltar história causal.
 

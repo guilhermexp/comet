@@ -761,9 +761,17 @@ impl Actor {
                 .dial_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let Some(dial_slot) = acquire_dial_slot().await else {
+            let dial_slot = tokio::select! {
+                biased;
+                _ = self.shutdown.changed() => return,
+                slot = acquire_dial_slot() => slot,
+            };
+            let Some(dial_slot) = dial_slot else {
                 return;
             };
+            if *self.shutdown.borrow() {
+                return;
+            }
             let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
             drop(dial_slot);
             let pipe = match dial {
