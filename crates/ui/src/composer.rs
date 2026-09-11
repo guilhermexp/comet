@@ -3279,15 +3279,10 @@ impl ComposerInput {
         // Shape the undecorated projection separately. These metrics alone
         // drive compact↔expanded hysteresis, so heading glyph size and bold/
         // mono widths cannot cause decorate→measure→flip feedback.
+        let wrap_width = (!self.single_line).then_some(width);
         let base_lines = window
             .text_system()
-            .shape_text(
-                display.clone(),
-                font_size,
-                &base_runs,
-                (!self.single_line).then_some(width),
-                None,
-            )
+            .shape_text(display.clone(), font_size, &base_runs, wrap_width, None)
             .map(|small| small.into_vec())
             .unwrap_or_default();
         let has_sized_heading = plans.iter().any(|plan| plan.decor.heading.is_some());
@@ -3304,7 +3299,7 @@ impl ComposerInput {
                     SharedString::from(line.to_owned()),
                     px(line_size),
                     &line_runs,
-                    Some(width),
+                    wrap_width,
                     None,
                 ) {
                     shaped.extend(line);
@@ -3315,7 +3310,7 @@ impl ComposerInput {
         } else {
             window
                 .text_system()
-                .shape_text(display.clone(), font_size, &runs, Some(width), None)
+                .shape_text(display.clone(), font_size, &runs, wrap_width, None)
                 .map(|small| small.into_vec())
                 .unwrap_or_default()
         };
@@ -8622,6 +8617,34 @@ mod tests {
             assert!(window.focused(cx).is_none());
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn single_line_layout_keeps_plain_and_heading_text_unwrapped(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (input, cx) = cx.add_window_view(|_, cx| {
+            ComposerInput::new("Address", cx)
+                .with_single_line()
+                .with_text_metrics(11.0, 16.0)
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                let style = window.text_style();
+                for text in [
+                    "http://device.a-very-long-project-name.localhost:7331/path",
+                    "# A very long heading that must stay on a single line",
+                ] {
+                    input.set_text(text, cx);
+                    let unwrapped_height = input.layout_text(px(2000.0), &style, window, cx);
+                    assert_eq!(
+                        input.layout_text(px(100.0), &style, window, cx),
+                        unwrapped_height
+                    );
+                    input.clamp_scroll(16.0);
+                    assert!(input.scroll_left > 0.0);
+                }
+            });
+        });
     }
 
     #[cfg(target_os = "linux")]
