@@ -179,11 +179,24 @@ pub(super) enum SpacesMenuRow {
     AddSpace,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectPickerTarget {
+    Space,
+    Worker,
+}
+
+impl ProjectPickerTarget {
+    fn allows_device(self, device_id: &str, local_id: Option<&str>) -> bool {
+        self == Self::Space || local_id == Some(device_id)
+    }
+}
+
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
 /// across the top, folder browser on the left, a Devices + Locations rail on
 /// the right, kbd-hint footer. One surface — picking a device or a drive in
 /// the rail rebrowses in place, no step wizard.
 pub(super) struct AddSpaceFlow {
+    target: ProjectPickerTarget,
     /// The device currently browsed (the highlighted rail row).
     device: Option<Device>,
     /// Filter input; Enter descends into the highlighted folder. Carries the
@@ -1555,8 +1568,28 @@ impl Shell {
     // ---- add-space flow (the ⌘K palette) ----
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
-        let devices: Vec<Device> = self.state.read(cx).devices.clone();
+        let target = if self.sidebar_mode == SidebarMode::Workers {
+            ProjectPickerTarget::Worker
+        } else {
+            ProjectPickerTarget::Space
+        };
+        self.open_project_palette(target, cx);
+    }
+
+    pub(super) fn open_project_palette(
+        &mut self,
+        target: ProjectPickerTarget,
+        cx: &mut Context<Self>,
+    ) {
         let local = self.state.read(cx).local_device_id.clone();
+        let devices: Vec<Device> = self
+            .state
+            .read(cx)
+            .devices
+            .iter()
+            .filter(|device| target.allows_device(&device.id, local.as_deref()))
+            .cloned()
+            .collect();
         // Land on this device's tab (else the first registered device).
         let device = devices
             .iter()
@@ -1585,6 +1618,7 @@ impl Shell {
         });
         let has_device = device.is_some();
         self.add_space = Some(AddSpaceFlow {
+            target,
             device,
             search,
             browser: Loadable::Idle,
@@ -1613,10 +1647,13 @@ impl Shell {
 
     /// Devices-rail click: rebrowse the same palette on another device.
     fn add_space_pick_device(&mut self, device: Device, cx: &mut Context<Self>) {
+        let local = self.state.read(cx).local_device_id.clone();
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
-        if flow.device.as_ref().is_some_and(|d| d.id == device.id) {
+        if !flow.target.allows_device(&device.id, local.as_deref())
+            || flow.device.as_ref().is_some_and(|d| d.id == device.id)
+        {
             return;
         }
         flow.device = Some(device);
@@ -1665,6 +1702,12 @@ impl Shell {
             return;
         };
         let device_id = flow.device.as_ref().map(|d| d.id.clone());
+        if !device_id
+            .as_deref()
+            .is_some_and(|id| flow.target.allows_device(id, local.as_deref()))
+        {
+            return;
+        }
         flow.drives = Loadable::Loading;
         flow.drives_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
@@ -1865,6 +1908,12 @@ impl Shell {
             return;
         };
         let device_id = flow.device.as_ref().map(|d| d.id.clone());
+        if !device_id
+            .as_deref()
+            .is_some_and(|id| flow.target.allows_device(id, local.as_deref()))
+        {
+            return;
+        }
         let show_hidden = flow.show_hidden;
         let went_home = path.is_none();
         flow.browser_path = path.clone();
@@ -1934,6 +1983,19 @@ impl Shell {
             return;
         };
         let path = listing.path.clone();
+        if !flow
+            .target
+            .allows_device(&device.id, self.state.read(cx).local_device_id.as_deref())
+        {
+            return;
+        }
+        if flow.target == ProjectPickerTarget::Worker {
+            self.add_space = None;
+            self.workers_model
+                .update(cx, |model, cx| model.add_project(path.into(), cx));
+            cx.notify();
+            return;
+        }
         let git_detected = flow.browser_repo;
         // Same (device, folder) already has a space → just switch to it. The
         // engine dedupes this case too (a createSpace for a duplicate pair
@@ -2162,7 +2224,14 @@ impl Shell {
                 flow.drives.ready().cloned().unwrap_or_default(),
             )
         };
-        let devices = self.state.read(cx).devices.clone();
+        let state = self.state.read(cx);
+        let target = self.add_space.as_ref()?.target;
+        let devices: Vec<Device> = state
+            .devices
+            .iter()
+            .filter(|device| target.allows_device(&device.id, state.local_device_id.as_deref()))
+            .cloned()
+            .collect();
         let rows = self.add_space_filtered(cx);
         // Push the completion preview into the input — the faint suffix ahead
         // of the caret that ⇥ accepts. Recomputed every render (query, active
@@ -3232,5 +3301,26 @@ mod tests {
             visible_device_chat_ids(groups, &collapsed),
             ["remote-a", "remote-b"]
         );
+    }
+}
+
+#[cfg(test)]
+mod project_picker_scope_tests {
+    use super::ProjectPickerTarget;
+
+    #[test]
+    fn worker_picker_rejects_remote_and_unknown_local_identity() {
+        let target = ProjectPickerTarget::Worker;
+        assert!(target.allows_device("local", Some("local")));
+        assert!(!target.allows_device("remote", Some("local")));
+        assert!(!target.allows_device("remote", None));
+    }
+
+    #[test]
+    fn orchestrator_picker_keeps_local_and_remote_devices() {
+        let target = ProjectPickerTarget::Space;
+        assert!(target.allows_device("local", Some("local")));
+        assert!(target.allows_device("remote", Some("local")));
+        assert!(target.allows_device("remote", None));
     }
 }

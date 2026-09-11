@@ -928,7 +928,14 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
 const HUB_INPUT_KEEP: [&str; 5] = ["op", "name", "to", "from", "application"];
 const SKILL_INPUT_KEEP: [&str; 3] = ["skill", "path", "name"];
 const EVAL_INPUT_KEEP: [&str; 2] = ["language", "title"];
-const WORKERS_INPUT_KEEP: [&str; 5] = ["action", "session_id", "project_id", "name", "project"];
+const WORKERS_INPUT_KEEP: [&str; 6] = [
+    "action",
+    "session_id",
+    "project_id",
+    "preset_id",
+    "name",
+    "project",
+];
 
 /// The only slice of a tool input allowed into the doc: either a subagent
 /// spawn's [`SUBAGENT_INPUT_KEEP`] keys, or the short chip identifiers for
@@ -1666,6 +1673,26 @@ mod tests {
             );
             assert_eq!(sanitize_tool_call(&clean), clean);
         }
+    }
+
+    #[test]
+    fn sanitize_workers_launch_keeps_preset_identity_without_briefing() {
+        let call = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(
+                serde_json::json!({"action":"launch_worker", "project_id":"project-1", "preset_id":" preset-1 ", "initial_text":"private briefing", "command":"private command"}),
+            ),
+        };
+        let clean = sanitize_tool_call(&call);
+        let ToolCall::Mcp { input, .. } = &clean else {
+            panic!("MCP call");
+        };
+        assert_eq!(
+            input.as_ref().unwrap(),
+            &serde_json::json!({"action":"launch_worker", "project_id":"project-1", "preset_id":"preset-1"})
+        );
+        assert_eq!(sanitize_tool_call(&clean), clean);
     }
 
     #[test]

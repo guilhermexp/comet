@@ -51,7 +51,7 @@ use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
-use crate::state::AppState;
+use crate::state::{AppState, WorkersToolCatalog, WorkersToolLabel};
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 use crate::turn_steps::plan_turn_steps;
@@ -2245,6 +2245,84 @@ fn stream_file_name(path: &str) -> &str {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkersToolChips {
+    detail: String,
+    project: Option<String>,
+    identity: Option<WorkersToolLabel>,
+}
+
+/// Resolve local Workers targets without rewriting the persisted call.
+fn workers_tool_chips(
+    call: &ToolCall,
+    catalog: &WorkersToolCatalog,
+    host_device: Option<&str>,
+    local_device: Option<&str>,
+) -> Option<WorkersToolChips> {
+    if host_device.is_none() || host_device != local_device {
+        return None;
+    }
+    let ToolCall::Mcp {
+        server,
+        tool,
+        input: Some(input),
+    } = call
+    else {
+        return None;
+    };
+    if tool != "workers" && server != "comet-workers" {
+        return None;
+    }
+    let field = |key| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let action = field("action")?;
+    let identity = |label: &WorkersToolLabel| {
+        (!label.name.trim().is_empty()).then(|| WorkersToolLabel {
+            name: zeron_proto::view::single_line(label.name.trim()),
+            icon: label.icon,
+        })
+    };
+    // A session target wins even if unknown: never substitute a preset or project.
+    if let Some(session_id) = field("session_id") {
+        return Some(WorkersToolChips {
+            detail: zeron_proto::view::single_line(action),
+            project: None,
+            identity: Some(identity(catalog.sessions.get(session_id)?)?),
+        });
+    }
+    let project = field("project_id")
+        .and_then(|id| catalog.projects.get(id))
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(zeron_proto::view::single_line);
+    let preset = (action == "launch_worker")
+        .then(|| {
+            field("preset_id")
+                .and_then(|id| catalog.presets.get(id))
+                .and_then(identity)
+        })
+        .flatten();
+    if project.is_none() && preset.is_none() {
+        return None;
+    }
+    // If only the preset resolves, keep the unresolved project ID in the copy.
+    let detail = if project.is_some() {
+        zeron_proto::view::single_line(action)
+    } else {
+        tool_chip_content(call).1
+    };
+    Some(WorkersToolChips {
+        detail,
+        project,
+        identity: preset,
+    })
 }
 
 /// Verb + object as painted on a timeline row. File tools show the basename;
@@ -8184,6 +8262,26 @@ impl Transcript {
             )
             .child(stream_disclosure(open, theme));
 
+        let worker_chips: Vec<_> = {
+            let state = self.state.read(cx);
+            let chat_id = self.journal_chat_id.as_ref().or(self.chat_id.as_ref());
+            let host = state
+                .chats
+                .iter()
+                .find(|chat| Some(&chat.id) == chat_id)
+                .map(|chat| chat.device_id.as_str());
+            tools
+                .iter()
+                .map(|tool| {
+                    workers_tool_chips(
+                        &tool.call,
+                        &state.workers_tool_catalog,
+                        host,
+                        state.local_device_id.as_deref(),
+                    )
+                })
+                .collect()
+        };
         let chips = div()
             .when(collapses, |column| column.pl(px(STREAM_ICON + 8.0)))
             .pt(px(CHIPS_TOP_PAD))
@@ -8226,7 +8324,7 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, theme, cx.entity_id(), cx);
+                    return tool_chip(tool, worker_chips[ix].as_ref(), theme, cx.entity_id(), cx);
                 }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
@@ -8288,7 +8386,14 @@ impl Transcript {
                                 group.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
-                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                            .child(chip_header(
+                                tool,
+                                open,
+                                worker_chips[ix].as_ref(),
+                                theme,
+                                cx.entity_id(),
+                                cx,
+                            )),
                     );
                 // Wrapped bodies use their natural height, without a close
                 // tween. Retaining one here would wait for an unrelated repaint.
@@ -8970,6 +9075,7 @@ enum ChipTrail {
 fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
+    worker_chips: Option<&WorkersToolChips>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -8981,6 +9087,9 @@ fn chip_header_row(
         (presentation.label, presentation.detail)
     };
     let (mut label, detail) = stream_copy(&tool.call, raw_label, &raw_detail);
+    let detail = worker_chips
+        .map(|chips| chips.detail.clone())
+        .unwrap_or(detail);
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -9064,6 +9173,56 @@ fn chip_header_row(
                     theme.text_faint
                 })
                 .child(SharedString::from(detail)),
+        )
+        .when_some(
+            worker_chips.and_then(|chips| chips.project.as_ref()),
+            |row, name| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.0)
+                        .px(px(5.0))
+                        .rounded(px(5.0))
+                        .bg(theme.code_wash)
+                        .h(px(render::MD_LINE_HEIGHT - 4.0))
+                        .line_height(px(render::MD_LINE_HEIGHT - 4.0))
+                        .font_family(theme.font_mono.clone())
+                        .text_color(tint)
+                        .truncate()
+                        .child(SharedString::from(format!("@{name}"))),
+                )
+            },
+        )
+        .when_some(
+            worker_chips.and_then(|chips| chips.identity.as_ref()),
+            |row, identity| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.0)
+                        .max_w(px(300.0))
+                        .h(px(render::MD_LINE_HEIGHT))
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .rounded(px(5.0))
+                        .bg(theme.code_wash)
+                        .text_color(tint)
+                        .child(
+                            crate::icons::icon(identity.icon)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(tint),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(identity.name.clone())),
+                        ),
+                )
+            },
         )
         .when_some(tool.call.subagent_model(), |row, model| {
             // Which model the child runs on, when the spawn named one.
@@ -9183,11 +9342,19 @@ fn chip_header_row(
 fn chip_header(
     tool: &ToolItem,
     open: bool,
+    worker_chips: Option<&WorkersToolChips>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    chip_header_row(tool, Some(ChipTrail::Chevron { open }), theme, view, cx)
+    chip_header_row(
+        tool,
+        Some(ChipTrail::Chevron { open }),
+        worker_chips,
+        theme,
+        view,
+        cx,
+    )
 }
 
 /// Max chars a subagent tab title keeps. The strip chip is fixed-width and
@@ -9532,6 +9699,7 @@ fn file_change_line_row(
 /// A plain (non-expandable) event row: icon, verb + object.
 fn tool_chip(
     tool: &ToolItem,
+    worker_chips: Option<&WorkersToolChips>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9540,7 +9708,7 @@ fn tool_chip(
         .h(px(CHIP_HEIGHT))
         .w_full()
         .flex_none()
-        .child(chip_header_row(tool, None, theme, view, cx))
+        .child(chip_header_row(tool, None, worker_chips, theme, view, cx))
         .into_any_element()
 }
 
@@ -9567,6 +9735,7 @@ fn subagent_chip(
         .child(chip_header_row(
             tool,
             Some(ChipTrail::OpenArrow),
+            None,
             theme,
             view,
             cx,
@@ -13232,6 +13401,164 @@ mod tests {
             stream_copy(&call, "Called", "js · literal title").1,
             "js · literal title"
         );
+    }
+
+    #[test]
+    fn workers_tool_chips_show_preset_on_launch_and_worker_on_follow_up() {
+        let mut catalog = WorkersToolCatalog {
+            projects: HashMap::from([("project-1".into(), "meridian".into())]),
+            presets: HashMap::from([(
+                "preset-1".into(),
+                WorkersToolLabel {
+                    name: "Codex review".into(),
+                    icon: crate::icons::WORKER_CODEX,
+                },
+            )]),
+            sessions: HashMap::from([(
+                "worker-1".into(),
+                WorkersToolLabel {
+                    name: "Corrigir streaming".into(),
+                    icon: crate::icons::WORKER_OMP,
+                },
+            )]),
+        };
+        let launch = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(
+                serde_json::json!({"action":"launch_worker", "project_id":"project-1", "preset_id":"preset-1"}),
+            ),
+        };
+        let clean = zeron_doc::parts::sanitize_tool_call(&launch);
+        assert_eq!(
+            workers_tool_chips(&clean, &catalog, Some("local"), Some("local")),
+            Some(WorkersToolChips {
+                detail: "launch_worker".into(),
+                project: Some("meridian".into()),
+                identity: Some(WorkersToolLabel {
+                    name: "Codex review".into(),
+                    icon: crate::icons::WORKER_CODEX
+                })
+            })
+        );
+        let follow = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(
+                serde_json::json!({"action":"read_output", "session_id":"worker-1", "project_id":"project-1", "preset_id":"preset-1"}),
+            ),
+        };
+        assert_eq!(
+            workers_tool_chips(&follow, &catalog, Some("local"), Some("local")),
+            Some(WorkersToolChips {
+                detail: "read_output".into(),
+                project: None,
+                identity: Some(WorkersToolLabel {
+                    name: "Corrigir streaming".into(),
+                    icon: crate::icons::WORKER_OMP
+                })
+            })
+        );
+        catalog.sessions.get_mut("worker-1").unwrap().name = "Título novo".into();
+        assert_eq!(
+            workers_tool_chips(&follow, &catalog, Some("local"), Some("local"))
+                .unwrap()
+                .identity
+                .unwrap()
+                .name,
+            "Título novo"
+        );
+        catalog.sessions.clear();
+        assert_eq!(
+            workers_tool_chips(&follow, &catalog, Some("local"), Some("local")),
+            None,
+            "unknown session must not inherit preset identity"
+        );
+        assert_eq!(
+            workers_tool_chips(&launch, &catalog, Some("remote"), Some("local")),
+            None
+        );
+    }
+
+    #[test]
+    fn workers_project_chip_resolves_exact_catalog_target_without_changing_call() {
+        let call = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(serde_json::json!({"action":"launch_worker", "project_id":"comet-123"})),
+        };
+        let before = serde_json::to_value(&call).unwrap();
+        let mut projects = WorkersToolCatalog {
+            projects: HashMap::from([("comet-123".into(), "meridian".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            workers_tool_chips(&call, &projects, Some("local"), Some("local")),
+            Some(WorkersToolChips {
+                detail: "launch_worker".into(),
+                project: Some("meridian".into()),
+                identity: None
+            })
+        );
+        projects
+            .projects
+            .insert("comet-123".into(), "Renamed project".into());
+        assert_eq!(
+            workers_tool_chips(&call, &projects, Some("local"), Some("local")),
+            Some(WorkersToolChips {
+                detail: "launch_worker".into(),
+                project: Some("Renamed project".into()),
+                identity: None
+            })
+        );
+        assert_eq!(serde_json::to_value(&call).unwrap(), before);
+        for (host, local) in [
+            (Some("remote"), Some("local")),
+            (None, Some("local")),
+            (None, None),
+        ] {
+            assert_eq!(workers_tool_chips(&call, &projects, host, local), None);
+        }
+        projects.projects.clear();
+        assert_eq!(
+            workers_tool_chips(&call, &projects, Some("local"), Some("local")),
+            None
+        );
+    }
+
+    #[test]
+    fn workers_project_chip_does_not_relabel_sessions_or_unrelated_tools() {
+        let projects = WorkersToolCatalog {
+            projects: HashMap::from([("comet-123".into(), "meridian".into())]),
+            ..Default::default()
+        };
+        for (server, tool, input) in [
+            (
+                "comet-workers",
+                "workers",
+                serde_json::json!({"action":"read_output","session_id":"worker-1","project_id":"comet-123"}),
+            ),
+            (
+                "other",
+                "unrelated",
+                serde_json::json!({"action":"launch_worker","project_id":"comet-123"}),
+            ),
+            (
+                "comet-workers",
+                "workers",
+                serde_json::json!({"action":"launch_worker","project_id":"comet-12"}),
+            ),
+        ] {
+            let call = ToolCall::Mcp {
+                server: server.into(),
+                tool: tool.into(),
+                input: Some(input),
+            };
+            assert_eq!(
+                workers_tool_chips(&call, &projects, Some("local"), Some("local")),
+                None
+            );
+        }
     }
 
     #[test]

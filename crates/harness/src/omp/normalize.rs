@@ -703,6 +703,16 @@ fn execution_meta(result: &Value) -> Option<ToolExecutionMeta> {
 }
 
 fn tool_diff(result: &Value) -> Option<ToolDiff> {
+    // OMP's edit modes return snapshots in AgentToolResult.details; older
+    // rpc-ui frames carried the same fields directly on result.
+    let details = result.get("details").unwrap_or(result);
+    let result = match details.get("perFileResults").and_then(Value::as_array) {
+        Some(files) if files.len() == 1 => &files[0],
+        // ToolDiff describes one file. Never silently present just the first
+        // file of a batch or pair snapshots from different files.
+        Some(_) => return None,
+        None => details,
+    };
     let path = result.get("path")?.as_str()?.trim();
     if path.is_empty() {
         return None;
@@ -933,6 +943,56 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
+
+    #[test]
+    fn edit_result_details_preserve_authoritative_snapshots() {
+        for details in [
+            json!({"path":"/repo/TOOLS.md", "oldText":"before\n", "newText":"after\n"}),
+            json!({"perFileResults":[{"path":"/repo/TOOLS.md", "oldText":"before\n", "newText":"after\n"}]}),
+        ] {
+            let mut normalizer = OmpNormalizer::new("/repo", "test");
+            let events = normalizer.push(json!({
+                "type":"tool_execution_end", "toolCallId":"edit-1", "toolName":"edit",
+                "isError":false,
+                "result":{"content":[{"type":"text", "text":"Updated TOOLS.md"}], "details":details}
+            }));
+            assert!(
+                matches!(&events[..], [AgentEvent::ToolResult {
+                id, diff:Some(diff), is_error:false, output:Some(output), ..
+            }] if id == "edit-1" && diff.path == "/repo/TOOLS.md"
+                && diff.old_text.as_deref() == Some("before\n") && diff.new_text == "after\n"
+                && output == "Updated TOOLS.md"),
+                "{events:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_result_details_keep_legacy_and_empty_replacements() {
+        for result in [
+            json!({"path":"/repo/TOOLS.md", "oldText":"before", "newText":""}),
+            json!({"details":{"path":"/repo/TOOLS.md", "oldText":"before", "newText":""}}),
+        ] {
+            let diff = tool_diff(&result).expect("empty replacement is a real edit");
+            assert_eq!(diff.path, "/repo/TOOLS.md");
+            assert_eq!(diff.old_text.as_deref(), Some("before"));
+            assert_eq!(diff.new_text, "");
+        }
+    }
+
+    #[test]
+    fn edit_result_details_do_not_invent_single_file_snapshots() {
+        for result in [
+            json!({"details":{"path":"/repo/TOOLS.md", "snapshotsPruned":true, "diff":"-before\n+after"}}),
+            json!({"details":{"path":" ", "newText":"after"}}),
+            json!({"details":{"perFileResults":[
+                {"path":"a", "oldText":"a", "newText":"b"},
+                {"path":"b", "oldText":"c", "newText":"d"}
+            ]}}),
+        ] {
+            assert!(tool_diff(&result).is_none(), "{result}");
+        }
+    }
 
     #[test]
     fn captured_partial_content_shape_streams_progressive_write() {

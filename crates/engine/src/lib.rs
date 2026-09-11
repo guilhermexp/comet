@@ -23,6 +23,7 @@ pub mod chat2_host;
 pub(crate) mod cursor_usage;
 pub mod diff_sync;
 pub mod doc_host;
+mod fd_limit;
 pub(crate) mod grok_usage;
 pub mod instance_lock;
 pub(crate) mod kimi_usage;
@@ -54,6 +55,7 @@ pub use diff_sync::{
     read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use fd_limit::raise_nofile_limit;
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};

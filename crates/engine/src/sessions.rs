@@ -1475,7 +1475,16 @@ impl SessionsEngine {
             if already_swept.contains(&chat_id) || lock(&self.inner.runs).contains_key(&chat_id) {
                 continue;
             }
-            let Ok(handle) = self.doc_handle(&chat_id) else {
+            // Peek the local snapshot before open(): open() joins the edge
+            // room, and sweeping every journaled chat at boot exhausted FDs
+            // (EMFILE → Metal abort, 2026-09-11). Settled transcripts skip.
+            let Some(host) = self.inner.doc_host() else {
+                continue;
+            };
+            if !host.peek_needs_abandoned_recovery(&chat_id) {
+                continue;
+            }
+            let Ok(handle) = host.open(&chat_id) else {
                 continue;
             };
             let stamped = match handle.mark_abandoned_streams(NOTE) {

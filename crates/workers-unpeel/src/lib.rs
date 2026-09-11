@@ -364,18 +364,17 @@ pub struct WorkersProject {
 }
 
 impl WorkersProject {
-    /// A branch a PR badge should follow, for a worktree only.
-    ///
-    /// `worktree_branch` is the branch the worktree was CREATED on and never
-    /// follows a `git switch` inside it — which is why the badge vanished. It
-    /// stays the GATE (only a worktree gets a badge); the VALUE comes from
-    /// `git_branch`, projected from disk on every bootstrap.
+    /// Current checkout branch shared by context labels and PR lookup.
+    /// Group rows are organizational aliases, not additional checkouts.
     pub fn change_request_branch(&self) -> Option<&str> {
-        let registry = self.worktree_branch.as_deref()?;
-        if registry.trim().is_empty() {
+        if self.is_group {
             return None;
         }
-        Some(self.git_branch.as_deref().unwrap_or(registry))
+        self.git_branch
+            .as_deref()
+            .or(self.worktree_branch.as_deref())
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
     }
 
     /// Whether the app may tear this checkout down — the question the removal
@@ -3805,11 +3804,10 @@ mod project_ledger_projection_tests {
         assert_eq!(ids, vec!["project", "worktree"]);
     }
 
-    /// O gate e o registro de worktree; o VALOR e o que o disco diz agora.
-    /// Sem isso, um `git switch` dentro do worktree assinava o PR com a branch
-    /// de criacao e a badge sumia.
+    /// Local checkouts and worktrees both follow the current branch; group
+    /// aliases do not create duplicate pull-request subscriptions.
     #[test]
-    fn change_request_branch_gates_on_the_registry_and_reads_disk() {
+    fn change_request_branch_uses_current_checkout_including_local_branches() {
         let mut worktree = project("worktree", "/tmp/wt", false, Some("fix/correios"));
         assert_eq!(worktree.change_request_branch(), Some("fix/correios"));
         worktree.git_branch = Some("fix/renamed".into());
@@ -3817,6 +3815,10 @@ mod project_ledger_projection_tests {
 
         let mut plain = project("project", "/tmp/repo", false, None);
         plain.git_branch = Some("main".into());
+        assert_eq!(plain.change_request_branch(), Some("main"));
+        plain.git_branch = Some(" fix/local ".into());
+        assert_eq!(plain.change_request_branch(), Some("fix/local"));
+        plain.is_group = true;
         assert_eq!(plain.change_request_branch(), None);
 
         let blank = project("blank", "/tmp/wt", false, Some("   "));

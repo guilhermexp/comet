@@ -1,0 +1,2 @@
+{"type":"tool_execution_start","toolCallId":"omp-edit-details-demo","toolName":"edit","args":{"input":"[demo/TOOLS.md]\n«\n⟪CLI antigo│CLI atualizado⟫"}}
+{"type":"tool_execution_end","toolCallId":"omp-edit-details-demo","toolName":"edit","isError":false,"result":{"content":[{"type":"text","text":"Updated demo/TOOLS.md"}],"details":{"path":"demo/TOOLS.md","diff":"-CLI antigo\n+CLI atualizado","oldText":"# Executáveis do workspace\n\nCLI antigo\n","newText":"# Executáveis do workspace\n\nCLI atualizado\n"}}}

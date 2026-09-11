@@ -509,6 +509,20 @@ pub use zeron_proto::view::{
     parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
 
+/// Device-local names and runtime icons used by Workers tool headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersToolLabel {
+    pub name: String,
+    pub icon: &'static str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkersToolCatalog {
+    pub projects: HashMap<String, String>,
+    pub presets: HashMap<String, WorkersToolLabel>,
+    pub sessions: HashMap<String, WorkersToolLabel>,
+}
+
 // ---------------------------------------------------------------------------
 // Org gate (pure)
 // ---------------------------------------------------------------------------
@@ -687,6 +701,8 @@ pub struct AppState {
     /// the unsupported-device filter, the visibility gate and task lifetime
     /// stay in one place.
     workers_change_request_targets: HashSet<ChangeRequestWatchKey>,
+    /// Local Workers catalog for presentation only; never persisted or synced.
+    pub workers_tool_catalog: WorkersToolCatalog,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
     /// feed must survive chat switches — the tab itself is what scopes it.
@@ -745,6 +761,7 @@ impl AppState {
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
             workers_change_request_targets: HashSet::new(),
+            workers_tool_catalog: WorkersToolCatalog::default(),
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),

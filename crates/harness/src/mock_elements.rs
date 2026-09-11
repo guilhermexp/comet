@@ -209,6 +209,12 @@ pub(super) fn script() -> Vec<AgentEvent> {
             execution: None,
         });
     }
+    // Synthetic OMP wire fixture goes through the production normalizer so
+    // native QA catches an empty Edited card, not just pre-normalized diffs.
+    let mut omp = crate::omp::normalize::OmpNormalizer::new("/tmp", "mock");
+    for line in include_str!("../tests/fixtures/omp/edit-result-details.jsonl").lines() {
+        events.extend(omp.push(serde_json::from_str(line).expect("OMP edit fixture")));
+    }
     events.push(AgentEvent::TextDelta {
         text: "\n\nReview complete. Expand a row to inspect its recorded payload.\n".into(),
     });

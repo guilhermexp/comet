@@ -14,7 +14,7 @@
 //! protocol frames with probe deadlines.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -30,6 +30,21 @@ use crate::types::{StaticUrl, SyncError, UrlProvider};
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const SILENCE_LEASE: Duration = Duration::from_secs(45);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Shared WS+HTTP dial budget. Boot used to open every journaled chat at
+/// once; macOS then exhausted FDs (`EMFILE`) and Metal aborted loading
+/// MPSImage's metallib (2026-09-11). One permit covers one in-flight TCP/TLS
+/// handshake or HTTPS pull/push — connected sockets do not hold a slot.
+const MAX_CONCURRENT_DIALS: usize = 8;
+
+fn dial_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS))
+}
+
+async fn acquire_dial_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    dial_slots().acquire().await.ok()
+}
+
 const HELLO_DEADLINE: Duration = Duration::from_secs(15);
 /// Backfill after hello must complete (rowsDone) within this deadline —
 /// post-strip rooms are KB-scale, so this is generous even at 1.2 Mbps.
@@ -746,6 +761,9 @@ impl Actor {
                 .dial_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
+            let Some(_dial_slot) = acquire_dial_slot().await else {
+                return;
+            };
             let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
             let pipe = match dial {
                 Ok(Ok(pipe)) => pipe,
@@ -1249,6 +1267,10 @@ impl Actor {
         let events = self.events.clone();
         let busy = self.sync_busy.clone();
         tokio::spawn(async move {
+            let Some(_dial_slot) = acquire_dial_slot().await else {
+                busy.store(false, Relaxed);
+                return;
+            };
             let batches: Vec<(String, Vec<u8>)> = lock(&shared)
                 .pending
                 .iter()

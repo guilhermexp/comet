@@ -18,6 +18,8 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 
 - `workspace_files.rs` é o acesso de leitura da árvore Files por checkout autorizado: diretório paginado (500 entradas/página), busca limitada, texto bounded e watcher compartilhado/cancelável. Toda operação valida ownership do Chat/Space e path relativo; nunca usa esse contrato para restringir links locais absolutos do Chat. A baseline do watcher e publicação usam o mesmo lock de sequência, inclusive no recovery por lag. Salvamento/editor do upstream não foi importado.
 
+- **Boot recovery não liga a room de todo Chat journalado.** `sweep_abandoned_streams` lê o snapshot local (`peek_needs_abandoned_recovery`) e só chama `open()` — que faz join WS/HTTP — quando este device deixou uma entry assistant `streaming`. Abrir todos os journals no boot esgotava FDs (`EMFILE`) e o Metal abortava ao carregar `default.metallib` do MPSImage (2026-09-11). `recover_stale` continua abrindo só os journals sem `Done`.
+- **`raise_nofile_limit`** sobe o soft `RLIMIT_NOFILE` até o hard max no start do binário, antes do gpui. O teto de dials concorrentes mora em `zeron-sync`.
 - `EngineChatSink` só persiste cursor de row cuja história causal foi aplicada. Import com dependências pendentes pede checkpoint ao cliente; checkpoint incompleto falha sem gravar cursor. Operações estacionadas pelo Loro não entram no snapshot, então cursor contíguo da room sozinho não prova durabilidade.
 
 - `respond_input` enfileira `InputResolved` com as respostas antes de liberar o runtime; a resolução órfã grava as mesmas respostas no documento antes de retomar o Chat.
@@ -93,6 +95,7 @@ Tudo que roda mesmo com a janela fechada: engine de sessões (pub/sub, run journ
 | `src/sessions.rs` (captura e coalescing de Trajectory em publish) | unit | `cargo test -p zeron-engine trajectory_capture` |
 | `src/workspace_host.rs` (lifecycle de Chat, Space cascade, sync deletion e retenção serializada de Trajectory) | unit | `cargo test -p zeron-engine trajectory_workspace_host` |
 | `src/change_requests.rs` (cache, backoff e classificação de provider) | unit | `cargo test -p zeron-engine change_requests` |
+| `src/fd_limit.rs` + peek de recovery em `doc_host` | unit | `cargo test -p zeron-engine --lib fd_limit abandoned_recovery` |
 | `src/chat2_host.rs` (dependências causais, snapshot e reinício) | unit — Loro + SQLite reais | `cargo test -p zeron-engine --lib chat2_host` |
 | `src/workspace_files.rs` + `tests/workspace_files.rs` + Files em `tests/device_routing.rs` | unit / integration — filesystem temporário, memória e relay entre engines | `cargo test -p zeron-engine workspace_files` · `cargo test -p zeron-engine --test device_routing workspace_file_surface` |
 | `src/process.rs` (teto de saída, kill, spawn) | unit | `cargo test -p zeron-engine process::` |

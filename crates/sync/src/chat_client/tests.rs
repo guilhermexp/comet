@@ -1673,3 +1673,34 @@ async fn http_catchup_crosses_a_contained_checkpoint_and_repairs_causal_gaps() {
         client.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn dial_slots_cap_concurrent_acquires() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+    let current = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..24 {
+        let current = current.clone();
+        let max = max.clone();
+        tasks.push(tokio::spawn(async move {
+            let _slot = super::acquire_dial_slot().await.expect("dial slot");
+            let n = current.fetch_add(1, SeqCst) + 1;
+            max.fetch_max(n, SeqCst);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            current.fetch_sub(1, SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.expect("join");
+    }
+    let observed = max.load(SeqCst);
+    assert!(
+        observed <= super::MAX_CONCURRENT_DIALS,
+        "observed {observed} concurrent dials, cap is {}",
+        super::MAX_CONCURRENT_DIALS
+    );
+    assert!(observed >= 1, "semaphore never admitted a dial");
+}

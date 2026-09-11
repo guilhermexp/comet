@@ -113,6 +113,7 @@ impl Render for ChangeRequestTooltip {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChangeRequestBadgeSurface {
     Sidebar,
+    SidebarIcon,
     Composer,
 }
 
@@ -127,6 +128,7 @@ pub(crate) fn pull_request_badge(
     let url = summary.url.clone();
     let tooltip_summary = summary;
     let composer = surface == ChangeRequestBadgeSurface::Composer;
+    let icon_only = surface == ChangeRequestBadgeSurface::SidebarIcon;
 
     div()
         .id(id)
@@ -153,7 +155,7 @@ pub(crate) fn pull_request_badge(
                 .into()
         })
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .when(composer, |element| {
+        .when(composer || icon_only, |element| {
             element.child(
                 crate::icons::icon(crate::icons::PULL_REQUEST)
                     .size(px(11.0))
@@ -162,11 +164,13 @@ pub(crate) fn pull_request_badge(
             )
         })
         // Monospace digits give the badge a stable tabular width as PR numbers change.
-        .child(
-            div()
-                .font_family(theme.font_mono.clone())
-                .child(model.number),
-        )
+        .when(!icon_only, |element| {
+            element.child(
+                div()
+                    .font_family(theme.font_mono.clone())
+                    .child(model.number),
+            )
+        })
         .into_any_element()
 }
 
@@ -336,11 +340,8 @@ pub(crate) fn desired_watch_targets(
         .collect()
 }
 
-/// The Workers surface's checkouts: one per worktree project, on the local
-/// device. A project without a worktree branch is a repository on its default
-/// branch — nothing to resolve, and nowhere on the row to draw it. The branch
-/// watched is the one `change_request_branch` reports, so a worktree switched
-/// after creation subscribes to where it is now.
+/// Current branches of local checkouts and worktrees supplied by the Workers
+/// working set. The same branch resolver drives their visible context labels.
 pub(crate) fn workers_change_request_targets(
     projects: &[zeron_workers_unpeel::WorkersProject],
     local_device_id: &str,
@@ -518,28 +519,29 @@ mod tests {
     }
 
     #[test]
-    fn workers_change_request_targets_cover_worktrees_only() {
-        // A repository on its default branch has no pull request to name, and
-        // a real registry holds dozens of them — watching those would be
-        // dozens of subscriptions serving a badge no row draws.
+    fn workers_change_request_targets_include_local_checkouts_and_skip_groups() {
+        let mut group = workers_project("group", None);
+        group.is_group = true;
+        let mut unknown = workers_project("unknown", None);
+        unknown.git_branch = None;
         let projects = [
             workers_project("plain", None),
-            workers_project("wt", Some("fix/correios")),
-            // A blank branch is not a checkout identity.
-            workers_project("blank", Some("   ")),
+            workers_project("wt", Some("old")),
+            group,
+            unknown,
         ];
         let targets = workers_change_request_targets(&projects, "local");
-        assert_eq!(targets.len(), 1);
-        let target = targets.iter().next().expect("the worktree target");
-        assert_eq!(target.cwd, "/repos/wt");
-        // Created on `fix/correios`, switched to `fix/renamed` on disk: the
-        // subscription follows the checkout, not the creation record.
-        assert_eq!(target.branch, "fix/renamed");
-        assert_eq!(target.device_id, "local");
-
-        // No worktree, no subscription — the empty set is what the model
-        // publishes while the badge setting is off.
-        assert!(workers_change_request_targets(&projects[..1], "local").is_empty());
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.cwd == "/repos/plain" && target.branch == "fix/renamed")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.cwd == "/repos/wt" && target.branch == "fix/renamed")
+        );
     }
 
     #[test]

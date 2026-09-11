@@ -156,6 +156,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Before gpui / the engine open sockets: a 256-FD soft ceiling cannot
+    // survive boot recovery joining every journaled chat, and Metal aborts
+    // when MPSImage cannot open default.metallib (2026-09-11).
+    zeron_engine::raise_nofile_limit();
+
     match cli.command {
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;

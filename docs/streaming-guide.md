@@ -322,6 +322,12 @@ As abas de preview reutilizam o avatar do `doc_id` do subagente; o spinner de at
 
 Write/Edit progressivos: adapters Claude/OMP atualizam a cauda bounded por tempo (100ms após o preview semântico inicial); flush final continua autoritativo. A janela nativa ativa tem 72px, retém até 15 linhas novas e ancora na base após três linhas; não pede highlight durante geração. Depois de resolver, aplica highlight assíncrono após 50ms; header ou corpo recolhido expandem até 200px com scroll vertical.
 
+Resultados OMP (11/09): o normalizer lê os snapshots de edição de `result.details`, também aceitando um único `perFileResults` e o formato legado no topo. Isso recupera nome do arquivo, stats e preview no card `Edited` quando os argumentos eram texto e não tinham `path` próprio. Snapshots ausentes e lotes multi-file não viram um diff de arquivo fabricado; histórico já persistido sem esses dados não é reescrito.
+
 Render de file cards: snapshot completo só entra na expansão; recolhido usa a cauda durável de até 15 linhas. Medição pós-prepaint adia a atualização da lista até o layout liberar seus borrows e notifica apenas ao mudar a altura, sem ciclo permanente de frames, e preserva a geometria sticky do turno atual.
 
 Sticky durante streaming: o scroll usado na projeção é publicado somente após o layout completo da lista. O top de uma mensagem e seu offset são registrados no mesmo ciclo, após liberar o borrow do virtualizador. Ler o sentinela de fim ou alturas ainda não medidas em `Render` fazia o cabeçalho trocar de turno por um frame a cada chunk. Disclosures de tools com altura natural fecham diretamente; não aguardam um tween que não está montado.
+
+Headers Workers (11/09): alvo efetivo `project_id` de Chat local resolve pelo catálogo local e aparece como ação + chip `@nome`, com a aparência de menção do composer. `session_id`, ID não cadastrado e Chat remoto/sem host conhecido mantêm a apresentação técnica. O JSON expandido conserva os IDs; refresh do catálogo atualiza o nome sem reescrever o transcript.
+
+Presets e Workers nos headers (11/09): `launch_worker` conserva `preset_id` no input sanitizado e adiciona chip com ícone do runtime + nome do preset ao lado de `@projeto`. Chamadas com `session_id` conhecido mostram ícone + título do Worker, sem inferir identidade por nome/comando/projeto. O catálogo é local e acompanha refresh; Chats remotos e IDs ausentes mantêm fallback técnico. Lançamentos antigos sem `preset_id` não recuperam o nome do preset.

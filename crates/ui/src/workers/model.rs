@@ -91,6 +91,25 @@ pub struct WorkersReveal {
     pub target: WorkersRevealTarget,
 }
 
+// Pure selection seam shared by refresh and its regression cases.
+fn project_selection_after_snapshot(
+    current_project: Option<&str>,
+    selected_session: Option<&str>,
+    keep_empty_selection: bool,
+    projects: &[WorkersProject],
+    sessions: &[WorkersSession],
+) -> Option<String> {
+    selected_session
+        .and_then(|id| sessions.iter().find(|s| s.id == id && !s.archived))
+        .map(|session| session.project_id.clone())
+        .or_else(|| {
+            current_project
+                .filter(|_| keep_empty_selection)
+                .filter(|id| projects.iter().any(|p| p.id == *id))
+                .map(str::to_owned)
+        })
+}
+
 pub fn reconcile_selection(current: Option<&str>, sessions: &[WorkersSession]) -> Option<String> {
     current
         .filter(|current| {
@@ -1076,6 +1095,31 @@ impl WorkersModel {
                         }
                         let app_focused = cx.active_window().is_some();
                         model.apply_snapshot(snapshot, app_focused);
+                        let catalog = crate::state::WorkersToolCatalog {
+                            projects: model.projects().iter()
+                                .map(|project| (project.id.clone(), project.name.clone())).collect(),
+                            presets: model.presets().iter().map(|preset| {
+                                (preset.id.clone(), crate::state::WorkersToolLabel {
+                                    name: preset.label.clone(),
+                                    icon: super::presentation::runtime_icon_path(
+                                        preset.cli_id.as_deref(), Some(&preset.command)),
+                                })
+                            }).collect(),
+                            sessions: model.sessions().iter().map(|session| {
+                                (session.id.clone(), crate::state::WorkersToolLabel {
+                                    name: session.title.clone(),
+                                    icon: super::presentation::runtime_icon_path(
+                                        session.active_runtime_id.as_deref().or(session.provider_id.as_deref()),
+                                        Some(&session.command)),
+                                })
+                            }).collect(),
+                        };
+                        model.state.update(cx, |state, cx| {
+                            if state.workers_tool_catalog != catalog {
+                                state.workers_tool_catalog = catalog;
+                                cx.notify();
+                            }
+                        });
                         model.publish_change_request_targets(cx);
                         model.hibernate_idle_workers(cx);
                         model.dispatch_parent_notifications(deliveries, cx);
@@ -1746,6 +1790,7 @@ impl WorkersModel {
             return;
         };
         let archived = std::mem::take(&mut self.confirming_remove_archived);
+        let removed_selected = self.selected_session_id.as_deref() == Some(&session_id);
         let sessions = if archived {
             &self.archived_sessions
         } else {
@@ -1753,6 +1798,10 @@ impl WorkersModel {
         };
         self.selected_session_id =
             selection_after_remove(self.selected_session_id.as_deref(), &session_id, sessions);
+        if removed_selected && self.selected_session_id.is_none() {
+            self.selected_project_id = None;
+            self.launcher_project_id = None;
+        }
         if archived {
             self.remove_archived(session_id, cx);
         } else {
@@ -1825,6 +1874,10 @@ impl WorkersModel {
         };
         self.selected_session_id =
             selection_after_remove(Some(&session_id), &session_id, self.sessions());
+        if self.selected_session_id.is_none() {
+            self.selected_project_id = None;
+            self.launcher_project_id = None;
+        }
         self.stop_and_archive(session_id, live, cx);
         true
     }
@@ -1980,16 +2033,30 @@ impl WorkersModel {
         });
     }
 
-    /// Tell `AppState` which checkouts this surface wants a PR for. Only
-    /// worktrees: a repository sitting on its default branch has no pull
-    /// request to name, and the 46 projects a real registry holds would be 46
-    /// subscriptions serving a badge no row draws.
+    /// Watch checkout branches in the working set, including ordinary local
+    /// checkouts. The durable catalog alone must not create subscriptions.
     fn publish_change_request_targets(&mut self, cx: &mut Context<Self>) {
         let visible = crate::settings::current(cx).sidebar_show_pull_request;
         let state = self.state.clone();
         let device_id = state.read(cx).local_device_id.clone();
         let targets = match (visible, device_id) {
-            (true, Some(device_id)) => workers_change_request_targets(self.projects(), &device_id),
+            (true, Some(device_id)) => {
+                let projects = self
+                    .projects()
+                    .iter()
+                    .filter(|project| {
+                        super::workspace::project_has_working_set(
+                            project,
+                            self.projects(),
+                            self.sessions(),
+                            self.selected_project_id.as_deref(),
+                            self.launcher_project_id.as_deref(),
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                workers_change_request_targets(&projects, &device_id)
+            }
             _ => std::collections::HashSet::new(),
         };
         state.update(cx, |state, cx| {
@@ -2011,6 +2078,11 @@ impl WorkersModel {
     }
 
     fn apply_snapshot(&mut self, snapshot: WorkersBootstrap, app_focused: bool) {
+        let had_selected_session = self.selected_session_id.is_some();
+        let selected_project_had_sessions = self.sessions().iter().any(|session| {
+            !session.archived
+                && self.selected_project_id.as_deref() == Some(session.project_id.as_str())
+        });
         let notification_settings = notification_settings_for_snapshot(self.settings.as_ref());
         // A worker can appear without this app launching it (the MCP sidecar,
         // another instance). `notification_state` is the per-session ledger
@@ -2116,29 +2188,14 @@ impl WorkersModel {
             self.selected_session_id =
                 reconcile_selection(self.selected_session_id.as_deref(), &snapshot.sessions);
         }
-        self.selected_project_id = self
-            .selected_session_id
-            .as_deref()
-            .and_then(|selected| {
-                snapshot
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == selected)
-            })
-            .map(|session| session.project_id.clone())
-            .or_else(|| {
-                self.selected_project_id
-                    .as_ref()
-                    .filter(|selected| snapshot.projects.iter().any(|p| &p.id == *selected))
-                    .cloned()
-            })
-            .or_else(|| {
-                snapshot
-                    .projects
-                    .iter()
-                    .find(|project| !project.is_group)
-                    .map(|project| project.id.clone())
-            });
+        self.selected_project_id = project_selection_after_snapshot(
+            self.selected_project_id.as_deref(),
+            self.selected_session_id.as_deref(),
+            (!had_selected_session && !selected_project_had_sessions)
+                || self.pending_launch_selection.is_some(),
+            &snapshot.projects,
+            &snapshot.sessions,
+        );
         self.project_filter = filter_after_snapshot(self.project_filter.take(), &snapshot.projects);
         if self.selected_session_id.is_some() {
             self.launcher_project_id = None;
@@ -2289,6 +2346,54 @@ mod tests {
         selection_after_remove, sessions_for_parent_chat_from_links, sessions_for_project,
         toggle_expanded, worktree_setup_failure_message,
     };
+
+    #[test]
+    fn empty_projects_are_not_selected_implicitly_after_refresh() {
+        let projects = vec![project("craft", None), project("comet", None)];
+        assert_eq!(
+            super::project_selection_after_snapshot(None, None, true, &projects, &[]),
+            None
+        );
+        assert_eq!(
+            super::project_selection_after_snapshot(Some("craft"), None, false, &projects, &[]),
+            None
+        );
+        let selected =
+            super::project_selection_after_snapshot(Some("craft"), None, false, &projects, &[]);
+        assert!(!super::super::workspace::project_has_working_set(
+            &projects[0],
+            &projects,
+            &[],
+            selected.as_deref(),
+            None
+        ));
+    }
+
+    #[test]
+    fn explicit_empty_project_and_remaining_session_keep_their_context() {
+        let projects = vec![project("craft", None), project("comet", None)];
+        assert_eq!(
+            super::project_selection_after_snapshot(Some("craft"), None, true, &projects, &[])
+                .as_deref(),
+            Some("craft")
+        );
+        let sessions = vec![session("s", "comet", true)];
+        assert_eq!(
+            super::project_selection_after_snapshot(
+                Some("craft"),
+                Some("s"),
+                false,
+                &projects,
+                &sessions
+            )
+            .as_deref(),
+            Some("comet")
+        );
+        assert_eq!(
+            super::project_selection_after_snapshot(Some("removed"), None, true, &projects, &[]),
+            None
+        );
+    }
 
     fn project(id: &str, parent: Option<&str>) -> zeron_workers_unpeel::WorkersProject {
         zeron_workers_unpeel::WorkersProject {

@@ -70,12 +70,12 @@ use crate::workers::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
 use crate::workers::session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
-use crate::workers::workspace::{WorkersContent, WorkersSidebar};
+use crate::workers::workspace::{WorkersContent, WorkersSidebar, WorkersSidebarEvent};
 
 mod spaces;
 mod tabs;
 
-use spaces::{AddSpaceFlow, RenameSpaceDialog};
+use spaces::{AddSpaceFlow, ProjectPickerTarget, RenameSpaceDialog};
 
 actions!(
     shell,
@@ -1782,6 +1782,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _workers_observation: Subscription,
+    _workers_sidebar_events: Subscription,
     _composer_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
@@ -1838,6 +1839,14 @@ impl Shell {
             let workers_content = workers_content.clone();
             move |cx| WorkersSidebar::new(workers_model, workers_content, cx)
         });
+        let workers_sidebar_events = cx.subscribe(
+            &workers_sidebar,
+            |this: &mut Shell, _, event, cx| match event {
+                WorkersSidebarEvent::OpenProjectPicker => {
+                    this.open_project_palette(ProjectPickerTarget::Worker, cx)
+                }
+            },
+        );
         let startup_workers_model = workers_model.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -2251,6 +2260,7 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _workers_observation: workers_observation,
+            _workers_sidebar_events: workers_sidebar_events,
             _composer_events: composer_events,
             _transcript_events: transcript_events,
         }

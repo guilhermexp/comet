@@ -29,15 +29,13 @@ pub fn workers_titlebar(
             branch_is_worktree: false,
         };
     };
-    let branch_is_worktree = project.worktree_branch.is_some();
+    let branch_is_worktree = project.worktree_branch.is_some()
+        || (project.parent_project_id.is_some() && !project.is_group);
     // The registry's `worktree_branch` is the CREATION branch and never follows
     // a `git switch` inside the worktree; `change_request_branch` is the same
     // source the PR badge resolves from, so the title never names one branch
     // while the badge points at another one's pull request.
-    let branch = project
-        .change_request_branch()
-        .map(str::to_owned)
-        .or_else(|| project.git_branch.clone());
+    let branch = project.change_request_branch().map(str::to_owned);
     let segments = match (parent, branch_is_worktree) {
         (Some(parent), true) => vec![parent.name.clone()],
         (Some(parent), false) => vec![parent.name.clone(), project.name.clone()],
@@ -52,44 +50,6 @@ pub fn workers_titlebar(
 
 pub fn workers_titlebar_content_insets(sidebar_width: f32, occupied_right: f32) -> (f32, f32) {
     (sidebar_width.max(0.0), occupied_right.max(0.0))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionBranchMarker {
-    pub branch: String,
-    pub is_worktree: bool,
-}
-
-/// Branch glyph for a Workers session row.
-///
-/// Precedence is the same as [`crate::details_sidebar::context::context_for_worker`]:
-/// `session.worktree_branch` → `project.worktree_branch` → `project.git_branch`.
-/// The first non-empty value after `trim()` wins; nothing usable yields `None`.
-pub fn session_branch_marker(
-    project: &WorkersProject,
-    session: &WorkersSession,
-) -> Option<SessionBranchMarker> {
-    let branch = usable_branch(session.worktree_branch.as_deref())
-        .or_else(|| usable_branch(project.worktree_branch.as_deref()))
-        .or_else(|| usable_branch(project.git_branch.as_deref()))?
-        .to_owned();
-    // `worktree_branch` on the registry is POSSESSION (the app created that
-    // checkout), not identity. An adopted worktree — `git worktree add` in a
-    // terminal, then "Add project…" — arrives with no `worktree_branch` and no
-    // parent in the registry; the projection fills `parent_project_id` and
-    // `git_branch` from disk. A 46-project registry on this machine had 9 live
-    // worktrees and ZERO with `worktree_branch` set. Gating identity on
-    // `worktree_branch.is_some()` alone would make this glyph invisible.
-    let is_worktree = project.worktree_branch.is_some()
-        || (project.parent_project_id.is_some() && !project.is_group);
-    Some(SessionBranchMarker {
-        branch,
-        is_worktree,
-    })
-}
-
-fn usable_branch(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,8 +236,8 @@ mod tests {
         SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
         SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
         SIDEBAR_TOP_PADDING, SessionIndicator, compare_sessions_by_activity, relative_age,
-        runtime_icon_path, runtime_spinner_tint, session_branch_marker, session_indicator,
-        session_settled_at, spinner_frame, workers_titlebar, workers_titlebar_content_insets,
+        runtime_icon_path, runtime_spinner_tint, session_indicator, session_settled_at,
+        spinner_frame, workers_titlebar, workers_titlebar_content_insets,
     };
     use zeron_workers_unpeel::{WorkersProject, WorkersSession};
 
@@ -391,22 +351,6 @@ mod tests {
             total_tokens: None,
             model_usage: Vec::new(),
             capabilities: Default::default(),
-        }
-    }
-
-    fn test_project() -> WorkersProject {
-        WorkersProject {
-            id: "project".into(),
-            name: "comet".into(),
-            path: "/tmp/comet".into(),
-            folder_id: None,
-            parent_project_id: None,
-            is_group: false,
-            worktree_branch: None,
-            git_branch: None,
-            archived_session_count: 0,
-            folder_color_id: None,
-            session_sort: Default::default(),
         }
     }
 
@@ -683,80 +627,5 @@ mod tests {
             (260.0, 880.0)
         );
         assert_eq!(workers_titlebar_content_insets(-1.0, -1.0), (0.0, 0.0));
-    }
-
-    #[test]
-    fn session_branch_marker_prefers_session_stamp_over_project_branches() {
-        let mut project = test_project();
-        project.worktree_branch = Some("project-worktree".into());
-        project.git_branch = Some("project-git".into());
-        let mut session = test_session("s", 1, 1);
-        session.worktree_branch = Some("session-branch".into());
-        let marker = session_branch_marker(&project, &session).expect("stamp");
-        assert_eq!(marker.branch, "session-branch");
-        assert!(marker.is_worktree);
-    }
-
-    #[test]
-    fn session_branch_marker_uses_project_worktree_branch_when_session_has_none() {
-        let mut project = test_project();
-        project.worktree_branch = Some("project-worktree".into());
-        project.git_branch = Some("project-git".into());
-        let session = test_session("s", 1, 1);
-        let marker = session_branch_marker(&project, &session).expect("project worktree");
-        assert_eq!(marker.branch, "project-worktree");
-        assert!(marker.is_worktree);
-    }
-
-    #[test]
-    fn session_branch_marker_treats_adopted_worktree_as_worktree() {
-        let mut project = test_project();
-        project.parent_project_id = Some("root".into());
-        project.is_group = false;
-        project.worktree_branch = None;
-        project.git_branch = Some("adopted".into());
-        let session = test_session("s", 1, 1);
-        let marker = session_branch_marker(&project, &session).expect("adopted");
-        assert_eq!(marker.branch, "adopted");
-        assert!(marker.is_worktree);
-    }
-
-    #[test]
-    fn session_branch_marker_root_with_git_branch_is_not_a_worktree() {
-        let mut project = test_project();
-        project.git_branch = Some("main".into());
-        let session = test_session("s", 1, 1);
-        let marker = session_branch_marker(&project, &session).expect("root git");
-        assert_eq!(marker.branch, "main");
-        assert!(!marker.is_worktree);
-    }
-
-    #[test]
-    fn session_branch_marker_group_child_is_not_a_worktree() {
-        let mut project = test_project();
-        project.parent_project_id = Some("root".into());
-        project.is_group = true;
-        project.worktree_branch = None;
-        project.git_branch = Some("folder".into());
-        let session = test_session("s", 1, 1);
-        let marker = session_branch_marker(&project, &session).expect("group");
-        assert_eq!(marker.branch, "folder");
-        assert!(!marker.is_worktree);
-    }
-
-    #[test]
-    fn session_branch_marker_skips_blank_sources_and_is_none_when_empty() {
-        let project = test_project();
-        let session = test_session("s", 1, 1);
-        assert_eq!(session_branch_marker(&project, &session), None);
-
-        let mut project = test_project();
-        project.worktree_branch = Some("   ".into());
-        project.git_branch = Some("\t main \n".into());
-        let mut session = test_session("s", 1, 1);
-        session.worktree_branch = Some("  ".into());
-        let marker = session_branch_marker(&project, &session).expect("falls through blanks");
-        assert_eq!(marker.branch, "main");
-        assert!(marker.is_worktree);
     }
 }

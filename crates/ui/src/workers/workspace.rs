@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Image,
-    IntoElement, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point, Render,
-    SharedString, StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
+    IntoElement, MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString,
+    StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
 };
 use zeron_workers_unpeel::{
     WorkersArtifact, WorkersLaunchRequest, WorkersPreset, WorkersProject, WorkersSession,
@@ -27,20 +27,20 @@ use super::presentation::{
     HOSTED_SIDEBAR_TOP_PADDING, PROJECT_ROW_BASE_LEADING, SESSION_ROW_BASE_LEADING,
     SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
     SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
-    SessionBranchMarker, SessionIndicator, compare_sessions_by_activity, relative_age,
-    runtime_icon_path, runtime_spinner_tint, session_branch_marker, session_indicator,
-    session_title_truncate, spinner_frame,
+    SessionIndicator, compare_sessions_by_activity, relative_age, runtime_icon_path,
+    runtime_spinner_tint, session_indicator, session_title_truncate, spinner_frame,
+    workers_titlebar,
 };
 
 /// Deepest parent chain the sidebar walks. Same guard as [`project_depth`] and
 /// [`project_visible`]: a cycle in `parent_project_id` must not hang the render.
 const MAX_PROJECT_DEPTH: usize = 8;
 
-struct SessionBranchTooltip {
-    branch: SharedString,
+struct WorkerContextTooltip {
+    text: SharedString,
 }
 
-impl Render for SessionBranchTooltip {
+impl Render for WorkerContextTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         div()
@@ -53,7 +53,7 @@ impl Render for SessionBranchTooltip {
             .shadow_md()
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.branch.clone())
+            .child(self.text.clone())
     }
 }
 
@@ -514,10 +514,15 @@ fn push_project_level(
     }
 }
 
+pub enum WorkersSidebarEvent {
+    OpenProjectPicker,
+}
+
+impl gpui::EventEmitter<WorkersSidebarEvent> for WorkersSidebar {}
+
 pub struct WorkersSidebar {
     model: Entity<WorkersModel>,
     content: Entity<WorkersContent>,
-    picker_task: Option<Task<()>>,
     /// Projects whose session list is revealed past [`SESSION_ROW_CAP`].
     /// View-local and volatile, like the Orchestrator's archived page size:
     /// collapsing the project drops the entry, so reopening it starts capped.
@@ -552,7 +557,6 @@ impl WorkersSidebar {
         Self {
             model,
             content,
-            picker_task: None,
             revealed_projects: std::collections::HashSet::new(),
             projects_menu: popover::Popup::default(),
             _spinner_task: spinner_task,
@@ -855,24 +859,7 @@ impl WorkersSidebar {
     }
 
     fn open_project_picker(&mut self, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add Project".into()),
-        });
-        self.picker_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                this.update(cx, |sidebar, cx| {
-                    sidebar
-                        .model
-                        .update(cx, |model, cx| model.add_project(path, cx));
-                })
-                .ok();
-            }
-        }));
+        cx.emit(WorkersSidebarEvent::OpenProjectPicker);
     }
 
     fn open_new_session_menu(
@@ -1107,8 +1094,17 @@ impl WorkersSidebar {
         let new_session_presets = presets.clone();
         let select_project_id = project.id.clone();
         let toggle_project_id = project.id.clone();
-        let project_name: SharedString = project.name.clone().into();
         let is_group = project.is_group;
+        let context = workers_titlebar(Some(&project), None);
+        let is_worktree = !is_group && context.branch_is_worktree;
+        let project_name: SharedString = if is_worktree {
+            context
+                .branch
+                .unwrap_or_else(|| project.name.clone())
+                .into()
+        } else {
+            project.name.clone().into()
+        };
         let change_request = self.model.read(cx).change_request_for(&project, cx);
         let is_child_folder = project.parent_project_id.is_some();
         let folder_tint = project_folder_tint(
@@ -1125,17 +1121,12 @@ impl WorkersSidebar {
         let revealed = self.revealed_projects.contains(&project.id);
         let (visible_indices, hidden_sessions) =
             project_session_row_plan(sessions.len(), selected_index, revealed);
-        let show_branch = crate::settings::current(cx).sidebar_show_branch;
         let rows = visible_indices
             .into_iter()
             .map(|session_index| {
                 let session = sessions[session_index].clone();
-                let branch = show_branch
-                    .then(|| session_branch_marker(&project, &session))
-                    .flatten();
                 self.render_session(
                     session,
-                    branch,
                     selected_session_id,
                     depth,
                     index * 10_000 + session_index,
@@ -1237,7 +1228,7 @@ impl WorkersSidebar {
                     .min_h(px(SIDEBAR_ROW_HEIGHT))
                     .pt(px(2.0))
                     .pb(px(2.0))
-                    .pl(px(if is_child_folder {
+                    .pl(px(if is_child_folder && !is_worktree {
                         10.0 + depth.saturating_sub(1) as f32 * SIDEBAR_NESTING_STEP
                     } else {
                         PROJECT_ROW_BASE_LEADING + depth as f32 * SIDEBAR_NESTING_STEP
@@ -1260,7 +1251,11 @@ impl WorkersSidebar {
                             model.toggle_project(&toggle_project_id, cx);
                         });
                     }))
-                    .child(if is_child_folder {
+                    .child(if is_worktree {
+                        icon(icons::WORKER_BRANCH)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted)
+                    } else if is_child_folder {
                         icon(if expanded {
                             icons::ALT_ARROW_DOWN
                         } else {
@@ -1279,6 +1274,7 @@ impl WorkersSidebar {
                     })
                     .child(
                         div()
+                            .id(("workers-project-name", index))
                             .min_w_0()
                             .flex_1()
                             .truncate()
@@ -1289,48 +1285,20 @@ impl WorkersSidebar {
                             } else {
                                 theme.text.opacity(0.60)
                             })
+                            .tooltip({
+                                let name = project_name.clone();
+                                move |_, cx| {
+                                    cx.new(|_| WorkerContextTooltip { text: name.clone() })
+                                        .into()
+                                }
+                            })
                             .child(project_name),
                     )
-                    // Same source the PR badge on this row resolves from: the
-                    // registry's `worktree_branch` is the creation branch and
-                    // never follows a `git switch` inside the worktree, so
-                    // reading it here labelled one branch next to another
-                    // branch's pull request.
-                    .when_some(
-                        project.change_request_branch().map(str::to_owned),
-                        |el, branch| {
-                            el.child(
-                                div()
-                                    .max_w(px(110.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(3.0))
-                                    .opacity(0.55)
-                                    .child(
-                                        icon(icons::WORKER_BRANCH)
-                                            .size(px(12.0))
-                                            .text_color(theme.text_muted),
-                                    )
-                                    .when(branch != project.name, |el| {
-                                        el.child(
-                                            div()
-                                                .truncate()
-                                                .text_size(px(10.0))
-                                                .text_color(theme.text_muted)
-                                                .child(branch),
-                                        )
-                                    }),
-                            )
-                        },
-                    )
-                    // Outside the branch chip on purpose: that container is
-                    // faded to 0.55, and the badge's whole job is a state
-                    // colour that has to read at full strength.
                     .when_some(change_request, |el, summary| {
                         el.child(crate::change_requests::pull_request_badge(
                             format!("workers-project-pr-{index}").into(),
                             summary,
-                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            crate::change_requests::ChangeRequestBadgeSurface::SidebarIcon,
                             theme,
                         ))
                     })
@@ -1478,7 +1446,6 @@ impl WorkersSidebar {
     fn render_session(
         &self,
         session: WorkersSession,
-        branch: Option<SessionBranchMarker>,
         selected_session_id: Option<&str>,
         depth: usize,
         index: usize,
@@ -1605,6 +1572,15 @@ impl WorkersSidebar {
             .unwrap_or_default()
             .as_millis() as u64;
         let runtime_icon = runtime_icon_path(runtime_id, Some(session.command.as_str()));
+        let runtime_label: SharedString = format!(
+            "Agent runtime: {}",
+            runtime_id.unwrap_or_else(|| session
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or("terminal"))
+        )
+        .into();
         // Same stamp the row is RANKED by, so the age can never disagree with
         // the position: "13s" on a settled Worker reads as "finished 13s ago",
         // and a Worker mid-run holds the age of its launch.
@@ -1686,32 +1662,6 @@ impl WorkersSidebar {
                     div().w(px(16.0)).flex().justify_center()
                 }
             })
-            .when_some(branch, |el, marker| {
-                let branch_name: SharedString = marker.branch.clone().into();
-                el.child(
-                    div()
-                        .id(("workers-session-branch", index))
-                        .flex_none()
-                        .opacity(0.55)
-                        .child(
-                            icon(if marker.is_worktree {
-                                icons::WORKER_BRANCH
-                            } else {
-                                icons::WORKER_GIT_BRANCH
-                            })
-                            .size(px(12.0))
-                            .flex_none()
-                            .text_color(theme.text_muted),
-                        )
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| SessionBranchTooltip {
-                                branch: branch_name.clone(),
-                            })
-                            .into()
-                        })
-                        .tooltip_show_delay(Duration::from_millis(350)),
-                )
-            })
             .child(
                 div()
                     .min_w_0()
@@ -1744,10 +1694,21 @@ impl WorkersSidebar {
                 )
             })
             .child(
-                icon(runtime_icon)
-                    .size(px(12.0))
-                    .ml(px(3.0))
-                    .text_color(theme.text_muted),
+                div()
+                    .id(("workers-runtime", index))
+                    .flex_none()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| WorkerContextTooltip {
+                            text: runtime_label.clone(),
+                        })
+                        .into()
+                    })
+                    .child(
+                        icon(runtime_icon)
+                            .size(px(12.0))
+                            .ml(px(3.0))
+                            .text_color(theme.text_muted),
+                    ),
             )
             .into_any_element()
     }

@@ -415,6 +415,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `~/.codex/hooks.json` (`/private/tmp/orchestrator-…`) parecer asset stale e
   bloqueava a migração para sempre.
 
+- **Branch de contexto/PR**: `WorkersProject::change_request_branch` aceita checkout local e worktree, exclui grupos e prefere `git_branch` do snapshot ao registro de criação. Valores vazios não viram branch. O consumidor limita subscriptions ao working set; não inferir que um checkout comum está na default branch ou não possui PR.
+
 ## Work Guidance
 
 - New Workers capability: extend `LocalWorkersClient` + typed models here, then

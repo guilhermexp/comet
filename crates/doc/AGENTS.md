@@ -12,6 +12,8 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Local Contracts
 
+- Tools `workers` preservam `preset_id` junto de `action`, `session_id`, `project_id`, `name` e `project`, usando o mesmo limite/trim dos identificadores. Briefing, comandos e args adicionais continuam fora do transcript; sanitização repetida conserva o identificador. Histórico já salvo sem `preset_id` não é reconstruído.
+
 - Skill/skill preserva apenas os identificadores `skill`, `path` e `name` no input renderizável, com trim e strings vazias omitidas. Args, prompt e conteúdo continuam fora do transcript; sanitizer permanece idempotente.
 
 - Input parts persistem `answers` opcional, tanto pelo fold/SegmentWriter quanto por `resolve_input` de pergunta órfã. Ausência não significa resposta vazia; cancelamento sem respostas não apaga respostas já registradas. O gêmeo edge preserva esse campo.
