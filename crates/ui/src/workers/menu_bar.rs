@@ -720,7 +720,8 @@ mod platform {
 mod platform {
     use std::sync::mpsc::Sender;
 
-    use super::{MenuBarIntent, WorkersActivityMenu};
+    use super::super::activity_menu::WorkersActivityMenu;
+    use super::MenuBarIntent;
 
     pub struct NativeMenuBar;
 
