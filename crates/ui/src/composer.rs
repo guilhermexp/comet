@@ -8668,8 +8668,12 @@ mod tests {
                         "http://device.a-very-long-project-name.localhost:7331/path",
                         cx,
                     );
-                    input.layout_text(px(100.0), &style, window, cx);
-                    assert_eq!(input.content_height, 16.0, "long hostnames must not wrap");
+                    let unwrapped_height = input.layout_text(px(2000.0), &style, window, cx);
+                    assert_eq!(
+                        input.layout_text(px(100.0), &style, window, cx),
+                        unwrapped_height,
+                        "long hostnames must not wrap"
+                    );
                     input.clamp_scroll(16.0);
                     assert!(input.scroll_left > 0.0);
                     let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(100.0), px(16.0)));
