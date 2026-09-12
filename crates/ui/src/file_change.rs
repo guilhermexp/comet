@@ -13,6 +13,65 @@ pub struct DerivedFileInput {
     pub source: Option<String>,
 }
 
+pub fn file_diff_line_numbers(
+    preview: &zeron_doc::FileChangePreview,
+) -> Vec<(Option<u32>, Option<u32>)> {
+    if preview.truncated_before > 0 {
+        return vec![(None, None); preview.lines.len()];
+    }
+    let (mut old, mut new) = (1u32, 1u32);
+    preview
+        .lines
+        .iter()
+        .map(|line| {
+            use zeron_doc::FileChangeLineKind::*;
+            let numbers = match line.kind {
+                Added => (None, Some(new)),
+                Removed => (Some(old), None),
+                Context => (Some(old), Some(new)),
+            };
+            if line.kind != Added {
+                old += 1;
+            }
+            if line.kind != Removed {
+                new += 1;
+            }
+            numbers
+        })
+        .collect()
+}
+
+/// Generated content only: removals belong to the completed diff.
+pub fn streaming_file_lines(
+    preview: &zeron_doc::FileChangePreview,
+) -> Vec<zeron_doc::FileChangeLine> {
+    let generated = preview
+        .lines
+        .iter()
+        .filter(|line| line.kind != zeron_doc::FileChangeLineKind::Removed)
+        .collect::<Vec<_>>();
+    generated
+        .into_iter()
+        .rev()
+        .take(15)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| zeron_doc::FileChangeLine {
+            kind: zeron_doc::FileChangeLineKind::Added,
+            text: line.text.clone(),
+        })
+        .collect()
+}
+
+pub fn file_card_preview<'a>(
+    expanded: bool,
+    durable: Option<&'a zeron_doc::FileChangePreview>,
+    full: Option<&'a zeron_doc::FileChangePreview>,
+) -> Option<&'a zeron_doc::FileChangePreview> {
+    if expanded { full.or(durable) } else { durable }
+}
+
 pub fn file_card_action(kind: FileChangeKind, resolved: bool, is_error: bool) -> &'static str {
     if is_error {
         return "Failed";
@@ -33,7 +92,7 @@ pub fn file_card_body_height(expanded: bool, content_height: f32) -> f32 {
     if expanded {
         content_height.min(FILE_CARD_EXPANDED_MAX_HEIGHT)
     } else {
-        FILE_CARD_COLLAPSED_BODY_HEIGHT
+        content_height.min(FILE_CARD_COLLAPSED_BODY_HEIGHT)
     }
 }
 
@@ -179,6 +238,73 @@ pub fn file_card_virtualized_footer_index(line_count: usize, has_footer: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsing_large_loaded_file_returns_to_bounded_preview() {
+        let snapshot = FileToolInputSnapshot {
+            path: "large.rs".into(),
+            content: Some("line\n".repeat(10_000)),
+            old_string: None,
+            new_string: None,
+            truncated: false,
+        };
+        let full = snapshot_preview(FileChangeKind::Write, &snapshot).unwrap();
+        let durable = zeron_doc::file_change_preview(
+            &zeron_proto::ToolCall::WriteFile {
+                path: "large.rs".into(),
+                content: snapshot.content.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(std::ptr::eq(
+            file_card_preview(true, Some(&durable), Some(&full)).unwrap(),
+            &full
+        ));
+        let collapsed = file_card_preview(false, Some(&durable), Some(&full)).unwrap();
+        assert!(
+            collapsed.lines.len() <= 15,
+            "collapsed content must not scale with the fetched file"
+        );
+        assert!(std::ptr::eq(collapsed, &durable));
+        assert!(std::ptr::eq(
+            file_card_preview(true, Some(&durable), Some(&full)).unwrap(),
+            &full
+        ));
+    }
+
+    #[test]
+    fn live_edit_tail_contains_only_latest_generated_lines() {
+        use zeron_doc::{FileChangeLine, FileChangeLineKind as K, FileChangePreview};
+        let preview = FileChangePreview {
+            kind: FileChangeKind::Edit,
+            lines: std::iter::once(FileChangeLine {
+                kind: K::Removed,
+                text: "old".into(),
+            })
+            .chain((1..=20).map(|n| FileChangeLine {
+                kind: K::Added,
+                text: format!("ação {n}"),
+            }))
+            .collect(),
+            additions: 20,
+            deletions: 1,
+            total_lines: 21,
+            truncated_before: 0,
+        };
+        let tail = streaming_file_lines(&preview);
+        assert_eq!(tail.len(), 15);
+        assert_eq!(tail.first().unwrap().text, "ação 6");
+        assert_eq!(tail.last().unwrap().text, "ação 20");
+        assert!(tail.iter().all(|line| line.kind == K::Added));
+    }
+
+    #[test]
+    fn compact_preview_and_expansion_stay_within_requested_heights() {
+        assert_eq!(file_card_body_height(false, 1000.0), 72.0);
+        assert_eq!(file_card_body_height(true, 1000.0), 200.0);
+        assert_eq!(file_card_body_height(false, 40.0), 40.0);
+    }
 
     #[test]
     fn file_card_labels_follow_kind_and_lifecycle() {
@@ -424,6 +550,33 @@ mod tests {
                 .map(|line| line.text.len())
                 .sum::<usize>(),
             1024 * 1024
+        );
+    }
+    #[test]
+    fn short_diff_preview_hugs_its_content() {
+        assert_eq!(file_card_body_height(false, 40.0), 40.0);
+        assert_eq!(file_card_body_height(true, 40.0), 40.0);
+        assert_eq!(file_card_body_height(false, 0.0), 0.0);
+    }
+    #[test]
+    fn unified_diff_gutters_track_both_sides_without_inventing_truncated_positions() {
+        let snapshot = FileToolInputSnapshot {
+            path: "x.py".into(),
+            content: None,
+            old_string: Some("same\nold\n".into()),
+            new_string: Some("same\nnew\n".into()),
+            truncated: false,
+        };
+        let mut preview = snapshot_preview(FileChangeKind::Edit, &snapshot).unwrap();
+        assert_eq!(
+            file_diff_line_numbers(&preview),
+            [(Some(1), Some(1)), (Some(2), None), (None, Some(2))]
+        );
+        preview.truncated_before = 10;
+        assert!(
+            file_diff_line_numbers(&preview)
+                .iter()
+                .all(|pair| *pair == (None, None))
         );
     }
 }

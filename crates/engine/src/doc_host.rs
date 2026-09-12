@@ -39,6 +39,13 @@ use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
+/// Opening of the marker text written by [`ChatDocHandle::write_model_switch`].
+/// The marker is a plain text system entry, so this prefix is the only thing
+/// telling it apart from the other system notices — the UI matches on it to
+/// collapse back-to-back switches, so keep the two in step by using this const
+/// on both sides.
+pub const MODEL_SWITCH_MARKER_PREFIX: &str = "Model changed from ";
+
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
@@ -483,6 +490,37 @@ impl ChatDocHandle {
         })
     }
 
+    /// Mark a mid-conversation model switch in the transcript: a SYSTEM entry
+    /// whose text names both models. Deliberately a plain text part — an app
+    /// version that predates the notice row renders it as an ordinary line
+    /// instead of dropping the entry. No-op on an empty transcript: nothing to
+    /// divide, and the chat's first run already uses the new model.
+    pub fn write_model_switch(&self, from: &str, to: &str) -> Result<(), DocError> {
+        self.write_marker(&format!("{MODEL_SWITCH_MARKER_PREFIX}{from} to {to}."))
+    }
+
+    /// The shared marker write behind [`Self::write_model_switch`] and the
+    /// compaction marker: caller-composed text (only the UI knows model labels
+    /// or token counts), same system entry, same empty-transcript no-op.
+    pub fn write_marker(&self, text: &str) -> Result<(), DocError> {
+        if self.doc.read_entries()?.is_empty() {
+            return Ok(());
+        }
+        self.doc.push_message(&SessionMessageEntry {
+            id: crate::new_id(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }],
+            created_at: crate::now_ms(),
+            device_id: self.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            duration_ms: None,
+            continuation_of: None,
+        })
+    }
+
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
     /// `note` as a visible error part so the transcript says WHY the turn
     /// ended (zeron folded "Run interrupted by backend restart" the same
@@ -491,9 +529,7 @@ impl ChatDocHandle {
     pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, DocError> {
         let mut stamped = Vec::new();
         for entry in self.doc.read_entries()? {
-            if entry.role == MessageRole::Assistant
-                && entry.status == Some(MessageStatus::Streaming)
-                && entry.device_id == self.device_id
+            if is_abandoned_stream(&entry, &self.device_id)
                 && self
                     .doc
                     .set_message_status(&entry.id, MessageStatus::Aborted)?
@@ -558,6 +594,15 @@ impl ChatDocHandle {
     }
 }
 
+/// This device's assistant entry is still `streaming` — boot recovery must
+/// open the doc (and join its room) to stamp it aborted. Settled journaled
+/// chats must NOT join: opening every journal at boot exhausted FDs (2026-09-11).
+fn is_abandoned_stream(entry: &SessionMessageEntry, device_id: &str) -> bool {
+    entry.role == MessageRole::Assistant
+        && entry.status == Some(MessageStatus::Streaming)
+        && entry.device_id == device_id
+}
+
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
         Self {
@@ -582,10 +627,37 @@ impl DocHost {
                 links: OnceLock::new(),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
+                    .pool_max_idle_per_host(8)
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new()),
             }),
         }
+    }
+
+    /// Cheap local-snapshot read: true only when this device left a streaming
+    /// assistant entry. Does not insert a handle and does not join a room.
+    pub fn peek_needs_abandoned_recovery(&self, chat_id: &str) -> bool {
+        let cached = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = cached {
+            return handle.doc.read_entries().ok().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| is_abandoned_stream(e, &handle.device_id))
+            });
+        }
+        let Ok(Some((bytes, _, _))) = self.inner.store.load_snapshot_with_cursor(chat_id) else {
+            return false;
+        };
+        let raw = loro::LoroDoc::new();
+        if raw.import(&bytes).is_err() {
+            return false;
+        }
+        let doc = SessionDoc::from_doc(raw);
+        doc.read_entries().ok().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| is_abandoned_stream(e, &self.inner.config.device_id))
+        })
     }
 
     /// Every background task rides the tracker, raced against the shutdown
@@ -3387,7 +3459,7 @@ impl DocHost {
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
-                if let Err(err) = handle.doc.resolve_input(request_id) {
+                if let Err(err) = handle.doc.resolve_input(request_id, answers) {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
@@ -3829,5 +3901,119 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.evict_over_budget();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod abandoned_recovery_tests {
+    use super::{DocHost, DocHostConfig, is_abandoned_stream, lock};
+    use std::sync::Arc;
+    use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionDoc, SessionMessageEntry};
+
+    fn entry(role: MessageRole, status: MessageStatus, device: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: "m1".into(),
+            role,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "x".into(),
+            }],
+            created_at: 1,
+            device_id: device.into(),
+            status: Some(status),
+            duration_ms: None,
+            continuation_of: None,
+        }
+    }
+
+    fn host_with_store() -> (tempfile::TempDir, DocHost) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store"));
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        (dir, host)
+    }
+
+    #[test]
+    fn only_this_device_streaming_assistant_is_abandoned() {
+        assert!(is_abandoned_stream(
+            &entry(MessageRole::Assistant, MessageStatus::Streaming, "dev-a"),
+            "dev-a"
+        ));
+        assert!(!is_abandoned_stream(
+            &entry(MessageRole::Assistant, MessageStatus::Complete, "dev-a"),
+            "dev-a"
+        ));
+        assert!(!is_abandoned_stream(
+            &entry(MessageRole::Assistant, MessageStatus::Streaming, "dev-b"),
+            "dev-a"
+        ));
+        assert!(!is_abandoned_stream(
+            &entry(MessageRole::User, MessageStatus::Streaming, "dev-a"),
+            "dev-a"
+        ));
+    }
+
+    #[test]
+    fn peek_does_not_open_a_handle_and_skips_settled_snapshots() {
+        let (_dir, host) = host_with_store();
+        assert_eq!(
+            host.peek_needs_abandoned_recovery("missing"),
+            false,
+            "absent snapshot is not a recovery candidate"
+        );
+        assert!(
+            lock(&host.inner.handles).is_empty(),
+            "peek must not insert a handle (that would join the room)"
+        );
+
+        let settled = SessionDoc::init("settled").unwrap();
+        settled
+            .push_message(&entry(
+                MessageRole::Assistant,
+                MessageStatus::Complete,
+                "dev-a",
+            ))
+            .unwrap();
+        host.inner
+            .store
+            .save_snapshot("settled", &settled.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(host.peek_needs_abandoned_recovery("settled"), false);
+        assert!(lock(&host.inner.handles).is_empty());
+
+        let live = SessionDoc::init("live").unwrap();
+        live.push_message(&entry(
+            MessageRole::Assistant,
+            MessageStatus::Streaming,
+            "dev-a",
+        ))
+        .unwrap();
+        host.inner
+            .store
+            .save_snapshot("live", &live.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(host.peek_needs_abandoned_recovery("live"), true);
+        assert!(lock(&host.inner.handles).is_empty());
+
+        let other = SessionDoc::init("other").unwrap();
+        other
+            .push_message(&entry(
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+                "dev-b",
+            ))
+            .unwrap();
+        host.inner
+            .store
+            .save_snapshot("other", &other.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(host.peek_needs_abandoned_recovery("other"), false);
     }
 }

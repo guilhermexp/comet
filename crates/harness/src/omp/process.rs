@@ -131,13 +131,7 @@ impl OmpProcess {
     pub async fn start(launch: OmpLaunch) -> Result<Self, HarnessError> {
         let mut command = Command::new(&launch.executable);
         command
-            .args([
-                "--mode",
-                "rpc-ui",
-                "--auto-approve",
-                "--no-extensions",
-                "--allow-home",
-            ])
+            .args(["--mode", "rpc-ui", "--auto-approve", "--allow-home"])
             .arg("--cwd")
             .arg(&launch.cwd);
         // Losing skill scoping must never cost the turn: without the overlay the
@@ -173,6 +167,17 @@ impl OmpProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Which `omp` we resolved is the first thing a "before ready" failure
+        // needs and the one thing the error never carried: PATH, the login
+        // shell's PATH and `OMP_EXECUTABLE` can each point at a different
+        // build, and a broken source checkout fails identically to a broken
+        // install.
+        tracing::debug!(
+            target: "zeron_harness::omp",
+            executable = %launch.executable.display(),
+            cwd = %launch.cwd.display(),
+            "spawning OMP RPC"
+        );
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(launch.executable.display().to_string())
@@ -270,7 +275,10 @@ impl OmpProcess {
             }
             Ok(Ok(Err(message))) => {
                 let _ = process.shutdown().await;
-                Err(HarnessError::Protocol(message))
+                Err(HarnessError::Protocol(format!(
+                    "{message} (executable: {})",
+                    launch.executable.display()
+                )))
             }
             Ok(Err(_)) => {
                 let _ = process.shutdown().await;
@@ -328,6 +336,15 @@ impl OmpProcess {
     }
 
     pub async fn request(&self, command: Value) -> Result<Value, HarnessError> {
+        self.request_with_timeout(command, self.inner.request_timeout)
+            .await
+    }
+
+    pub async fn request_with_timeout(
+        &self,
+        command: Value,
+        timeout: Duration,
+    ) -> Result<Value, HarnessError> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(HarnessError::Protocol("OMP RPC process is closed".into()));
         }
@@ -375,18 +392,41 @@ impl OmpProcess {
             lock(&self.inner.pending).remove(&id);
             return Err(HarnessError::Protocol("OMP RPC stdin is closed".into()));
         }
-        match tokio::time::timeout(self.inner.request_timeout, rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(message))) => Err(HarnessError::Protocol(message)),
-            Ok(Err(_)) => Err(HarnessError::Protocol(format!(
-                "OMP RPC {command_name} response channel closed"
-            ))),
-            Err(_) => {
-                lock(&self.inner.pending).remove(&id);
+        struct PendingGuard<'a> {
+            pending: &'a Mutex<HashMap<String, Pending>>,
+            id: &'a str,
+            active: bool,
+        }
+        impl Drop for PendingGuard<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    lock(self.pending).remove(self.id);
+                }
+            }
+        }
+        let mut guard = PendingGuard {
+            pending: &self.inner.pending,
+            id: &id,
+            active: true,
+        };
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(value))) => {
+                guard.active = false;
+                Ok(value)
+            }
+            Ok(Ok(Err(message))) => {
+                guard.active = false;
+                Err(HarnessError::Protocol(message))
+            }
+            Ok(Err(_)) => {
+                guard.active = false;
                 Err(HarnessError::Protocol(format!(
-                    "OMP RPC {command_name} request timed out"
+                    "OMP RPC {command_name} response channel closed"
                 )))
             }
+            Err(_) => Err(HarnessError::Protocol(format!(
+                "OMP RPC {command_name} request timed out"
+            ))),
         }
     }
 

@@ -23,6 +23,7 @@ internal host modes (`__session_host__` et al.).
 | `workspace_trust.rs` | Workspace trust decisions |
 | `hook_migration.rs` | Legacy hook root migration — installs Comet-managed hooks under `app_hooks_root()` (every runtime attempted, failures accumulated instead of aborting the loop), then prunes the migrated assets out of `<unpeel_home>/hooks` while retaining the entries the pinned upstream still resolves there (`UPSTREAM_OWNED_LEGACY_ASSETS`) |
 | `resources.rs` + `resources/{macos,unsupported}.rs` | Host resource sampling (CPU/memory pressure); macOS implementation + unsupported-platform fallback |
+| `maintenance.rs` | Worker CLI version detection (`--version`), npm/brew latest version querying with TTL cache, semver comparison, advisory generation, and safe update command execution |
 | `tests/` | Integration tests per surface |
 
 Depends on: `unpeel-core` (vendorizado em `third_party/unpeel`) only.
@@ -33,7 +34,16 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
 - **Request id é sequência única do processo.** O `REPLAY_CACHE` do host é global e chaveado por `(principal, request_id)`, e todo `LocalWorkersClient` fala pelo mesmo principal (`comet-local`). Um contador por instância fazia cada `new()` recomeçar em 1 — e a UI criava cinco (terminal, model, resource monitor, workspace, settings/projects). Hoje a UI passa por `crate::workers::client::shared()` e tem **uma** instância, mas o contador compartilhado permanece como segunda defesa: qualquer consumidor novo (controller MCP, teste, host) volta a criar clientes próprios. Colidir com payload diferente devolve `409: request id reused with different request`; colidir com payload **igual** é pior, porque o segundo cliente recebe a resposta do primeiro sem erro nenhum. `next_request_id` é `shared_next_request_id()`, no mesmo padrão `OnceLock` dos outros campos compartilhados.
 
 - **`third_party/unpeel` e codigo vendorizado, nao submodulo.** O upstream
-  `unpeel-com/unpeel` deixou de existir publicamente; enquanto foi submodulo,
+  `unpeel-com/unpeel` ficou um tempo fora do ar e **voltou em 2026-09-07 com
+  outro histórico** — 254 commits, o mais antigo de 2026-08-24, e o
+  `base_revision` que gravamos não resolve lá. Não existe ancestral comum:
+  trazer algo de lá é **triagem arquivo a arquivo**, nunca merge, e várias
+  áreas nossas estão à frente (`parse_procargs2` tolerante a título reescrito,
+  `embedded_conversation_id`/`forked` do resume, o marker de atividade em
+  `write_session_input`) — o que o upstream "corrigiu" nelas é remoção do que
+  nós adicionamos. O upstream também já não tem `unpeel-tui`/`unpeel-ui`, de
+  onde `activity_bridge.rs` inclui a máquina de estados por `#[path]`.
+  Enquanto foi submodulo,
   NENHUM clone limpo compilava (`unpeel-core` e dependencia path de
   `zeron-workers-unpeel`, que e dependencia de `zeron-ui`, entao o workspace
   inteiro falhava na resolucao) — foi o que fez o gate de push revisar cinco
@@ -73,6 +83,51 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   novo a cada entrada. Grupos organizacionais NAO entram: reutilizam o path do
   pai e violariam essa chave; worktrees entram porque têm path próprio. A
   projeção filtra `is_group` e `reconcile` deduplica path defensivamente.
+- **Grupo é `is_folder` + parent + SEM branch — worktree tem as duas primeiras.**
+  `create_worktree` registra o worktree com `is_folder: true` (ele aninha sob o
+  pai na sidebar), então marcar grupo por `is_folder && parent` sozinho fazia
+  todo worktree chegar na UI como organização. `is_group` é o portão de tudo
+  que nomeia um path: seleção da row, controles de hover, `open_launcher`,
+  linha de estado vazio, entrada no ledger e casamento em Worked Projects — um
+  worktree criado sem sessão sumia da sidebar inteira, porque a row sem sessão
+  só sobrevive como projeto selecionado ou alvo do launcher e o flag barra os
+  dois. O predicado canônico está no app upstream (`Models.swift:43`,
+  `acceptsSessionDrop`), e hoje ele é **um veredito por projeto**, decidido uma
+  vez no topo do laço de `DiskCatalog::capture` porque o catálogo de criação é
+  montado FORA do objeto de fio: o mesmo `is_group` publica `isGroup` no fio e
+  vira `HostCreateProject::is_folder`. O `is_folder` do registro sozinho não
+  chega mais a nenhum dos dois — ele é só uma das três cláusulas. Antes disso o
+  catálogo de criação perguntava `is_folder && parent`, e como `create_worktree`
+  registra o worktree com `is_folder: true` + pai, TODO worktree criado pelo app
+  era recusado no launch com `project is a folder`. Do lado do registro o gêmeo
+  é `is_plain_group` (`lib.rs`), e ele governa `remove_group` **e** o ramo de
+  rename de `set_project_organization`: perguntar o COMPLEMENTO ali
+  (`worktree_branch.is_none()` ⇒ grupo) mandava worktree adotado — que não tem
+  branch no registro — para `rename_group_project` e morria em "only plain
+  groups can be renamed here". `worktree_lifecycle_registers_and_removes_the_child_project`
+  fixa o flag no bootstrap que a UI lê — teste que constrói `WorkersProject` à
+  mão não prova nada sobre a rota `comet-local`, foi assim que isto passou
+  despercebido (mesma classe do `git_branch` acima).
+- **Worktree se reconhece pelo checkout, nao so pelo registro.** O registro
+  guarda o que lhe foi dito na hora de adicionar: um `git worktree add` feito
+  no terminal e depois adicionado por "Add project…" nao tem `worktree_branch`
+  nem parent, e chegava na sidebar como projeto raiz com icone de pasta, ao
+  lado do repositorio de que e checkout. Medido em `~/.unpeel/app-state.json`
+  desta maquina: 46 projetos, 9 worktrees vivos no disco, ZERO com
+  `worktree_branch`. O disco sabe sem ambiguidade — git so escreve `.git` como
+  ARQUIVO (com o ponteiro `gitdir:`) dentro de worktree linkado, e o ponteiro
+  soletra `<main>/.git/worktrees/<nome>`. `git_checkout` devolve os dois, e a
+  projeção PREENCHE o que faltava: `parentProjectID` quando o repositorio
+  principal tambem e projeto registrado, e `worktreeBranch` sob DUAS portas —
+  `!is_group` (grupo herda o path do pai em `create_group`, então o disco o
+  chamaria de worktree e "remover o rótulo" apagaria a árvore de trabalho do
+  pai) e `!detached` (`GitCheckout::detached`, o mesmo ramo que trunca HEAD em
+  sha curto: sha nao nomeia branch para lançar nem para assinar PR).
+  `gitBranch` continua dizendo o que HEAD diz, sha inclusive — só a promoção a
+  `worktreeBranch` recusa HEAD destacado. O registro
+  continua ganhando onde falou. Comparação de path passa por
+  `canonicalize` — no macOS o gitdir grava `/private/var/...` e o registro
+  guarda `/var/...`, e sem isso o parent nunca casa.
 - **`reconcile` e puro e `last_seen_at` so anda com atividade real.** Nunca
   carimbe `now` num projeto vivo e parado: `dirty` viraria true a cada passada
   e abrir a tela escreveria num arquivo compartilhado e travado a cada render.
@@ -81,11 +136,15 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   filtro. So `@<segundos> <offset>` e ISO 8601 filtram. Qualquer mexida em
   `project_git::commit_at` mantem
   `a_date_before_the_first_commit_has_no_anchor`, que e a rede desse silencio.
-- **Nada de estado de git no ledger.** `is_repo`, remote, branch e commits
-  ancora sao lidos frescos por projeto SELECIONADO. `WorkersProject::git_branch`
-  nao serve de fonte: o campo e desserializado de `gitBranch`, mas o
-  `controller_host.rs` que o comet usa nunca o emite (so o host TUI emite), entao
-  pela rota `comet-local` ele e sempre `None`.
+- **Nada de estado de git no ledger.** `is_repo`, remote e commits ancora sao
+  lidos frescos por projeto SELECIONADO. `WorkersProject::git_branch` **passou
+  a chegar preenchido** (2026-09-07, `git_head_branch` trazido do upstream): a
+  projeção lê `.git/HEAD` direto — seguindo o `gitdir:` de um worktree,
+  truncando HEAD destacado em sha curto — e nunca forka `git`, porque ela roda
+  a cada bootstrap. Continua sendo campo de PROJEÇÃO, não fonte para o ledger,
+  e `None` continua possível (path sem checkout, HEAD ilegível). O leitor
+  chama-se `git_checkout` desde que passou a devolver tambem o repositorio
+  principal de um worktree.
 - **`owner`/`repo` nao sao derivados aqui.** Isso e
   `zeron_engine::parse_git_remote`, e puxar `engine` (loro, tokio, rusqlite,
   reqwest) para dentro desta crate por um parser inflaria ate o `cargo test`
@@ -101,7 +160,20 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   drenado concorrentemente com cauda de 64 KiB; timeout encerra o process group
   inteiro. Falha mantém o worktree registrado, carrega comando + motivo em
   `WorkersWorktreeResult` e barra `create_worktree_and_launch` antes de iniciar
-  a Session.
+  a Session. **Falha de LAUNCH também não desfaz** — o rollback que chamava
+  `remove_worktree(force)` no braço de erro saiu: o checkout já existe e já está
+  registrado, e apagá-lo à força por causa de um preset inválido joga fora
+  trabalho do usuário. O único rollback que sobrou é o do registro que falhou,
+  onde o worktree ainda não é projeto de ninguém.
+- **`worktree_branch` no registro é POSSE, não identidade.** Identidade quem
+  responde é a projeção (bullet acima): worktree adotado é worktree e o registro
+  nunca ouviu falar dele. Por isso `remove_worktree` não recusa mais quem não
+  tem o campo — ele apaga do disco só quando o registro tem `worktree_branch`
+  (o app criou este checkout) **e** `worktrees::is_managed(path)`; qualquer
+  outra coisa é apenas desregistrada, com a pasta intacta. `is_managed` é o
+  predicado extraído de `worktrees::remove`, para quem PERGUNTA antes e quem
+  RECUSA depois fazerem a mesma pergunta — e é ele que impede um grupo (que
+  herda o path do pai) de derrubar o checkout do pai junto com o rótulo.
 - **Hook ingress não morre por sinal de filho.** O accept loop trata
   `WouldBlock` e `Interrupted` como transitórios; setup/Worker encerrando
   processos no mesmo host não pode fechar o endpoint e devolver BrokenPipe ao
@@ -264,7 +336,17 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   (`task` stays inside the caller's session, read-only).
   `tests/controller_mcp.rs` locks both: every action in the enum appears in
   some description, and no field is left without one.
+- **`list_presets` emite a ordem da tela, nunca re-ordena.** A lista de
+  Settings ▸ Presets É a ordem de fallback: cada linha leva `fallback_order`
+  (1-based, posição entre os habilitados) e `preferred` (a estrela,
+  `quick_launch`) como campo explícito. O sort "estrelado primeiro" saiu —
+  com ele, estrelar um preset que não é o primeiro fazia a saída divergir da
+  tela. Desabilitado continua fora da resposta e `enabled` não é emitido.
+  `cli_id: null` / `is_default: false` são mortos no wire e ficam como estão
+  por decisão explícita.
 - **O orquestrador é dono da duração de `wait_for_status`; o teto (`WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS` = 4h) é só sanidade de transporte.** Schema (`maximum`), help (`limits.wait_seconds`) e `.clamp` derivam da mesma constante. Default continua 30s. Expiração devolve `timed_out: true` + snapshot + `next` (`WAIT_TIMED_OUT_NEXT`): esperar de novo com timeout do tamanho do trabalho, ou encerrar o turno e receber `[worker-task-notification]`. Wait curto repetido é polling e custa um turno inteiro do modelo por chamada — foi o que aconteceu com teto de 120s (≈100 chamadas por attempt em worker de horas).
+- **`wait_for_status(completed)` casa evidência do episódio atual, não o processo.** O Worker vivo fica `state=running` / `activity=idle` depois do Stop. ACK grava `acknowledged_completed_generation` da notificação; o latch só completa se a geração atual for essa, activity não for `blocked`/`working`, e o output estiver quiescente. Binding legado sem geração falha fechado. Idle sem evidência não é completed.
+
 - **`serve` despacha concorrente e cancelável.** `run_stdio` é casca sobre `serve(reader, writer, handler)`: uma thread por request, `stdout` atrás de `Mutex`, registro de ids em voo. `notifications/cancelled` flipa o flag do request (`wait_until` checa a cada tick de 250ms) e o request cancelado **não recebe resposta** (contrato MCP). EOF flipa só o flag de saída — waits pendentes morrem, respostas em voo ainda são escritas. `wait_until` é o núcleo puro do wait (poll injetado) para testar deadline, cancel e `next` sem host.
 - **An unlisted checkout is an unlaunchable one.** `launch_worker` takes a
   `project_id` and `validate_launch_target` rejects any id absent from the live
@@ -333,6 +415,8 @@ Consumed by: zeron-ui (`workers/`), apps/zeron (host-mode dispatch at startup).
   `~/.codex/hooks.json` (`/private/tmp/orchestrator-…`) parecer asset stale e
   bloqueava a migração para sempre.
 
+- **Branch de contexto/PR**: `WorkersProject::change_request_branch` aceita checkout local e worktree, exclui grupos e prefere `git_branch` do snapshot ao registro de criação. Valores vazios não viram branch. O consumidor limita subscriptions ao working set; não inferir que um checkout comum está na default branch ou não possui PR.
+
 ## Work Guidance
 
 - New Workers capability: extend `LocalWorkersClient` + typed models here, then
@@ -362,9 +446,9 @@ rodadas, passava com `--test-threads=1`). Medido em 2026-08-28 com sonda no
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
-| `src/lib.rs` (16 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
-| `tests/controller_mcp.rs` (29) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
-| `tests/parent_notifications.rs` (17) | integration | `--test parent_notifications` |
+| `src/lib.rs` (19 + 12 de hibernação, incluindo portões de evidência, segunda passada e laço por candidato), `src/hook_migration.rs` (2 — loop de instalação com instalador injetado, composição install+prune), `src/activity_bridge.rs` (29 local + 11 shared upstream), `src/resources.rs` (8), `src/session_event_journal.rs` (7), `src/project_ledger.rs` (11), `src/project_git.rs` (11), `src/worktree_config.rs` (15), `worktree_setup_wiring_tests` (4) | unit | `cargo test -p zeron-workers-unpeel --lib` |
+| `tests/controller_mcp.rs` (31) — Comet-owned MCP surface | integration | `cargo test -p zeron-workers-unpeel --test controller_mcp` |
+| `tests/parent_notifications.rs` (30) | integration | `--test parent_notifications` |
 | `tests/workspace_trust.rs` (10) | integration | `--test workspace_trust` |
 | `tests/settings.rs` (9) — settings snapshot/persistence e preset migration v2 | integration | `--test settings` |
 | `tests/project_actions.rs` (5), `tests/local_actions.rs` (4), `tests/session_actions.rs` (4), `tests/local_bootstrap.rs` (2), `tests/dev_demo_fixture.rs` (1) — client actions and deterministic demo state over the local runtime | integration | `cargo test -p zeron-workers-unpeel --test <name>` |

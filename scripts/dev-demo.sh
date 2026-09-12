@@ -9,12 +9,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DAEMON_DIR=/tmp/zeron-demo-daemon
-UI_DIR=/tmp/zeron-demo-ui
-WORKERS_DIR=/tmp/zeron-demo-workers
-IPC=27921
+# Sessões concorrentes no mesmo checkout precisam de porta e dirs próprios,
+# senão o daemon novo perde o bind e o seed vai parar no daemon alheio.
+TAG=${ZERON_DEMO_TAG:-}
+DAEMON_DIR=/tmp/zeron-demo-daemon$TAG
+UI_DIR=/tmp/zeron-demo-ui$TAG
+WORKERS_DIR=/tmp/zeron-demo-workers$TAG
+IPC=${ZERON_DEMO_IPC:-27921}
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
+
+# Discard our own artifacts so the demo can never run stale app code: a cached
+# `cargo build` prints "Finished" without recompiling, which reads as success.
+# Scoped to workspace members — wiping dependency artifacts too would turn a
+# ~40s rebuild into minutes of gpui compilation for no extra freshness.
+echo "▸ clearing workspace artifacts (deps stay cached)…"
+cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(" ".join("-p " + p["name"] for p in json.load(sys.stdin)["packages"]))' \
+  | xargs cargo clean -q
 
 echo "▸ building (first run takes a few minutes)…"
 cargo build -p zeron -q

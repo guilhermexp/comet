@@ -498,21 +498,194 @@ fn auto_update_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// "Nothing would be interrupted by a restart right now" — wired by the engine
-/// to its live-run and open-terminal registries. `None` = no gate.
+/// Callback allowing the updater to query whether the engine is idle with respect
+/// to its live-run and open-terminal registries.
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Reason why restart authorization was blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartBlockedReason {
+    /// Active sessions or open terminals are currently running.
+    WorkActive,
+    /// A service restart has already been authorized.
+    AlreadyRestarting,
+}
+
+impl std::fmt::Display for RestartBlockedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkActive => write!(f, "work active: sessions or terminals running"),
+            Self::AlreadyRestarting => write!(f, "restart already authorized"),
+        }
+    }
+}
+
+impl std::error::Error for RestartBlockedReason {}
+
+/// Guards an authorized service restart window.
+///
+/// If dropped before calling [`Self::commit`], the authorization is rolled back
+/// and the gate is reopened for work admission. Once committed, the gate remains
+/// locked across the restart delay until the service process terminates.
+pub struct RestartAuthorization {
+    gate: RestartGate,
+    token: u64,
+    committed: bool,
+}
+
+impl RestartAuthorization {
+    /// Confirm that the restart has been scheduled and will proceed to process termination.
+    /// The lockout remains permanently active until process exit.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RestartAuthorization {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.gate.release(self.token);
+        }
+    }
+}
+
+/// RAII guard representing an in-flight work admission (run dispatch or terminal open).
+///
+/// While held during asynchronous setup across awaits, [`RestartGate::try_authorize_restart`]
+/// considers work active and rejects restart authorizations. Dropping the guard decrements
+/// the in-flight admission count.
+pub struct AdmissionGuard {
+    gate: RestartGate,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut guard = self.gate.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.in_flight_admissions = guard.in_flight_admissions.saturating_sub(1);
+    }
+}
+
+#[derive(Default)]
+struct RestartGateInner {
+    active_auth: Option<u64>,
+    next_auth_id: u64,
+    in_flight_admissions: usize,
+    quiescent: Option<QuiescentCheck>,
+}
+
+/// Coordinates atomic restart authorization with engine work admission.
+///
+/// Ensures that:
+/// 1. Staging updates can proceed concurrently with active work.
+/// 2. Restart authorization is atomic: under an exclusive lock, it checks
+///    that no sessions, terminals, or in-flight admissions are active, and grants
+///    a single-owner authorization token.
+/// 3. Once authorized, new runs and terminals are rejected.
+/// 4. Protection remains active throughout the 800ms restart window until process exit.
+/// 5. Failure during staging, apply, or the background restart task safely releases the authorization.
+#[derive(Clone, Default)]
+pub struct RestartGate {
+    inner: Arc<std::sync::Mutex<RestartGateInner>>,
+}
+
+impl RestartGate {
+    pub fn new(quiescent: Option<QuiescentCheck>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(RestartGateInner {
+                active_auth: None,
+                next_auth_id: 0,
+                in_flight_admissions: 0,
+                quiescent,
+            })),
+        }
+    }
+
+    /// Check whether new work (runs or terminals) may be admitted.
+    pub fn can_admit_work(&self) -> bool {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active_auth.is_none()
+    }
+
+    /// Atomically reserve an admission ticket for work setup across awaits.
+    ///
+    /// Fails if a restart is currently authorized.
+    /// While the returned [`AdmissionGuard`] is held, [`try_authorize_restart`]
+    /// will fail with [`RestartBlockedReason::WorkActive`].
+    pub fn reserve_admission(&self) -> Result<AdmissionGuard, RestartBlockedReason> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.active_auth.is_some() {
+            return Err(RestartBlockedReason::AlreadyRestarting);
+        }
+        guard.in_flight_admissions += 1;
+        Ok(AdmissionGuard { gate: self.clone() })
+    }
+
+    /// Atomically check quiescence and authorize restart.
+    ///
+    /// Fails if work is currently active, work admission is in-flight, or a restart
+    /// is already authorized.
+    /// Returns a [`RestartAuthorization`] which rolls back the authorization
+    /// on drop unless [`RestartAuthorization::commit`] is called.
+    pub fn try_authorize_restart(&self) -> Result<RestartAuthorization, RestartBlockedReason> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.active_auth.is_some() {
+            return Err(RestartBlockedReason::AlreadyRestarting);
+        }
+        if guard.in_flight_admissions > 0 {
+            return Err(RestartBlockedReason::WorkActive);
+        }
+        if let Some(check) = &guard.quiescent {
+            if !check() {
+                return Err(RestartBlockedReason::WorkActive);
+            }
+        }
+        guard.next_auth_id = guard.next_auth_id.wrapping_add(1);
+        let token = guard.next_auth_id;
+        guard.active_auth = Some(token);
+        Ok(RestartAuthorization {
+            gate: self.clone(),
+            token,
+            committed: false,
+        })
+    }
+
+    /// Force authorize a restart for manual updates initiated by user command.
+    ///
+    /// Fails if a restart is already authorized, enforcing single ownership.
+    pub fn force_authorize_restart(&self) -> Result<RestartAuthorization, RestartBlockedReason> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.active_auth.is_some() {
+            return Err(RestartBlockedReason::AlreadyRestarting);
+        }
+        guard.next_auth_id = guard.next_auth_id.wrapping_add(1);
+        let token = guard.next_auth_id;
+        guard.active_auth = Some(token);
+        Ok(RestartAuthorization {
+            gate: self.clone(),
+            token,
+            committed: false,
+        })
+    }
+
+    fn release(&self, token: u64) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.active_auth == Some(token) {
+            guard.active_auth = None;
+        }
+    }
+}
 
 /// Background release checker: polls `{edge}/releases` on a 6h cadence and
 /// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
 /// stream). Managed installs with `ZERON_AUTO_UPDATE` set stage + apply + service
-/// restart on their own — but only in a quiet window: while `quiescent` reports
+/// restart on their own — but only in a quiet window: while `gate` reports
 /// activity, the apply defers and re-probes every [`IDLE_RECHECK`].
 #[derive(Clone)]
 pub struct Updater {
     edge_url: String,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     check_tx: Arc<watch::Sender<u64>>,
-    quiescent: Option<QuiescentCheck>,
+    gate: RestartGate,
     /// Flips to true exactly once; the check loop selects against it so
     /// cancellation lands at any await point (no tokio-util in this crate).
     shutdown_tx: Arc<watch::Sender<bool>>,
@@ -521,20 +694,21 @@ pub struct Updater {
 
 impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
-    pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
+    pub fn spawn(edge_url: String, gate: Option<RestartGate>) -> Self {
+        let gate = gate.unwrap_or_default();
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
         let (check_tx, _) = watch::channel(0);
-        let (shutdown_tx, _) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let updater = Self {
             edge_url,
             status_tx: Arc::new(status_tx),
             check_tx: Arc::new(check_tx),
-            quiescent,
+            gate,
             shutdown_tx: Arc::new(shutdown_tx),
             check_task: Arc::new(std::sync::Mutex::new(None)),
         };
         let for_loop = updater.clone();
-        let task = tokio::spawn(async move { for_loop.check_loop().await });
+        let task = tokio::spawn(async move { for_loop.check_loop(shutdown_rx).await });
         *updater.check_task.lock().unwrap() = Some(task);
         updater
     }
@@ -543,7 +717,7 @@ impl Updater {
     /// not keep polling `{edge}/releases` (or auto-applying) in the background.
     /// Idempotent, and callable from any clone.
     pub async fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         let task = self
             .check_task
             .lock()
@@ -565,12 +739,7 @@ impl Updater {
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
-    fn quiescent_now(&self) -> bool {
-        self.quiescent.as_ref().is_none_or(|check| check())
-    }
-
-    async fn check_loop(&self) {
-        let mut shutdown = self.shutdown_tx.subscribe();
+    async fn check_loop(&self, mut shutdown: watch::Receiver<bool>) {
         // Shutdown must cut the loop at ANY await point — including mid
         // `check_once()` / `auto_apply_when_idle()` HTTP — so the whole body
         // races the flag rather than checking it between iterations.
@@ -602,41 +771,89 @@ impl Updater {
 
     /// Sessions must never die to an update: pre-stage the download now
     /// (harmless while busy), wait for a quiet window (no live runs, no open
-    /// terminals), then apply — which re-fetches the manifest (so a long defer
-    /// lands on whatever is newest) and reuses the staged dir, keeping the
+    /// terminals), then apply with atomic restart authorization, keeping the
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
-        if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest(&self.edge_url).await {
+        let (app_root, manifest) = match detect_install() {
+            InstallKind::Managed { app_root } => match fetch_latest(&self.edge_url).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
-                        tracing::warn!(error = %err, "auto-update staging failed");
-                        return;
-                    }
+                    (app_root, manifest)
                 }
                 Ok(_) => return,
                 Err(err) => {
                     tracing::warn!(error = %err, "auto-update staging fetch failed");
                     return;
                 }
-            }
-        }
-        let mut deferred = false;
-        while !self.quiescent_now() {
-            if !deferred {
-                deferred = true;
-                tracing::info!("auto-update deferred: sessions or terminals active");
-            }
-            tokio::time::sleep(IDLE_RECHECK).await;
-        }
-        match self.apply().await {
-            Ok(version) => {
-                tracing::info!(%version, "auto-update applied; service restarting")
-            }
+            },
+            _ => return,
+        };
+
+        let edge_url = self.edge_url.clone();
+        let app_root_stage = app_root.clone();
+        let manifest_clone = manifest.clone();
+        let app_root_apply = app_root.clone();
+        let version_apply = manifest.version.clone();
+
+        let res = self
+            .auto_apply_flow(
+                || async move {
+                    stage_headless(&edge_url, &manifest_clone, &app_root_stage)
+                        .await
+                        .map(|_| ())
+                },
+                IDLE_RECHECK,
+                |auth| {
+                    let app_root = app_root_apply.clone();
+                    let version = version_apply.clone();
+                    async move {
+                        self.apply_authorized_staged(&app_root, &version, auth, restart_service)
+                            .await
+                    }
+                },
+            )
+            .await;
+        match res {
+            Ok(version) => tracing::info!(%version, "auto-update applied; service restarting"),
             Err(err) => tracing::warn!(error = %err, "auto-update failed"),
         }
     }
 
+    /// Orchestrates auto-update staging and application with atomic restart coordination.
+    ///
+    /// 1. Runs `stage_fn` with the restart gate OPEN, allowing work admission to continue.
+    /// 2. Defers and polls `try_authorize_restart` at `idle_recheck` intervals while work is active.
+    /// 3. Once quiet, atomically authorizes restart and runs `apply_fn` under the gate without network I/O.
+    pub(crate) async fn auto_apply_flow<StageFn, StageFut, ApplyFn, ApplyFut>(
+        &self,
+        stage_fn: StageFn,
+        idle_recheck: std::time::Duration,
+        apply_fn: ApplyFn,
+    ) -> anyhow::Result<String>
+    where
+        StageFn: FnOnce() -> StageFut,
+        StageFut: Future<Output = anyhow::Result<()>>,
+        ApplyFn: FnOnce(RestartAuthorization) -> ApplyFut,
+        ApplyFut: Future<Output = anyhow::Result<String>>,
+    {
+        stage_fn().await?;
+        let mut deferred = false;
+        let auth = loop {
+            match self.gate.try_authorize_restart() {
+                Ok(auth) => break auth,
+                Err(RestartBlockedReason::WorkActive) => {
+                    if !deferred {
+                        deferred = true;
+                        tracing::info!("auto-update deferred: sessions or terminals active");
+                    }
+                    tokio::time::sleep(idle_recheck).await;
+                }
+                Err(RestartBlockedReason::AlreadyRestarting) => {
+                    anyhow::bail!("already restarting");
+                }
+            }
+        };
+        apply_fn(auth).await
+    }
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
         match fetch_latest(&self.edge_url).await {
@@ -681,15 +898,65 @@ impl Updater {
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
+        // Staging proceeds concurrently with active work without locking out admission:
         stage_headless(&self.edge_url, &manifest, &app_root).await?;
-        apply_headless(&app_root, &manifest.version)?;
-        tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            if let Err(err) = restart_service() {
-                tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+        // Once staged, acquire single restart authorization:
+        let auth = self
+            .gate
+            .force_authorize_restart()
+            .map_err(|e| anyhow::anyhow!("cannot authorize restart: already restarting ({e:?})"))?;
+        self.apply_authorized_staged(&app_root, &manifest.version, auth, restart_service)
+            .await
+    }
+
+    pub(crate) async fn apply_authorized_staged<F>(
+        &self,
+        app_root: &Path,
+        version: &str,
+        auth: RestartAuthorization,
+        restart_fn: F,
+    ) -> anyhow::Result<String>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    {
+        self.apply_authorized_staged_internal(
+            app_root,
+            version,
+            auth,
+            std::time::Duration::from_millis(800),
+            restart_fn,
+        )
+        .await
+        .map(|(ver, _)| ver)
+    }
+
+    pub(crate) async fn apply_authorized_staged_internal<F>(
+        &self,
+        app_root: &Path,
+        version: &str,
+        auth: RestartAuthorization,
+        delay: std::time::Duration,
+        restart_fn: F,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    {
+        apply_headless(app_root, version)?;
+        // Ownership of auth accompanies the restart task across the delay window:
+        let handle = tokio::spawn(async move {
+            let auth = auth;
+            tokio::time::sleep(delay).await;
+            match restart_fn() {
+                Ok(()) => {
+                    auth.commit();
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+                    // auth drops here without commit, safely releasing the gate so work can be admitted!
+                }
             }
         });
-        Ok(manifest.version)
+        Ok((version.to_string(), handle))
     }
 }
 
@@ -802,5 +1069,255 @@ mod tests {
         );
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_immediately_after_spawn_terminates() {
+        let updater = Updater::spawn("http://127.0.0.1:0".to_string(), None);
+        tokio::time::timeout(std::time::Duration::from_millis(500), updater.shutdown())
+            .await
+            .expect("shutdown hung when called immediately after spawn in current_thread");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_shutdown_is_idempotent() {
+        let updater = Updater::spawn("http://127.0.0.1:0".to_string(), None);
+        tokio::time::timeout(std::time::Duration::from_millis(500), updater.shutdown())
+            .await
+            .expect("first shutdown timed out");
+        tokio::time::timeout(std::time::Duration::from_millis(500), updater.shutdown())
+            .await
+            .expect("second shutdown timed out");
+    }
+
+    #[test]
+    fn restart_gate_blocks_work_and_releases_on_failure() {
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let active_check = {
+            let active = active.clone();
+            Arc::new(move || !active.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        let gate = RestartGate::new(Some(active_check));
+
+        // While work is active:
+        assert!(gate.can_admit_work());
+        let auth_res = gate.try_authorize_restart();
+        assert_eq!(auth_res.err(), Some(RestartBlockedReason::WorkActive));
+        assert!(gate.can_admit_work());
+
+        // Once work finishes:
+        active.store(false, std::sync::atomic::Ordering::SeqCst);
+        let auth = gate
+            .try_authorize_restart()
+            .expect("should authorize restart");
+        // Gate is now locked out:
+        assert!(!gate.can_admit_work());
+        assert_eq!(
+            gate.try_authorize_restart().err(),
+            Some(RestartBlockedReason::AlreadyRestarting)
+        );
+        let admit_res = gate.reserve_admission();
+        assert!(admit_res.is_err());
+
+        // Failure/rollback without commit:
+        drop(auth);
+        assert!(gate.can_admit_work());
+        let guard = gate.reserve_admission().expect("should reserve admission");
+        assert_eq!(
+            gate.try_authorize_restart().err(),
+            Some(RestartBlockedReason::WorkActive)
+        );
+        drop(guard);
+        // Commit permanently locks out:
+        let auth2 = gate
+            .try_authorize_restart()
+            .expect("should authorize restart");
+        assert!(!gate.can_admit_work());
+        auth2.commit();
+        assert!(!gate.can_admit_work());
+    }
+
+    #[test]
+    fn restart_gate_prevents_double_authorization_and_stale_release() {
+        let gate = RestartGate::new(None);
+        let first = gate.force_authorize_restart().expect("first auth succeeds");
+        let second_res = gate.force_authorize_restart();
+        assert_eq!(
+            second_res.err(),
+            Some(RestartBlockedReason::AlreadyRestarting)
+        );
+        assert!(
+            !gate.can_admit_work(),
+            "gate must stay locked while first authorization is alive"
+        );
+        drop(first);
+        assert!(gate.can_admit_work());
+    }
+
+    #[tokio::test]
+    async fn apply_authorized_rolls_back_on_restart_task_failure_or_cancellation() {
+        let gate = RestartGate::new(None);
+        let temp = tempfile::tempdir().unwrap();
+        let app_root = temp.path().to_path_buf();
+        let v1_dir = app_root.join("0.1.1");
+        std::fs::create_dir_all(&v1_dir).unwrap();
+        std::fs::write(v1_dir.join("zeron"), b"binary").unwrap();
+
+        // 1. Failure rollback:
+        let auth = gate.force_authorize_restart().expect("auth succeeds");
+        assert!(!gate.can_admit_work());
+        let updater = Updater::spawn("http://127.0.0.1:0".into(), Some(gate.clone()));
+        let res = updater
+            .apply_authorized_staged_internal(
+                &app_root,
+                "0.1.1",
+                auth,
+                std::time::Duration::from_millis(5),
+                || anyhow::bail!("simulated restart failure"),
+            )
+            .await;
+        assert!(res.is_ok());
+        let (_ver, handle) = res.unwrap();
+        // Wait directly for restart task completion without flaky timing assumptions:
+        let _ = handle.await;
+        assert!(
+            gate.can_admit_work(),
+            "gate must reopen after restart task failure"
+        );
+
+        // 2. Cancellation rollback (exercising real task cancellation holding authorization):
+        let auth_cancel = gate
+            .force_authorize_restart()
+            .expect("auth_cancel succeeds");
+        assert!(!gate.can_admit_work());
+        let res_cancel = updater
+            .apply_authorized_staged_internal(
+                &app_root,
+                "0.1.1",
+                auth_cancel,
+                std::time::Duration::from_secs(10),
+                || Ok(()),
+            )
+            .await;
+        assert!(res_cancel.is_ok());
+        let (_ver, handle_cancel) = res_cancel.unwrap();
+        // Abort the task holding the authorization token:
+        handle_cancel.abort();
+        let _ = handle_cancel.await;
+        assert!(
+            gate.can_admit_work(),
+            "gate must reopen after restart task cancellation"
+        );
+
+        // 3. Success permanently locks:
+        let auth_success = gate
+            .force_authorize_restart()
+            .expect("auth_success succeeds");
+        assert!(!gate.can_admit_work());
+        let res_success = updater
+            .apply_authorized_staged_internal(
+                &app_root,
+                "0.1.1",
+                auth_success,
+                std::time::Duration::from_millis(5),
+                || Ok(()),
+            )
+            .await;
+        assert!(res_success.is_ok());
+        let (_ver, handle_success) = res_success.unwrap();
+        let _ = handle_success.await;
+        assert!(
+            !gate.can_admit_work(),
+            "successful restart permanently locks gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_apply_admits_work_during_staging_and_blocks_restart_until_quiet() {
+        let gate = RestartGate::new(None);
+        let updater = Updater::spawn("http://127.0.0.1:0".into(), Some(gate.clone()));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_clone = barrier.clone();
+
+        let stage_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stage_started_clone = stage_started.clone();
+
+        let stage_fn = move || {
+            let barrier = barrier_clone.clone();
+            let stage_started = stage_started_clone.clone();
+            async move {
+                stage_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                barrier.wait().await;
+                Ok(())
+            }
+        };
+
+        let apply_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let apply_invoked_clone = apply_invoked.clone();
+        let apply_fn = move |auth: RestartAuthorization| {
+            let apply_invoked = apply_invoked_clone.clone();
+            async move {
+                apply_invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                auth.commit();
+                Ok("0.2.0".to_string())
+            }
+        };
+
+        // Spawn auto_apply_flow:
+        let flow_handle = tokio::spawn(async move {
+            updater
+                .auto_apply_flow(stage_fn, std::time::Duration::from_millis(5), apply_fn)
+                .await
+        });
+
+        // Spin until staging starts:
+        while !stage_started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        // 1. While staging is in-flight (blocked on barrier), new work CAN be admitted:
+        assert!(
+            gate.can_admit_work(),
+            "work must be admissible during staging"
+        );
+        let work_guard = gate
+            .reserve_admission()
+            .expect("should reserve admission during staging");
+
+        // 2. Unblock staging:
+        barrier.wait().await;
+
+        // Give staging time to complete and let the loop reach try_authorize_restart:
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        // Because work_guard is held, auto_apply_flow cannot authorize restart:
+        assert!(
+            !apply_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "restart must not be applied while work admission is active"
+        );
+        assert!(
+            gate.can_admit_work(),
+            "gate must remain in admissible state while work is active"
+        );
+
+        // 3. Complete active work:
+        drop(work_guard);
+
+        // 4. Now auto_apply_flow can authorize restart and complete apply:
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), flow_handle)
+            .await
+            .expect("auto_apply_flow timed out")
+            .expect("task panicked");
+
+        assert_eq!(result.unwrap(), "0.2.0");
+        assert!(
+            apply_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "apply must be invoked once work is quiet"
+        );
+        assert!(
+            !gate.can_admit_work(),
+            "gate must be locked after restart authorization and apply commit"
+        );
     }
 }

@@ -417,7 +417,7 @@ fn run_stream(
                 // here: on a quiet stream, re-check health about once a
                 // second and end the stream when the session stops running.
                 idle_timeouts += 1;
-                if idle_timeouts % 4 == 0 {
+                if idle_timeouts.is_multiple_of(4) {
                     // Two consecutive strikes before giving up: a single
                     // failed read here used to end the stream — and with it
                     // blank the preview — on any transient (a manifest read

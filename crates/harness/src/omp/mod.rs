@@ -1,6 +1,6 @@
 //! Native Oh My Pi driver over `omp --mode rpc-ui`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +130,15 @@ pub struct OmpHarness {
     env: Option<HashMap<String, String>>,
     handshake_timeout: Duration,
     request_timeout: Duration,
+    prompt_timeout: Duration,
 }
+
+/// Prazo padrão para comandos e execuções de prompt no OMP.
+///
+/// Comandos locais como `/compact` ou operações longas não podem herdar o prazo
+/// curto de ACK (10s), que expira durante trabalho legítimo. Este prazo longo é
+/// finito e cancelável.
+const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Quanto esperar o `{"type":"ready"}` do `omp` antes de desistir.
 ///
@@ -169,6 +177,7 @@ impl Default for OmpHarness {
             env: None,
             handshake_timeout: handshake_timeout_from_env(),
             request_timeout: Duration::from_secs(10),
+            prompt_timeout: DEFAULT_PROMPT_TIMEOUT,
         }
     }
 }
@@ -201,6 +210,11 @@ impl OmpHarness {
     pub fn with_timeouts(mut self, handshake: Duration, request: Duration) -> Self {
         self.handshake_timeout = handshake;
         self.request_timeout = request;
+        self
+    }
+
+    pub fn with_prompt_timeout(mut self, timeout: Duration) -> Self {
+        self.prompt_timeout = timeout;
         self
     }
 
@@ -339,7 +353,7 @@ impl Harness for OmpHarness {
         let setup = async {
             if !process.capabilities().live_voice {
                 return Err(HarnessError::Unsupported(
-                    "installed OMP does not support Live Voice; update OMP".into(),
+                    "this OMP's ready frame has no Live Voice capability".into(),
                 ));
             }
             if let Some(session_path) = request.resume.as_deref() {
@@ -486,8 +500,6 @@ impl Harness for OmpHarness {
         if !images.is_empty() {
             prompt["images"] = Value::Array(images);
         }
-        let prompt_response = process.request(prompt).await?;
-
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         event_tx
             .send(Ok(AgentEvent::SessionStarted {
@@ -500,32 +512,19 @@ impl Harness for OmpHarness {
             }))
             .await
             .map_err(|_| HarnessError::Protocol("OMP event consumer closed".into()))?;
-        if prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
-            event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Completed,
-                    result: None,
-                    error: None,
-                    session_id: Some(session_id),
-                }))
-                .await
-                .ok();
-            if let Some(workers) = workers {
-                let _ = workers.shutdown().await;
-            }
-            let _ = process.shutdown().await;
-        } else {
-            tokio::spawn(run_session(
-                process,
-                events,
-                event_tx,
-                controls,
-                workers,
-                request.cwd,
-                model,
-                session_id,
-            ));
-        }
+
+        tokio::spawn(run_session(
+            process,
+            events,
+            event_tx,
+            controls,
+            workers,
+            request.cwd,
+            model,
+            session_id,
+            prompt,
+            self.prompt_timeout,
+        ));
 
         Ok(
             futures::stream::unfold(event_rx, |mut receiver| async move {
@@ -808,6 +807,52 @@ fn context_usage_from_state(state: &Value) -> Option<zeron_proto::ContextUsage> 
     })
 }
 
+fn user_steering_text(frame: &Value) -> Option<String> {
+    if frame.get("type").and_then(Value::as_str) != Some("message_start") {
+        return None;
+    }
+    let message = frame.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if message.get("steering").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    let mut text = String::new();
+    for part in message.get("content")?.as_array()? {
+        if part.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(piece) = part.get("text").and_then(Value::as_str)
+        {
+            text.push_str(piece);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn dispatch_steer(
+    process: OmpProcess,
+    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    prompt: String,
+    failed: mpsc::UnboundedSender<String>,
+) {
+    tokio::spawn(async move {
+        match process
+            .request(json!({ "type": "steer", "message": prompt }))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = failed.send(prompt);
+                let message = protocol::sanitize_diagnostic(&error.to_string());
+                let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+            }
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     process: OmpProcess,
@@ -818,6 +863,8 @@ async fn run_session(
     cwd: String,
     model: String,
     mut session_id: String,
+    prompt: Value,
+    prompt_timeout: Duration,
 ) {
     let RunControls {
         request_input,
@@ -833,9 +880,63 @@ async fn run_session(
     let mut pending_agent_end: Option<Value> = None;
     let mut steering_open = true;
     let mut finished = false;
+    let mut queued_steers: VecDeque<SteerMessage> = VecDeque::new();
+    let mut in_flight_steers: Vec<(String, Option<String>)> = Vec::new();
+    let mut delivering: HashSet<String> = HashSet::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
+    let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
+
+    let prompt_fut = process.request_with_timeout(prompt, prompt_timeout);
+    tokio::pin!(prompt_fut);
+    let mut prompt_pending = true;
 
     while !finished {
         tokio::select! {
+            prompt_res = &mut prompt_fut, if prompt_pending => {
+                prompt_pending = false;
+                match prompt_res {
+                    Ok(prompt_response) => {
+                        if prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
+                            while let Ok(frame) = events.try_recv() {
+                                for event in normalizer.push(frame) {
+                                    if !emit(&event_tx, event).await {
+                                        finished = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !finished {
+                                let _ = emit(&event_tx, AgentEvent::Done {
+                                    status: DoneStatus::Completed,
+                                    result: None,
+                                    error: None,
+                                    session_id: Some(session_id.clone()),
+                                }).await;
+                            }
+                            finished = true;
+                        }
+                    }
+                    Err(err) => {
+                        while let Ok(frame) = events.try_recv() {
+                            for event in normalizer.push(frame) {
+                                if !emit(&event_tx, event).await {
+                                    break;
+                                }
+                            }
+                        }
+                        let message = err.to_string();
+                        let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
+                        let _ = emit(&event_tx, AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(message),
+                            session_id: Some(session_id.clone()),
+                        }).await;
+                        finished = true;
+                    }
+                }
+            }
             _ = event_tx.closed() => {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(500),
@@ -864,6 +965,7 @@ async fn run_session(
                     if resolution.cancel_host_input {
                         let _ = emit(&event_tx, AgentEvent::InputResolved {
                             request_id: resolution.id.clone(),
+                            answers: None,
                         }).await;
                     }
                     if let Err(error) = process.send_control(resolution.response) {
@@ -875,24 +977,82 @@ async fn run_session(
             steer = steering.recv(), if steering_open => {
                 match steer {
                     Some(SteerMessage { prompt, message_id }) => {
-                        let steer_process = process.clone();
-                        let steer_events = event_tx.clone();
-                        tokio::spawn(async move {
-                            match steer_process.request(json!({ "type": "steer", "message": prompt })).await {
-                                Ok(_) => {
-                                    let _ = emit(&steer_events, AgentEvent::Steered {
-                                        assistant_message_id: message_id,
-                                        next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
-                                    }).await;
-                                }
-                                Err(error) => {
-                                    let message = protocol::sanitize_diagnostic(&error.to_string());
-                                    let _ = emit(&steer_events, AgentEvent::Error { message }).await;
-                                }
-                            }
-                        });
+                        if delivering.is_empty() {
+                            in_flight_steers.push((prompt.clone(), message_id));
+                            dispatch_steer(
+                                process.clone(),
+                                event_tx.clone(),
+                                prompt,
+                                steer_failed_tx.clone(),
+                            );
+                        } else {
+                            queued_steers.push_back(SteerMessage { prompt, message_id });
+                        }
                     }
                     None => steering_open = false,
+                }
+            }
+            Some(failed_prompt) = steer_failed_rx.recv() => {
+                if let Some(index) = in_flight_steers
+                    .iter()
+                    .position(|(prompt, _)| prompt == &failed_prompt)
+                {
+                    in_flight_steers.remove(index);
+                }
+            }
+            Some((tool_id, outcome)) = tool_rx.recv() => {
+                if answered.contains(&tool_id) {
+                    delivering.remove(&tool_id);
+                    if delivering.is_empty() {
+                        while let Some(SteerMessage { prompt, message_id }) =
+                            queued_steers.pop_front()
+                        {
+                            in_flight_steers.push((prompt.clone(), message_id));
+                            dispatch_steer(
+                                process.clone(),
+                                event_tx.clone(),
+                                prompt,
+                                steer_failed_tx.clone(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                answered.insert(tool_id.clone());
+                let result = outcome.unwrap_or_else(|| {
+                    json!({
+                        "type": "host_tool_result",
+                        "id": tool_id,
+                        "result": { "content": [{ "type": "text", "text": "OMP host tool was cancelled" }] },
+                        "isError": true
+                    })
+                });
+                if let Err(error) = process.send_control(result) {
+                    let message = protocol::sanitize_diagnostic(&error.to_string());
+                    let fallback = json!({
+                        "type": "host_tool_result",
+                        "id": tool_id,
+                        "result": { "content": [{
+                            "type": "text",
+                            "text": "Workers result exceeded the OMP RPC frame budget"
+                        }] },
+                        "isError": true
+                    });
+                    if process.send_control(fallback).is_err() {
+                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                    }
+                }
+                delivering.remove(&tool_id);
+                if delivering.is_empty() {
+                    while let Some(SteerMessage { prompt, message_id }) = queued_steers.pop_front() {
+                        in_flight_steers.push((prompt.clone(), message_id));
+                        dispatch_steer(
+                            process.clone(),
+                            event_tx.clone(),
+                            prompt,
+                            steer_failed_tx.clone(),
+                        );
+                    }
                 }
             }
             frame = events.recv() => {
@@ -907,6 +1067,21 @@ async fn run_session(
                     }).await;
                     break;
                 };
+                if let Some(text) = user_steering_text(&frame)
+                    && let Some(index) = in_flight_steers
+                        .iter()
+                        .position(|(prompt, _)| prompt == &text)
+                {
+                    let (_, message_id) = in_flight_steers.remove(index);
+                    let _ = emit(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: message_id,
+                            next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
+                        },
+                    )
+                    .await;
+                }
                 match frame.get("type").and_then(Value::as_str) {
                     Some("host_tool_call") => {
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -914,38 +1089,24 @@ async fn run_session(
                         let arguments = frame.get("arguments").cloned().unwrap_or(Value::Null);
                         match &workers {
                             Some(workers) => match workers.begin_call(id, tool, arguments) {
-                                Ok(result) => {
-                                    let tool_process = process.clone();
-                                    let tool_events = event_tx.clone();
+                                Ok(receiver) => {
+                                    delivering.insert(id.to_owned());
+                                    let tool_id = id.to_owned();
+                                    let tool_tx = tool_tx.clone();
                                     tokio::spawn(async move {
-                                        if let Ok(result) = result.await {
-                                            let id = result
-                                                .get("id")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or_default()
-                                                .to_owned();
-                                            if let Err(error) = tool_process.send_control(result) {
-                                                let message = protocol::sanitize_diagnostic(&error.to_string());
-                                                let fallback = json!({
-                                                    "type": "host_tool_result",
-                                                    "id": id,
-                                                    "result": { "content": [{
-                                                        "type": "text",
-                                                        "text": "Workers result exceeded the OMP RPC frame budget"
-                                                    }] },
-                                                    "isError": true
-                                                });
-                                                if tool_process.send_control(fallback).is_err() {
-                                                    let _ = emit(&tool_events, AgentEvent::Error { message }).await;
-                                                }
-                                            }
-                                        }
+                                        let outcome = receiver.await.ok();
+                                        let _ = tool_tx.send((tool_id, outcome));
                                     });
                                 }
                                 Err(result) => {
-                                    if let Err(error) = process.send_control(result) {
-                                        let message = protocol::sanitize_diagnostic(&error.to_string());
-                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                                    if answered.insert(id.to_owned()) {
+                                        if let Err(error) = process.send_control(result) {
+                                            let message = protocol::sanitize_diagnostic(
+                                                &error.to_string(),
+                                            );
+                                            let _ = emit(&event_tx, AgentEvent::Error { message })
+                                                .await;
+                                        }
                                     }
                                 }
                             },
@@ -982,6 +1143,7 @@ async fn run_session(
                                 token.cancel();
                                 let _ = emit(&event_tx, AgentEvent::InputResolved {
                                     request_id: target_id.to_owned(),
+                            answers: None,
                                 }).await;
                             }
                         } else if matches!(method, "select" | "confirm" | "input" | "editor") {
@@ -993,6 +1155,7 @@ async fn run_session(
                                         let _ = process.send_control(cancelled_interactive_response(&id, false));
                                         let _ = emit(&event_tx, AgentEvent::InputResolved {
                                             request_id: id.clone(),
+                            answers: None,
                                         }).await;
                                         let _ = emit(&event_tx, AgentEvent::Error { message }).await;
                                     } else if pending_interactive.len() >= MAX_PENDING_INTERACTIVE_REQUESTS {

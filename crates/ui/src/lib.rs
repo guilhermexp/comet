@@ -16,6 +16,7 @@ pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
 pub mod badges;
+pub mod browser;
 mod capture;
 pub mod change_requests;
 pub mod changes;
@@ -42,6 +43,7 @@ pub mod motion;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
+mod questions;
 pub mod rail;
 pub mod settings;
 pub mod shell;
@@ -51,6 +53,7 @@ pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
 pub mod theme_library;
+pub mod toast;
 pub mod tool_icons;
 pub mod trajectory;
 pub mod transcript;
@@ -163,6 +166,13 @@ pub fn run_app(config: UiConfig) {
             ui_settings.theme_selection,
             ui_settings.accent,
             ui_settings.surface,
+            cx,
+        );
+        history::init(
+            ui_settings.git_history_columns,
+            ui_settings.git_history_column_widths,
+            ui_settings.git_history_column_order,
+            ui_settings.git_history_author_display,
             cx,
         );
         composer::init(cx);
@@ -297,3 +307,5 @@ fn open_main_window(
     .detach();
     appearance::reapply_window_background(cx);
 }
+
+mod surface_chrome;

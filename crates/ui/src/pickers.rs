@@ -434,16 +434,67 @@ pub enum PickerKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerFooterControl {
     Model,
-    Branch,
 }
 
-fn composer_footer_right_order() -> [ComposerFooterControl; 2] {
-    [ComposerFooterControl::Model, ComposerFooterControl::Branch]
+/// The (device, repo path, chat) a `ListRefs` answer belongs to.
+///
+/// Path alone is not a key: the same absolute path on the local machine and
+/// on a remote space host are two different repos. The chat is part of it too
+/// because the rows carry live checkout state (`current`, `worktreePath`)
+/// that another chat's session may have moved or removed since.
+type RefsKey = (Option<String>, String, Option<String>);
+
+/// The key the refs slot has to answer for: the sidebar's live repo target
+/// when one is set, else the selected space's folder (`git_space`, passed
+/// only when it IS a repo). `None` = nothing gitful in scope, nothing to list.
+fn refs_target_key(
+    target: Option<&RepoTarget>,
+    git_space: Option<(&str, &str)>,
+) -> Option<RefsKey> {
+    match target {
+        Some(t) => Some((t.device_id.clone(), t.path.clone(), t.chat_id.clone())),
+        None => git_space.map(|(device, path)| (Some(device.to_string()), path.to_string(), None)),
+    }
 }
 
-fn composer_footer_right(model_controls: AnyElement, branch_control: AnyElement) -> gpui::Div {
+/// What [`Pickers::ensure_refs`] must do with the refs slot.
+#[derive(Debug, PartialEq, Eq)]
+enum RefsFetch {
+    /// The slot already answers for this key (loaded, or in flight).
+    Skip,
+    /// Call `ListRefs`. `keep_rows` leaves the rows on screen while it runs —
+    /// only ever a forced refresh of the SAME key; rows listed for another
+    /// key must go, or a reader would resolve this target's checkout against
+    /// another repo/device/chat's refs.
+    Reload { keep_rows: bool },
+}
+
+fn refs_fetch(
+    loaded: Option<&RefsKey>,
+    slot: &Loadable<Vec<RepoRef>>,
+    key: &RefsKey,
+    force: bool,
+) -> RefsFetch {
+    if loaded != Some(key) {
+        return RefsFetch::Reload { keep_rows: false };
+    }
+    match slot {
+        Loadable::Loading => RefsFetch::Skip, // already in flight for this key
+        Loadable::Idle => RefsFetch::Reload { keep_rows: false },
+        // Ready/Error for this key: only an explicit refresh reloads.
+        _ if force => RefsFetch::Reload {
+            keep_rows: matches!(slot, Loadable::Ready(_)),
+        },
+        _ => RefsFetch::Skip,
+    }
+}
+
+fn composer_footer_right_order() -> [ComposerFooterControl; 1] {
+    [ComposerFooterControl::Model]
+}
+
+fn composer_footer_right(model_controls: AnyElement) -> gpui::Div {
     let mut model_controls = Some(model_controls);
-    let mut branch_control = Some(branch_control);
     composer_footer_right_order().into_iter().fold(
         div()
             .flex()
@@ -455,12 +506,19 @@ fn composer_footer_right(model_controls: AnyElement, branch_control: AnyElement)
             ComposerFooterControl::Model => {
                 row.child(model_controls.take().expect("one model control"))
             }
-            ComposerFooterControl::Branch => {
-                row.child(branch_control.take().expect("one branch control"))
-            }
         },
     )
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoTarget {
+    pub path: String,
+    pub device_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub branch: Option<String>,
+}
+
+pub(crate) struct ReturnComposerFocus;
+impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
 
 pub struct Pickers {
     state: Entity<AppState>,
@@ -476,6 +534,7 @@ pub struct Pickers {
     draft_owner: Option<String>,
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
+    pub active_repo_target: Option<RepoTarget>,
     open: popover::Popup<PickerKind>,
     /// The harness/model picker's rail selection (favorites vs the effective
     /// harness's list). Re-primed on every open.
@@ -483,8 +542,11 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     refs: Loadable<Vec<RepoRef>>,
-    /// Space id the `refs` slot belongs to (invalidated on space change).
-    refs_space: Option<String>,
+    /// Key the `refs` slot was listed for (see [`RefsKey`]). The slot is
+    /// shared by the composer draft and the sidebar's workspace widget, so a
+    /// question about any other key reloads instead of being answered with
+    /// another repo's, device's or chat's rows.
+    refs_key: Option<RefsKey>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view.
@@ -565,6 +627,10 @@ impl Pickers {
             let selected = state.read(cx).selected_chat.clone();
             if selected != this.draft_owner {
                 this.draft_owner = selected;
+                // The sidebar's repo target belonged to the PREVIOUS chat; a
+                // pick made after the switch must not switch that chat's ref.
+                // (The sidebar writes the new one during its next render.)
+                this.active_repo_target = None;
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
@@ -579,7 +645,7 @@ impl Pickers {
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
-                this.refs_space = None;
+                this.refs_key = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -651,7 +717,8 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             refs: Loadable::Idle,
-            refs_space: None,
+            active_repo_target: None,
+            refs_key: None,
             active: 0,
             model_scroll: gpui::UniformListScrollHandle::new(),
             model_rows_cache: std::cell::RefCell::new(None),
@@ -857,10 +924,19 @@ impl Pickers {
 
     /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
+        if self.is_open() {
+            cx.emit(ReturnComposerFocus);
+        }
+        self.dismiss(cx);
+    }
+
+    /// Outside clicks and navigation keep focus at the clicked destination.
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.model_bar = popover::MenuScrollbarState::default();
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
+        cx.notify();
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
@@ -900,6 +976,9 @@ impl Pickers {
         let pressed_open = self.open.take_press_was_open();
         if self.open_kind() == Some(kind) || pressed_open {
             self.animate_close(cx);
+            if pressed_open {
+                cx.emit(ReturnComposerFocus);
+            }
             cx.notify();
             return;
         }
@@ -1174,52 +1253,54 @@ impl Pickers {
         .detach();
     }
 
-    /// ListRefs for the selected SPACE's folder — targeted at the space's
-    /// device (relay-forwarded when remote), keyed/invalidated by space id.
-    /// Rows carry checkout state (`current`, `worktreePath`) so the picker can
-    /// tag refs and the checkout-kind selector can offer worktree reuse.
+    /// ListRefs for the repo in scope — the sidebar's
+    /// [`Self::active_repo_target`] when one is set, else the selected
+    /// SPACE's folder — targeted at that repo's device (relay-forwarded when
+    /// remote). Rows carry checkout state (`current`, `worktreePath`) so the
+    /// picker can tag refs and the checkout-kind selector can offer worktree
+    /// reuse.
+    ///
+    /// The slot is keyed by [`RefsKey`] — the space's folder IS the target
+    /// path the sidebar passes for that space, so both surfaces share one
+    /// load; any other key reloads and drops the stale rows, so no reader can
+    /// resolve one target's checkout against another target's refs.
     fn ensure_refs(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
+        // The space is only consulted when there is no live target.
+        let space = self
+            .active_repo_target
+            .is_none()
+            .then(|| self.state.read(cx).selected_space_row().cloned())
+            .flatten()
+            .filter(|space| space.git_detected);
+        let Some(key) = refs_target_key(
+            self.active_repo_target.as_ref(),
+            space
+                .as_ref()
+                .map(|s| (s.device_id.as_str(), s.path.as_str())),
+        ) else {
             return;
         };
-        if !space.git_detected {
+        let RefsFetch::Reload { keep_rows } =
+            refs_fetch(self.refs_key.as_ref(), &self.refs, &key, force)
+        else {
             return;
-        }
-        let fresh = self.refs_space.as_deref() == Some(space.id.as_str());
-        if fresh && matches!(self.refs, Loadable::Loading) {
-            return; // a load is already in flight
-        }
-        // Non-forced (the footer's eager kick, re-run every render) only loads
-        // from Idle: an Error must WAIT for an explicit retry/reopen (force),
-        // or re-render would flip Error back to Loading before the retry row
-        // ever paints — an eternal skeleton plus an RPC storm (user report:
-        // "the ref dropdown never loads anything").
-        if !force && fresh && !matches!(self.refs, Loadable::Idle) {
-            return;
-        }
+        };
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
-        // Stale-while-revalidate: a forced refresh of an already-loaded space
-        // keeps the current rows on screen while the reload runs — a send that
-        // just minted a worktree (or a terminal-side branch) appears on the
-        // popover's next open without the list ever flashing to a skeleton.
-        if !(force && fresh && matches!(self.refs, Loadable::Ready(_))) {
+        if !keep_rows {
             self.refs = Loadable::Loading;
         }
-        self.refs_space = Some(space.id.clone());
+        let (device_id, repo_path, _) = key.clone();
+        self.refs_key = Some(key);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
-            params.insert(
-                "repoPath".into(),
-                serde_json::Value::String(space.path.clone()),
-            );
-            if local.as_deref() != Some(space.device_id.as_str()) {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(space.device_id.clone()),
-                );
+            params.insert("repoPath".into(), serde_json::Value::String(repo_path));
+            if let Some(dev) = device_id
+                && local.as_deref() != Some(dev.as_str())
+            {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(dev));
             }
             let result = engine
                 .client()
@@ -1233,8 +1314,6 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                // Rows landed under an open, un-searched popover: re-home the
-                // nav highlight to the selected row.
                 if pickers.open_kind() == Some(PickerKind::Branch)
                     && pickers.search.read(cx).text().is_empty()
                 {
@@ -1249,31 +1328,243 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Refs are fixed at creation: an existing session can never move
-        // (wing's rule — the footer renders read-only labels there, so this
-        // is a belt-and-braces guard).
-        if self.state.read(cx).selected_chat_row().is_some() {
+        if let Some(target) = self.active_repo_target.clone() {
+            if let Some(chat_id) = &target.chat_id {
+                let now = chrono::Utc::now();
+                if self.state.read(cx).indicator_for(chat_id, now)
+                    == zeron_proto::view::Indicator::Working
+                {
+                    self.switch_error =
+                        Some("Cannot switch branches while the agent is working".into());
+                    cx.notify();
+                    return;
+                }
+                if let Some(worktree_path) = &row.worktree_path {
+                    self.switch_live_worktree(chat_id, worktree_path, &row.name, cx);
+                } else {
+                    self.switch_live_ref(chat_id, &target.path, &row.name, cx);
+                }
+            } else {
+                self.switch_repo_ref(&target.path, target.device_id.as_deref(), &row.name, cx);
+            }
             return;
         }
+
+        if let Some(chat) = self.state.read(cx).selected_chat_row().cloned() {
+            let now = chrono::Utc::now();
+            if self.state.read(cx).indicator_for(&chat.id, now)
+                == zeron_proto::view::Indicator::Working
+            {
+                self.switch_error =
+                    Some("Cannot switch branches while the agent is working".into());
+                cx.notify();
+                return;
+            }
+            if let Some(worktree_path) = &row.worktree_path {
+                self.switch_live_worktree(&chat.id, worktree_path, &row.name, cx);
+            } else {
+                let repo_path = chat.cwd.clone().or_else(|| {
+                    self.state
+                        .read(cx)
+                        .selected_space_row()
+                        .map(|s| s.path.clone())
+                });
+                if let Some(repo_path) = repo_path {
+                    self.switch_live_ref(&chat.id, &repo_path, &row.name, cx);
+                }
+            }
+            return;
+        }
+
         if row.worktree_path.is_some() {
-            // Reuse the ref's existing worktree ("Current worktree") — the
-            // t3code `reuseExistingWorktree` path.
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
-            // Base pick for a new worktree, or the already-current ref.
             self.config.branch = Some(row.name.clone());
         } else {
-            // Local mode + a plain non-current ref: CHECK OUT the space
-            // folder (full t3code `switchRef` — picking `main` means "put my
-            // local checkout on main", it must never flip the mode).
             self.switch_draft_ref(row, cx);
             return;
         }
         self.animate_close(cx);
         cx.notify();
     }
+    fn switch_live_ref(
+        &mut self,
+        chat_id: &str,
+        repo_path: &str,
+        ref_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let target_device_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|c| c.device_id.clone());
+        let local = self.state.read(cx).local_device_id.clone();
+        self.switch_error = None;
+        self.switching = Some(ref_name.to_string());
+        let ref_name = ref_name.to_string();
+        let repo_path = repo_path.to_string();
+        let chat_id = chat_id.to_string();
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(repo_path));
+            params.insert(
+                "refName".into(),
+                serde_json::Value::String(ref_name.clone()),
+            );
+            if let Some(target) = target_device_id
+                && local.as_deref() != Some(target.as_str())
+            {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::SWITCH_REF, serde_json::Value::Object(params))
+                .await;
+            match result {
+                Ok(_) => {
+                    let mutate_params = serde_json::json!({
+                        "op": "setChatBranch",
+                        "chatId": chat_id,
+                        "branch": ref_name,
+                    });
+                    let _ = engine.client().call(methods::MUTATE, mutate_params).await;
+                    this.update(cx, |pickers, cx| {
+                        pickers.switching = None;
+                        pickers.config.branch = Some(ref_name);
+                        pickers.animate_close(cx);
+                        pickers.ensure_refs(true, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(err) => {
+                    this.update(cx, |pickers, cx| {
+                        pickers.switching = None;
+                        pickers.switch_error = Some(err.to_string());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+        cx.notify();
+    }
 
+    fn switch_live_worktree(
+        &mut self,
+        chat_id: &str,
+        worktree_path: &str,
+        ref_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.switch_error = None;
+        self.switching = Some(ref_name.to_string());
+        let ref_name = ref_name.to_string();
+        let worktree_path = worktree_path.to_string();
+        let chat_id = chat_id.to_string();
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mutate_cwd = serde_json::json!({
+                "op": "setChatCwd",
+                "chatId": chat_id,
+                "cwd": worktree_path,
+            });
+            let res = engine.client().call(methods::MUTATE, mutate_cwd).await;
+            if let Err(err) = res {
+                this.update(cx, |pickers, cx| {
+                    pickers.switching = None;
+                    pickers.switch_error = Some(err.to_string());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            let mutate_branch = serde_json::json!({
+                "op": "setChatBranch",
+                "chatId": chat_id,
+                "branch": ref_name,
+            });
+            let _ = engine.client().call(methods::MUTATE, mutate_branch).await;
+            this.update(cx, |pickers, cx| {
+                pickers.switching = None;
+                pickers.config.branch = Some(ref_name);
+                pickers.animate_close(cx);
+                pickers.ensure_refs(true, cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+    fn switch_repo_ref(
+        &mut self,
+        repo_path: &str,
+        target_device_id: Option<&str>,
+        ref_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        self.switch_error = None;
+        self.switching = Some(ref_name.to_string());
+        let ref_name = ref_name.to_string();
+        let repo_path = repo_path.to_string();
+        let target_device_id = target_device_id.map(str::to_string);
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(repo_path));
+            params.insert(
+                "refName".into(),
+                serde_json::Value::String(ref_name.clone()),
+            );
+            if let Some(target) = target_device_id
+                && local.as_deref() != Some(target.as_str())
+            {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::SWITCH_REF, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |pickers, cx| {
+                pickers.switching = None;
+                match result {
+                    Ok(_) => {
+                        if let Some(target) = pickers.active_repo_target.as_mut() {
+                            target.branch = Some(ref_name.clone());
+                        }
+                        pickers.config.branch = Some(ref_name);
+                        pickers.animate_close(cx);
+                        pickers.ensure_refs(true, cx);
+                    }
+                    Err(err) => {
+                        pickers.switch_error = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
     /// Draft-mode checkout switch: `git checkout` in the SPACE's folder
     /// (relay-forwarded for remote spaces). Success records the pick and
     /// refreshes tags; failure keeps the popover open with git's message.
@@ -1369,26 +1660,58 @@ impl Pickers {
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
         // a model is the expected flow. Esc, click-out, or the chip close it.
+        // Every explicit pick becomes the next Chat's last-used model,
+        // including picks made inside an existing Chat. Keep the opaque id:
+        // the same model offered by different providers is a different choice.
+        // The model in force until this click — the transcript marker names it.
+        let previous = self.selected_model(cx).cloned();
+        if let Some(harness) = self.effective_harness(cx) {
+            let label = self
+                .models
+                .get(&harness)
+                .and_then(|l| l.ready())
+                .and_then(|models| models.iter().find(|m| m.id == model_id))
+                .map(|m| m.label.clone())
+                .unwrap_or_else(|| model_id.clone());
+            if let Some(previous) = previous.filter(|p| p.id != model_id) {
+                self.note_model_switch(&previous.label, &label, cx);
+            }
+            self.defaults
+                .remember_model(harness, model_id.clone(), label);
+            self.save_defaults();
+        }
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
         } else {
-            // New chat: draft pick + sticky last-used memory for this harness.
-            self.config.model = Some(model_id.clone());
-            if let Some(harness) = self.effective_harness(cx) {
-                let label = self
-                    .models
-                    .get(&harness)
-                    .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
-                    .map(|m| m.label.clone())
-                    .unwrap_or_else(|| model_id.clone());
-                self.defaults.remember_model(harness, model_id, label);
-                self.save_defaults();
-            }
+            self.config.model = Some(model_id);
         }
         cx.notify();
+    }
+
+    /// Leave the model change visible in the transcript itself (the engine
+    /// skips a chat with no entries yet). Fire-and-forget: the marker is a
+    /// note, never a gate on the pick.
+    fn note_model_switch(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let params = serde_json::json!({
+            "op": "noteModelSwitch",
+            "chatId": chat_id,
+            "from": from,
+            "to": to,
+        });
+        cx.spawn(async move |_, _| {
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                tracing::warn!(error = %err, "noteModelSwitch mutate failed");
+            }
+        })
+        .detach();
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
@@ -1664,10 +1987,15 @@ impl Pickers {
     fn selected_ref_index(&self, cx: &App) -> usize {
         let rows = self.filtered_ref_rows(cx);
         let selected = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.branch.clone())
+            .active_repo_target
+            .as_ref()
+            .and_then(|t| t.branch.clone())
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .selected_chat_row()
+                    .and_then(|c| c.branch.clone())
+            })
             .or_else(|| self.config.branch.clone());
         let index = match selected {
             Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
@@ -1730,17 +2058,6 @@ impl Pickers {
             }
         }
     }
-
-    /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
-    /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
-    fn ref_label(&self) -> SharedString {
-        match (self.config.checkout, self.effective_ref_name()) {
-            (_, None) => SharedString::from("Select ref"),
-            (CheckoutKind::NewWorktree, Some(name)) => SharedString::from(format!("From {name}")),
-            (CheckoutKind::Local, Some(name)) => SharedString::from(name),
-        }
-    }
-
     // ---- the space picker (new-session canvas) ----
 
     /// The picker's project rows: scoped to the canvas's device — the device
@@ -2002,7 +2319,7 @@ impl Pickers {
         let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
             .id("project-new")
             .on_click(cx.listener(|this, _, window, cx| {
-                this.close(cx);
+                this.dismiss(cx);
                 window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
             }))
             .child(
@@ -2418,6 +2735,7 @@ impl Pickers {
     pub fn render_footer(
         &mut self,
         window: &mut Window,
+        context_indicator: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -2482,20 +2800,7 @@ impl Pickers {
             } else {
                 div()
             };
-            let branch_control = git_space
-                .map(|_| {
-                    Self::footer_label(
-                        crate::icons::GIT_BRANCH,
-                        chat.branch
-                            .clone()
-                            .map(SharedString::from)
-                            .unwrap_or_else(|| SharedString::from("No ref")),
-                        &theme,
-                    )
-                    .into_any_element()
-                })
-                .unwrap_or_else(|| div().into_any_element());
-            let branch_control = div()
+            let right_cluster = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2509,15 +2814,17 @@ impl Pickers {
                         &theme,
                     ))
                 })
-                .child(branch_control)
-                .into_any_element();
-            let right = composer_footer_right(model_controls, branch_control);
-            return Some(row().child(left).child(right).into_any_element());
+                .child(composer_footer_right(model_controls))
+                .when_some(context_indicator, |el, indicator| el.child(indicator));
+            return Some(row().child(left).child(right_cluster).into_any_element());
         }
 
         // New-session draft: checkout stays left; model + effort + optional
         // ref form the right context cluster. Device + project live above the
         // pill now.
+        // No target juggling here: `active_repo_target` is dropped where the
+        // selection changes (the state observer), not per-render — the
+        // sidebar re-renders after the composer and would just write it back.
         let git = space.as_ref().is_some_and(|s| s.git_detected);
         // Refs feed the draft labels — eager + idempotent.
         if git {
@@ -2526,10 +2833,6 @@ impl Pickers {
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = if git {
             match self.mounted_kind() {
-                Some(PickerKind::Branch) => {
-                    let content = self.render_branch_popover(cx);
-                    Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
-                }
                 Some(PickerKind::Checkout) => {
                     let content = self.render_checkout_popover(cx);
                     Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
@@ -2570,27 +2873,8 @@ impl Pickers {
         } else {
             div()
         };
-        let branch_control = if git {
-            let ref_chip = self.footer_chip(
-                PickerKind::Branch,
-                "picker-branch",
-                crate::icons::GIT_BRANCH,
-                self.ref_label(),
-                &theme,
-                cx,
-            );
-            attach_overlay_end(
-                ref_chip,
-                &mut overlay,
-                PickerKind::Branch,
-                "branch-popover",
-                closing,
-            )
-            .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-        let right = composer_footer_right(model_controls, branch_control);
+        let right = composer_footer_right(model_controls)
+            .when_some(context_indicator, |el, indicator| el.child(indicator));
         Some(row().child(left).child(right).into_any_element())
     }
 
@@ -2606,7 +2890,20 @@ impl Pickers {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx)
             }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.is_open() && !this.focus.contains_focused(window, cx) {
+                        window.focus(&this.focus, cx);
+                    }
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss(cx);
+                if this.focus.contains_focused(window, cx) {
+                    window.blur();
+                }
+            }))
             .flex()
             .flex_col()
             .child(content)
@@ -2631,7 +2928,20 @@ impl Pickers {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx)
             }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.is_open() && !this.focus.contains_focused(window, cx) {
+                        window.focus(&this.focus, cx);
+                    }
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss(cx);
+                if this.focus.contains_focused(window, cx) {
+                    window.blur();
+                }
+            }))
             .flex()
             .flex_col()
             .child(content)
@@ -2780,7 +3090,9 @@ impl Pickers {
     /// "Showing X of Y refs" footer when the list is capped.
     fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        if self.state.read(cx).selected_space_row().is_none() {
+        let has_repo =
+            self.active_repo_target.is_some() || self.state.read(cx).selected_space_row().is_some();
+        if !has_repo {
             return div()
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
@@ -2791,14 +3103,17 @@ impl Pickers {
         let rows = self.filtered_ref_rows(cx);
         let total = rows.len();
         let shown = total.min(MAX_REF_ROWS);
-        // Existing session: the highlighted row is the SESSION's branch and a
-        // pick switches the checkout (see `pick_ref`); a new chat highlights
-        // the draft pick.
+        // Existing session or active target branch:
         let session_branch = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.branch.clone());
+            .active_repo_target
+            .as_ref()
+            .and_then(|t| t.branch.clone())
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .selected_chat_row()
+                    .and_then(|c| c.branch.clone())
+            });
         let switching = self.switching.clone();
         let body: AnyElement =
             match &self.refs {
@@ -2813,7 +3128,7 @@ impl Pickers {
                     .p(px(Theme::SPACE_SM))
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from("No refs found."))
+                    .child(SharedString::from("No branches found."))
                     .into_any_element(),
                 Loadable::Ready(_) => {
                     let active = self.active;
@@ -2823,22 +3138,18 @@ impl Pickers {
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
-                        .max_h(px(224.0))
+                        .max_h(px(260.0))
                         .overflow_y_scroll()
                         .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
                             |(ix, row)| {
                                 let label: SharedString = row.name.clone().into();
                                 let is_selected = selected.as_deref() == Some(row.name.as_str());
-                                // Right-aligned muted tag (t3code `text-[10px]
-                                // text-muted-foreground/45`): current beats worktree.
-                                let tag: Option<&'static str> = if row.current {
-                                    Some("current")
-                                } else if row.worktree_path.is_some() {
-                                    Some("worktree")
-                                } else {
-                                    None
-                                };
+                                let is_remote = row.is_remote.unwrap_or(false);
+                                let is_default = row.is_default.unwrap_or(false);
+                                let is_current = row.current || is_selected;
+                                let is_worktree = row.worktree_path.is_some() && !row.current;
                                 let is_switching = switching.as_deref() == Some(row.name.as_str());
+
                                 popover::menu_row_nav(
                                     &theme,
                                     is_selected,
@@ -2850,6 +3161,12 @@ impl Pickers {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_ref(row.clone(), cx);
                                 }))
+                                .child(
+                                    crate::icons::icon(crate::icons::GIT_BRANCH)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted)
+                                        .flex_none(),
+                                )
                                 .child(div().flex_1().min_w_0().truncate().child(label))
                                 .when(is_switching, |el| {
                                     el.child(
@@ -2860,13 +3177,56 @@ impl Pickers {
                                             .child(SharedString::from("switching…")),
                                     )
                                 })
-                                .when_some(tag, |el, tag| {
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .px(px(4.5))
+                                        .py(px(1.0))
+                                        .rounded(px(3.0))
+                                        .when(is_remote, |el| {
+                                            el.bg(gpui::rgba(0xf973161a))
+                                                .text_color(gpui::rgb(0xf97316))
+                                                .child(SharedString::from("remote"))
+                                        })
+                                        .when(!is_remote, |el| {
+                                            el.bg(gpui::rgba(0x3b82f61a))
+                                                .text_color(gpui::rgb(0x3b82f6))
+                                                .child(SharedString::from("local"))
+                                        }),
+                                )
+                                .when(is_default, |el| {
                                     el.child(
                                         div()
                                             .flex_none()
                                             .text_size(px(10.0))
-                                            .text_color(theme.text_muted.opacity(0.45))
-                                            .child(SharedString::from(tag)),
+                                            .px(px(4.0))
+                                            .py(px(1.0))
+                                            .rounded(px(3.0))
+                                            .bg(theme.ink(0.08))
+                                            .text_color(theme.text_muted.opacity(0.8))
+                                            .child(SharedString::from("default")),
+                                    )
+                                })
+                                .when(is_worktree, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.0))
+                                            .px(px(4.0))
+                                            .py(px(1.0))
+                                            .rounded(px(3.0))
+                                            .bg(theme.ink(0.08))
+                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .child(SharedString::from("worktree")),
+                                    )
+                                })
+                                .when(is_current, |el| {
+                                    el.child(
+                                        crate::icons::icon(crate::icons::CHECK)
+                                            .size(px(12.0))
+                                            .text_color(theme.text)
+                                            .flex_none(),
                                     )
                                 })
                             },
@@ -2908,6 +3268,101 @@ impl Pickers {
             );
         }
         popover.into_any_element()
+    }
+    pub fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open.open(PickerKind::Branch);
+        self.search_reset_muted = true;
+        self.search.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder("Search branches…", cx);
+        });
+        let handle = self.search.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.active = self.selected_ref_index(cx);
+        self.switch_error = None;
+        self.ensure_refs(true, cx);
+    }
+
+    /// Interactive branch switcher control for the Details Sidebar Workspace widget.
+    pub fn render_workspace_branch_control(
+        &mut self,
+        target: RepoTarget,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let closing = self.open.closing_since();
+        let kind = PickerKind::Branch;
+
+        // This is the live target every branch pick applies to while the
+        // widget is on screen. No manual invalidation: the refs slot is keyed
+        // by device+path+chat, so a moved target reloads on its own (and a
+        // slot loaded for another key is dropped instead of answering here).
+        self.active_repo_target = Some(target.clone());
+        if !disabled {
+            self.ensure_refs(false, cx);
+        }
+
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+            Some(PickerKind::Branch) => {
+                let content = self.render_branch_popover(cx);
+                Some((PickerKind::Branch, self.popover_frame(290.0, content, cx)))
+            }
+            _ => None,
+        };
+
+        let label: SharedString = target
+            .branch
+            .clone()
+            .or_else(|| self.config.branch.clone())
+            .unwrap_or_else(|| "—".to_string())
+            .into();
+        let id = "workspace-branch-trigger";
+        let trigger = div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .py(px(2.0))
+            .text_size(px(12.0))
+            .text_color(theme.text)
+            .when(disabled, |el| el.cursor_default().opacity(0.5))
+            .when(!disabled, |el| {
+                el.cursor_pointer()
+                    .hover(|style| style.text_color(theme.accent))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, _| {
+                            this.open.note_trigger_press_matching(|open| *open == kind)
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle(kind, window, cx);
+                    }))
+            })
+            .child(div().max_w(px(180.0)).truncate().child(label))
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                    .size(px(11.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .flex_none(),
+            );
+
+        if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
+            && let Some((_, element)) = overlay.take()
+        {
+            return trigger
+                .relative()
+                .child(popover::anchored_menu_below(
+                    "branch-popover",
+                    element,
+                    closing,
+                ))
+                .into_any_element();
+        }
+
+        trigger.into_any_element()
     }
 
     /// The checkout-kind dropdown (t3code BranchToolbarEnvModeSelector): two
@@ -3984,6 +4439,18 @@ impl Pickers {
             }
         }
 
+        if self.is_open() {
+            let search = self.search.focus_handle(cx);
+            let frame = self.focus.clone();
+            window.defer(cx, move |window, cx| {
+                // Loading, empty, and error states can omit the search box.
+                // Keep Escape/arrow keys on the mounted menu in those states.
+                if search.is_focused(window) && !frame.contains(&search, window) {
+                    window.focus(&frame, cx);
+                }
+            });
+        }
+
         // Eager-load the harness catalog + every offered harness's models so
         // the chip reads "Fable 5" (a concrete pick) before any popover
         // opens, and rail switches inside the picker are instant.
@@ -4137,7 +4604,137 @@ impl Render for Pickers {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn picker_completion_and_dismissal_have_distinct_focus_behavior(cx: &mut gpui::TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        let returned = Rc::new(Cell::new(0));
+        let observed = returned.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(
+                &handle.entity(cx).unwrap(),
+                move |_, _: &ReturnComposerFocus, _| observed.set(observed.get() + 1),
+            )
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.open.open(PickerKind::Checkout);
+                pickers.pick_checkout(CheckoutKind::Local, cx);
+            })
+            .unwrap();
+        assert_eq!(returned.get(), 1);
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.open.open(PickerKind::HarnessModel);
+                pickers.pick_model("test-model".into(), cx);
+                assert!(
+                    pickers.is_open(),
+                    "model options remain available after a selection"
+                );
+                pickers.dismiss(cx);
+            })
+            .unwrap();
+        assert_eq!(
+            returned.get(),
+            1,
+            "outside clicks must not request composer focus"
+        );
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.open.open(PickerKind::Checkout);
+                pickers.open.note_trigger_press();
+                pickers.dismiss(cx); // Capture closes before the trigger's click.
+                pickers.toggle(PickerKind::Checkout, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            returned.get(),
+            2,
+            "closing via the trigger returns to the composer"
+        );
+    }
+
     use super::*;
+
+    fn repo_target(device: Option<&str>, path: &str, chat: Option<&str>) -> RepoTarget {
+        RepoTarget {
+            path: path.into(),
+            device_id: device.map(str::to_string),
+            chat_id: chat.map(str::to_string),
+            branch: None,
+        }
+    }
+
+    #[test]
+    fn refs_key_follows_device_path_and_chat() {
+        let local = repo_target(None, "/w/app", None);
+        // Same absolute path, two machines (Workers local vs remote space).
+        assert_ne!(
+            refs_target_key(Some(&local), None),
+            refs_target_key(Some(&repo_target(Some("mac-2"), "/w/app", None)), None)
+        );
+        // Same repo, two chats: rows carry per-chat checkout state.
+        assert_ne!(
+            refs_target_key(Some(&repo_target(None, "/w/app", Some("chat-a"))), None),
+            refs_target_key(Some(&repo_target(None, "/w/app", Some("chat-b"))), None)
+        );
+        // A live target wins over the selected space...
+        assert_eq!(
+            refs_target_key(Some(&local), Some(("mac-2", "/w/other"))),
+            Some((None, "/w/app".into(), None))
+        );
+        // ...and the space fallback carries ITS device, so two spaces sharing
+        // a path on different hosts never share the slot.
+        assert_ne!(
+            refs_target_key(None, Some(("mac-1", "/w/app"))),
+            refs_target_key(None, Some(("mac-2", "/w/app")))
+        );
+        // Nothing in scope (no target, no git space) lists nothing.
+        assert_eq!(refs_target_key(None, None), None);
+    }
+
+    #[test]
+    fn loaded_refs_never_answer_for_another_key() {
+        let key_a = (None, "/repos/a".to_string(), None);
+        let key_b = (Some("mac-2".to_string()), "/repos/a".to_string(), None);
+        let refs_of_a = Loadable::Ready(vec![RepoRef {
+            name: "project-a-branch".into(),
+            current: true,
+            worktree_path: None,
+            is_remote: None,
+            is_default: None,
+        }]);
+        // Loaded for A: A's own question is served from the slot.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &refs_of_a, &key_a, false),
+            RefsFetch::Skip
+        );
+        // Another key asks next: reload, and drop A's rows meanwhile.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &refs_of_a, &key_b, false),
+            RefsFetch::Reload { keep_rows: false }
+        );
+        // Even an in-flight load for A does not stand in for B.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &Loadable::Loading, &key_b, false),
+            RefsFetch::Reload { keep_rows: false }
+        );
+        // ...while B's own in-flight load is not restarted every render.
+        assert_eq!(
+            refs_fetch(Some(&key_b), &Loadable::Loading, &key_b, false),
+            RefsFetch::Skip
+        );
+        // A forced refresh of the same key keeps its rows on screen.
+        assert_eq!(
+            refs_fetch(Some(&key_a), &refs_of_a, &key_a, true),
+            RefsFetch::Reload { keep_rows: true }
+        );
+    }
 
     #[test]
     fn omp_uses_its_own_existing_worker_mark() {
@@ -4174,10 +4771,117 @@ mod tests {
     fn picker_controls_move_to_footer() {
         assert_eq!(
             composer_footer_right_order(),
-            [ComposerFooterControl::Model, ComposerFooterControl::Branch]
+            [ComposerFooterControl::Model]
         );
     }
+    #[test]
+    fn branch_ref_metadata_classification() {
+        let local_ref = RepoRef {
+            name: "feature/branch".into(),
+            current: true,
+            worktree_path: None,
+            is_remote: Some(false),
+            is_default: Some(false),
+        };
+        assert_eq!(local_ref.is_remote, Some(false));
+        assert!(local_ref.current);
+
+        let remote_ref = RepoRef {
+            name: "main".into(),
+            current: false,
+            worktree_path: None,
+            is_remote: Some(true),
+            is_default: Some(true),
+        };
+        assert_eq!(remote_ref.is_remote, Some(true));
+        assert_eq!(remote_ref.is_default, Some(true));
+    }
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn existing_chat_model_pick_is_remembered_for_new_chats(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let dir = tempfile::tempdir().unwrap();
+        let old = "openrouter/openai/gpt-6-astra";
+        let chosen = "openai-codex/gpt-6-astra";
+        let mut defaults = ComposerDefaults::default();
+        defaults.remember_model(HarnessId::Omp, old.into(), "OpenRouter Astra".into());
+        defaults.save(dir.path()).unwrap();
+        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "existing", "deviceId": "dev", "archived": false,
+            "createdAt": "2026-09-05T00:00:00Z",
+            "config": ChatConfig { harness: HarnessId::Omp, model: Some(old.into()),
+                reasoning: None, model_options: Default::default(), sandbox: SandboxLevel::WorkspaceWrite }
+        })).unwrap();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(dir.path().to_path_buf());
+            state.chats.push(chat);
+            state.selected_chat = Some("existing".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Omp, "omp")]);
+            pickers.models.insert(
+                HarnessId::Omp,
+                Loadable::Ready(vec![
+                    bare_model(old, "OpenRouter Astra"),
+                    bare_model(chosen, "ChatGPT Astra"),
+                ]),
+            );
+            pickers.pick_model(chosen.into(), cx);
+        });
+        assert_eq!(
+            state.read_with(cx, |s, _| s.chats[0].config.as_ref().unwrap().model.clone()),
+            Some(chosen.into())
+        );
+        let saved = ComposerDefaults::load(dir.path());
+        assert_eq!(
+            saved.model_for(HarnessId::Omp).map(|m| m.id.as_str()),
+            Some(chosen)
+        );
+        assert_eq!(
+            saved.model_for(HarnessId::Omp).map(|m| m.label.as_str()),
+            Some("ChatGPT Astra")
+        );
+        state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        assert_eq!(
+            pickers.read_with(cx, |p, cx| p.resolved(cx).model),
+            Some(chosen.into())
+        );
+        // Reading the older Chat config is navigation, not a new explicit pick.
+        state.update(cx, |state, cx| {
+            state.chats[0].config.as_mut().unwrap().model = Some(old.into());
+            state.selected_chat = Some("existing".into());
+            cx.notify();
+        });
+        assert_eq!(
+            pickers.read_with(cx, |p, cx| p.resolved(cx).model),
+            Some(old.into())
+        );
+        state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        assert_eq!(
+            pickers.read_with(cx, |p, cx| p.resolved(cx).model),
+            Some(chosen.into())
+        );
+        let reloaded = cx.new(|cx| Pickers::new(state.clone(), cx));
+        assert_eq!(
+            reloaded.read_with(cx, |p, _| p
+                .defaults
+                .model_for(HarnessId::Omp)
+                .unwrap()
+                .id
+                .clone()),
+            chosen
+        );
+    }
 
     fn bare_model(id: &str, label: &str) -> Model {
         Model {

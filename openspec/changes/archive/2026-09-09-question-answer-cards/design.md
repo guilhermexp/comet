@@ -1,0 +1,2 @@
+# Design
+The engine already owns the question bridge. InputResolved gains optional answers; Input parts and the Loro map retain them. None means legacy/cancelled without recorded answers; an explicit empty collection means submitted skip. Answer labels are joined by question id in original question order. The existing composer remains the only interactive surface. Question tools are projected through the question presenter; matching input requests replace the generic tool payload, while unassociated input requests remain independently visible. Errors remain visible.

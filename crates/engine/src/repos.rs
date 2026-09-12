@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 
 use zeron_proto::{
-    DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage,
-    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, Worktree,
+    DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit,
+    GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind, Repo, RepoRef,
+    Worktree,
 };
 
 use crate::EngineError;
@@ -39,6 +41,13 @@ const GIT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Hard wall-clock ceiling for a folder listing (the walk runs in a disposable
 /// blocking task; on expiry the caller unblocks and the task is abandoned).
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
+/// Ceiling on the fallback recursive delete of a worktree directory. It has to
+/// fit INSIDE the `DeleteWorktree` deadline (no `deadline_secs`, so the 30s
+/// default in `rpc::method`), which also has to cover the porcelain listing,
+/// the path resolution, `worktree remove`, the prune and the branch delete —
+/// on a forwarded call across devices. 10s leaves that headroom while still
+/// being generous for a large checkout on a healthy disk.
+const WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
 /// Cap on returned drives (a machine with more mounts than this is a server
@@ -48,6 +57,7 @@ const DRIVE_LIST_MAX_ENTRIES: usize = 50;
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+const GITHUB_AVATAR_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_INDEX_TTL: Duration = Duration::from_secs(10);
 const FILE_INDEX_MAX_ENTRIES: usize = 250_000;
 const RANK_BUFFER: usize = 1_024;
@@ -103,6 +113,9 @@ struct ReposInner {
     worktrees_root: PathBuf,
     runner: std::sync::Arc<dyn ProcessRunner>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    http: reqwest::Client,
+    github_avatars: std::sync::Mutex<HashMap<String, String>>,
+    github_avatar_pages: std::sync::Mutex<HashSet<String>>,
     file_index: FileIndexCache,
 }
 
@@ -165,6 +178,13 @@ impl Repos {
                 worktrees_root,
                 runner,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
+                http: reqwest::Client::builder()
+                    .timeout(GITHUB_AVATAR_TIMEOUT)
+                    .user_agent("Comet-Git-History")
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
+                github_avatars: std::sync::Mutex::new(HashMap::new()),
+                github_avatar_pages: std::sync::Mutex::new(HashSet::new()),
                 file_index: std::sync::Mutex::new(HashMap::new()),
             }),
         }
@@ -507,37 +527,82 @@ impl Repos {
     /// as linked worktrees (`worktree_path`). Feeds the composer's ref picker
     /// and its checkout-kind selector.
     pub async fn refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
-        let names = self.branches(repo_path).await?;
-        let current = self.current_branch(repo_path).await.ok();
-        // `git worktree list --porcelain`: stanzas of `worktree <path>` /
-        // `HEAD <sha>` / `branch refs/heads/<name>`. The first stanza is the
-        // main checkout — excluded (it's `current`, not a linked worktree).
-        let mut worktrees: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        if let Ok(out) = self
-            .git(&["worktree", "list", "--porcelain"], Some(repo_path))
-            .await
-        {
-            let mut stanza = 0usize;
-            let mut path: Option<String> = None;
-            for line in out.lines().map(str::trim) {
-                if let Some(p) = line.strip_prefix("worktree ") {
-                    stanza += 1;
-                    // The first stanza is the main checkout, not a linked tree.
-                    path = (stanza > 1).then(|| p.to_string());
-                } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
-                    && let Some(path) = path.take()
-                {
-                    worktrees.insert(branch.to_string(), path);
-                }
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut local_set = std::collections::HashSet::new();
+        let mut push = |name: &str| {
+            if !name.is_empty() && name != "HEAD" && seen.insert(name.to_string()) {
+                names.push(name.to_string());
+            }
+        };
+        let out = self
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/remotes",
+                ],
+                Some(repo_path),
+            )
+            .await?;
+        for line in out.lines().map(str::trim) {
+            if let Some(name) = line.strip_prefix("refs/heads/") {
+                local_set.insert(name.to_string());
+                push(name);
             }
         }
+        for line in out.lines().map(str::trim) {
+            if let Some(remote) = line.strip_prefix("refs/remotes/")
+                && let Some((_, name)) = remote.split_once('/')
+            {
+                push(name);
+            }
+        }
+        let default = match self
+            .git(
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                Some(repo_path),
+            )
+            .await
+        {
+            Ok(short) => short.split_once('/').map(|(_, b)| b.to_string()),
+            Err(_) => None,
+        };
+        let default = match default {
+            Some(branch) => Some(branch),
+            None => self
+                .current_branch(repo_path)
+                .await
+                .ok()
+                .filter(|b| b != "HEAD"),
+        };
+        if let Some(default_name) = &default
+            && let Some(pos) = names.iter().position(|n| n == default_name)
+        {
+            let head = names.remove(pos);
+            names.insert(0, head);
+        }
+
+        let current = self.current_branch(repo_path).await.ok();
+        let worktrees: HashMap<String, String> = self
+            .linked_worktrees(repo_path)
+            .await
+            .into_iter()
+            .filter_map(|entry| Some((entry.branch?, entry.path)))
+            .collect();
         Ok(names
             .into_iter()
-            .map(|name| RepoRef {
-                current: current.as_deref() == Some(name.as_str()),
-                worktree_path: worktrees.get(&name).cloned(),
-                name,
+            .map(|name| {
+                let is_remote = !local_set.contains(&name);
+                let is_default = default.as_deref() == Some(name.as_str());
+                RepoRef {
+                    current: current.as_deref() == Some(name.as_str()),
+                    worktree_path: worktrees.get(&name).cloned(),
+                    is_remote: Some(is_remote),
+                    is_default: Some(is_default),
+                    name,
+                }
             })
             .collect())
     }
@@ -575,10 +640,12 @@ impl Repos {
         if head_sha.is_none() && refs_by_sha.is_empty() {
             return Ok(GitHistoryPage {
                 commits: Vec::new(),
+                branch_tips: Vec::new(),
                 head_sha: None,
                 next_cursor: None,
                 total_count: Some(0),
                 head_commit_count: Some(0),
+                comparison: None,
             });
         }
 
@@ -604,6 +671,30 @@ impl Repos {
         let has_next = commits.len() > limit;
         commits.truncate(limit);
 
+        // Branch tips are deliberately independent from history pagination.
+        // `--no-walk` resolves every local/remote tip while deduplicating refs
+        // that point at the same commit. Include HEAD as a useful anchor for a
+        // detached checkout, but do not let tags seed extra overview rows.
+        let branch_tips = if cursor == 0 {
+            let mut tip_args = vec![
+                "log",
+                "--no-walk=sorted",
+                "--no-color",
+                "--no-decorate",
+                "--no-show-signature",
+                "--no-patch",
+                "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
+            ];
+            if head_sha.is_some() {
+                tip_args.push("HEAD");
+            }
+            tip_args.extend(["--branches", "--remotes"]);
+            let tips = self.git(&tip_args, Some(repo_path)).await?;
+            parse_history_log(&tips, &refs_by_sha)
+        } else {
+            Vec::new()
+        };
+
         let total_count = if cursor == 0 {
             let mut count_args = vec!["rev-list", "--count"];
             if head_sha.is_some() {
@@ -625,39 +716,440 @@ impl Repos {
         } else {
             None
         };
+        let comparison = if cursor == 0 && head_sha.is_some() {
+            self.history_comparison(repo_path).await
+        } else {
+            None
+        };
 
         Ok(GitHistoryPage {
             next_cursor: has_next.then_some(cursor + commits.len()),
             commits,
+            branch_tips,
             head_sha,
             total_count,
             head_commit_count,
+            comparison,
         })
     }
 
+    /// Compare the checked-out branch with the best locally available
+    /// integration ref. This deliberately never talks to the network: `Fetch
+    /// all` refreshes remote-tracking refs, then the next History load sees
+    /// those new counts.
+    async fn history_comparison(&self, repo_path: &Path) -> Option<GitHistoryComparison> {
+        // Detached checkouts do not have a branch relationship to present.
+        self.git(
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            Some(repo_path),
+        )
+        .await
+        .ok()?;
+
+        // An integration remote is more useful than the branch's push/tracking
+        // ref: a feature usually tracks origin/feature, whereas the status the
+        // user needs in History is its relationship to upstream/main.
+        let mut candidates = Vec::new();
+        for remote in ["upstream", "origin"] {
+            let remote_head = format!("refs/remotes/{remote}/HEAD");
+            if let Ok(base) = self
+                .git(
+                    &["symbolic-ref", "--quiet", "--short", &remote_head],
+                    Some(repo_path),
+                )
+                .await
+                && !base.is_empty()
+            {
+                candidates.push(base);
+            }
+        }
+        // A remote HEAD is not guaranteed to have been configured locally.
+        // Conventional default names keep the result useful in that case.
+        candidates.extend([
+            "upstream/main".to_string(),
+            "origin/main".to_string(),
+            "upstream/master".to_string(),
+            "origin/master".to_string(),
+        ]);
+        // Fall back to the configured tracking ref only after integration
+        // defaults. This still gives sensible data in a single-remote repo.
+        if let Ok(base) = self
+            .git(
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                Some(repo_path),
+            )
+            .await
+            && !base.is_empty()
+        {
+            candidates.push(base);
+        }
+
+        let mut seen = HashSet::new();
+        for base in candidates
+            .into_iter()
+            .filter(|base| seen.insert(base.clone()))
+        {
+            let commit_ref = format!("{base}^{{commit}}");
+            if self
+                .git(
+                    &["rev-parse", "--verify", "--quiet", &commit_ref],
+                    Some(repo_path),
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let range = format!("HEAD...{base}");
+            let Ok(counts) = self
+                .git(
+                    &["rev-list", "--left-right", "--count", &range],
+                    Some(repo_path),
+                )
+                .await
+            else {
+                continue;
+            };
+            let mut counts = counts.split_whitespace();
+            let (Some(ahead), Some(behind)) = (counts.next(), counts.next()) else {
+                continue;
+            };
+            let (Ok(ahead), Ok(behind)) = (ahead.parse(), behind.parse()) else {
+                continue;
+            };
+            return Some(GitHistoryComparison {
+                base,
+                ahead,
+                behind,
+            });
+        }
+        None
+    }
+
+    /// Fuzzy subject / SHA search across the complete public history. Results
+    /// stay in `--topo-order`; fuzzy score decides inclusion, never row order,
+    /// so the client can keep rendering a meaningful commit graph.
+    pub async fn search_history(
+        &self,
+        repo_path: &Path,
+        query: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<GitHistoryPage, EngineError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(GitHistoryPage {
+                commits: Vec::new(),
+                branch_tips: Vec::new(),
+                head_sha: None,
+                next_cursor: None,
+                total_count: Some(0),
+                head_commit_count: None,
+                comparison: None,
+            });
+        }
+        let limit = limit.clamp(1, GIT_HISTORY_MAX_LIMIT);
+        let head_sha = self
+            .git(&["rev-parse", "--verify", "HEAD^{commit}"], Some(repo_path))
+            .await
+            .ok()
+            .filter(|sha| !sha.is_empty());
+        let refs_out = self
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)%00%(symref)%00",
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags",
+                ],
+                Some(repo_path),
+            )
+            .await?;
+        let refs_by_sha = parse_history_refs(&refs_out);
+        if head_sha.is_none() && refs_by_sha.is_empty() {
+            return Ok(GitHistoryPage {
+                commits: Vec::new(),
+                branch_tips: Vec::new(),
+                head_sha: None,
+                next_cursor: None,
+                total_count: Some(0),
+                head_commit_count: None,
+                comparison: None,
+            });
+        }
+
+        let mut log_args = vec![
+            "log",
+            "--topo-order",
+            "--no-color",
+            "--no-decorate",
+            "--no-show-signature",
+            "--no-patch",
+            "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
+        ];
+        if head_sha.is_some() {
+            log_args.push("HEAD");
+        }
+        log_args.extend(["--branches", "--remotes", "--tags"]);
+        let log = self.git(&log_args, Some(repo_path)).await?;
+        let all_commits = parse_history_log(&log, &refs_by_sha);
+        let visible: HashSet<String> = all_commits
+            .iter()
+            .filter(|commit| git_history_matches(query, commit))
+            .map(|commit| commit.sha.clone())
+            .collect();
+        let matches = compact_history_commits(&all_commits, &visible);
+        let total_count = matches.len();
+        let start = cursor.min(total_count);
+        let end = start.saturating_add(limit).min(total_count);
+        let commits = matches[start..end].to_vec();
+
+        Ok(GitHistoryPage {
+            commits,
+            branch_tips: Vec::new(),
+            head_sha,
+            next_cursor: (end < total_count).then_some(end),
+            total_count: Some(total_count),
+            head_commit_count: None,
+            comparison: None,
+        })
+    }
+
+    /// Best-effort GitHub profile images for the authors in one history page.
+    /// Git itself only stores names and emails, so this resolves the hosting
+    /// metadata separately and caches it by both commit and normalized email.
+    pub async fn history_avatar_urls(
+        &self,
+        repo_path: &Path,
+        authors: &[(String, String)],
+        cursor: usize,
+        limit: usize,
+    ) -> HashMap<String, String> {
+        let Ok(remote) = self
+            .git(&["remote", "get-url", "origin"], Some(repo_path))
+            .await
+        else {
+            return HashMap::new();
+        };
+        let Some((owner, repo)) = parse_github_remote(&remote) else {
+            return HashMap::new();
+        };
+        let repo_key = format!("{owner}/{repo}").to_ascii_lowercase();
+        let per_page = limit.clamp(1, 100);
+        let page = cursor / per_page + 1;
+        let page_key = format!("{repo_key}|{page}|{per_page}");
+        let should_fetch = self
+            .inner
+            .github_avatar_pages
+            .lock()
+            .map(|mut pages| pages.insert(page_key.clone()))
+            .unwrap_or(false);
+
+        if should_fetch {
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/commits");
+            let mut request = self.inner.http.get(url).query(&[
+                ("per_page", per_page.to_string()),
+                ("page", page.to_string()),
+            ]);
+            if let Some(token) = std::env::var("GITHUB_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+                .or_else(|| {
+                    std::env::var("GH_TOKEN")
+                        .ok()
+                        .filter(|token| !token.is_empty())
+                })
+            {
+                request = request.bearer_auth(token);
+            }
+
+            let rows = match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    bounded_http_body(response, 4 * 1024 * 1024)
+                        .await
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<Vec<GitHubCommitAvatar>>(&bytes).ok()
+                        })
+                }
+                _ => None,
+            };
+            if let Some(rows) = rows {
+                let mut identities_by_url: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for row in rows {
+                    let Some(author) = row.author else {
+                        continue;
+                    };
+                    if !author.avatar_url.starts_with("https://") {
+                        continue;
+                    }
+                    let avatar_url = if author.avatar_url.contains('?') {
+                        format!("{}&s=40", author.avatar_url)
+                    } else {
+                        format!("{}?s=40", author.avatar_url)
+                    };
+                    identities_by_url.entry(avatar_url).or_default().push((
+                        row.sha.to_ascii_lowercase(),
+                        row.commit.author.email.trim().to_ascii_lowercase(),
+                    ));
+                }
+                let downloads = stream::iter(identities_by_url.into_iter().map(
+                    |(url, identities)| async move {
+                        self.cache_github_avatar(&url)
+                            .await
+                            .map(|path| (identities, path))
+                    },
+                ))
+                .buffer_unordered(8)
+                .filter_map(|download| async move { download })
+                .collect::<Vec<_>>()
+                .await;
+                if let Ok(mut cache) = self.inner.github_avatars.lock() {
+                    for (identities, path) in downloads {
+                        for (sha, email) in identities {
+                            cache.insert(format!("{repo_key}|sha|{sha}"), path.clone());
+                            if !email.is_empty() {
+                                cache.insert(format!("{repo_key}|email|{email}"), path.clone());
+                            }
+                        }
+                    }
+                }
+            } else if let Ok(mut pages) = self.inner.github_avatar_pages.lock() {
+                // A transient network/auth failure may be retried on refresh.
+                pages.remove(&page_key);
+            }
+        }
+
+        let Ok(cache) = self.inner.github_avatars.lock() else {
+            return HashMap::new();
+        };
+        authors
+            .iter()
+            .filter_map(|(sha, email)| {
+                let avatar = cache
+                    .get(&format!("{repo_key}|sha|{}", sha.to_ascii_lowercase()))
+                    .or_else(|| {
+                        cache.get(&format!(
+                            "{repo_key}|email|{}",
+                            email.trim().to_ascii_lowercase()
+                        ))
+                    })?;
+                Some((email.trim().to_ascii_lowercase(), avatar.clone()))
+            })
+            .collect()
+    }
+
+    async fn cache_github_avatar(&self, url: &str) -> Option<String> {
+        const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
+
+        let digest = Sha256::digest(url.as_bytes());
+        let cache_dir = self.inner.data_dir.join("cache").join("git-avatars");
+        let path = cache_dir.join(format!("{}.img", hex(&digest[..16])));
+        if tokio::fs::metadata(&path)
+            .await
+            .ok()
+            .is_some_and(|metadata| metadata.len() > 0 && metadata.len() <= MAX_AVATAR_BYTES)
+        {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        tokio::fs::create_dir_all(&cache_dir).await.ok()?;
+        let response = self.inner.http.get(url).send().await.ok()?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|size| size > MAX_AVATAR_BYTES)
+        {
+            return None;
+        }
+        let bytes = bounded_http_body(response, MAX_AVATAR_BYTES as usize).await?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_AVATAR_BYTES {
+            return None;
+        }
+        let temporary = cache_dir.join(format!(
+            ".{}.{}.tmp",
+            hex(&digest[..8]),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::write(&temporary, &bytes).await.ok()?;
+        if tokio::fs::rename(&temporary, &path).await.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            if !path.is_file() {
+                return None;
+            }
+        }
+        Some(path.to_string_lossy().into_owned())
+    }
+
     /// Whether `candidate` is the repository root or one of its linked
-    /// worktrees. Filesystem resolution happens on a disposable thread because
-    /// user-selected paths may be dead mounts.
+    /// worktrees, and still exists. Filesystem resolution happens on a
+    /// disposable thread because user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
+        self.resolve_checkout(repo_path, candidate, CheckoutQuery::Workspace)
+            .await
+            .map(|(path, _)| path)
+    }
+
+    /// The linked worktrees of `repo_path` as git itself registers them — the
+    /// main checkout excluded. Read from `git worktree list --porcelain`, so a
+    /// detached checkout is listed too (it just has no branch), and so is one
+    /// whose directory has already vanished (until `worktree prune` runs).
+    async fn linked_worktrees(&self, repo_path: &Path) -> Vec<WorktreeEntry> {
+        self.git(&["worktree", "list", "--porcelain"], Some(repo_path))
+            .await
+            .map(|out| parse_worktree_list(&out).into_iter().skip(1).collect())
+            .unwrap_or_default()
+    }
+
+    /// Resolve `candidate` to a checkout of this repository, together with the
+    /// branch that checkout holds (`None` when detached, or for the root).
+    /// What counts as a hit depends on the [`CheckoutQuery`].
+    ///
+    /// Authorization follows the registration, never the branch: a worktree in
+    /// detached HEAD is still a worktree of this repository. Deletion resolves
+    /// through here, because `git worktree remove` refuses the main checkout
+    /// and any unrelated folder, which is precisely where a fallback that
+    /// deletes the directory outright must never land.
+    ///
+    /// Path resolution runs on a disposable thread under [`PATH_EXISTS_TIMEOUT`]
+    /// because user-selected paths may be dead mounts: the thread is isolated,
+    /// but the oneshot it answers on is not, so without the ceiling the FIRST
+    /// step of `DeleteWorktree` is the one that pins the RPC forever.
+    async fn resolve_checkout(
+        &self,
+        repo_path: &Path,
+        candidate: &Path,
+        query: CheckoutQuery,
+    ) -> Option<(PathBuf, Option<String>)> {
+        let worktrees = self.linked_worktrees(repo_path).await;
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
-        let worktrees: Vec<_> = self
-            .refs(&repo_path)
+        let worker = disposable_worker("checkout-auth", move || {
+            // "Is this an authorized checkout that EXISTS": a path that no
+            // longer resolves is not one, and answering otherwise would widen
+            // the RPC boundary into an arbitrary path probe (see `rpc.rs`).
+            if query == CheckoutQuery::Workspace && std::fs::canonicalize(&candidate).is_err() {
+                return None;
+            }
+            let resolved = canonicalize_lossy(&candidate);
+            let same = |path: &Path| canonicalize_lossy(path) == resolved;
+            if query == CheckoutQuery::Workspace && same(&repo_path) {
+                return Some((resolved, None));
+            }
+            worktrees
+                .into_iter()
+                .find(|entry| same(Path::new(&entry.path)))
+                .map(|entry| (resolved, entry.branch))
+        });
+        tokio::time::timeout(PATH_EXISTS_TIMEOUT, worker)
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.worktree_path.map(PathBuf::from))
-            .collect();
-        disposable_worker("checkout-auth", move || {
-            let candidate = std::fs::canonicalize(candidate).ok()?;
-            std::iter::once(repo_path)
-                .chain(worktrees)
-                .filter_map(|path| std::fs::canonicalize(path).ok())
-                .any(|path| path == candidate)
-                .then_some(candidate)
-        })
-        .await
-        .flatten()
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     /// Switch the checkout at `cwd` (a main folder OR a linked worktree) to
@@ -836,38 +1328,99 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
-    /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) — the
-    /// user may have checked out their own branch inside the worktree.
+    /// Remove one linked worktree, then prune stale refs. Fails when the
+    /// removal ran and did not succeed — a checkout still on disk is not a
+    /// deletion, and only the caller can act on that.
+    ///
+    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) —
+    /// the user may have checked out their own branch inside the worktree —
+    /// and only once the checkout is provably gone.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
-        let branch = if worktree_path.exists() {
-            self.current_branch(worktree_path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if worktree_path.exists() {
-            let removed = self
-                .git(
-                    &[
-                        "worktree",
-                        "remove",
-                        "--force",
-                        &worktree_path.to_string_lossy(),
-                    ],
-                    Some(repo_path),
-                )
-                .await;
-            if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
+        // Resolve BEFORE removing: with `worktree_path` coming from the caller
+        // (the method is forwardable, so from another device too), an unrelated
+        // folder must never reach the recursive delete below. The registration
+        // also carries the branch, which outlives the directory — that is how a
+        // `zeron/…` branch still gets pruned once the folder is already gone.
+        let resolved = self
+            .resolve_checkout(repo_path, worktree_path, CheckoutQuery::Registration)
+            .await;
+        // A removal that never ran must not pass as a success: the folder is
+        // still there and only the caller can act on that.
+        let branch = match resolved {
+            Some((path, branch)) => {
+                let removed = self
+                    .git(
+                        &["worktree", "remove", "--force", &path.to_string_lossy()],
+                        Some(repo_path),
+                    )
+                    .await
+                    .is_ok();
+                // git reports success only after the checkout is gone; anything
+                // else has to be proven by the fallback below.
+                let removed = if removed {
+                    true
+                } else {
+                    // git refused (or the dir is half-gone) — delete the folder
+                    // directly. Safe now: the path is a resolved linked
+                    // worktree. Off the executor under a ceiling: a big
+                    // checkout takes a while, a dead mount takes forever.
+                    let target = path;
+                    let worker = disposable_worker("worktree-rm", move || {
+                        match std::fs::remove_dir_all(&target) {
+                            Ok(()) => Ok(true),
+                            // Nothing there — but "deleted" and "out of reach"
+                            // both read as NotFound, and an unmounted volume
+                            // reports it for the whole subtree. Only a missing
+                            // leaf under a parent that IS still there proves
+                            // the checkout is gone for good.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(target.parent().is_some_and(Path::exists))
+                            }
+                            // Permission, EIO, a file still in use: the removal
+                            // ran and failed. Say so instead of reporting ok.
+                            Err(e) => Err(format!("could not remove the worktree folder: {e}")),
+                        }
+                    });
+                    match tokio::time::timeout(WORKTREE_REMOVE_TIMEOUT, worker).await {
+                        Ok(Some(Ok(removed))) => removed,
+                        Ok(Some(Err(error))) => return Err(EngineError::Other(error)),
+                        Ok(None) => {
+                            return Err(EngineError::Other(
+                                "worktree removal worker could not run on the device".into(),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(EngineError::Other(
+                                "worktree removal timed out on the device".into(),
+                            ));
+                        }
+                    }
+                };
+                // The branch outlives the directory, but `-D` skips the
+                // unmerged check: dropping it while the checkout is merely
+                // unreachable (unmounted volume, moved folder) orphans every
+                // commit that was never pushed. Only delete it once the
+                // checkout is provably gone.
+                branch.filter(|_| removed)
             }
-        }
+            None => {
+                // Unregistered. A folder still on disk is somebody else's
+                // checkout: refuse. Nothing on disk is just stale bookkeeping —
+                // prune it. Probed under a ceiling, like every other path here.
+                if Self::path_exists(worktree_path).await {
+                    return Err(EngineError::Other(
+                        "not a linked worktree of this repository".into(),
+                    ));
+                }
+                None
+            }
+        };
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("zeron/") {
+        if let Some(branch) = branch.filter(|branch| branch.starts_with("zeron/")) {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
@@ -1237,6 +1790,164 @@ fn unescape_mount_point(raw: &str) -> String {
     out
 }
 
+/// Case-insensitive subsequence score. Lower is better: adjacent and earlier
+/// characters win, while still allowing `cmp rs` to find `composer.rs`.
+fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
+    let candidate = candidate.to_lowercase();
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .try_fold(0usize, |total, term| {
+            let mut at = 0;
+            let mut score = 0usize;
+            let mut previous_end = None;
+            for needle in term.chars() {
+                let found = candidate[at..].find(needle)? + at;
+                score += found;
+                if previous_end == Some(found) {
+                    score = score.saturating_sub(2);
+                }
+                at = found + needle.len_utf8();
+                previous_end = Some(at);
+            }
+            Some(total.saturating_add(score))
+        })
+}
+
+/// Match a history commit using the same semantics as the history UI.
+///
+/// This remains the shared entry point so RPC filtering and client-side
+/// filtering cannot disagree about Unicode case normalization.
+pub fn git_history_matches(query: &str, commit: &GitHistoryCommit) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let normalized = query.to_ascii_lowercase();
+    commit.sha.to_ascii_lowercase().starts_with(&normalized)
+        || fuzzy_score(query, &format!("{} {}", commit.sha, commit.subject)).is_some()
+}
+
+/// Contract hidden commits to their nearest visible ancestors. Search results
+/// remain sparse without leaving graph lanes aimed at rows that are absent.
+fn compact_history_commits(
+    commits: &[GitHistoryCommit],
+    visible: &HashSet<String>,
+) -> Vec<GitHistoryCommit> {
+    let by_sha: HashMap<_, _> = commits
+        .iter()
+        .map(|commit| (commit.sha.as_str(), commit))
+        .collect();
+
+    /// Resolve a hidden commit to its nearest visible ancestors without using
+    /// the call stack. Completed nodes are cached across visible commits so a
+    /// shared hidden branch is contracted only once.
+    fn nearest_visible_parents(
+        sha: &str,
+        visible: &HashSet<String>,
+        by_sha: &HashMap<&str, &GitHistoryCommit>,
+        memo: &mut HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        if visible.contains(sha) || !by_sha.contains_key(sha) {
+            return vec![sha.to_string()];
+        }
+        if let Some(cached) = memo.get(sha) {
+            return cached.clone();
+        }
+
+        struct Frame {
+            sha: String,
+            next_parent: usize,
+            resolved: Vec<String>,
+            seen: HashSet<String>,
+        }
+
+        impl Frame {
+            fn new(sha: String) -> Self {
+                Self {
+                    sha,
+                    next_parent: 0,
+                    resolved: Vec::new(),
+                    seen: HashSet::new(),
+                }
+            }
+
+            fn extend(&mut self, parents: &[String]) {
+                for parent in parents {
+                    if self.seen.insert(parent.clone()) {
+                        self.resolved.push(parent.clone());
+                    }
+                }
+            }
+        }
+
+        let mut visiting = HashSet::from([sha.to_string()]);
+        let mut stack = vec![Frame::new(sha.to_string())];
+        loop {
+            let next_parent = {
+                let frame = stack.last_mut().expect("history traversal frame");
+                let parents = &by_sha[frame.sha.as_str()].parent_shas;
+                (frame.next_parent < parents.len()).then(|| {
+                    let parent = parents[frame.next_parent].clone();
+                    frame.next_parent += 1;
+                    parent
+                })
+            };
+
+            let Some(parent) = next_parent else {
+                let frame = stack.pop().expect("history traversal frame");
+                visiting.remove(&frame.sha);
+                let resolved = frame.resolved;
+                memo.insert(frame.sha, resolved.clone());
+                if let Some(caller) = stack.last_mut() {
+                    caller.extend(&resolved);
+                    continue;
+                }
+                return resolved;
+            };
+
+            let resolved = if visible.contains(&parent) || !by_sha.contains_key(parent.as_str()) {
+                Some(vec![parent.clone()])
+            } else if let Some(cached) = memo.get(&parent) {
+                Some(cached.clone())
+            } else if visiting.contains(&parent) {
+                // Git commit graphs are acyclic, but keep malformed input from
+                // looping forever just as the previous `visiting` guard did.
+                Some(Vec::new())
+            } else {
+                None
+            };
+
+            if let Some(resolved) = resolved {
+                stack
+                    .last_mut()
+                    .expect("history traversal frame")
+                    .extend(&resolved);
+            } else {
+                visiting.insert(parent.clone());
+                stack.push(Frame::new(parent));
+            }
+        }
+    }
+
+    let mut memo = HashMap::new();
+    commits
+        .iter()
+        .filter(|commit| visible.contains(&commit.sha))
+        .cloned()
+        .map(|mut commit| {
+            let mut seen = HashSet::new();
+            commit.parent_shas = commit
+                .parent_shas
+                .iter()
+                .flat_map(|parent| nearest_visible_parents(parent, visible, &by_sha, &mut memo))
+                .filter(|parent| seen.insert(parent.clone()))
+                .collect();
+            commit
+        })
+        .collect()
+}
+
 type RankedFileMatch = (Option<usize>, u32, String, bool);
 
 fn compare_file_matches(
@@ -1262,6 +1973,24 @@ fn compare_file_matches(
         })
         .then_with(|| path_a.len().cmp(&path_b.len()))
         .then_with(|| path_a.cmp(path_b))
+}
+
+/// Enforce the bound while receiving chunked responses too.
+async fn bounded_http_body(mut response: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -1504,6 +2233,55 @@ fn bounded_field(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+#[derive(serde::Deserialize)]
+struct GitHubCommitAvatar {
+    sha: String,
+    author: Option<GitHubAvatarUser>,
+    commit: GitHubCommitMetadata,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubAvatarUser {
+    avatar_url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubCommitMetadata {
+    author: GitHubCommitAuthor,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubCommitAuthor {
+    email: String,
+}
+
+fn parse_github_remote(remote: &str) -> Option<(String, String)> {
+    let remote = remote.trim();
+    let path = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("http://github.com/"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("git@github.com:"))?;
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty()
+        || repo.is_empty()
+        || parts.next().is_some()
+        || !owner
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        || !repo.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
 fn parse_history_log(
     output: &str,
     refs_by_sha: &HashMap<String, Vec<GitHistoryRef>>,
@@ -1592,6 +2370,67 @@ fn parse_history_refs(output: &str) -> HashMap<String, Vec<GitHistoryRef>> {
     refs_by_sha
 }
 
+/// What a checkout lookup is asking — two different questions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckoutQuery {
+    /// "Is this an authorized checkout that exists?" The repository root
+    /// counts, and a path that no longer resolves does not: this answers a
+    /// forwardable RPC, which must never become an arbitrary path probe.
+    Workspace,
+    /// "Which linked-worktree registration does this path name?" The root is
+    /// rejected, and a registration whose directory is already gone still
+    /// matches — nothing to delete there, but its branch stays prunable.
+    Registration,
+}
+
+/// One checkout in git's worktree registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeEntry {
+    path: String,
+    /// The branch checked out there; `None` for a detached HEAD.
+    branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain`. Every stanza opens with
+/// `worktree <path>`; the last line is `branch refs/heads/<name>` OR `detached`
+/// (and a stale registration adds `prunable`), so the checkout is defined by
+/// its `worktree` line alone. The main checkout is always the first stanza.
+fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    for line in output.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            entries.push(WorktreeEntry {
+                path: path.to_string(),
+                branch: None,
+            });
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+            && let Some(entry) = entries.last_mut()
+        {
+            entry.branch = Some(branch.to_string());
+        }
+    }
+    entries
+}
+
+/// Canonicalize `path`, falling back to the deepest ancestor that still
+/// exists with the missing tail re-attached.
+///
+/// Comparing two spellings of the same directory is the whole job here: git
+/// records the fully resolved path in its worktree registry while the app
+/// hands back the raw join of the worktrees root, so any symlinked component
+/// (on macOS the temp/volume root itself) makes the literals differ. Falling
+/// back to the raw literal when the directory is already gone would therefore
+/// miss exactly the case that matters — an orphan registration to prune.
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_) => match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => canonicalize_lossy(parent).join(name),
+            _ => path.to_path_buf(),
+        },
+    }
+}
+
 /// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -1615,6 +2454,61 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::process::ProcessOutput;
+
+    #[tokio::test]
+    async fn refs_excludes_origin_head_and_preserves_normal_branches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let repos = Repos::new(temp.path(), "dev");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "initial",
+            ],
+            vec!["branch", "feature/local"],
+            vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            vec!["update-ref", "refs/remotes/origin/feature/remote", "HEAD"],
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        ] {
+            repos.git(&args, Some(&root)).await.unwrap();
+        }
+        let refs = repos.refs(&root).await.unwrap();
+        let actual: Vec<_> = refs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.as_str(),
+                    entry.current,
+                    entry.is_remote,
+                    entry.is_default,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("main", true, Some(false), Some(true)),
+                ("feature/local", false, Some(false), Some(false)),
+                ("feature/remote", false, Some(true), Some(false)),
+            ]
+        );
+        assert!(refs.iter().all(|entry| entry.worktree_path.is_none()));
+    }
 
     /// The runner seam: `Repos` never spawns git itself, so a failure is
     /// whatever the runner reports — stderr and all.
@@ -1641,6 +2535,290 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worktree_list_keeps_detached_and_prunable_stanzas() {
+        let entries = parse_worktree_list(
+            "\
+worktree /repo
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /wt/detached
+HEAD 2222222222222222222222222222222222222222
+detached
+
+worktree /wt/gone
+HEAD 3333333333333333333333333333333333333333
+branch refs/heads/zeron/lucky-otter
+prunable gitdir file points to non-existent location
+",
+        );
+        let rows: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.branch.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("/repo", Some("main")),
+                ("/wt/detached", None),
+                ("/wt/gone", Some("zeron/lucky-otter")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_branch_tips_are_independent_of_page_cursor() {
+        struct HistoryGit(std::sync::Mutex<Vec<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl ProcessRunner for HistoryGit {
+            async fn run(&self, r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+                self.0.lock().unwrap().push(r.args.clone());
+                let out = match r.args.first().map(String::as_str) {
+                    Some("rev-parse") => "abc",
+                    Some("for-each-ref") => "refs/heads/main\0abc\0commit\0\0\0\0",
+                    Some("log") => {
+                        "abc\0parent\0Visible tip\0Test\0test@example.invalid\02026-09-10T00:00:00Z\0"
+                    }
+                    Some("rev-list") => "1",
+                    _ => "",
+                };
+                Ok(ProcessOutput {
+                    success: !out.is_empty(),
+                    stdout: out.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                })
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let git = std::sync::Arc::new(HistoryGit(Default::default()));
+        let repos = Repos::with_runner(temp.path(), "test", git.clone());
+        let first = serde_json::to_value(repos.history(temp.path(), 0, 1).await.unwrap()).unwrap();
+        assert_eq!(first["branchTips"][0]["sha"], "abc");
+        let next = serde_json::to_value(repos.history(temp.path(), 1, 1).await.unwrap()).unwrap();
+        assert_eq!(next["branchTips"], serde_json::json!([]));
+        let calls = git.0.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|a| a == "--no-walk=sorted"))
+                .count(),
+            1
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|args| args.iter().any(|a| a == "fetch" || a == "--all"))
+        );
+    }
+
+    /// Every git call answers with the same porcelain and records its argv.
+    /// `refuse` is an argv prefix this git fails on — without it every call
+    /// succeeds, and the `worktree remove` fallback is never reached.
+    struct FakeGit {
+        porcelain: String,
+        refuse: &'static [&'static str],
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl FakeGit {
+        fn new(porcelain: String, refuse: &'static [&'static str]) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                porcelain,
+                refuse,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn called(&self, argv: &[&str]) -> bool {
+            self.calls.lock().unwrap().iter().any(|args| args == argv)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for FakeGit {
+        async fn run(&self, r: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+            self.calls.lock().unwrap().push(r.args.clone());
+            let refused = !self.refuse.is_empty()
+                && r.args.len() >= self.refuse.len()
+                && (self.refuse.iter())
+                    .zip(&r.args)
+                    .all(|(want, got)| *want == got.as_str());
+            Ok(ProcessOutput {
+                success: !refused,
+                stdout: if refused {
+                    Vec::new()
+                } else {
+                    self.porcelain.clone().into_bytes()
+                },
+                stderr: if refused {
+                    b"fatal: refused".to_vec()
+                } else {
+                    Vec::new()
+                },
+                stdout_truncated: false,
+            })
+        }
+    }
+
+    /// A detached worktree has no `branch` line, and a deleted one has no
+    /// directory left — neither may cost it its authorization or its branch.
+    /// The checkouts are reached through a symlinked parent, because that is
+    /// the real shape: git registers the fully resolved path while the app
+    /// hands back the raw join of the worktrees root.
+    #[tokio::test]
+    async fn detached_and_vanished_worktrees_stay_deletable() {
+        let data = tempfile::tempdir().unwrap();
+        let real = data.path().join("real");
+        let link = data.path().join("link");
+        std::fs::create_dir_all(real.join("repo")).unwrap();
+        std::fs::create_dir_all(real.join("detached")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = link.join("repo");
+        let detached = link.join("detached");
+        let gone = link.join("gone");
+        // What git actually emits: paths with every symlink resolved, the
+        // vanished stanza included.
+        // Spelled out with `std::fs` on purpose: building it through the
+        // production helper would make this test agree with itself.
+        let as_git_reports = |path: &Path| {
+            std::fs::canonicalize(path)
+                .unwrap_or_else(|_| {
+                    std::fs::canonicalize(path.parent().unwrap())
+                        .unwrap()
+                        .join(path.file_name().unwrap())
+                })
+                .display()
+                .to_string()
+        };
+        // `worktree remove` refuses a stanza whose directory is already gone,
+        // so the recursive-delete fallback is what actually runs here.
+        let git = FakeGit::new(
+            format!(
+                "worktree {}\nbranch refs/heads/main\n\nworktree {}\ndetached\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\nprunable gitdir file points to non-existent location\n",
+                as_git_reports(&root),
+                as_git_reports(&detached),
+                as_git_reports(&gone),
+            ),
+            &["worktree", "remove"],
+        );
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        assert!(
+            repos
+                .resolve_checkout(&root, &detached, CheckoutQuery::Registration)
+                .await
+                .is_some(),
+            "a detached worktree is still a linked worktree"
+        );
+        assert!(
+            repos
+                .resolve_checkout(&root, &root, CheckoutQuery::Registration)
+                .await
+                .is_none(),
+            "the main checkout is not a linked worktree"
+        );
+        assert!(
+            repos.workspace_checkout(&root, &root).await.is_some(),
+            "the repository root is a workspace checkout"
+        );
+        let dead = link.join("dead-mount");
+        assert!(
+            repos.workspace_checkout(&dead, &dead).await.is_none(),
+            "a path that no longer exists must never authorize itself"
+        );
+
+        repos.delete_worktree(&root, &gone).await.unwrap();
+        assert!(
+            git.called(&["branch", "-D", "zeron/lucky-otter"]),
+            "the orphan branch of a deleted worktree must still be pruned: {:?}",
+            git.calls.lock().unwrap()
+        );
+    }
+
+    /// A checkout that is merely UNREACHABLE — its whole parent subtree is
+    /// missing, as when the volume holding it is unmounted or the folder was
+    /// moved — is not a checkout that was deleted. `branch -D` skips the
+    /// unmerged check, so dropping the branch here strands every commit that
+    /// worktree never pushed, and remounting brings back a tree with no ref.
+    #[tokio::test]
+    async fn unreachable_worktree_keeps_its_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(data.path()).unwrap();
+        let root = data.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // Nothing under `volume/` exists — the mount is gone, not the checkout.
+        let unmounted = data.path().join("volume").join("wt");
+        let git = FakeGit::new(
+            format!(
+                "worktree {}\nbranch refs/heads/main\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\n",
+                base.join("repo").display(),
+                base.join("volume").join("wt").display(),
+            ),
+            &["worktree", "remove"],
+        );
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        repos.delete_worktree(&root, &unmounted).await.unwrap();
+        assert!(
+            !git.called(&["branch", "-D", "zeron/lucky-otter"]),
+            "an unreachable worktree must keep its branch: {:?}",
+            git.calls.lock().unwrap()
+        );
+    }
+
+    /// A recursive delete that RAN and FAILED is not a removal: report the
+    /// error rather than an ok, and touch neither the registration nor the
+    /// branch. A regular file at the registered path stands in for the
+    /// permission / EIO / still-in-use cases — `remove_dir_all` fails on it
+    /// with something other than `NotFound`.
+    #[tokio::test]
+    async fn failed_removal_is_reported_and_keeps_the_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(data.path()).unwrap();
+        let root = data.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked = data.path().join("wt");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let git = FakeGit::new(
+            format!(
+                "worktree {}\nbranch refs/heads/main\n\nworktree {}\nbranch refs/heads/zeron/lucky-otter\n",
+                base.join("repo").display(),
+                base.join("wt").display(),
+            ),
+            &["worktree", "remove"],
+        );
+        let repos = Repos::with_runner(data.path(), "dev", git.clone());
+
+        let error = repos
+            .delete_worktree(&root, &blocked)
+            .await
+            .expect_err("a removal that failed must not report success");
+        assert!(
+            error.to_string().contains("could not remove the worktree"),
+            "the real filesystem error must surface: {error}"
+        );
+        assert!(
+            !git.called(&["worktree", "prune"])
+                && !git.called(&["branch", "-D", "zeron/lucky-otter"]),
+            "nothing was removed, so nothing may be pruned: {:?}",
+            git.calls.lock().unwrap()
+        );
+    }
+
+    fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {
+        GitHistoryCommit {
+            subject: sha.clone(),
+            sha,
+            parent_shas: parent_sha.into_iter().collect(),
+            author_name: "Test".into(),
+            author_email: "test@example.com".into(),
+            authored_at: "2026-08-20T12:00:00Z".into(),
+            refs: Vec::new(),
+        }
+    }
+
     fn score(query: &str, candidate: &str) -> Option<u32> {
         let mut matcher = nucleo_matcher::Matcher::new({
             let mut config = nucleo_matcher::Config::DEFAULT;
@@ -1656,6 +2834,74 @@ mod tests {
             nucleo_matcher::Utf32String::from(candidate).slice(..),
             &mut matcher,
         )
+    }
+
+    #[test]
+    fn parses_common_github_remote_forms() {
+        let expected = Some(("openai".to_string(), "codex".to_string()));
+        assert_eq!(
+            parse_github_remote("https://github.com/openai/codex.git"),
+            expected
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:openai/codex.git"),
+            expected
+        );
+        assert_eq!(parse_github_remote("https://gitlab.com/openai/codex"), None);
+    }
+
+    #[tokio::test]
+    async fn history_http_metadata_rejects_chunked_body_over_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\n01234567890123456789012345678901\r\n0\r\n\r\n").await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        assert!(bounded_http_body(response, 16).await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_avatar_downloads_once_into_the_local_cache() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let bytes = b"\xff\xd8\xffavatar".to_vec();
+        let served = bytes.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&served).await.unwrap();
+        });
+
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let url = format!("http://{address}/avatar.jpg");
+        let first = repos.cache_github_avatar(&url).await.expect("downloaded");
+        server.await.unwrap();
+        assert_eq!(tokio::fs::read(&first).await.unwrap(), bytes);
+        assert_eq!(
+            repos.cache_github_avatar(&url).await.as_deref(),
+            Some(first.as_str())
+        );
     }
 
     #[test]
@@ -1747,6 +2993,39 @@ tmpfs /run tmpfs rw 0 0
         assert!(score("cmp rs", "crates/ui/src/composer.rs").is_some());
         assert!(score("composer crates", "crates/ui/src/composer.rs").is_some());
         assert!(score("xyzq", "crates/ui/src/composer.rs").is_none());
+    }
+
+    #[test]
+    fn git_history_matches_unicode_case_insensitively() {
+        let mut candidate = history_commit("a1b2c3d4".into(), None);
+        candidate.subject = "RÉPARER la recherche".into();
+
+        assert!(git_history_matches("réparer", &candidate));
+    }
+
+    #[test]
+    fn history_compaction_handles_a_twenty_thousand_commit_gap() {
+        const DEPTH: usize = 20_000;
+        let commits = (0..DEPTH)
+            .rev()
+            .map(|index| {
+                history_commit(
+                    format!("c{index:05}"),
+                    (index > 0).then(|| format!("c{:05}", index - 1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let newest = format!("c{:05}", DEPTH - 1);
+        let oldest = "c00000".to_string();
+        let visible = HashSet::from([newest.clone(), oldest.clone()]);
+
+        let compact = compact_history_commits(&commits, &visible);
+
+        assert_eq!(compact.len(), 2);
+        assert_eq!(compact[0].sha, newest);
+        assert_eq!(compact[0].parent_shas, vec![oldest.clone()]);
+        assert_eq!(compact[1].sha, oldest);
+        assert!(compact[1].parent_shas.is_empty());
     }
 
     #[test]
@@ -1861,6 +3140,35 @@ tmpfs /run tmpfs rw 0 0
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_worktree_refuses_paths_that_are_not_linked_worktrees() {
+        // `git worktree remove` refuses both of these, and the direct-removal
+        // fallback used to delete them anyway.
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        std::fs::write(sibling.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(root.path().join("keep.txt"), "keep").unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+
+        assert!(
+            repos
+                .delete_worktree(root.path(), sibling.path())
+                .await
+                .is_err()
+        );
+        assert!(sibling.path().join("keep.txt").exists());
+
+        assert!(
+            repos
+                .delete_worktree(root.path(), root.path())
+                .await
+                .is_err()
+        );
+        assert!(root.path().join("keep.txt").exists());
     }
 
     #[tokio::test]

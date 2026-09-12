@@ -4,7 +4,7 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. Nada abaixo depende de nada acima.
+As bibliotecas que compõem o comet. A camada de dependência sobe assim: `proto` (tipos) → `doc` (schema CRDT) → `sync` (transporte Loro) → `harness` (agentes) → `engine` (backend) → `rpc` (fronteira tipada) → `ui` (consumidor). `preview` é consumida pela engine para HTTP/RTC; `syntax`, `theme` e `workers-unpeel` são fronteiras laterais consumidas pela `ui` sem depender da engine. Nada abaixo depende de nada acima.
 
 ## Ownership
 
@@ -33,7 +33,7 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `crates/{engine,harness,rpc,workers-unpeel,doc,sync}/tests/**` | integration | `cargo test -p <crate>` |
 | `crates/ui/src/**` (estado, derivações) | unit | `cargo test -p zeron-ui` |
 | `crates/ui` (render gpui) | none — sem harness de render; validação é visual no `scripts/dev-demo.sh` | — |
-| `crates/update` | none — wrapper fino sobre download/replace, coberto no smoke | — |
+| `crates/update` | unit (versão/manifest, swap symlink, shutdown, restart gate) | `cargo test -p zeron-update` |
 
 ## Child DOX Index
 
@@ -48,5 +48,6 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 | `comet-syntax` | [`syntax/AGENTS.md`](syntax/AGENTS.md) | Tokenizer tree-sitter paint-only compartilhado pelas surfaces |
 | `zeron-theme` | [`theme/AGENTS.md`](theme/AGENTS.md) | Modelo source-neutral, catálogo e importação de temas |
 | `zeron-workers-unpeel` | [`workers-unpeel/AGENTS.md`](workers-unpeel/AGENTS.md) | Fronteira tipada sobre `third_party/unpeel`: projetos, worktrees, sessões de Worker, controller MCP, notificações ao parent |
+| `zeron-preview` | [`preview/AGENTS.md`](preview/AGENTS.md) | Catálogo, proxy HTTP/WebSocket e pairing RTC autenticado |
 | `zeron-ui` | [`ui/AGENTS.md`](ui/AGENTS.md) | App gpui: shell, transcript e export puro, composer/intake e decoração paint-only, terminal, diff |
 | `zeron-update` | [`update/AGENTS.md`](update/AGENTS.md) | Checagem de release e auto-update do binário |

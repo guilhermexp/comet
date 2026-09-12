@@ -100,27 +100,64 @@ fn mouse_report_bytes(
     column: usize,
     row: usize,
     modifiers: gpui::Modifiers,
+    protocol: MouseProtocol,
 ) -> Vec<u8> {
-    let base = match kind {
-        MouseReportKind::Down | MouseReportKind::Up => 0,
-        MouseReportKind::Drag => 32,
-        MouseReportKind::Move => 35,
-    };
     let modifier_bits = if modifiers.shift { 4 } else { 0 }
         + if modifiers.alt { 8 } else { 0 }
         + if modifiers.control { 16 } else { 0 };
-    let suffix = if kind == MouseReportKind::Up {
-        'm'
-    } else {
-        'M'
-    };
-    format!(
-        "\x1b[<{};{};{}{suffix}",
-        base + modifier_bits,
-        column.saturating_add(1),
-        row.saturating_add(1)
-    )
-    .into_bytes()
+
+    match protocol {
+        MouseProtocol::Sgr => {
+            let base = match kind {
+                MouseReportKind::Down | MouseReportKind::Up => 0,
+                MouseReportKind::Drag => 32,
+                MouseReportKind::Move => 35,
+            };
+            let suffix = if kind == MouseReportKind::Up {
+                'm'
+            } else {
+                'M'
+            };
+            format!(
+                "\x1b[<{};{};{}{suffix}",
+                base + modifier_bits,
+                column.saturating_add(1),
+                row.saturating_add(1)
+            )
+            .into_bytes()
+        }
+        MouseProtocol::Normal | MouseProtocol::Utf8 => {
+            let base = match kind {
+                MouseReportKind::Down => 0,
+                MouseReportKind::Up => 3,
+                MouseReportKind::Drag => 32,
+                MouseReportKind::Move => 35,
+            };
+            let button = base + modifier_bits;
+            let mut report = vec![0x1b, b'[', b'M', 32 + button as u8];
+            let utf8 = protocol == MouseProtocol::Utf8;
+            let mut push_coord = |coord: usize| {
+                if utf8 {
+                    // In UTF-8 mode (mode 1005), 1-based coordinates up to 2015 can be encoded in 2-byte UTF-8.
+                    let col_1 = coord.saturating_add(1).min(2015);
+                    let encoded = 32 + col_1;
+                    if encoded >= 128 {
+                        report.push((0xC0 + encoded / 64) as u8);
+                        report.push((0x80 + (encoded & 63)) as u8);
+                    } else {
+                        report.push(encoded as u8);
+                    }
+                } else {
+                    // In Normal mode (mode 1000), coordinates saturate at 223 (1-based), so 32 + 223 = 255.
+                    let col_1 = coord.saturating_add(1).min(223);
+                    report.push((32 + col_1) as u8);
+                }
+            };
+            push_coord(column);
+            push_coord(row);
+            report
+        }
+    }
 }
 
 fn scroll_action(
@@ -164,34 +201,23 @@ impl RemoteGridTracker {
             self.grids.remove(session_id);
         }
     }
+
+    fn retain_sessions(
+        &mut self,
+        live_ids: &std::collections::HashSet<String>,
+        active_id: Option<&str>,
+    ) {
+        self.grids
+            .retain(|id, _| live_ids.contains(id) || active_id == Some(id.as_str()));
+    }
 }
 
 #[derive(Default)]
 struct HistoricalReplay {
     active: bool,
     grid_ready: bool,
-    chunks: u32,
     backlog_end: Option<u64>,
-    started_at: Option<Instant>,
 }
-
-/// Teto do catch-up silencioso, em leituras de output (cada uma traz no
-/// maximo um chunk de `OUTPUT_MAX_BYTES`, 256 KB do host). Backstop de
-/// runaway, nao a saida normal: quem termina o catch-up e o offset de
-/// abertura em [`HistoricalReplay::backlog_end`]. Existe porque uma sessao
-/// cujo `output_offset` nunca chega deixaria a tela coberta pra sempre;
-/// estourado, volta a pintar chunk a chunk, entao o pior caso vira o
-/// comportamento antigo e nunca algo pior.
-const MAX_SILENT_REPLAY_CHUNKS: u32 = 512;
-
-/// Prazo de parede do catch-up, contado a partir do momento em que ele PODE
-/// drenar — a primeira medida da grade —, nunca da selecao da sessao. Uma
-/// sessao selecionada com o terminal fora da tela nao consome leitura nenhuma
-/// (`can_consume_output`), e queimar a janela ali devolvia o filme do
-/// scrollback ao usuario que abrisse o painel depois. Ultimo recurso, atras do
-/// offset de abertura e da falha de leitura: mede um poll que parou de voltar,
-/// e so solta a tela no proximo repaint de outra fonte.
-const MAX_SILENT_REPLAY_WINDOW: Duration = Duration::from_secs(5);
 
 /// Cadencia do re-sync de `input_modes` com o host depois de um truncamento.
 ///
@@ -262,6 +288,18 @@ fn give_up_on_resize(consecutive_failures: u32) -> bool {
     consecutive_failures >= MAX_RESIZE_RETRIES
 }
 
+/// Um Worker que terminou não é falha de transporte.
+///
+/// O host responde `409: session has exited` a QUALQUER request feito contra
+/// uma sessão morta — write, resize, poll — e o banner de disconnect
+/// transformava o encerramento normal de um Worker num erro vermelho no topo
+/// da grade. O rodapé do terminal já diz que a sessão encerrou, então o banner
+/// só repetia o fato em tom de falha. Erro de transporte de verdade (host
+/// fora, socket recusado, payload inválido) continua aparecendo.
+fn is_expected_session_exit(error: &str) -> bool {
+    error.contains("session has exited")
+}
+
 fn is_visible(last_prepaint: Option<Instant>, now: Instant) -> bool {
     last_prepaint.is_some_and(|at| now.saturating_duration_since(at) < VISIBLE_PREPAINT_WINDOW)
 }
@@ -270,15 +308,10 @@ impl HistoricalReplay {
     fn start(&mut self) {
         self.active = true;
         self.grid_ready = false;
-        self.chunks = 0;
         self.backlog_end = None;
-        self.started_at = None;
     }
 
     fn observe_geometry(&mut self) {
-        if !self.grid_ready {
-            self.started_at = Some(Instant::now());
-        }
         self.grid_ready = true;
     }
 
@@ -286,31 +319,11 @@ impl HistoricalReplay {
         !self.active || self.grid_ready
     }
 
-    /// Enquanto o backlog nao drena, o terminal alimenta o emulador sem
-    /// pintar: cada chunk pintado era um quadro do terminal rolando do topo,
-    /// e quem abre a sessao quer o fim dela, nao o filme.
-    ///
-    /// A saida e TOTAL: alcancar o offset de abertura, uma leitura vazia, uma
-    /// falha de leitura, o teto de chunks ou o prazo de parede. Inferir "ainda
-    /// drenando" so do caminho feliz deixava o overlay pendurado em cima de
-    /// uma grade viva sempre que um refresh nao chegava.
+    /// Only consuming the opening boundary makes the first grid presentable.
+    /// A timer, chunk budget or transport failure cannot make partial history
+    /// complete. Failed reads use the terminal's error banner and retry backoff.
     fn is_catching_up(&self) -> bool {
-        self.is_catching_up_at(Instant::now())
-    }
-
-    fn is_catching_up_at(&self, now: Instant) -> bool {
         self.active
-            && self.chunks < MAX_SILENT_REPLAY_CHUNKS
-            && self
-                .started_at
-                .is_none_or(|start| now.saturating_duration_since(start) < MAX_SILENT_REPLAY_WINDOW)
-    }
-
-    /// Ler falhou. "Nao consegui ler" nao e "ainda estou drenando backlog": a
-    /// faixa de erro e o sinal, e esconder a grade atras de um estado de
-    /// carregamento falso so tira do usuario o scrollback que ele veio ver.
-    fn observe_failure(&mut self) {
-        self.active = false;
     }
 
     /// Fim do catch-up: o backlog que existia QUANDO O TERMINAL ABRIU. O
@@ -326,11 +339,10 @@ impl HistoricalReplay {
         if let Some(end) = backlog_end {
             self.backlog_end.get_or_insert(end);
         }
-        if !had_data {
+        if !had_data && self.backlog_end.is_none() {
             self.active = false;
             return;
         }
-        self.chunks = self.chunks.saturating_add(1);
         if self.backlog_end.is_some_and(|end| next_offset >= end) {
             self.active = false;
         }
@@ -357,6 +369,9 @@ struct ResizeSync {
 
 impl ResizeSync {
     fn start(&mut self) -> u64 {
+        if self.pending {
+            return self.epoch;
+        }
         self.epoch = self.epoch.wrapping_add(1);
         self.pending = true;
         self.epoch
@@ -410,6 +425,7 @@ impl<T> WorkersTerminalView<T> {
 
 struct WorkersTerminalState {
     emulator: Emulator,
+    stopped: bool,
     offset: u64,
     viewport_dirty: bool,
     modes_from_snapshot: bool,
@@ -430,8 +446,11 @@ struct WorkersTerminalState {
 
 impl WorkersTerminalState {
     fn new(cols: u16, rows: u16) -> Self {
+        let mut emulator = Emulator::new(cols, rows);
+        emulator.retain_last_alternate_screen();
         Self {
-            emulator: Emulator::new(cols, rows),
+            emulator,
+            stopped: false,
             offset: 0,
             viewport_dirty: true,
             modes_from_snapshot: false,
@@ -462,6 +481,11 @@ impl WorkersTerminalState {
                     .is_none_or(|at| now.saturating_duration_since(at) >= MODE_RESYNC_INTERVAL))
     }
 
+    fn observe_failure(&mut self) {
+        // Retry the snapshot too, without publishing a partially recovered grid.
+        self.viewport_dirty = true;
+    }
+
     /// Roda por refresh E por render, entao so monta a cauda que o scan olha:
     /// a grade inteira era ~10 KB de String descartada duas vezes por quadro.
     fn has_tui_jump_hint(&self) -> bool {
@@ -474,6 +498,11 @@ impl WorkersTerminalState {
     }
 
     fn apply_refresh(&mut self, output: WorkersOutput, viewport: Option<WorkersViewport>) -> bool {
+        // Clear any previous resize error on successful output/viewport refresh.
+        // If polling succeeds, the worker session is alive and connected; keeping
+        // a stale resize error banner over a functional grid leads to a false
+        // "Worker terminal disconnected" indicator.
+        self.resize_error = None;
         let had_data = !output.data.is_empty();
         let truncated = output.truncated;
         let backlog_end = viewport.as_ref().map(|viewport| viewport.output_offset);
@@ -482,7 +511,13 @@ impl WorkersTerminalState {
                 .as_ref()
                 .map(|viewport| (viewport.cols, viewport.rows))
                 .unwrap_or((self.emulator.cols() as u16, self.emulator.rows() as u16));
+            let cols = if self.stopped && self.historical_replay.is_catching_up() {
+                300
+            } else {
+                cols
+            };
             self.emulator = Emulator::new(cols, rows);
+            self.emulator.retain_last_alternate_screen();
             self.modes_from_snapshot = true;
         }
         if had_data {
@@ -515,6 +550,9 @@ impl WorkersTerminalState {
         }
         self.historical_replay
             .observe_output(had_data, self.offset, backlog_end);
+        if self.stopped && !self.historical_replay.is_catching_up() {
+            self.emulator.prepare_stopped_screen();
+        }
         if !self.has_tui_jump_hint() {
             self.tui_jump_suppressed = false;
         }
@@ -581,6 +619,12 @@ impl RetainedWorkerTerminals {
             state.selection_drag = None;
         }
     }
+
+    fn retain_sessions(&mut self, live_ids: &std::collections::HashSet<String>) {
+        let active_id = self.active_id.clone();
+        self.states
+            .retain(|id, _| live_ids.contains(id) || active_id.as_deref() == Some(id.as_str()));
+    }
 }
 
 pub struct WorkersTerminal {
@@ -619,6 +663,7 @@ impl WorkersTerminal {
                     viewport_dirty,
                     resize_epoch,
                     visible,
+                    catching_up,
                 )) = this.update(cx, |terminal, _| {
                     let state = terminal.active_state();
                     (
@@ -634,6 +679,7 @@ impl WorkersTerminal {
                         state.is_some_and(|state| state.needs_viewport(Instant::now())),
                         state.map_or(0, |state| state.resize_sync.epoch()),
                         is_visible(terminal.last_prepaint, Instant::now()),
+                        state.is_some_and(|state| state.historical_replay.is_catching_up()),
                     )
                 })
                 else {
@@ -655,7 +701,7 @@ impl WorkersTerminal {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let wait_ms = if visible {
+                        let wait_ms = if visible && !catching_up {
                             FOREGROUND_OUTPUT_WAIT_MS
                         } else {
                             0
@@ -681,6 +727,9 @@ impl WorkersTerminal {
                     })
                     .await;
                 let failed = result.is_err();
+                let had_data = result
+                    .as_ref()
+                    .is_ok_and(|(output, _)| !output.data.is_empty());
                 if this
                     .update(cx, |terminal, cx| {
                         if terminal.generation != generation
@@ -699,6 +748,7 @@ impl WorkersTerminal {
                                 let was_catching_up = state.historical_replay.is_catching_up();
                                 let had_data = state.apply_refresh(output, viewport);
                                 let catching_up = state.historical_replay.is_catching_up();
+                                state.resize_error = None;
                                 terminal.error = None;
                                 if should_paint(
                                     was_catching_up,
@@ -710,7 +760,7 @@ impl WorkersTerminal {
                                 }
                             }
                             Err(error) => {
-                                state.historical_replay.observe_failure();
+                                state.observe_failure();
                                 terminal.error = Some(error.to_string());
                                 cx.notify();
                             }
@@ -731,9 +781,9 @@ impl WorkersTerminal {
                         .await;
                 } else {
                     error_backoff_ms = 0;
-                    if !visible {
-                        // Sem long-poll segurando a resposta, a cadencia tem
-                        // que vir daqui — senao isto vira busy loop.
+                    if (!visible && !catching_up) || (catching_up && !had_data) {
+                        // Drain real backlog immediately. Empty recovery reads
+                        // still yield on a timer so a stalled source cannot spin.
                         cx.background_executor()
                             .timer(BACKGROUND_POLL_INTERVAL)
                             .await;
@@ -765,6 +815,11 @@ impl WorkersTerminal {
         if self.session_id == session_id {
             return;
         }
+        // Flush any pending coalesced input to the previous session before switching,
+        // so typing/pasting immediately before a switch is not discarded.
+        self.flush_input(cx);
+        self.flush_task = None;
+
         self.focus_pending = session_id.is_some();
         self.session_id = session_id.clone();
         let (cols, rows) = self
@@ -775,10 +830,29 @@ impl WorkersTerminal {
         if inserted && let Some(state) = self.terminals.active_mut() {
             state.historical_replay.start();
         }
+        // Reset resize retry counters upon entering the session, giving it a fresh
+        // chance to synchronize geometry. If the session has exited, `is_expected_session_exit`
+        // will immediately saturate retries on the first failure without looping.
+        if let Some(state) = self.terminals.active_mut() {
+            state.resize_failures = 0;
+            state.resize_retry_blocked = false;
+        }
         self.generation = self.generation.wrapping_add(1);
         self.error = None;
         self.coalescer.take();
         cx.notify();
+    }
+
+    pub fn set_stopped(&mut self, stopped: bool, cx: &mut Context<Self>) {
+        if let Some(state) = self.active_state_mut() {
+            state.stopped = stopped;
+            if stopped
+                && !state.historical_replay.is_catching_up()
+                && state.emulator.prepare_stopped_screen()
+            {
+                cx.notify();
+            }
+        }
     }
 
     fn active_state(&self) -> Option<&WorkersTerminalState> {
@@ -799,17 +873,39 @@ impl WorkersTerminal {
     pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
         self.last_prepaint = Some(Instant::now());
         self.client.remember_grid(geometry.cols, geometry.rows);
-        let dimensions_changed = self.geometry.is_none_or(|previous| {
-            previous.cols != geometry.cols || previous.rows != geometry.rows
-        });
+        let dimensions_changed = self.geometry.is_none()
+            || self.active_state().is_some_and(|state| {
+                state.emulator.cols() != geometry.cols as usize
+                    || state.emulator.rows() != geometry.rows as usize
+            });
         self.geometry = Some(geometry);
         if let Some(state) = self.active_state_mut() {
             state.historical_replay.observe_geometry();
-            if state.emulator.cols() != geometry.cols as usize
+        }
+        // Local geometry follows the panel on every frame. Only the host
+        // transport waits for the previous request; otherwise a slow response
+        // leaves the painted grid at the old width during direct manipulation.
+        if let Some(state) = self.active_state_mut() {
+            // A stopped TUI cannot redraw text clipped during replay. Decode
+            // at the host's supported column ceiling, then reflow the completed
+            // read-only grid into the panel. In particular, DEC ?7l must not
+            // discard the right half of every historical line on a narrow open.
+            let cols = if state.stopped && state.historical_replay.is_catching_up() {
+                300
+            } else {
+                geometry.cols
+            };
+            if state.emulator.cols() != cols as usize
                 || state.emulator.rows() != geometry.rows as usize
             {
-                state.emulator.resize(geometry.cols, geometry.rows);
+                state.emulator.resize(cols, geometry.rows);
             }
+        }
+        if self
+            .active_state()
+            .is_some_and(|state| state.resize_sync.pending() || state.stopped)
+        {
+            return;
         }
         let Some(session_id) = self.session_id.clone() else {
             return;
@@ -875,12 +971,19 @@ impl WorkersTerminal {
                         }
                     }
                     Err(error) => {
+                        let error_str = error.to_string();
                         tracing::warn!(%error, "workers terminal resize failed");
                         terminal.remote_grids.invalidate(&session_id, cols, rows);
                         if let Some(state) = terminal.terminals.states.get_mut(&session_id) {
-                            state.resize_error = Some(error.to_string());
+                            state.resize_error = Some(error_str.clone());
                             state.resize_retry_blocked = true;
-                            state.resize_failures = state.resize_failures.saturating_add(1);
+                            // An expected session exit is not a transient transport failure:
+                            // do not burn retries in the 500ms timer; give up immediately.
+                            if is_expected_session_exit(&error_str) {
+                                state.resize_failures = MAX_RESIZE_RETRIES;
+                            } else {
+                                state.resize_failures = state.resize_failures.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -905,6 +1008,9 @@ impl WorkersTerminal {
 
     pub fn active_grid_snapshot(&self) -> Option<GridSnapshot> {
         let state = self.active_state()?;
+        if state.historical_replay.is_catching_up() {
+            return None;
+        }
         Some(GridSnapshot {
             lines: state.emulator.lines(),
             cursor: state.emulator.cursor(),
@@ -916,6 +1022,12 @@ impl WorkersTerminal {
     pub fn shed_scrollback(&mut self, include_active: bool, cx: &mut Context<Self>) {
         self.terminals.shed_scrollback(include_active);
         cx.notify();
+    }
+
+    pub fn retain_sessions(&mut self, live_ids: &std::collections::HashSet<String>) {
+        self.terminals.retain_sessions(live_ids);
+        self.remote_grids
+            .retain_sessions(live_ids, self.session_id.as_deref());
     }
 
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1258,11 +1370,10 @@ impl WorkersTerminal {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
-        let input_modes = self
-            .active_state()
-            .map_or(WorkersViewportInputModes::default(), |state| {
-                state.input_modes
-            });
+        let (input_modes, mouse_protocol) = self.active_state().map_or(
+            (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
+            |state| (state.input_modes, state.mouse_protocol),
+        );
         if input_modes.known && input_modes.mouse_reporting {
             let Some(hit) = self.cell_hit_at(event.position) else {
                 return;
@@ -1271,7 +1382,13 @@ impl WorkersTerminal {
                 state.selection_drag = None;
             }
             self.queue_input(
-                &mouse_report_bytes(MouseReportKind::Down, hit.col, hit.row, event.modifiers),
+                &mouse_report_bytes(
+                    MouseReportKind::Down,
+                    hit.col,
+                    hit.row,
+                    event.modifiers,
+                    mouse_protocol,
+                ),
                 cx,
             );
             return;
@@ -1326,11 +1443,10 @@ impl WorkersTerminal {
             }
             return;
         }
-        let input_modes = self
-            .active_state()
-            .map_or(WorkersViewportInputModes::default(), |state| {
-                state.input_modes
-            });
+        let (input_modes, mouse_protocol) = self.active_state().map_or(
+            (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
+            |state| (state.input_modes, state.mouse_protocol),
+        );
         if input_modes.known && input_modes.mouse_reporting {
             let kind = match event.pressed_button {
                 Some(MouseButton::Left) if input_modes.mouse_button_motion => MouseReportKind::Drag,
@@ -1341,7 +1457,7 @@ impl WorkersTerminal {
                 return;
             };
             self.queue_input(
-                &mouse_report_bytes(kind, hit.col, hit.row, event.modifiers),
+                &mouse_report_bytes(kind, hit.col, hit.row, event.modifiers, mouse_protocol),
                 cx,
             );
             return;
@@ -1381,15 +1497,20 @@ impl WorkersTerminal {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let input_modes = self
-            .active_state()
-            .map_or(WorkersViewportInputModes::default(), |state| {
-                state.input_modes
-            });
+        let (input_modes, mouse_protocol) = self.active_state().map_or(
+            (WorkersViewportInputModes::default(), MouseProtocol::Sgr),
+            |state| (state.input_modes, state.mouse_protocol),
+        );
         if input_modes.known && input_modes.mouse_reporting {
             if let Some(hit) = self.cell_hit_at(event.position) {
                 self.queue_input(
-                    &mouse_report_bytes(MouseReportKind::Up, hit.col, hit.row, event.modifiers),
+                    &mouse_report_bytes(
+                        MouseReportKind::Up,
+                        hit.col,
+                        hit.row,
+                        event.modifiers,
+                        mouse_protocol,
+                    ),
                     cx,
                 );
             }
@@ -1448,18 +1569,21 @@ impl Render for WorkersTerminal {
         let error = self
             .active_state()
             .and_then(|state| state.resize_error.clone())
-            .or_else(|| self.error.clone());
+            .or_else(|| self.error.clone())
+            .filter(|error| !is_expected_session_exit(error));
         let theme = crate::theme::Theme::of(cx).clone();
-        // Suprimir o notify do replay nao basta: qualquer outro repaint da
-        // janela pinta o emulador no meio do backlog, e o usuario ve o
-        // terminal rolando do topo. A grade fica coberta ate o catch-up
-        // drenar — o TerminalElement continua montado porque e ele que mede a
-        // geometria, e o replay so consome output depois que a grade existe.
+        // The element stays mounted to measure geometry, but its grid snapshot
+        // is withheld until recovery completes. An overlay alone leaks partial
+        // history through Glass's translucent terminal background.
         let catching_up = self
             .active_state()
             .is_some_and(|state| state.historical_replay.is_catching_up());
-        let scrollbar = self.render_scrollbar(&theme, cx);
-        let jump_to_bottom = self.render_jump_to_bottom(cx);
+        let scrollbar = (!catching_up)
+            .then(|| self.render_scrollbar(&theme, cx))
+            .flatten();
+        let jump_to_bottom = (!catching_up)
+            .then(|| self.render_jump_to_bottom(cx))
+            .flatten();
         div()
             .id("workers-terminal")
             .role(gpui::Role::Terminal)
@@ -1482,7 +1606,6 @@ impl Render for WorkersTerminal {
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(crate::terminal::view::terminal_panel_bg(&theme))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1523,11 +1646,25 @@ mod tests {
     use crate::terminal::view::paste_bytes;
 
     use super::{
-        HistoricalReplay, Instant, MAX_SILENT_REPLAY_CHUNKS, MAX_SILENT_REPLAY_WINDOW,
-        MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync, RetainedWorkerTerminals,
-        TerminalRefresh, TerminalScrollAction, WorkersTerminalView, mouse_report_bytes,
-        scroll_action, should_paint, terminal_refresh, viewport_has_tui_jump_hint,
+        HistoricalReplay, MouseProtocol, MouseReportKind, RemoteGridTracker, ResizeSync,
+        RetainedWorkerTerminals, TerminalRefresh, TerminalScrollAction, WorkersTerminalView,
+        is_expected_session_exit, mouse_report_bytes, scroll_action, should_paint,
+        terminal_refresh, viewport_has_tui_jump_hint,
     };
+
+    #[test]
+    fn a_finished_worker_is_not_reported_as_a_disconnect() {
+        // The host answers every request against a dead session this way, so
+        // the banner fired on normal Worker completion.
+        assert!(is_expected_session_exit(
+            "Unpeel request failed with status 409: session has exited"
+        ));
+        // Real transport failures must still reach the banner.
+        assert!(!is_expected_session_exit(
+            "Unpeel request failed with status 500: internal error"
+        ));
+        assert!(!is_expected_session_exit("connection refused"));
+    }
 
     #[test]
     fn retained_session_switch_preserves_history_and_view_position() {
@@ -1972,6 +2109,164 @@ mod tests {
         assert!(should_paint(false, replay.is_catching_up(), true, false));
     }
 
+    #[gpui::test]
+    fn stopped_history_keeps_text_written_with_autowrap_disabled(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let terminal = cx.new(super::WorkersTerminal::new);
+        terminal.update(cx, |terminal, cx| {
+            terminal
+                .terminals
+                .select(Some("stopped-history-fixture".into()), 8, 5);
+            let state = terminal.active_state_mut().unwrap();
+            state.stopped = true;
+            state.historical_replay.start();
+            terminal.on_grid_metrics(
+                crate::terminal::panel::GridGeometry {
+                    bounds: gpui::Bounds::default(),
+                    origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                    cell_w: 8.0,
+                    line_h: 16.0,
+                    cols: 8,
+                    rows: 5,
+                },
+                cx,
+            );
+            let state = terminal.active_state_mut().unwrap();
+            state.emulator.feed(b"\x1b[?7labcdefghijklmnopqrst");
+            state.emulator.prepare_stopped_screen();
+            state.emulator.resize(8, 5);
+            state.emulator.resize(20, 5);
+            state.emulator.scroll(1000);
+            let rows: Vec<_> = (0..5).map(|row| state.emulator.row_text(row)).collect();
+            assert!(
+                rows.iter().any(|row| row == "abcdefghijklmnopqrst"),
+                "{rows:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn local_grid_tracks_panel_while_host_resize_is_pending(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let terminal = cx.new(super::WorkersTerminal::new);
+        terminal.update(cx, |terminal, cx| {
+            terminal
+                .terminals
+                .select(Some("resize-fixture".into()), 20, 5);
+            terminal.terminals.active_mut().unwrap().resize_sync.start();
+            terminal.on_grid_metrics(
+                crate::terminal::panel::GridGeometry {
+                    bounds: gpui::Bounds::default(),
+                    origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                    cell_w: 8.0,
+                    line_h: 16.0,
+                    cols: 40,
+                    rows: 10,
+                },
+                cx,
+            );
+            let state = terminal.active_state().unwrap();
+            assert_eq!((state.emulator.cols(), state.emulator.rows()), (40, 10));
+            assert!(state.resize_sync.pending());
+        });
+    }
+
+    #[gpui::test]
+    fn first_open_never_projects_a_partial_grid(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+
+        let terminal = cx.new(super::WorkersTerminal::new);
+        terminal.update(cx, |terminal, _| {
+            terminal
+                .terminals
+                .select(Some("first-open-fixture".into()), 12, 3);
+            let state = terminal.terminals.active_mut().unwrap();
+            state.historical_replay.start();
+            state.historical_replay.observe_geometry();
+            state.apply_refresh(
+                zeron_workers_unpeel::WorkersOutput {
+                    offset: 0,
+                    next_offset: 9,
+                    data: b"earlier\r\n".to_vec(),
+                    truncated: false,
+                },
+                Some(zeron_workers_unpeel::WorkersViewport {
+                    output_offset: 17,
+                    cols: 12,
+                    rows: 3,
+                    ansi: Vec::new(),
+                    input_modes: WorkersViewportInputModes::default(),
+                }),
+            );
+            assert!(
+                terminal.active_grid_snapshot().is_none(),
+                "unrelated repaints must not shape historical intermediate rows"
+            );
+
+            terminal.terminals.active_mut().unwrap().apply_refresh(
+                zeron_workers_unpeel::WorkersOutput {
+                    offset: 9,
+                    next_offset: 17,
+                    data: b"latest\r\n".to_vec(),
+                    truncated: false,
+                },
+                None,
+            );
+            assert!(terminal.active_grid_snapshot().is_some());
+            assert_eq!(
+                terminal.active_state().unwrap().emulator.row_text(1).trim(),
+                "latest"
+            );
+        });
+    }
+
+    #[test]
+    fn first_open_keeps_large_history_hidden_until_its_boundary() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+        for chunk in 1..=600 {
+            replay.observe_output(true, chunk * CHUNK, Some(601 * CHUNK));
+            assert!(replay.is_catching_up(), "chunk {chunk} is still historical");
+        }
+        replay.observe_output(true, 601 * CHUNK, None);
+        assert!(!replay.is_catching_up());
+    }
+
+    #[test]
+    fn first_open_empty_read_before_the_boundary_keeps_history_hidden() {
+        let mut replay = HistoricalReplay::default();
+        replay.start();
+        replay.observe_geometry();
+        replay.observe_output(true, CHUNK, Some(2 * CHUNK));
+        replay.observe_output(false, CHUNK, None);
+        assert!(replay.is_catching_up());
+        replay.observe_output(true, 2 * CHUNK, None);
+        assert!(!replay.is_catching_up());
+    }
+
+    #[test]
+    fn first_open_failure_does_not_publish_partial_history() {
+        let mut state = super::WorkersTerminalState::new(12, 3);
+        state.historical_replay.start();
+        state.historical_replay.observe_geometry();
+        state
+            .historical_replay
+            .observe_output(true, CHUNK, Some(3 * CHUNK));
+        state.viewport_dirty = false;
+        state.observe_failure();
+        assert!(state.viewport_dirty);
+        assert!(state.historical_replay.is_catching_up());
+        state
+            .historical_replay
+            .observe_output(true, 2 * CHUNK, None);
+        assert!(state.historical_replay.is_catching_up());
+        state
+            .historical_replay
+            .observe_output(true, 3 * CHUNK, None);
+        assert!(!state.historical_replay.is_catching_up());
+    }
+
     /// A regressao: `read_output` faz long-poll de 180 ms, entao uma sessao
     /// viva que imprime a cada <180 ms nunca devolve leitura vazia. Sem o
     /// offset de abertura, o overlay "Loading history…" cobria a grade
@@ -2008,101 +2303,17 @@ mod tests {
         assert!(!replay.is_catching_up());
     }
 
-    /// O braco de erro do poll nunca chama `apply_refresh`, entao um erro
-    /// persistente de `read_output`/`read_viewport` deixava o overlay
-    /// "Loading history…" cobrindo a grade pra sempre — nem o teto de chunks
-    /// salvava, porque ele so avanca no caminho feliz.
     #[test]
-    fn a_read_that_keeps_failing_stops_reading_as_catch_up() {
-        let mut replay = HistoricalReplay::default();
-        replay.start();
-        replay.observe_geometry();
-        replay.observe_output(true, CHUNK, Some(10 * CHUNK));
-        assert!(replay.is_catching_up());
-
-        for _ in 0..3 {
-            replay.observe_failure();
-            assert!(!replay.is_catching_up());
-        }
-
-        assert!(should_paint(true, replay.is_catching_up(), false, false));
-    }
-
-    /// E se `apply_refresh` nunca for chamado — poll que nao volta, com a
-    /// grade ja medida — o prazo de parede e a unica coisa que sobra pra
-    /// soltar a tela.
-    #[test]
-    fn a_catch_up_that_never_receives_a_refresh_expires_on_the_clock() {
-        let mut replay = HistoricalReplay::default();
-        replay.start();
-        replay.observe_geometry();
-        let measured = Instant::now();
-
-        assert!(replay.can_consume_output());
-        assert!(replay.is_catching_up_at(measured));
-        assert!(!replay.is_catching_up_at(measured + MAX_SILENT_REPLAY_WINDOW));
-    }
-
-    /// A janela conta do momento em que o catch-up PODE drenar, nao da
-    /// selecao: `set_session` roda na restauracao do boot e no auto-select
-    /// pos-launch, com o terminal fora da tela. Carimbando em `start()`, a
-    /// sessao queimava os 5 s sem ler nada e quem abrisse o painel depois via
-    /// o backlog inteiro rolar do topo — o bug original.
-    #[test]
-    fn a_session_selected_off_screen_still_catches_up_when_the_grid_appears() {
-        let mut replay = HistoricalReplay::default();
-        replay.start();
-        let selected = Instant::now();
-
-        assert!(!replay.can_consume_output());
-        assert!(replay.is_catching_up_at(selected + MAX_SILENT_REPLAY_WINDOW * 4));
-
-        replay.observe_geometry();
-        let measured = Instant::now();
-
-        assert!(replay.can_consume_output());
-        assert!(
-            replay.is_catching_up_at(measured),
-            "a janela so comeca quando a grade mede"
+    fn resize_sync_coalesces_while_a_request_is_in_flight() {
+        let mut sync = ResizeSync::default();
+        let first = sync.start();
+        assert_eq!(
+            sync.start(),
+            first,
+            "an in-flight resize must not be superseded"
         );
-        assert!(!replay.is_catching_up_at(measured + MAX_SILENT_REPLAY_WINDOW));
-    }
-
-    /// O relogio e o ultimo recurso: numa abertura normal quem encerra o
-    /// catch-up e o offset de abertura, muito antes do prazo.
-    #[test]
-    fn a_normal_open_leaves_on_the_backlog_mark_not_on_the_deadline() {
-        let mut replay = HistoricalReplay::default();
-        replay.start();
-        replay.observe_geometry();
-        let measured = Instant::now();
-
-        for chunk in 1..=3_u64 {
-            assert!(replay.is_catching_up_at(measured));
-            replay.observe_output(true, chunk * CHUNK, (chunk == 1).then_some(3 * CHUNK));
-        }
-
-        assert!(
-            !replay.is_catching_up_at(measured),
-            "saiu pelo offset de abertura, com a janela inteira ainda de pe"
-        );
-    }
-
-    /// Uma sessao viva e tagarela pode nunca drenar; sem teto a tela ficaria
-    /// vazia pra sempre.
-    #[test]
-    fn a_backlog_that_never_drains_starts_painting_again() {
-        let mut replay = HistoricalReplay::default();
-        replay.start();
-        replay.observe_geometry();
-
-        for chunk in 1..=u64::from(MAX_SILENT_REPLAY_CHUNKS) {
-            assert!(replay.is_catching_up());
-            replay.observe_output(true, chunk * CHUNK, None);
-        }
-
-        assert!(!replay.is_catching_up(), "o teto solta o paint");
-        assert!(should_paint(false, replay.is_catching_up(), true, false));
+        assert!(sync.complete(first));
+        assert_ne!(sync.start(), first);
     }
 
     #[test]
@@ -2119,6 +2330,7 @@ mod tests {
     fn stale_resize_completion_does_not_release_a_newer_resize() {
         let mut sync = ResizeSync::default();
         let stale_resize = sync.start();
+        assert!(sync.complete(stale_resize));
         let current_resize = sync.start();
 
         assert!(!sync.complete(stale_resize));
@@ -2137,16 +2349,184 @@ mod tests {
         };
 
         assert_eq!(
-            mouse_report_bytes(MouseReportKind::Down, 0, 0, modifiers),
+            mouse_report_bytes(MouseReportKind::Down, 0, 0, modifiers, MouseProtocol::Sgr),
             b"\x1b[<28;1;1M"
         );
         assert_eq!(
-            mouse_report_bytes(MouseReportKind::Drag, 7, 4, Modifiers::default()),
+            mouse_report_bytes(
+                MouseReportKind::Drag,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Sgr
+            ),
             b"\x1b[<32;8;5M"
         );
         assert_eq!(
-            mouse_report_bytes(MouseReportKind::Up, 7, 4, Modifiers::default()),
+            mouse_report_bytes(
+                MouseReportKind::Up,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Sgr
+            ),
             b"\x1b[<0;8;5m"
+        );
+    }
+
+    #[test]
+    fn normal_and_utf8_mouse_encoder_formats_and_saturation() {
+        let modifiers = Modifiers {
+            shift: true,
+            alt: true,
+            control: true,
+            ..Modifiers::default()
+        };
+
+        // Normal mode (X10 / mode 1000):
+        // Down with modifiers (shift=4, alt=8, ctrl=16 -> 28; button 32 + 28 = 60 ('<')):
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                0,
+                0,
+                modifiers,
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 60, 33, 33]
+        );
+        // Down with no modifiers: button 32 + 0 = 32 (' ')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                0,
+                0,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Up with no modifiers: release code 3 -> button 32 + 3 = 35 ('#')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Up,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 35, 40, 37]
+        );
+        // Drag with no modifiers: code 32 -> button 32 + 32 = 64 ('@')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Drag,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 64, 40, 37]
+        );
+        // Move with no modifiers: code 35 -> button 32 + 35 = 67 ('C')
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Move,
+                7,
+                4,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 67, 40, 37]
+        );
+        // Coordinate saturation in Normal mode: coordinates saturate at 223 (1-based), so 32 + 223 = 255 (0xFF):
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                300,
+                500,
+                Modifiers::default(),
+                MouseProtocol::Normal
+            ),
+            vec![0x1b, b'[', b'M', 32, 255, 255]
+        );
+
+        // UTF-8 mode (mode 1005):
+        // Single byte coordinates for <= 95 (0-based 94 -> 1-based 95 -> encoded 127):
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                0,
+                0,
+                Modifiers::default(),
+                MouseProtocol::Utf8
+            ),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // 2-byte UTF-8 encoding for coordinate > 95 (column 100 -> 1-based 101 -> encoded 133):
+        // 133 in UTF-8 is [0xC2, 0x85]
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                100,
+                0,
+                Modifiers::default(),
+                MouseProtocol::Utf8
+            ),
+            vec![0x1b, b'[', b'M', 32, 0xC2, 0x85, 33]
+        );
+        // Saturation in UTF-8 mode: coordinates saturate at 2015 (1-based), encoded = 2047:
+        // 2047 in UTF-8 is [0xDF, 0xBF]
+        assert_eq!(
+            mouse_report_bytes(
+                MouseReportKind::Down,
+                5000,
+                5000,
+                Modifiers::default(),
+                MouseProtocol::Utf8
+            ),
+            vec![0x1b, b'[', b'M', 32, 0xDF, 0xBF, 0xDF, 0xBF]
+        );
+    }
+
+    #[test]
+    fn retain_sessions_removes_dead_sessions_while_preserving_active() {
+        let mut terminals = RetainedWorkerTerminals::default();
+        terminals.select(Some("a".into()), 8, 2);
+        terminals.select(Some("b".into()), 8, 2);
+        terminals.select(Some("c".into()), 8, 2);
+        // Active is "c".
+        let mut live = std::collections::HashSet::new();
+        live.insert("a".into());
+        // "b" is dead (not in live). "c" is not in live, but is currently active.
+        terminals.retain_sessions(&live);
+        assert!(terminals.states.contains_key("a"), "live session retained");
+        assert!(!terminals.states.contains_key("b"), "dead session pruned");
+        assert!(
+            terminals.states.contains_key("c"),
+            "active session preserved even if not in live"
+        );
+    }
+
+    #[test]
+    fn apply_refresh_clears_stale_resize_error() {
+        let mut state = super::WorkersTerminalState::new(8, 2);
+        state.resize_error = Some("500 internal server error".into());
+        assert!(state.resize_error.is_some());
+
+        state.apply_refresh(
+            zeron_workers_unpeel::WorkersOutput {
+                offset: 0,
+                next_offset: 4,
+                data: b"live".to_vec(),
+                truncated: false,
+            },
+            None,
+        );
+
+        assert!(
+            state.resize_error.is_none(),
+            "successful poll output clears resize_error"
         );
     }
 

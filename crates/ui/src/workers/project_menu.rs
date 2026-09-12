@@ -36,7 +36,10 @@ pub fn project_menu_items(
         WorkersSessionSort::Custom => WorkersProjectMenuItem::SortRecentlyUpdated,
         WorkersSessionSort::RecentlyUpdated => WorkersProjectMenuItem::SortCustom,
     });
-    if !project.is_group && !is_worktree {
+    // Same gate the "In a new worktree" section of the launcher uses: a
+    // worktree branches from a ROOT project, and `worktree_branch` alone misses
+    // an adopted worktree, which is a child with no branch in the registry.
+    if !is_child && !project.is_group {
         items.push(WorkersProjectMenuItem::NewWorktree);
     }
     if !is_child {
@@ -53,7 +56,9 @@ pub fn project_menu_items(
         WorkersProjectMenuItem::OpenInEditor,
         if is_worktree {
             WorkersProjectMenuItem::RemoveWorktree
-        } else if is_child {
+        // Only the removal verb needs the organization verdict: an adopted
+        // worktree is a child too, and `remove_group` would reject it.
+        } else if project.is_group {
             WorkersProjectMenuItem::RemoveGroup
         } else {
             WorkersProjectMenuItem::RemoveProject
@@ -154,5 +159,18 @@ mod tests {
                 Item::RemoveWorktree,
             ]
         );
+    }
+
+    /// An adopted worktree on a detached HEAD: a child with a parent projected
+    /// from disk and no registry branch, but not an organization. Routing it to
+    /// `RemoveGroup` would die on "project is not a group".
+    #[test]
+    fn adopted_worktree_without_a_branch_removes_as_a_project() {
+        let mut adopted = project(Some("root"), None);
+        adopted.is_group = false;
+        let items = project_menu_items(&adopted, &[]);
+        assert_eq!(items.last(), Some(&Item::RemoveProject));
+        // And no worktree branches off a worktree.
+        assert!(!items.contains(&Item::NewWorktree));
     }
 }

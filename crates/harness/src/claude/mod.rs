@@ -431,8 +431,50 @@ impl Harness for ClaudeHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_with_mode(request, controls, None).await
+    }
+
+    async fn run_isolated(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+        instructions: &'static str,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        request.enable_workers_mcp = false;
+        request.workers_parent_chat_id = None;
+        self.run_with_mode(request, controls, Some(instructions))
+            .await
+    }
+}
+
+impl ClaudeHarness {
+    async fn run_with_mode(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+        instructions: Option<&'static str>,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let title_only = instructions.is_some();
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
+        if title_only {
+            cmd.args([
+                "--system-prompt",
+                instructions.unwrap(),
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--setting-sources",
+                "",
+            ]);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -479,6 +521,7 @@ impl Harness for ClaudeHarness {
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            title_only,
             child,
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
@@ -603,6 +646,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 }
 
 struct Session {
+    title_only: bool,
     child: Child,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
@@ -620,6 +664,7 @@ struct Session {
 /// mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        title_only,
         mut child,
         mut stdout_lines,
         stdin_tx,
@@ -663,7 +708,14 @@ async fn run_session(session: Session) {
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, &request_input, &stdin_tx);
+                        if title_only {
+                            let line = control_response_line(&req.request_id, serde_json::json!({
+                                "behavior": "deny", "message": "Tools are disabled for title generation"
+                            }));
+                            let _ = stdin_tx.send(StdinMsg::Line(line));
+                        } else {
+                            handle_control_request(req, &request_input, &stdin_tx);
+                        }
                         continue;
                     }
                     for ev in norm.normalize(frame, interrupted) {

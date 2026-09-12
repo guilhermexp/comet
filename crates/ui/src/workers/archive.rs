@@ -28,9 +28,14 @@ pub struct ArchiveRestorePresentation {
 }
 
 pub fn archive_restore_presentation(session: &WorkersSession) -> ArchiveRestorePresentation {
-    if session.capabilities.restart || session.capabilities.resume_agent {
+    if session.capabilities.resume_agent {
         ArchiveRestorePresentation {
             label: "Restore & Resume",
+            resume: true,
+        }
+    } else if session.capabilities.restart {
+        ArchiveRestorePresentation {
+            label: "Restore & Restart",
             resume: true,
         }
     } else {
@@ -104,6 +109,10 @@ mod tests {
     #[test]
     fn archive_exposes_exactly_one_restore_presentation() {
         let mut session = archived("worker", false, 1);
+
+        // Combination 1: neither restart nor resume_agent
+        session.capabilities.restart = false;
+        session.capabilities.resume_agent = false;
         assert_eq!(
             archive_restore_presentation(&session),
             ArchiveRestorePresentation {
@@ -112,7 +121,20 @@ mod tests {
             }
         );
 
+        // Combination 2: restart only (clean restart, no resume promise)
         session.capabilities.restart = true;
+        session.capabilities.resume_agent = false;
+        assert_eq!(
+            archive_restore_presentation(&session),
+            ArchiveRestorePresentation {
+                label: "Restore & Restart",
+                resume: true,
+            }
+        );
+
+        // Combination 3: resume_agent only
+        session.capabilities.restart = false;
+        session.capabilities.resume_agent = true;
         assert_eq!(
             archive_restore_presentation(&session),
             ArchiveRestorePresentation {
@@ -121,7 +143,8 @@ mod tests {
             }
         );
 
-        session.capabilities.restart = false;
+        // Combination 4: both restart and resume_agent (prefers resume)
+        session.capabilities.restart = true;
         session.capabilities.resume_agent = true;
         assert_eq!(
             archive_restore_presentation(&session),

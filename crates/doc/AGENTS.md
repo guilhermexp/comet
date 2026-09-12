@@ -12,6 +12,12 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 
 ## Local Contracts
 
+- Tools `workers` preservam `preset_id` junto de `action`, `session_id`, `project_id`, `name` e `project`, usando o mesmo limite/trim dos identificadores. Briefing, comandos e args adicionais continuam fora do transcript; sanitização repetida conserva o identificador. Histórico já salvo sem `preset_id` não é reconstruído.
+
+- Skill/skill preserva apenas os identificadores `skill`, `path` e `name` no input renderizável, com trim e strings vazias omitidas. Args, prompt e conteúdo continuam fora do transcript; sanitizer permanece idempotente.
+
+- Input parts persistem `answers` opcional, tanto pelo fold/SegmentWriter quanto por `resolve_input` de pergunta órfã. Ausência não significa resposta vazia; cancelamento sem respostas não apaga respostas já registradas. O gêmeo edge preserva esse campo.
+
 - Corpo de mensagem é **LoroText**, nunca reescrita LWW de valor — é a forma medida em 1.03× de oplog. Trocar isso multiplica o histórico.
 - Command ledger segue as regras 1–3: entradas append-only por device; outcome só do host; dedupe/TTL/supersede avaliados na leitura.
 - `set_command_status` carimba **toda** entrada com aquele id, não a primeira. Id é a identidade do comando; docs de antes de 2026-08-25 carregam milhares de gêmeos `pending` de um mesmo id (loop de retry no produtor), e carimbar só o primeiro deixava o resto inalcançável — o dead-command sweep do host reportava os restos em todo drain, para sempre.
@@ -22,6 +28,9 @@ Dona do formato dos documentos CRDT. O edge (TypeScript) materializa o mesmo sha
 - `SessionMessageEntry.duration_ms` é metadata aditiva de segmento assistant: `SegmentWriter::finish` só carimba quando a engine tem uma fronteira confiável; docs legados e recovery sem medição mantêm `None`.
 - Durante import incremental, Loro pode expor o map de uma part antes de seus escalares. Só map incompleto sem conteúdo e sem chaves além de `id`/`kind` é shell transitório (diagnóstico `debug`); shape com conteúdo ou chave desconhecida continua salvage com `warn`. O diagnóstico estrutural limita-se a path e kind allowlisted — nunca copia payload.
 - Mudança de nome/shape de container é **destrutiva cross-device** (foi o motivo do `2` em `ws2/{orgId}`). Vai por OpenSpec.
+- Row de sessão do `RegistryDoc` (`sessions`, kind) persiste `contextTokens`/`contextWindow` junto de status/`updatedAt` — a janela de contexto tem de sobreviver a restart do app (o gauge do composer lia zero até o próximo turno). `null` limpa o campo por LWW, mesma semântica de delete do row legado `WorkspaceDoc`. Ambos leem via `RawSession`; se um passar a gravar esses campos, o outro tem de acompanhar.
+
+- Both RegistryDoc and WorkspaceDoc preserve optional `lastCompletedTurn` in Session rows; absent legacy fields decode as None. Context usage and error metadata retain their existing contracts.
 
 ## Work Guidance
 

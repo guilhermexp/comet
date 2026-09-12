@@ -40,6 +40,14 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
 }
 
 impl Shell {
+    /// Navigation requests focus once the destination composer renders.
+    pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.focus_pending = true;
+            cx.notify();
+        });
+    }
+
     /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
     /// the order it is drawn. Selection is immediate (no MRU overlay held open
     /// on the modifier) — one press, one session.
@@ -77,6 +85,7 @@ impl Shell {
                 .map(|(_, c)| c.id.clone())
         };
         if let Some(first) = first {
+            self.focus_composer(cx);
             self.state
                 .update(cx, |s, cx| s.select_chat(Some(first), cx));
         }
@@ -85,6 +94,7 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.focus_composer(cx);
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -121,6 +131,7 @@ impl Shell {
             return;
         }
         self.route = Route::Chat;
+        self.focus_composer(cx);
         let target = {
             let state = self.state.read(cx);
             self.settings
@@ -273,20 +284,6 @@ impl Shell {
                             cx,
                         ))
                     })
-                    .child(header_icon_button(
-                        "expand-changes",
-                        right_pane_expand_icon(self.right_pane_expanded),
-                        takeover,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
-                    ))
-                    .child(header_icon_button(
-                        "toggle-changes",
-                        icons::SIDEBAR_MINIMALISTIC,
-                        true,
-                        &theme,
-                        cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
-                    ))
                     .into_any_element(),
             )
         } else {
@@ -316,6 +313,50 @@ impl Shell {
                     .into_any_element(),
             )
         };
+        // The pane's surface tabs live IN the titlebar band, exactly as the
+        // Workers header does (`panel_header`, shell.rs): the titlebar overlay
+        // owns this band's hit-testing, so a strip mounted inside the pane had
+        // to start 38px lower - the empty stripe above the tabs (user report).
+        let panel_header = (changes_active
+            && !on_canvas
+            && !matches!(self.resolved_right_active(cx), RightSurface::Picker))
+        .then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .right(px(details_now))
+                .w(px(right_now))
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .pr(px(10.0))
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .occlude()
+                // No left pad: the strip brings its own 8px gutter, which is
+                // what lands the first chip on the pane's own gutter.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(self.render_right_tab_strip(cx)),
+                )
+                .child(header_icon_button(
+                    "expand-changes",
+                    right_pane_expand_icon(self.right_pane_expanded),
+                    takeover,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                ))
+                .child(header_icon_button(
+                    "toggle-changes",
+                    icons::SIDEBAR_MINIMALISTIC,
+                    true,
+                    &theme,
+                    cx.listener(|this, _, window, cx| this.toggle_right_pane(window, cx)),
+                ))
+        });
         let inner = div()
             .size_full()
             .flex()
@@ -418,7 +459,8 @@ impl Shell {
             .relative()
             .h(px(Theme::TITLEBAR_HEIGHT))
             .flex_none()
-            .child(inner);
+            .child(inner)
+            .children(panel_header);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
     }

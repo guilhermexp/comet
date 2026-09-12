@@ -261,8 +261,42 @@ while IFS= read -r line; do
       ;;
     prompt)
       if [ "$scenario" = "live-frontend" ]; then fail_stage live_unexpected_prompt 59; fi
-      respond "$line" '{"agentInvoked":true}'
-      if [ "$scenario" = "full-run" ]; then
+      if [ "$scenario" = "local-command-output" ]; then
+        emit '{"type":"command_output","text":"Context window: 1048576 tokens (3% used)\n"}'
+        emit '{"type":"command_output","text":"  System prompt: 15553 tokens\n"}'
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-burst-output" ]; then
+        i=0
+        while [ "$i" -lt 300 ]; do
+          emit "{\"type\":\"command_output\",\"text\":\"chunk-$i\n\"}"
+          i=$((i + 1))
+        done
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-empty-output" ]; then
+        respond "$line" '{"agentInvoked":false}'
+      elif [ "$scenario" = "local-failure-with-partial" ]; then
+        emit '{"type":"command_output","text":"partial output before failure\n"}'
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"command execution failed\"}"
+      elif [ "$scenario" = "local-premature-exit" ]; then
+        emit '{"type":"command_output","text":"partial output before exit\n"}'
+        exit 12
+      elif [ "$scenario" = "local-long-cancel" ]; then
+        emit '{"type":"command_output","text":"working on long operation\n"}'
+        while read -r abort_cmd; do
+          if has "$abort_cmd" '"type":"abort"'; then
+            respond "$abort_cmd" '{}'
+            emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"Operation aborted\"}"
+            break
+          fi
+        done
+      elif [ "$scenario" = "prompt-omitted-agent-invoked" ]; then
+        respond "$line" '{}'
+        emit '{"type":"agent_start"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"normal prompt output"}}'
+        emit '{"type":"agent_end","messages":[]}'
+      else
+        respond "$line" '{"agentInvoked":true}'
+        if [ "$scenario" = "full-run" ]; then
         emit '{"type":"agent_start"}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"checking"}}'
@@ -297,6 +331,7 @@ while IFS= read -r line; do
         else
           fail_stage steer 27
         fi
+        emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"next"}]}}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" after steer"}}'
         emit '{"type":"agent_end","isTerminal":false,"messages":[]}'
         emit '{"type":"agent_start"}'
@@ -350,8 +385,109 @@ while IFS= read -r line; do
         else
           fail_stage workers_oversized 29
         fi
+      elif [ "$scenario" = "workers-wait-steer" ]; then
+        emit '{"type":"agent_start"}'
+        emit "{\"type\":\"host_tool_call\",\"id\":\"host-slow\",\"toolCallId\":\"workers-slow\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${FAKE_OMP_HOLD_PATH}\"}}"
+        emit '{"type":"host_tool_call","id":"host-fast","toolCallId":"workers-fast","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
+        got_slow=
+        got_fast=
+        while [ -z "$got_slow" ] || [ -z "$got_fast" ]; do
+          read -r host_result
+          if has "$host_result" '"type":"steer"'; then
+            fail_stage steer_before_tool_result 30
+          fi
+          if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-slow"'; then
+            got_slow=1
+          elif has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-fast"'; then
+            got_fast=1
+          else
+            fail_stage host_wait 31
+          fi
+        done
+        read -r steer
+        if has "$steer" '"type":"steer"' && has "$steer" '"message":"steer-now"'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"before-steer-tail"}}'
+          emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"steer-now"}]}}'
+          respond "$steer" '{}'
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after wait"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage steer 32
+        fi
+      elif [ "$scenario" = "workers-steer-cancel" ]; then
+        emit '{"type":"agent_start"}'
+        emit "{\"type\":\"host_tool_call\",\"id\":\"host-hold\",\"toolCallId\":\"workers-hold\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${FAKE_OMP_HOLD_PATH}\"}}"
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
+        marker=${FAKE_OMP_CANCEL_MARKER:-}
+        if [ -n "$marker" ]; then
+          (
+            while [ ! -f "$marker" ]; do sleep 0.05; done
+            emit '{"type":"host_tool_cancel","id":"cancel-host","targetId":"host-hold"}'
+          ) &
+        fi
+        got_result=
+        while [ -z "$got_result" ]; do
+          read -r host_result
+          if has "$host_result" '"type":"steer"'; then
+            fail_stage steer_before_tool_result 30
+          fi
+          if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-hold"'; then
+            if has "$host_result" '"isError":true'; then
+              emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"cancelled-delivered"}}'
+              got_result=1
+            else
+              fail_stage expected_cancelled 33
+            fi
+          else
+            fail_stage host_wait 31
+          fi
+        done
+        read -r after_result
+        if has "$after_result" '"type":"host_tool_result"'; then
+          fail_stage duplicate_tool_result 34
+        fi
+        if has "$after_result" '"type":"steer"' && has "$after_result" '"message":"steer-now"'; then
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"before-steer-tail"}}'
+          emit '{"type":"message_start","message":{"role":"user","steering":true,"attribution":"user","content":[{"type":"text","text":"steer-now"}]}}'
+          respond "$after_result" '{}'
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after wait"}}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          fail_stage steer 32
+        fi
+      elif [ "$scenario" = "workers-duplicate-id" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"host_tool_call","id":"host-dup","toolCallId":"workers-dup","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"host_tool_call","id":"host-dup","toolCallId":"workers-dup","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"host_tool_call","id":"host-tail","toolCallId":"workers-tail","toolName":"workers","arguments":{"action":"help"}}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"tools-pending"}}'
+        dup_count=0
+        got_tail=
+        while [ -z "$got_tail" ]; do
+          read -r host_result
+          if has "$host_result" '"type":"steer"'; then
+            fail_stage unexpected_steer 30
+          fi
+          if has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-dup"'; then
+            dup_count=$((dup_count + 1))
+            if [ "$dup_count" -gt 1 ]; then
+              fail_stage duplicate_tool_result 34
+            fi
+          elif has "$host_result" '"type":"host_tool_result"' && has "$host_result" '"id":"host-tail"'; then
+            got_tail=1
+          else
+            fail_stage host_wait 31
+          fi
+        done
+        if [ "$dup_count" -ne 1 ]; then
+          fail_stage expected_one_dup_result 35
+        fi
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after-dup"}}'
+        emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "wait" ]; then
         sleep 60
+      fi
       fi
       ;;
     *)

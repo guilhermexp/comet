@@ -12,6 +12,12 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Local Contracts
 
+- SearchGitHistory e ResolveGitAvatars são unary tipados e relay-forwardable no registry. Não recriar listas de forwardable/deadlines no handler.
+
+- `WatchPreviews` tem parâmetros/reply tipados no registry; não é forwardable. O catálogo no viewer já reúne serviços locais/remotos. Não marcar local_only: esse flag rejeita `targetDeviceId`, que neste método é filtro de conteúdo.
+
+- `ListWorkspaceDirectory`, `SearchWorkspaceFiles`, `ReadWorkspaceFile` e `WatchWorkspaceFiles` são tipados e relay-forwardable; só o último é stream. Ownership e limites de filesystem são validados pela engine de destino.
+
 - **Um protocolo só** para in-process, daemon local e device remoto. Atalho que só existe no modo in-process quebra headless silenciosamente.
 - **`src/method.rs` é a lista única de métodos**: nome de fio, `params`, `reply`, `forwardable`, `stream` e `deadline` de um método moram todos numa linha do macro `rpc_methods!`. Adicionar RPC = uma linha no macro + o handler na engine. Nome e valor de cada const de `methods::` são fio — nunca renomear. A engine lê esses atributos por `zeron_rpc::info(method)`; não existe segunda lista para estender.
 - Frame do device room é o envelope de relay — método novo que precisa ser dirigível de outro device tem que ser relay-forwardable.
@@ -20,6 +26,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 - No IPC local, `ProtocolError::HandshakeIncomplete` significa que o peer TCP saiu antes do upgrade e fica em debug; handshakes completos inválidos, `Origin` de browser e demais falhas continuam em warning.
 - `LinkCache::new` instala o watcher de credenciais antes de retornar; sign-out não pode perder a primeira versão do `watch` nem manter sockets autenticados em cache.
 - `WatchTrajectory` e `RevealTrajectoryRaw` são métodos estritamente device-local (IPC local apenas; nunca relay-forwarded — rejeitados no ingresso de conexões virtuais de peer relay pelo wrapper de transporte `RelayPeerService` antes do dispatch, além do gate de `targetDeviceId` no engine como defesa em profundidade). `TrajectoryCursor` é `(source_seq, sub_seq, rev)`: a tupla de posição desambigua o terminal Interrupted legado que compartilha `source_seq` com o prefixo em `sub_seq = u32::MAX`, e `rev` é a revisão de commit do store — sem ela, resume por posição perde a substituição in-place de partial→final. `rev` é `#[serde(default)]` e `0` significa "sem conhecimento de revisão"; `Ord` continua position-first, com `rev` só como desempate.
+
+- `GetTitleSettings` and `SetTitleSettings` are device-forwardable registry methods; title preferences are device-local and not CRDT data.
 
 ## Work Guidance
 

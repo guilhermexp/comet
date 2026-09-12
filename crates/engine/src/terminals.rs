@@ -80,6 +80,9 @@ impl LiveTerminal {
 
 struct TerminalsInner {
     sessions: Mutex<HashMap<String, Arc<Mutex<LiveTerminal>>>>,
+    restart_gate: Mutex<Option<zeron_update::RestartGate>>,
+    #[cfg(test)]
+    admission_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -129,10 +132,24 @@ impl Terminals {
         let terminals = Self {
             inner: Arc::new(TerminalsInner {
                 sessions: Mutex::new(HashMap::new()),
+                restart_gate: Mutex::new(None),
+                #[cfg(test)]
+                admission_hook: Mutex::new(None),
             }),
         };
         tokio::spawn(reaper_task(Arc::downgrade(&terminals.inner)));
         terminals
+    }
+
+    pub fn set_restart_gate(&self, gate: zeron_update::RestartGate) {
+        let mut slot = lock(&self.inner.restart_gate);
+        *slot = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub fn set_admission_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let mut slot = lock(&self.inner.admission_hook);
+        *slot = Some(hook);
     }
 
     /// Open a login shell in `cwd`. The PTY outlives every subscriber; it dies on
@@ -149,6 +166,18 @@ impl Terminals {
         rows: u16,
         shell: Option<&str>,
     ) -> Result<TerminalSession, EngineError> {
+        let _admission_guard = if let Some(gate) = lock(&self.inner.restart_gate).as_ref() {
+            Some(
+                gate.reserve_admission()
+                    .map_err(|_| EngineError::Other("engine is restarting for an update".into()))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.inner.admission_hook).as_ref() {
+            hook();
+        }
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
                 "Too many open terminals (maximum {MAX_TERMINALS})"
@@ -419,5 +448,70 @@ async fn reaper_task(inner: Weak<TerminalsInner>) {
             let session = lock(session);
             !(session.exited && session.last_active_at.elapsed() > EXITED_TTL)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_open_rejected_when_restart_authorized() {
+        let terminals = Terminals::new();
+        let gate = zeron_update::RestartGate::new(None);
+        terminals.set_restart_gate(gate.clone());
+        let _auth = gate.force_authorize_restart().unwrap();
+        let err = terminals.open("/tmp", 80, 24).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("engine is restarting for an update")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_admission_reserved_before_setup_blocks_restart() {
+        let terminals = Terminals::new();
+        let terminals_for_gate = terminals.clone();
+        let gate =
+            zeron_update::RestartGate::new(Some(Arc::new(move || !terminals_for_gate.any_open())));
+        terminals.set_restart_gate(gate.clone());
+
+        let (in_setup_tx, in_setup_rx) = std::sync::mpsc::channel();
+        let (allow_tx, allow_rx) = std::sync::mpsc::channel();
+        let allow_rx = Arc::new(std::sync::Mutex::new(allow_rx));
+
+        terminals.set_admission_hook(Box::new(move || {
+            let _ = in_setup_tx.send(());
+            let _ = allow_rx.lock().unwrap().recv();
+        }));
+
+        let terminals_clone = terminals.clone();
+        let open_task = tokio::task::spawn_blocking(move || {
+            terminals_clone.open_with_shell("/tmp", 80, 24, Some("/bin/sh"))
+        });
+
+        // Wait until open_with_shell acquired admission reservation and entered hook:
+        in_setup_rx.recv().expect("reached in_setup");
+
+        // While in setup (terminal not yet inserted into sessions):
+        assert!(!terminals.any_open());
+        // Restart authorization MUST be rejected with WorkActive:
+        let auth_res = gate.try_authorize_restart();
+        assert_eq!(
+            auth_res.err(),
+            Some(zeron_update::RestartBlockedReason::WorkActive)
+        );
+
+        // Allow setup to proceed and insert session:
+        allow_tx.send(()).expect("allow open");
+        let session = open_task.await.unwrap().expect("terminal should open");
+        assert!(terminals.any_open());
+
+        // While terminal is open, restart authorization STILL rejected with WorkActive:
+        assert_eq!(
+            gate.try_authorize_restart().err(),
+            Some(zeron_update::RestartBlockedReason::WorkActive)
+        );
+        let _ = terminals.close(&session.id);
     }
 }

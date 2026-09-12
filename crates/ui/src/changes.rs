@@ -44,7 +44,10 @@ use zeron_rpc::methods;
 
 use crate::comments::{self, CommentSide, DiffComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
+use crate::history::{
+    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton, GitHistorySearchControl,
+    GitHistoryViewButton,
+};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -67,6 +70,8 @@ pub const HUNK_HEADER_HEIGHT: f32 = 28.0;
 pub const DIFF_LINE_HEIGHT: f32 = 21.0;
 pub const NOTICE_HEIGHT: f32 = 24.0;
 pub const BODY_BOTTOM_PAD: f32 = 8.0;
+/// The pane's options row (scope dropdown, ref selector, split, fold-all).
+const CONTROLS_ROW_HEIGHT: f32 = 36.0;
 /// Gutter width per line-number column.
 pub const GUTTER_WIDTH: f32 = 36.0;
 /// The +/−/· marker column between the gutters and the code.
@@ -728,7 +733,9 @@ pub enum DiffScope {
     Branch,
     /// Changes since the current chat's last turn started.
     LatestTurn,
-    /// Repository commit graph. Hosted here until the right pane becomes tabs.
+    /// Repository commit graph. History owns this scope in its own right-pane
+    /// surface tab; it remains a `Changes` variant so commit rows can open
+    /// their corresponding diff tabs through the existing event path.
     History,
     /// One commit's own changes (parent vs commit) — the per-commit tab a
     /// History row click opens. Never listed in the scope menu
@@ -737,12 +744,9 @@ pub enum DiffScope {
 }
 
 impl DiffScope {
-    pub const ALL: [DiffScope; 4] = [
-        Self::WorkingTree,
-        Self::Branch,
-        Self::LatestTurn,
-        Self::History,
-    ];
+    /// Scopes available from a Diff tab. History is selected from the surface
+    /// picker instead, so it can keep its own tab and toolbar state.
+    pub const ALL: [DiffScope; 3] = [Self::WorkingTree, Self::Branch, Self::LatestTurn];
     pub const WORKERS: [DiffScope; 2] = [Self::WorkingTree, Self::Branch];
 
     pub fn label(self) -> &'static str {
@@ -1451,7 +1455,9 @@ pub struct Changes {
     comment_key: u64,
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
+    history_search_control: Option<Entity<GitHistorySearchControl>>,
     history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
+    history_view_button: Option<Entity<GitHistoryViewButton>>,
     history_events: Option<Subscription>,
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
     /// the fetch and the surface-tab title).
@@ -1507,7 +1513,9 @@ impl Changes {
             comment_key: 0,
             history: None,
             history_count: None,
+            history_search_control: None,
             history_fetch_button: None,
+            history_view_button: None,
             history_events: None,
             commit: None,
             _observe: observe,
@@ -1525,12 +1533,31 @@ impl Changes {
     pub fn for_commit(
         state: Entity<AppState>,
         commit: GitHistoryCommit,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut changes = Self::new(state, cx);
+        changes.explicit_cwd = cwd;
         changes.scope = DiffScope::Commit;
         changes.commit = Some(commit);
         changes
+    }
+
+    /// A dedicated History surface. It shares the commit-opening event path
+    /// with diffs, but is never offered as an item in a Diff tab's scope menu.
+    pub fn for_history(
+        state: Entity<AppState>,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.explicit_cwd = cwd;
+        changes.scope = DiffScope::History;
+        changes
+    }
+
+    pub fn is_history(&self) -> bool {
+        self.scope == DiffScope::History
     }
 
     /// The surface-tab title (contextual, user request): the pinned commit's
@@ -1580,12 +1607,17 @@ impl Changes {
         }
         self.started = true;
         self.watch_target = target.clone();
-        self.watch_task = Some(Self::spawn_watch(engine, target, cx));
+        let cwd = self.explicit_cwd.clone();
+        self.watch_task = Some(Self::spawn_watch(engine, target, cwd, cx));
     }
 
+    /// `cwd` (Workers panes) pins that checkout on the engine for as long as
+    /// the stream lives — its entries come from chat rows otherwise, and a
+    /// Workers project has none, so nothing was ever captured for it.
     fn spawn_watch(
         engine: EngineHandle,
         target: Option<String>,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -1596,6 +1628,9 @@ impl Changes {
                         "targetDeviceId".into(),
                         serde_json::Value::String(target.clone()),
                     );
+                }
+                if let Some(cwd) = &cwd {
+                    params.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
                 }
                 let subscribed = engine
                     .client()
@@ -1895,7 +1930,10 @@ impl Changes {
         if let Some(history) = &self.history {
             return history.clone();
         }
-        let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
+        let history = cx.new(|cx| match &self.explicit_cwd {
+            Some(cwd) => GitHistory::for_cwd(self.state.clone(), cwd.clone(), cx),
+            None => GitHistory::new(self.state.clone(), cx),
+        });
         self.history_events =
             Some(
                 cx.subscribe(&history, |this: &mut Self, _, event, cx| match event {
@@ -1940,6 +1978,29 @@ impl Changes {
         let history = self.history_pane(cx);
         let button = cx.new(|cx| GitHistoryFetchButton::new(history, cx));
         self.history_fetch_button = Some(button.clone());
+        button
+    }
+
+    fn history_search_control(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<GitHistorySearchControl> {
+        if let Some(control) = &self.history_search_control {
+            return control.clone();
+        }
+        let history = self.history_pane(cx);
+        let control = cx.new(|cx| GitHistorySearchControl::new(history, cx));
+        self.history_search_control = Some(control.clone());
+        control
+    }
+
+    fn history_view_button(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryViewButton> {
+        if let Some(button) = &self.history_view_button {
+            return button.clone();
+        }
+        let history = self.history_pane(cx);
+        let button = cx.new(|cx| GitHistoryViewButton::new(history, cx));
+        self.history_view_button = Some(button.clone());
         button
     }
 
@@ -3297,10 +3358,21 @@ impl Changes {
                 .into_any_element();
         }
         let scope = self.scope;
+        let history_branch = (scope == DiffScope::History).then(|| {
+            self.state
+                .read(cx)
+                .selected_chat_row()
+                .and_then(|chat| chat.branch.clone())
+                .unwrap_or_else(|| "HEAD".to_string())
+        });
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
+        let history_search_control =
+            (scope == DiffScope::History).then(|| self.history_search_control(cx));
         let history_fetch_button =
             (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
-        let trigger = div()
+        let history_view_button =
+            (scope == DiffScope::History).then(|| self.history_view_button(cx));
+        let scope_trigger = div()
             .id("changes-scope-trigger")
             .h(px(24.0))
             .px(px(8.0))
@@ -3337,6 +3409,7 @@ impl Changes {
             .child(
                 div()
                     .text_size(px(12.0))
+                    .line_height(px(14.0))
                     .text_color(theme.text)
                     .child(SharedString::from(scope.label())),
             )
@@ -3345,17 +3418,36 @@ impl Changes {
                     .size(px(12.0))
                     .text_color(theme.text_muted.opacity(0.7)),
             );
-        let trigger = if self.scope_menu.get().is_some() {
+        let trigger = if scope == DiffScope::History {
+            // The tab already identifies this as History; use the fixed title
+            // slot for the current branch instead of repeating the surface name.
+            div()
+                .id("history-surface-title")
+                .h(px(24.0))
+                .px(px(8.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .line_height(px(14.0))
+                .text_color(theme.text_dim)
+                .child(SharedString::from(history_branch.unwrap_or_default()))
+                .into_any_element()
+        } else if self.scope_menu.get().is_some() {
             let closing = self.scope_menu.closing_since();
             let menu = self.render_scope_menu(&theme, cx);
-            trigger.relative().child(popover::anchored_menu_below_gap(
-                "changes-scope-menu",
-                menu,
-                closing,
-                10.0,
-            ))
+            scope_trigger
+                .relative()
+                .child(popover::anchored_menu_below_gap(
+                    "changes-scope-menu",
+                    menu,
+                    closing,
+                    10.0,
+                ))
+                .into_any_element()
         } else {
-            trigger
+            scope_trigger.into_any_element()
         };
 
         let trailing: AnyElement = if scope == DiffScope::History {
@@ -3364,7 +3456,9 @@ impl Changes {
                 .flex()
                 .items_center()
                 .gap(px(2.0))
+                .children(history_search_control)
                 .children(history_fetch_button)
+                .children(history_view_button)
                 .child(
                     Self::header_button("history-refresh", crate::icons::REFRESH, &theme).on_click(
                         cx.listener(|this, _, _, cx| {
@@ -3400,7 +3494,15 @@ impl Changes {
             .gap(px(6.0))
             .child(trigger)
             .when_some(history_count, |element, count| {
-                element.child(div().flex_1().min_w_0().h_full().child(count))
+                element.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .child(count),
+                )
             })
             .children(self.render_ref_selector(&theme, cx))
             .when(scope != DiffScope::History, |element| {
@@ -4430,12 +4532,29 @@ fn render_file_body_upto(
 
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        // The pane's own options row, under the shell's surface-tab strip:
+        // scope dropdown, base-ref selector, split toggle, fold-all. It sits
+        // above every state (History included) — without it a History pane
+        // has no way back to a diff scope.
+        let controls = div()
+            .flex_none()
+            .h(px(CONTROLS_ROW_HEIGHT))
+            .px(px(Theme::SPACE_MD))
+            .border_b_1()
+            .border_color(crate::theme::hairline(0.06))
+            .child(self.render_header_controls(cx));
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
-            return div().size_full().child(history).into_any_element();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(controls)
+                .child(div().flex_1().min_h_0().child(history))
+                .into_any_element();
         }
-        let theme = Theme::of(cx).clone();
         let active = self.active_diff(cx);
         let scope = self.scope;
         let base = self.base_ref.clone();
@@ -4584,6 +4703,7 @@ impl Render for Changes {
                         .child(message),
                 )
             })
+            .child(controls)
             .child(content)
             .into_any_element()
     }
@@ -5383,6 +5503,19 @@ rename to new_name.rs
     }
 
     #[test]
+    fn diff_scope_menu_keeps_history_as_a_separate_surface() {
+        assert_eq!(
+            DiffScope::ALL,
+            [
+                DiffScope::WorkingTree,
+                DiffScope::Branch,
+                DiffScope::LatestTurn,
+            ]
+        );
+        assert!(!DiffScope::ALL.contains(&DiffScope::History));
+    }
+
+    #[test]
     fn diff_frames_replace_lists_and_upsert_singles() {
         let mut diffs = Vec::new();
         let one = diff("co-1", "d", "/w", "p1");
@@ -5424,13 +5557,13 @@ rename to new_name.rs
 
     #[test]
     fn full_diff_highlights_map_old_new_and_context_by_source_line() {
-        let old_source = "fn old() {\n    let value = 1;\n}\n";
-        let new_source = "fn new() {\n    let value = 2;\n}\n";
+        let old_source = "export function old(value: string) {\n    return value.trim();\n}\n";
+        let new_source = "export function new(value: string) {\n    return value.trim();\n}\n";
         let parse = |source| {
             Arc::new(
                 comet_syntax::highlight(comet_syntax::HighlightRequest {
                     source,
-                    path: Some("src/lib.rs"),
+                    path: Some("src/derive.ts"),
                     fence_tag: None,
                 })
                 .unwrap(),
@@ -5444,19 +5577,19 @@ rename to new_name.rs
             kind: LineKind::Del,
             old_no: Some(1),
             new_no: None,
-            text: "fn old() {".into(),
+            text: "export function old(value: string) {".into(),
         };
         let added = DiffLine {
             kind: LineKind::Add,
             old_no: None,
             new_no: Some(1),
-            text: "fn new() {".into(),
+            text: "export function new(value: string) {".into(),
         };
         let context = DiffLine {
             kind: LineKind::Context,
             old_no: Some(2),
             new_no: Some(2),
-            text: "    let value = 2;".into(),
+            text: "    return value.trim();".into(),
         };
         assert_eq!(
             highlights.source_ref(&deleted),
@@ -5491,6 +5624,72 @@ rename to new_name.rs
                 .iter()
                 .any(|span| span.kind == comet_syntax::HighlightKind::Function)
         );
+    }
+
+    #[test]
+    fn split_line_runs_use_affected_old_and_new_documents() {
+        let theme = Theme::dark();
+        for (path, source, required) in [
+            (
+                "src/card.tsx",
+                "const view: JSX.Element = <main id=\"app\" />;",
+                comet_syntax::HighlightKind::Tag,
+            ),
+            (
+                "src/Greeter.kt",
+                "fun greet(name: String) = println(name)",
+                comet_syntax::HighlightKind::Function,
+            ),
+            (
+                "Dockerfile",
+                "RUN echo \"hello\"",
+                comet_syntax::HighlightKind::Function,
+            ),
+        ] {
+            let document = Arc::new(
+                comet_syntax::highlight(comet_syntax::HighlightRequest {
+                    source,
+                    path: Some(path),
+                    fence_tag: None,
+                })
+                .unwrap(),
+            );
+            let highlights = DiffHighlights {
+                old: Some(document.clone()),
+                new: Some(document),
+            };
+            for line in [
+                DiffLine {
+                    kind: LineKind::Del,
+                    old_no: Some(1),
+                    new_no: None,
+                    text: source.into(),
+                },
+                DiffLine {
+                    kind: LineKind::Add,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: source.into(),
+                },
+            ] {
+                assert!(
+                    highlights
+                        .spans(&line)
+                        .iter()
+                        .any(|span| span.kind == required),
+                    "missing {required:?} for {path} on {:?}",
+                    line.kind
+                );
+                let runs = line_runs(&line, Some(&highlights), &theme);
+                assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), source.len());
+                assert!(
+                    runs.iter()
+                        .any(|run| run.color == render::token_color(required, &theme)),
+                    "split runs dropped {required:?} for {path} on {:?}",
+                    line.kind
+                );
+            }
+        }
     }
 
     #[test]

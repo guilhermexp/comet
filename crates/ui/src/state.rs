@@ -509,6 +509,20 @@ pub use zeron_proto::view::{
     parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
 
+/// Device-local names and runtime icons used by Workers tool headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkersToolLabel {
+    pub name: String,
+    pub icon: &'static str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkersToolCatalog {
+    pub projects: HashMap<String, String>,
+    pub presets: HashMap<String, WorkersToolLabel>,
+    pub sessions: HashMap<String, WorkersToolLabel>,
+}
+
 // ---------------------------------------------------------------------------
 // Org gate (pure)
 // ---------------------------------------------------------------------------
@@ -598,6 +612,9 @@ pub struct AppState {
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
+    // Compare visible metadata while retaining fresh liveness leases.
+    device_presentation: Option<Vec<(Device, bool, String)>>,
+    session_presence_presentation: Vec<Indicator>,
     /// Live edge posture (WatchConnectivity): drives the connection pill,
     /// composer honesty ("will queue"), and the Queued send badges.
     pub connectivity: zeron_proto::Connectivity,
@@ -606,6 +623,7 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    session_presentation: Option<Vec<Session>>,
     /// The project the new-session canvas mints into. Healed by
     /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
     /// its project.
@@ -620,6 +638,10 @@ pub struct AppState {
     /// the local device.
     pub selected_device: Option<String>,
     pub selected_chat: Option<String>,
+    /// Chats whose transcript watch keeps failing to subscribe, by the reason
+    /// the engine gave. Device-local: it describes THIS app's delivery, not
+    /// anything in the doc.
+    pub transcript_stalls: std::collections::HashMap<String, String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
     /// First chats / spaces watch frame has landed — device-local state that
@@ -635,12 +657,19 @@ pub struct AppState {
     /// empty transcript is otherwise indistinguishable from the pre-replay
     /// gap after selection, where optimistic echoes may already be visible.
     pub transcript_replayed: bool,
+    /// Content revision; unrelated app notifications do not require row derivation.
+    pub(crate) transcript_revision: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// Chats with a `/compact` in flight → the context token count taken just
+    /// before it. The composer reads this to say "Compactando…" instead of the
+    /// usage ring, and the run's Working→Idle edge turns it into the
+    /// transcript's compaction marker (`shell::finish_compaction`).
+    compacting: HashMap<String, u64>,
     /// The in-flight send's attachment upload, when it has one.
     upload_progress: Option<UploadProgress>,
     /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
@@ -666,6 +695,14 @@ pub struct AppState {
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
     change_requests_visible: bool,
+    /// Checkouts the Workers surface wants resolved, published by
+    /// `WorkersModel` after each snapshot. A second SOURCE of targets, not a
+    /// second watcher: they are unioned into the chat-derived set so retention,
+    /// the unsupported-device filter, the visibility gate and task lifetime
+    /// stay in one place.
+    workers_change_request_targets: HashSet<ChangeRequestWatchKey>,
+    /// Local Workers catalog for presentation only; never persisted or synced.
+    pub workers_tool_catalog: WorkersToolCatalog,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
     /// feed must survive chat switches — the tab itself is what scopes it.
@@ -690,18 +727,24 @@ impl AppState {
             workspace_scope: None,
             auth: None,
             devices: Vec::new(),
+            device_presentation: None,
+            session_presence_presentation: Vec::new(),
             connectivity: zeron_proto::Connectivity::default(),
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            session_presentation: None,
             selected_space: None,
             no_project: false,
             selected_device: None,
             selected_chat: None,
+            transcript_stalls: std::collections::HashMap::new(),
             transcript: Vec::new(),
             transcript_replayed: false,
+            transcript_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            compacting: HashMap::new(),
             upload_progress: None,
             transfers: HashMap::new(),
             diff_comments: HashMap::new(),
@@ -717,6 +760,8 @@ impl AppState {
             transcript_task: None,
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
+            workers_change_request_targets: HashSet::new(),
+            workers_tool_catalog: WorkersToolCatalog::default(),
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
@@ -778,13 +823,37 @@ impl AppState {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
             self.transcript.clear();
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_replayed = false;
             self.transcript_task = None;
         }
     }
 
-    pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
+    pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
+        self.apply_sessions_at(sessions, Utc::now())
+    }
+
+    fn apply_sessions_at(&mut self, sessions: Vec<Session>, now: DateTime<Utc>) -> bool {
+        let presence: Vec<_> = sessions
+            .iter()
+            .map(|session| effective_indicator(Some(session), now))
+            .collect();
+        let presentation: Vec<_> = sessions
+            .iter()
+            .map(|session| {
+                let mut metadata = session.clone();
+                // The timestamp is a liveness lease, not visible text. Keep its
+                // effective indicator in the key and retain the actual value below.
+                metadata.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+                metadata
+            })
+            .collect();
+        let changed = self.session_presentation.as_ref() != Some(&presentation)
+            || self.session_presence_presentation != presence;
+        self.session_presentation = Some(presentation);
+        self.session_presence_presentation = presence;
         self.sessions = sessions;
+        changed
     }
 
     pub(crate) fn apply_live_voice(&mut self, mut next: LiveVoiceState) {
@@ -833,6 +902,34 @@ impl AppState {
         self.connectivity = connectivity;
     }
 
+    /// Record that this chat's transcript delivery is down, with the reason the
+    /// engine gave. Returns whether the surface changed.
+    ///
+    /// The watch loop retries forever by design (a return there freezes the
+    /// transcript with no heal), but silence during those retries is a lie:
+    /// the canvas paints EMPTY, which reads as "this chat has no messages".
+    pub fn mark_transcript_stall(&mut self, chat_id: &str, reason: String) -> bool {
+        match self.transcript_stalls.get(chat_id) {
+            Some(existing) if *existing == reason => false,
+            _ => {
+                self.transcript_stalls.insert(chat_id.to_owned(), reason);
+                true
+            }
+        }
+    }
+
+    /// Delivery came back. Returns whether the surface changed.
+    pub fn clear_transcript_stall(&mut self, chat_id: &str) -> bool {
+        self.transcript_stalls.remove(chat_id).is_some()
+    }
+
+    /// Why this chat's transcript is not arriving, if it is not.
+    pub fn transcript_stall(&self, chat_id: &str) -> Option<&str> {
+        self.transcript_stalls
+            .get(chat_id)
+            .map(std::string::String::as_str)
+    }
+
     /// Is this chat's delivery path degraded — will a send QUEUE rather than
     /// reach its executor promptly? Locally-hosted chats are never degraded
     /// (a queued command executes on this device even fully offline). Remote
@@ -872,7 +969,11 @@ impl AppState {
         self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
     }
 
-    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
+    pub fn apply_devices(&mut self, devices: Vec<Device>) -> bool {
+        self.apply_devices_at(devices, Utc::now())
+    }
+
+    fn apply_devices_at(&mut self, mut devices: Vec<Device>, now: DateTime<Utc>) -> bool {
         // A local-only workspace has no remote device identity to distinguish.
         // Keep the engine's legacy sentinel out of the UI while preserving real
         // hostnames and user-assigned device names.
@@ -887,7 +988,31 @@ impl AppState {
             self.change_requests
                 .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
         }
+        let presentation: Vec<_> = devices
+            .iter()
+            .map(|device| {
+                let mut metadata = device.clone();
+                metadata.last_seen_at = None;
+                (
+                    metadata,
+                    crate::settings::devices::device_online(device.last_seen_at, now),
+                    crate::settings::devices::format_last_seen(device.last_seen_at, now),
+                )
+            })
+            .collect();
+        let session_presence: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|session| effective_indicator(Some(session), now))
+            .collect();
+        let changed = self.device_presentation.as_ref() != Some(&presentation)
+            || self.session_presence_presentation != session_presence;
+        self.device_presentation = Some(presentation);
+        self.session_presence_presentation = session_presence;
+        // Freshness must advance even when the heartbeat does not redraw:
+        // delivery gating and later renders still need the newest timestamp.
         self.devices = devices;
+        changed
     }
 
     /// True when `device_id`'s engine (per its registry device row) is at
@@ -939,6 +1064,7 @@ impl AppState {
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         // Doc frames supersede optimistic echoes carrying the same id.
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
@@ -958,6 +1084,7 @@ impl AppState {
     ) -> Result<(), TranscriptDesync> {
         let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         if is_reset {
             self.transcript_replayed = true;
         }
@@ -998,6 +1125,7 @@ impl AppState {
     /// Tab closed: drop the watch task (cancels the engine-side watch and
     /// unpins the doc from the engine LRU) and the rows.
     pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(doc_id);
         self.sub_transcripts.remove(doc_id);
     }
@@ -1005,6 +1133,7 @@ impl AppState {
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
     /// watch needed (and any in-flight watch is superseded).
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(&doc_id);
         self.sub_transcripts.insert(doc_id, entries);
     }
@@ -1014,13 +1143,18 @@ impl AppState {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
         }
     }
 
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
+            let previous_len = echoes.len();
             echoes.retain(|e| e.id != message_id);
+            if echoes.len() != previous_len {
+                self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            }
         }
     }
 
@@ -1051,6 +1185,21 @@ impl AppState {
         {
             self.pending_sends.remove(chat_id);
         }
+    }
+
+    /// A `/compact` just went out for this chat; `before` is the context size
+    /// it starts from (0 when the harness never reported one).
+    pub fn begin_compaction(&mut self, chat_id: &str, before: u64) {
+        self.compacting.insert(chat_id.to_string(), before);
+    }
+
+    pub fn is_compacting(&self, chat_id: &str) -> bool {
+        self.compacting.contains_key(chat_id)
+    }
+
+    /// The compaction run ended: hand back its `before` count, once.
+    pub fn take_compaction(&mut self, chat_id: &str) -> Option<u64> {
+        self.compacting.remove(chat_id)
     }
 
     /// Attachment upload starting: expose its progress to the working label.
@@ -1373,6 +1522,18 @@ impl AppState {
             .change_request_for_chat(chat, &self.spaces)
     }
 
+    /// Latest valid PR for a device-local checkout — what a Workers worktree
+    /// row asks. A project has no chat identity to re-verify, so the checkout
+    /// itself is the identity.
+    pub fn change_request_for_checkout(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Option<&ChangeRequestSummary> {
+        self.change_requests
+            .change_request_for_checkout(cwd, branch)
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
@@ -1512,9 +1673,12 @@ impl AppState {
         self.workspace_scope = None;
         self.auth = None;
         self.devices.clear();
+        self.device_presentation = None;
+        self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
         self.sessions.clear();
+        self.session_presentation = None;
         self.selected_space = None;
         self.no_project = false;
         self.selected_device = None;
@@ -1523,6 +1687,7 @@ impl AppState {
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.echoes.clear();
         self.pending_sends.clear();
@@ -1597,27 +1762,29 @@ impl AppState {
                 cx,
                 handle.clone(),
                 methods::WATCH_CONNECTIVITY,
-                AppState::apply_connectivity,
+                |state, value| {
+                    state.apply_connectivity(value);
+                    true
+                },
             ),
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_TRANSFERS,
-                AppState::apply_transfers,
+                |state, value| {
+                    state.apply_transfers(value);
+                    true
+                },
             ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SPACES,
-                AppState::apply_spaces,
-            ),
+            spawn_watch(cx, handle.clone(), methods::WATCH_SPACES, |state, value| {
+                state.apply_spaces(value);
+                true
+            }),
             // Auth frames parse tolerantly — engine and proto tags differ today.
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::AUTH_STATUS,
-                AppState::apply_auth_value,
-            ),
+            spawn_watch(cx, handle.clone(), methods::AUTH_STATUS, |state, value| {
+                state.apply_auth_value(value);
+                true
+            }),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         self.watch_tasks = watch_tasks;
@@ -1625,7 +1792,10 @@ impl AppState {
             cx,
             handle.clone(),
             methods::WATCH_LIVE_VOICE,
-            AppState::apply_live_voice,
+            |state, value| {
+                state.apply_live_voice(value);
+                true
+            },
         ));
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
@@ -1645,9 +1815,16 @@ impl AppState {
             return;
         };
         let targets = if self.change_requests_visible {
-            desired_watch_targets(&self.chats, &self.spaces, |device| {
+            let mut targets = desired_watch_targets(&self.chats, &self.spaces, |device| {
                 !self.change_requests.is_supported(device)
-            })
+            });
+            targets.extend(
+                self.workers_change_request_targets
+                    .iter()
+                    .filter(|target| self.change_requests.is_supported(&target.device_id))
+                    .cloned(),
+            );
+            targets
         } else {
             HashSet::new()
         };
@@ -1668,6 +1845,19 @@ impl AppState {
                 local_device_id.clone(),
             );
             self.change_request_tasks.insert(target, task);
+        }
+    }
+
+    /// Publish the Workers surface's checkouts. Cheap on a repeat: the snapshot
+    /// poll calls this every refresh and an unchanged set does no work.
+    pub(crate) fn set_workers_change_request_targets(
+        &mut self,
+        targets: HashSet<ChangeRequestWatchKey>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workers_change_request_targets != targets {
+            self.workers_change_request_targets = targets;
+            self.reconcile_change_request_watches(cx);
         }
     }
 
@@ -1734,6 +1924,7 @@ impl AppState {
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
@@ -1998,7 +2189,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     method: &'static str,
-    apply: fn(&mut AppState, T),
+    apply: fn(&mut AppState, T) -> bool,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Resubscribe loop: these are the standing Sessions/Devices/Spaces
@@ -2032,15 +2223,17 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                     }
                 };
                 let alive = this.update(cx, |state, cx| {
-                    apply(state, parsed);
+                    let changed = apply(state, parsed);
                     state.apply_pending_deep_link(cx);
                     if method == methods::WATCH_SESSIONS {
                         state.refresh_live_voice_availability(false, cx);
                     }
-                    if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
-                        state.reconcile_change_request_watches(cx);
+                    if changed {
+                        if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
+                            state.reconcile_change_request_watches(cx);
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
                 });
                 if alive.is_err() {
                     return;
@@ -2102,6 +2295,15 @@ fn spawn_transcript_watch(
         // task itself is dropped by select_chat/apply_chats when the chat is
         // deselected or deleted, so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        // How many consecutive subscribe failures before the surface says so.
+        // One failure is an engine restart healing itself; a run of them means
+        // delivery is down, and the canvas rendering EMPTY while this loop
+        // retries forever reads as "the chat lost its messages" — which is
+        // exactly how a second app instance on the same profile presented
+        // itself: blank transcript, no banner, `error=connection closed`
+        // visible only in the log.
+        const STALL_THRESHOLD: u32 = 3;
+        let mut consecutive_failures: u32 = 0;
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
@@ -2109,10 +2311,35 @@ fn spawn_transcript_watch(
                 .subscribe(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
-                Ok(rx) => rx,
+                Ok(rx) => {
+                    consecutive_failures = 0;
+                    let chat_id = chat_id.clone();
+                    if this
+                        .update(cx, |state, cx| {
+                            if state.clear_transcript_stall(&chat_id) {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    rx
+                }
                 Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
-                    if this.update(cx, |_, _| {}).is_err() {
+                    let stalled = consecutive_failures >= STALL_THRESHOLD;
+                    let reason = err.to_string();
+                    let chat_id = chat_id.clone();
+                    if this
+                        .update(cx, |state, cx| {
+                            if stalled && state.mark_transcript_stall(&chat_id, reason) {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     cx.background_executor().timer(RETRY_DELAY).await;
@@ -2202,6 +2429,7 @@ fn spawn_subagent_watch(
                 let alive = this.update(cx, |state, cx| {
                     // A stale pump racing a snapshot/unwatch finds no key.
                     if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        state.transcript_revision = state.transcript_revision.wrapping_add(1);
                         if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
@@ -2794,6 +3022,7 @@ mod tests {
         now: DateTime<Utc>,
     ) -> Session {
         Session {
+            last_completed_turn: None,
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
@@ -2817,6 +3046,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transcript_revision_tracks_replay_echoes_and_subagent_content() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        let initial = state.transcript_revision;
+        state.apply_transfers(Vec::new());
+        state.apply_auth(AuthState::SignedOut);
+        assert_eq!(
+            state.transcript_revision, initial,
+            "unrelated notifications are inert"
+        );
+
+        state.push_echo("c", user_entry("m1"));
+        let echo = state.transcript_revision;
+        assert_ne!(echo, initial);
+        state.push_echo("c", user_entry("m1"));
+        state.remove_echo("c", "absent");
+        assert_eq!(
+            state.transcript_revision, echo,
+            "unchanged echoes do not invalidate"
+        );
+        state.apply_transcript(vec![user_entry("m1")]);
+        assert!(state.pending_echoes().is_empty());
+        assert_ne!(
+            state.transcript_revision, echo,
+            "echo-to-replay handoff invalidates"
+        );
+
+        let before_reset = state.transcript_revision;
+        state
+            .apply_transcript_frame(TranscriptFrame::Reset { reset: Vec::new() })
+            .unwrap();
+        assert!(state.transcript_replayed);
+        assert_ne!(
+            state.transcript_revision, before_reset,
+            "empty replay is authoritative"
+        );
+
+        let before_subagent = state.transcript_revision;
+        state.set_subagent_snapshot("sub".into(), vec![user_entry("nested")]);
+        assert_ne!(state.transcript_revision, before_subagent);
+        let before_close = state.transcript_revision;
+        state.unwatch_subagent_doc("sub");
+        assert!(state.sub_transcript("sub").is_empty());
+        assert_ne!(state.transcript_revision, before_close);
+    }
+
     fn device(id: &str, name: &str) -> Device {
         Device {
             id: id.into(),
@@ -2826,6 +3102,98 @@ mod tests {
             created_at: None,
             version: None,
         }
+    }
+
+    #[test]
+    fn session_heartbeats_preserve_freshness_without_redrawing_unchanged_status() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        let mut row = Session {
+            last_completed_turn: None,
+            chat_id: "chat".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(now),
+            updated_at: now,
+            error: None,
+            context_usage: None,
+        };
+        assert!(state.apply_sessions_at(vec![row.clone()], now));
+        row.updated_at = now + TimeDelta::seconds(30);
+        assert!(!state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(30)));
+        assert_eq!(state.sessions[0].updated_at, row.updated_at);
+        assert_eq!(
+            state.indicator_for("chat", now + TimeDelta::seconds(60)),
+            Indicator::Working
+        );
+        assert!(state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(76)));
+        row.updated_at = now + TimeDelta::seconds(80);
+        assert!(state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(80)));
+        row.status = SessionStatus::AwaitingInput;
+        assert!(state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(80)));
+        row.status = SessionStatus::Idle;
+        row.started_at = None;
+        assert!(state.apply_sessions_at(vec![row], now + TimeDelta::seconds(80)));
+        assert!(state.apply_sessions_at(vec![], now + TimeDelta::seconds(80)));
+    }
+
+    #[test]
+    fn unchanged_device_heartbeat_still_retires_stale_session_indicators() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        state.sessions = vec![Session {
+            last_completed_turn: None,
+            chat_id: "chat".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(now),
+            updated_at: now,
+            error: None,
+            context_usage: None,
+        }];
+        let mut row = device("host", "Host");
+        row.last_seen_at = Some(now);
+        assert!(state.apply_devices_at(vec![row.clone()], now));
+        row.last_seen_at = Some(now + TimeDelta::seconds(30));
+        assert!(!state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(30)));
+        row.last_seen_at = Some(now + TimeDelta::seconds(46));
+        assert!(state.apply_devices_at(vec![row], now + TimeDelta::seconds(46)));
+        assert_eq!(
+            state.indicator_for("chat", now + TimeDelta::seconds(46)),
+            Indicator::None
+        );
+        let mut recovered = state.sessions.clone();
+        recovered[0].updated_at = now + TimeDelta::seconds(47);
+        assert!(
+            state.apply_sessions_at(recovered, now + TimeDelta::seconds(47)),
+            "a heartbeat must immediately restore an indicator retired by a device tick"
+        );
+    }
+
+    #[test]
+    fn device_heartbeats_keep_freshness_without_repainting_unchanged_presentation() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        let mut row = device("host", "Host");
+        row.last_seen_at = Some(now);
+        assert!(state.apply_devices_at(vec![row.clone()], now));
+        row.last_seen_at = Some(now + TimeDelta::seconds(15));
+        assert!(!state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(15)));
+        assert_eq!(state.devices[0].last_seen_at, row.last_seen_at);
+        // The settings label still advances even before the presence dot expires.
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(75)));
+        // An identical frame must redraw when presence crosses the expiry boundary.
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(86)));
+        assert!(!state.device_online("host", now + TimeDelta::seconds(86)));
+        row.last_seen_at = Some(now + TimeDelta::seconds(90));
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(90)));
+        assert!(state.device_online("host", now + TimeDelta::seconds(90)));
+        row.name = "Renamed".into();
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(90)));
+        row.version = Some("9.0.0".into());
+        assert!(state.apply_devices_at(vec![row], now + TimeDelta::seconds(90)));
+        assert!(state.apply_devices_at(vec![], now + TimeDelta::seconds(90)));
+        assert!(!state.apply_devices_at(vec![], now + TimeDelta::seconds(90)));
     }
 
     #[test]
@@ -3231,6 +3599,28 @@ mod tests {
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             },
         );
+    }
+
+    #[test]
+    fn a_stalled_transcript_is_reported_until_delivery_returns() {
+        let mut state = AppState::new();
+        assert_eq!(state.transcript_stall("c"), None);
+
+        // First mark surfaces the reason; repeating the same one is not a
+        // change (the watch retries every 2s and must not repaint each time).
+        assert!(state.mark_transcript_stall("c", "connection closed".into()));
+        assert!(!state.mark_transcript_stall("c", "connection closed".into()));
+        assert_eq!(state.transcript_stall("c"), Some("connection closed"));
+
+        // A different reason is news.
+        assert!(state.mark_transcript_stall("c", "engine restarting".into()));
+        assert_eq!(state.transcript_stall("c"), Some("engine restarting"));
+
+        // Only the stalled chat is affected, and a successful subscribe clears.
+        assert_eq!(state.transcript_stall("other"), None);
+        assert!(state.clear_transcript_stall("c"));
+        assert!(!state.clear_transcript_stall("c"));
+        assert_eq!(state.transcript_stall("c"), None);
     }
 
     #[test]

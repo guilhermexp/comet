@@ -95,11 +95,16 @@ fn is_unsettled_part(part: &MessagePart) -> bool {
 }
 
 pub fn activity_breakdown(parts: &[MessagePart]) -> String {
-    let mut counts = HashMap::<ActivityBucket, usize>::new();
-    for call in parts.iter().filter_map(|part| match part {
+    activity_breakdown_for_calls(parts.iter().filter_map(|part| match part {
         MessagePart::Tool { call, .. } => Some(call),
         _ => None,
-    }) {
+    }))
+}
+
+/// Shared categories and units for both live tool groups and settled turns.
+pub fn activity_breakdown_for_calls<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> String {
+    let mut counts = HashMap::<ActivityBucket, usize>::new();
+    for call in calls {
         *counts.entry(activity_bucket(call)).or_default() += 1;
     }
 
@@ -120,6 +125,10 @@ pub fn activity_breakdown(parts: &[MessagePart]) -> String {
 
 fn activity_bucket(call: &ToolCall) -> ActivityBucket {
     match call {
+        // O OMP nao tem tool `skill`: invocar uma skill vira um `read` do
+        // pseudo-path `skill://<nome>` (as leituras dos arquivos da skill que
+        // vem depois seguem sendo reads de verdade).
+        ToolCall::ReadFile { path } if is_skill_path(path) => ActivityBucket::Skill,
         ToolCall::ReadFile { .. } | ToolCall::Search { .. } | ToolCall::Glob { .. } => {
             ActivityBucket::Read
         }
@@ -132,6 +141,12 @@ fn activity_bucket(call: &ToolCall) -> ActivityBucket {
         ToolCall::Mcp { tool, input, .. } => named_activity_bucket(tool, input.as_ref()),
         ToolCall::Unknown { name, input } => named_activity_bucket(name, input.as_ref()),
     }
+}
+
+fn is_skill_path(path: &str) -> bool {
+    path.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("skill://")
 }
 
 fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> ActivityBucket {
@@ -152,6 +167,25 @@ fn named_activity_bucket(name: &str, input: Option<&serde_json::Value>) -> Activ
             Some("wait") => ActivityBucket::Wait,
             Some("send") => ActivityBucket::Message,
             Some("start" | "restart" | "stop") => ActivityBucket::Command,
+            _ => ActivityBucket::Tool,
+        };
+    }
+
+    if normalized == "workers" {
+        return match input
+            .and_then(|value| value.get("action"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("wait_for_status") => ActivityBucket::Wait,
+            Some("send_text" | "send_keys") => ActivityBucket::Message,
+            Some("launch_worker" | "stop_worker" | "restart_worker" | "archive_worker") => {
+                ActivityBucket::Command
+            }
+            Some("read_output" | "read_transcript" | "inspect_worker" | "list_workers") => {
+                ActivityBucket::Read
+            }
             _ => ActivityBucket::Tool,
         };
     }
@@ -278,6 +312,7 @@ mod tests {
             id: id.into(),
             request_id: format!("request-{id}"),
             questions: Vec::new(),
+            answers: None,
             resolved,
         }
     }
@@ -514,6 +549,25 @@ mod tests {
     }
 
     #[test]
+    fn omp_skill_reads_count_as_skills_not_reads() {
+        let parts = vec![
+            tool("skill", read("skill://to-brainstorm"), true),
+            tool("native", unknown("Skill", None), true),
+            // Os arquivos da skill lidos depois seguem sendo reads.
+            tool(
+                "glob",
+                ToolCall::Glob {
+                    pattern: ".agents/skills/to-brainstorm/**".into(),
+                },
+                true,
+            ),
+            tool("file", read(".agents/skills/to-brainstorm/SKILL.md"), true),
+        ];
+
+        assert_eq!(activity_breakdown(&parts), "2 skills, 2 reads");
+    }
+
+    #[test]
     fn activity_breakdown_merges_builtin_and_mcp_agent_calls() {
         let parts = vec![
             tool("native", unknown("Agent", None), true),
@@ -541,6 +595,36 @@ mod tests {
         assert_eq!(
             activity_breakdown(&parts),
             "3 commands, 1 wait, 1 message, 1 tool"
+        );
+    }
+
+    #[test]
+    fn activity_breakdown_classifies_each_workers_action() {
+        let parts = [
+            "launch_worker",
+            "wait_for_status",
+            "send_text",
+            "read_output",
+            "list_projects",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, action)| {
+            tool(
+                &format!("workers-{index}"),
+                ToolCall::Mcp {
+                    server: "comet-workers".into(),
+                    tool: "workers".into(),
+                    input: Some(serde_json::json!({ "action": action })),
+                },
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            activity_breakdown(&parts),
+            "1 read, 1 command, 1 wait, 1 message, 1 tool"
         );
     }
 

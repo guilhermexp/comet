@@ -61,8 +61,9 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item,
+    notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_event,
+    user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -323,9 +324,38 @@ impl Harness for CodexHarness {
 
     async fn run(
         &self,
-        mut request: RunRequest,
+        request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_with_mode(request, controls, None).await
+    }
+
+    async fn run_isolated(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+        instructions: &'static str,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        request.enable_workers_mcp = false;
+        request.workers_parent_chat_id = None;
+        self.run_with_mode(request, controls, Some(instructions))
+            .await
+    }
+}
+
+impl CodexHarness {
+    async fn run_with_mode(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+        instructions: Option<&'static str>,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let title_only = instructions.is_some();
         let exe = self.resolve_executable()?;
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
         // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
@@ -334,7 +364,11 @@ impl Harness for CodexHarness {
         // sidesteps codex ≤0.144.x's workspace-write bug where a linked
         // worktree on a slash-named branch derives a malformed mount that
         // kills every command.
-        request.sandbox = zeron_proto::SandboxLevel::DangerFullAccess;
+        request.sandbox = if title_only {
+            zeron_proto::SandboxLevel::ReadOnly
+        } else {
+            zeron_proto::SandboxLevel::DangerFullAccess
+        };
         let mut cmd = self.build_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -367,6 +401,7 @@ impl Harness for CodexHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            instructions,
             child,
             client,
             incoming,
@@ -390,6 +425,7 @@ impl Harness for CodexHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    instructions: Option<&'static str>,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -480,6 +516,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 /// steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        instructions,
         mut child,
         client,
         mut incoming,
@@ -490,6 +527,7 @@ async fn run_session(session: Session) {
         kill_grace,
         stderr_tail,
     } = session;
+    let title_only = instructions.is_some();
     let RunControls {
         request_input,
         mut steering,
@@ -519,6 +557,29 @@ async fn run_session(session: Session) {
 
     let start_params = {
         let mut p = serde_json::Map::new();
+        if title_only {
+            p.insert("baseInstructions".into(), instructions.unwrap().into());
+            p.insert("developerInstructions".into(), instructions.unwrap().into());
+            p.insert("ephemeral".into(), true.into());
+            p.insert(
+                "config".into(),
+                json!({
+                    "project_doc_max_bytes": 0,
+                    "web_search": "disabled",
+                    "features.shell_tool": false,
+                    "features.apply_patch_freeform": false,
+                    "features.multi_agent": false,
+                    "features.apps": false,
+                    "features.multi_agent_v2": false,
+                    "agents.enabled": false,
+                    "features.browser_use": false,
+                    "features.computer_use": false,
+                    "features.js_repl": false,
+                    "features.image_generation": false,
+                    "features.memories": false
+                }),
+            );
+        }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
@@ -548,6 +609,23 @@ async fn run_session(session: Session) {
             .await?;
         client.notify("initialized", None);
 
+        let mut start_params = start_params.clone();
+        if title_only {
+            // Disable each configured MCP server explicitly: an empty table
+            // would merge with user configuration and leave servers enabled.
+            let config = client
+                .request("config/read", json!({"includeLayers": false}))
+                .await?;
+            if let Some(servers) = config["config"]["mcp_servers"].as_object() {
+                let overrides = start_params
+                    .get_mut("config")
+                    .and_then(Value::as_object_mut)
+                    .unwrap();
+                for name in servers.keys() {
+                    overrides.insert(format!("mcp_servers.{name}.enabled"), false.into());
+                }
+            }
+        }
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
@@ -672,6 +750,7 @@ async fn run_session(session: Session) {
     // Deltas seen per agent-message item, so a model that never streams
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
+    let mut reasoning_streams: HashMap<String, ReasoningStream> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
@@ -759,10 +838,9 @@ async fn run_session(session: Session) {
                                         .into_iter()
                                         .collect(),
                                     "item/reasoning/textDelta"
-                                    | "item/reasoning/summaryTextDelta" => delta_text(&params)
-                                        .map(|text| AgentEvent::ReasoningDelta { text })
-                                        .into_iter()
-                                        .collect(),
+                                    | "item/reasoning/summaryTextDelta"
+                                    | "item/reasoning/summaryPartAdded" => reasoning_streams
+                                        .entry(nthread.clone()).or_default().map(&method, &params),
                                     "item/started" | "item/completed" => {
                                         let phase = if method == "item/started" {
                                             Phase::Started
@@ -850,11 +928,14 @@ async fn run_session(session: Session) {
                         }
                     }
 
-                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
-                        if let Some(text) = delta_text(&params)
-                            && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
+                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta"
+                    | "item/reasoning/summaryPartAdded" => {
+                        for event in reasoning_streams.entry(thread_id.clone()).or_default()
+                            .map(&method, &params)
                         {
-                            break 'main;
+                            if !send(&event_tx, event).await {
+                                break 'main;
+                            }
                         }
                     }
 

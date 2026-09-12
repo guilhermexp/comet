@@ -313,7 +313,7 @@ pub fn word_range(text: &str, ix: usize) -> Range<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn elems<'a>() -> Vec<(&'a str, &'a str)> {
@@ -348,7 +348,7 @@ mod tests {
     /// The drag tests below mutate the process-global selection state —
     /// serialize them, or the parallel test runner interleaves their
     /// begin/end_drag calls (long-standing flake).
-    fn state_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn state_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

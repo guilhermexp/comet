@@ -4,13 +4,19 @@ Pai: [`../AGENTS.md`](../AGENTS.md)
 
 ## Purpose
 
-O único componente não-Rust do produto: Worker + **SessionRoom DO** (uma sala por chat, também usada pelo workspace doc `ws2/{orgId}`) + **DeviceRoom DO** (uma por device, relay de controle) + R2 para anexos + auth WorkOS (JWKS, troca de código, refresh, orgs). Absorve o que no comet original eram `apps/server` e o stack Postgres/Hono/WebRTC — todos eliminados.
+O único componente não-Rust do produto: Worker + **SessionRoom DO** (uma sala por chat, também usada pelo workspace doc `ws2/{orgId}`) + **DeviceRoom DO** (uma por device, relay de controle) + R2 para anexos + auth WorkOS (JWKS, troca de código, refresh, orgs). Absorve o que no comet original eram `apps/server` e o stack Postgres/Hono/WebRTC — eliminados do sync de documentos. PreviewRoom faz apenas sinalização para previews RTC independentes do Loro.
 
 ## Ownership
 
 Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não é dono da forma do documento — essa é de `crates/doc`, e o materializador daqui segue ela.
 
 ## Local Contracts
+
+- `PreviewRoom` (`preview1/{org}/{userId}`) isola catálogo/sinalização por identidade autenticada, confirma org e sobrescreve headers internos no ingresso. Não transporta bytes de páginas. WebSockets têm limites de tamanho, taxa e peers e removem catálogo stale. Adicionar binding/migration não autoriza deploy.
+
+- Skill/skill preserva apenas os identificadores `skill`, `path` e `name` no input renderizável, com trim e strings vazias omitidas. Args, prompt e conteúdo continuam fora do transcript; sanitizer permanece idempotente.
+
+- O campo opcional `answers` de input parts preserva `questionId` + `labels` nos dois sentidos de `toDocParts`/`fromDocParts`, em paridade com `zeron-doc`.
 
 - Decisão registrada em `docs/research/durable-objects-language.md`: **os DOs ficam em TypeScript**. Tudo device-side é Rust. Não portar DO pra Rust sem revisitar essa decisão.
 - `edge/src/session-doc/` é o gêmeo do schema de `crates/doc` — nome e shape de container casam byte a byte. Mudou lá, muda aqui, no mesmo commit.
@@ -33,6 +39,7 @@ Dono do estado que vive fora dos devices: salas, blobs e sessão de auth. Não �
 | `src/*.test.ts` (device frame, liveness) | unit — vitest | `npm -C edge run test` |
 | `src/{session-room,device-room}.ts` (DOs) | integration — convergência pelo lado Rust | `cargo test -p zeron-sync` |
 | `src/{auth,auth-routes,workos}.ts` | integration | `npm -C edge run test` + `npm -C edge run smoke` |
+| `src/preview-room.ts` | integration — auth, isolamento e protocolo DO | `npm -C edge run test:workerd` |
 | Tipos (todo o `src/**`) | typecheck obrigatório | `npm -C edge run typecheck` |
 
 ## Child DOX Index

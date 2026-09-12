@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,10 @@ pub struct DetailsSidebarPreferences {
     pub active_tab: DetailsTab,
     pub expanded: HashMap<String, Vec<String>>,
     pub hidden: HashMap<String, bool>,
+    pub idle_recaps: HashMap<String, super::idle_recap::IdleRecapEntry>,
+    pub idle_recap_enabled: bool,
+    pub idle_recap_delay_seconds: u64,
+    pub hidden_widgets: BTreeSet<String>,
 }
 
 impl Default for DetailsSidebarPreferences {
@@ -18,9 +22,24 @@ impl Default for DetailsSidebarPreferences {
             active_tab: DetailsTab::Details,
             expanded: HashMap::new(),
             hidden: HashMap::new(),
+            idle_recaps: HashMap::new(),
+            idle_recap_enabled: true,
+            idle_recap_delay_seconds: super::idle_recap::IDLE_RECAP_DEFAULT_SECONDS,
+            hidden_widgets: BTreeSet::new(),
         }
     }
 }
+
+/// The Details-tab widget cards the user can show/hide from the header gear
+/// (`SETTINGS_MINIMALISTIC`), in render order: `(stable id, menu label, icon)`.
+/// The id matches the `widget_card` id in [`DetailsSidebar::render_details`]
+/// and the key persisted in [`DetailsSidebarPreferences::hidden_widgets`].
+pub const TOGGLEABLE_WIDGETS: &[(&str, &str, &str)] = &[
+    ("workspace-widget", "Workspace", icons::DETAILS_BOX),
+    ("chat-workers-widget", "Workers", icons::DETAILS_WORKERS),
+    ("todos-widget", "To-dos", icons::CHECKLIST),
+    ("usage-widget", "Usage", icons::DETAILS_GAUGE),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkedProjectsCacheKey {
@@ -64,7 +83,12 @@ pub struct DetailsSidebarState {
 }
 
 impl DetailsSidebarState {
-    pub fn new(preferences: DetailsSidebarPreferences) -> Self {
+    pub fn new(mut preferences: DetailsSidebarPreferences) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        super::idle_recap::prune_idle_recaps(&mut preferences.idle_recaps, now);
         Self {
             context: None,
             preferences,
@@ -136,6 +160,27 @@ impl DetailsSidebarState {
         }
     }
 
+    pub fn idle_recap_for(&self, context_key: &str) -> Option<&super::idle_recap::IdleRecapEntry> {
+        self.preferences.idle_recaps.get(context_key)
+    }
+
+    pub fn set_idle_recap(
+        &mut self,
+        context_key: String,
+        entry: super::idle_recap::IdleRecapEntry,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.preferences.idle_recaps.insert(context_key, entry);
+        super::idle_recap::prune_idle_recaps(&mut self.preferences.idle_recaps, now);
+    }
+
+    pub fn clear_idle_recap(&mut self, context_key: &str) {
+        self.preferences.idle_recaps.remove(context_key);
+    }
+
     pub fn toggle_expanded(&mut self, relative_path: &str) {
         let Some(context) = &self.context else {
             return;
@@ -175,6 +220,18 @@ impl DetailsSidebarState {
             .hidden
             .insert(context.key.clone(), !current);
         self.load_generation = self.load_generation.wrapping_add(1);
+    }
+
+    pub fn widget_hidden(&self, widget_id: &str) -> bool {
+        self.preferences.hidden_widgets.contains(widget_id)
+    }
+
+    pub fn toggle_widget_hidden(&mut self, widget_id: &str) {
+        if !self.preferences.hidden_widgets.remove(widget_id) {
+            self.preferences
+                .hidden_widgets
+                .insert(widget_id.to_string());
+        }
     }
 
     pub fn preferences(&self) -> DetailsSidebarPreferences {
@@ -231,7 +288,7 @@ use zeron_proto::{
 };
 
 use crate::{
-    composer::{ComposerInput, ComposerInputEvent},
+    composer::{Composer, ComposerInput, ComposerInputEvent},
     details_sidebar::{
         chat_workers::{
             ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
@@ -250,11 +307,13 @@ use crate::{
         },
         widgets::{
             CHAT_WORKERS_ROW_HEIGHT, ChatWorkersTab, ChatWorkersWidgetState,
-            chat_workers_viewport_height_px, property_row, widget_card, worker_expansion_key,
-            workers_tab_presence,
+            chat_workers_viewport_height_px, property_row, property_row_custom, widget_card,
+            worker_expansion_key, workers_tab_presence,
         },
     },
     icons,
+    pickers::Pickers,
+    popover,
     state::AppState,
     theme::Theme,
     workers::{
@@ -315,6 +374,7 @@ pub enum DetailsSidebarEvent {
         context_key: String,
         root: std::path::PathBuf,
         relative_path: String,
+        remote_target: Option<(zeron_proto::WorkspaceTarget, String)>,
     },
     OpenSubagent {
         chat_id: String,
@@ -386,18 +446,31 @@ fn worker_click_event(
 pub struct DetailsSidebar {
     app_state: Entity<AppState>,
     workers_model: Entity<WorkersModel>,
+    pickers: Entity<Pickers>,
+    /// Read-only, for one question: does the chat being shown have an unsent
+    /// draft? A draft is what tells the idle recap the user is not idle.
+    composer: Entity<Composer>,
     sidebar: DetailsSidebarState,
     chat_workers: ChatWorkersWidgetState,
     files: LoadState<Vec<FileNode>>,
+    directory_cache: super::file_tree::DirectoryCache,
+    workspace_watch: Option<Task<()>>,
+    workspace_watch_key: Option<String>,
     usage: LoadState<Vec<ProviderUsageRow>>,
     usage_snapshot: Option<AgentAccountsSnapshot>,
     usage_fetched_at: Option<std::time::Instant>,
     search: Entity<ComposerInput>,
     search_visible: bool,
+    widgets_menu: popover::Popup<()>,
     active_file: Option<String>,
     usage_expanded: std::collections::HashSet<String>,
     material_icons: std::collections::HashMap<SharedString, std::sync::Arc<Image>>,
     resolved_branch: Option<String>,
+    /// Memoized `<cwd>/.git` probe: without it the Workspace widget stats the
+    /// disk on every render. Re-probed when the context's cwd changes.
+    /// ponytail: a `git init` under an unchanged context is not noticed until
+    /// the sidebar switches context; add an fs watch if that ever matters.
+    has_git_dir: Option<(std::path::PathBuf, bool)>,
     file_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
     recency: FileRecency,
@@ -408,8 +481,13 @@ pub struct DetailsSidebar {
     recency_refresh: Option<Task<()>>,
     usage_task: Option<Task<()>>,
     usage_tick: Option<Task<()>>,
+    recap_task: Option<Task<()>>,
+    recap_armed_epoch: Option<(String, usize)>,
+    failed_epochs: std::collections::HashMap<String, usize>,
     _state_observe: Subscription,
     _workers_observe: Subscription,
+    _pickers_observe: Subscription,
+    _composer_observe: Subscription,
     _search_events: Subscription,
 }
 
@@ -418,6 +496,8 @@ impl DetailsSidebar {
         app_state: Entity<AppState>,
         workers_model: Entity<WorkersModel>,
         preferences: DetailsSidebarPreferences,
+        pickers: Entity<Pickers>,
+        composer: Entity<Composer>,
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| ComposerInput::with_context("Search files…", "PaletteSearch", cx));
@@ -442,24 +522,49 @@ impl DetailsSidebar {
             if local_files_became_available {
                 this.reload_files(cx);
             }
+            this.sync_idle_recap(cx);
             cx.notify();
         });
         let workers_observe = cx.observe(&workers_model, |_, _, cx| cx.notify());
+        // Every keystroke reaches the composer's own notify (`on_input_edited`),
+        // so this is where the draft gate learns the user stopped being idle.
+        // Re-arming is idempotent for an unchanged epoch, so the repeat is free
+        // and no repaint is requested here — `sync_idle_recap` notifies itself
+        // when it actually changes something.
+        let composer_observe = cx.observe(&composer, |this, _, cx| this.sync_idle_recap(cx));
+        let pickers_observe = cx.observe(&pickers, |this, p, cx| {
+            if let Some(target) = &p.read(cx).active_repo_target {
+                if let Some(branch) = &target.branch {
+                    if this.resolved_branch.as_ref() != Some(branch) {
+                        this.resolved_branch = Some(branch.clone());
+                        this.reload_files(cx);
+                    }
+                }
+            }
+            cx.notify();
+        });
         let mut sidebar = Self {
             app_state,
             workers_model,
+            pickers,
+            composer,
             sidebar: DetailsSidebarState::new(preferences),
             chat_workers: ChatWorkersWidgetState::default(),
             files: LoadState::Idle,
+            directory_cache: super::file_tree::DirectoryCache::default(),
+            workspace_watch: None,
+            workspace_watch_key: None,
             usage: LoadState::Idle,
             usage_snapshot: None,
             usage_fetched_at: None,
             search,
             search_visible: false,
+            widgets_menu: popover::Popup::default(),
             active_file: None,
             usage_expanded: std::collections::HashSet::new(),
             material_icons: std::collections::HashMap::new(),
             resolved_branch: None,
+            has_git_dir: None,
             file_task: None,
             branch_task: None,
             usage_task: None,
@@ -470,8 +575,13 @@ impl DetailsSidebar {
             recency_tick: None,
             recency_ticking: false,
             recency_refresh: None,
+            recap_task: None,
+            recap_armed_epoch: None,
+            failed_epochs: std::collections::HashMap::new(),
             _state_observe: state_observe,
             _workers_observe: workers_observe,
+            _pickers_observe: pickers_observe,
+            _composer_observe: composer_observe,
             _search_events: search_events,
         };
         sidebar.load_usage(cx);
@@ -490,6 +600,12 @@ impl DetailsSidebar {
         let before = self.sidebar.load_generation();
         let after = self.sidebar.set_context(context);
         if before != after {
+            self.stop_recency_watch();
+            self.directory_cache = super::file_tree::DirectoryCache::default();
+            self.workspace_watch = None;
+            self.workspace_watch_key = None;
+            self.file_task = None;
+            self.files = LoadState::Idle;
             self.chat_workers
                 .sync_context(self.sidebar.context().map(|context| context.key.as_str()));
             self.active_file = None;
@@ -500,6 +616,7 @@ impl DetailsSidebar {
             self.reload_files(cx);
             self.load_branch(cx);
             cx.notify();
+            self.sync_idle_recap(cx);
         }
     }
 
@@ -516,6 +633,95 @@ impl DetailsSidebar {
         cx.emit(DetailsSidebarEvent::PreferencesChanged(self.preferences()));
     }
 
+    fn close_widgets_menu(&mut self, cx: &mut Context<Self>) {
+        if self.widgets_menu.begin_close() {
+            popover::reap_popup(cx, |this: &mut Self| &mut this.widgets_menu);
+            cx.notify();
+        }
+    }
+
+    fn render_widgets_gear(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mounted = self.widgets_menu.get().is_some();
+        let closing = self.widgets_menu.closing_since();
+        let mut trigger = div()
+            .id("details-widgets-menu-toggle")
+            .relative()
+            .size(px(28.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .when(mounted, |el| el.bg(crate::theme::ink(0.05)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.widgets_menu.note_trigger_press()),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.widgets_menu.take_press_was_open() {
+                    this.widgets_menu.open(());
+                    cx.notify();
+                }
+            }))
+            .child(
+                icons::icon(icons::SETTINGS_MINIMALISTIC)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
+        if mounted {
+            let menu = self.render_widgets_menu(theme, cx);
+            trigger = trigger.child(popover::anchored_menu_below_end(
+                "details-widgets-menu",
+                menu,
+                closing,
+            ));
+        }
+        trigger.into_any_element()
+    }
+
+    fn render_widgets_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows: Vec<AnyElement> = TOGGLEABLE_WIDGETS
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let (widget_id, label, icon_path) = *entry;
+                let visible = !self.sidebar.widget_hidden(widget_id);
+                popover::menu_row(theme, false, format!("details-widget-row-{ix}"))
+                    .id(("details-widget-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sidebar.toggle_widget_hidden(widget_id);
+                        this.emit_preferences(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        icons::icon(icon_path)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    )
+                    .child(div().flex_1().child(SharedString::from(label)))
+                    .child(div().w(px(14.0)).flex_none().when(visible, |el| {
+                        el.child(
+                            icons::icon(icons::CHECK)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        popover::popover_card(theme)
+            .w(px(200.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_widgets_menu(cx)))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(popover::menu_heading(theme, "Widgets"))
+            .children(rows)
+            .into_any_element()
+    }
+
     fn set_tab(&mut self, tab: DetailsTab, cx: &mut Context<Self>) {
         if self.sidebar.tab() == tab {
             return;
@@ -529,6 +735,183 @@ impl DetailsSidebar {
         self.load_files(false, cx);
     }
 
+    /// Cached `<cwd>/.git` probe — see the `has_git_dir` field.
+    fn git_dir_exists(&mut self, cwd: &std::path::Path) -> bool {
+        if let Some((cached_cwd, exists)) = &self.has_git_dir
+            && cached_cwd == cwd
+        {
+            return *exists;
+        }
+        let exists = cwd.join(".git").exists();
+        self.has_git_dir = Some((cwd.to_path_buf(), exists));
+        exists
+    }
+
+    fn sync_idle_recap(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.sidebar.context() else {
+            self.recap_task = None;
+            self.recap_armed_epoch = None;
+            return;
+        };
+
+        if context.mode != super::context::DetailsMode::Orchestrator {
+            self.recap_task = None;
+            self.recap_armed_epoch = None;
+            return;
+        }
+
+        let Some(chat_id) = context.chat_id.clone() else {
+            self.recap_task = None;
+            self.recap_armed_epoch = None;
+            return;
+        };
+        let context_key = context.key.clone();
+
+        let (is_working, is_compacting, message_count, composer_shows_chat) = {
+            let state = self.app_state.read(cx);
+            let is_working = state.indicator_for(&chat_id, chrono::Utc::now())
+                == crate::state::Indicator::Working;
+            let count = state.transcript.len();
+            // Compaction has its own flag: the indicator does not report it.
+            (
+                is_working,
+                state.is_compacting(&chat_id),
+                count,
+                state.selected_chat.as_deref() == Some(chat_id.as_str()),
+            )
+        };
+        let has_entry = self.sidebar.idle_recap_for(&context_key).is_some();
+        let prefs = self.sidebar.preferences();
+
+        let signals = super::idle_recap::IdleRecapSignals {
+            enabled: prefs.idle_recap_enabled,
+            delay_seconds: prefs.idle_recap_delay_seconds,
+            is_streaming: is_working,
+            is_compacting,
+            message_count,
+            failed_epoch: self.failed_epochs.get(&chat_id).copied(),
+            composer_shows_chat,
+            composer_has_draft: self.composer.read(cx).has_draft(cx),
+        };
+
+        let action = super::idle_recap::evaluate_idle_recap_signals(
+            &signals,
+            self.sidebar.idle_recap_for(&context_key),
+        );
+        match action {
+            super::idle_recap::IdleRecapAction::Clear => {
+                self.recap_task = None;
+                self.recap_armed_epoch = None;
+                if has_entry {
+                    self.sidebar.clear_idle_recap(&context_key);
+                    self.emit_preferences(cx);
+                    cx.notify();
+                }
+            }
+            super::idle_recap::IdleRecapAction::Keep | super::idle_recap::IdleRecapAction::None => {
+                self.recap_task = None;
+                self.recap_armed_epoch = None;
+            }
+            super::idle_recap::IdleRecapAction::Arm { delay_ms } => {
+                if self.recap_armed_epoch.as_ref() == Some(&(chat_id.clone(), message_count))
+                    && self.recap_task.is_some()
+                {
+                    return;
+                }
+
+                self.recap_armed_epoch = Some((chat_id.clone(), message_count));
+                let chat_id_clone = chat_id.clone();
+                let context_key = context.key.clone();
+                let epoch_at_arm = message_count;
+
+                self.recap_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(delay_ms))
+                        .await;
+
+                    let should_call = this
+                        .update(cx, |this, cx| {
+                            let state = this.app_state.read(cx);
+                            let is_working = state.indicator_for(&chat_id_clone, chrono::Utc::now())
+                                == crate::state::Indicator::Working;
+                            let dispatch = super::idle_recap::IdleRecapDispatch {
+                                is_streaming: is_working,
+                                message_count: state.transcript.len(),
+                                epoch_at_arm,
+                                is_active_chat: this
+                                    .sidebar
+                                    .context()
+                                    .and_then(|c| c.chat_id.as_deref())
+                                    == Some(&chat_id_clone),
+                            };
+                            super::idle_recap::should_dispatch_idle_recap(&dispatch)
+                        })
+                        .unwrap_or(false);
+
+                    if !should_call {
+                        return;
+                    }
+                    let engine = this
+                        .update(cx, |this, cx| {
+                            this.app_state.read(cx).engine().cloned()
+                        })
+                        .ok()
+                        .flatten();
+
+                    let Some(engine) = engine else {
+                        return;
+                    };
+
+                    let result = engine
+                        .client()
+                        .call_as::<zeron_rpc::GenerateChatRecapReply>(
+                            zeron_rpc::methods::GENERATE_CHAT_RECAP,
+                            serde_json::to_value(zeron_rpc::GenerateChatRecapParams::new(
+                                &chat_id_clone,
+                            ))
+                            .unwrap_or_default(),
+                        )
+                        .await;
+
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(reply) => {
+                                if let Some(text) = reply.recap {
+                                    let state = this.app_state.read(cx);
+                                    let is_working = state
+                                        .indicator_for(&chat_id_clone, chrono::Utc::now())
+                                        == crate::state::Indicator::Working;
+                                    let count_now = state.transcript.len();
+                                    if !is_working && count_now == epoch_at_arm {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        let entry = super::idle_recap::IdleRecapEntry {
+                                            text,
+                                            epoch: epoch_at_arm,
+                                            generated_at: now,
+                                        };
+                                        this.sidebar.set_idle_recap(context_key, entry);
+                                        this.emit_preferences(cx);
+                                        cx.notify();
+                                    }
+                                } else {
+                                    this.failed_epochs.insert(chat_id_clone, epoch_at_arm);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(chat = %chat_id_clone, error = %err, "GenerateChatRecap failed");
+                                this.failed_epochs.insert(chat_id_clone, epoch_at_arm);
+                            }
+                        }
+                    })
+                    .ok();
+                }));
+            }
+        }
+    }
+
     /// Rescan without flipping to `Loading`, so a watcher-driven refresh keeps
     /// the current rows (and their recency tint) visible while it runs.
     fn refresh_files(&mut self, cx: &mut Context<Self>) {
@@ -536,6 +919,10 @@ impl DetailsSidebar {
     }
 
     fn load_files(&mut self, silent: bool, cx: &mut Context<Self>) {
+        if self.workspace_file_source(cx).is_some() {
+            self.load_workspace_files(silent, None, None, cx);
+            return;
+        }
         let Some(context) = self.sidebar.context().cloned() else {
             self.files = LoadState::Idle;
             return;
@@ -587,6 +974,301 @@ impl DetailsSidebar {
             });
         }));
         cx.notify();
+    }
+
+    fn workspace_file_source(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(
+        crate::state::EngineHandle,
+        zeron_proto::WorkspaceTarget,
+        String,
+    )> {
+        let context = self.sidebar.context()?;
+        let state = self.app_state.read(cx);
+        let device = context.target_device_id.clone()?;
+        let engine = state.engine()?.clone();
+        let target = if let Some(chat_id) = &context.chat_id {
+            // Project-less local Chats retain the existing local-folder surface.
+            if state
+                .chats
+                .iter()
+                .find(|chat| &chat.id == chat_id)?
+                .space_id
+                .is_none()
+            {
+                return None;
+            }
+            zeron_proto::WorkspaceTarget {
+                chat_id: Some(chat_id.clone()),
+                space_id: None,
+                checkout_path: None,
+            }
+        } else {
+            let space = state.spaces.iter().find(|space| {
+                space.device_id == device && std::path::Path::new(&space.path) == context.cwd
+            })?;
+            zeron_proto::WorkspaceTarget {
+                chat_id: None,
+                space_id: Some(space.id.clone()),
+                checkout_path: None,
+            }
+        };
+        Some((engine, target, device))
+    }
+
+    fn load_workspace_files(
+        &mut self,
+        silent: bool,
+        only: Option<Vec<String>>,
+        append: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, target, device)) = self.workspace_file_source(cx) else {
+            return;
+        };
+        let Some(context) = self.sidebar.context().cloned() else {
+            return;
+        };
+        self.ensure_workspace_watch(
+            context.key.clone(),
+            engine.clone(),
+            target.clone(),
+            device.clone(),
+            cx,
+        );
+        if self.recency_root.is_some() {
+            self.stop_recency_watch();
+        }
+        let generation = self.sidebar.load_generation();
+        let context_key = context.key;
+        let show_hidden = self.sidebar.show_hidden();
+        let query = self.search.read(cx).text().trim().to_string();
+        let mut cache = self.directory_cache.clone();
+        let mut directories = only.unwrap_or_else(|| {
+            let mut dirs = cache.loaded_directories();
+            dirs.push(String::new());
+            dirs
+        });
+        if !cache.contains("") {
+            directories.push(String::new());
+        }
+        // A rapid second expansion can cancel the previous fetch; include all
+        // still-missing expanded directories so neither click gets lost.
+        directories.extend(
+            self.sidebar
+                .expanded_paths()
+                .into_iter()
+                .filter(|path| !cache.contains(path)),
+        );
+        directories.sort();
+        directories.dedup();
+        if !silent && !matches!(self.files, LoadState::Ready(_)) {
+            self.files = LoadState::Loading;
+        }
+        self.file_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<Vec<FileNode>, zeron_rpc::RpcError> = async {
+                if !query.is_empty() {
+                    let request = zeron_proto::SearchWorkspaceFilesRequest {
+                        target: target.clone(),
+                        query: query.clone(),
+                        include_ignored: true,
+                        limit: Some(200),
+                    };
+                    let mut params = serde_json::to_value(request).unwrap();
+                    params["targetDeviceId"] = device.clone().into();
+                    let matches: Vec<zeron_proto::WorkspaceFileSearchMatch> = engine
+                        .client()
+                        .call_as(zeron_rpc::methods::SEARCH_WORKSPACE_FILES, params)
+                        .await?;
+                    return Ok(super::file_tree::search_result_nodes(&matches, show_hidden));
+                }
+                for directory in directories {
+                    if !directory.is_empty() && !cache.can_expand(&directory) {
+                        continue;
+                    }
+                    let is_append = append.as_deref() == Some(directory.as_str());
+                    let retained = cache.loaded_count(&directory).max(500);
+                    let mut cursor = if is_append {
+                        cache.cursor(&directory).map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    let mut page = zeron_proto::WorkspaceDirectoryPage {
+                        directory: directory.clone(),
+                        entries: Vec::new(),
+                        next_cursor: None,
+                        truncated: false,
+                    };
+                    loop {
+                        let request = zeron_proto::ListWorkspaceDirectoryRequest {
+                            target: target.clone(),
+                            directory: directory.clone(),
+                            include_ignored: true,
+                            cursor,
+                        };
+                        let mut params = serde_json::to_value(request).unwrap();
+                        params["targetDeviceId"] = device.clone().into();
+                        let next: zeron_proto::WorkspaceDirectoryPage = engine
+                            .client()
+                            .call_as(zeron_rpc::methods::LIST_WORKSPACE_DIRECTORY, params)
+                            .await?;
+                        if next.directory != directory {
+                            return Err(zeron_rpc::RpcError::Failed(
+                                "Files returned a different directory".into(),
+                            ));
+                        }
+                        page.entries.extend(next.entries);
+                        page.next_cursor = next.next_cursor;
+                        page.truncated = next.truncated;
+                        if is_append || page.entries.len() >= retained || page.next_cursor.is_none()
+                        {
+                            break;
+                        }
+                        cursor = page.next_cursor.clone();
+                    }
+                    cache.apply(page, is_append);
+                }
+                Ok(cache.nodes(show_hidden))
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.sidebar.accept_file_load(generation, &context_key)
+                    || this.search.read(cx).text().trim() != query
+                {
+                    return;
+                }
+                match result {
+                    Ok(nodes) => {
+                        let changed = this.directory_cache != cache
+                            || !matches!(&this.files, LoadState::Ready(old) if old == &nodes);
+                        this.directory_cache = cache;
+                        this.files = LoadState::Ready(nodes);
+                        if changed {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        let message: SharedString = match error {
+                            zeron_rpc::RpcError::UnknownMethod(_) => {
+                                "Update the project device to enable Files browsing.".into()
+                            }
+                            other => format!("Files: {other}").into(),
+                        };
+                        let changed =
+                            !matches!(&this.files, LoadState::Error(old) if old == &message);
+                        this.files = LoadState::Error(message);
+                        if changed {
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        }));
+        if !silent {
+            cx.notify();
+        }
+    }
+
+    fn ensure_workspace_watch(
+        &mut self,
+        key: String,
+        engine: crate::state::EngineHandle,
+        target: zeron_proto::WorkspaceTarget,
+        device: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_watch_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.workspace_watch_key = Some(key.clone());
+        self.workspace_watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let mut params = serde_json::to_value(zeron_proto::WatchWorkspaceFilesRequest {
+                    target: target.clone(),
+                })
+                .unwrap();
+                params["targetDeviceId"] = device.clone().into();
+                let mut last_sequence = None;
+                let subscription = engine
+                    .client()
+                    .subscribe(zeron_rpc::methods::WATCH_WORKSPACE_FILES, params)
+                    .await;
+                if matches!(&subscription, Err(zeron_rpc::RpcError::UnknownMethod(_))) {
+                    return;
+                }
+                if let Ok(mut stream) = subscription {
+                    while let Some(value) = stream.recv().await {
+                        let Ok(batch) =
+                            serde_json::from_value::<zeron_proto::WorkspaceFileChanges>(value)
+                        else {
+                            continue;
+                        };
+                        let initial = last_sequence.is_none();
+                        let gap = last_sequence.is_some_and(|last| batch.sequence != last + 1);
+                        last_sequence = Some(batch.sequence);
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.sidebar.context().map(|c| c.key.as_str())
+                                    != Some(key.as_str())
+                                {
+                                    return;
+                                }
+                                if initial || gap || batch.resync_required {
+                                    this.load_workspace_files(true, None, None, cx);
+                                    return;
+                                }
+                                let mut parents = std::collections::BTreeSet::new();
+                                let now = std::time::Instant::now();
+                                for change in batch.changes {
+                                    for path in std::iter::once(change.path).chain(change.old_path)
+                                    {
+                                        if super::file_tree::is_denied_relative(
+                                            std::path::Path::new(&path),
+                                        ) {
+                                            continue;
+                                        }
+                                        this.recency.mark(path.clone(), now);
+                                        if let Some(parent) = std::path::Path::new(&path)
+                                            .parent()
+                                            .and_then(|p| p.to_str())
+                                        {
+                                            if this.directory_cache.contains(parent) {
+                                                parents.insert(parent.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                if !parents.is_empty() {
+                                    this.ensure_recency_tick(cx);
+                                    cx.notify();
+                                    this.load_workspace_files(
+                                        true,
+                                        Some(parents.into_iter().collect()),
+                                        None,
+                                        cx,
+                                    );
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.load_workspace_files(true, None, None, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+            }
+        }));
     }
 
     fn stop_recency_watch(&mut self) {
@@ -743,8 +1425,11 @@ impl DetailsSidebar {
                 cx.background_executor().timer(USAGE_TICK).await;
                 let keep_ticking = this.update(cx, |this, cx| {
                     if let Some(snapshot) = &this.usage_snapshot {
-                        this.usage =
-                            LoadState::Ready(provider_usage_rows(snapshot, chrono::Utc::now()));
+                        this.usage = LoadState::Ready(provider_usage_rows(
+                            snapshot,
+                            &crate::settings::current(cx).usage_widget_hidden_account_ids,
+                            chrono::Utc::now(),
+                        ));
                         cx.notify();
                     }
                     let should_fetch = this
@@ -787,7 +1472,11 @@ impl DetailsSidebar {
                         Ok(snapshot) => {
                             this.usage_fetched_at = Some(std::time::Instant::now());
                             let snapshot = this.usage_snapshot.insert(snapshot);
-                            let rows = provider_usage_rows(snapshot, chrono::Utc::now());
+                            let rows = provider_usage_rows(
+                                snapshot,
+                                &crate::settings::current(cx).usage_widget_hidden_account_ids,
+                                chrono::Utc::now(),
+                            );
                             this.usage = LoadState::Ready(rows);
                         }
                         Err(error) => {
@@ -872,7 +1561,9 @@ impl DetailsSidebar {
                 .justify_center()
                 .cursor_pointer()
                 .bg(if active {
-                    theme.bg
+                    // Translucent active plate (was opaque theme.bg): reads
+                    // active over the glass without a solid black slab.
+                    theme.bg.opacity(0.6)
                 } else {
                     gpui::transparent_black()
                 })
@@ -916,7 +1607,7 @@ impl DetailsSidebar {
                         div()
                             .p(px(2.0))
                             .rounded(px(9.0))
-                            .bg(crate::theme::ink(0.045))
+                            .bg(crate::theme::ink(0.03))
                             .flex()
                             .items_center()
                             .child(
@@ -993,6 +1684,15 @@ impl DetailsSidebar {
                                 cx.notify();
                             }),
                         )),
+                )
+            })
+            .when(tab == DetailsTab::Details, |header| {
+                header.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(self.render_widgets_gear(theme, cx)),
                 )
             })
     }
@@ -1140,7 +1840,13 @@ impl DetailsSidebar {
                 theme.text_muted
             })
             .when(active == tab, |pill| pill.bg(crate::theme::ink(0.08)))
-            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .hover(move |style| {
+                if active == tab {
+                    style.bg(crate::theme::ink(0.10))
+                } else {
+                    style.bg(crate::theme::ink(0.05))
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.chat_workers.select(tab);
                 cx.notify();
@@ -1150,7 +1856,11 @@ impl DetailsSidebar {
                 pill.child(
                     div()
                         .text_size(px(10.0))
-                        .text_color(theme.text_muted)
+                        .text_color(if active == tab {
+                            theme.text_muted.opacity(0.9)
+                        } else {
+                            theme.text_muted
+                        })
                         .child(count.to_string()),
                 )
             })
@@ -1643,15 +2353,24 @@ impl DetailsSidebar {
         // follow. And an errored snapshot goes in as absence, never as zero —
         // `current_chat_workers` empties the list on any client failure, so a
         // count would make the recovery look like a launch.
-        self.chat_workers.sync_dispatch(
+        let latest_started = [
+            snapshot.latest_started_at(ChatWorkersTab::Workflows),
+            snapshot.latest_started_at(ChatWorkersTab::Subagents),
+            snapshot.latest_started_at(ChatWorkersTab::Workers),
+        ];
+        self.chat_workers.sync_dispatch_with_recency(
             Some(workflows),
             Some(subagents),
             workers_error.is_none().then_some(workers),
+            latest_started,
         );
-        let active = self.chat_workers.active_tab(
-            workflows,
-            subagents,
-            workers_tab_presence(workers, workers_error.is_some()),
+        let active = self.chat_workers.active_tab_with_recency(
+            (workflows, latest_started[0]),
+            (subagents, latest_started[1]),
+            (
+                workers_tab_presence(workers, workers_error.is_some()),
+                latest_started[2],
+            ),
         );
         // Shimmer de atividade: a strip inteira brilha enquanto ha worker
         // rodando ou workflow/subagente em voo — um sinal por widget, em vez de
@@ -1766,17 +2485,37 @@ impl DetailsSidebar {
                 .text_color(theme.text_muted)
                 .child("No workspace selected");
         };
+        let hide_workspace = self.sidebar.widget_hidden("workspace-widget");
+        let hide_workers = self.sidebar.widget_hidden("chat-workers-widget");
+        let hide_todos = self.sidebar.widget_hidden("todos-widget");
+        let hide_usage = self.sidebar.widget_hidden("usage-widget");
         let folder = context
             .cwd
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
             .to_string();
+        let current_branch = self
+            .resolved_branch
+            .clone()
+            .or_else(|| context.branch.clone());
+        let has_git = current_branch.is_some() || self.git_dir_exists(&context.cwd);
+        let disabled = !has_git;
+        let repo_target = crate::pickers::RepoTarget {
+            path: context.cwd.to_string_lossy().to_string(),
+            device_id: context.target_device_id.clone(),
+            chat_id: context.chat_id.clone(),
+            branch: current_branch.clone(),
+        };
+        let branch_control: AnyElement = self.pickers.update(cx, |p, cx| {
+            p.render_workspace_branch_control(repo_target, disabled, cx)
+        });
+
         let mut workspace_body = div()
-            .child(property_row(
+            .child(property_row_custom(
                 icons::GIT_BRANCH,
                 "Branch",
-                self.resolved_branch.clone().unwrap_or_else(|| "—".into()),
+                branch_control,
                 theme,
             ))
             .child(property_row(icons::FOLDER, "Path", folder, theme));
@@ -1892,22 +2631,60 @@ impl DetailsSidebar {
                 }
                 workspace_body = workspace_body.child(worked_section);
             }
+            if let Some(entry) = self.sidebar.idle_recap_for(&context.key) {
+                let generated_at =
+                    chrono::DateTime::from_timestamp_millis(entry.generated_at as i64)
+                        .unwrap_or_else(chrono::Utc::now);
+                let local_now = chrono::Local::now();
+                let entry_local = generated_at.with_timezone(&chrono::Local);
+                let clock_text = if entry_local.date_naive() == local_now.date_naive() {
+                    entry_local.format("%H:%M").to_string()
+                } else {
+                    entry_local.format("%b %d, %H:%M").to_string()
+                };
+
+                let recap_row = div()
+                    .id("idle-recap-row")
+                    .mt(px(4.0))
+                    .pt(px(6.0))
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.50))
+                    .flex()
+                    .items_end()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .italic()
+                            .text_color(theme.text_muted.opacity(0.85))
+                            .child(format!("※ recap: {}", entry.text)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.50))
+                            .child(clock_text),
+                    );
+                workspace_body = workspace_body.child(recap_row);
+            }
         }
-        let mut content = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .p(px(10.0))
-            .child(widget_card(
+        let mut content = div().w_full().flex().flex_col().gap(px(10.0)).p(px(10.0));
+        if !hide_workspace {
+            content = content.child(widget_card(
                 "workspace-widget",
                 icons::DETAILS_BOX,
                 "Workspace",
                 workspace_body,
                 theme,
             ));
+        }
 
-        if context.mode == super::context::DetailsMode::Orchestrator
+        if !hide_workers
+            && context.mode == super::context::DetailsMode::Orchestrator
             && let Some(chat_id) = context.chat_id.clone()
         {
             let (snapshot, workers_error) = self.current_chat_workers(&chat_id, cx);
@@ -1926,7 +2703,8 @@ impl DetailsSidebar {
             }
         }
 
-        if context.mode == super::context::DetailsMode::Orchestrator
+        if !hide_todos
+            && context.mode == super::context::DetailsMode::Orchestrator
             && let Some(todos) = latest_todos(&self.app_state.read(cx).transcript)
         {
             let status_layout = todo_status_layout();
@@ -1998,23 +2776,39 @@ impl DetailsSidebar {
             ));
         }
 
-        let usage_body = match &self.usage {
-            LoadState::Ready(rows) => div().children(
-                rows.clone()
-                    .into_iter()
-                    .map(|row| self.render_usage_row(row, theme, cx)),
-            ),
-            LoadState::Loading => div()
+        if hide_usage {
+            return content;
+        }
+        let hidden = crate::settings::current(cx).usage_widget_hidden_account_ids;
+        let usage_body = match (&self.usage, &self.usage_snapshot) {
+            (_, Some(snapshot)) => {
+                let rows = provider_usage_rows(snapshot, &hidden, chrono::Utc::now());
+                if rows.is_empty() {
+                    div()
+                        .p(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(
+                            "No accounts in Usage. Toggle them on in Settings → Accounts.",
+                        ))
+                } else {
+                    div().children(
+                        rows.into_iter()
+                            .map(|row| self.render_usage_row(row, theme, cx)),
+                    )
+                }
+            }
+            (LoadState::Loading, None) => div()
                 .p(px(10.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_muted)
                 .child("Loading usage…"),
-            LoadState::Error(message) => div()
+            (LoadState::Error(message), None) => div()
                 .p(px(10.0))
                 .text_size(px(12.0))
                 .text_color(theme.danger)
                 .child(message.clone()),
-            LoadState::Idle => div(),
+            _ => div(),
         };
         content.child(widget_card(
             "usage-widget",
@@ -2031,7 +2825,10 @@ impl DetailsSidebar {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let key = row.label.to_string();
+        let key = row
+            .account_id
+            .clone()
+            .unwrap_or_else(|| row.label.to_string());
         let expandable = row.state == ProviderUsageState::Ready
             && (!row.windows.is_empty() || !row.usage_lines.is_empty());
         let expanded = expandable && self.usage_expanded.contains(&key);
@@ -2089,10 +2886,27 @@ impl DetailsSidebar {
                     )
                     .child(
                         div()
-                            .text_size(px(12.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(row.label),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(row.label),
+                            )
+                            .when_some(row.account_label.clone(), |el, label| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(label)),
+                                )
+                            }),
                     )
                     .child(
                         // Badge + percent read as one right-aligned cluster, so
@@ -2330,7 +3144,7 @@ impl DetailsSidebar {
                         .min_h_0()
                         .rounded(px(10.0))
                         .border_1()
-                        .border_color(theme.border)
+                        .border_color(theme.border.opacity(0.5))
                         .overflow_hidden()
                         .flex()
                         .flex_col()
@@ -2342,7 +3156,7 @@ impl DetailsSidebar {
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
-                                .bg(crate::theme::ink(0.025))
+                                .bg(crate::theme::ink(0.012))
                                 .child(
                                     icons::icon(icons::DETAILS_BOX)
                                         .size(px(15.0))
@@ -2388,6 +3202,44 @@ impl DetailsSidebar {
                                             self.render_file_row(index, row, theme, cx)
                                         }),
                                 )
+                                .children(
+                                    self.directory_cache
+                                        .loaded_directories()
+                                        .into_iter()
+                                        .filter(|directory| {
+                                            (directory.is_empty()
+                                                || self
+                                                    .sidebar
+                                                    .expanded_paths()
+                                                    .contains(directory))
+                                                && self.directory_cache.cursor(directory).is_some()
+                                        })
+                                        .map(|directory| {
+                                            let label = if directory.is_empty() {
+                                                "Load more files".to_string()
+                                            } else {
+                                                format!("Load more in {directory}")
+                                            };
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "files-more-{directory}"
+                                                )))
+                                                .px(px(8.0))
+                                                .py(px(6.0))
+                                                .text_size(px(11.0))
+                                                .text_color(theme.text_muted)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.load_workspace_files(
+                                                        true,
+                                                        Some(vec![directory.clone()]),
+                                                        Some(directory.clone()),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child(label)
+                                        }),
+                                )
                                 .when(truncated, |list| {
                                     list.child(
                                         div()
@@ -2417,6 +3269,10 @@ impl DetailsSidebar {
         let absolute = self
             .sidebar
             .context()
+            .filter(|context| {
+                context_file_access(context, self.app_state.read(cx).local_device_id.as_deref())
+                    == ContextFileAccess::Local
+            })
             .map(|context| context.cwd.join(&relative));
         let expanded = self.sidebar.expanded_paths().contains(&relative);
         let active = self.active_file.as_deref() == Some(relative.as_str());
@@ -2452,6 +3308,11 @@ impl DetailsSidebar {
             .on_click(cx.listener(move |this, _, _, cx| {
                 if is_dir {
                     this.sidebar.toggle_expanded(&relative);
+                    if this.sidebar.expanded_paths().contains(&relative)
+                        && this.workspace_file_source(cx).is_some()
+                    {
+                        this.load_workspace_files(true, Some(vec![relative.clone()]), None, cx);
+                    }
                     this.emit_preferences(cx);
                 } else {
                     this.active_file = Some(relative.clone());
@@ -2460,6 +3321,16 @@ impl DetailsSidebar {
                             context_key: context.key.clone(),
                             root: context.cwd.clone(),
                             relative_path: relative.clone(),
+                            remote_target: if context_file_access(
+                                context,
+                                this.app_state.read(cx).local_device_id.as_deref(),
+                            ) == ContextFileAccess::Remote
+                            {
+                                this.workspace_file_source(cx)
+                                    .map(|(_, target, device)| (target, device))
+                            } else {
+                                None
+                            },
                         });
                     }
                 }
@@ -2614,6 +3485,28 @@ mod tests {
         assert_eq!(preferences.active_tab, DetailsTab::Files);
         assert_eq!(preferences.expanded.get("one").unwrap(), &["src"]);
         assert_eq!(preferences.hidden, HashMap::from([("one".into(), true)]));
+    }
+
+    #[test]
+    fn widget_visibility_toggles_and_persists() {
+        let mut state = DetailsSidebarState::new(DetailsSidebarPreferences::default());
+        // Default: every toggleable widget is visible.
+        for entry in super::TOGGLEABLE_WIDGETS {
+            assert!(!state.widget_hidden(entry.0));
+        }
+        state.toggle_widget_hidden("usage-widget");
+        assert!(state.widget_hidden("usage-widget"));
+        assert!(!state.widget_hidden("workspace-widget"));
+        // Persists across a reload (boot path: preferences() -> stored -> new()).
+        let mut reloaded = DetailsSidebarState::new(state.preferences());
+        assert!(reloaded.widget_hidden("usage-widget"));
+        assert_eq!(
+            reloaded.preferences().hidden_widgets,
+            std::collections::BTreeSet::from(["usage-widget".to_string()])
+        );
+        // Toggling again clears it.
+        reloaded.toggle_widget_hidden("usage-widget");
+        assert!(!reloaded.widget_hidden("usage-widget"));
     }
 
     #[test]
@@ -2790,11 +3683,13 @@ mod tests {
             context_key: "project".into(),
             root: PathBuf::from("/tmp/project"),
             relative_path: "README.md".into(),
+            remote_target: None,
         };
         let DetailsSidebarEvent::OpenFile {
             context_key,
             root,
             relative_path,
+            remote_target,
         } = event
         else {
             panic!("expected open file event");
@@ -2802,6 +3697,7 @@ mod tests {
         assert_eq!(context_key, "project");
         assert_eq!(root, PathBuf::from("/tmp/project"));
         assert_eq!(relative_path, "README.md");
+        assert!(remote_target.is_none());
     }
 
     #[test]
@@ -2814,6 +3710,7 @@ mod tests {
             usage: None,
             progress: Vec::new(),
             subagent_type: Some("reviewer".into()),
+            started_at_unix_ms: 0,
         };
         let worker = ChatWorkerRow {
             session_id: "worker-42".into(),
@@ -2824,6 +3721,7 @@ mod tests {
             semantic: WorkerSemantic::Working,
             state: "running".into(),
             activity: "working".into(),
+            created_at_unix_ms: 0,
             updated_at_unix_ms: 42,
             total_tokens: None,
             model_usage: Vec::new(),
@@ -2867,6 +3765,7 @@ mod tests {
             semantic: WorkerSemantic::Disconnected,
             state: "disconnected".into(),
             activity: "disconnected".into(),
+            created_at_unix_ms: 0,
             updated_at_unix_ms: 42,
             total_tokens: None,
             model_usage: Vec::new(),

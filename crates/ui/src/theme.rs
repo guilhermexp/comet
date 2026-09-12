@@ -94,6 +94,11 @@ fn accent_tokens(accent: AccentColor, appearance: Appearance) -> AccentTokens {
         (AccentColor::Pink, Appearance::Light) => {
             (oklch(0.48, 0.20, 350.0), oklch(0.48, 0.20, 350.0))
         }
+        // Chroma zero: the neutral accent must not tint chrome authored to be
+        // achromatic. Lightness follows the same ladder as the hued presets so
+        // selections and controls keep their weight.
+        (AccentColor::Gray, Appearance::Dark) => (oklch(0.74, 0.0, 0.0), oklch(0.52, 0.0, 0.0)),
+        (AccentColor::Gray, Appearance::Light) => (oklch(0.47, 0.0, 0.0), oklch(0.47, 0.0, 0.0)),
     };
     AccentTokens {
         primary,
@@ -840,6 +845,16 @@ impl Theme {
         let window = flatten(self.glass(), self.adverse_backdrop());
         self.input_bg
             .opacity(self.contrast_checked_tint_alpha(self.input_bg, base, window))
+    }
+
+    /// The composer pill fill thinned to ~half coverage, so the input reads as
+    /// a translucent hairline outline instead of a solid plate (user request).
+    /// The sent user-message bubble shares this exact fill: a message keeps the
+    /// same tone whether it is still being typed in the composer or already
+    /// pinned at the top of its turn.
+    pub fn composer_glass_bg(&self) -> Hsla {
+        let fill = self.input_glass_bg();
+        fill.opacity(fill.a * 0.5)
     }
 
     /// Section-card fill (settings cards and similar in-panel cards). The

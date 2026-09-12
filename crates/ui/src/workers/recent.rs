@@ -28,6 +28,13 @@ pub struct RecentActivitySection {
     pub label: String,
     pub rows: Vec<RecentActivityRow>,
 }
+/// Maximum number of non-active activity log entries projected into the Recent view.
+///
+/// Because the view currently constructs unvirtualized `div` elements for each row
+/// on every model refresh, unbounded iteration over weeks of daemon activity degrades
+/// frame rates and memory. Capping at 100 recent entries provides ample history
+/// for user inspection while keeping GPUI layout and rendering lightweight.
+pub const MAX_RECENT_ACTIVITY_ENTRIES: usize = 100;
 
 pub fn recent_activity_sections(
     snapshot: &WorkersBootstrap,
@@ -74,7 +81,11 @@ pub fn recent_activity_sections(
     }
 
     let mut current_day: Option<chrono::NaiveDate> = None;
+    let mut historical_count = 0;
     for entry in snapshot.activity_log.iter().rev() {
+        if historical_count >= MAX_RECENT_ACTIVITY_ENTRIES {
+            break;
+        }
         if active_ids.contains(&entry.session_id) {
             continue;
         }
@@ -128,6 +139,7 @@ pub fn recent_activity_sections(
                 unread: live.is_some_and(|session| session.unread),
                 available: live.is_some(),
             });
+        historical_count += 1;
     }
 
     sections
@@ -182,13 +194,11 @@ fn day_label(day: DateTime<Local>, now: DateTime<Local>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_RECENT_ACTIVITY_ENTRIES, WorkersSessionTarget, recent_activity_sections};
     use zeron_workers_unpeel::{
         WorkersActivityLogEntry, WorkersActivityLogKind, WorkersBootstrap, WorkersProject,
         WorkersProtocol, WorkersSession, WorkersSessionCapabilities,
     };
-
-    use super::{WorkersSessionTarget, recent_activity_sections};
-
     fn session(id: &str, activity: &str) -> WorkersSession {
         WorkersSession {
             id: id.to_owned(),
@@ -336,5 +346,36 @@ mod tests {
                 )),
             ]
         );
+    }
+    #[test]
+    fn recent_activity_projection_is_capped_at_maximum_entries() {
+        let entries = (0..150)
+            .map(|i| WorkersActivityLogEntry {
+                id: format!("entry-{i}"),
+                session_id: format!("session-{i}"),
+                kind: WorkersActivityLogKind::Finished,
+                at_unix_ms: 1_700_000_000_000 + i * 1_000,
+                title: format!("Title {i}"),
+                command: "echo".to_owned(),
+                project_id: "project".to_owned(),
+                project_name: "Project".to_owned(),
+            })
+            .collect();
+        let snapshot = WorkersBootstrap {
+            mac_name: "Mac".to_owned(),
+            protocol: WorkersProtocol {
+                major_version: 1,
+                minor_version: 0,
+                capabilities: Vec::new(),
+            },
+            projects: Vec::new(),
+            presets: Vec::new(),
+            sessions: Vec::new(),
+            activity_log: entries,
+        };
+
+        let sections = recent_activity_sections(&snapshot, 1_700_000_200_000);
+        let total_projected: usize = sections.iter().map(|s| s.rows.len()).sum();
+        assert_eq!(total_projected, MAX_RECENT_ACTIVITY_ENTRIES);
     }
 }

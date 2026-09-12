@@ -1,15 +1,22 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use comet_syntax::HighlightedDocument;
 use gpui::{
-    AnyElement, ClipboardItem, Context, EventEmitter, Image, IntoElement, ObjectFit, Render,
-    SharedString, StyledText, Task, Window, div, font, img, prelude::*, px,
+    AnyElement, ClipboardItem, Context, EventEmitter, Image, InteractiveElement, IntoElement,
+    ListHorizontalSizingBehavior, ListState, ObjectFit, Render, SharedString, StyledText, Task,
+    UniformListScrollHandle, Window, div, font, img, list, prelude::*, px, uniform_list,
 };
 
 use crate::{
     details_sidebar::files_view::material_icon_path,
     file_preview::{
-        loader::{LoadedPreview, PreviewLoadError, load_preview},
+        loader::{LoadedPreview, PreviewLoadError, load_preview_with_typography},
         model::{PreviewDisplayMode, PreviewTabs},
     },
     icons,
@@ -25,13 +32,42 @@ enum PreviewLoadState {
     Error(SharedString),
 }
 
-/// What the native host is being asked to paint. HTML arrives as a sanitized
-/// string; PDF and video are loaded straight off disk by WebKit.
-#[derive(Clone, Copy)]
-enum NativeSource<'a> {
-    Html(&'a str),
-    Pdf,
-    Video,
+/// Construction of the native host (WKWebView) is decided from load state,
+/// never from `Render`. Paint only attaches an already-built view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDocumentAction {
+    Hide,
+    Keep,
+    OpenHtml,
+    OpenPdf,
+    OpenVideo,
+}
+
+fn native_document_action(
+    loaded: &PreviewLoadState,
+    absolute: &Path,
+    existing: Option<&Path>,
+) -> NativeDocumentAction {
+    let open = match loaded {
+        PreviewLoadState::Ready(LoadedPreview::Html(_)) => NativeDocumentAction::OpenHtml,
+        PreviewLoadState::Ready(LoadedPreview::Pdf) => NativeDocumentAction::OpenPdf,
+        PreviewLoadState::Ready(LoadedPreview::Video) => NativeDocumentAction::OpenVideo,
+        _ => return NativeDocumentAction::Hide,
+    };
+    if existing == Some(absolute) {
+        NativeDocumentAction::Keep
+    } else {
+        open
+    }
+}
+
+fn preview_absolute_path(root: &Path, relative_path: &str) -> PathBuf {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute() {
+        relative.to_path_buf()
+    } else {
+        root.join(relative)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,14 +83,25 @@ pub enum FilePreviewEvent {
     DisplayModeChanged(PreviewDisplayMode),
 }
 
+#[derive(Clone)]
+struct RemoteFileSource {
+    engine: crate::state::EngineHandle,
+    target: zeron_proto::WorkspaceTarget,
+    device: String,
+}
+
 pub struct FilePreview {
     tabs: PreviewTabs,
     roots: HashMap<String, PathBuf>,
+    remote_sources: HashMap<String, RemoteFileSource>,
     active_context: Option<String>,
     loaded: PreviewLoadState,
     generation: u64,
     display_mode: PreviewDisplayMode,
     load_task: Option<Task<()>>,
+    scroll_handles: HashMap<(String, String), UniformListScrollHandle>,
+    markdown_lists: HashMap<(String, String), (ListState, u32)>,
+    markdown_cache: Rc<RefCell<markdown_render::RenderCache>>,
     #[cfg(target_os = "macos")]
     native_document: Option<(
         PathBuf,
@@ -67,14 +114,35 @@ impl FilePreview {
         Self {
             tabs: PreviewTabs::default(),
             roots: HashMap::new(),
+            remote_sources: HashMap::new(),
             active_context: None,
             loaded: PreviewLoadState::Idle,
             generation: 0,
             display_mode: PreviewDisplayMode::SidePeek,
             load_task: None,
+            scroll_handles: HashMap::new(),
+            markdown_lists: HashMap::new(),
+            markdown_cache: Rc::default(),
             #[cfg(target_os = "macos")]
             native_document: None,
         }
+    }
+
+    pub fn set_remote_source(
+        &mut self,
+        context_key: String,
+        engine: crate::state::EngineHandle,
+        target: zeron_proto::WorkspaceTarget,
+        device: String,
+    ) {
+        self.remote_sources.insert(
+            context_key,
+            RemoteFileSource {
+                engine,
+                target,
+                device,
+            },
+        );
     }
 
     pub fn active_path(&self, context_key: &str) -> Option<&str> {
@@ -134,11 +202,22 @@ impl FilePreview {
             self.load_active(cx);
         }
     }
-
     pub fn close_path(&mut self, context_key: &str, relative_path: &str, cx: &mut Context<Self>) {
+        let is_active_context = self.active_context.as_deref() == Some(context_key);
+        let was_active_tab =
+            is_active_context && self.tabs.active_path(context_key) == Some(relative_path);
         self.tabs.close(context_key, relative_path);
-        if self.active_context.as_deref() == Some(context_key) {
-            self.load_active(cx);
+        if self.tabs.paths(context_key).is_empty() {
+            self.remote_sources.remove(context_key);
+        }
+        self.markdown_lists
+            .remove(&(context_key.to_owned(), relative_path.to_owned()));
+        self.scroll_handles
+            .remove(&(context_key.to_string(), relative_path.to_string()));
+        if is_active_context {
+            if was_active_tab {
+                self.load_active(cx);
+            }
             cx.emit(FilePreviewEvent::ActiveChanged {
                 context_key: context_key.to_string(),
                 relative_path: self.tabs.active_path(context_key).map(str::to_owned),
@@ -150,9 +229,13 @@ impl FilePreview {
         let Some(context_key) = self.active_context.clone() else {
             return;
         };
+        self.remote_sources.remove(&context_key);
         let paths = self.tabs.paths(&context_key).to_vec();
         for path in paths {
             self.tabs.close(&context_key, &path);
+            self.markdown_lists
+                .remove(&(context_key.clone(), path.clone()));
+            self.scroll_handles.remove(&(context_key.clone(), path));
         }
         self.load_active(cx);
         cx.emit(FilePreviewEvent::ActiveChanged {
@@ -163,6 +246,7 @@ impl FilePreview {
 
     fn load_active(&mut self, cx: &mut Context<Self>) {
         self.clear_native_document();
+        self.markdown_cache.borrow_mut().clear();
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let Some(context_key) = self.active_context.clone() else {
@@ -181,11 +265,64 @@ impl FilePreview {
             return;
         };
         self.loaded = PreviewLoadState::Loading;
+        let font_mono = Theme::of(cx).font_mono.clone();
+        let font_size = px(12.5);
+        let text_system = cx.text_system().clone();
+        let remote = self.remote_sources.get(&context_key).cloned();
+        let viewport_key = (context_key, relative_path.clone());
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { load_preview(&root, std::path::Path::new(&relative_path)) })
-                .await;
+            let result = if let Some(remote) = remote {
+                let request = zeron_proto::ReadWorkspaceFileRequest {
+                    target: remote.target,
+                    path: relative_path.clone(),
+                };
+                let mut params = serde_json::to_value(request).unwrap();
+                params["targetDeviceId"] = remote.device.into();
+                match remote
+                    .engine
+                    .client()
+                    .call_as::<zeron_proto::WorkspaceFileText>(
+                        zeron_rpc::methods::READ_WORKSPACE_FILE,
+                        params,
+                    )
+                    .await
+                {
+                    Ok(file) => match file.text {
+                        Some(source) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    super::loader::load_text_preview(
+                                        Path::new(&relative_path),
+                                        source,
+                                        font_mono,
+                                        font_size,
+                                        Some(text_system),
+                                    )
+                                })
+                                .await
+                        }
+                        None => Err(PreviewLoadError::Remote(
+                            "This remote file is not available as a text preview.".into(),
+                        )),
+                    },
+                    Err(zeron_rpc::RpcError::UnknownMethod(_)) => Err(PreviewLoadError::Remote(
+                        "Update the project device to enable file previews.".into(),
+                    )),
+                    Err(error) => Err(PreviewLoadError::Remote(format!("Remote file: {error}"))),
+                }
+            } else {
+                cx.background_executor()
+                    .spawn(async move {
+                        load_preview_with_typography(
+                            &root,
+                            std::path::Path::new(&relative_path),
+                            font_mono,
+                            font_size,
+                            Some(text_system),
+                        )
+                    })
+                    .await
+            };
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -194,6 +331,19 @@ impl FilePreview {
                     Ok(preview) => PreviewLoadState::Ready(preview),
                     Err(error) => PreviewLoadState::Error(load_error_message(&error).into()),
                 };
+                if let PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) = &this.loaded {
+                    let (state, _) = this.markdown_lists.entry(viewport_key).or_insert_with(|| {
+                        (
+                            ListState::new(0, gpui::ListAlignment::Top, px(200.0)),
+                            crate::theme::theme_generation(),
+                        )
+                    });
+                    let mut position = state.logical_scroll_top();
+                    position.item_ix = position.item_ix.min(tree.len().saturating_sub(1));
+                    state.reset(tree.len());
+                    state.scroll_to(position);
+                }
+                this.ensure_native_document();
                 cx.notify();
             });
         }));
@@ -215,14 +365,15 @@ impl FilePreview {
             .expect("material file icon is embedded");
         let close_path = relative_path.clone();
         let close_context = context_key.to_string();
+        let remote = self.remote_sources.contains_key(context_key);
         let reveal = absolute.clone();
         let copy = absolute;
         div()
-            .h(px(44.0))
+            .h(px(36.0))
             .flex_none()
-            .px(px(14.0))
+            .px(px(Theme::SPACE_MD))
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(crate::theme::hairline(0.06))
             .flex()
             .items_center()
             .justify_between()
@@ -254,12 +405,12 @@ impl FilePreview {
                                     .text_color(theme.text_muted),
                             ),
                     )
-                    .child(img(image).size(px(16.0)).object_fit(ObjectFit::Contain))
+                    .child(img(image).size(px(14.0)).object_fit(ObjectFit::Contain))
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(14.0))
+                            .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(name),
@@ -287,35 +438,38 @@ impl FilePreview {
                                     .text_color(theme.text_muted),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("file-preview-reveal")
-                            .h(px(28.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::ink(0.05)))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .on_click(move |_, _, cx| {
-                                let path = reveal.clone();
-                                cx.background_executor()
-                                    .spawn(async move {
-                                        let _ =
-                                            std::process::Command::new("open").arg(path).status();
-                                    })
-                                    .detach();
-                            })
-                            .child("Open in")
-                            .child(
-                                icons::icon(icons::WORKER_OPEN_CODE)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    )
+                    .when(!remote, |row| {
+                        row.child(
+                            div()
+                                .id("file-preview-reveal")
+                                .h(px(28.0))
+                                .px(px(10.0))
+                                .rounded(px(6.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .on_click(move |_, _, cx| {
+                                    let path = reveal.clone();
+                                    cx.background_executor()
+                                        .spawn(async move {
+                                            let _ = std::process::Command::new("open")
+                                                .arg(path)
+                                                .status();
+                                        })
+                                        .detach();
+                                })
+                                .child("Open in")
+                                .child(
+                                    icons::icon(icons::WORKER_OPEN_CODE)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("file-preview-copy-path")
@@ -358,39 +512,73 @@ impl FilePreview {
             PreviewLoadState::Ready(LoadedPreview::Unsupported) => {
                 centered_message("Cannot view this file", theme)
             }
-            // Scroll offset is element state keyed by id: a shared id handed
-            // the next file the previous file's offset, so a short document
-            // opened parked past its own end (user report: "opens in the
-            // middle, shows nothing"). One id per path, one offset per file.
-            PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => div()
-                .id(SharedString::from(format!(
-                    "file-preview-markdown-scroll:{path}"
-                )))
+            PreviewLoadState::Ready(LoadedPreview::Markdown(tree)) => {
+                if tree.is_empty() {
+                    return centered_message("Empty file", theme);
+                }
+                let (state, generation) = self
+                    .markdown_lists
+                    .get_mut(&(context_key.to_owned(), path.clone()))
+                    .expect("Markdown viewport is prepared when loading completes");
+                let current_generation = crate::theme::theme_generation();
+                if *generation != current_generation {
+                    state.remeasure();
+                    *generation = current_generation;
+                }
+                let mut options = markdown_render::RenderOptions::settled(
+                    format!("file-preview:{context_key}:{path}").into(),
+                );
+                options.cache = Some(self.markdown_cache.clone());
+                let theme = theme.clone();
+                list(state.clone(), move |ix, window, _cx| {
+                    div()
+                        .px(px(28.0))
+                        .pt(px(if ix == 0 {
+                            24.0
+                        } else {
+                            markdown_render::MD_BLOCK_GAP
+                        }))
+                        .when(ix + 1 == tree.len(), |row| row.pb(px(24.0)))
+                        .child(markdown_render::render_block(
+                            &tree.blocks[ix].block,
+                            ix,
+                            ix,
+                            &options,
+                            &theme,
+                            window,
+                            None,
+                        ))
+                        .into_any_element()
+                })
                 .size_full()
-                .overflow_y_scroll()
-                .px(px(28.0))
-                .py(px(24.0))
-                .child(markdown_render::render_tree(
-                    tree.as_ref(),
-                    &markdown_render::RenderOptions::settled(format!("file-preview:{path}").into()),
-                    theme,
-                    window,
-                    &|_| None,
-                ))
-                .into_any_element(),
-            PreviewLoadState::Ready(LoadedPreview::Code { lines, highlights }) => {
-                render_code(&path, lines, highlights, theme)
+                .into_any_element()
             }
-            PreviewLoadState::Ready(LoadedPreview::Html(document)) => {
-                self.render_native_document(window, theme, NativeSource::Html(document.as_ref()))
+            PreviewLoadState::Ready(LoadedPreview::Code {
+                lines,
+                highlights,
+                widest_line_ix,
+            }) => {
+                let scroll_handle = self
+                    .scroll_handles
+                    .entry((context_key.to_string(), path.clone()))
+                    .or_default()
+                    .clone();
+                render_code(
+                    context_key,
+                    &path,
+                    lines,
+                    highlights,
+                    widest_line_ix,
+                    &scroll_handle,
+                    theme,
+                )
+            }
+            PreviewLoadState::Ready(LoadedPreview::Html(_))
+            | PreviewLoadState::Ready(LoadedPreview::Pdf)
+            | PreviewLoadState::Ready(LoadedPreview::Video) => {
+                self.render_native_document(window, theme)
             }
             PreviewLoadState::Ready(LoadedPreview::Image(image)) => render_image(image, theme),
-            PreviewLoadState::Ready(LoadedPreview::Pdf) => {
-                self.render_native_document(window, theme, NativeSource::Pdf)
-            }
-            PreviewLoadState::Ready(LoadedPreview::Video) => {
-                self.render_native_document(window, theme, NativeSource::Video)
-            }
             PreviewLoadState::Ready(LoadedPreview::Table(rows)) => render_data(&path, rows, theme),
         }
     }
@@ -402,47 +590,72 @@ impl FilePreview {
         }
     }
 
-    fn render_native_document(
-        &mut self,
-        window: &Window,
-        theme: &Theme,
-        source: NativeSource<'_>,
-    ) -> AnyElement {
+    fn active_absolute_path(&self) -> Option<PathBuf> {
+        let context_key = self.active_context.as_deref()?;
+        let relative = self.tabs.active_path(context_key)?;
+        let root = self.roots.get(context_key)?;
+        Some(preview_absolute_path(root, relative))
+    }
+
+    fn ensure_native_document(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            let Some(context_key) = self.active_context.as_deref() else {
-                return gpui::Empty.into_any_element();
-            };
-            let Some(relative_path) = self.tabs.active_path(context_key) else {
-                return gpui::Empty.into_any_element();
-            };
-            let Some(root) = self.roots.get(context_key).cloned() else {
-                return centered_message("Project folder is unavailable.", theme);
-            };
-            let absolute = root.join(relative_path);
-            let needs_new = self
-                .native_document
-                .as_ref()
-                .is_none_or(|(path, _)| path != &absolute);
-            if needs_new {
+            let Some(absolute) = self.active_absolute_path() else {
                 self.clear_native_document();
-                let view = match source {
-                    NativeSource::Html(document) => {
-                        super::native_document::NativeDocumentView::open_html(document)
+                return;
+            };
+            let action = {
+                let existing = self
+                    .native_document
+                    .as_ref()
+                    .map(|(path, _)| path.as_path());
+                native_document_action(&self.loaded, &absolute, existing)
+            };
+            match action {
+                NativeDocumentAction::Hide => self.clear_native_document(),
+                NativeDocumentAction::Keep => {}
+                NativeDocumentAction::OpenHtml => {
+                    let document = match &self.loaded {
+                        PreviewLoadState::Ready(LoadedPreview::Html(document)) => document.clone(),
+                        _ => {
+                            self.clear_native_document();
+                            return;
+                        }
+                    };
+                    self.clear_native_document();
+                    if let Some(view) =
+                        super::native_document::NativeDocumentView::open_html(document.as_ref())
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
-                    NativeSource::Pdf => {
+                }
+                NativeDocumentAction::OpenPdf => {
+                    self.clear_native_document();
+                    if let Some(view) =
                         super::native_document::NativeDocumentView::open_pdf(&absolute)
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
-                    NativeSource::Video => {
+                }
+                NativeDocumentAction::OpenVideo => {
+                    self.clear_native_document();
+                    if let Some(view) =
                         super::native_document::NativeDocumentView::open_video(&absolute)
+                    {
+                        self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
                     }
-                };
-                let Some(view) = view else {
-                    return centered_message("The native preview could not be opened.", theme);
-                };
-                self.native_document = Some((absolute, Rc::new(RefCell::new(view))));
+                }
             }
-            let view = self.native_document.as_ref().unwrap().1.clone();
+        }
+    }
+
+    fn render_native_document(&mut self, window: &Window, theme: &Theme) -> AnyElement {
+        #[cfg(target_os = "macos")]
+        {
+            let Some((_, view)) = self.native_document.as_ref() else {
+                return centered_message("The native preview could not be opened.", theme);
+            };
+            let view = view.clone();
             let viewport_height = f32::from(window.viewport_size().height) as f64;
             return gpui::canvas(
                 move |bounds, _, _| {
@@ -460,7 +673,10 @@ impl FilePreview {
             .into_any_element();
         }
         #[cfg(not(target_os = "macos"))]
-        centered_message("Open this file in its native app to preview it.", theme)
+        {
+            let _ = window;
+            centered_message("Open this file in its native app to preview it.", theme)
+        }
     }
 }
 
@@ -479,7 +695,7 @@ impl Render for FilePreview {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.bg)
+            // The shell owns the themed utility-pane surface, as for Changes.
             .child(self.render_header(&theme, cx))
             .child(
                 div()
@@ -494,12 +710,13 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn load_error_message(error: &PreviewLoadError) -> &'static str {
+fn load_error_message(error: &PreviewLoadError) -> &str {
     match error {
         PreviewLoadError::OutsideCheckout => "This file is outside the project.",
         PreviewLoadError::Missing => "This file no longer exists.",
         PreviewLoadError::TooLarge => "This file is too large to preview safely.",
         PreviewLoadError::InvalidUtf8 => "This text file is not valid UTF-8.",
+        PreviewLoadError::Remote(message) => message,
         PreviewLoadError::Io(_) => "The file could not be read.",
     }
 }
@@ -518,9 +735,12 @@ fn centered_message(message: impl Into<SharedString>, theme: &Theme) -> AnyEleme
 }
 
 fn render_code(
+    context_key: &str,
     path: &str,
     lines: Arc<[SharedString]>,
     highlights: Option<Arc<HighlightedDocument>>,
+    widest_line_ix: Option<usize>,
+    scroll_handle: &UniformListScrollHandle,
     theme: &Theme,
 ) -> AnyElement {
     let mono = font(theme.font_mono.clone());
@@ -569,52 +789,66 @@ fn render_code(
         );
     let code_lines = lines.clone();
     let code_highlights = highlights;
+    let code_theme = theme.clone();
+    let mono_font = mono.clone();
+    let line_count = code_lines.len();
+
+    let scroll_id = SharedString::from(format!("file-preview-code-scroll:{context_key}:{path}"));
     let code = div()
         .id(SharedString::from(format!(
-            "file-preview-code-scroll:{path}"
+            "file-preview-code-wrapper:{context_key}:{path}"
         )))
         .flex_1()
         .min_w_0()
         .h_full()
-        .overflow_scroll()
         .py(px(10.0))
-        .children((0..code_lines.len()).map(move |index| {
-            let line = code_lines[index].clone();
-            let runs = markdown_render::runs_for_syntax_line_with_plain(
-                line.as_ref(),
-                code_highlights
-                    .as_deref()
-                    .and_then(|document| document.lines.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-                &mono,
-                theme.text.opacity(0.92),
-                theme,
-            );
-            div()
-                .h(px(20.0))
-                .min_w_full()
-                .flex()
-                .items_center()
-                .font_family(theme.font_mono.clone())
-                .text_size(px(12.5))
-                .child(
-                    div()
-                        .w(px(54.0))
-                        .flex_none()
-                        .pr(px(14.0))
-                        .flex()
-                        .justify_end()
-                        .text_color(theme.text_faint)
-                        .child((index + 1).to_string()),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .whitespace_nowrap()
-                        .child(StyledText::new(line).with_runs(runs)),
-                )
-        }));
+        .child(
+            uniform_list(scroll_id, line_count, move |range, _window, _cx| {
+                range
+                    .map(|index| {
+                        let line = code_lines[index].clone();
+                        let runs = markdown_render::runs_for_syntax_line_with_plain(
+                            line.as_ref(),
+                            code_highlights
+                                .as_deref()
+                                .and_then(|document| document.lines.get(index))
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                            &mono_font,
+                            code_theme.text.opacity(0.92),
+                            &code_theme,
+                        );
+                        div()
+                            .h(px(20.0))
+                            .min_w_full()
+                            .flex()
+                            .items_center()
+                            .font_family(code_theme.font_mono.clone())
+                            .text_size(px(12.5))
+                            .child(
+                                div()
+                                    .w(px(64.0))
+                                    .flex_none()
+                                    .pr(px(12.0))
+                                    .flex()
+                                    .justify_end()
+                                    .text_color(code_theme.text_faint)
+                                    .child((index + 1).to_string()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .child(StyledText::new(line).with_runs(runs)),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+            .with_width_from_item(widest_line_ix)
+            .track_scroll(scroll_handle)
+            .size_full(),
+        );
     div()
         .size_full()
         .flex()
@@ -700,5 +934,63 @@ mod tests {
         assert_eq!(sampled.len(), 240);
         assert_eq!(sampled.first(), Some(&0));
         assert!(sampled.last().is_some_and(|last| *last < 1_000));
+    }
+
+    #[test]
+    fn native_webview_is_planned_from_load_state_not_from_paint() {
+        use super::{NativeDocumentAction, PreviewLoadState, native_document_action};
+        use crate::file_preview::loader::LoadedPreview;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let html = PreviewLoadState::Ready(LoadedPreview::Html(Arc::from("<p>hi</p>")));
+        let pdf = PreviewLoadState::Ready(LoadedPreview::Pdf);
+        let video = PreviewLoadState::Ready(LoadedPreview::Video);
+        let path = Path::new("/tmp/a.html");
+        let other = Path::new("/tmp/b.html");
+
+        assert_eq!(
+            native_document_action(&html, path, None),
+            NativeDocumentAction::OpenHtml
+        );
+        assert_eq!(
+            native_document_action(&html, path, Some(path)),
+            NativeDocumentAction::Keep
+        );
+        assert_eq!(
+            native_document_action(&html, path, Some(other)),
+            NativeDocumentAction::OpenHtml
+        );
+        assert_eq!(
+            native_document_action(&pdf, Path::new("/tmp/a.pdf"), None),
+            NativeDocumentAction::OpenPdf
+        );
+        assert_eq!(
+            native_document_action(&video, Path::new("/tmp/a.mp4"), None),
+            NativeDocumentAction::OpenVideo
+        );
+        assert_eq!(
+            native_document_action(&PreviewLoadState::Loading, path, Some(path)),
+            NativeDocumentAction::Hide
+        );
+        assert_eq!(
+            native_document_action(&PreviewLoadState::Idle, path, None),
+            NativeDocumentAction::Hide
+        );
+    }
+
+    #[test]
+    fn preview_absolute_path_keeps_out_of_checkout_keys() {
+        use super::preview_absolute_path;
+        use std::path::{Path, PathBuf};
+
+        assert_eq!(
+            preview_absolute_path(Path::new("/repo"), "docs/a.html"),
+            PathBuf::from("/repo/docs/a.html")
+        );
+        assert_eq!(
+            preview_absolute_path(Path::new("/repo"), "/tmp/out.html"),
+            PathBuf::from("/tmp/out.html")
+        );
     }
 }

@@ -2548,7 +2548,7 @@ pub fn project_event_to_record(
             error_message: None,
             is_degraded: false,
         }),
-        AgentEvent::InputResolved { request_id } => Some(TrajectoryRecord {
+        AgentEvent::InputResolved { request_id, .. } => Some(TrajectoryRecord {
             id: TrajectoryRecordId::new(run_id, seq, 0),
             chat_id: chat_id.to_string(),
             run_id: run_id.to_string(),

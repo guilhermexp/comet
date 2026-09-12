@@ -1,5 +1,5 @@
 use gpui::Styled;
-use zeron_workers_unpeel::WorkersProject;
+use zeron_workers_unpeel::{WorkersProject, WorkersSession};
 
 /// Elipse no MEIO, não na cauda: o título é o prompt do brief, e briefs
 /// irmãos compartilham prefixo longo ("Leia /tmp/orch-jk-inta…"). Cortando a
@@ -29,11 +29,13 @@ pub fn workers_titlebar(
             branch_is_worktree: false,
         };
     };
-    let branch_is_worktree = project.worktree_branch.is_some();
-    let branch = project
-        .worktree_branch
-        .clone()
-        .or_else(|| project.git_branch.clone());
+    let branch_is_worktree = project.worktree_branch.is_some()
+        || (project.parent_project_id.is_some() && !project.is_group);
+    // The registry's `worktree_branch` is the CREATION branch and never follows
+    // a `git switch` inside the worktree; `change_request_branch` is the same
+    // source the PR badge resolves from, so the title never names one branch
+    // while the badge points at another one's pull request.
+    let branch = project.change_request_branch().map(str::to_owned);
     let segments = match (parent, branch_is_worktree) {
         (Some(parent), true) => vec![parent.name.clone()],
         (Some(parent), false) => vec![parent.name.clone(), project.name.clone()],
@@ -145,8 +147,18 @@ pub fn session_indicator(
     if runtime_launch_pending {
         return SessionIndicator::Restarting;
     }
+    if activity == "blocked" {
+        return SessionIndicator::Attention;
+    }
     if state != "running" {
-        return SessionIndicator::Exited;
+        // When a session is not running, unread represents a completed worker
+        // waiting for review (e.g. "done" or "idle"). Sessions interrupted mid-run
+        // ("working" or "starting") are dead runs, not unread deliverables.
+        return match activity {
+            "starting" | "working" => SessionIndicator::Exited,
+            _ if unread => SessionIndicator::Unread,
+            _ => SessionIndicator::Exited,
+        };
     }
     match activity {
         "starting" | "working" => SessionIndicator::Busy,
@@ -155,6 +167,49 @@ pub fn session_indicator(
         _ if unread => SessionIndicator::Unread,
         _ => SessionIndicator::Idle,
     }
+}
+
+/// When a session last SETTLED — the stamp the sidebar ranks and ages rows by.
+///
+/// `updated_at_unix_ms` cannot be that stamp: it moves with the host heartbeat
+/// and with every streamed frame, so ranking by it made the rows and the folders
+/// above them trade places on any call while nothing had finished. What the user
+/// wants to see is a Worker rising when it FINISHES, so:
+///
+/// - a Worker with a turn in flight (`starting`/`working`) is frozen at its
+///   creation stamp: it holds the position it launched into for the whole run,
+///   no matter how much output it produces;
+/// - anything else (turn done, blocked on input, process exited) ranks by
+///   `idle_since_unix_ms` — the host's stamp of the last REAL activity, which
+///   is the moment the Worker stopped, and which by construction does not move
+///   with the heartbeat or an identical repaint. `updated_at_unix_ms` is the
+///   fallback when the host has no evidence yet.
+///
+/// So the only event that reorders the sidebar is a Worker settling.
+pub fn session_settled_at(session: &WorkersSession) -> u64 {
+    if session.state == "running" && matches!(session.activity.as_str(), "starting" | "working") {
+        return session.created_at_unix_ms;
+    }
+    session
+        .idle_since_unix_ms
+        .unwrap_or(session.updated_at_unix_ms)
+}
+
+/// Activity order for the sessions of one project, newest settle first.
+///
+/// The key is [`session_settled_at`] — the same value `render_session` prints as
+/// the row's age, so the order can never disagree with what the rows say.
+/// Created-then-id breaks ties, which keeps the comparator total: a partial one
+/// would let equal timestamps reshuffle between frames, and the sidebar repaints
+/// every 120 ms.
+pub fn compare_sessions_by_activity(
+    left: &WorkersSession,
+    right: &WorkersSession,
+) -> std::cmp::Ordering {
+    session_settled_at(right)
+        .cmp(&session_settled_at(left))
+        .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -180,11 +235,11 @@ mod tests {
         HOSTED_SIDEBAR_TOP_PADDING, PROJECT_ROW_BASE_LEADING, SESSION_ROW_BASE_LEADING,
         SIDEBAR_BOTTOM_PADDING, SIDEBAR_LABEL_SIZE, SIDEBAR_LIST_SPACING, SIDEBAR_NESTING_STEP,
         SIDEBAR_ROW_GAP, SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_RADIUS, SIDEBAR_SIDE_PADDING,
-        SIDEBAR_TOP_PADDING, SessionIndicator, relative_age, runtime_icon_path,
-        runtime_spinner_tint, session_indicator, spinner_frame, workers_titlebar,
-        workers_titlebar_content_insets,
+        SIDEBAR_TOP_PADDING, SessionIndicator, compare_sessions_by_activity, relative_age,
+        runtime_icon_path, runtime_spinner_tint, session_indicator, session_settled_at,
+        spinner_frame, workers_titlebar, workers_titlebar_content_insets,
     };
-    use zeron_workers_unpeel::WorkersProject;
+    use zeron_workers_unpeel::{WorkersProject, WorkersSession};
 
     #[test]
     fn running_activity_maps_to_distinct_worker_indicators() {
@@ -214,6 +269,175 @@ mod tests {
         );
         assert_eq!(spinner_frame(0), "⠋");
         assert_eq!(spinner_frame(120), "⠙");
+    }
+
+    #[test]
+    fn finished_but_unseen_workers_keep_the_unread_indicator() {
+        // The process is gone and the output was never opened: this is the
+        // case the dot exists for, and it used to render as a plain Exited row.
+        assert_eq!(
+            session_indicator("exited", "done", true, false),
+            SessionIndicator::Unread
+        );
+        assert_eq!(
+            session_indicator("exited", "idle", true, false),
+            SessionIndicator::Unread
+        );
+        // Seen, so it stays a quiet finished row.
+        assert_eq!(
+            session_indicator("exited", "done", false, false),
+            SessionIndicator::Exited
+        );
+        // A relaunch in flight still outranks the dot.
+        assert_eq!(
+            session_indicator("exited", "done", true, true),
+            SessionIndicator::Restarting
+        );
+    }
+
+    #[test]
+    fn exited_workers_with_anomalous_activities_map_correctly() {
+        // Blocked sessions require attention even when the process exited.
+        assert_eq!(
+            session_indicator("exited", "blocked", true, false),
+            SessionIndicator::Attention
+        );
+        assert_eq!(
+            session_indicator("exited", "blocked", false, false),
+            SessionIndicator::Attention
+        );
+        // Workers dying mid-run are Exited, never falsely painted as unread completed tasks.
+        assert_eq!(
+            session_indicator("exited", "working", true, false),
+            SessionIndicator::Exited
+        );
+        assert_eq!(
+            session_indicator("exited", "starting", true, false),
+            SessionIndicator::Exited
+        );
+        assert_eq!(
+            session_indicator("exited", "working", false, false),
+            SessionIndicator::Exited
+        );
+        assert_eq!(
+            session_indicator("exited", "starting", false, false),
+            SessionIndicator::Exited
+        );
+    }
+
+    fn test_session(id: &str, updated: u64, created: u64) -> WorkersSession {
+        WorkersSession {
+            id: id.to_owned(),
+            project_id: "p".to_owned(),
+            title: id.to_owned(),
+            command: "zsh".to_owned(),
+            state: "exited".to_owned(),
+            activity: "idle".to_owned(),
+            unread: false,
+            pinned: false,
+            archived: false,
+            provider_id: None,
+            active_runtime_id: None,
+            runtime_launch_pending: false,
+            runtime_generation: 1,
+            notify_when_done: false,
+            terminal_background_hex: None,
+            worktree_branch: None,
+            created_at_unix_ms: created,
+            updated_at_unix_ms: updated,
+            idle_since_unix_ms: None,
+            idle_confirmed_by_hook: false,
+            resumable_conversation: false,
+            total_tokens: None,
+            model_usage: Vec::new(),
+            capabilities: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sessions_sorted_by_activity_newest_first() {
+        let sessions = vec![
+            test_session("old", 100, 100),
+            test_session("newest", 900, 100),
+            test_session("middle", 400, 100),
+        ];
+        let mut sorted = sessions.clone();
+        sorted.sort_by(compare_sessions_by_activity);
+        let ids: Vec<_> = sorted.into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, ["newest", "middle", "old"]);
+    }
+
+    #[test]
+    fn a_worker_in_flight_does_not_move_until_it_settles() {
+        // Launched first, still working, and printing output the whole time:
+        // `updated_at` is now, but the row must not climb over the Worker that
+        // actually finished — this is the churn the user saw.
+        let mut working = test_session("working", 9_000, 100);
+        working.state = "running".to_owned();
+        working.activity = "working".to_owned();
+
+        let mut finished = test_session("finished", 5_000, 200);
+        finished.state = "running".to_owned();
+        finished.activity = "done".to_owned();
+        finished.idle_since_unix_ms = Some(5_000);
+
+        let mut sorted = vec![working.clone(), finished.clone()];
+        sorted.sort_by(compare_sessions_by_activity);
+        assert_eq!(
+            sorted.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["finished", "working"]
+        );
+
+        // More output moves nothing: the key is frozen at the launch stamp.
+        let mut louder = working.clone();
+        louder.updated_at_unix_ms = 20_000;
+        assert_eq!(session_settled_at(&louder), session_settled_at(&working));
+
+        // Settling is the one event that reorders: now it takes the top.
+        let mut settled = louder;
+        settled.activity = "done".to_owned();
+        settled.idle_since_unix_ms = Some(20_000);
+        let mut sorted = vec![finished, settled];
+        sorted.sort_by(compare_sessions_by_activity);
+        assert_eq!(
+            sorted.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["working", "finished"]
+        );
+    }
+
+    #[test]
+    fn a_blocked_or_dead_worker_ranks_by_when_it_stopped() {
+        // Both stopped needing the machine; the stamp is the last real
+        // activity, never the heartbeat that kept touching `updated_at`.
+        let mut blocked = test_session("blocked", 9_000, 100);
+        blocked.state = "running".to_owned();
+        blocked.activity = "blocked".to_owned();
+        blocked.idle_since_unix_ms = Some(400);
+        assert_eq!(session_settled_at(&blocked), 400);
+
+        let mut dead = test_session("dead", 9_000, 100);
+        dead.activity = "working".to_owned();
+        dead.idle_since_unix_ms = Some(700);
+        assert_eq!(session_settled_at(&dead), 700);
+
+        // No evidence yet: fall back to `updated_at` rather than sinking the
+        // row to the epoch.
+        let mut fresh = test_session("fresh", 9_000, 100);
+        fresh.idle_since_unix_ms = None;
+        assert_eq!(session_settled_at(&fresh), 9_000);
+    }
+
+    #[test]
+    fn sessions_with_equal_activity_break_ties_deterministically() {
+        let sessions = vec![
+            test_session("b-older-create", 500, 100),
+            test_session("a-same-create", 500, 200),
+            test_session("c-same-create", 500, 200),
+        ];
+        let mut sorted = sessions.clone();
+        sorted.sort_by(compare_sessions_by_activity);
+        let ids: Vec<_> = sorted.into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, ["a-same-create", "c-same-create", "b-older-create"]);
     }
 
     #[test]
@@ -363,6 +587,30 @@ mod tests {
         assert_eq!(titlebar.segments, [".orchestrator"]);
         assert_eq!(titlebar.branch.as_deref(), Some("master"));
         assert!(!titlebar.branch_is_worktree);
+    }
+
+    /// A `git switch` inside a worktree leaves `worktree_branch` on the branch
+    /// the worktree was created on. The badge already follows the disk, so the
+    /// title has to follow it too — otherwise the chrome names one branch and
+    /// the badge beside it opens another branch's pull request.
+    #[test]
+    fn workers_titlebar_follows_the_branch_checked_out_in_the_worktree() {
+        let project = WorkersProject {
+            id: "worktree".into(),
+            name: "fix".into(),
+            path: "/tmp/fix".into(),
+            folder_id: None,
+            parent_project_id: Some("project".into()),
+            is_group: false,
+            worktree_branch: Some("change/created".into()),
+            git_branch: Some("change/switched".into()),
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: Default::default(),
+        };
+        let titlebar = workers_titlebar(Some(&project), None);
+        assert_eq!(titlebar.branch.as_deref(), Some("change/switched"));
+        assert!(titlebar.branch_is_worktree);
     }
 
     #[test]

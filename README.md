@@ -55,6 +55,12 @@ The desktop app separates managed Orchestrator chats from local Workers
 sessions. Workers remain active when the main window closes and can be reopened
 from the macOS menu bar.
 
+In Workers, use **New project** or **⌘K** to browse and register a local
+folder. Confirming selects the project without creating a Space or starting a
+Worker; Escape cancels. Base projects contain their local Workers directly,
+and linked worktrees appear underneath by branch name with their own Workers.
+Confirmed pull requests appear as icons with tooltips on the relevant checkout.
+
 In either mode, `Details` shows Workspace, structured To-dos when available,
 and account Usage while `Files` explores the selected local checkout with
 Material file icons. Opening a file keeps the chat visible and uses the same

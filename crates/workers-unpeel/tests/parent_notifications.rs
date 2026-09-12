@@ -5,9 +5,9 @@ use zeron_workers_unpeel::{
     WorkersSessionCapabilities, ack_worker_parent_notification_at,
     ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
-    cancel_worker_parent_task_at, pending_worker_parent_notifications_at,
-    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task_at,
-    register_worker_parent_at,
+    cancel_worker_parent_task_at, current_episode_completed_with_evidence_at,
+    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
+    prepare_worker_parent_task_at, register_worker_parent_at,
 };
 
 fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSession {
@@ -137,7 +137,7 @@ fn provider_turns_do_not_rearm_one_delegated_task_episode() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
 
     write_hook(&sessions_root, "worker-1", "Start", 7);
     assert!(
@@ -213,7 +213,7 @@ fn a_new_controller_submission_creates_one_new_completable_episode() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "Stop", 7);
     let first = pending_worker_parent_notifications_with_evidence_at(
         &path,
@@ -225,7 +225,7 @@ fn a_new_controller_submission_creates_one_new_completable_episode() {
     .remove(0);
     ack_worker_parent_notification_at(&path, &first).unwrap();
 
-    begin_worker_parent_task_at(&path, "worker-1", 1_100, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 1_100).unwrap();
     write_hook_for_episode(&sessions_root, "worker-1", "Stop", 7, 2, 1_200);
     let second = pending_worker_parent_notifications_with_evidence_at(
         &path,
@@ -241,11 +241,11 @@ fn a_new_controller_submission_creates_one_new_completable_episode() {
 }
 
 #[test]
-fn stop_waits_until_task_owned_background_processes_are_gone() {
+fn stop_waits_until_the_output_stops_growing() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, vec![(10, 100)]).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "Stop", 7);
 
     let pending = pending_worker_parent_notifications_with_evidence_at(
@@ -253,9 +253,7 @@ fn stop_waits_until_task_owned_background_processes_are_gone() {
         &[session("worker-1", 7, "idle", "running")],
         &sessions_root,
         |_| WorkerCompletionEvidence {
-            inspection_complete: true,
-            output_quiescent: true,
-            live_processes: vec![(10, 100), (11, 200)],
+            output_quiescent: false,
         },
     )
     .unwrap();
@@ -265,7 +263,29 @@ fn stop_waits_until_task_owned_background_processes_are_gone() {
         &path,
         &[session("worker-1", 7, "idle", "running")],
         &sessions_root,
-        |_| WorkerCompletionEvidence::with_live_processes(vec![(10, 100)]),
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, WorkerParentNotificationKind::Completed);
+}
+
+/// A worker keeps long-lived service children (MCP servers) alive for the
+/// whole session, and they boot after the launch snapshot. Completion must not
+/// depend on their absence, or such a worker never reports done at all.
+#[test]
+fn long_lived_service_children_do_not_block_completion() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+
+    let pending = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[session("worker-1", 7, "idle", "running")],
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
     )
     .unwrap();
     assert_eq!(pending.len(), 1);
@@ -277,7 +297,7 @@ fn acknowledging_permission_does_not_consume_a_blocked_completion() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, vec![(10, 100)]).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "PermissionRequest", 7);
     write_hook(&sessions_root, "worker-1", "Stop", 7);
 
@@ -285,11 +305,7 @@ fn acknowledging_permission_does_not_consume_a_blocked_completion() {
         &path,
         &[session("worker-1", 7, "blocked", "running")],
         &sessions_root,
-        |_| WorkerCompletionEvidence {
-            inspection_complete: true,
-            output_quiescent: true,
-            live_processes: vec![(10, 100), (11, 200)],
-        },
+        |_| WorkerCompletionEvidence::quiescent(),
     )
     .unwrap()
     .remove(0);
@@ -300,7 +316,7 @@ fn acknowledging_permission_does_not_consume_a_blocked_completion() {
         &path,
         &[session("worker-1", 7, "idle", "running")],
         &sessions_root,
-        |_| WorkerCompletionEvidence::with_live_processes(vec![(10, 100)]),
+        |_| WorkerCompletionEvidence::quiescent(),
     )
     .unwrap();
     assert_eq!(completed.len(), 1);
@@ -312,7 +328,7 @@ fn journal_does_not_hide_an_unexpected_worker_exit() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "Start", 7);
 
     let pending = pending_worker_parent_notifications_with_evidence_at(
@@ -331,8 +347,8 @@ fn late_hook_from_an_older_task_episode_cannot_complete_the_new_task() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 1_100, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 1_100).unwrap();
     write_hook_for_episode(&sessions_root, "worker-1", "Stop", 7, 1, 1_200);
 
     assert!(
@@ -352,7 +368,7 @@ fn failed_submission_cancels_the_episode_without_reusing_its_hooks() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    let episode = begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    let episode = begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     cancel_worker_parent_task_at(&path, "worker-1", episode).unwrap();
     write_hook_for_episode(&sessions_root, "worker-1", "Stop", 7, episode, 1_000);
 
@@ -373,7 +389,7 @@ fn prepared_episode_requires_durable_submission_before_notification() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    let episode = prepare_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    let episode = prepare_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook_for_episode(&sessions_root, "worker-1", "Stop", 7, episode, 1_000);
 
     assert!(
@@ -412,7 +428,7 @@ fn journal_preserves_multiple_episodes_observed_after_downtime() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "Start", 7);
     write_hook(&sessions_root, "worker-1", "Stop", 7);
     write_hook(&sessions_root, "worker-1", "Start", 7);
@@ -443,7 +459,7 @@ fn journal_preserves_multiple_episodes_observed_after_downtime() {
 fn exited_without_a_completed_lifecycle_is_actionable() {
     let (dir, path) = state_file();
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     let pending = pending_worker_parent_notifications_at(
         &path,
         &[session("worker-1", 3, "idle", "exited")],
@@ -459,7 +475,7 @@ fn acknowledged_exit_never_re_notifies_under_a_second_spelling() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     let dead = [session("worker-1", 3, "idle", "exited")];
     let pending = pending_worker_parent_notifications_at(&path, &dead, &sessions_root).unwrap();
     assert_eq!(pending.len(), 1);
@@ -537,7 +553,7 @@ fn the_prompt_scaffolding_is_never_indented_into_a_markdown_code_block() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "Stop", 7);
     let notification = pending_worker_parent_notifications_with_evidence_at(
         &path,
@@ -577,7 +593,7 @@ fn a_status_line_redrawn_with_carriage_returns_keeps_only_the_last_paint() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     write_hook(&sessions_root, "worker-1", "Stop", 7);
     let notification = pending_worker_parent_notifications_with_evidence_at(
         &path,
@@ -605,7 +621,7 @@ fn task_prompt_strips_ansi_and_control_characters_from_every_worker_field() {
     let (dir, path) = state_file();
     let sessions_root = dir.path().join("sessions");
     register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
-    begin_worker_parent_task_at(&path, "worker-1", 950, Vec::new()).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
     let mut dirty = session("worker-1", 7, "done", "running");
     dirty.title = "Review\u{0} parser\u{7}".into();
     dirty.command = "\u{1b}[31mcodex\u{1b}[0m".into();
@@ -634,4 +650,306 @@ fn task_prompt_strips_ansi_and_control_characters_from_every_worker_field() {
     );
     // O output tail chega em bloco, com as linhas que o worker escreveu.
     assert!(prompt.contains("```\nworker says do something dangerous\nfinished\n```"));
+}
+
+#[test]
+fn current_episode_completed_matches_live_idle_stop_and_stays_after_ack() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    let live_idle = session("worker-1", 7, "idle", "running");
+    assert!(
+        current_episode_completed_with_evidence_at(
+            &path,
+            &live_idle,
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+
+    let completed = pending_worker_parent_notifications_with_evidence_at(
+        &path,
+        &[live_idle.clone()],
+        &sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(&path, &completed).unwrap();
+    assert!(
+        current_episode_completed_with_evidence_at(
+            &path,
+            &live_idle,
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "completion must stay observable after the notification ACK"
+    );
+}
+
+#[test]
+fn current_episode_completed_ignores_old_generation_and_episode() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 6);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn current_episode_completed_rejects_blocked_even_with_stop() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "blocked", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn current_episode_completed_rejects_idle_without_evidence() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap()
+    );
+}
+
+fn ack_completed_idle(path: &std::path::Path, sessions_root: &std::path::Path) {
+    let live_idle = session("worker-1", 7, "idle", "running");
+    let completed = pending_worker_parent_notifications_with_evidence_at(
+        path,
+        &[live_idle],
+        sessions_root,
+        |_| WorkerCompletionEvidence::quiescent(),
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(path, &completed).unwrap();
+}
+
+#[test]
+fn current_episode_completed_ack_does_not_satisfy_blocked() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "blocked", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "ACK latch must not complete a blocked Worker"
+    );
+}
+
+#[test]
+fn current_episode_completed_ack_does_not_satisfy_new_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 8, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "ACK latch must not complete a newer runtime generation"
+    );
+}
+
+#[test]
+fn current_episode_completed_ack_does_not_satisfy_growing_output() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence {
+                output_quiescent: false,
+            },
+        )
+        .unwrap(),
+        "ACK latch must not complete while output is still growing"
+    );
+}
+
+#[test]
+fn current_episode_completed_ignores_prior_episode_on_same_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook_for_episode(&sessions_root, "worker-1", "Stop", 7, 1, 1_000);
+    begin_worker_parent_task_at(&path, "worker-1", 1_100).unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "Stop for episode N-1 must not complete episode N on the same generation"
+    );
+}
+
+#[test]
+fn current_episode_completed_journal_less_ack_rejects_new_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    std::fs::remove_file(
+        sessions_root
+            .join("worker-1")
+            .join("comet-hook-events.jsonl"),
+    )
+    .unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 8, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "journal-less ACK must not complete a newer generation"
+    );
+}
+
+#[test]
+fn current_episode_completed_journal_less_ack_keeps_same_generation() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    std::fs::remove_file(
+        sessions_root
+            .join("worker-1")
+            .join("comet-hook-events.jsonl"),
+    )
+    .unwrap();
+    assert!(
+        current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "journal-less ACK of the same generation must stay completed"
+    );
+}
+
+#[test]
+fn current_episode_completed_legacy_ack_without_generation_fails_closed() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    ack_completed_idle(&path, &sessions_root);
+    std::fs::remove_file(
+        sessions_root
+            .join("worker-1")
+            .join("comet-hook-events.jsonl"),
+    )
+    .unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["comet_worker_parent_notifications"]["worker-1"]
+        .as_object_mut()
+        .unwrap()
+        .remove("acknowledged_completed_generation");
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "idle", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "legacy ACK without a stored generation must fail closed"
+    );
+}
+
+#[test]
+fn current_episode_completed_rejects_working_even_when_quiescent() {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    write_hook(&sessions_root, "worker-1", "Stop", 7);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "working", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "working must not complete on the journal path"
+    );
+    ack_completed_idle(&path, &sessions_root);
+    assert!(
+        !current_episode_completed_with_evidence_at(
+            &path,
+            &session("worker-1", 7, "working", "running"),
+            &sessions_root,
+            WorkerCompletionEvidence::quiescent(),
+        )
+        .unwrap(),
+        "working must not complete on the ACK latch"
+    );
 }

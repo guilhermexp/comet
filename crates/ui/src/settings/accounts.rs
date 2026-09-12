@@ -24,6 +24,7 @@ use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
+use crate::settings::{self, SavePolicy};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -116,16 +117,17 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 5] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 6] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Kimi, "Kimi Code", "kimi"),
     (HarnessId::Antigravity, "Antigravity", "agy"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Grok, "Grok", "grok"),
 ];
 
 pub fn provider_can_add(harness: HarnessId) -> bool {
-    harness != HarnessId::Kimi && harness != HarnessId::Antigravity
+    harness != HarnessId::Kimi && harness != HarnessId::Antigravity && harness != HarnessId::Grok
 }
 
 /// Accounts of one provider, in the engine's order (slot creation). No
@@ -856,6 +858,9 @@ impl AccountsPage {
                 })
         });
 
+        let visible = settings::current(cx).usage_widget_account_visible(&account.id);
+        let toggle_account_id = account.id.clone();
+
         div()
             .px(px(20.0))
             .py(px(14.0))
@@ -932,6 +937,21 @@ impl AccountsPage {
                     .gap(px(8.0))
                     .child(badges)
                     .children(actions),
+            )
+            .child(
+                widgets::toggle_switch(theme, visible)
+                    .id(SharedString::from(format!(
+                        "account-usage-toggle-{toggle_account_id}"
+                    )))
+                    .self_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::update(SavePolicy::Immediate, cx, |current| {
+                            let next = !current.usage_widget_account_visible(&toggle_account_id);
+                            current.set_usage_widget_account_visible(&toggle_account_id, next);
+                        });
+                        cx.refresh_windows();
+                    })),
             )
             .into_any_element()
     }
@@ -1264,6 +1284,7 @@ impl Render for AccountsPage {
                         HarnessId::Kimi => "accounts-skeleton-kimi",
                         HarnessId::Antigravity => "accounts-skeleton-antigravity",
                         HarnessId::Cursor => "accounts-skeleton-cursor",
+                        HarnessId::Grok => "accounts-skeleton-grok",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -1354,12 +1375,12 @@ impl Render for AccountsPage {
                             HarnessId::Kimi | HarnessId::Antigravity => {
                                 format!("No {name} managed subscription detected on this device.")
                             }
-                            // Cursor's app login is SEPARATE from `cursor-agent
-                            // login` — pointing at the CLI would send users to a
-                            // sign-in that does not light this up.
                             HarnessId::Cursor => format!(
                                 "{name} isn't connected on this device — connect it to run \
                                  Cursor sessions."
+                            ),
+                            HarnessId::Grok => format!(
+                                "No {name} subscription detected on this device — run grok login."
                             ),
                             _ => format!(
                                 "No {name} login detected on this device — sign in \
@@ -1465,9 +1486,9 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code, Codex, and Cursor logins plus managed Kimi Code \
-                         and Antigravity Usage on this device. Zeron keeps switchable \
-                         accounts backed up; authentication for Kimi and Antigravity \
+                        "The Claude Code, Codex, and Cursor logins plus managed Kimi Code, \
+                         Grok, and Antigravity Usage on this device. Zeron keeps switchable \
+                         accounts backed up; authentication for Kimi, Grok, and Antigravity \
                          remains owned by their CLIs.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
@@ -1532,10 +1553,12 @@ mod tests {
                 HarnessId::Kimi,
                 HarnessId::Antigravity,
                 HarnessId::Cursor,
+                HarnessId::Grok,
             ]
         );
         assert!(!provider_can_add(HarnessId::Kimi));
         assert!(!provider_can_add(HarnessId::Antigravity));
+        assert!(!provider_can_add(HarnessId::Grok));
         assert!(provider_can_add(HarnessId::ClaudeCode));
     }
 

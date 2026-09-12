@@ -403,6 +403,44 @@ impl TrajectoryRawRevealResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Chat Recap Wire Types
+// ---------------------------------------------------------------------------
+
+/// Request parameters for `GenerateChatRecap`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateChatRecapParams {
+    pub chat_id: String,
+}
+
+impl GenerateChatRecapParams {
+    pub fn new(chat_id: impl Into<String>) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+        }
+    }
+}
+
+/// Reply for `GenerateChatRecap`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateChatRecapReply {
+    pub recap: Option<String>,
+}
+
+impl GenerateChatRecapReply {
+    pub fn some(recap: impl Into<String>) -> Self {
+        Self {
+            recap: Some(recap.into()),
+        }
+    }
+
+    pub fn none() -> Self {
+        Self { recap: None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

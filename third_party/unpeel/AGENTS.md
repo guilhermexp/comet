@@ -908,3 +908,7 @@ Pro, customer-facing direction: Link), and the target Link model also entitles
 each Controller principal.
 `RemoteControlManager.swift` supervises the server whenever paired devices
 exist.
+
+## Fork hook verification
+
+`runtimes/setup_conformance_tests.rs` executes every owned shell hook with explicit proxy variables and empty proxy exclusions. CaptureServer verifies direct loopback delivery and the persisted `last-hook-event.json` event and generation.

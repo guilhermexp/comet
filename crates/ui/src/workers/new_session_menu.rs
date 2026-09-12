@@ -122,8 +122,12 @@ pub mod native {
         }) as *mut Object
     }
 
+    pub(crate) fn sanitize_label(value: &str) -> String {
+        value.replace('\0', "")
+    }
+
     fn ns_string(value: &str) -> *mut Object {
-        let value = CString::new(value).expect("menu labels cannot contain null bytes");
+        let value = CString::new(sanitize_label(value)).expect("valid native string");
         unsafe { msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()] }
     }
 
@@ -324,8 +328,16 @@ pub mod native {
 
             let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
             let event: *mut Object = msg_send![application, currentEvent];
-            let window: *mut Object = msg_send![event, window];
-            let view: *mut Object = msg_send![window, contentView];
+            let window: *mut Object = if !event.is_null() {
+                msg_send![event, window]
+            } else {
+                std::ptr::null_mut()
+            };
+            let view: *mut Object = if !window.is_null() {
+                msg_send![window, contentView]
+            } else {
+                std::ptr::null_mut()
+            };
             if !event.is_null() && !view.is_null() {
                 let event: *mut Object = msg_send![event, retain];
                 let view: *mut Object = msg_send![view, retain];
@@ -436,5 +448,14 @@ mod tests {
                 "missing native bytes for {runtime_id}: {path}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sanitize_label_removes_null_bytes() {
+        assert_eq!(
+            super::native::sanitize_label("preset\0name\0"),
+            "presetname"
+        );
     }
 }

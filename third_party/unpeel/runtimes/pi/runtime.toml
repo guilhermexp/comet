@@ -24,8 +24,8 @@ icon_source = "internal:legacy-unpeel-tool-icons"
 icon_license = "vendor-brand-asset"
 
 [install]
-official_url = "https://github.com/badlogic/pi-mono"
-command = "npm install -g @mariozechner/pi-coding-agent"
+official_url = "https://github.com/earendil-works/pi"
+command = "npm install -g @earendil-works/pi-coding-agent"
 
 [detection]
 command_aliases = ["pi"]

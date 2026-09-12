@@ -22,6 +22,8 @@
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//! - Workspace files: lazy directory listing, recursive path search, bounded text
+//!   reads and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -49,6 +51,7 @@
 //! routed: `ListHarnesses`, `ListModels`, `QueueCommand`, and `WatchDocMessages`.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
@@ -93,6 +96,13 @@ struct ChatParams {
 #[derive(Debug, Deserialize)]
 struct SetLiveVoiceMutedParams {
     muted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeLiveVoiceParams {
+    chat_id: Option<String>,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +439,19 @@ enum MutateParams {
     /// so they survive restarts and reach every device.
     #[serde(rename_all = "camelCase")]
     SetChatConfig { chat_id: String, config: ChatConfig },
+    /// Transcript marker for a model change made mid-conversation. Carries the
+    /// catalog LABELS (the picker's own text) because only the UI holds the
+    /// model catalog; the engine just writes the line.
+    #[serde(rename_all = "camelCase")]
+    NoteModelSwitch {
+        chat_id: String,
+        from: String,
+        to: String,
+    },
+    /// Same system-entry marker with caller-composed text — the UI owns the
+    /// wording (it holds the token counts the compaction line names).
+    #[serde(rename_all = "camelCase")]
+    NoteMarker { chat_id: String, text: String },
     /// Tombstone: removes the chats-map row; the session doc remains.
     #[serde(rename_all = "camelCase")]
     DeleteChat { chat_id: String },
@@ -450,7 +473,9 @@ pub struct EngineRpc {
     workspace: WorkspaceHost,
     registry: std::sync::Arc<HarnessRegistry>,
     repos: Repos,
+    workspace_files: crate::WorkspaceFiles,
     terminals: Terminals,
+    previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
@@ -473,6 +498,7 @@ impl EngineRpc {
         workspace: WorkspaceHost,
         registry: std::sync::Arc<HarnessRegistry>,
         repos: Repos,
+        workspace_files: crate::WorkspaceFiles,
         terminals: Terminals,
         change_requests: CheckoutChangeRequests,
         diff_sync: CheckoutDiffSync,
@@ -490,7 +516,9 @@ impl EngineRpc {
             workspace,
             registry,
             repos,
+            workspace_files,
             terminals,
+            previews: None,
             change_requests,
             diff_sync,
             uploads,
@@ -524,6 +552,11 @@ impl EngineRpc {
 
     pub fn run_journal(&self) -> Option<Arc<RunJournal>> {
         self.run_journal.clone()
+    }
+
+    pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
+        self.previews = Some(previews);
+        self
     }
 
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
@@ -572,79 +605,16 @@ impl EngineRpc {
     /// name an existing linked worktree for a new chat, but it is verified
     /// against the space repository before any filesystem walk begins.
     async fn file_search_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
-        let local_device = self.doc_host.device_id();
-        match (&p.chat_id, &p.space_id) {
-            (Some(_), Some(_)) | (None, None) => Err(RpcError::BadParams(
-                "SearchFiles needs exactly one of chatId or spaceId".into(),
-            )),
-            (Some(chat_id), None) => {
-                if p.path.is_some() {
-                    return Err(RpcError::BadParams(
-                        "SearchFiles path applies only to a space".into(),
-                    ));
-                }
-                let chat = self
-                    .workspace
-                    .chat(chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
-                if chat.device_id != local_device {
-                    return Err(RpcError::Failed("chat belongs to another device".into()));
-                }
-                let cwd = chat
-                    .cwd
-                    .map(std::path::PathBuf::from)
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
-                let space_id = chat
-                    .space_id
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
-                let space = self
-                    .workspace
-                    .space(&space_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
-                if space.device_id != local_device {
-                    return Err(RpcError::Failed(
-                        "chat space belongs to another device".into(),
-                    ));
-                }
-                if let Some(cwd) = self
-                    .repos
-                    .workspace_checkout(std::path::Path::new(&space.path), &cwd)
-                    .await
-                {
-                    Ok(cwd)
-                } else {
-                    Err(RpcError::Failed(
-                        "chat folder is not a workspace checkout".into(),
-                    ))
-                }
-            }
-            (None, Some(space_id)) => {
-                let space = self
-                    .workspace
-                    .space(space_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("space not found".into()))?;
-                if space.device_id != local_device {
-                    return Err(RpcError::Failed("space belongs to another device".into()));
-                }
-                let space_path = std::path::PathBuf::from(&space.path);
-                let requested = p
-                    .path
-                    .as_deref()
-                    .map_or_else(|| space_path.clone(), std::path::PathBuf::from);
-                if let Some(requested) =
-                    self.repos.workspace_checkout(&space_path, &requested).await
-                {
-                    Ok(requested)
-                } else {
-                    Err(RpcError::BadParams(
-                        "SearchFiles path is not a workspace checkout".into(),
-                    ))
-                }
-            }
-        }
+        let target = zeron_proto::WorkspaceTarget {
+            chat_id: p.chat_id.clone(),
+            space_id: p.space_id.clone(),
+            checkout_path: p.path.clone(),
+        };
+        self.workspace_files
+            .resolve_target(&target)
+            .await
+            .map(|workspace| workspace.root)
+            .map_err(Into::into)
     }
 
     /// Accept only a checkout already named by a local chat or contained in a
@@ -922,6 +892,18 @@ impl EngineRpc {
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
+            MutateParams::NoteModelSwitch { chat_id, from, to } => self
+                .doc_host
+                .open(&chat_id)
+                .map_err(failed)?
+                .write_model_switch(&from, &to)
+                .map_err(|e| RpcError::Failed(e.to_string())),
+            MutateParams::NoteMarker { chat_id, text } => self
+                .doc_host
+                .open(&chat_id)
+                .map_err(failed)?
+                .write_marker(&text)
+                .map_err(|e| RpcError::Failed(e.to_string())),
             MutateParams::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
@@ -1428,6 +1410,14 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
+            methods::SET_TITLE_SETTINGS => {
+                let p: crate::registry::TitleSettings = parse_params(params)?;
+                self.registry
+                    .set_title_settings(p)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.title_settings())
+            }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
                 self.registry
@@ -1523,12 +1513,22 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::PROBE_LIVE_VOICE => {
-                let p: ChatParams = parse_params(params)?;
-                let availability = self
-                    .sessions
-                    .probe_live_voice(&p.chat_id)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let p: ProbeLiveVoiceParams = parse_params(params)?;
+                let availability =
+                    if let Some(chat_id) = p.chat_id.as_deref().filter(|id| !id.is_empty()) {
+                        self.sessions
+                            .probe_live_voice(chat_id)
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    } else {
+                        let cwd = p.cwd.filter(|cwd| !cwd.trim().is_empty()).ok_or_else(|| {
+                            RpcError::Failed("ProbeLiveVoice requires chatId or cwd".into())
+                        })?;
+                        self.sessions
+                            .probe_live_voice_at_cwd(&cwd)
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    };
                 RpcReply::value(&availability)
             }
             methods::START_LIVE_VOICE => {
@@ -1619,6 +1619,69 @@ impl RpcService for EngineRpc {
             methods::WATCH_TRANSFERS => Ok(RpcReply::Stream(watch_stream(
                 self.doc_host.watch_transfers(),
             ))),
+            methods::WATCH_PREVIEWS => {
+                let p: zeron_proto::WatchPreviewsParams = parse_params(params)?;
+                if self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .is_none()
+                {
+                    return Err(RpcError::Failed("Project session not found".into()));
+                }
+                let previews = self
+                    .previews
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Preview discovery unavailable".into()))?;
+                let catalog = previews.catalog().clone();
+                let changes = catalog.subscribe();
+                let chats = self.workspace.watch_chats();
+                let workspace = self.workspace.clone();
+                // This subscription stays on the viewing device. A remote chat
+                // selects advertised services, but its URL uses our local proxy.
+                let stream = futures::stream::unfold(
+                    (changes, chats, true, workspace, catalog, p.chat_id),
+                    |(mut changes, mut chats, first, workspace, catalog, chat_id)| async move {
+                        if !first {
+                            tokio::select! {
+                                result = changes.changed() => { if result.is_err() { return None; } }
+                                result = chats.changed() => { if result.is_err() { return None; } }
+                            }
+                        }
+                        let mut snapshot = changes.borrow_and_update().clone();
+                        chats.borrow_and_update();
+                        let chat = workspace.chat(&chat_id).ok().flatten();
+                        let device = chat
+                            .as_ref()
+                            .map(|c| c.device_id.clone())
+                            .unwrap_or_default();
+                        snapshot.remote = device != catalog.device_id();
+                        let cwd = chat.and_then(|c| c.cwd);
+                        let cwd = cwd.map(|cwd| {
+                            if snapshot.remote {
+                                std::path::PathBuf::from(cwd)
+                            } else {
+                                std::path::PathBuf::from(&cwd)
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| cwd.into())
+                            }
+                        });
+                        snapshot.project_name = cwd
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|s| s.to_string_lossy().into_owned());
+                        snapshot.services.retain(|service| {
+                            service.device_id == device
+                                && cwd.as_ref().is_some_and(|cwd| {
+                                    cwd == std::path::Path::new(&service.project_cwd)
+                                })
+                        });
+                        let value = serde_json::to_value(snapshot).ok()?;
+                        Some((value, (changes, chats, false, workspace, catalog, chat_id)))
+                    },
+                );
+                Ok(RpcReply::Stream(Box::pin(stream)))
+            }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }
@@ -1637,6 +1700,64 @@ impl RpcService for EngineRpc {
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+            }
+            methods::GENERATE_CHAT_RECAP => {
+                let p: zeron_rpc::GenerateChatRecapParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let Some(chat) = chat else {
+                    return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                };
+
+                let doc_handle = match self.doc_host.open(&p.chat_id) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        tracing::debug!(chat = %p.chat_id, error = %err, "recap failed to open chat doc");
+                        return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                    }
+                };
+
+                let entries = match doc_handle.doc().read_entries() {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::debug!(chat = %p.chat_id, error = %err, "recap failed to read entries");
+                        return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                    }
+                };
+
+                let transcript = crate::recap::select_recap_transcript(&entries);
+                if transcript.is_empty() {
+                    return RpcReply::value(&zeron_rpc::GenerateChatRecapReply::none());
+                }
+
+                let prompt = crate::recap::build_recap_prompt(&transcript, chat.title.as_deref());
+                let harness_id = chat
+                    .config
+                    .as_ref()
+                    .map(|c| c.harness)
+                    .or_else(|| self.registry.enabled_set().into_iter().next())
+                    .unwrap_or(HarnessId::ClaudeCode);
+                let cwd = chat.cwd.as_deref().unwrap_or(".");
+
+                let recap = match crate::recap::run_recap_model(
+                    &p.chat_id,
+                    harness_id,
+                    &prompt,
+                    cwd,
+                    &self.registry,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::warn!(chat = %p.chat_id, error = %err, "recap model generation failed");
+                        None
+                    }
+                };
+
+                RpcReply::value(&zeron_rpc::GenerateChatRecapReply { recap })
             }
             methods::LOCAL_IMPORT_STATUS => {
                 let importer = self.local_importer()?.clone();
@@ -1689,7 +1810,41 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
-                Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
+                // An optional `cwd` pins that checkout for the life of the
+                // stream. Entries are otherwise built from chat rows alone, so
+                // a pane opened on a checkout no chat points at (a Workers
+                // project) would wait on a diff that is never captured.
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(default)]
+                    cwd: Option<String>,
+                }
+                let cwd = parse_params::<P>(params).ok().and_then(|p| p.cwd);
+                let pin = match cwd {
+                    Some(cwd) => match self
+                        .diff_sync
+                        .pin_checkout(std::path::Path::new(&cwd))
+                        .await
+                    {
+                        Ok(pin) => Some(pin),
+                        Err(error) => {
+                            // Not a checkout (or git is unavailable): the
+                            // stream still carries every chat-backed diff.
+                            tracing::debug!(cwd = %cwd, %error, "diff watch: pin failed");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let stream = watch_stream(self.diff_sync.watch_diffs());
+                Ok(RpcReply::Stream(
+                    stream
+                        .map(move |value| {
+                            let _pin = &pin; // held for the stream's lifetime
+                            value
+                        })
+                        .boxed(),
+                ))
             }
             methods::WATCH_CHECKOUT_CHANGE_REQUEST => {
                 let p: CheckoutChangeRequestParams = parse_params(params)?;
@@ -1907,6 +2062,57 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&history)
             }
+            methods::SEARCH_GIT_HISTORY => {
+                let p: zeron_proto::SearchGitHistoryParams = parse_params(params)?;
+                if p.query.len() > 1024 {
+                    return Err(RpcError::Failed("History query is too long".into()));
+                }
+                let history = self
+                    .repos
+                    .search_history(std::path::Path::new(&p.cwd), &p.query, p.cursor, p.limit)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&history)
+            }
+            methods::RESOLVE_GIT_AVATARS => {
+                let p: zeron_proto::ResolveGitAvatarsParams = parse_params(params)?;
+                let authors: Vec<_> = p
+                    .authors
+                    .into_iter()
+                    .take(crate::repos::GIT_HISTORY_MAX_LIMIT)
+                    .filter(|author| author.sha.len() <= 64 && author.email.len() <= 512)
+                    .map(|author| (author.sha, author.email))
+                    .collect();
+                let avatar_paths = self
+                    .repos
+                    .history_avatar_urls(std::path::Path::new(&p.cwd), &authors, p.cursor, p.limit)
+                    .await;
+                let mut avatars = std::collections::HashMap::new();
+                let mut remaining = 512 * 1024_usize;
+                for (email, path) in avatar_paths {
+                    use tokio::io::AsyncReadExt;
+                    let Ok(file) = tokio::fs::File::open(path).await else {
+                        continue;
+                    };
+                    let mut bytes = Vec::new();
+                    if file
+                        .take(remaining as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .is_err()
+                        || bytes.is_empty()
+                        || bytes.len() > remaining
+                    {
+                        continue;
+                    }
+                    remaining -= bytes.len();
+                    avatars.insert(
+                        email,
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    );
+                }
+                RpcReply::value(&avatars)
+            }
             methods::FETCH_ALL => {
                 let p: RepoPathParams = parse_params(params)?;
                 self.repos
@@ -1968,6 +2174,53 @@ impl RpcService for EngineRpc {
                 .await
                 .map_err(|_| RpcError::Failed("file search timed out".into()))??;
                 RpcReply::value(&matches)
+            }
+            methods::LIST_WORKSPACE_DIRECTORY => {
+                let request: zeron_proto::ListWorkspaceDirectoryRequest = parse_params(params)?;
+                let page = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.list_directory(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace directory listing timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&page)
+            }
+            methods::SEARCH_WORKSPACE_FILES => {
+                let request: zeron_proto::SearchWorkspaceFilesRequest = parse_params(params)?;
+                let matches = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.search(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file search timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&matches)
+            }
+            methods::READ_WORKSPACE_FILE => {
+                let request: zeron_proto::ReadWorkspaceFileRequest = parse_params(params)?;
+                let file = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.read_file(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file read timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&file)
+            }
+            methods::WATCH_WORKSPACE_FILES => {
+                let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
+                let subscription = self
+                    .workspace_files
+                    .watch_files(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                let stream = futures::stream::unfold(subscription, |mut subscription| async move {
+                    let changes = subscription.recv().await?;
+                    let value = serde_json::to_value(changes).ok()?;
+                    Some((value, subscription))
+                });
+                Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
@@ -2396,6 +2649,8 @@ mod tests {
         assert!(is_forwardable(methods::QUEUE_COMMAND));
         assert!(is_forwardable(methods::QUEUE_WORKER_NOTIFICATION));
         assert!(is_forwardable(methods::SEARCH_FILES));
+        assert!(is_forwardable(methods::SEARCH_GIT_HISTORY));
+        assert!(is_forwardable(methods::RESOLVE_GIT_AVATARS));
         assert!(is_forwardable(methods::FETCH_ALL));
         assert!(is_forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_forwardable(methods::FETCH_TOOL_INPUT));

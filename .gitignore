@@ -10,5 +10,7 @@ node_modules
 .wrangler
 build/
 edge/dist/
-.auto-claude/
+.auto-code/
 .reverse-engineering/
+.plan-worktree-cutover.json
+progress.md

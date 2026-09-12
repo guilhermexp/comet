@@ -4,14 +4,16 @@ Fork de [zeronsh/comet](https://github.com/zeronsh/comet) (MIT). Controlador mul
 
 Detalhe canônico de arquitetura: `ARCHITECTURE.md`. Paridade contra o app original: `docs/PARITY.md`. Inventário funcional: `FUNCTIONAL-BASELINE.html`.
 
+Mapa de referência do streaming do Chat: [`docs/streaming-guide.md`](docs/streaming-guide.md) — catálogo de eventos/rows, agrupamentos, duplicações e caminhos de render, observado em 2026-09-09. Consulte antes de corrigir o streaming e revalide os trechos afetados; o guia é uma fotografia, não substitui os contratos DOX/OpenSpec.
+
 Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes de nomear qualquer coisa. Duas colisões que o código já carrega: **Chat** é a conversa durável (a linha da sidebar, o que se exporta) enquanto **Session** é o estado de execução dela num device — chamar Chat de "session" nomeia a coisa errada. E **Managed Provider Usage** é quota de assinatura device-local, nunca billing de API nem usage sincronizado.
 
 ## Stack
 
-- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel}` + `apps/zeron` (membro padrão do workspace).
-- **UI = gpui**, pinado num fork do Zed (`wingleeio/zed`, rev fixado em `Cargo.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
+- **Rust workspace** (edition 2024, `resolver = "2"`) — `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,preview}` + `apps/zeron` (membro padrão do workspace).
+- **UI = gpui**, pinado num fork do Zed (`zeronsh/zui`, extração Apache-2.0 de `zeronsh/zui`, rev fixado em `Cargo.toml`). Não usamos as crates GPL do Zed (`markdown`, `ui`, `theme`, `editor`) — markdown, componentes e tema são nossos.
 - **Sync = loro 1.13 + loro-protocol 0.3** (twin Rust do pacote npm que a edge fala).
-- **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres, sem Hono server, sem WebRTC.
+- **Edge = TypeScript** (`edge/`) — Worker + SessionRoom DO (por chat) + DeviceRoom DO (por device) + R2 + auth WorkOS. Sem Postgres nem Hono server. Sync não usa WebRTC; previews de servidores usam RTC autenticado por PreviewRoom.
 - **apps/ios** — cliente iOS (projeto Xcode), fora do workspace Cargo.
 - Binário único `zeron`: headed (gpui) ou `zeron headless` (só engine).
 
@@ -28,6 +30,8 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 | Edge | `npm -C edge run dev\|test\|typecheck\|deploy` |
 | Packaging | `scripts/package-linux.sh` · `scripts/package-macos.sh` |
 
+O job Rust em `.github/workflows/rust.yml` provisiona Bun para os testes executáveis da extensão lifecycle pi-family do Unpeel vendorizado.
+
 ## Remotes e publicação
 
 - `origin` = `guilhermexp/comet` (nosso fork) · `upstream` = `zeronsh/comet` (terceiro, MIT).
@@ -38,11 +42,13 @@ Terminologia canônica de produto vive em [`CONTEXT.md`](CONTEXT.md). Leia antes
 
 ## Gotchas duráveis
 
+- **`cargo run` usa o checkout atual do Comet e o OMP instalado.** Não impor OMP de fonte em `.cargo/config.toml`: desenvolvimento com o checkout irmão é opt-in via `OMP_EXECUTABLE="$PWD/scripts/omp-dev" cargo run` (contrato em `scripts/AGENTS.md`). Outro worktree tem código e binário próprios; executar ali não inclui mudanças locais deste checkout.
+
 - **Sync com o upstream é frequente** (várias versões por semana). A receita que faz o merge passar é `cargo fmt --all` do nosso lado **antes** do merge. Conflitos se resolvem a favor do fork, e o motivo de cada um vai no corpo do commit de merge.
 - `crates/tui` / `apps/tui` foram **deletados** (upstream removeu o viewport ratatui). Isso **não** é o painel de terminal dentro do app — esse vive em `crates/ui/src/terminal/` e está intacto.
 - `dist/` guarda **assets-fonte** de packaging (ícone, `.desktop`, `Info.plist`), consumidos por `scripts/package-*.sh` e pelo workflow de release. Só `edge/dist/` é gerado/ignorado — não apagar a `dist/` da raiz.
 - Build do gpui é caro; `[profile.dev]` já usa `opt-level = 2` pras deps. Primeira build leva minutos.
-- Bump do rev do gpui exige rebase da branch `comet/line-wrap-closing-punctuation` no fork do Zed.
+- Bump do rev do gpui exige verificar ambas as regras de `comet/line-wrap-closing-punctuation` (`line_wrapper` e `line_layout`); o pin zui 07fd941a já incorpora essas correções.
 - **Live Voice pertence à engine host, não à surface selecionada.** Trocar/limpar o Chat, perder foco ou minimizar não encerra a call. Em `Working`/`AwaitingInput`, start exige que o OMP anuncie contexto operacional silencioso; a engine projeta só status/texto visível/label de tool/espera/erro e coalesce o último snapshot. Delegação vocal confirmada entra como comando durável `Steer`, com fallback único para novo turno se o run assentar; comando durável alheio, End/Escape no Chat ativo, falha de transporte, shutdown ou quit encerram. Run OMP estacionado em `Idle` continua quente e requer só Live básico.
 - Este é um repo de terceiro sob MIT. Preservar licença e atribuição.
 
@@ -83,7 +89,7 @@ A seção **Verification** carrega a **Test Coverage Matrix** local (`camada/pat
 
 | Domínio | Doc | O que mora ali |
 |---|---|---|
-| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 11 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, syntax, tema, workers-unpeel, updater, UI/composer, export de Chat Transcript e decoração markdown |
+| Workspace Rust | [`crates/AGENTS.md`](crates/AGENTS.md) | As 12 crates da lib: wire types, docs CRDT, sync, harnesses, engine/uploads, RPC, syntax, tema, workers-unpeel, updater, UI/composer, export de Chat Transcript e decoração markdown |
 | Binário e clientes | [`apps/AGENTS.md`](apps/AGENTS.md) | `apps/zeron` (CLI headed/headless) e `apps/ios` |
 | Edge Cloudflare | [`edge/AGENTS.md`](edge/AGENTS.md) | Worker, SessionRoom/DeviceRoom DOs, R2, auth WorkOS |
 | Scripts | [`scripts/AGENTS.md`](scripts/AGENTS.md) | Dev demo, smoke e2e, packaging Linux/macOS |

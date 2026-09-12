@@ -22,7 +22,14 @@ Single `lib.rs` covering:
 - `Updater`: background task with `watch::Receiver<UpdateStatus>`; cadence
   constants `CHECK_INTERVAL=6h`, `CHECK_RETRY=30min`,
   `CHECK_INITIAL_DELAY=20s`, `IDLE_RECHECK=5min` (auto-apply defers behind
-  active sessions via the `QuiescentCheck` seam).
+  active sessions via atomic `RestartGate` coordination).
+- `RestartGate` / `RestartAuthorization` / `AdmissionGuard`: atomic coordination
+  between update restarts and engine work admission. Staging proceeds concurrently
+  with active work without blocking admission. Restart authorization atomically
+  checks quiescence (including in-flight admissions) and blocks new run and terminal
+  admissions across apply and the 800ms restart delay, with safe rollback on failure
+  or cancellation. Single-owner tokens prevent double authorization and guard against
+  stale releases.
 
 ## Ownership
 
@@ -41,8 +48,13 @@ presentation of `UpdateStatus`.
   only pre-manifest `latest.txt` releases may skip verification (and must log).
 - `apply_headless` flips the `current` symlink atomically; never patch a
   running versioned dir in place.
-- Auto-apply only when the quiescent check passes; otherwise re-probe at
-  `IDLE_RECHECK`.
+- Auto-apply and manual apply stage artifacts concurrently with active work with the gate OPEN,
+  then acquire atomic restart authorization via `RestartGate` without network I/O under authorization;
+  if work is active or in-flight, auto-apply defers and re-probes at `IDLE_RECHECK`. Once authorized,
+  admission of new runs and terminals is blocked across the 800ms restart delay until process termination;
+  failure or cancellation of the background restart task safely rolls back and reopens the gate.
+- `Updater::shutdown` is persistent and idempotent, terminating the check loop
+  within timeout even in `current_thread` runtimes immediately after spawn.
 
 ## Work Guidance
 
@@ -53,18 +65,21 @@ presentation of `UpdateStatus`.
 
 ## Verification
 
-`cargo test -p zeron-update` — 5 unit tests, all in `lib.rs`. Coverage is
-**thin** by design of what's testable offline: version compare, install-kind
-detection, artifact naming, manifest parsing, and the headless symlink swap
-against a tempdir. The download/verify/stage network path and the macOS bundle
-swap have no automated coverage — validate changes to them by hand (a staged
-update on a real install) before shipping.
+`cargo test -p zeron-update` — 11 unit tests, all in `lib.rs`, covering version
+compare, install-kind detection, artifact naming, manifest parsing, headless
+symlink swap against tempdirs, persistent shutdown in current_thread runtimes,
+and atomic restart gating with single ownership, in-flight admission tracking,
+deterministic auto-apply staging concurrency, and rollback on task failure/cancellation.
+Download verification and the macOS bundle swap have no automated coverage — validate changes to them by hand
+(a staged update on a real install) before shipping.
 
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | Version/manifest/artifact-name logic | unit | `cargo test -p zeron-update` |
 | Install-kind detection | unit | `cargo test -p zeron-update` |
 | Headless symlink swap (`apply_headless`) | unit (tempdir) | `cargo test -p zeron-update` |
+| Shutdown persistence & idempotency | unit | `cargo test -p zeron-update` |
+| Atomic restart gating (`RestartGate`) | unit | `cargo test -p zeron-update` |
 | Download + sha256 verify + stage | none — needs the releases bucket; manual validation | — |
 | macOS bundle swap + relaunch | none — needs a real .app install; manual validation | — |
 

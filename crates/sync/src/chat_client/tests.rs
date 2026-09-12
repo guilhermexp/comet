@@ -50,17 +50,27 @@ struct RecordingSink {
     checkpoints: Mutex<Vec<(Vec<u8>, u64)>>,
     cursor_advances: Mutex<Vec<u64>>,
     frontier_contained: std::sync::atomic::AtomicBool,
+    pending_until_checkpoint: std::sync::atomic::AtomicBool,
     /// Global apply order across rows and checkpoints — the overlap test
     /// pins "checkpoint imports before any row that buffered during it".
     ops: Mutex<Vec<String>>,
 }
 
 impl ChatDocSink for RecordingSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) {
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome {
+        if self
+            .pending_until_checkpoint
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return RowImportOutcome::PendingDependencies;
+        }
         lock(&self.rows).push((bytes.to_vec(), cursor));
         lock(&self.ops).push(format!("row@{cursor}"));
+        RowImportOutcome::Applied
     }
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
+        self.pending_until_checkpoint
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         lock(&self.checkpoints).push((bytes.to_vec(), cursor));
         lock(&self.ops).push(format!("ckpt@{cursor}"));
         Ok(())
@@ -223,6 +233,7 @@ fn catch_up_plan_covers_the_decision_table() {
 
 #[tokio::test(start_paused = true)]
 async fn fresh_join_backfills_rows_and_advances_cursor() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, fetch_calls) = fetcher(b"");
@@ -267,6 +278,7 @@ async fn fresh_join_backfills_rows_and_advances_cursor() {
 
 #[tokio::test(start_paused = true)]
 async fn contained_frontier_skips_the_checkpoint_download() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     sink.frontier_contained
@@ -314,6 +326,7 @@ async fn contained_frontier_skips_the_checkpoint_download() {
 
 #[tokio::test(start_paused = true)]
 async fn missing_frontier_fetches_and_imports_the_checkpoint_first() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, fetch_calls) = fetcher(b"checkpoint-bytes");
@@ -355,6 +368,7 @@ async fn missing_frontier_fetches_and_imports_the_checkpoint_first() {
 
 #[tokio::test(start_paused = true)]
 async fn unacked_pushes_survive_reconnect_and_acks_retire_them() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe1, mut end1) = pipe_pair();
     let (pipe2, mut end2) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
@@ -443,6 +457,7 @@ impl CheckpointFetcher for PendingFetcher {
 /// retry clock without waiting for a new enqueue.
 #[tokio::test(start_paused = true)]
 async fn permanent_rejection_retires_transient_keeps_and_retries() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -524,6 +539,7 @@ async fn permanent_rejection_retires_transient_keeps_and_retries() {
 /// immediate full-queue replay before the retry deadline.
 #[tokio::test(start_paused = true)]
 async fn quota_rejection_blocks_enqueue_nudges_until_retry_deadline() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -580,6 +596,7 @@ async fn quota_rejection_blocks_enqueue_nudges_until_retry_deadline() {
 /// rejected head, and only its acknowledgement unlocks the following batch.
 #[tokio::test(start_paused = true)]
 async fn quota_retry_sends_one_head_then_ack_drains_next() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -664,6 +681,7 @@ async fn quota_retry_sends_one_head_then_ack_drains_next() {
 /// F2: batches over the row cap never enter the replay queue.
 #[tokio::test(start_paused = true)]
 async fn oversized_enqueue_is_refused_at_the_door() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -700,6 +718,7 @@ async fn oversized_enqueue_is_refused_at_the_door() {
 /// actor is parked inside a hung checkpoint fetch.
 #[tokio::test(start_paused = true)]
 async fn shutdown_interrupts_a_hung_checkpoint_fetch() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe1, mut end1) = pipe_pair();
     let (pipe2, mut end2) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
@@ -748,6 +767,7 @@ async fn shutdown_interrupts_a_hung_checkpoint_fetch() {
 /// SURFACED — counted in stats, honest head_seq — not silently absorbed.
 #[tokio::test(start_paused = true)]
 async fn server_reset_is_counted_and_head_seq_stays_honest() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -791,6 +811,7 @@ async fn server_reset_is_counted_and_head_seq_stays_honest() {
 /// the deadline instead of hanging the actor (and shutdown) forever.
 #[tokio::test(start_paused = true)]
 async fn hung_checkpoint_fetch_fails_the_join_within_deadline() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
     let server = tokio::spawn(async move {
@@ -826,6 +847,7 @@ async fn hung_checkpoint_fetch_fails_the_join_within_deadline() {
 /// EMPTY transcript.
 #[tokio::test(start_paused = true)]
 async fn seeded_at_zero_room_fetches_the_checkpoint() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
     let (fetch, fetch_calls) = fetcher(b"seed-checkpoint-bytes");
@@ -894,6 +916,7 @@ impl CheckpointFetcher for GatedFetcher {
 /// the join must not serialize download → request → backfill.
 #[tokio::test]
 async fn checkpoint_fetch_overlaps_row_backfill() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
     let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
@@ -968,6 +991,7 @@ async fn checkpoint_fetch_overlaps_row_backfill() {
 /// backfill AFTER seeing (and acking) the push; the old order deadlocks here.
 #[tokio::test(start_paused = true)]
 async fn pending_push_flushes_before_backfill_completes() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe_a, mut end_a) = pipe_pair();
     let (pipe_b, mut end_b) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
@@ -1064,9 +1088,9 @@ fn empty_frontier_with_real_checkpoint_is_not_contained() {
 // virtual clock. The contract under test: every send delivers exactly once
 // or surfaces a visible degraded state — silence is a failure.
 
-/// Tests that flip the process-global OS-path flag or assert precise dial
-/// timing serialize through this: a park triggered by one test inflates
-/// another's measured backoff gaps.
+/// Async client tests share the process-global OS-path flag and dial budget.
+/// Serialize them so a different runtime cannot hold a dial slot while a
+/// paused clock advances through its deadlines or backoff measurements.
 static PATH_AND_TIMING: Mutex<()> = Mutex::new(());
 
 struct FlakyConnector {
@@ -1362,6 +1386,7 @@ async fn os_offline_parks_dials_and_the_online_event_unparks_immediately() {
 /// close the gap.
 #[tokio::test(start_paused = true)]
 async fn live_row_gap_holds_cursor_and_repairs() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -1455,6 +1480,7 @@ async fn live_row_gap_holds_cursor_and_repairs() {
 /// checkpoint threshold policy, and re-imports are no-ops.
 #[tokio::test(start_paused = true)]
 async fn checkpointless_amnesty_refetches_from_zero() {
+    let _serial = lock(&PATH_AND_TIMING);
     let (pipe, mut end) = pipe_pair();
     let sink = Arc::new(RecordingSink::default());
     let (fetch, _) = fetcher(b"");
@@ -1498,4 +1524,285 @@ async fn checkpointless_amnesty_refetches_from_zero() {
     assert_eq!(client.stats().cursor, 3);
     drop(end);
     client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn causal_gap_refetches_checkpoint_without_skipping_parked_row() {
+    let _serial = lock(&PATH_AND_TIMING);
+    use std::sync::atomic::Ordering::Relaxed;
+    let (first_pipe, mut first_end) = pipe_pair();
+    let (second_pipe, mut second_end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    sink.frontier_contained.store(true, Relaxed);
+    sink.pending_until_checkpoint.store(true, Relaxed);
+    let (fetch, calls) = fetcher(b"complete-history");
+    let server = tokio::spawn(async move {
+        let state = serde_json::json!({"headSeq": 5, "seqFloor": 5,
+            "checkpointSeq": 5, "checkpointSize": 1000, "rowCount": 0, "rowBytes": 0});
+        serve_join(&mut first_end, state.clone(), b"frontier", vec![], false).await;
+        send(
+            &first_end,
+            frame_type::ROW,
+            serde_json::json!({"seq": 6, "device": "dev-b", "batchId": "b6"}),
+            b"dependent-row",
+        )
+        .await;
+        let hello = expect_kind(&mut second_end, frame_type::HELLO).await;
+        assert_eq!(
+            hello.header["cursor"], 5,
+            "parked row must not advance cursor"
+        );
+        let mut state = state;
+        state["headSeq"] = 6.into();
+        send(&second_end, frame_type::STATE, state, b"frontier").await;
+        let rows = expect_kind(&mut second_end, frame_type::ROWS_REQ).await;
+        assert_eq!(rows.header["after"], 5);
+        assert_eq!(
+            rows.header["excludeOwn"], false,
+            "repair includes every writer"
+        );
+        send(
+            &second_end,
+            frame_type::ROW,
+            serde_json::json!({"seq": 6, "device": "dev-b", "batchId": "b6"}),
+            b"dependent-row",
+        )
+        .await;
+        send(
+            &second_end,
+            frame_type::ROWS_DONE,
+            serde_json::json!({"headSeq": 6}),
+            &[],
+        )
+        .await;
+        (first_end, second_end)
+    });
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![first_pipe, second_pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        5,
+        ChatTuning::default(),
+    )
+    .await
+    .unwrap();
+    let ends = server.await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.stats().cursor != 6 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "causal repair stalled"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        calls.load(Relaxed),
+        1,
+        "fetch despite the contained frontier"
+    );
+    assert_eq!(*lock(&sink.ops), vec!["ckpt@5", "row@6"]);
+    drop(ends);
+    client.shutdown().await;
+}
+
+struct FixedHttpRows {
+    body: Vec<u8>,
+    requests: Mutex<Vec<u64>>,
+}
+impl ChatTransport for FixedHttpRows {
+    fn fetch_rows(&self, after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        lock(&self.requests).push(after);
+        let body = self.body.clone();
+        Box::pin(async move { Ok(body) })
+    }
+    fn push(&self, _: String, _: Vec<u8>) -> BoxFuture<'static, Result<String, SyncError>> {
+        Box::pin(async { panic!("read-only recovery must not push") })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_catchup_crosses_a_contained_checkpoint_and_repairs_causal_gaps() {
+    let _serial = lock(&PATH_AND_TIMING);
+    use std::sync::atomic::Ordering::Relaxed;
+    for pending_dependencies in [false, true] {
+        let sink = Arc::new(RecordingSink::default());
+        sink.frontier_contained.store(true, Relaxed);
+        sink.pending_until_checkpoint
+            .store(pending_dependencies, Relaxed);
+        let (fetch, calls) = fetcher(b"complete-history");
+        let frames = [
+            encode(
+                frame_type::STATE,
+                &serde_json::json!({"headSeq": 6, "seqFloor": 5,
+                "checkpointSeq": 5, "checkpointSize": 1000, "rowCount": 1, "rowBytes": 20}),
+                b"frontier",
+            ),
+            encode(
+                frame_type::ROW,
+                &serde_json::json!({"seq": 6, "device": "dev-b", "batchId": "b6"}),
+                b"row",
+            ),
+            encode(
+                frame_type::ROWS_DONE,
+                &serde_json::json!({"headSeq": 6}),
+                &[],
+            ),
+        ];
+        let mut body = Vec::new();
+        for frame in frames {
+            body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            body.extend_from_slice(&frame);
+        }
+        let transport = Arc::new(FixedHttpRows {
+            body,
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = ChatClient::connect_with_transport(
+            connector(vec![]),
+            sink.clone(),
+            fetch,
+            "dev-a",
+            1,
+            ChatTuning::default(),
+            Some(transport.clone()),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while client.stats().cursor != 6 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "HTTP recovery stalled"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls.load(Relaxed), u64::from(pending_dependencies));
+        assert_eq!(lock(&transport.requests)[0], 1);
+        assert_eq!(lock(&sink.rows).last().unwrap().1, 6);
+        if pending_dependencies {
+            assert_eq!(
+                lock(&transport.requests)[1],
+                5,
+                "retry starts before the parked row"
+            );
+            assert_eq!(lock(&sink.ops)[0], "ckpt@5");
+        }
+        client.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn dial_slots_cap_concurrent_acquires() {
+    let _serial = lock(&PATH_AND_TIMING);
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+    let current = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..24 {
+        let current = current.clone();
+        let max = max.clone();
+        tasks.push(tokio::spawn(async move {
+            let _slot = super::acquire_dial_slot().await.expect("dial slot");
+            let n = current.fetch_add(1, SeqCst) + 1;
+            max.fetch_max(n, SeqCst);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            current.fetch_sub(1, SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.expect("join");
+    }
+    let observed = max.load(SeqCst);
+    assert!(
+        observed <= super::MAX_CONCURRENT_DIALS,
+        "observed {observed} concurrent dials, cap is {}",
+        super::MAX_CONCURRENT_DIALS
+    );
+    assert!(observed >= 1, "semaphore never admitted a dial");
+}
+
+#[tokio::test]
+async fn established_chats_release_dial_slots() {
+    let _serial = lock(&PATH_AND_TIMING);
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..=MAX_CONCURRENT_DIALS {
+        let (pipe, mut end) = pipe_pair();
+        let server = tokio::spawn(async move {
+            serve_join(
+                &mut end,
+                serde_json::json!({"headSeq": 0, "seqFloor": 0, "checkpointSeq": 0,
+                    "checkpointSize": 0, "rowCount": 0, "rowBytes": 0}),
+                &[],
+                vec![],
+                false,
+            )
+            .await;
+            end
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            ChatClient::connect_with_tuned(
+                connector(vec![pipe]),
+                Arc::new(RecordingSink::default()),
+                fetcher(&[]).0,
+                "dev-a",
+                0,
+                ChatTuning::default(),
+            ),
+        )
+        .await
+        .expect("established chats must not block a new dial")
+        .unwrap();
+        servers.push(server.await.unwrap());
+        clients.push(client);
+    }
+    assert!(clients.iter().all(|client| client.stats().connected));
+    for client in clients {
+        client.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_dial_wait_without_releasing_occupied_slots() {
+    let _serial = lock(&PATH_AND_TIMING);
+    let mut occupied = Vec::new();
+    for _ in 0..MAX_CONCURRENT_DIALS {
+        occupied.push(acquire_dial_slot().await.unwrap());
+    }
+    let (pipe, _server) = pipe_pair();
+    let connector = connector(vec![pipe]);
+    let client = ChatClient::connect_with_transport(
+        connector.clone(),
+        Arc::new(RecordingSink::default()),
+        fetcher(&[]).0,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(Arc::new(FixedHttpRows {
+            body: Vec::new(),
+            requests: Mutex::new(Vec::new()),
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .flags
+            .dial_seq
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(1), client.shutdown())
+        .await
+        .expect("shutdown must finish while all dial slots remain occupied");
+    assert_eq!(occupied.len(), MAX_CONCURRENT_DIALS);
+    assert_eq!(
+        lock(&connector.pipes).len(),
+        1,
+        "cancelled Chat attempted to connect"
+    );
 }

@@ -130,6 +130,9 @@ macro_rules! rpc_methods {
 // worktree creation checks out a full tree; everything else is interactive
 // and must fail fast on the default 30s.
 rpc_methods! {
+    WATCH_PREVIEWS / WatchPreviews = "WatchPreviews" { params: zeron_proto::WatchPreviewsParams, reply: zeron_proto::PreviewSnapshot },
+    GET_TITLE_SETTINGS / GetTitleSettings = "GetTitleSettings" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SET_TITLE_SETTINGS / SetTitleSettings = "SetTitleSettings" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_HARNESSES / ListHarnesses = "ListHarnesses" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
@@ -220,6 +223,8 @@ rpc_methods! {
     LIST_BRANCHES / ListBranches = "ListBranches" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_REFS / ListRefs = "ListRefs" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     LIST_GIT_HISTORY / ListGitHistory = "ListGitHistory" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    SEARCH_GIT_HISTORY / SearchGitHistory = "SearchGitHistory" { params: zeron_proto::SearchGitHistoryParams, reply: zeron_proto::GitHistoryPage, forwardable: true },
+    RESOLVE_GIT_AVATARS / ResolveGitAvatars = "ResolveGitAvatars" { params: zeron_proto::ResolveGitAvatarsParams, reply: std::collections::HashMap<String, String>, forwardable: true },
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     FETCH_ALL / FetchAll = "FetchAll" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 900 },
     SWITCH_REF / SwitchRef = "SwitchRef" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
@@ -228,6 +233,10 @@ rpc_methods! {
     LIST_DRIVES / ListDrives = "ListDrives" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     SEARCH_FILES / SearchFiles = "SearchFiles" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
+    LIST_WORKSPACE_DIRECTORY / ListWorkspaceDirectory = "ListWorkspaceDirectory" { params: zeron_proto::ListWorkspaceDirectoryRequest, reply: zeron_proto::WorkspaceDirectoryPage, forwardable: true },
+    SEARCH_WORKSPACE_FILES / SearchWorkspaceFiles = "SearchWorkspaceFiles" { params: zeron_proto::SearchWorkspaceFilesRequest, reply: Vec<zeron_proto::WorkspaceFileSearchMatch>, forwardable: true },
+    READ_WORKSPACE_FILE / ReadWorkspaceFile = "ReadWorkspaceFile" { params: zeron_proto::ReadWorkspaceFileRequest, reply: zeron_proto::WorkspaceFileText, forwardable: true },
+    WATCH_WORKSPACE_FILES / WatchWorkspaceFiles = "WatchWorkspaceFiles" { params: zeron_proto::WatchWorkspaceFilesRequest, reply: zeron_proto::WorkspaceFileChanges, forwardable: true, stream: true },
     CREATE_WORKTREE / CreateWorktree = "CreateWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true, deadline_secs: 120 },
     DELETE_WORKTREE / DeleteWorktree = "DeleteWorktree" { params: serde_json::Value, reply: serde_json::Value, forwardable: true },
     // Terminals (ControlRpc, relay-forwardable — a terminal lives on the chat's
@@ -274,6 +283,13 @@ rpc_methods! {
     WATCH_TRAJECTORY / WatchTrajectory = "WatchTrajectory" { params: crate::WatchTrajectoryParams, reply: crate::TrajectoryWatchItem, local_only: true },
     /// Device-local unary lookup to reveal one raw field from Run Journal.
     REVEAL_TRAJECTORY_RAW / RevealTrajectoryRaw = "RevealTrajectoryRaw" { params: crate::RevealTrajectoryRawParams, reply: crate::TrajectoryRawRevealResult, local_only: true },
+    /// Generate a one-line idle session recap for the chat. Strictly device-local,
+    /// rejected at relay ingress, never forwarded — so a `deadline_secs` here
+    /// would be dead config: `MethodInfo::deadline` is only read when the engine
+    /// forwards a call to another device, and `RpcClient::call` awaits the reply
+    /// with no timeout of its own. The engine's `recap::RUN_BUDGET_SECS` is the
+    /// only real ceiling; tune it there.
+    GENERATE_CHAT_RECAP / GenerateChatRecap = "GenerateChatRecap" { params: crate::GenerateChatRecapParams, reply: crate::GenerateChatRecapReply, local_only: true },
 }
 
 #[cfg(test)]
@@ -309,6 +325,7 @@ mod tests {
         assert!(methods::is_local_only(methods::WATCH_TRAJECTORY));
         assert!(methods::is_local_only(methods::REVEAL_TRAJECTORY_RAW));
         assert!(methods::is_local_only(methods::PROBE_LIVE_VOICE));
+        assert!(methods::is_local_only(methods::GENERATE_CHAT_RECAP));
         assert!(!methods::is_local_only(methods::LIST_HARNESSES));
         assert!(!methods::is_local_only("Nope"));
     }

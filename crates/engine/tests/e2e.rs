@@ -703,6 +703,13 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)
     );
+    assert_eq!(
+        core.sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_turn,
+        None
+    );
 }
 
 #[tokio::test]
@@ -1995,7 +2002,7 @@ async fn respond_input_resolves_pending_question() {
     assert!(entries(&core).iter().any(|e| {
         e.parts
             .iter()
-            .any(|p| matches!(p, MessagePart::Input { resolved: true, .. }))
+            .any(|p| matches!(p, MessagePart::Input { resolved: true, answers: Some(answers), .. } if answers.iter().any(|answer| answer.question_id == "q1" && answer.labels == ["b"])))
     }));
     // The run task writes the Complete entry BEFORE settling the status row —
     // wait for the transition instead of asserting the instant in between.
@@ -3306,4 +3313,341 @@ async fn context_usage_survives_the_turn_boundary_until_a_new_measurement() {
             .all(|snapshot| snapshot == &Some(measured)),
         "the gauge fell back to an unmeasured state between turns: {observed:?}"
     );
+}
+
+/// The composer's context ring must show a settled session's real usage the
+/// instant the app reopens — not a zeroed gauge that only refills on the next
+/// turn. The live-status map starts empty at boot, so the fix seeds it from the
+/// persisted workspace rows; this proves the seeded usage reaches
+/// `watch_sessions` BEFORE any new run.
+#[tokio::test]
+async fn context_usage_survives_an_engine_restart() {
+    struct Measures;
+
+    #[async_trait]
+    impl Harness for Measures {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Measures"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let script = vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: format!("a-{}", request.prompt),
+                },
+                AgentEvent::Usage {
+                    input_tokens: 120_000,
+                    output_tokens: 512,
+                    context_usage: Some(zeron_proto::ContextUsage {
+                        tokens: 120_000,
+                        context_window: 200_000,
+                    }),
+                },
+                AgentEvent::TextDelta {
+                    text: "answering".into(),
+                },
+                done(DoneStatus::Completed),
+            ];
+            Ok(futures::stream::iter(script.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    let measured = zeron_proto::ContextUsage {
+        tokens: 120_000,
+        context_window: 200_000,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    // First boot: run one turn that measures usage, let it settle, shut down.
+    {
+        let core = assemble(dir.path(), Arc::new(Measures));
+        let watch = core.sessions.watch_sessions();
+        let handle = core.doc_host.open(CHAT).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            "cmd-usage-restart",
+            SessionCommandPayload::Run {
+                request: run_request("first"),
+                message_id: "m-usage-restart".into(),
+            },
+        );
+        wait_for(
+            || watch.borrow().first().and_then(|s| s.context_usage) == Some(measured),
+            "the turn to report a context measurement",
+        )
+        .await;
+        wait_for(
+            || watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle),
+            "the turn to settle",
+        )
+        .await;
+        core.shutdown().await;
+    }
+
+    // Second boot against the same data dir: the live-status watch must already
+    // carry the persisted usage, with no new turn dispatched.
+    let core = assemble(dir.path(), Arc::new(Measures));
+    let usage = core
+        .sessions
+        .watch_sessions()
+        .borrow()
+        .first()
+        .and_then(|s| s.context_usage);
+    assert_eq!(
+        usage,
+        Some(measured),
+        "context usage survives an engine restart"
+    );
+}
+
+#[tokio::test]
+async fn local_command_output_persists_and_survives_reopening_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Omp,
+            model: "omp-default".into(),
+            tools: Vec::new(),
+            cwd: "/tmp".into(),
+            session_id: "omp-local-session".into(),
+            assistant_message_id: "msg-assistant-local".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "Context window: 1048576 tokens (3% used)\n".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "  System prompt: 15553 tokens\n".into(),
+        },
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("omp-local-session".into()),
+        },
+    ];
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script,
+            step_delay: Duration::from_millis(1),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-local-1",
+        SessionCommandPayload::Run {
+            request: run_request("/context"),
+            message_id: "msg-user-local".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "local command assistant entry to complete",
+    )
+    .await;
+
+    let all = entries(&core);
+    assert_eq!(all.len(), 2, "user + assistant entries, got {all:#?}");
+    assert_eq!(all[0].id, "msg-user-local");
+    assert_eq!(all[0].role, MessageRole::User);
+
+    let assistant = &all[1];
+    assert_eq!(assistant.role, MessageRole::Assistant);
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    let expected_text = "Context window: 1048576 tokens (3% used)\n  System prompt: 15553 tokens\n";
+    let text_part = assistant
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("must contain text part");
+    assert_eq!(text_part, expected_text);
+
+    // Reopen doc from disk to prove persistence and readability across chat close/reopen
+    drop(handle);
+    let reopened = core.doc_host.open(CHAT).unwrap();
+    let reopened_entries = reopened.doc().read_entries().unwrap();
+    assert_eq!(reopened_entries.len(), 2);
+    let reopened_assistant_text = reopened_entries[1]
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("must contain text part after reopening");
+    assert_eq!(reopened_assistant_text, expected_text);
+}
+
+/// Reproduce a steer accepted just before the old turn's Done. The harness
+/// confirms the new boundary later; only its eventual completion may notify.
+#[tokio::test]
+async fn pending_steer_handoff_does_not_publish_a_completion() {
+    struct ControlledHarness(
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>>,
+    );
+    #[async_trait]
+    impl Harness for ControlledHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Controlled"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let rx = self.0.lock().unwrap().take().unwrap();
+            // Keep the mailbox alive but let the test control confirmation.
+            Ok(
+                futures::stream::unfold((rx, controls), |(mut rx, controls)| async move {
+                    rx.recv().await.map(|event| (Ok(event), (rx, controls)))
+                })
+                .boxed(),
+            )
+        }
+    }
+    for routed_dispatch in [false, true] {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble(
+            dir.path(),
+            Arc::new(ControlledHarness(std::sync::Mutex::new(Some(rx)))),
+        );
+        let handle = core.doc_host.open(CHAT).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            "cmd-completion",
+            SessionCommandPayload::Run {
+                request: run_request("opening"),
+                message_id: "user-opening".into(),
+            },
+        );
+        tx.send(mock_script()[0].clone()).unwrap();
+        wait_for(
+            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+            "opening run",
+        )
+        .await;
+        if routed_dispatch {
+            core.sessions
+                .dispatch(
+                    CHAT,
+                    HarnessId::Mock,
+                    run_request("redirect"),
+                    Some("user-steer".into()),
+                )
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                core.sessions
+                    .steer(CHAT, "redirect", Some("user-steer".into()))
+                    .await
+                    .unwrap(),
+                zeron_engine::sessions::SteerOutcome::Accepted
+            );
+        }
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+            "internal handoff",
+        )
+        .await;
+        assert_eq!(
+            core.sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_turn,
+            None
+        );
+        tx.send(AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-steered".into()),
+        })
+        .unwrap();
+        tx.send(AgentEvent::TextDelta {
+            text: "redirected response".into(),
+        })
+        .unwrap();
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || {
+                core.sessions
+                    .session_status(CHAT)
+                    .and_then(|s| s.last_completed_turn)
+                    .as_deref()
+                    == Some("a-steered")
+            },
+            "real completion",
+        )
+        .await;
+        // A duplicate terminal frame from a parked runtime cannot ring twice.
+        let (_, mut events) = core.sessions.subscribe(CHAT, 0).unwrap();
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(duplicate.event, AgentEvent::Done { .. }));
+        // drive_run publishes and settles synchronously before polling again.
+        tokio::task::yield_now().await;
+        drop(tx);
+        assert_eq!(
+            core.sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_turn
+                .as_deref(),
+            Some("a-steered")
+        );
+        core.shutdown().await;
+    }
 }

@@ -477,6 +477,13 @@ impl gpui::Element for TerminalElement {
         let cols = ((inner_w / f32::from(cell_w)).floor() as i64).clamp(2, 500) as u16;
         let rows = ((inner_h / f32::from(line_h)).floor() as i64).clamp(1, 500) as u16;
 
+        // The Worker host accepts 2..=300 columns and 2..=120 rows.
+        // Keep painting, pointer mapping and the actual PTY on the same grid.
+        let (cols, rows) = match &self.source {
+            TerminalSource::Workers(_) => (cols.clamp(2, 300), rows.clamp(2, 120)),
+            TerminalSource::Engine(_) => (cols, rows),
+        };
+
         // Report the measured grid, then snapshot for painting. Safe: the
         // panel entity is not borrowed during element prepaint.
         let origin = point(

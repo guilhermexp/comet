@@ -410,8 +410,149 @@ const _: () = {
     assert!(GRADIENT_SPIN.duration_ms == 750);
 };
 
+// Agent Elements SpiralLoader vector/keyframes, native port of commit
+// b04b36cb6381a1dd1a0e86cc7c90564ddcd56d37 (MIT; docs/agent-elements-LICENSE.txt).
+// Vertex, incoming tangent, outgoing tangent in the original 16px canvas.
+const SPIRAL_CURVE: [([f32; 2], [f32; 2], [f32; 2]); 13] = [
+    ([-12.0, 6.0], [0.0, 0.0], [4.452, 0.0]),
+    ([-4.975, -1.012], [-0.289, 3.296], [0.23, -2.627]),
+    ([-8.0, -6.0], [2.218, 0.0], [-2.218, 0.0]),
+    ([-11.025, -1.012], [-0.23, -2.627], [0.289, 3.296]),
+    ([-4.0, 6.0], [-4.452, 0.0], [4.452, 0.0]),
+    ([3.025, -1.012], [-0.289, 3.296], [0.23, -2.627]),
+    ([0.0, -6.0], [2.218, 0.0], [-2.218, 0.0]),
+    ([-3.025, -1.012], [-0.23, -2.627], [0.289, 3.296]),
+    ([4.0, 6.0], [-4.452, 0.0], [4.452, 0.0]),
+    ([11.025, -1.012], [-0.289, 3.296], [0.23, -2.627]),
+    ([8.0, -6.0], [2.218, 0.0], [-2.218, 0.0]),
+    ([4.98, -1.012], [-0.232, -2.627], [0.292, 3.296]),
+    ([12.0, 6.0], [-4.443, 0.0], [0.0, 0.0]),
+];
+
+fn spiral_cycle(seconds: f32) -> (bool, f32) {
+    let elapsed = seconds.rem_euclid(4.0);
+    if elapsed < 2.0 {
+        (false, (elapsed * 2.0).fract())
+    } else {
+        (true, (elapsed - 2.0).fract())
+    }
+}
+
+// Sample once, retaining arc length so Lottie's percentage trim follows the
+// curve rather than the unevenly spaced Bezier vertices.
+static SPIRAL_PATH: std::sync::LazyLock<Vec<([f32; 2], f32)>> = std::sync::LazyLock::new(|| {
+    let mut result = vec![(SPIRAL_CURVE[0].0, 0.0)];
+    let mut distance = 0.0;
+    for pair in SPIRAL_CURVE.windows(2) {
+        let (a, _, outgoing) = pair[0];
+        let (b, incoming, _) = pair[1];
+        for step in 1..=32 {
+            let t = step as f32 / 32.0;
+            let u = 1.0 - t;
+            let at = std::array::from_fn(|axis| {
+                u * u * u * a[axis]
+                    + 3.0 * u * u * t * (a[axis] + outgoing[axis])
+                    + 3.0 * u * t * t * (b[axis] + incoming[axis])
+                    + t * t * t * b[axis]
+            });
+            let previous = result.last().unwrap().0;
+            distance += (at[0] - previous[0]).hypot(at[1] - previous[1]);
+            result.push((at, distance));
+        }
+    }
+    for (_, length) in &mut result {
+        *length /= distance;
+    }
+    result
+});
+
+/// The reference's translating, trimmed spiral. Uses the shared 30fps clock;
+/// completed reasoning and reduced motion do not acquire an animation lease.
+pub fn spiral_loader(
+    size: f32,
+    tint: gpui::Hsla,
+    active: bool,
+    view: EntityId,
+    cx: &mut App,
+) -> AnyElement {
+    let seconds = if active && !cx.reduce_motion() {
+        motion::pulse_delta(
+            &motion::MotionSpec::new(4000, motion::CubicBezier::new(0.0, 0.0, 1.0, 1.0)),
+            view,
+            cx,
+        ) * 4.0
+    } else {
+        0.25
+    };
+    let (slow, phase) = spiral_cycle(seconds);
+    let frames = if slow { 60.0 } else { 30.0 };
+    let t = (phase * frames / (frames - 1.0)).min(1.0);
+    let (start_curve, end_curve) = if slow {
+        (
+            motion::CubicBezier::new(0.32, 0.313, 0.826, 0.143),
+            motion::CubicBezier::new(0.341, 0.992, 0.269, 0.491),
+        )
+    } else {
+        (
+            motion::CubicBezier::new(0.32, 0.154, 0.826, 0.579),
+            motion::CubicBezier::new(0.341, 0.488, 0.269, 0.75),
+        )
+    };
+    let start = 0.23 + 0.34 * start_curve.eval(t);
+    let end = 0.44 + 0.33 * end_curve.eval(t);
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let scale = size / 16.0;
+            let at = |p: [f32; 2]| {
+                point(
+                    bounds.origin.x + px((p[0] + 12.0 - 8.0 * t) * scale),
+                    bounds.origin.y + px((p[1] + 8.0) * scale),
+                )
+            };
+            let mut builder = PathBuilder::stroke(px(1.4 * scale));
+            let mut started = false;
+            for pair in SPIRAL_PATH.windows(2) {
+                let (a, lo) = pair[0];
+                let (b, hi) = pair[1];
+                if hi < start || lo > end {
+                    continue;
+                }
+                let interpolate = |fraction: f32| {
+                    std::array::from_fn(|axis| a[axis] + (b[axis] - a[axis]) * fraction)
+                };
+                if !started {
+                    builder.move_to(at(interpolate(((start - lo) / (hi - lo)).clamp(0.0, 1.0))));
+                    started = true;
+                }
+                builder.line_to(at(interpolate(((end - lo) / (hi - lo)).clamp(0.0, 1.0))));
+            }
+            if started && let Ok(path) = builder.build() {
+                window.paint_path(path, tint);
+            }
+        },
+    )
+    .size(px(size))
+    .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spiral_repeats_four_fast_then_two_slow_cycles() {
+        for (seconds, slow, phase) in [
+            (0.125, false, 0.25),
+            (0.625, false, 0.25),
+            (1.125, false, 0.25),
+            (1.625, false, 0.25),
+            (2.25, true, 0.25),
+            (3.25, true, 0.25),
+            (4.125, false, 0.25),
+        ] {
+            assert_eq!(super::spiral_cycle(seconds), (slow, phase));
+        }
+    }
+
     use super::*;
 
     #[test]

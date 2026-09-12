@@ -40,7 +40,7 @@ pub struct FavoriteModel {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ComposerDefaults {
-    /// Last harness picked on the new-chat canvas.
+    /// Harness of the last explicit pick, in a draft or an existing Chat.
     pub harness: Option<HarnessId>,
     /// Last model picked, per harness (restored on harness switch).
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,

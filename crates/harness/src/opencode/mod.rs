@@ -1909,6 +1909,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 let _ = tx
                     .send(Ok(AgentEvent::InputResolved {
                         request_id: request_id.clone(),
+                        answers: None,
                     }))
                     .await;
             });

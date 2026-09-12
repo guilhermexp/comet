@@ -4,7 +4,8 @@ use std::fs;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use zeron_workers_unpeel::{
-    WorkersSession, WorkersSessionCapabilities, controller_mcp_archive_guard,
+    WorkerCompletionEvidence, WorkersSession, WorkersSessionCapabilities,
+    begin_worker_parent_task_at, controller_mcp_archive_guard,
     controller_mcp_briefing_stability_key, controller_mcp_choose_semantic_output,
     controller_mcp_clean_output, controller_mcp_consume_authority_marker,
     controller_mcp_encode_keys, controller_mcp_handle_request, controller_mcp_is_booting_screen,
@@ -12,8 +13,9 @@ use zeron_workers_unpeel::{
     controller_mcp_parse_launch, controller_mcp_parse_launch_briefing,
     controller_mcp_replacement_session_id, controller_mcp_sanitize_text,
     controller_mcp_startup_prompt_response, controller_mcp_take_parent_chat_id,
-    controller_mcp_tracks_task_episode, ensure_controller_mcp_host_launcher, is_session_host_mode,
-    register_worker_parent_at, worker_parent_links_at,
+    controller_mcp_tracks_task_episode, current_episode_completed_with_evidence_at,
+    ensure_controller_mcp_host_launcher, is_session_host_mode, register_worker_parent_at,
+    worker_parent_links_at,
 };
 
 #[test]
@@ -127,8 +129,15 @@ fn notifications_do_not_receive_json_rpc_responses() {
 }
 
 #[test]
-fn launch_requires_exactly_one_launch_mode() {
+fn launch_accepts_only_an_enabled_preset_never_a_raw_command() {
     assert!(controller_mcp_parse_launch(json!({ "project_id": "p" })).is_err());
+    assert!(
+        controller_mcp_parse_launch(json!({
+            "project_id": "p",
+            "command": "omp --model anthropic/claude-opus-4-8"
+        }))
+        .is_err()
+    );
     assert!(
         controller_mcp_parse_launch(json!({
             "project_id": "p",
@@ -395,6 +404,63 @@ fn tools_call_lists_real_controller_projects() -> Result<(), Box<dyn std::error:
         response["result"]["structuredContent"]["projects"][0]["id"],
         "project-1"
     );
+    Ok(())
+}
+
+/// The emitted order is the Presets screen order (fallback order), not
+/// "starred first": a starred preset that is NOT first must stay in place,
+/// carry `preferred: true`, and a disabled preset must not appear at all.
+#[test]
+fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock().expect("UNPEEL_HOME test lock");
+    let home = TempDir::new()?;
+    fs::write(
+        home.path().join("app-state.json"),
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [
+                { "id": "omp", "label": "OMP CLI", "command": "omp", "enabled": true, "quick_launch": false },
+                { "id": "disabled", "label": "pi", "command": "pi", "enabled": false, "quick_launch": true },
+                { "id": "claude", "label": "claude", "command": "claude", "enabled": true, "quick_launch": true },
+                { "id": "codex", "label": "codex", "command": "codex", "enabled": true, "quick_launch": false }
+            ],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))?,
+    )?;
+    let _guard = UnpeelHomeGuard::set(home.path());
+
+    let response = controller_mcp_handle_request(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "workers",
+            "arguments": { "action": "list_presets" }
+        }
+    }))
+    .expect("tools/call responds");
+
+    assert_eq!(response["result"]["isError"], false);
+    let presets = &response["result"]["structuredContent"]["presets"];
+    let rows: Vec<(&str, u64, bool)> = presets
+        .as_array()
+        .expect("presets array")
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().expect("id"),
+                row["fallback_order"].as_u64().expect("fallback_order"),
+                row["preferred"].as_bool().expect("preferred"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("omp", 1, false), ("claude", 2, true), ("codex", 3, false)]
+    );
+    assert!(presets[0].get("enabled").is_none());
     Ok(())
 }
 
@@ -851,5 +917,80 @@ fn workers_wait_for_status_ceiling_is_orchestrator_owned_and_documented() {
     assert!(
         sentence_count <= 2,
         "timeout_seconds description must be concise and at most 2 sentences, got {sentence_count}: {desc}"
+    );
+}
+
+fn write_stop_hook(root: &std::path::Path, session_id: &str, generation: u64) {
+    let dir = root.join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("comet-hook-events.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "sequence": 1,
+                "hook_event_name": "Stop",
+                "runtime_generation": generation,
+                "occurred_at_unix_ms": 1_000
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn wait_for_completed_matches_live_idle_worker_with_current_episode_evidence() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app-state.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "projects": [],
+            "presets": [],
+            "active_tabs": {},
+            "pinned_sessions": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    register_worker_parent_at(&path, "worker-1", "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, "worker-1", 950).unwrap();
+    let sessions_root = dir.path().join("sessions");
+    write_stop_hook(&sessions_root, "worker-1", 1);
+
+    let cancel = AtomicBool::new(false);
+    let polls = AtomicU32::new(0);
+    let started = Instant::now();
+    let result = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        1800,
+        "completed",
+        &cancel,
+        || {
+            let n = polls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                n < 3,
+                "completed wait polled {n} times instead of matching current-episode evidence on a live idle Worker"
+            );
+            Ok(worker_with_state("running"))
+        },
+        |session| {
+            current_episode_completed_with_evidence_at(
+                &path,
+                session,
+                &sessions_root,
+                WorkerCompletionEvidence::quiescent(),
+            )
+            .unwrap_or(false)
+        },
+    )
+    .expect("completed should match");
+    assert_eq!(result["matched"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "wait must not consume the 1800s timeout"
     );
 }

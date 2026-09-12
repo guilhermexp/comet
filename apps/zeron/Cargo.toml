@@ -4,12 +4,42 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+default-run = "zeron"
 
 [[bin]]
 name = "zeron"
 path = "src/main.rs"
 
+# Native fixtures must use the production GPUI draw/present loop. Building them
+# as zeron-ui examples also enables its gpui/test-support dev dependency.
+[features]
+browser-fixture = [
+    "zeron-ui/browser-fixture", "dep:gpui", "dep:gpui_platform", "dep:gpui_tokio",
+    "dep:zeron-proto", "dep:zeron-doc", "dep:zeron-theme", "dep:futures",
+    "dep:tempfile", "dep:objc2", "dep:objc2-app-kit", "dep:image",
+]
+
+[[bin]]
+name = "browser-fixture"
+path = "src/fixtures/browser.rs"
+required-features = ["browser-fixture"]
+test = false
+
+[[bin]]
+name = "preview-fixture"
+path = "src/fixtures/preview.rs"
+required-features = ["browser-fixture"]
+test = false
+
 [dependencies]
+tempfile = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+zeron-theme = { workspace = true, optional = true }
+zeron-doc = { workspace = true, optional = true }
+zeron-proto = { workspace = true, optional = true }
+gpui_tokio = { workspace = true, optional = true }
+gpui_platform = { workspace = true, optional = true }
+gpui = { workspace = true, optional = true }
 zeron-engine.workspace = true
 zeron-rpc.workspace = true
 zeron-ui.workspace = true
@@ -17,12 +47,17 @@ zeron-update.workspace = true
 zeron-workers-unpeel.workspace = true
 tokio.workspace = true
 clap.workspace = true
-mimalloc.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mimalloc.workspace = true
+image = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-app-kit = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

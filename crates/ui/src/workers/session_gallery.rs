@@ -232,7 +232,9 @@ pub mod native {
     }
 
     fn ns_string(value: &str) -> *mut Object {
-        let value = CString::new(value).expect("menu labels cannot contain null bytes");
+        // A label can carry a project path or a user preset, so a stray null
+        // byte is external data, not a bug worth panicking over.
+        let value = CString::new(value.replace('\0', "")).expect("valid native string");
         unsafe { msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()] }
     }
 
@@ -283,6 +285,15 @@ pub mod native {
             let window: *mut Object = msg_send![event, window];
             let view: *mut Object = msg_send![window, contentView];
             let view: *mut Object = msg_send![view, retain];
+            // `popUpMenuPositioningItem:atLocation:inView:` raises
+            // NSInvalidArgumentException on a nil view, so a pop-up with no
+            // current event (shortcut, programmatic trigger, event already
+            // drained) has to fail as "no selection" instead of crashing.
+            if event.is_null() || view.is_null() {
+                let _: () = msg_send![menu, release];
+                let _ = sender.send(None);
+                return receiver;
+            }
             let context = Box::new(MenuContext {
                 menu,
                 event,

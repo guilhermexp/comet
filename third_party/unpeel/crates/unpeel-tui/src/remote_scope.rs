@@ -1611,10 +1611,10 @@ fn handle_remote_mouse(
                         app.collapsed.insert(name);
                     }
                 }
-                Some(SidebarItem::WorktreeHeader { project_id, .. }) => {
-                    if !app.expanded_worktrees.remove(&project_id) {
-                        app.expanded_worktrees.insert(project_id);
-                    }
+                Some(SidebarItem::WorktreeHeader { project_id, .. })
+                    if !app.expanded_worktrees.remove(&project_id) =>
+                {
+                    app.expanded_worktrees.insert(project_id);
                 }
                 _ => {}
             }

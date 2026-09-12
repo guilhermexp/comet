@@ -1,0 +1,2 @@
+# Design
+Move the existing remember_model/save_defaults path out of the new-Chat-only branch. Capture the effective harness before changing Chat config; keep the existing per-Chat mutation and draft assignment. Persist the full opaque model id without parsing or provider substitution. Exercise actual Pickers with GPUI test context, temporary defaults storage and no engine connection; no inference request is sent.

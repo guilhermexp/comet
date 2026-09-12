@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Div, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Div, SharedString, div, prelude::*, px};
 
 use crate::{icons, theme::Theme};
 
@@ -23,17 +23,41 @@ pub const CHAT_WORKERS_VISIBLE_ROWS: usize = 6;
 pub fn chat_workers_viewport_height_px() -> f32 {
     CHAT_WORKERS_ROW_HEIGHT * CHAT_WORKERS_VISIBLE_ROWS as f32
 }
-
+#[allow(dead_code)]
 pub fn auto_tab(workflows: usize, subagents: usize, workers: usize) -> ChatWorkersTab {
-    if workflows > 0 {
-        ChatWorkersTab::Workflows
-    } else if subagents > 0 {
-        ChatWorkersTab::Subagents
-    } else if workers > 0 {
-        ChatWorkersTab::Workers
-    } else {
-        ChatWorkersTab::Workflows
+    auto_tab_by_recency((workflows, None), (subagents, None), (workers, None))
+}
+
+pub fn auto_tab_by_recency(
+    workflows: (usize, Option<u64>),
+    subagents: (usize, Option<u64>),
+    workers: (usize, Option<u64>),
+) -> ChatWorkersTab {
+    let candidates = [
+        (ChatWorkersTab::Workflows, workflows.0, workflows.1),
+        (ChatWorkersTab::Subagents, subagents.0, subagents.1),
+        (ChatWorkersTab::Workers, workers.0, workers.1),
+    ];
+    let non_empty: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, count, _)| *count > 0)
+        .collect();
+    if non_empty.is_empty() {
+        return ChatWorkersTab::Workflows;
     }
+    let mut best = non_empty[0];
+    for candidate in &non_empty[1..] {
+        match (candidate.2, best.2) {
+            (Some(cand_ts), Some(best_ts)) if cand_ts > best_ts => {
+                best = *candidate;
+            }
+            (Some(_), None) => {
+                best = *candidate;
+            }
+            _ => {}
+        }
+    }
+    best.0
 }
 
 pub fn workers_tab_presence(worker_count: usize, bindings_unavailable: bool) -> usize {
@@ -50,6 +74,7 @@ pub struct ChatWorkersWidgetState {
     selected_tab: Option<ChatWorkersTab>,
     activity_expansion: HashMap<String, bool>,
     dispatch_counts: Option<[usize; 3]>,
+    latest_started: [Option<u64>; 3],
 }
 
 impl ChatWorkersWidgetState {
@@ -63,12 +88,29 @@ impl ChatWorkersWidgetState {
         // Re-baseline: comparing the new chat's rows against the old chat's
         // counts reads as a dispatch that never happened.
         self.dispatch_counts = None;
+        self.latest_started = [None; 3];
         true
     }
 
+    #[allow(dead_code)]
     pub fn active_tab(&self, workflows: usize, subagents: usize, workers: usize) -> ChatWorkersTab {
+        self.selected_tab.unwrap_or_else(|| {
+            auto_tab_by_recency(
+                (workflows, self.latest_started[0]),
+                (subagents, self.latest_started[1]),
+                (workers, self.latest_started[2]),
+            )
+        })
+    }
+
+    pub fn active_tab_with_recency(
+        &self,
+        workflows: (usize, Option<u64>),
+        subagents: (usize, Option<u64>),
+        workers: (usize, Option<u64>),
+    ) -> ChatWorkersTab {
         self.selected_tab
-            .unwrap_or_else(|| auto_tab(workflows, subagents, workers))
+            .unwrap_or_else(|| auto_tab_by_recency(workflows, subagents, workers))
     }
 
     pub fn select(&mut self, tab: ChatWorkersTab) {
@@ -87,18 +129,32 @@ impl ChatWorkersWidgetState {
     /// made its recovery read as a launch. An unavailable list leaves both the
     /// baseline and the selection untouched, so healing back to the same rows
     /// compares equal and a launch that happened during the outage still wins.
+    #[allow(dead_code)]
     pub fn sync_dispatch(
         &mut self,
         workflows: Option<usize>,
         subagents: Option<usize>,
         workers: Option<usize>,
     ) {
+        self.sync_dispatch_with_recency(workflows, subagents, workers, [None; 3]);
+    }
+
+    pub fn sync_dispatch_with_recency(
+        &mut self,
+        workflows: Option<usize>,
+        subagents: Option<usize>,
+        workers: Option<usize>,
+        latest_started: [Option<u64>; 3],
+    ) {
         let (Some(workflows), Some(subagents), Some(workers)) = (workflows, subagents, workers)
         else {
             return;
         };
-        let next = [workflows, subagents, workers];
-        let Some(previous) = self.dispatch_counts.replace(next) else {
+        let next_counts = [workflows, subagents, workers];
+        let previous_counts = self.dispatch_counts.replace(next_counts);
+        let previous_started = std::mem::replace(&mut self.latest_started, latest_started);
+
+        let Some(previous_counts) = previous_counts else {
             return;
         };
         // Coarsest dispatch first: a workflow or a worker launch also mints
@@ -109,7 +165,13 @@ impl ChatWorkersWidgetState {
             (ChatWorkersTab::Workers, 2),
             (ChatWorkersTab::Subagents, 1),
         ] {
-            if next[ix] > previous[ix] {
+            let count_grew = next_counts[ix] > previous_counts[ix];
+            let new_item_started = match (latest_started[ix], previous_started[ix]) {
+                (Some(next_ts), Some(prev_ts)) => next_ts > prev_ts,
+                (Some(next_ts), None) => next_ts > 0,
+                _ => false,
+            };
+            if count_grew || new_item_started {
                 self.selected_tab = Some(tab);
                 return;
             }
@@ -153,21 +215,20 @@ pub fn widget_card(
     body: Div,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
+    // Header plate matches the composer input (`theme.composer_glass_bg`).
+    // The body stays on the pane — no card fill, no hairline.
     div()
         .id(id)
         .w_full()
-        .rounded(px(10.0))
-        .border_1()
-        .border_color(theme.border)
-        .overflow_hidden()
         .child(
             div()
                 .h(px(36.0))
                 .px(px(10.0))
+                .rounded(px(8.0))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .bg(crate::theme::ink(0.025))
+                .bg(theme.composer_glass_bg())
                 .child(
                     icons::icon(icon_path)
                         .size(px(15.0))
@@ -224,12 +285,51 @@ pub fn property_row(
                 .child(value.into()),
         )
 }
+pub fn property_row_custom(
+    icon_path: &'static str,
+    label: impl Into<SharedString>,
+    value_element: AnyElement,
+    theme: &Theme,
+) -> Div {
+    div()
+        .h(px(30.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .w(px(108.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .child(
+                    icons::icon(icon_path)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(label.into()),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .child(value_element),
+        )
+}
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatWorkersTab, ChatWorkersWidgetState, auto_tab, worker_expansion_key,
-        workers_tab_presence,
+        ChatWorkersTab, ChatWorkersWidgetState, auto_tab, auto_tab_by_recency,
+        worker_expansion_key, workers_tab_presence,
     };
 
     #[test]
@@ -429,5 +529,38 @@ mod tests {
         assert!(state.sync_context(Some("chat-b")));
         assert_eq!(state.active_tab(1, 1, 1), ChatWorkersTab::Workflows);
         assert!(!state.activity_expanded_with_default("workflow-a", false));
+    }
+
+    #[test]
+    fn recency_prioritizes_latest_started_tab_even_when_subagents_exist() {
+        // Subagent started at t=1000, worker started at t=2000.
+        // Worker started after subagent, so active tab must be Workers!
+        assert_eq!(
+            auto_tab_by_recency((0, None), (2, Some(1000)), (1, Some(2000)),),
+            ChatWorkersTab::Workers,
+        );
+
+        // Subagent started at t=3000 (after worker at t=2000) -> Subagents wins.
+        assert_eq!(
+            auto_tab_by_recency((0, None), (2, Some(3000)), (1, Some(2000)),),
+            ChatWorkersTab::Subagents,
+        );
+    }
+
+    #[test]
+    fn new_worker_with_newer_timestamp_pulls_focus_even_if_parked_on_subagents() {
+        let mut state = ChatWorkersWidgetState::default();
+        // Baseline: 2 subagents started at t=1000.
+        state.sync_dispatch_with_recency(Some(0), Some(2), Some(0), [None, Some(1000), None]);
+        state.select(ChatWorkersTab::Subagents);
+        assert_eq!(state.active_tab(0, 2, 0), ChatWorkersTab::Subagents);
+
+        // Agent starts a worker at t=2000.
+        state.sync_dispatch_with_recency(Some(0), Some(2), Some(1), [None, Some(1000), Some(2000)]);
+        assert_eq!(
+            state.active_tab(0, 2, 1),
+            ChatWorkersTab::Workers,
+            "worker started after subagent pulls focus to Workers tab"
+        );
     }
 }

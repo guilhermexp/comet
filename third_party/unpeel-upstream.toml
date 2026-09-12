@@ -1,7 +1,29 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "1ba4f7a4009e0792626b32dea9d24cbbfd782a0b"
+vendored_tree = "71bf33c1a72215f8a09f16ff6a4c8dd70128cc4a"
 vendored_from = "working-tree"
-local_modifications_count = 30
+local_modifications_count = 31
+local_deletions = ["apps/website"]
 local_patch_available = false
 license = "MIT"
+
+# O repositório voltou a ser público, mas com OUTRO histórico: 254 commits, o
+# mais antigo de 2026-08-24, e `base_revision` acima NÃO resolve lá. Não há
+# ancestral comum — sync é triagem arquivo a arquivo, nunca merge. O upstream
+# também já não tem `unpeel-tui`/`unpeel-ui` (de onde `activity_bridge.rs`
+# inclui a máquina de estados por `#[path]`) e está em meio a uma reescrita do
+# core (`core_reactor`, `pty_core`, `direct_path*`, `crates/apps`).
+upstream_checked_at = "2026-09-07"
+upstream_head_observed = "7a0e18e"
+upstream_history_rewritten = true
+base_revision_resolves_upstream = false
+
+# 2026-09-08 — o cutover de identidade de worktree (openspec/changes/
+# unify-worktree-identity) tocou DOIS arquivos vendorizados:
+#   crates/unpeel-core/src/controller_host.rs  (já tinha modificação local)
+#   crates/unpeel-core/src/worktrees.rs        (primeira modificação local:
+#                                               extraiu `pub fn is_managed`)
+# `local_modifications_count = 31` acima NÃO foi recalculado: não achamos a
+# ferramenta que produziu esse número (não é a contagem de arquivos que diferem
+# de `216b61e8`, que hoje são 181), e chutar um valor aqui é pior que deixar o
+# antigo com esta nota. Quem retomar o sync recalcula pela ferramenta original.

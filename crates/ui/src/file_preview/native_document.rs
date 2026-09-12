@@ -66,6 +66,60 @@ fn navigation_policy(
     }
 }
 
+/// After the WKWebView leaves the hierarchy, AppKit keeps sending keys to
+/// whoever was first responder. HTML/PDF/video previews put a descendant
+/// (`WKContentView`) there; removing the web view without restoring leaves
+/// the gpui composer looking focused while typing goes nowhere.
+unsafe fn restore_key_view_if_preview_owns_it(view: *mut Object) {
+    let window: *mut Object = msg_send![view, window];
+    if window.is_null() {
+        return;
+    }
+    let first: *mut Object = msg_send![window, firstResponder];
+    let belongs = if first.is_null() {
+        false
+    } else if first == view {
+        true
+    } else {
+        let is_view: BOOL = msg_send![first, isKindOfClass: class!(NSView)];
+        if is_view == YES {
+            let descendant: BOOL = msg_send![first, isDescendantOf: view];
+            descendant == YES
+        } else {
+            false
+        }
+    };
+    if !belongs {
+        return;
+    }
+    let content: *mut Object = msg_send![window, contentView];
+    if content.is_null() {
+        return;
+    }
+    // GPUI's native keyboard view is a child of contentView, not the
+    // container itself (gpui_macos::MacWindow::new). Logical Window::focus
+    // cannot repair AppKit first responder, so target that child explicitly.
+    let Some(gpui_class) = Class::get("GPUIView") else {
+        tracing::warn!("Cannot restore preview keyboard focus: GPUIView class unavailable");
+        return;
+    };
+    let children: *mut Object = msg_send![content, subviews];
+    let count: usize = msg_send![children, count];
+    for index in 0..count {
+        let child: *mut Object = msg_send![children, objectAtIndex: index];
+        let is_gpui: BOOL = msg_send![child, isKindOfClass: gpui_class];
+        if is_gpui == YES {
+            let accepted: BOOL = msg_send![window, makeFirstResponder: child];
+            let restored: *mut Object = msg_send![window, firstResponder];
+            if accepted != YES || restored != child {
+                tracing::warn!("AppKit did not restore GPUIView keyboard focus after preview");
+            }
+            return;
+        }
+    }
+    tracing::warn!("Cannot restore preview keyboard focus: GPUIView missing from owning window");
+}
+
 extern "C" fn decide_navigation(
     this: &mut Object,
     _selector: Sel,
@@ -263,6 +317,7 @@ impl NativeDocumentView {
     pub fn hide(&mut self) {
         unsafe {
             if !self.view.is_null() {
+                restore_key_view_if_preview_owns_it(self.view);
                 let _: () = msg_send![self.view, removeFromSuperview];
             }
         }
@@ -271,14 +326,16 @@ impl NativeDocumentView {
 
 impl Drop for NativeDocumentView {
     fn drop(&mut self) {
-        unsafe {
-            if !self.view.is_null() {
+        if !self.view.is_null() {
+            self.hide();
+            unsafe {
                 let nil: *mut Object = std::ptr::null_mut();
                 let _: () = msg_send![self.view, setNavigationDelegate: nil];
-                let _: () = msg_send![self.view, removeFromSuperview];
                 let _: () = msg_send![self.view, release];
                 self.view = std::ptr::null_mut();
             }
+        }
+        unsafe {
             if !self.navigation_delegate.is_null() {
                 let _: () = msg_send![self.navigation_delegate, release];
                 self.navigation_delegate = std::ptr::null_mut();

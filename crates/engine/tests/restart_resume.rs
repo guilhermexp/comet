@@ -1144,6 +1144,7 @@ async fn orphaned_question_on_a_streaming_entry_is_answerable() {
             parts: vec![MessagePart::Input {
                 id: "in-req-1".into(),
                 request_id: "req-1".into(),
+                answers: None,
                 questions: vec![zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
@@ -1203,7 +1204,7 @@ async fn orphaned_question_on_a_streaming_entry_is_answerable() {
             entries_now(&core).iter().any(|e| {
                 e.parts
                     .iter()
-                    .any(|p| matches!(p, MessagePart::Input { resolved: true, .. }))
+                    .any(|p| matches!(p, MessagePart::Input { resolved: true, answers: Some(answers), .. } if answers.iter().any(|a| a.question_id == "q1" && a.labels == ["b"])))
             })
         },
         "the question to close",

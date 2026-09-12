@@ -1,0 +1,161 @@
+{
+  "observed_at": "2026-09-09T14:19:07.797371+00:00",
+  "repository": "guilhermexp/comet",
+  "head": "bd5ebf07eb029479a1f32696b5a54f80b7a7e8d9",
+  "branch": "main",
+  "includes_uncommitted_changes": true,
+  "scope": "Structural audit of Chat streaming, no production code changes or new provider/native end-to-end run",
+  "catalog": {
+    "AgentEvent": {
+      "source": "crates/proto/src/agent.rs",
+      "count": 17,
+      "variants": [
+        "SessionStarted",
+        "TextDelta",
+        "ReasoningDelta",
+        "AssistantMessageCompleted",
+        "ToolCall",
+        "ToolCallPreview",
+        "ToolResult",
+        "Usage",
+        "AvailableCommands",
+        "WorkflowTask",
+        "Error",
+        "InputRequested",
+        "InputResolved",
+        "Steered",
+        "Done",
+        "UserMessage",
+        "Subagent"
+      ]
+    },
+    "MessagePart": {
+      "source": "crates/doc/src/parts.rs",
+      "count": 6,
+      "variants": [
+        "Text",
+        "Reasoning",
+        "Tool",
+        "Input",
+        "Error",
+        "WorkflowTask"
+      ]
+    },
+    "ToolCall": {
+      "source": "crates/proto/src/agent.rs",
+      "count": 12,
+      "variants": [
+        "Exec",
+        "ReadFile",
+        "WriteFile",
+        "EditFile",
+        "ApplyPatch",
+        "Search",
+        "Glob",
+        "WebFetch",
+        "WebSearch",
+        "Todo",
+        "Mcp",
+        "Unknown"
+      ]
+    },
+    "RowKind": {
+      "source": "crates/ui/src/transcript.rs",
+      "count": 12,
+      "variants": [
+        "User",
+        "Markdown",
+        "LiveMarkdown",
+        "Reasoning",
+        "InlineImages",
+        "ToolGroup",
+        "FileChange",
+        "TurnSteps",
+        "TaskSnapshot",
+        "InputChip",
+        "ErrorChip",
+        "Notice"
+      ]
+    },
+    "ToolDetail": {
+      "source": "crates/ui/src/transcript.rs",
+      "count": 3,
+      "variants": [
+        "Output",
+        "Diff",
+        "Stats"
+      ]
+    },
+    "Block": {
+      "source": "crates/ui/src/markdown/parser.rs",
+      "count": 7,
+      "variants": [
+        "Paragraph",
+        "Heading",
+        "CodeBlock",
+        "BlockQuote",
+        "List",
+        "Table",
+        "Rule"
+      ]
+    }
+  },
+  "validation": {
+    "ui-tests": {
+      "command": "cargo test -p zeron-ui --lib transcript::",
+      "exit_code": 0,
+      "result": [
+        "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 1082 filtered out; finished in 0.02s"
+      ],
+      "log_sha256": "d538f942a87ea0622c29e461ed3e99133e7575b9a8e33ef629797237a0166c2c"
+    },
+    "doc-tests": {
+      "command": "cargo test -p zeron-doc --lib",
+      "exit_code": 0,
+      "result": [
+        "test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+      ],
+      "log_sha256": "19e2298069be41a3361a6ef151a080d2c85cec060d897328c2a10a8dd1f9258a"
+    },
+    "harness-tests": {
+      "command": "cargo test -p zeron-harness --lib normalize",
+      "exit_code": 0,
+      "result": [
+        "test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 0.06s"
+      ],
+      "log_sha256": "046211bcec9454435c6a8b488744a1d14ea739a4f5d5cc391697e08bdfcd3604"
+    }
+  },
+  "probe": {
+    "kind": "Standalone Rust diagnostic against compatible prebuilt local doc/proto artifacts and current turn_steps source; no live provider",
+    "stdout": "error_then_done_error: 2 error parts\nsame_tool_id_twice: 1 tool parts\nclassification Unknown { name: \"eval\", input: None }: group=Called 1 tool; turn=1 command\nclassification Search { pattern: \"test\", path: None }: group=Searched 1 time; turn=1 read\nlong_output_at_fold: Some(\"first line…\"), output_ref=None\n"
+  },
+  "source_sha256": {
+    "crates/doc/src/parts.rs": "57df655a8861951c99e52354d60602824d560a460c67d3f940704272c3d634a0",
+    "crates/doc/src/schema.rs": "e6811c77447cc7cd57bcc373fb8391cd090c9d1712c4af7784bb7bf14f354345",
+    "crates/doc/src/transcript_delta.rs": "fa0c6e06e33165b7b8412679b3dfd1b970438f1ba8a210aba5dd0899546ce29e",
+    "crates/engine/src/doc_host.rs": "908314a33263e06172b6708a40a3861eb45d81c5311a2688935599d2a06d5347",
+    "crates/engine/src/rpc.rs": "2cc026431b9ca0c13b199f464038ece974a156b33954b53e344a4c5b188f705a",
+    "crates/engine/src/sessions.rs": "f6f0a7a2abcfda255ff23d6a194d5bcb89f39a163de35d28590d8966746644f2",
+    "crates/harness/src/acp/normalize.rs": "6dbd281850caf1bb8f48b95ee0152612bbd22329395bc402167da015458094ca",
+    "crates/harness/src/claude/normalize.rs": "9599dde0ead7c8b9b9d1d61874258ead38904b4f88313028d2095a321ff55dde",
+    "crates/harness/src/codex/mod.rs": "63051dfda3482f124004e23ea50104af6152782a74f763635fdc985dc8094d16",
+    "crates/harness/src/codex/normalize.rs": "a022bf9a63dda75b9e8c798264364bf79a5510fea44f2225958159eb544cdabc",
+    "crates/harness/src/cursor/mod.rs": "e1f87fbac325971fc8a3914fdcf52e1eea205aff4fc19e121fedd8c42794e8f3",
+    "crates/harness/src/mock.rs": "7a72d98bf7b32969fc446c8bdfbd6d383229895c8d39e63d725a967913077e99",
+    "crates/harness/src/omp/normalize.rs": "58f37af70c08a66410d19827a63a94b80834ee8d056612d7b808ea2244ec4671",
+    "crates/harness/src/opencode/mod.rs": "d2542fd59c256711e031f28b5af54f1251787d58e30f1ea6601287c845cd8848",
+    "crates/proto/src/agent.rs": "c334c5c4ad9c5d5c4cdb107192ce6482921a1fded9ec39338251b6b5537cf411",
+    "crates/proto/src/view.rs": "6367854e028580b886895dc10919a5097334cf273c9f321bb7c0a0bde74a175f",
+    "crates/ui/src/markdown/parser.rs": "9228d07edc776f2fc70992917afd443498b812c54f3dfe2681f400a985fc7212",
+    "crates/ui/src/state.rs": "7d0a431e178d46b8388bf8fa9cb95b7cfb15e7abc2e313f69714e982138b58e0",
+    "crates/ui/src/tool_icons.rs": "f4af26923515964aefdda21b7c85b4a17e844e36b951560e159928457e0bf7ef",
+    "crates/ui/src/transcript.rs": "6f9f895967dbfa4834419056418b7c43426c93c7ace175da5b9d20a823c8d079"
+  },
+  "limits": [
+    "Native rendering not exhaustively revalidated in this audit",
+    "No private run-history scan",
+    "No network or remote-provider proof",
+    "Unknown/MCP names form an open catalog; typed variants enumerated exhaustively"
+  ]
+}

@@ -86,6 +86,20 @@ impl LiveVoiceViewModel {
             muted: state.muted || state.phase == LiveVoicePhase::Muted,
         }
     }
+
+    /// Draft canvas: show the microphone while we probe the installed OMP, but
+    /// never synthesize `available: true`. The ready frame is the gate.
+    pub fn derive_draft(
+        availability: Option<&LiveVoiceAvailability>,
+        state: &LiveVoiceState,
+        eligible: bool,
+    ) -> Self {
+        let mut model = Self::derive(None, availability, state);
+        if eligible && !model.replaces_editor {
+            model.show_microphone = true;
+        }
+        model
+    }
 }
 
 pub(crate) fn capture_state(
@@ -162,10 +176,15 @@ pub fn unavailable_message(reason: LiveVoiceUnavailableReason) -> &'static str {
         LiveVoiceUnavailableReason::RemoteChat => "Open this Chat on its host device",
         LiveVoiceUnavailableReason::NonOmp => "Live Voice is available for OMP Chats",
         LiveVoiceUnavailableReason::Archived => "Unarchive this Chat to use Live Voice",
+        // The gate is a capability in OMP's ready frame, never a version
+        // comparison, and the host cannot tell whether some other build has it:
+        // the published `omp` here is newer than the one that does. So these two
+        // name the missing capability and stop, instead of telling the user to
+        // update — the update they'd reach for is what removed the capability.
         LiveVoiceUnavailableReason::ActiveRun => {
-            "Update Comet on the Chat host to use Live Voice during active work"
+            "The OMP here cannot join Live Voice during active work"
         }
-        LiveVoiceUnavailableReason::UnsupportedOmp => "Update OMP to use Live Voice",
+        LiveVoiceUnavailableReason::UnsupportedOmp => "The OMP here has no Live Voice capability",
         LiveVoiceUnavailableReason::AnotherLiveCall => "End the active Live Voice call first",
     }
 }
@@ -296,6 +315,32 @@ mod tests {
     }
 
     #[test]
+    fn live_voice_new_chat_shows_checking_microphone_until_omp_is_probed() {
+        let model = LiveVoiceViewModel::derive_draft(None, &LiveVoiceState::default(), true);
+
+        assert!(model.show_microphone);
+        assert!(!model.microphone_enabled);
+        assert_eq!(
+            model.microphone_tooltip,
+            "Checking Live Voice availability…"
+        );
+    }
+
+    #[test]
+    fn live_voice_new_chat_disables_microphone_when_omp_has_no_capability() {
+        let availability = availability(false, Some(LiveVoiceUnavailableReason::UnsupportedOmp));
+        let model =
+            LiveVoiceViewModel::derive_draft(Some(&availability), &LiveVoiceState::default(), true);
+
+        assert!(model.show_microphone);
+        assert!(!model.microphone_enabled);
+        assert_eq!(
+            model.microphone_tooltip,
+            "The OMP here has no Live Voice capability"
+        );
+    }
+
+    #[test]
     fn live_voice_unavailable_reasons_are_actionable() {
         let cases = [
             (
@@ -312,11 +357,11 @@ mod tests {
             ),
             (
                 LiveVoiceUnavailableReason::ActiveRun,
-                "Update Comet on the Chat host to use Live Voice during active work",
+                "The OMP here cannot join Live Voice during active work",
             ),
             (
                 LiveVoiceUnavailableReason::UnsupportedOmp,
-                "Update OMP to use Live Voice",
+                "The OMP here has no Live Voice capability",
             ),
             (
                 LiveVoiceUnavailableReason::AnotherLiveCall,

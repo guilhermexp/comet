@@ -10,13 +10,13 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - `cmux/` — checkout local-only do terminal macOS baseado em Ghostty, usado
   apenas como referência de pesquisa.
 - `unpeel-upstream.toml` — proveniência verificável do snapshot vendorizado.
-- `rust/` — snapshots licenciados de crates.io com patches mínimos de compatibilidade do toolchain, documentados em `rust/PATCHES.md` e consumidos por `[patch.crates-io]`.
+- `rust/` — snapshots licenciados de crates.io com patches mínimos de compatibilidade do toolchain e transporte, documentados em `rust/PATCHES.md` e consumidos por `[patch.crates-io]`.
 
 ## Ownership
 
 - O projeto mantém o snapshot exato de `unpeel/` e suas patches de
   compatibilidade locais, preservando a licença MIT e atribuição upstream.
-- O projeto mantém os snapshots em `rust/` apenas enquanto a resolução transitiva do GPUI pinado exigir as versões incompatíveis, preservando versão, API, licença, checksum de origem e justificativa do patch.
+- O projeto mantém os snapshots em `rust/` apenas enquanto as dependências pinadas exigirem as correções documentadas, preservando versão, API, licença, checksum de origem e justificativa do patch.
 - `cmux/` não é propriedade nem dependência do projeto e permanece untracked.
 
 ## Local Contracts
@@ -33,13 +33,25 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 - O workspace continua com `exclude = ["third_party/unpeel"]` porque o snapshot
   contém workspaces próprios. Só `unpeel-core` entra no build do Comet pela
   dependência path explícita do `Cargo.toml` raiz.
+- **`apps/website` foi deletado localmente** (unpeel.com: site, docs, UI de
+  compra e o serviço de licença React/Hono em Worker). Nada do Comet o
+  consumia — nenhum `Cargo.toml`, script, workflow ou `edge/` o referenciava —
+  e ele carregava a única árvore React do repositório. A remoção limpou o que
+  ficaria pendurado: os scripts `dev:website`/`build`/`check` do
+  `package.json` do workspace Unpeel, o `bun.lock` (regerado, 95 pacotes),
+  o gate de changelog em `apps/native/release.sh` e o `cd apps/website` dos
+  dois `release:updates:*`, hoje apontando para `apps/releases`. A prosa
+  upstream (`unpeel/README.md`, `unpeel/AGENTS.md`, `docs/`) continua citando
+  o site de propósito: é documentação do upstream e o sync a sobrescreve.
+  Sync futuro do Unpeel reapresenta `apps/website` como adição nova — deletar
+  de novo e recomputar `vendored_tree`.
 - Patch necessária ao Comet é editada no próprio fonte vendorizado, com teste
   downstream e atualização simultânea de `vendored_tree` na metadata.
 - `cmux/` não é rastreado, está excluído em `.git/info/exclude`, e nenhum build,
   CI ou documento operacional pode depender da sua presença.
-- O fork gpui (`wingleeio/zed`) continua uma dependência Git do Cargo, não um
+- O renderer gpui (`zeronsh/zui`) continua uma dependência Git do Cargo, não um
   diretório desta árvore. Crates GPL do Zed permanecem proibidas.
-- Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico futuro que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
+- Patches em `rust/` não são atualização de dependência: a versão publicada permanece idêntica e a mudança deve se limitar ao diagnóstico documentado que motivou a vendorização. Nova correção exige proveniência em `rust/PATCHES.md`.
 
 ## Work Guidance
 
@@ -139,4 +151,6 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 ## Child DOX Index
 
-None — flat domain.
+| Domínio | Doc | Papel |
+|---|---|---|
+| Unpeel | [`unpeel/AGENTS.md`](unpeel/AGENTS.md) | Contratos upstream e verificação executável de hooks do fork |

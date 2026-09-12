@@ -113,6 +113,7 @@ async fn two_clients_converge_and_stream_live_updates() {
     {
         let mut doc = doc_a.lock().unwrap();
         doc.upsert_session(&Session {
+            last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "dev-a".into(),
             status: SessionStatus::Working,
@@ -423,6 +424,7 @@ async fn churn_stays_bounded_no_history_growth() {
         {
             let mut d = doc.lock().unwrap();
             d.upsert_session(&Session {
+                last_completed_turn: None,
                 chat_id: "chat-1".into(),
                 device_id: "dev-a".into(),
                 status: if i % 2 == 0 {

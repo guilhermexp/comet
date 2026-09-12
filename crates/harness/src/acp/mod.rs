@@ -1021,6 +1021,12 @@ impl Harness for AcpHarness {
     fn display_name(&self) -> &str {
         self.spec.display_name
     }
+    fn authoritative_prompt_end(&self) -> bool {
+        // ACP session/prompt owns the turn until its response. The engine's
+        // quiet watchdog must not park a still-pending model request either.
+        true
+    }
+
     fn supports_steering(&self) -> bool {
         true
     }
@@ -1614,7 +1620,6 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
-    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -1650,10 +1655,6 @@ fn handle_server_request_live(
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
-    // Pending questions block the agent — the quiet-settle must not read
-    // that silence as a finished turn.
-    let open_questions = std::sync::Arc::clone(open_questions);
-    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         let answers = (request_input)(vec![question.clone()])
             .await
@@ -1675,7 +1676,6 @@ fn handle_server_request_live(
             ),
             None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
         }
-        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
     Vec::new()
 }
@@ -1726,18 +1726,10 @@ fn prompt_like_request(
     Box::pin(async move { client.request(method, params).await })
 }
 
-/// Track the liveness signals the blanket quiet-settle keys on: content
-/// proves the turn produced something; an open tool call or a pending
-/// question proves silence is legitimate.
-fn track_turn_signals(
-    ev: &AgentEvent,
-    content_seen: &mut bool,
-    open_tools: &mut std::collections::HashSet<String>,
-) {
+/// Track tools to avoid prompting into an unowned self-continued turn.
+fn track_open_tools(ev: &AgentEvent, open_tools: &mut std::collections::HashSet<String>) {
     match ev {
-        AgentEvent::TextDelta { text } if !text.is_empty() => *content_seen = true,
         AgentEvent::ToolCall { id, .. } | AgentEvent::ToolCallPreview { id, .. } => {
-            *content_seen = true;
             open_tools.insert(id.clone());
         }
         AgentEvent::ToolResult { id, .. } => {
@@ -2078,31 +2070,12 @@ async fn run_session(session: Session) {
     // the queued steer is promoted to a fresh turn.
     const STARVE_GRACE: Duration = Duration::from_secs(2);
     let mut starve_deadline: Option<tokio::time::Instant> = None;
-    // BLANKET dropped-reply settle, adapter-agnostic: any ACP agent whose
-    // prompt response goes missing must not strand the turn. Signals that
-    // exist in core ACP stand in for the adapter-specific cost frame: once
-    // the turn has streamed content, every tool call it opened has resolved,
-    // no permission/question round-trip is pending, and the stream has been
-    // quiet past the window, the turn is settled through the same recovery
-    // arm. A false settle is only PARTLY recoverable: the engine folds any
-    // later output as a self-continued segment and re-arms Working, but the
-    // turn is orphaned — the real response resolves a closed channel, no
-    // Done ever comes, and the session strands Working until the engine's
-    // quiesce watchdog parks it.
-    //
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
-    };
+    // Silence is not a turn boundary: completed tools, text, and usage may
+    // all precede a slow model request. Keep the prompt future alive until
+    // its response (or an authoritative completion extension) arrives.
+    // ZERON_ACP_QUIET_SETTLE_MS is intentionally no longer honored (#296).
     let mut last_update_at = tokio::time::Instant::now();
-    let mut turn_content_seen = false;
     let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // PREVENTION, ahead of all the recovery above: never send a
     // `session/prompt` into a session that is visibly mid SELF-CONTINUED
     // turn — that prompt's reply is what the adapter drops (the verified
@@ -2206,7 +2179,6 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
-                                &open_questions,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2278,7 +2250,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2372,7 +2343,7 @@ async fn run_session(session: Session) {
                         &mut updates,
                     );
                     for ev in events {
-                        track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
+                        track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
@@ -2386,7 +2357,6 @@ async fn run_session(session: Session) {
                         &method,
                         &params,
                         &request_input,
-                        &open_questions,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -2468,8 +2438,8 @@ async fn run_session(session: Session) {
                     // eternal-timer bug. Post-turn: nothing left to do.
                     if turn.is_some() {
                         // The injection proves the turn is LIVE: any settle
-                        // deadline armed off a cost frame that raced this
-                        // response is invalid evidence.
+                        // deadline armed by an earlier noRunningTurn reply
+                        // is no longer valid.
                         starve_deadline = None;
                         // Pre-injection updates can still sit in `incoming`
                         // (responses bypass that queue): drain them into the
@@ -2501,7 +2471,6 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
-                                        &open_questions,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2572,7 +2541,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     updates.finish_turn();
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
@@ -2623,7 +2591,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     updates.finish_turn();
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
@@ -2644,39 +2611,10 @@ async fn run_session(session: Session) {
                 }
             },
 
-            // BLANKET quiet settle (see `quiet_settle` above), adapter-
-            // agnostic: content streamed, every tool resolved, no question
-            // pending, stream quiet past the window with the prompt still
-            // unsettled. Feeds the recovery arm below by expiring its
-            // deadline — one settle path for all three evidence sources.
-            _ = tokio::time::sleep_until(
-                last_update_at + quiet_settle.unwrap_or_default()
-            ), if quiet_settle.is_some()
-                && starve_deadline.is_none()
-                && turn.is_some()
-                && !interrupted
-                && turn_content_seen
-                && open_tools.is_empty()
-                && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
-            {
-                tracing::warn!(
-                    target: "zeron_harness::acp",
-                    quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
-                    "turn quiet past the settle window with completed output; \
-                     treating the prompt response as dropped"
-                );
-                starve_deadline = Some(tokio::time::Instant::now());
-            },
-
-            // Starved-turn recovery: the grace elapsed with the prompt still
-            // unsettled after turn-end evidence — a steering call answered
-            // noRunningTurn (STARVE_GRACE) or the blanket quiet settle
-            // above. Close the dead turn out
-            // with a Done — its output already streamed as session/updates
-            // and its text was delivered via the CLI's own queue — then
-            // promote any queued steer to a fresh prompt, which settles
-            // normally on a now-idle agent (verified against the real
-            // adapter).
+            // Explicit noRunningTurn from the steering extension proves
+            // the adapter has no running turn. After a grace for its racing
+            // response, recover the stranded prompt. Silence, tool results,
+            // and usage updates must never arm this recovery.
             _ = tokio::time::sleep_until(
                 starve_deadline.unwrap_or_else(tokio::time::Instant::now)
             ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
@@ -2726,7 +2664,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     updates.finish_turn();
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
@@ -2764,14 +2701,6 @@ async fn run_session(session: Session) {
                         // Mid self-continued turn (see BUSY_RECENT above):
                         // cancel it rather than prompt into the starve.
                         //
-                        // Claude skips this branch ON PURPOSE and prompts
-                        // straight in — its NATIVE semantics: the CLI queues
-                        // the message and folds it into the running turn (no
-                        // work lost, verified from live session data). The
-                        // adapter drops that prompt's reply, and the
-                        // cost-frame settle reconstructs it ~1s after the
-                        // merged turn really ends. Only adapters with no
-                        // verified turn-end frame pay the cancel.
                         tracing::info!(
                             target: "zeron_harness::acp",
                             "steer into a self-continuing session; cancelling \
@@ -2799,7 +2728,6 @@ async fn run_session(session: Session) {
                             break 'main;
                         }
                         done_current = false;
-                        turn_content_seen = false;
                         updates.finish_turn();
                         open_tools.clear();
                         last_update_at = tokio::time::Instant::now();
@@ -2941,10 +2869,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn progressive_tool_preview_holds_quiet_settle_open_until_result() {
-        let mut content_seen = false;
+    fn progressive_tool_preview_tracks_open_tool_until_result() {
         let mut open_tools = std::collections::HashSet::new();
-        track_turn_signals(
+        track_open_tools(
             &AgentEvent::ToolCallPreview {
                 id: "write-live".into(),
                 call: zeron_proto::ToolCall::WriteFile {
@@ -2952,13 +2879,11 @@ mod tests {
                     content: Some("bounded".into()),
                 },
             },
-            &mut content_seen,
             &mut open_tools,
         );
-        assert!(content_seen);
         assert!(open_tools.contains("write-live"));
 
-        track_turn_signals(
+        track_open_tools(
             &AgentEvent::ToolResult {
                 id: "write-live".into(),
                 is_error: false,
@@ -2966,7 +2891,6 @@ mod tests {
                 diff: None,
                 execution: None,
             },
-            &mut content_seen,
             &mut open_tools,
         );
         assert!(open_tools.is_empty());

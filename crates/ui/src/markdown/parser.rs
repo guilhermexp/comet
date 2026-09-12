@@ -12,6 +12,7 @@
 //! through both paths and assert equality.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
@@ -87,7 +88,9 @@ pub struct TopBlock {
 /// The parse result: top-level blocks in document order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BlockTree {
-    pub blocks: Vec<TopBlock>,
+    // Completed blocks are immutable. Canonical/display trees and old/new
+    // transcript rows share their contents across streamed tail updates.
+    pub blocks: Vec<Arc<TopBlock>>,
 }
 
 impl BlockTree {
@@ -123,17 +126,17 @@ pub fn parse_full(source: &str) -> BlockTree {
         match event {
             Event::Rule => {
                 cur.bump();
-                blocks.push(TopBlock {
+                blocks.push(Arc::new(TopBlock {
                     range,
                     block: Block::Rule,
-                });
+                }));
             }
             Event::Start(_) => {
                 for block in parse_started_block(&mut cur) {
-                    blocks.push(TopBlock {
+                    blocks.push(Arc::new(TopBlock {
                         range: range.clone(),
                         block,
-                    });
+                    }));
                 }
             }
             // Stray inline events at top level (shouldn't happen): skip.
@@ -434,14 +437,118 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
 /// re-applying it on their merged output is harmless.
 fn autolink_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out = Vec::with_capacity(runs.len());
-    for run in runs {
-        if run.style.link.is_some() || run.style.code {
+    for mut run in runs {
+        if run.style.link.is_some() {
+            out.push(run);
+        } else if run.style.code {
+            if let Some(target) = crate::file_preview::model::is_file_path_candidate(&run.text) {
+                run.style.link = Some(target.to_string());
+            }
             out.push(run);
         } else {
             push_text_autolinked(&mut out, &run.text, &run.style);
         }
     }
     out
+}
+
+enum NextLink {
+    Url { at: usize, len: usize },
+    FilePath { at: usize, len: usize },
+}
+
+fn next_autolink(text: &str) -> Option<NextLink> {
+    let url_opt = find_url_start(text).and_then(|at| {
+        let from = &text[at..];
+        let scheme = if from.starts_with("https://") {
+            "https://".len()
+        } else {
+            "http://".len()
+        };
+        let len = bare_url_len(from);
+        if len > scheme { Some((at, len)) } else { None }
+    });
+
+    let file_opt = find_file_path(text);
+
+    match (url_opt, file_opt) {
+        (Some((u_at, u_len)), Some((f_at, f_len))) => {
+            if u_at <= f_at {
+                Some(NextLink::Url {
+                    at: u_at,
+                    len: u_len,
+                })
+            } else {
+                Some(NextLink::FilePath {
+                    at: f_at,
+                    len: f_len,
+                })
+            }
+        }
+        (Some((u_at, u_len)), None) => Some(NextLink::Url {
+            at: u_at,
+            len: u_len,
+        }),
+        (None, Some((f_at, f_len))) => Some(NextLink::FilePath {
+            at: f_at,
+            len: f_len,
+        }),
+        (None, None) => None,
+    }
+}
+
+fn find_file_path(text: &str) -> Option<(usize, usize)> {
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let remainder = &text[cursor..];
+        let Some(first_non_ws) = remainder.find(|c: char| !c.is_whitespace()) else {
+            break;
+        };
+        let start = cursor + first_non_ws;
+        let boundary = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+        if !boundary {
+            cursor = start + 1;
+            continue;
+        }
+
+        let token_slice = &text[start..];
+        let token_end = token_slice
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`'))
+            .map_or(token_slice.len(), |(i, _)| i);
+        let mut raw_token = &token_slice[..token_end];
+
+        while let Some(last) = raw_token.chars().next_back() {
+            let trim = match last {
+                '.' | ',' | ';' | '!' | '?' | '*' | '_' | '~' => true,
+                ')' => raw_token.matches('(').count() < raw_token.matches(')').count(),
+                ']' => raw_token.matches('[').count() < raw_token.matches(']').count(),
+                ':' => !raw_token.rsplit_once(':').map_or(false, |(_, s)| {
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                }),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            raw_token = &raw_token[..raw_token.len() - last.len_utf8()];
+        }
+
+        if !raw_token.is_empty()
+            && !raw_token.contains("://")
+            && !raw_token.starts_with('#')
+            && crate::file_preview::model::is_file_path_candidate(raw_token).is_some()
+        {
+            return Some((start, raw_token.len()));
+        }
+
+        cursor = start + token_end.max(1);
+    }
+    None
 }
 
 fn push_text_autolinked(runs: &mut Vec<InlineRun>, text: &str, style: &InlineStyle) {
@@ -454,25 +561,16 @@ fn push_text_autolinked(runs: &mut Vec<InlineRun>, text: &str, style: &InlineSty
         }
     };
     let mut rest = text;
-    while let Some(at) = find_url_start(rest) {
-        let from = &rest[at..];
-        let scheme = if from.starts_with("https://") {
-            "https://".len()
-        } else {
-            "http://".len()
+    while let Some(link) = next_autolink(rest) {
+        let (at, len) = match link {
+            NextLink::Url { at, len } => (at, len),
+            NextLink::FilePath { at, len } => (at, len),
         };
-        let len = bare_url_len(from);
-        if len <= scheme {
-            // A scheme with nothing after it stays text (don't re-find it).
-            push(runs, &rest[..at + scheme], style.clone());
-            rest = &from[scheme..];
-            continue;
-        }
         push(runs, &rest[..at], style.clone());
         let mut linked = style.clone();
-        linked.link = Some(from[..len].to_string());
-        push(runs, &from[..len], linked);
-        rest = &from[len..];
+        linked.link = Some(rest[at..at + len].to_string());
+        push(runs, &rest[at..at + len], linked);
+        rest = &rest[at + len..];
     }
     push(runs, rest, style.clone());
 }
@@ -559,7 +657,7 @@ pub struct IncrementalParser {
     /// has hanging inline markers ([`super::mend`]): `None` means the display
     /// tree is exactly [`Self::tree`]. Never fed back into the incremental
     /// state — the canonical tree stays parity-exact with `parse_full`.
-    display_tail: Option<Vec<TopBlock>>,
+    display_tail: Option<Vec<Arc<TopBlock>>>,
     /// Link-reference definitions act at a distance — full reparses only.
     full_only: bool,
     /// Bytes fed through `parse_full` by the most recent `set_text`/`append`/
@@ -587,7 +685,7 @@ impl IncrementalParser {
     /// The tree to render while streaming: the canonical tree with the last
     /// block swapped for its mended parse when inline markers hang (an
     /// unclosed `**bold`, a half-streamed `[link](url…`). Same shape and cost
-    /// as `tree().clone()` — the stable prefix is copied either way; only a
+    /// as `tree().clone()` — the stable prefix shares its blocks; only a
     /// hanging tail adds one O(tail) reparse, done at append time.
     pub fn display_tree(&self) -> BlockTree {
         let Some(tail) = &self.display_tail else {
@@ -613,13 +711,13 @@ impl IncrementalParser {
     /// Set the source: appends take the incremental path, anything else resets.
     pub fn set_text(&mut self, text: &str) {
         if text.len() >= self.source.len() && text.starts_with(self.source.as_str()) {
-            let delta = text[self.source.len()..].to_string();
+            let delta = &text[self.source.len()..];
             if delta.is_empty() {
                 self.last_parse_bytes = 0;
                 self.stable_prefix_blocks = self.tree.blocks.len();
                 return;
             }
-            self.append(&delta);
+            self.append(delta);
         } else {
             self.reset(text);
         }
@@ -678,8 +776,9 @@ impl IncrementalParser {
         self.tree.blocks.retain(|b| b.range.start < boundary);
         self.stable_prefix_blocks = self.tree.blocks.len();
         for mut top in tail.blocks {
-            top.range.start += boundary;
-            top.range.end += boundary;
+            let block = Arc::make_mut(&mut top);
+            block.range.start += boundary;
+            block.range.end += boundary;
             self.tree.blocks.push(top);
         }
         self.remend();
@@ -714,6 +813,7 @@ impl IncrementalParser {
         self.last_parse_bytes += mended.len();
         let mut tail = parse_full(&mended).blocks;
         for top in &mut tail {
+            let top = Arc::make_mut(top);
             // Display ranges point back into the unmended source; synthetic
             // closers at the end clamp away.
             top.range.start += start;
@@ -746,6 +846,29 @@ fn has_link_defs(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_snapshots_share_stable_blocks_without_mutating_old_frames() {
+        let mut parser = IncrementalParser::new();
+        parser.set_text("first **bold** paragraph\n\nsecond paragraph\n\nlast **open");
+        let before = parser.display_tree();
+        let frozen = format!("{before:?}");
+        assert!(std::ptr::eq(
+            &before.blocks[0].block,
+            &parser.tree().blocks[0].block
+        ));
+        parser.append(" tail**\n\nnext paragraph");
+        let after = parser.display_tree();
+        assert!(std::ptr::eq(
+            &before.blocks[0].block,
+            &after.blocks[0].block
+        ));
+        assert_eq!(format!("{before:?}"), frozen);
+        assert_eq!(parser.tree(), &parse_full(parser.source()));
+        parser.reset("replacement");
+        assert_eq!(format!("{before:?}"), frozen);
+        assert_eq!(parser.tree(), &parse_full("replacement"));
+    }
 
     fn stream(chunks: usize, text: &str) -> IncrementalParser {
         let mut p = IncrementalParser::new();
@@ -1002,6 +1125,32 @@ mod tests {
         assert_eq!(
             only_link("[https://shown.dev](https://real.dev)\n"),
             Some(("https://shown.dev".into(), "https://real.dev".into()))
+        );
+    }
+
+    #[test]
+    fn file_paths_autolink_in_code_and_plain_text() {
+        assert_eq!(
+            only_link("Saved to `~/.orchestrator/outputs/emissao-remota-tutor.png`.\n"),
+            Some((
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into(),
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Saved to ~/.orchestrator/outputs/emissao-remota-tutor.png.\n"),
+            Some((
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into(),
+                "~/.orchestrator/outputs/emissao-remota-tutor.png".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Inspect `src/main.rs` for details\n"),
+            Some(("src/main.rs".into(), "src/main.rs".into()))
+        );
+        assert_eq!(
+            only_link("See /tmp/output.png now\n"),
+            Some(("/tmp/output.png".into(), "/tmp/output.png".into()))
         );
     }
 

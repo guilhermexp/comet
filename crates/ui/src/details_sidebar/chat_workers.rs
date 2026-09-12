@@ -10,6 +10,8 @@ use zeron_workers_unpeel::WorkersSession;
 
 use crate::transcript::subagent_tab_title;
 
+use super::widgets::{ChatWorkersTab, auto_tab_by_recency};
+
 const SETTLED_ACTIVITY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub struct ChatActivityRow {
     pub usage: Option<String>,
     pub progress: Vec<WorkflowProgressNode>,
     pub subagent_type: Option<String>,
+    pub started_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,7 @@ pub struct ChatWorkerRow {
     pub semantic: WorkerSemantic,
     pub state: String,
     pub activity: String,
+    pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub total_tokens: Option<u64>,
     pub model_usage: Vec<ChatWorkerModelUsage>,
@@ -67,6 +71,70 @@ pub struct ChatWorkersSnapshot {
     pub workflows: Vec<ChatActivityRow>,
     pub subagents: Vec<ChatActivityRow>,
     pub workers: Vec<ChatWorkerRow>,
+}
+
+impl ChatWorkersSnapshot {
+    pub fn latest_started_at(&self, tab: ChatWorkersTab) -> Option<u64> {
+        match tab {
+            ChatWorkersTab::Workflows => self
+                .workflows
+                .iter()
+                .map(|row| row.started_at_unix_ms)
+                .max(),
+            ChatWorkersTab::Subagents => self
+                .subagents
+                .iter()
+                .map(|row| row.started_at_unix_ms)
+                .max(),
+            ChatWorkersTab::Workers => self.workers.iter().map(|row| row.created_at_unix_ms).max(),
+        }
+    }
+
+    pub fn auto_tab(&self) -> ChatWorkersTab {
+        auto_tab_by_recency(
+            (
+                self.workflows.len(),
+                self.latest_started_at(ChatWorkersTab::Workflows),
+            ),
+            (
+                self.subagents.len(),
+                self.latest_started_at(ChatWorkersTab::Subagents),
+            ),
+            (
+                self.workers.len(),
+                self.latest_started_at(ChatWorkersTab::Workers),
+            ),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatActivityTask {
+    pub task: WorkflowTaskUpdate,
+    pub started_at_unix_ms: u64,
+}
+
+impl From<WorkflowTaskUpdate> for ChatActivityTask {
+    fn from(task: WorkflowTaskUpdate) -> Self {
+        Self {
+            task,
+            started_at_unix_ms: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for ChatActivityTask {
+    type Target = WorkflowTaskUpdate;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
+impl std::ops::DerefMut for ChatActivityTask {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.task
+    }
 }
 
 /// Ha trabalho em voo no widget: worker rodando, ou workflow/subagente ainda
@@ -161,7 +229,7 @@ pub(crate) fn compact_activity_label(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
+fn activity_row(task: WorkflowTaskUpdate, started_at_unix_ms: u64) -> ChatActivityRow {
     let is_subagent = task.task_type.as_deref() == Some("subagent");
     let title = if is_subagent {
         task.description
@@ -188,6 +256,7 @@ fn activity_row(task: WorkflowTaskUpdate) -> ChatActivityRow {
         usage: format_usage(task.usage, task.agent_count),
         progress: task.progress,
         subagent_type: task.subagent_type,
+        started_at_unix_ms,
     }
 }
 
@@ -198,11 +267,11 @@ fn stable_active_first<T>(rows: Vec<T>, active: impl Fn(&T) -> bool) -> Vec<T> {
     active_rows
 }
 
-fn bounded_activity(tasks: Vec<WorkflowTaskUpdate>) -> Vec<WorkflowTaskUpdate> {
+fn bounded_activity(tasks: Vec<ChatActivityTask>) -> Vec<ChatActivityTask> {
     let mut settled = 0;
     let mut selected = Vec::new();
     for task in tasks.into_iter().rev() {
-        if task.status != WorkflowTaskStatus::Running {
+        if task.task.status != WorkflowTaskStatus::Running {
             if settled >= SETTLED_ACTIVITY_LIMIT {
                 continue;
             }
@@ -214,21 +283,21 @@ fn bounded_activity(tasks: Vec<WorkflowTaskUpdate>) -> Vec<WorkflowTaskUpdate> {
 }
 
 pub fn project_chat_workers(
-    tasks: Vec<WorkflowTaskUpdate>,
+    tasks: Vec<ChatActivityTask>,
     sessions: Vec<WorkersSession>,
 ) -> ChatWorkersSnapshot {
     let mut workflows = Vec::new();
     let mut subagents = Vec::new();
-    for task in bounded_activity(
+    for activity in bounded_activity(
         tasks
             .into_iter()
-            .filter(|task| workflow_task(task) || subagent_task(task))
+            .filter(|activity| workflow_task(&activity.task) || subagent_task(&activity.task))
             .collect(),
     ) {
-        if workflow_task(&task) {
-            workflows.push(activity_row(task));
-        } else if subagent_task(&task) {
-            subagents.push(activity_row(task));
+        if workflow_task(&activity.task) {
+            workflows.push(activity_row(activity.task, activity.started_at_unix_ms));
+        } else if subagent_task(&activity.task) {
+            subagents.push(activity_row(activity.task, activity.started_at_unix_ms));
         }
     }
     let mut sessions = sessions;
@@ -250,6 +319,7 @@ pub fn project_chat_workers(
             provider_id: session.provider_id,
             state: session.state,
             activity: session.activity,
+            created_at_unix_ms: session.created_at_unix_ms,
             updated_at_unix_ms: session.updated_at_unix_ms,
             total_tokens: session.total_tokens,
             model_usage: session
@@ -270,68 +340,99 @@ pub fn project_chat_workers(
     }
 }
 
-pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<WorkflowTaskUpdate> {
+pub fn activity_tasks_from_entries(entries: &[SessionMessageEntry]) -> Vec<ChatActivityTask> {
+    let mut spawn_timestamps = HashMap::new();
+    for entry in entries {
+        let ts = entry.created_at.max(0) as u64;
+        for part in &entry.parts {
+            match part {
+                MessagePart::WorkflowTask { task, .. } => {
+                    spawn_timestamps.entry(task.task_id.clone()).or_insert(ts);
+                }
+                MessagePart::Tool {
+                    subagent_ref: Some(subagent_ref),
+                    ..
+                } => {
+                    spawn_timestamps.entry(subagent_ref.clone()).or_insert(ts);
+                }
+                _ => {}
+            }
+        }
+    }
     let mut latest_workflows = workflow_tasks_from_entries(entries, usize::MAX)
         .into_iter()
         .map(|task| (task.task_id.clone(), task))
         .collect::<HashMap<_, _>>();
     let mut seen_spawn_refs = HashSet::new();
     let mut tasks = Vec::new();
-    for part in entries
-        .iter()
-        .rev()
-        .flat_map(|entry| entry.parts.iter().rev())
-    {
-        match part {
-            MessagePart::WorkflowTask { task, .. } => {
-                if workflow_task(task)
-                    && let Some(latest) = latest_workflows.remove(&task.task_id)
-                {
-                    tasks.push(latest);
+    for entry in entries.iter().rev() {
+        let entry_created_at = entry.created_at.max(0) as u64;
+        for part in entry.parts.iter().rev() {
+            match part {
+                MessagePart::WorkflowTask { task, .. } => {
+                    if workflow_task(task)
+                        && let Some(latest) = latest_workflows.remove(&task.task_id)
+                    {
+                        let started_at = spawn_timestamps
+                            .get(&latest.task_id)
+                            .copied()
+                            .unwrap_or(entry_created_at);
+                        tasks.push(ChatActivityTask {
+                            task: latest,
+                            started_at_unix_ms: started_at,
+                        });
+                    }
                 }
-            }
-            MessagePart::Tool {
-                id,
-                call,
-                subagent_ref: Some(subagent_ref),
-                subagent_status,
-                subagent_tail,
-                ..
-            } if seen_spawn_refs.insert(subagent_ref.clone()) => {
-                let label = subagent_tab_title(call).to_string();
-                let status = match subagent_status {
-                    Some(SubagentStatus::Done) => WorkflowTaskStatus::Completed,
-                    Some(SubagentStatus::Failed) => WorkflowTaskStatus::Failed,
-                    Some(SubagentStatus::Running) | None => WorkflowTaskStatus::Running,
-                };
-                let mut task = latest_workflows
-                    .remove(id)
-                    .filter(subagent_task)
-                    .unwrap_or_else(|| WorkflowTaskUpdate {
-                        task_id: id.clone(),
-                        status,
-                        workflow_name: None,
-                        description: None,
-                        usage: None,
-                        progress: Vec::new(),
-                        agent_count: None,
-                        task_type: Some("subagent".into()),
-                        subagent_type: None,
+                MessagePart::Tool {
+                    id,
+                    call,
+                    subagent_ref: Some(subagent_ref),
+                    subagent_status,
+                    subagent_tail,
+                    ..
+                } if seen_spawn_refs.insert(subagent_ref.clone()) => {
+                    let label = subagent_tab_title(call).to_string();
+                    let status = match subagent_status {
+                        Some(SubagentStatus::Done) => WorkflowTaskStatus::Completed,
+                        Some(SubagentStatus::Failed) => WorkflowTaskStatus::Failed,
+                        Some(SubagentStatus::Running) | None => WorkflowTaskStatus::Running,
+                    };
+                    let mut task = latest_workflows
+                        .remove(id)
+                        .filter(subagent_task)
+                        .unwrap_or_else(|| WorkflowTaskUpdate {
+                            task_id: id.clone(),
+                            status,
+                            workflow_name: None,
+                            description: None,
+                            usage: None,
+                            progress: Vec::new(),
+                            agent_count: None,
+                            task_type: Some("subagent".into()),
+                            subagent_type: None,
+                        });
+                    task.task_id = subagent_ref.clone();
+                    task.status = status;
+                    if task.description.is_none() {
+                        task.description = subagent_tail.clone();
+                    }
+                    if task.agent_count.is_none() {
+                        task.agent_count = Some(1);
+                    }
+                    if task.subagent_type.is_none() {
+                        task.subagent_type = Some(label);
+                    }
+                    let started_at = spawn_timestamps
+                        .get(&task.task_id)
+                        .copied()
+                        .unwrap_or(entry_created_at);
+                    tasks.push(ChatActivityTask {
+                        task,
+                        started_at_unix_ms: started_at,
                     });
-                task.task_id = subagent_ref.clone();
-                task.status = status;
-                if task.description.is_none() {
-                    task.description = subagent_tail.clone();
                 }
-                if task.agent_count.is_none() {
-                    task.agent_count = Some(1);
-                }
-                if task.subagent_type.is_none() {
-                    task.subagent_type = Some(label);
-                }
-                tasks.push(task);
+                _ => {}
             }
-            _ => {}
         }
     }
     tasks.reverse();
@@ -350,12 +451,12 @@ mod tests {
     };
 
     use super::{
-        ChatActivityRow, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
+        ChatActivityRow, ChatActivityTask, ChatWorkerRow, ChatWorkersSnapshot, WorkerSemantic,
         activity_tasks_from_entries, compact_activity_label, format_token_total, format_usage,
         project_chat_workers, snapshot_is_active, worker_compact_metadata, worker_semantic,
     };
 
-    fn workflow_task(id: &str) -> WorkflowTaskUpdate {
+    fn workflow_task(id: &str) -> ChatActivityTask {
         WorkflowTaskUpdate {
             task_id: id.into(),
             status: WorkflowTaskStatus::Completed,
@@ -370,9 +471,10 @@ mod tests {
             task_type: Some("local_workflow".into()),
             subagent_type: None,
         }
+        .into()
     }
 
-    fn subagent_task(id: &str) -> WorkflowTaskUpdate {
+    fn subagent_task(id: &str) -> ChatActivityTask {
         WorkflowTaskUpdate {
             task_id: id.into(),
             status: WorkflowTaskStatus::Completed,
@@ -384,6 +486,7 @@ mod tests {
             task_type: Some("subagent".into()),
             subagent_type: Some("general-purpose".into()),
         }
+        .into()
     }
 
     fn worker_session(id: &str, state: &str, activity: &str) -> WorkersSession {
@@ -419,9 +522,9 @@ mod tests {
     fn activity_labels_collapse_multiline_whitespace_for_fixed_rows() {
         assert_eq!(
             compact_activity_label(
-                "Repo de referência de terceiro, read-only, em:\n  ~/Documents/Projetos",
+                "Third-party reference repo, read-only, at:\n  ~/Documents/Projetos",
             ),
-            "Repo de referência de terceiro, read-only, em: ~/Documents/Projetos"
+            "Third-party reference repo, read-only, at: ~/Documents/Projetos"
         );
     }
 
@@ -710,7 +813,7 @@ mod tests {
             parts: vec![
                 MessagePart::WorkflowTask {
                     id: "workflow-sub-1".into(),
-                    task: rich_subagent,
+                    task: rich_subagent.task,
                 },
                 spawn_part("call-parent-1", SubagentStatus::Done, "Reviewed parser"),
             ],
@@ -755,7 +858,7 @@ mod tests {
             role: MessageRole::Assistant,
             parts: vec![MessagePart::WorkflowTask {
                 id: format!("workflow-part-{index}"),
-                task: workflow_task(&format!("workflow-{index}")),
+                task: workflow_task(&format!("workflow-{index}")).task,
             }],
             created_at: index + 1,
             device_id: "device-1".into(),
@@ -899,6 +1002,7 @@ mod tests {
             semantic,
             state: "running".into(),
             activity: "working".into(),
+            created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             total_tokens: None,
             model_usage: Vec::new(),
@@ -911,6 +1015,7 @@ mod tests {
             usage: None,
             progress: Vec::new(),
             subagent_type: None,
+            started_at_unix_ms: 0,
         };
 
         assert!(!snapshot_is_active(&ChatWorkersSnapshot::default()));
@@ -935,5 +1040,44 @@ mod tests {
             workflows: vec![activity(WorkflowTaskStatus::Running)],
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn snapshot_auto_tab_selects_latest_started_category() {
+        use super::ChatWorkersTab;
+
+        let subagent = ChatActivityRow {
+            id: "a".into(),
+            title: "t".into(),
+            description: None,
+            status: WorkflowTaskStatus::Completed,
+            usage: None,
+            progress: Vec::new(),
+            subagent_type: None,
+            started_at_unix_ms: 1_000,
+        };
+
+        let worker = ChatWorkerRow {
+            session_id: "s".into(),
+            project_id: "p".into(),
+            title: "w".into(),
+            command: "codex".into(),
+            provider_id: None,
+            semantic: WorkerSemantic::Working,
+            state: "running".into(),
+            activity: "working".into(),
+            created_at_unix_ms: 2_000,
+            updated_at_unix_ms: 2_000,
+            total_tokens: None,
+            model_usage: Vec::new(),
+        };
+
+        let snapshot = ChatWorkersSnapshot {
+            workflows: Vec::new(),
+            subagents: vec![subagent],
+            workers: vec![worker],
+        };
+
+        assert_eq!(snapshot.auto_tab(), ChatWorkersTab::Workers);
     }
 }

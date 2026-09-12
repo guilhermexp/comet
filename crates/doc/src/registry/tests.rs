@@ -291,6 +291,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
+        last_completed_turn: None,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,
@@ -368,6 +369,34 @@ fn rows_round_trip_and_upsert_refreshes() {
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0].title, None);
     assert_eq!(chats[0].last_message_preview.as_deref(), Some("hello"));
+}
+
+#[test]
+fn session_context_usage_persists_and_survives_a_snapshot_reload() {
+    // Regression: the live registry row dropped contextTokens/contextWindow,
+    // so the composer gauge zeroed after an app restart even though usage had
+    // been measured. The fields must round-trip through the persisted snapshot.
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut with_usage = session("chat-1", "dev-a", SessionStatus::Idle);
+    with_usage.context_usage = Some(zeron_proto::ContextUsage {
+        tokens: 392_000,
+        context_window: 828_000,
+    });
+    doc.upsert_session(&with_usage).unwrap();
+    assert_eq!(doc.read_sessions().unwrap(), vec![with_usage.clone()]);
+
+    let bytes = doc.to_bytes().unwrap();
+    let reloaded = RegistryDoc::from_bytes(&bytes, "dev-a").unwrap();
+    assert_eq!(
+        reloaded.read_sessions().unwrap(),
+        vec![with_usage.clone()],
+        "context usage must survive a snapshot reload (the restart path)"
+    );
+
+    // A later silent turn clears the measurement: the null write removes it.
+    let cleared = session("chat-1", "dev-a", SessionStatus::Idle);
+    doc.upsert_session(&cleared).unwrap();
+    assert_eq!(doc.read_sessions().unwrap()[0].context_usage, None);
 }
 
 #[test]
@@ -879,4 +908,21 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
         doc.chat("chat-1").unwrap().unwrap().title.as_deref(),
         Some("live rename")
     );
+}
+
+#[test]
+fn completion_marker_replicates_and_survives_next_turn() {
+    let mut source = RegistryDoc::new("dev-a");
+    let mut viewer = RegistryDoc::new("dev-b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+    row.last_completed_turn = Some("turn-one".into());
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+    row.status = SessionStatus::Working;
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }

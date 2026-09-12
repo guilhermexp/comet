@@ -20,8 +20,11 @@ pub(crate) mod antigravity_usage;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
+pub(crate) mod cursor_usage;
 pub mod diff_sync;
 pub mod doc_host;
+mod fd_limit;
+pub(crate) mod grok_usage;
 pub mod instance_lock;
 pub(crate) mod kimi_usage;
 pub mod live_voice;
@@ -29,6 +32,7 @@ pub mod local_import;
 pub(crate) mod process;
 pub mod profile;
 mod provider_usage_archive;
+pub mod recap;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -40,16 +44,18 @@ pub mod terminals;
 pub mod titles;
 pub mod trajectory_store;
 pub mod uploads;
+pub mod workspace_files;
 pub mod workspace_host;
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
+    CheckoutDiffSync, CheckoutPin, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
     read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use fd_limit::raise_nofile_limit;
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -67,6 +73,7 @@ pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use trajectory_store::TrajectoryStore;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use workspace_files::WorkspaceFiles;
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
@@ -128,7 +135,9 @@ pub struct EngineCore {
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
+    pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -249,6 +258,15 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        // Seed live statuses from the persisted workspace rows so a settled
+        // session's context-window usage survives an app restart: the merged
+        // WatchSessions lets the local live view win, and that map starts empty.
+        // Runs BEFORE recover_stale so its Idle transition keeps the seeded
+        // context_usage instead of inserting a fresh None entry.
+        match workspace.read_sessions() {
+            Ok(persisted) => sessions.hydrate_persisted_statuses(persisted),
+            Err(err) => tracing::warn!(error = %err, "session status hydration skipped"),
+        }
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
@@ -258,7 +276,15 @@ impl EngineCore {
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
+        let workspace_files =
+            WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
+        let previews = zeron_preview::PreviewService::new(
+            profile.store_root().join("previews.json"),
+            device_id.clone(),
+            local_device_name(&device_id),
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
@@ -306,7 +332,9 @@ impl EngineCore {
             workspace,
             registry,
             repos,
+            workspace_files,
             terminals,
+            previews,
             change_requests,
             diff_sync,
             spaces_sync,
@@ -437,6 +465,7 @@ impl EngineCore {
             self.workspace.clone(),
             self.registry.clone(),
             self.repos.clone(),
+            self.workspace_files.clone(),
             self.terminals.clone(),
             self.change_requests.clone(),
             self.diff_sync.clone(),
@@ -446,7 +475,8 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_trajectory_store(self.trajectory.clone())
-        .with_run_journal(self.sessions.run_journal());
+        .with_run_journal(self.sessions.run_journal())
+        .with_previews(self.previews.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -463,6 +493,7 @@ impl EngineCore {
     /// draining. Connected sockets remain authorized by their handshake, so
     /// clearing credentials alone is not a security boundary.
     pub fn disconnect_edge(&self) {
+        self.previews.stop();
         if let Some(links) = self.links() {
             links.disconnect_all();
         }
@@ -474,6 +505,7 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.previews.shutdown().await;
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
@@ -499,6 +531,7 @@ impl EngineCore {
             updater.shutdown().await;
         }
         self.diff_sync.shutdown().await;
+        self.workspace_files.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
@@ -749,6 +782,7 @@ impl Engine {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
+        let preview_org = profile.org_id().to_string();
         let core = match lock {
             Some(lock) => EngineCore::assemble_with_profile_locked(
                 profile,
@@ -765,16 +799,35 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        let preview_workspace = core.workspace.clone();
+        let preview_device = core.device_id.clone();
+        let projects = Arc::new(move || {
+            preview_workspace
+                .read_chats()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|chat| chat.device_id == preview_device)
+                .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
+                .collect()
+        });
+        let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
+            edge_url: config.edge_url.clone(),
+            org_id: preview_org,
+            tokens: Arc::new(auth.clone()),
+        });
+        core.previews.start(projects, preview_signaling).await;
         if edge_enabled {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
             // on quiescence so a restart never lands under a live run or open PTY.
-            let quiescent: zeron_update::QuiescentCheck = {
-                let sessions = core.sessions.clone();
-                let terminals = core.terminals.clone();
-                Arc::new(move || !sessions.any_active() && !terminals.any_open())
-            };
-            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            let sessions = core.sessions.clone();
+            let terminals = core.terminals.clone();
+            let gate = zeron_update::RestartGate::new(Some(Arc::new(move || {
+                !sessions.any_active() && !terminals.any_open()
+            })));
+            core.sessions.set_restart_gate(gate.clone());
+            core.terminals.set_restart_gate(gate.clone());
+            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(gate));
             if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
                 let updater_for_tokens = updater.clone();
                 let wake = tokio::spawn(async move {

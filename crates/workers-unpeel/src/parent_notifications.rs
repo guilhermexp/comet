@@ -23,9 +23,9 @@ struct WorkerParentBinding {
     #[serde(default)]
     submitted_at_unix_ms: u64,
     #[serde(default)]
-    baseline_processes: Vec<(u32, u64)>,
-    #[serde(default)]
     acknowledged_completed_episode: Option<u64>,
+    #[serde(default)]
+    acknowledged_completed_generation: Option<u64>,
     #[serde(default, alias = "acknowledged_event_ids")]
     acknowledged_notification_ids: HashSet<String>,
 }
@@ -37,33 +37,26 @@ pub struct WorkerParentLink {
     pub registered_at_unix_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Completion evidence: the runtime said the turn ended and the output has
+/// stopped growing. Process liveness is deliberately NOT part of this — a
+/// worker keeps long-lived service children (MCP servers) alive for the whole
+/// session, so "no process outside a launch-time snapshot" was unsatisfiable
+/// for any runtime that boots one, and the snapshot itself raced the children.
+/// Judging what the worker actually delivered is the orchestrator's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCompletionEvidence {
-    pub inspection_complete: bool,
     pub output_quiescent: bool,
-    pub live_processes: Vec<(u32, u64)>,
 }
 
 impl WorkerCompletionEvidence {
     pub fn quiescent() -> Self {
-        Self::with_live_processes(Vec::new())
-    }
-
-    pub fn with_live_processes(live_processes: Vec<(u32, u64)>) -> Self {
         Self {
-            inspection_complete: true,
             output_quiescent: true,
-            live_processes,
         }
     }
 
-    fn permits_completion(&self, baseline: &[(u32, u64)]) -> bool {
-        self.inspection_complete
-            && self.output_quiescent
-            && self
-                .live_processes
-                .iter()
-                .all(|identity| baseline.contains(identity))
+    fn permits_completion(&self) -> bool {
+        self.output_quiescent
     }
 }
 
@@ -306,8 +299,8 @@ fn register_in_state(
             active_task_episode: 0,
             task_episode_active: false,
             submitted_at_unix_ms: 0,
-            baseline_processes: Vec::new(),
             acknowledged_completed_episode: None,
+            acknowledged_completed_generation: None,
             acknowledged_notification_ids: HashSet::new(),
         },
     )
@@ -317,7 +310,6 @@ fn begin_task_in_state(
     state: &mut Map<String, Value>,
     session_id: &str,
     submitted_at_unix_ms: u64,
-    baseline_processes: Vec<(u32, u64)>,
     active: bool,
 ) -> Result<u64, String> {
     let value = state
@@ -335,7 +327,6 @@ fn begin_task_in_state(
     binding.active_task_episode = binding.active_task_episode.saturating_add(1).max(1);
     binding.task_episode_active = active;
     binding.submitted_at_unix_ms = submitted_at_unix_ms;
-    binding.baseline_processes = baseline_processes;
     binding.acknowledged_notification_ids.clear();
     let episode = binding.active_task_episode;
     write_binding(state, session_id, binding)?;
@@ -371,9 +362,8 @@ fn activate_task_in_state(
 pub fn begin_worker_parent_task(
     session_id: &str,
     submitted_at_unix_ms: u64,
-    baseline_processes: Vec<(u32, u64)>,
 ) -> Result<u64, String> {
-    let episode = prepare_worker_parent_task(session_id, submitted_at_unix_ms, baseline_processes)?;
+    let episode = prepare_worker_parent_task(session_id, submitted_at_unix_ms)?;
     activate_worker_parent_task(session_id, episode)?;
     Ok(episode)
 }
@@ -381,16 +371,9 @@ pub fn begin_worker_parent_task(
 pub fn prepare_worker_parent_task(
     session_id: &str,
     submitted_at_unix_ms: u64,
-    baseline_processes: Vec<(u32, u64)>,
 ) -> Result<u64, String> {
     let episode = unpeel_core::app_state::edit(|state| {
-        begin_task_in_state(
-            state,
-            session_id,
-            submitted_at_unix_ms,
-            baseline_processes,
-            false,
-        )
+        begin_task_in_state(state, session_id, submitted_at_unix_ms, false)
     })?;
     write_task_episode_file(session_id, episode)?;
     Ok(episode)
@@ -483,10 +466,8 @@ pub fn begin_worker_parent_task_at(
     path: &Path,
     session_id: &str,
     submitted_at_unix_ms: u64,
-    baseline_processes: Vec<(u32, u64)>,
 ) -> Result<u64, String> {
-    let episode =
-        prepare_worker_parent_task_at(path, session_id, submitted_at_unix_ms, baseline_processes)?;
+    let episode = prepare_worker_parent_task_at(path, session_id, submitted_at_unix_ms)?;
     activate_worker_parent_task_at(path, session_id, episode)?;
     Ok(episode)
 }
@@ -496,16 +477,9 @@ pub fn prepare_worker_parent_task_at(
     path: &Path,
     session_id: &str,
     submitted_at_unix_ms: u64,
-    baseline_processes: Vec<(u32, u64)>,
 ) -> Result<u64, String> {
     unpeel_core::app_state::edit_at(path, |state| {
-        begin_task_in_state(
-            state,
-            session_id,
-            submitted_at_unix_ms,
-            baseline_processes,
-            false,
-        )
+        begin_task_in_state(state, session_id, submitted_at_unix_ms, false)
     })
 }
 
@@ -580,9 +554,13 @@ fn pending_from_state(
             }
         };
         let evidence = completion_evidence(session);
+        // A worker sitting on a permission prompt has a Stop in its journal and
+        // a quiescent output, so quiescence alone would announce it as done.
+        // Its own activity is the discriminator, and it costs no inspection.
         let completion_permitted = binding.acknowledged_completed_episode
             != Some(binding.active_task_episode)
-            && evidence.permits_completion(&binding.baseline_processes);
+            && session.activity != "blocked"
+            && evidence.permits_completion();
         let has_completed_event = events
             .iter()
             .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed);
@@ -665,18 +643,90 @@ fn live_completion_evidence(session: &WorkersSession) -> WorkerCompletionEvidenc
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|elapsed| elapsed.as_millis() as u64 >= COMPLETION_OUTPUT_QUIESCENCE_MS);
-    match crate::resources::current_session_process_identities(&session.id) {
-        Ok(live_processes) => WorkerCompletionEvidence {
-            inspection_complete: true,
-            output_quiescent,
-            live_processes,
-        },
-        Err(_) => WorkerCompletionEvidence {
-            inspection_complete: false,
-            output_quiescent,
-            live_processes: Vec::new(),
-        },
+    WorkerCompletionEvidence { output_quiescent }
+}
+
+fn episode_completed_from_state(
+    state: &Value,
+    session: &WorkersSession,
+    worker_session_dir: &Path,
+    evidence: WorkerCompletionEvidence,
+) -> Result<bool, String> {
+    let bindings = read_bindings(state)?;
+    let Some(binding) = bindings.get(&session.id) else {
+        return Ok(false);
+    };
+    if binding.active_task_episode == 0 {
+        return Ok(false);
     }
+    if binding.acknowledged_completed_episode == Some(binding.active_task_episode) {
+        return Ok(latched_completion_still_holds(binding, session, evidence));
+    }
+    let submission_recovered =
+        submitted_task_episode(worker_session_dir) == Some(binding.active_task_episode);
+    if !binding.task_episode_active && !submission_recovered {
+        return Ok(false);
+    }
+    let journal_events = hook_events(binding, session, worker_session_dir)?;
+    let events = match journal_events {
+        Some((events, _)) => events,
+        None => lifecycle_kind(session)
+            .map(|kind| {
+                vec![(
+                    kind,
+                    format!("{}:{}", session.runtime_generation, kind.label()),
+                    session.updated_at_unix_ms,
+                )]
+            })
+            .unwrap_or_default(),
+    };
+    let has_completed = events
+        .iter()
+        .any(|(kind, _, _)| *kind == WorkerParentNotificationKind::Completed);
+    Ok(has_completed
+        && !activity_blocks_completion(&session.activity)
+        && evidence.permits_completion())
+}
+
+fn activity_blocks_completion(activity: &str) -> bool {
+    activity == "blocked" || activity == "working"
+}
+
+fn latched_completion_still_holds(
+    binding: &WorkerParentBinding,
+    session: &WorkersSession,
+    evidence: WorkerCompletionEvidence,
+) -> bool {
+    let Some(acked_generation) = binding.acknowledged_completed_generation else {
+        return false;
+    };
+    !activity_blocks_completion(&session.activity)
+        && evidence.permits_completion()
+        && session.runtime_generation == acked_generation
+}
+
+pub fn current_episode_completed(session: &WorkersSession) -> bool {
+    let Ok(state) = unpeel_core::app_state::load() else {
+        return false;
+    };
+    episode_completed_from_state(
+        &state,
+        session,
+        &unpeel_core::session_host::session_dir(&session.id),
+        live_completion_evidence(session),
+    )
+    .unwrap_or(false)
+}
+
+#[doc(hidden)]
+pub fn current_episode_completed_with_evidence_at(
+    path: &Path,
+    session: &WorkersSession,
+    sessions_root: &Path,
+    evidence: WorkerCompletionEvidence,
+) -> Result<bool, String> {
+    let state = unpeel_core::app_state::load_for_edit_at(path)?;
+    episode_completed_from_state(&state, session, &sessions_root.join(&session.id), evidence)
 }
 
 #[doc(hidden)]
@@ -747,6 +797,7 @@ fn acknowledge_in_state(
         .insert(notification.event_id.clone());
     if notification.kind == WorkerParentNotificationKind::Completed {
         binding.acknowledged_completed_episode = Some(notification.task_episode);
+        binding.acknowledged_completed_generation = Some(notification.runtime_generation);
         binding.task_episode_active = false;
     } else if notification.kind == WorkerParentNotificationKind::Exited {
         binding.task_episode_active = false;

@@ -13,6 +13,9 @@
 //!   (`StoredSdkCredentials`) holding the named, expiring user API key its
 //!   browser login mints. Deliberately SEPARATE from `cursor-agent login`'s
 //!   whole-account session tokens, which zeron never reads.
+//! - **Grok** — `$GROK_HOME/auth.json` (default `~/.grok`): the grok.com
+//!   CLI login from `grok login`. Not the console.x.ai `apiKey` in
+//!   `user-settings.json`.
 //!
 //! Claude-swap mechanics:
 //!
@@ -56,6 +59,8 @@ use zeron_proto::{
 };
 
 use crate::antigravity_usage::AntigravityUsage;
+use crate::cursor_usage::CursorUsage;
+use crate::grok_usage::GrokUsage;
 use crate::kimi_usage::KimiUsage;
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
@@ -105,6 +110,11 @@ pub struct AgentAccountsConfig {
     /// named, expiring API key minted by its browser login. SEPARATE from
     /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
+    /// Grok home (`$GROK_HOME` or `~/.grok`) — holds `auth.json` from `grok login`.
+    pub grok_home: PathBuf,
+    /// The Cursor desktop app's global state store (`state.vscdb`) — holds the
+    /// WorkOS session token the subscription Usage probe needs. Read-only.
+    pub cursor_state_db: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -127,7 +137,15 @@ impl AgentAccountsConfig {
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
+            grok_home: env_dir("GROK_HOME").unwrap_or_else(|| home_dir().join(".grok")),
+            cursor_state_db: Self::cursor_state_db_default(),
         }
+    }
+    /// The Cursor desktop state store, per platform (macOS
+    /// `~/Library/Application Support/Cursor`, Linux `~/.config/Cursor`,
+    /// Windows `%APPDATA%/Cursor`).
+    pub fn cursor_state_db_default() -> PathBuf {
+        crate::cursor_usage::default_state_db_path()
     }
 
     fn claude_creds_file(&self) -> PathBuf {
@@ -136,6 +154,9 @@ impl AgentAccountsConfig {
 
     fn codex_auth_file(&self) -> PathBuf {
         self.codex_home.join("auth.json")
+    }
+    fn grok_auth_file(&self) -> PathBuf {
+        self.grok_home.join("auth.json")
     }
 
     fn root_dir(&self) -> PathBuf {
@@ -151,6 +172,8 @@ impl AgentAccountsConfig {
             && self.claude_config_file == detected.claude_config_file
             && self.codex_home == detected.codex_home
             && self.cursor_sdk_auth_file == detected.cursor_sdk_auth_file
+            && self.grok_home == detected.grok_home
+            && self.cursor_state_db == detected.cursor_state_db
     }
 }
 
@@ -262,6 +285,14 @@ struct Inner {
     kimi_setup_warning: Option<String>,
     antigravity_usage: Option<AntigravityUsage>,
     antigravity_setup_warning: Option<String>,
+    grok_usage: Option<GrokUsage>,
+    grok_setup_warning: Option<String>,
+    cursor_usage: Option<CursorUsage>,
+    cursor_setup_warning: Option<String>,
+    /// `"{harness}:{accountKey}"` → last successfully probed windows. A failed
+    /// or skipped forced probe serves these instead of rendering the failure
+    /// as empty usage.
+    last_good_usage: Mutex<HashMap<String, UsageSnapshot>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -291,18 +322,48 @@ impl AgentAccounts {
         } else {
             (None, None)
         };
+        let (grok_usage, grok_setup_warning) = if config.uses_detected_paths() {
+            match GrokUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+        let (cursor_usage, cursor_setup_warning) = if config.uses_detected_paths() {
+            match CursorUsage::production() {
+                Ok(usage) => (Some(usage), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
         Self::new_inner(
             config,
             kimi_usage,
             kimi_setup_warning,
             antigravity_usage,
             antigravity_setup_warning,
+            grok_usage,
+            grok_setup_warning,
+            cursor_usage,
+            cursor_setup_warning,
         )
     }
 
     #[cfg(test)]
     fn new_with_kimi_usage(config: AgentAccountsConfig, kimi_usage: KimiUsage) -> Self {
-        Self::new_inner(config, Some(kimi_usage), None, None, None)
+        Self::new_inner(
+            config,
+            Some(kimi_usage),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -310,7 +371,47 @@ impl AgentAccounts {
         config: AgentAccountsConfig,
         antigravity_usage: AntigravityUsage,
     ) -> Self {
-        Self::new_inner(config, None, None, Some(antigravity_usage), None)
+        Self::new_inner(
+            config,
+            None,
+            None,
+            Some(antigravity_usage),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_grok_usage(config: AgentAccountsConfig, grok_usage: GrokUsage) -> Self {
+        Self::new_inner(
+            config,
+            None,
+            None,
+            None,
+            None,
+            Some(grok_usage),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_cursor_usage(config: AgentAccountsConfig, cursor_usage: CursorUsage) -> Self {
+        Self::new_inner(
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(cursor_usage),
+            None,
+        )
     }
 
     fn new_inner(
@@ -319,6 +420,10 @@ impl AgentAccounts {
         kimi_setup_warning: Option<String>,
         antigravity_usage: Option<AntigravityUsage>,
         antigravity_setup_warning: Option<String>,
+        grok_usage: Option<GrokUsage>,
+        grok_setup_warning: Option<String>,
+        cursor_usage: Option<CursorUsage>,
+        cursor_setup_warning: Option<String>,
     ) -> Self {
         // Startup sweep: a previous process that crashed mid-login leaves
         // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
@@ -347,6 +452,11 @@ impl AgentAccounts {
                 kimi_setup_warning,
                 antigravity_usage,
                 antigravity_setup_warning,
+                grok_usage,
+                grok_setup_warning,
+                cursor_usage,
+                cursor_setup_warning,
+                last_good_usage: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -374,6 +484,26 @@ impl AgentAccounts {
                     .cloned()
                     .map(|message| AgentAccountWarning {
                         harness: HarnessId::Antigravity,
+                        message,
+                    }),
+            )
+            .chain(
+                self.inner
+                    .grok_setup_warning
+                    .iter()
+                    .cloned()
+                    .map(|message| AgentAccountWarning {
+                        harness: HarnessId::Grok,
+                        message,
+                    }),
+            )
+            .chain(
+                self.inner
+                    .cursor_setup_warning
+                    .iter()
+                    .cloned()
+                    .map(|message| AgentAccountWarning {
+                        harness: HarnessId::Cursor,
                         message,
                     }),
             )
@@ -407,12 +537,30 @@ impl AgentAccounts {
         };
         let antigravity = async {
             match &self.inner.antigravity_usage {
-                Some(usage) => Some(usage.snapshot(force_usage, Utc::now().timestamp()).await),
+                Some(usage) => usage.snapshots(force_usage, Utc::now().timestamp()).await,
+                None => Vec::new(),
+            }
+        };
+        let grok = async {
+            match &self.inner.grok_usage {
+                Some(usage) => Some(usage.snapshot(force_usage, Utc::now()).await),
                 None => None,
             }
         };
-        let (local_usage, (claude, claude_warning), kimi, antigravity) =
-            tokio::join!(local_usage, self.detect_claude(), kimi, antigravity);
+        let cursor = async {
+            match &self.inner.cursor_usage {
+                Some(usage) => Some(usage.snapshot(force_usage).await),
+                None => None,
+            }
+        };
+        let (local_usage, (claude, claude_warning), kimi, antigravity, grok, cursor) = tokio::join!(
+            local_usage,
+            self.detect_claude(),
+            kimi,
+            antigravity,
+            grok,
+            cursor
+        );
         if let Some(message) = claude_warning {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::ClaudeCode,
@@ -496,31 +644,79 @@ impl AgentAccounts {
                 });
             }
         }
-        if let Some(antigravity) = &antigravity {
+        if let Some(antigravity) = antigravity.first() {
             if let Some(message) = &antigravity.warning {
                 warnings.push(AgentAccountWarning {
                     harness: HarnessId::Antigravity,
                     message: message.clone(),
                 });
             }
-            if antigravity.present {
-                accounts.push(AgentAccount {
-                    id: "antigravity-managed".into(),
-                    harness: HarnessId::Antigravity,
-                    email: antigravity.email.clone(),
-                    plan_label: Some("Managed".into()),
-                    active: true,
-                    usage_windows: antigravity.usage_windows.clone(),
-                    usage_lines: Vec::new(),
-                    display_name: Some("Antigravity".into()),
-                    organization: None,
-                    auth_kind: Some(AgentAuthKind::Oauth),
-                    switchable: false,
-                    saved_at: None,
-                });
+        }
+        for (index, antigravity) in antigravity.into_iter().enumerate() {
+            if !antigravity.present {
+                continue;
             }
+            let id = antigravity
+                .email
+                .as_deref()
+                .map(|email| format!("antigravity-managed-{email}"))
+                .unwrap_or_else(|| format!("antigravity-managed-{index}"));
+            accounts.push(AgentAccount {
+                id,
+                harness: HarnessId::Antigravity,
+                email: antigravity.email.clone(),
+                plan_label: Some("Managed".into()),
+                active: true,
+                usage_windows: antigravity.usage_windows.clone(),
+                usage_lines: Vec::new(),
+                display_name: Some("Antigravity".into()),
+                organization: None,
+                auth_kind: Some(AgentAuthKind::Oauth),
+                switchable: false,
+                saved_at: None,
+            });
         }
         accounts.extend(cursor_accounts);
+        if let Some(usage) = grok {
+            if let Some(message) = &usage.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Grok,
+                    message: message.clone(),
+                });
+            }
+            if usage.present
+                && let Some(mut account) = self.detect_grok_login()
+            {
+                account.usage_windows = usage.usage_windows;
+                accounts.push(account);
+            }
+        } else if let Some(account) = self.detect_grok_login() {
+            accounts.push(account);
+        }
+        if let Some(usage) = cursor {
+            if let Some(message) = &usage.warning {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Cursor,
+                    message: message.clone(),
+                });
+            }
+            if usage.present && !usage.usage_windows.is_empty() {
+                // The desktop session owns the quota: it attaches to the
+                // Cursor account with the same email, falling back to the
+                // active account when the session carries none. A mismatch
+                // attaches nothing rather than misattributing quota.
+                let target = accounts.iter_mut().find(|account| {
+                    account.harness == HarnessId::Cursor
+                        && match usage.email.as_deref() {
+                            Some(email) => account.email.as_deref() == Some(email),
+                            None => account.active,
+                        }
+                });
+                if let Some(account) = target {
+                    account.usage_windows = usage.usage_windows;
+                }
+            }
+        }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
@@ -1210,6 +1406,11 @@ impl AgentAccounts {
         read_json(&self.inner.config.cursor_sdk_auth_file).and_then(parse_cursor_auth)
     }
 
+    fn detect_grok_login(&self) -> Option<AgentAccount> {
+        let auth = read_json(&self.inner.config.grok_auth_file())?;
+        parse_grok_login(auth)
+    }
+
     /// A live cursor login that runs can actually use: present, parseable,
     /// and not past the minted key's expiry.
     fn cursor_live_usable(&self) -> bool {
@@ -1403,6 +1604,15 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot).await,
             _ => None,
+        };
+        // Last-known-good: a transient probe failure must not erase rendered
+        // quota. Successes refresh the store; failures serve it.
+        let usage = match usage {
+            Some(usage) => {
+                lock(&self.inner.last_good_usage).insert(key.clone(), usage.clone());
+                Some(usage)
+            }
+            None => lock(&self.inner.last_good_usage).get(&key).cloned(),
         };
         lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
         usage
@@ -1965,6 +2175,40 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
+fn parse_grok_login(auth: serde_json::Value) -> Option<AgentAccount> {
+    let entries = auth.as_object()?;
+    for entry in entries.values() {
+        let Some(email) = str_field(entry, "email") else {
+            continue;
+        };
+        let Some(key) = str_field(entry, "key").filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        let _ = key;
+        let first = str_field(entry, "first_name").unwrap_or_default();
+        let last = str_field(entry, "last_name").unwrap_or_default();
+        let display_name = format!("{first} {last}").trim().to_string();
+        return Some(AgentAccount {
+            id: "grok-cli-managed".into(),
+            harness: HarnessId::Grok,
+            email: Some(email),
+            plan_label: Some("Managed".into()),
+            active: true,
+            usage_windows: Vec::new(),
+            usage_lines: Vec::new(),
+            display_name: Some(if display_name.is_empty() {
+                "Grok".into()
+            } else {
+                display_name
+            }),
+            organization: None,
+            auth_kind: Some(AgentAuthKind::Oauth),
+            switchable: false,
+            saved_at: None,
+        });
+    }
+    None
+}
 /// Present, parseable, and unexpired — what a run can actually use.
 fn cursor_key_usable(auth: &serde_json::Value) -> bool {
     str_field(auth, "apiKey").is_some()
@@ -2215,6 +2459,8 @@ mod tests {
             claude_config_file: root.path().join("claude.json"),
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let credential = root
             .path()
@@ -2264,6 +2510,8 @@ mod tests {
             claude_config_file: root.path().join("claude.json"),
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let cred_dir = root.path().join("cli-proxy");
         std::fs::create_dir_all(&cred_dir).unwrap();
@@ -2301,6 +2549,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn antigravity_pool_lists_every_directory_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
+        };
+        let cred_dir = root.path().join("cli-proxy");
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        for (email, token) in [
+            ("one@gmail.com", "ya29.one-private"),
+            ("two@gmail.com", "ya29.two-private"),
+        ] {
+            std::fs::write(
+                cred_dir.join(format!("antigravity-{email}.json")),
+                format!(
+                    r#"{{"access_token":"{token}","refresh_token":"1//{email}-rt","expired":"2099-01-01T00:00:00Z","disabled":false}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let antigravity = crate::antigravity_usage::AntigravityUsage::new(
+            cred_dir,
+            "http://127.0.0.1:1/v1internal:retrieveUserQuotaSummary".into(),
+            "http://127.0.0.1:1/token".into(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let snapshot = AgentAccounts::new_with_antigravity_usage(config, antigravity)
+            .list(false)
+            .await
+            .unwrap();
+        let emails: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.harness == HarnessId::Antigravity)
+            .map(|account| account.email.clone())
+            .collect();
+        assert_eq!(
+            emails,
+            [Some("one@gmail.com".into()), Some("two@gmail.com".into())]
+        );
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("ya29.one-private"));
+        assert!(!wire.contains("ya29.two-private"));
+    }
+
+    #[tokio::test]
     async fn kimi_windows_survive_forced_then_non_forced_account_lists() {
         use std::os::unix::fs::PermissionsExt as _;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2312,6 +2613,8 @@ mod tests {
             claude_config_file: root.path().join("claude.json"),
             codex_home: root.path().join("codex"),
             cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
         };
         let credential = root
             .path()
@@ -2365,6 +2668,253 @@ mod tests {
         assert_eq!(windows(&cached), Some(1));
     }
 
+    #[tokio::test]
+    async fn grok_account_carries_windows_from_usage_and_no_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
+        };
+        let credential = config.grok_auth_file();
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credential,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "https://auth.x.ai::test-client": {
+                    "key": "test-key-private",
+                    "refresh_token": "test-refresh-private",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "oidc_client_id": "test-client",
+                    "oidc_issuer": "https://auth.x.ai",
+                    "email": "user@example.com",
+                    "first_name": "Test",
+                    "last_name": "User"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = "{\"config\":{\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"start\":\"2026-09-05T17:00:00Z\",\"end\":\"2026-09-12T17:00:00Z\"},\"creditUsagePercent\":50.0}}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let grok = crate::grok_usage::GrokUsage::from_paths(
+            credential,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+            Duration::from_secs(1),
+            [Duration::ZERO, Duration::ZERO],
+            [Duration::ZERO; 5],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_grok_usage(config, grok);
+
+        let snapshot = accounts.list(true).await.unwrap();
+        server.await.unwrap();
+
+        let grok_account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Grok)
+            .expect("Grok account present");
+
+        assert_eq!(grok_account.usage_windows.len(), 1);
+        assert_eq!(grok_account.usage_windows[0].label, "Weekly");
+        assert_eq!(grok_account.email.as_deref(), Some("user@example.com"));
+
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("test-key-private"));
+        assert!(!wire.contains("test-refresh-private"));
+    }
+
+    #[tokio::test]
+    async fn cursor_desktop_session_usage_attaches_to_matching_account() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("state.vscdb"),
+        };
+        std::fs::create_dir_all(config.cursor_sdk_auth_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config.cursor_sdk_auth_file,
+            serde_json::json!({
+                "version": 1,
+                "backendUrl": "https://api2.cursor.sh",
+                "apiKey": "crsr_test_private",
+                "apiKeyExpiresAtMs": 99999999999999_i64,
+                "email": "user@example.com",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&config.cursor_state_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+             INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', 'workos-token-private');
+             INSERT INTO ItemTable VALUES ('cursorAuth/cachedEmail', 'user@example.com');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0_u8; 1024];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            let body = r#"{"billingCycleEnd":"1791325989000","planUsage":{"totalSpend":4433,"limit":7000}}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let cursor = crate::cursor_usage::CursorUsage::from_paths(
+            config.cursor_state_db.clone(),
+            format!("http://{address}"),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new_with_cursor_usage(config, cursor);
+        let snapshot = accounts.list(true).await.unwrap();
+        server.await.unwrap();
+
+        let cursor_account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Cursor)
+            .expect("Cursor account present");
+        assert_eq!(cursor_account.usage_windows.len(), 1);
+        assert_eq!(cursor_account.usage_windows[0].label, "Monthly");
+        assert_eq!(cursor_account.email.as_deref(), Some("user@example.com"));
+        assert!(
+            (cursor_account.usage_windows[0].used_fraction - (4433.0 / 7000.0) as f32).abs()
+                < 0.001
+        );
+
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("crsr_test_private"));
+        assert!(!wire.contains("workos-token-private"));
+    }
+
+    #[tokio::test]
+    #[ignore = "hits live grok CLI endpoints if auth.json is present"]
+    async fn live_grok_usage_smoke() {
+        let home = crate::repos::home_dir();
+        let auth_file = home.join(".grok").join("auth.json");
+        if !auth_file.exists() {
+            eprintln!("skipped: no ~/.grok/auth.json");
+            return;
+        }
+        let grok = crate::grok_usage::GrokUsage::production().expect("production client");
+        let snapshot = grok.snapshot(true, chrono::Utc::now()).await;
+        eprintln!(
+            "live grok snapshot: present={} windows={} warning={:?}",
+            snapshot.present,
+            snapshot.usage_windows.len(),
+            snapshot.warning
+        );
+        if let Some(w) = snapshot.usage_windows.first() {
+            eprintln!(
+                "  window: label={} used={:.1}% resets={:?}",
+                w.label,
+                w.used_fraction * 100.0,
+                w.resets_at
+            );
+        }
+        assert!(snapshot.present);
+        assert!(
+            !snapshot.usage_windows.is_empty(),
+            "expected at least 1 quota window from live grok subscription"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_good_usage_served_when_probe_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
+        };
+        let accounts =
+            AgentAccounts::new_inner(config, None, None, None, None, None, None, None, None);
+        let slot = Slot {
+            id: "codex-test".into(),
+            harness: HarnessId::Codex,
+            account_key: "acc-1".into(),
+            profile: SlotProfile {
+                email: "acc@example.com".into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({ "tokens": { "access_token": "token-1", "account_id": "aid" } }),
+            claude_config: None,
+            saved_at: 0,
+            created_at: None,
+        };
+        let key = format!("codex:{}", slot.account_key);
+
+        // Pre-populate last_good_usage directly to simulate a prior successful probe.
+        let prior_windows = vec![AgentUsageWindow {
+            label: "5h".into(),
+            used_fraction: 0.3,
+            resets_at: None,
+        }];
+        lock(&accounts.inner.last_good_usage).insert(
+            key.clone(),
+            UsageSnapshot {
+                windows: prior_windows.clone(),
+                plan_label: Some("ChatGPT Plus".into()),
+            },
+        );
+
+        // A forced probe that fails (hits the network or an invalid endpoint)
+        // falls back to the stored last-good snapshot.
+        let fallback = accounts
+            .usage_for(HarnessId::Codex, &slot, false, true)
+            .await;
+        let usage = fallback.expect("fallback serves prior good windows");
+        assert_eq!(usage.windows, prior_windows);
+        assert_eq!(usage.plan_label.as_deref(), Some("ChatGPT Plus"));
+    }
     #[test]
     fn plan_labels() {
         assert_eq!(
@@ -2558,5 +3108,76 @@ mod tests {
         let updated = with_claude_ai_oauth(&creds, serde_json::json!({ "accessToken": "new" }));
         assert_eq!(updated["claudeAiOauth"]["accessToken"], "new");
         assert_eq!(updated["mcpOAuth"]["github"]["accessToken"], "keep");
+    }
+
+    #[tokio::test]
+    async fn grok_cli_login_is_a_managed_subscription_not_an_api_key() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig {
+            data_dir: root.path().join("data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
+        };
+        std::fs::create_dir_all(&config.grok_home).unwrap();
+        std::fs::write(
+            config.grok_home.join("user-settings.json"),
+            serde_json::json!({ "apiKey": "xai-must-not-surface" }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            config.grok_home.join("auth.json"),
+            serde_json::json!({
+                "https://auth.x.ai::client": {
+                    "auth_mode": "oidc",
+                    "email": "grok-user@example.com",
+                    "first_name": "Grok",
+                    "last_name": "User",
+                    "key": "session-token-private",
+                    "refresh_token": "refresh-token-private",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let snapshot = AgentAccounts::new(config.clone())
+            .list(false)
+            .await
+            .unwrap();
+        let grok = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.harness == HarnessId::Grok)
+            .expect("grok account");
+        assert!(grok.active);
+        assert!(!grok.switchable);
+        assert_eq!(grok.auth_kind, Some(AgentAuthKind::Oauth));
+        assert_eq!(grok.plan_label.as_deref(), Some("Managed"));
+        assert_eq!(grok.email.as_deref(), Some("grok-user@example.com"));
+        assert_eq!(grok.id, "grok-cli-managed");
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("session-token-private"));
+        assert!(!wire.contains("xai-must-not-surface"));
+
+        let empty = AgentAccountsConfig {
+            data_dir: root.path().join("empty-data"),
+            claude_config_dir: root.path().join("claude"),
+            claude_config_file: root.path().join("claude.json"),
+            codex_home: root.path().join("codex"),
+            cursor_sdk_auth_file: root.path().join("cursor.json"),
+            grok_home: root.path().join("missing-grok"),
+            cursor_state_db: root.path().join("cursor-state.vscdb"),
+        };
+        let empty_snapshot = AgentAccounts::new(empty).list(false).await.unwrap();
+        assert!(
+            empty_snapshot
+                .accounts
+                .iter()
+                .all(|account| account.harness != HarnessId::Grok)
+        );
     }
 }

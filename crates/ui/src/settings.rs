@@ -7,6 +7,7 @@
 //! defaults, and loaded values are clamped so a hand-edited file can't wedge the
 //! layout.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -55,6 +56,102 @@ pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
 const FILE_NAME: &str = "ui-settings.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GitHistoryColumns {
+    pub author: bool,
+    pub date: bool,
+    pub sha: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistoryColumn {
+    Author,
+    Date,
+    Sha,
+}
+
+/// Stable order for the optional Git History columns. Hidden columns remain in
+/// the sequence so showing one again restores the position chosen by the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GitHistoryColumnOrder(pub Vec<GitHistoryColumn>);
+
+impl GitHistoryColumnOrder {
+    pub fn normalized(mut self) -> Self {
+        let mut columns = Vec::with_capacity(3);
+        for column in self.0.drain(..) {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        for column in [
+            GitHistoryColumn::Author,
+            GitHistoryColumn::Date,
+            GitHistoryColumn::Sha,
+        ] {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        Self(columns)
+    }
+}
+
+impl Default for GitHistoryColumnOrder {
+    fn default() -> Self {
+        Self(vec![
+            GitHistoryColumn::Author,
+            GitHistoryColumn::Date,
+            GitHistoryColumn::Sha,
+        ])
+    }
+}
+
+/// Persisted widths for the fixed Git History data columns. The commit column
+/// remains elastic and occupies the space left after these columns and the
+/// topology graph, so resizing its first divider adjusts the adjacent column.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GitHistoryColumnWidths {
+    pub author: f32,
+    pub date: f32,
+    pub sha: f32,
+}
+
+impl GitHistoryColumnWidths {
+    pub const AUTHOR_MIN: f32 = 44.0;
+    pub const AUTHOR_MAX: f32 = 220.0;
+    pub const DATE_MIN: f32 = 68.0;
+    pub const DATE_MAX: f32 = 180.0;
+    pub const SHA_MIN: f32 = 58.0;
+    pub const SHA_MAX: f32 = 140.0;
+
+    pub fn clamped(mut self) -> Self {
+        let defaults = Self::default();
+        self.author = clamp_or(
+            self.author,
+            Self::AUTHOR_MIN,
+            Self::AUTHOR_MAX,
+            defaults.author,
+        );
+        self.date = clamp_or(self.date, Self::DATE_MIN, Self::DATE_MAX, defaults.date);
+        self.sha = clamp_or(self.sha, Self::SHA_MIN, Self::SHA_MAX, defaults.sha);
+        self
+    }
+}
+
+impl Default for GitHistoryColumnWidths {
+    fn default() -> Self {
+        Self {
+            author: 88.0,
+            date: 88.0,
+            sha: 74.0,
+        }
+    }
+}
 
 /// Whether a settings mutation should wait for the normal coalescing window or
 /// reach disk before returning to the event loop.
@@ -143,6 +240,7 @@ pub(crate) fn apply_shell_settings(current: &mut UiSettings, shell: &UiSettings)
     current.sidebar_show_pull_request = shell.sidebar_show_pull_request;
     current.last_space_id = shell.last_space_id.clone();
     current.space_filter = shell.space_filter.clone();
+    current.workers_project_filter = shell.workers_project_filter.clone();
     current.sound_enabled = shell.sound_enabled;
     current.notifications_enabled = shell.notifications_enabled;
     current.notifications_background_only = shell.notifications_background_only;
@@ -169,6 +267,24 @@ fn schedule(policy: SavePolicy, cx: &mut App) {
             cx.global_mut::<SettingsStore>().save_task = Some(task);
         }
     }
+}
+
+impl Default for GitHistoryColumns {
+    fn default() -> Self {
+        Self {
+            author: true,
+            date: true,
+            sha: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistoryAuthorDisplay {
+    #[default]
+    Avatar,
+    Name,
 }
 
 /// Persist the latest revision. Safe to call at shutdown; no task is spawned.
@@ -249,6 +365,10 @@ pub struct UiSettings {
     /// Sidebar session filter: a space id, or `None` for "All spaces".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
+    /// Workers sidebar tree filter: a root Workers project id, or `None` for
+    /// "All projects". Device-local like every other Workers state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_project_filter: Option<String>,
     /// Legacy: per-space tab order, from when tabs were the selected space's
     /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -274,6 +394,9 @@ pub struct UiSettings {
     pub details_sidebar_width: f32,
     pub details_sidebar_open: bool,
     pub details_sidebar_preferences: crate::details_sidebar::view::DetailsSidebarPreferences,
+    /// Account ids omitted from the Usage widget. Missing id = visible.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub usage_widget_hidden_account_ids: BTreeSet<String>,
     #[serde(skip_serializing)]
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
@@ -283,6 +406,14 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Optional columns shown in every Git History pane.
+    pub git_history_columns: GitHistoryColumns,
+    /// User-adjusted widths for the resizable Git History columns.
+    pub git_history_column_widths: GitHistoryColumnWidths,
+    /// User-selected order for the optional Git History columns.
+    pub git_history_column_order: GitHistoryColumnOrder,
+    /// How authors are represented in Git History rows.
+    pub git_history_author_display: GitHistoryAuthorDisplay,
     /// Interface and conversational-prose family. Device-local by design.
     pub ui_font_family: crate::typography::UiFontFamily,
     /// Base size for interface and conversational prose. Code-related surfaces
@@ -316,6 +447,7 @@ impl Default for UiSettings {
             last_space_id: None,
             open_tabs: None,
             space_filter: None,
+            workers_project_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
@@ -327,10 +459,15 @@ impl Default for UiSettings {
             details_sidebar_open: false,
             details_sidebar_preferences:
                 crate::details_sidebar::view::DetailsSidebarPreferences::default(),
+            usage_widget_hidden_account_ids: BTreeSet::new(),
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            git_history_columns: GitHistoryColumns::default(),
+            git_history_column_widths: GitHistoryColumnWidths::default(),
+            git_history_column_order: GitHistoryColumnOrder::default(),
+            git_history_author_display: GitHistoryAuthorDisplay::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
             ui_font_size: crate::typography::UiFontSize::default(),
             theme_selection: zeron_theme::ThemeSelection::default(),
@@ -371,6 +508,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 /// rather than panicking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
+    BrowserReload,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
@@ -382,7 +520,8 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 7 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 8 + JUMP_SLOTS] = [
+        ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
@@ -404,6 +543,7 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::BrowserReload => "Reload browser page",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
@@ -426,6 +566,7 @@ impl ShortcutId {
         match self {
             ShortcutId::ToggleSidebar => "mod-s",
             ShortcutId::ToggleChanges => "mod-b",
+            ShortcutId::BrowserReload => "mod-shift-r",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
@@ -464,6 +605,7 @@ impl ShortcutId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
+    pub browser_reload: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
@@ -481,6 +623,7 @@ pub struct KeymapConfig {
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
@@ -496,6 +639,7 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
+            ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
@@ -513,6 +657,7 @@ impl KeymapConfig {
 
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
+            ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
@@ -742,6 +887,8 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.git_history_column_widths = self.git_history_column_widths.clamped();
+        self.git_history_column_order = self.git_history_column_order.normalized();
         self.keymap.heal_jump_slots();
         self
     }
@@ -784,6 +931,19 @@ impl UiSettings {
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join(FILE_NAME)
     }
+
+    pub fn usage_widget_account_visible(&self, account_id: &str) -> bool {
+        !self.usage_widget_hidden_account_ids.contains(account_id)
+    }
+
+    pub fn set_usage_widget_account_visible(&mut self, account_id: &str, visible: bool) {
+        if visible {
+            self.usage_widget_hidden_account_ids.remove(account_id);
+        } else {
+            self.usage_widget_hidden_account_ids
+                .insert(account_id.to_string());
+        }
+    }
 }
 
 fn clamp_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
@@ -821,6 +981,7 @@ mod tests {
             last_space_id: Some("space-1".into()),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
+            workers_project_filter: Some("comet-project".into()),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],
@@ -842,6 +1003,22 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            git_history_columns: GitHistoryColumns {
+                author: false,
+                date: true,
+                sha: false,
+            },
+            git_history_column_widths: GitHistoryColumnWidths {
+                author: 132.0,
+                date: 104.0,
+                sha: 82.0,
+            },
+            git_history_column_order: GitHistoryColumnOrder(vec![
+                GitHistoryColumn::Sha,
+                GitHistoryColumn::Author,
+                GitHistoryColumn::Date,
+            ]),
+            git_history_author_display: GitHistoryAuthorDisplay::Name,
             ui_font_family: crate::typography::UiFontFamily::System,
             ui_font_size: crate::typography::UiFontSize::default(),
             theme_selection: zeron_theme::ThemeSelection {
@@ -852,9 +1029,47 @@ mod tests {
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
+            usage_widget_hidden_account_ids: BTreeSet::from(["claude-1".into()]),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
+    }
+
+    #[test]
+    fn usage_widget_hidden_ids_round_trip_and_default_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = UiSettings::default();
+        assert!(settings.usage_widget_account_visible("claude-1"));
+        settings.set_usage_widget_account_visible("claude-1", false);
+        assert!(!settings.usage_widget_account_visible("claude-1"));
+        settings.save(dir.path()).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.usage_widget_account_visible("claude-1"));
+        assert!(loaded.usage_widget_account_visible("claude-2"));
+    }
+
+    #[test]
+    fn omitted_hidden_ids_field_means_every_account_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = UiSettings::path(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(loaded.usage_widget_hidden_account_ids.is_empty());
+        assert!(loaded.usage_widget_account_visible("claude-1"));
+    }
+
+    #[test]
+    fn apply_shell_settings_does_not_clobber_usage_widget_hidden_ids() {
+        let mut current = UiSettings::default();
+        current.set_usage_widget_account_visible("claude-1", false);
+        let shell = UiSettings {
+            sidebar_width: 320.0,
+            ..UiSettings::default()
+        };
+        apply_shell_settings(&mut current, &shell);
+        assert!(!current.usage_widget_account_visible("claude-1"));
+        assert_eq!(current.sidebar_width, 320.0);
     }
 
     #[test]
@@ -962,6 +1177,26 @@ mod tests {
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
         );
+        assert_eq!(
+            loaded.git_history_columns,
+            GitHistoryColumns::default(),
+            "pre-column files show the complete History table"
+        );
+        assert_eq!(
+            loaded.git_history_column_widths,
+            GitHistoryColumnWidths::default(),
+            "pre-resize files use the original History column widths"
+        );
+        assert_eq!(
+            loaded.git_history_column_order,
+            GitHistoryColumnOrder::default(),
+            "pre-reorder files use the original History column order"
+        );
+        assert_eq!(
+            loaded.git_history_author_display,
+            GitHistoryAuthorDisplay::Avatar,
+            "pre-author-display files default to avatars"
+        );
     }
 
     #[test]
@@ -1015,6 +1250,37 @@ mod tests {
         let saved = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(!saved.contains("terminalHeight"));
         assert!(!saved.contains("terminalOpen"));
+    }
+
+    #[test]
+    fn git_history_column_widths_are_clamped_and_nan_heals() {
+        let widths = GitHistoryColumnWidths {
+            author: 10_000.0,
+            date: f32::NAN,
+            sha: 1.0,
+        }
+        .clamped();
+        assert_eq!(widths.author, GitHistoryColumnWidths::AUTHOR_MAX);
+        assert_eq!(widths.date, GitHistoryColumnWidths::default().date);
+        assert_eq!(widths.sha, GitHistoryColumnWidths::SHA_MIN);
+    }
+
+    #[test]
+    fn git_history_column_order_deduplicates_and_restores_missing_columns() {
+        let order = GitHistoryColumnOrder(vec![
+            GitHistoryColumn::Sha,
+            GitHistoryColumn::Sha,
+            GitHistoryColumn::Author,
+        ])
+        .normalized();
+        assert_eq!(
+            order,
+            GitHistoryColumnOrder(vec![
+                GitHistoryColumn::Sha,
+                GitHistoryColumn::Author,
+                GitHistoryColumn::Date,
+            ])
+        );
     }
 
     #[test]
@@ -1370,5 +1636,17 @@ mod tests {
             UiSettings::load(dir.path()).terminal_height,
             TERMINAL_ABS_MAX_HEIGHT
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_history_preferences_tests {
+    #[test]
+    fn history_preferences_survive_serde_roundtrip() {
+        let value = serde_json::json!({"gitHistoryColumns":{"author":true,"date":false,"sha":false},"gitHistoryAuthorDisplay":"name"});
+        let settings: super::UiSettings = serde_json::from_value(value).unwrap();
+        let saved = serde_json::to_value(settings).unwrap();
+        assert_eq!(saved["gitHistoryColumns"]["sha"], false);
+        assert_eq!(saved["gitHistoryAuthorDisplay"], "name");
     }
 }

@@ -12,6 +12,14 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- GitHistoryPage inclui branchTips com default vazio e comparison opcional. SearchGitHistoryParams e ResolveGitAvatarsParams definem as novas requests aditivas; versões antigas podem continuar lendo páginas sem esses campos.
+
+- `preview.rs` define catálogo de serviços, porta estável e snapshot do browser. Metadados de descoberta não entram no documento Loro; pertencem ao catálogo de previews do device.
+
+- `WorkspaceTarget` ancora listagem, busca, leitura e watcher de Files em Chat/Space no device dono. Diretórios retornam cursor opaco; mudanças carregam sequência e `resyncRequired`. Estes contratos são aditivos e não alteram os links locais absolutos de Chat.
+
+- `InputResolved.answers` é aditivo e opcional: `None` preserva compatibilidade com journals antigos/cancelamentos; `Some` contém as respostas submetidas, identificadas por `question_id`.
+
 - Todo tipo que cruza processo (UI↔engine, engine↔engine via DeviceRoom, engine↔edge) mora aqui.
 - Mudar shape de tipo serializado é **breaking cross-device**: dois devices em versões diferentes falam o mesmo fio. Campo novo entra opcional/`#[serde(default)]`; remoção exige change no OpenSpec.
 - `view` e `trajectory` são puros: sem I/O, sem tokio, sem gpui. É o que permite testar as regras sem subir engine nem janela.
@@ -20,6 +28,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - A projeção pura de `group_records` identifica runs legadas pelo prefixo `legacy` do `run_id` e numera apenas runs não-legadas sequencialmente (`Run 1`, `Run 2`, etc.), já que o formato de `TrajectoryRecord` não carrega campo `is_legacy`.
 - Tipos de usage são compatíveis por serde e cruzam apenas engine↔UI; não são persistidos em Loro nem sincronizados pelo edge.
 - `HarnessId` também chaveia providers device-local de conta/Usage. Uma variante não torna um runtime executável — só o registry de harness da engine publica descritores runnable. Snapshots do Kimi carregam apenas campos normalizados de conta/quota, nunca material de credencial.
+
+- `Session.last_completed_turn` is optional/defaulted completion evidence. Interrupts, errors and liveness expiry do not advance it; subsequent Working and heartbeat rows retain it.
 
 ## Work Guidance
 

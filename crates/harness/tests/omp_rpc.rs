@@ -370,8 +370,11 @@ async fn older_omp_keeps_idle_live_available_but_rejects_session_context() {
     let support = harness.probe_live_voice(temp.path()).await.unwrap();
     assert!(support.available);
     assert!(!support.session_context);
-    assert!(support.usable(false));
-    assert!(!support.usable(true));
+    assert_eq!(support.gap(false), None);
+    assert_eq!(
+        support.gap(true),
+        Some(zeron_proto::LiveVoiceUnavailableReason::ActiveRun)
+    );
 
     let handle = harness
         .start_live_voice(LiveVoiceRequest {
@@ -1227,6 +1230,269 @@ async fn run_reports_provider_error_honestly() {
 }
 
 #[tokio::test]
+async fn local_command_output_is_preserved() {
+    let harness = fake_harness("local-command-output");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/context");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text_deltas,
+        vec![
+            "Context window: 1048576 tokens (3% used)\n".to_string(),
+            "  System prompt: 15553 tokens\n".to_string(),
+        ],
+        "local command_output text must be preserved in order"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1,
+        "local command must complete with exactly one Done"
+    );
+
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                ..
+            }
+        ),
+        "local command completion must have DoneStatus::Completed and no duplicated result"
+    );
+}
+
+#[tokio::test]
+async fn local_command_output_burst_exceeding_channel_capacity_progresses() {
+    let harness = fake_harness("local-burst-output");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/burst");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(text_deltas.len(), 300);
+    assert_eq!(text_deltas[0], "chunk-0\n");
+    assert_eq!(text_deltas[299], "chunk-299\n");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_command_empty_output_completes_without_invented_content() {
+    let harness = fake_harness("local-empty-output");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/empty");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(text_deltas.is_empty(), "empty output must not invent text");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_command_failure_preserves_partial_output_and_reports_error() {
+    let harness = fake_harness("local-failure-with-partial");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/fail");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text_deltas,
+        vec!["partial output before failure\n".to_string()]
+    );
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        ),
+        "failed local command must report DoneStatus::Errored"
+    );
+}
+
+#[tokio::test]
+async fn local_command_premature_exit_preserves_partial_output() {
+    let harness = fake_harness("local-premature-exit");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("/crash");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text_deltas,
+        vec!["partial output before exit\n".to_string()]
+    );
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event on process exit");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        ),
+        "premature exit must report DoneStatus::Errored"
+    );
+}
+
+#[tokio::test]
+async fn local_command_long_work_can_be_cancelled() {
+    let harness = fake_harness("local-long-cancel");
+    let (controls, _steer, interrupt) = controls_with_answer("Yes");
+    let request = request("/long");
+    let mut stream = harness.run(request, controls).await.unwrap();
+
+    // Wait for at least one event (SessionStarted or partial TextDelta) before cancelling
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let is_text = matches!(event, AgentEvent::TextDelta { .. });
+        events.push(event);
+        if is_text {
+            interrupt.cancel();
+            break;
+        }
+    }
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(text_deltas, vec!["working on long operation\n".to_string()]);
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event on cancellation");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            }
+        ),
+        "cancelled operation must report DoneStatus::Interrupted"
+    );
+}
+
+#[tokio::test]
+async fn prompt_omitted_agent_invoked_streams_normally() {
+    let harness = fake_harness("prompt-omitted-agent-invoked");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let request = request("normal");
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let events = collect_until_done(&mut stream).await;
+
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(text_deltas, vec!["normal prompt output".to_string()]);
+    let done = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("must produce Done event");
+    assert!(
+        matches!(
+            done,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ),
+        "normal prompt must complete"
+    );
+}
+
+#[tokio::test]
 async fn run_rejects_state_without_resume_identity() {
     let harness = fake_harness("missing-session");
     let (controls, _steer, _interrupt) = controls_with_answer("Yes");
@@ -1306,7 +1572,7 @@ async fn remote_ui_cancel_does_not_block_following_events() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::InputResolved { request_id } if request_id == "question-pending"
+        AgentEvent::InputResolved { request_id, .. } if request_id == "question-pending"
     )));
 }
 
@@ -1324,7 +1590,7 @@ async fn interactive_timeout_cancels_the_host_question_and_resumes_omp() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::InputResolved { request_id } if request_id == "question-timeout"
+        AgentEvent::InputResolved { request_id, .. } if request_id == "question-timeout"
     )));
 }
 
@@ -1358,6 +1624,237 @@ async fn oversized_workers_result_returns_a_bounded_error_to_omp() {
         event,
         AgentEvent::TextDelta { text } if text == "after oversized workers result"
     )));
+}
+
+#[tokio::test]
+async fn steer_during_pending_host_tool_is_consumed_once_after_tool_result() {
+    let hold_dir = tempfile::tempdir().unwrap();
+    let hold_path = hold_dir.path().join("hold");
+    let mut env = fake_env("workers-wait-steer");
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        hold_path.to_string_lossy().into_owned(),
+    );
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("tools-pending barrier")
+            .expect("stream")
+            .unwrap();
+        let pending = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "tools-pending"
+        );
+        events.push(event);
+        if pending {
+            steer
+                .send(SteerMessage {
+                    prompt: "steer-now".into(),
+                    message_id: Some("m-steer".into()),
+                })
+                .await
+                .unwrap();
+            std::fs::write(&hold_path, b"go").unwrap();
+            break;
+        }
+    }
+    events.extend(
+        tokio::time::timeout(Duration::from_secs(8), collect_until_done(&mut stream))
+            .await
+            .expect("pending host tools plus steer must complete"),
+    );
+    let _ = std::fs::remove_file(&hold_path);
+
+    let before = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "before-steer-tail"),
+    );
+    let steered = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }));
+    let after = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TextDelta { text } if text == "after wait"));
+    let before = before.expect("previous-task tail before ACK must stay visible");
+    let steered = steered.expect("steer consumption must emit Steered once");
+    let after = after.expect("consumed steer must continue the run");
+    assert!(
+        before < steered,
+        "leftover previous-task frame must not open a new frontier: {events:?}"
+    );
+    assert!(
+        steered < after,
+        "post-steer text belongs after the consumption frontier: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "steer prompt processed exactly once: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn steer_queued_during_host_tool_cancel_is_consumed_once() {
+    let hold_dir = tempfile::tempdir().unwrap();
+    let hold_path = hold_dir.path().join("hold");
+    let cancel_dir = tempfile::tempdir().unwrap();
+    let cancel_path = cancel_dir.path().join("cancel");
+    let mut env = fake_env("workers-steer-cancel");
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        hold_path.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "FAKE_OMP_CANCEL_MARKER".into(),
+        cancel_path.to_string_lossy().into_owned(),
+    );
+
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_env(env)
+        .with_workers_mcp_executable(fake_workers_controller_path())
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+    let (controls, steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("tools-pending barrier")
+            .expect("stream")
+            .unwrap();
+        let pending = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "tools-pending"
+        );
+        events.push(event);
+        if pending {
+            steer
+                .send(SteerMessage {
+                    prompt: "steer-now".into(),
+                    message_id: Some("m-steer".into()),
+                })
+                .await
+                .unwrap();
+            std::fs::write(&cancel_path, b"cancel").unwrap();
+            break;
+        }
+    }
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("cancelled toolResult")
+            .expect("stream")
+            .unwrap();
+        let cancelled = matches!(
+            &event,
+            AgentEvent::TextDelta { text } if text == "cancelled-delivered"
+        );
+        events.push(event);
+        if cancelled {
+            std::fs::write(&hold_path, b"late").unwrap();
+            break;
+        }
+    }
+    events.extend(
+        tokio::time::timeout(Duration::from_secs(8), collect_until_done(&mut stream))
+            .await
+            .expect("cancelled host tool plus steer must complete"),
+    );
+    let _ = std::fs::remove_file(&hold_path);
+    let _ = std::fs::remove_file(&cancel_path);
+
+    let cancelled = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "cancelled-delivered"),
+    );
+    let before = events.iter().position(
+        |event| matches!(event, AgentEvent::TextDelta { text } if text == "before-steer-tail"),
+    );
+    let steered = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }));
+    let after = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TextDelta { text } if text == "after wait"));
+    let cancelled = cancelled.expect("cancelled toolResult must reach OMP before steer");
+    let before = before.expect("previous-task tail must stay visible");
+    let steered = steered.expect("steer consumption must emit Steered once");
+    let after = after.expect("consumed steer must continue the run");
+    assert!(
+        cancelled < before,
+        "cancelled toolResult must precede leftover and steer: {events:?}"
+    );
+    assert!(
+        before < steered,
+        "leftover previous-task frame must not open a new frontier: {events:?}"
+    );
+    assert!(
+        steered < after,
+        "post-steer text belongs after the consumption frontier: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "steer prompt processed exactly once: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn duplicate_host_tool_id_delivers_one_result() {
+    let harness = fake_harness("workers-duplicate-id");
+    let (controls, _steer, _interrupt) = controls_with_answer("Yes");
+    let mut run_request = request("workers");
+    run_request.enable_workers_mcp = true;
+    run_request.workers_parent_chat_id = Some("chat-1".into());
+    let mut stream = harness.run(run_request, controls).await.unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), collect_until_done(&mut stream))
+        .await
+        .expect("duplicate host_tool_call id must complete with one result");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { text } if text == "after-dup"
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1531,4 +2028,63 @@ fn workers_bridge_timeout_strictly_exceeds_tool_blocking_ceiling() {
         zeron_workers_unpeel::WAIT_FOR_STATUS_MAX_TIMEOUT_SECONDS + 60,
         "native runtimes' MCP client deadline is pinned to the controller ceiling plus slack"
     );
+}
+
+#[test]
+fn omp_normalizer_handles_web_tools_and_structured_clean_outputs() {
+    let mut normalizer = zeron_harness::omp::normalize::OmpNormalizer::new("/tmp", "test-model");
+
+    // web_search
+    let search_events = normalizer.push(json!({
+        "type": "tool_execution_start",
+        "toolCallId": "search_1",
+        "toolName": "web_search",
+        "args": { "query": "rust async patterns" }
+    }));
+    assert_eq!(search_events.len(), 1);
+    assert!(matches!(
+        &search_events[0],
+        AgentEvent::ToolCall {
+            id,
+            call: ToolCall::WebSearch { query }
+        } if id == "search_1" && query == "rust async patterns"
+    ));
+
+    // fetch
+    let fetch_events = normalizer.push(json!({
+        "type": "tool_execution_start",
+        "toolCallId": "fetch_1",
+        "toolName": "fetch",
+        "args": { "url": "https://crates.io", "prompt": "extract name" }
+    }));
+    assert_eq!(fetch_events.len(), 1);
+    assert!(matches!(
+        &fetch_events[0],
+        AgentEvent::ToolCall {
+            id,
+            call: ToolCall::WebFetch { url, prompt: Some(prompt) }
+        } if id == "fetch_1" && url == "https://crates.io" && prompt == "extract name"
+    ));
+
+    // tool_execution_end with structured JSON output containing text field
+    let end_events = normalizer.push(json!({
+        "type": "tool_execution_end",
+        "toolCallId": "search_1",
+        "toolName": "web_search",
+        "result": {
+            "text": "Top result: The Rust Programming Language",
+            "details": { "count": 1 }
+        },
+        "isError": false
+    }));
+    assert_eq!(end_events.len(), 1);
+    assert!(matches!(
+        &end_events[0],
+        AgentEvent::ToolResult {
+            id,
+            output: Some(out),
+            is_error: false,
+            ..
+        } if id == "search_1" && out == "Top result: The Rust Programming Language"
+    ));
 }

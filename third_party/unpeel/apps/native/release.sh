@@ -122,16 +122,6 @@ if [ "$DRY_RUN" -eq 0 ]; then
       source, fetch origin/main, then rerun the release."
 fi
 
-# Every published release must have a website changelog entry (a `## <version>`
-# heading in apps/website/app/changelog.md) — the site's /changelog page renders it.
-# Dry runs are exempt (local iteration). After publishing, deploy the site
-# (`cd apps/website && npm run deploy`) so the entry goes live.
-CHANGELOG_MD="$REPO_ROOT/apps/website/app/changelog.md"
-if [ "$DRY_RUN" -eq 0 ] && ! grep -qE "^## $VERSION( |$)" "$CHANGELOG_MD" 2>/dev/null; then
-  fail "no changelog entry for $VERSION — add a '## $VERSION — <date>' section to
-      apps/website/app/changelog.md (newest first), then deploy the site after release."
-fi
-
 # Computer Use is deliberately absent from release bundles until its
 # TCC-bearing daemon is isolated from same-UID hosted code. build-app.sh
 # includes cua-driver only when UNPEEL_DEV_BUILD=1.

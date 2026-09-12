@@ -1,7 +1,7 @@
 # Third-party notices
 
 Comet bundles the following syntax-highlighting components. Their parsers and
-queries are consumed from the pinned Rust crates listed in `Cargo.lock`.
+queries are consumed from the pinned Rust crates listed in `Cargo.lock`, except the project-owned Kotlin query adapted from zeronsh/comet (MIT), stored at `crates/syntax/queries/kotlin/highlights.scm`.
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
@@ -73,6 +73,7 @@ by Zeron. Their names identify the corresponding palette adaptations.
 | Shades of Purple | `e8eb49f33e5db05ceba6677367b33ddb27ad821c` | [MIT text with an additional “With condition” section](https://github.com/ahmadawais/shades-of-purple-vscode/blob/e8eb49f33e5db05ceba6677367b33ddb27ad821c/LICENSE.md); Zeron is MIT-licensed, satisfying the stated condition |
 | Cobalt2 | `c4e9574372b85afad1682ed0fdd1ac0411c62512` | [MIT](https://github.com/wesbos/cobalt2-vscode/blob/c4e9574372b85afad1682ed0fdd1ac0411c62512/LICENSE) |
 | Andromeda | `d1abb48c69493000aa0133a32d594eb25e523d4f` | [MIT](https://github.com/EliverLara/Andromeda/blob/d1abb48c69493000aa0133a32d594eb25e523d4f/LICENSE.md) |
+| MonoCode | `65fbe78` | [MIT](https://github.com/hardbeat920/monocode/blob/65fbe78/LICENSE) |
 
 The palette values are adapted under the corresponding upstream license. The
 linked license pages contain each project's copyright and permission notice and
@@ -98,6 +99,7 @@ Copyright notices retained from those pinned upstream licenses:
 - Copyright (c) 2015-∞ Ahmad Awais
 - Copyright (c) 2018 Wes Bos, Roberto Achar
 - Copyright (c) 2017 <eliverlara@gmail.com>
+- Copyright (c) 2026 Nick
 
 The common MIT permission notice for the adaptations above follows:
 
@@ -121,3 +123,9 @@ The common MIT permission notice for the adaptations above follows:
 
 The pinned Shades of Purple license additionally says that anything built with
 it should also be MIT licensed. Zeron is distributed under MIT terms.
+
+## GPUI / zui
+
+GPUI is consumed from zeronsh/zui at 07fd941ad72e7edc812fed317aab66adb69fa8cc, an extraction of the Apache-2.0 GPUI renderer and supporting crates from wingleeio/zed. The source retains its licenses and attribution in LICENSE-APACHE and NOTICE. GPL Zed application crates and tracing crates are not linked into Comet.
+
+Source: https://github.com/zeronsh/zui/tree/07fd941ad72e7edc812fed317aab66adb69fa8cc

@@ -56,6 +56,15 @@ impl OmpNormalizer {
 
     pub fn push(&mut self, frame: Value) -> Vec<AgentEvent> {
         match frame.get("type").and_then(Value::as_str) {
+            Some("command_output") => frame
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| AgentEvent::TextDelta {
+                    text: text.to_owned(),
+                })
+                .into_iter()
+                .collect(),
             Some("message_update") => self.message_update(&frame),
             Some("message_start" | "message_end") => {
                 self.streaming_tools.clear();
@@ -650,7 +659,14 @@ fn content_index(event: &Value) -> Option<usize> {
 fn tool_start(frame: &Value) -> Option<AgentEvent> {
     let id = frame.get("toolCallId")?.as_str()?;
     let name = frame.get("toolName")?.as_str()?;
-    let input = frame.get("args").cloned().unwrap_or(Value::Null);
+    let mut input = frame.get("args").cloned().unwrap_or(Value::Null);
+    if let Some(intent) = frame.get("intent").and_then(Value::as_str) {
+        if let Value::Object(map) = &mut input {
+            if !map.contains_key("intent") && !map.contains_key("i") {
+                map.insert("intent".into(), Value::String(intent.to_owned()));
+            }
+        }
+    }
     Some(AgentEvent::ToolCall {
         id: id.to_owned(),
         call: normalize_tool(name, &input),
@@ -687,6 +703,16 @@ fn execution_meta(result: &Value) -> Option<ToolExecutionMeta> {
 }
 
 fn tool_diff(result: &Value) -> Option<ToolDiff> {
+    // OMP's edit modes return snapshots in AgentToolResult.details; older
+    // rpc-ui frames carried the same fields directly on result.
+    let details = result.get("details").unwrap_or(result);
+    let result = match details.get("perFileResults").and_then(Value::as_array) {
+        Some(files) if files.len() == 1 => &files[0],
+        // ToolDiff describes one file. Never silently present just the first
+        // file of a batch or pair snapshots from different files.
+        Some(_) => return None,
+        None => details,
+    };
     let path = result.get("path")?.as_str()?.trim();
     if path.is_empty() {
         return None;
@@ -729,6 +755,13 @@ fn normalize_tool(name: &str, input: &Value) -> ToolCall {
             pattern: optional_string(input, "path")
                 .or_else(|| optional_string(input, "pattern"))
                 .unwrap_or_default(),
+        },
+        "web_search" => ToolCall::WebSearch {
+            query: string_value(input, "query"),
+        },
+        "fetch" => ToolCall::WebFetch {
+            url: string_value(input, "url"),
+            prompt: optional_string(input, "prompt"),
         },
         "workers" => ToolCall::Mcp {
             server: "comet-workers".into(),
@@ -823,26 +856,63 @@ fn available_commands(frame: &Value) -> Option<Vec<SlashCommand>> {
 
 fn tool_output(result: &Value) -> Option<String> {
     if let Some(text) = result.as_str() {
-        return Some(truncate(text, MAX_TOOL_OUTPUT_BYTES));
+        return Some(readable_tool_text(text));
     }
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         let joined = content
             .iter()
-            .filter_map(|item| {
-                (item.get("type").and_then(Value::as_str) == Some("text"))
-                    .then(|| item.get("text").and_then(Value::as_str))
-                    .flatten()
-            })
+            .filter_map(content_item_text)
             .collect::<Vec<_>>()
             .join("\n");
         if !joined.is_empty() {
-            return Some(truncate(&joined, MAX_TOOL_OUTPUT_BYTES));
+            return Some(readable_tool_text(&joined));
         }
     }
-    serde_json::to_string(result)
+    json_readable_text(result).or_else(|| compact_json(result))
+}
+
+fn content_item_text(item: &Value) -> Option<&str> {
+    if let Some(text) = item.as_str() {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then_some(trimmed);
+    }
+    (item.get("type").and_then(Value::as_str) == Some("text"))
+        .then(|| item.get("text").and_then(Value::as_str))
+        .flatten()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn json_readable_text(value: &Value) -> Option<String> {
+    for key in ["text", "output", "stdout", "message"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(readable_tool_text(trimmed));
+            }
+        }
+    }
+    None
+}
+
+fn compact_json(value: &Value) -> Option<String> {
+    serde_json::to_string(value)
         .ok()
         .filter(|text| text != "null")
         .map(|text| truncate(&text, MAX_TOOL_OUTPUT_BYTES))
+}
+
+fn readable_tool_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(extracted) = json_readable_text(&parsed) {
+            return extracted;
+        }
+        if let Some(compact) = compact_json(&parsed) {
+            return compact;
+        }
+    }
+    truncate(trimmed, MAX_TOOL_OUTPUT_BYTES)
 }
 
 fn string_value(value: &Value, key: &str) -> String {
@@ -873,6 +943,56 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeron_proto::{WorkflowProgressNode, WorkflowTaskStatus, WorkflowUsage};
+
+    #[test]
+    fn edit_result_details_preserve_authoritative_snapshots() {
+        for details in [
+            json!({"path":"/repo/TOOLS.md", "oldText":"before\n", "newText":"after\n"}),
+            json!({"perFileResults":[{"path":"/repo/TOOLS.md", "oldText":"before\n", "newText":"after\n"}]}),
+        ] {
+            let mut normalizer = OmpNormalizer::new("/repo", "test");
+            let events = normalizer.push(json!({
+                "type":"tool_execution_end", "toolCallId":"edit-1", "toolName":"edit",
+                "isError":false,
+                "result":{"content":[{"type":"text", "text":"Updated TOOLS.md"}], "details":details}
+            }));
+            assert!(
+                matches!(&events[..], [AgentEvent::ToolResult {
+                id, diff:Some(diff), is_error:false, output:Some(output), ..
+            }] if id == "edit-1" && diff.path == "/repo/TOOLS.md"
+                && diff.old_text.as_deref() == Some("before\n") && diff.new_text == "after\n"
+                && output == "Updated TOOLS.md"),
+                "{events:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_result_details_keep_legacy_and_empty_replacements() {
+        for result in [
+            json!({"path":"/repo/TOOLS.md", "oldText":"before", "newText":""}),
+            json!({"details":{"path":"/repo/TOOLS.md", "oldText":"before", "newText":""}}),
+        ] {
+            let diff = tool_diff(&result).expect("empty replacement is a real edit");
+            assert_eq!(diff.path, "/repo/TOOLS.md");
+            assert_eq!(diff.old_text.as_deref(), Some("before"));
+            assert_eq!(diff.new_text, "");
+        }
+    }
+
+    #[test]
+    fn edit_result_details_do_not_invent_single_file_snapshots() {
+        for result in [
+            json!({"details":{"path":"/repo/TOOLS.md", "snapshotsPruned":true, "diff":"-before\n+after"}}),
+            json!({"details":{"path":" ", "newText":"after"}}),
+            json!({"details":{"perFileResults":[
+                {"path":"a", "oldText":"a", "newText":"b"},
+                {"path":"b", "oldText":"c", "newText":"d"}
+            ]}}),
+        ] {
+            assert!(tool_diff(&result).is_none(), "{result}");
+        }
+    }
 
     #[test]
     fn captured_partial_content_shape_streams_progressive_write() {
@@ -1695,6 +1815,103 @@ mod tests {
             glob_without_path,
             ToolCall::Glob {
                 pattern: "src/**/*.rs".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn omp_normalizes_web_search_and_fetch_tools() {
+        let search = normalize_tool(
+            "web_search",
+            &json!({
+                "query": "rust docs",
+            }),
+        );
+        assert_eq!(
+            search,
+            ToolCall::WebSearch {
+                query: "rust docs".into(),
+            }
+        );
+
+        let fetch = normalize_tool(
+            "fetch",
+            &json!({
+                "url": "https://example.com/api",
+                "prompt": "extract data",
+            }),
+        );
+        assert_eq!(
+            fetch,
+            ToolCall::WebFetch {
+                url: "https://example.com/api".into(),
+                prompt: Some("extract data".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_output_extracts_clean_text_from_structured_objects() {
+        let hub_logs_result = json!({
+            "text": "[omp-parity-probe: ready; cursor=32383]",
+            "details": {
+                "op": "logs",
+                "cursor": 32383,
+            }
+        });
+        assert_eq!(
+            tool_output(&hub_logs_result),
+            Some("[omp-parity-probe: ready; cursor=32383]".into())
+        );
+
+        let stdout_result = json!({
+            "stdout": "process completed successfully",
+            "exitCode": 0
+        });
+        assert_eq!(
+            tool_output(&stdout_result),
+            Some("process completed successfully".into())
+        );
+
+        let pretty_workers = json!({
+            "content": [{
+                "type": "text",
+                "text": "{\n  \"session_id\": \"worker-1\",\n  \"launched\": true\n}"
+            }]
+        });
+        let compact = tool_output(&pretty_workers).expect("compact workers json");
+        assert!(compact.contains("worker-1"), "{compact}");
+        assert!(compact.contains("launched"), "{compact}");
+        assert!(!compact.contains('\n'), "{compact}");
+
+        let string_blocks = json!({
+            "content": ["primeira linha", "segunda linha"]
+        });
+        assert_eq!(
+            tool_output(&string_blocks),
+            Some("primeira linha\nsegunda linha".into())
+        );
+    }
+
+    #[test]
+    fn tool_start_preserves_intent_in_arguments() {
+        let frame = json!({
+            "toolCallId": "call_1",
+            "toolName": "bash",
+            "intent": "Checking built-in commands",
+            "args": {
+                "command": "cargo check",
+            }
+        });
+        let event = tool_start(&frame).expect("tool start event");
+        let AgentEvent::ToolCall { id, call } = event else {
+            panic!("expected ToolCall event");
+        };
+        assert_eq!(id, "call_1");
+        assert_eq!(
+            call,
+            ToolCall::Exec {
+                command: "cargo check".into()
             }
         );
     }

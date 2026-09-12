@@ -19,10 +19,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, IntoElement,
-    KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window, WindowControlArea,
-    actions, div, img, prelude::*, px,
+    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
+    IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseUpEvent, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window,
+    WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -53,9 +53,9 @@ use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::projects::ProjectsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    self, CHAT_PANEL_MIN, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN,
-    JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX,
-    SIDEBAR_MIN, SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, UiSettings, badge_combo,
+    self, DETAILS_SIDEBAR_DEFAULT, DETAILS_SIDEBAR_MAX, DETAILS_SIDEBAR_MIN, JUMP_SLOTS,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
+    SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, UiSettings, badge_combo,
     jump_hints_visible, platform_combo,
 };
 use crate::state::{
@@ -66,19 +66,16 @@ use crate::terminal::panel::{TAB_BAR_HEIGHT, TerminalPanel, ToggleTerminal};
 use crate::theme::Theme;
 use crate::trajectory::TrajectoryView;
 use crate::transcript::{self, Transcript, TranscriptEvent};
-use crate::workers::model::{WorkersModel, WorkersRoute};
+use crate::workers::model::{WorkersModel, WorkersRoute, WorkersSettingsTab};
 use crate::workers::presentation::{workers_titlebar, workers_titlebar_content_insets};
 use crate::workers::session_gallery;
 use crate::workers::terminal::{WorkersTerminal, WorkersTerminalView};
-use crate::workers::workspace::{WorkersContent, WorkersSidebar};
-use crate::workers::workspace_open_menu::WorkspaceOpenTarget;
-#[cfg(target_os = "macos")]
-use crate::workers::workspace_open_menu::native as native_workspace_open_menu;
+use crate::workers::workspace::{WorkersContent, WorkersSidebar, WorkersSidebarEvent};
 
 mod spaces;
 mod tabs;
 
-use spaces::{AddSpaceFlow, RenameSpaceDialog};
+use spaces::{AddSpaceFlow, ProjectPickerTarget, RenameSpaceDialog};
 
 actions!(
     shell,
@@ -99,6 +96,23 @@ actions!(
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
+
+/// Restore a default focus only after an in-flight handoff has had a frame to
+/// claim the window. A synchronous focus-lost fallback can otherwise steal
+/// focus from controls that are mounting in response to the same input event.
+#[cfg(test)]
+pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
+    focus: FocusHandle,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    window.on_next_frame(move |window, cx| {
+        if window.focused(cx).is_none() {
+            window.focus(&focus, cx);
+        }
+    });
+    cx.notify();
+}
 
 #[derive(Clone, Copy)]
 enum ChatMenuPage {
@@ -151,6 +165,7 @@ impl SidebarDisclosureMotion {
 /// Vertical pane resize hitboxes yield the global titlebar. Keeping this in
 /// the shared constructor makes left/right seams mirror each other and avoids
 /// relying on paint order when chrome crosses an animated pane boundary.
+const PANE_RESIZE_HITBOX_HALF_WIDTH: f32 = 6.0;
 const PANE_RESIZE_HITBOX_TOP: f32 = Theme::TITLEBAR_HEIGHT;
 
 fn stable_panel_content_width(target: f32, transition: Option<(f32, f32)>) -> f32 {
@@ -187,6 +202,24 @@ fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f
 /// fullscreen hides them and the cluster reclaims the inset.
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
     if fullscreen { 12.0 } else { 88.0 }
+}
+
+/// Whether ⌘W archives the Worker session on screen instead of closing the
+/// window.
+///
+/// Deliberately blind to `Shell::route`: `render_main` returns the Workers
+/// content whenever the sidebar mode is Workers, **before** it looks at the
+/// route, so app Settings followed by the Workers switcher leaves
+/// `route == Settings` under a visible Workers workspace. Gating on
+/// `Route::Chat` made the shortcut dead exactly there, with no feedback.
+fn worker_archive_shortcut_enabled(
+    sidebar_mode: SidebarMode,
+    workers_route: WorkersRoute,
+    overlay_owns_keyboard: bool,
+) -> bool {
+    sidebar_mode == SidebarMode::Workers
+        && workers_route == WorkersRoute::Workspace
+        && !overlay_owns_keyboard
 }
 
 /// Width of the spacer ahead of the control cluster for a strip that already
@@ -321,7 +354,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
+        // Closing a Worker session rides ⌘W, whose action (`CloseWindow`) is
+        // owned by AppKit's Window ▸ Close key equivalent — see the handler in
+        // `Shell::render`. Nothing to bind here.
     ]);
+    crate::browser::bind_keys(cx, keymap);
     // Cmd+1..Cmd+9 open the sidebar's first nine rows. A slot left unbound
     // binds nothing rather than falling back: the user cleared it on purpose.
     cx.bind_keys((0..JUMP_SLOTS).filter_map(|slot| {
@@ -409,11 +446,33 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// Maximum requested width the right pane may occupy while retaining the
-/// conversation floor. The responsive multi-column allocator applies the
-/// final live constraint when Details is also open.
+/// Shared visible budget for the right columns. Drag constraints and passive
+/// window layout must reserve the same main-column floor and gutter.
 fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
-    (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
+    (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN - RESPONSIVE_COLUMN_GUTTER).max(0.0)
+}
+
+/// The utility divider has Details to its right; only its own width moves.
+fn right_pane_drag_width(viewport: f32, sidebar: f32, pointer_x: f32, details: f32) -> f32 {
+    let max = (right_pane_max_width(viewport, sidebar) - details).max(0.0);
+    (viewport - pointer_x - details).clamp(RIGHT_PANE_MIN.min(max), max)
+}
+
+fn details_sidebar_drag_width(
+    viewport: f32,
+    sidebar: f32,
+    pointer_x: f32,
+    right: f32,
+    expanded: bool,
+) -> f32 {
+    let max = if expanded {
+        // Takeover deliberately shares all remaining space with the utility.
+        right_pane_takeover_width(viewport, sidebar) - RIGHT_PANE_MIN
+    } else {
+        right_pane_max_width(viewport, sidebar) - right
+    }
+    .clamp(0.0, DETAILS_SIDEBAR_MAX);
+    (viewport - pointer_x).clamp(DETAILS_SIDEBAR_MIN.min(max), max)
 }
 
 /// Width available to a right-pane takeover. The conversation yields while
@@ -444,6 +503,42 @@ impl SidebarMode {
     fn shows_orchestrator_content(self) -> bool {
         matches!(self, Self::Orchestrator)
     }
+}
+
+fn settings_layer_open(app_route: Route, workers_route: WorkersRoute) -> bool {
+    matches!(app_route, Route::Settings(_)) || matches!(workers_route, WorkersRoute::Settings(_))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCatalog {
+    Orchestrator(SettingsSection),
+    Workers(WorkersSettingsTab),
+}
+
+fn settings_catalog_for_mode(
+    mode: SidebarMode,
+    app_route: Route,
+    workers_route: WorkersRoute,
+) -> SettingsCatalog {
+    match mode {
+        SidebarMode::Orchestrator => SettingsCatalog::Orchestrator(match app_route {
+            Route::Settings(section) => section,
+            Route::Chat => SettingsSection::Devices,
+        }),
+        SidebarMode::Workers => SettingsCatalog::Workers(match workers_route {
+            WorkersRoute::Settings(tab) => tab,
+            _ => WorkersSettingsTab::Presets,
+        }),
+    }
+}
+
+fn sidebar_mode_switch_catalog(
+    in_settings: bool,
+    mode: SidebarMode,
+    app_route: Route,
+    workers_route: WorkersRoute,
+) -> Option<SettingsCatalog> {
+    in_settings.then(|| settings_catalog_for_mode(mode, app_route, workers_route))
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -510,8 +605,7 @@ fn responsive_right_column_widths(
     let right = if right_open { requested_right } else { 0.0 };
     let details = if details_open { requested_details } else { 0.0 };
     let requested_total = right + details;
-    let budget =
-        (viewport - sidebar - RESPONSIVE_MAIN_PANE_MIN - RESPONSIVE_COLUMN_GUTTER).max(0.0);
+    let budget = right_pane_max_width(viewport, sidebar);
     if requested_total <= budget || requested_total <= f32::EPSILON {
         return (right, details);
     }
@@ -563,6 +657,7 @@ fn expanded_right_column_widths(
 pub enum RightSurface {
     #[default]
     Picker,
+    Browser(u64),
     Diff(u64),
     Terminal(u64),
     Preview(u64),
@@ -1090,30 +1185,6 @@ const EXPORT_MENU_ITEMS: &[ExportMenuItem] = &[
     },
 ];
 
-/// The sidebar notice strip's payload. `ok` rides with the text so a success
-/// message can never inherit the previous failure's red.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SidebarNotice {
-    text: SharedString,
-    ok: bool,
-}
-
-impl SidebarNotice {
-    fn failure(text: impl Into<SharedString>) -> Self {
-        Self {
-            text: text.into(),
-            ok: false,
-        }
-    }
-
-    fn success(text: impl Into<SharedString>) -> Self {
-        Self {
-            text: text.into(),
-            ok: true,
-        }
-    }
-}
-
 /// Where a Chat Transcript Export lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportDelivery {
@@ -1147,8 +1218,13 @@ fn export_outcome_with_worker_loss(
 ) -> ExportOutcome {
     match (outcome, worker_error) {
         (delivered @ (ExportOutcome::Downloaded(_) | ExportOutcome::Copied), Some(reason)) => {
+            let delivered_str = match &delivered {
+                ExportOutcome::Downloaded(file) => format!("Exported to Downloads: {file}"),
+                ExportOutcome::Copied => "Chat copied to clipboard".to_string(),
+                _ => String::new(),
+            };
             ExportOutcome::Incomplete {
-                delivered: export_notice(&delivered).text.to_string(),
+                delivered: delivered_str,
                 reason,
             }
         }
@@ -1156,16 +1232,15 @@ fn export_outcome_with_worker_loss(
     }
 }
 
-fn export_notice(outcome: &ExportOutcome) -> SidebarNotice {
+fn export_toast(outcome: &ExportOutcome) -> Option<crate::toast::Toast> {
     match outcome {
-        ExportOutcome::Downloaded(file) => {
-            SidebarNotice::success(format!("Exported to Downloads: {file}"))
-        }
-        ExportOutcome::Copied => SidebarNotice::success("Chat copied to clipboard"),
-        ExportOutcome::Incomplete { delivered, reason } => {
-            SidebarNotice::failure(format!("{delivered} — without the worker index: {reason}"))
-        }
-        ExportOutcome::Failed(reason) => SidebarNotice::failure(format!("Export failed: {reason}")),
+        ExportOutcome::Downloaded(_) | ExportOutcome::Copied => None,
+        ExportOutcome::Incomplete { delivered, reason } => Some(crate::toast::Toast::error(
+            format!("{delivered} — without the worker index: {reason}"),
+        )),
+        ExportOutcome::Failed(reason) => Some(crate::toast::Toast::error(format!(
+            "Export failed: {reason}"
+        ))),
     }
 }
 
@@ -1203,8 +1278,7 @@ async fn fetch_transcript_once(
     Err("the chat stream closed before sending anything".into())
 }
 
-/// The Downloads directory of the current user, or `None` when `HOME` is unset
-/// (the same resolution `workspace_open_menu` uses for `~/Applications`).
+/// The Downloads directory of the current user, or `None` when `HOME` is unset.
 fn downloads_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads"))
 }
@@ -1509,7 +1583,7 @@ pub struct Shell {
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
     right_terminal: Option<Entity<TerminalPanel>>,
-    /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
+    /// The surface-tab strip's `+` menu (Terminal / Diffs / History rows).
     right_plus: popover::Popup<()>,
     /// Last surface the strip scrolled into view — reveals a newly selected
     /// chip exactly once, leaving manual scrolling alone.
@@ -1535,6 +1609,11 @@ pub struct Shell {
     worker_terminal_seq: u64,
     trajectory_tabs: std::collections::HashMap<u64, TrajectoryTab>,
     trajectory_seq: u64,
+    browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
+    browser_subs: std::collections::HashMap<u64, Subscription>,
+    browser_seq: u64,
+    browser_context: crate::browser::BrowserContext,
+    browser_profile: Option<String>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1555,6 +1634,7 @@ pub struct Shell {
     sidebar_mode: SidebarMode,
     workers_model: Entity<WorkersModel>,
     workers_reveal_generation: u64,
+    workers_settings_open: bool,
     workers_sidebar: Entity<WorkersSidebar>,
     workers_content: Entity<WorkersContent>,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -1572,7 +1652,7 @@ pub struct Shell {
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     rename_dialog: Option<RenameChatDialog>,
-    /// Chat id awaiting delete confirmation.
+    /// Chat id awaiting inline delete confirmation on its sidebar row.
     delete_confirm: Option<String>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
@@ -1598,12 +1678,11 @@ pub struct Shell {
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
+    sound_prev: std::collections::HashMap<String, crate::sound::SessionNotificationState>,
+    /// When each in-flight `/compact` was first observed — the deadline half of
+    /// [`Shell::sweep_stuck_compactions`].
+    compaction_seen_at: std::collections::HashMap<String, std::time::Instant>,
     user_menu: popover::Popup<()>,
-    /// Inline sidebar notice strip (mutation failures, export outcomes); click
-    /// dismisses. The tone rides WITH the text: two parallel fields would let a
-    /// caller set a success message and leave the previous failure's red on it.
-    sidebar_notice: Option<SidebarNotice>,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -1617,6 +1696,7 @@ pub struct Shell {
     import_task: Option<Task<()>>,
     /// Title of the chat the import stream is copying right now.
     import_current: Option<SharedString>,
+    pub(super) toasts: Vec<crate::toast::Toast>,
     /// Kept for the failed-gate "Retry" action.
     boot: EngineBootConfig,
     data_dir: PathBuf,
@@ -1683,6 +1763,9 @@ pub struct Shell {
     /// Set by [`Shell::eval_tween`] when any tween is mid-flight this frame;
     /// render schedules the next animation frame off it.
     motion_active: std::cell::Cell<bool>,
+    /// All pane masks and chrome evaluate animation at the same frame time.
+    /// A slow render must not give the native page and its titlebar different widths.
+    render_time: Option<std::time::Instant>,
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
@@ -1690,6 +1773,8 @@ pub struct Shell {
     /// with nothing focused they go dead. Initial focus lands on the composer
     /// and focus lost with no successor routes back there.
     focus_sub: Option<Subscription>,
+    shortcut_focus: FocusHandle,
+    unfocused: FocusHandle,
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
@@ -1697,6 +1782,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _workers_observation: Subscription,
+    _workers_sidebar_events: Subscription,
     _composer_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
@@ -1716,11 +1802,31 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let workers_reveal_generation = workers_model.read(cx).reveal().generation;
+        let workers_settings_open =
+            matches!(workers_model.read(cx).route, WorkersRoute::Settings(_));
         let workers_observation = cx.observe(&workers_model, |this, model, cx| {
             let generation = model.read(cx).reveal().generation;
             if generation != this.workers_reveal_generation {
                 this.workers_reveal_generation = generation;
                 this.sidebar_mode = SidebarMode::Workers;
+            }
+            let workers_in_settings = matches!(model.read(cx).route, WorkersRoute::Settings(_));
+            if this.workers_settings_open
+                && !workers_in_settings
+                && this.sidebar_mode == SidebarMode::Workers
+                && matches!(this.route, Route::Settings(_))
+            {
+                this.route = Route::Chat;
+                this.nav.push(NavEntry::Chat(this.active_chat.clone()));
+            }
+            this.workers_settings_open = workers_in_settings;
+            // The tree filter lives on the model (beside the rest of the
+            // selection state) and is persisted from here, on the observation
+            // this surface already runs — no second channel for one field.
+            let filter = model.read(cx).project_filter().map(str::to_owned);
+            if filter != this.settings.workers_project_filter {
+                this.settings.workers_project_filter = filter;
+                this.schedule_save(cx);
             }
             cx.notify();
         });
@@ -1733,6 +1839,61 @@ impl Shell {
             let workers_content = workers_content.clone();
             move |cx| WorkersSidebar::new(workers_model, workers_content, cx)
         });
+        let workers_sidebar_events = cx.subscribe(
+            &workers_sidebar,
+            |this: &mut Shell, _, event, cx| match event {
+                WorkersSidebarEvent::OpenProjectPicker => {
+                    this.open_project_palette(ProjectPickerTarget::Worker, cx)
+                }
+            },
+        );
+        let startup_workers_model = workers_model.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let advisories = cx
+                .background_executor()
+                .spawn(async { zeron_workers_unpeel::get_all_advisories_blocking() })
+                .await;
+            let behind: Vec<_> = advisories
+                .iter()
+                .filter(|a| a.status == zeron_workers_unpeel::RuntimeUpdateStatus::BehindLatest)
+                .cloned()
+                .collect();
+
+            let _ = startup_workers_model.update(cx, |model, cx| {
+                model.advisories = advisories;
+                cx.notify();
+            });
+
+            if !behind.is_empty() {
+                static SHOWN_THIS_SESSION: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SHOWN_THIS_SESSION.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let count = behind.len();
+                    let updatable_count = behind.iter().filter(|a| a.can_update).count();
+                    let clis: Vec<String> = behind
+                        .iter()
+                        .map(|a| match a.cli_id.as_str() {
+                            "pi" => "Pi".to_string(),
+                            "omp" => "OMP".to_string(),
+                            "claude" | "claude-code" => "Claude Code".to_string(),
+                            "codex" => "Codex".to_string(),
+                            "opencode" => "OpenCode".to_string(),
+                            "agy" => "Antigravity CLI".to_string(),
+                            other => other.to_string(),
+                        })
+                        .collect();
+
+                    let toast = crate::toast::Toast::provider_updates(count, clis, updatable_count);
+                    let _ = this.update(cx, |shell, cx| {
+                        shell.push_toast(toast, cx);
+                    });
+                }
+            }
+        })
+        .detach();
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
@@ -1783,11 +1944,21 @@ impl Shell {
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
+        // Restore the Workers tree filter. A filter naming a project the next
+        // bootstrap does not carry is dropped there, so a stale id is safe.
+        if let Some(filter) = settings.workers_project_filter.clone() {
+            workers_model.update(cx, |model, cx| {
+                model.set_project_filter(Some(filter), cx);
+            });
+        }
+        let pickers = composer.read(cx).pickers().clone();
         let details_sidebar = cx.new({
             let state = state.clone();
             let workers_model = workers_model.clone();
             let preferences = settings.details_sidebar_preferences.clone();
-            move |cx| DetailsSidebar::new(state, workers_model, preferences, cx)
+            let pickers = pickers.clone();
+            let composer = composer.clone();
+            move |cx| DetailsSidebar::new(state, workers_model, preferences, pickers, composer, cx)
         });
         let file_preview = cx.new(|_| FilePreview::new());
         let details_sub = cx.subscribe(
@@ -1808,7 +1979,20 @@ impl Shell {
                     context_key,
                     root,
                     relative_path,
+                    remote_target,
                 } => {
+                    if let Some((target, device)) = remote_target {
+                        if let Some(engine) = this.state.read(cx).engine().cloned() {
+                            this.file_preview.update(cx, |preview, _| {
+                                preview.set_remote_source(
+                                    context_key.clone(),
+                                    engine,
+                                    target.clone(),
+                                    device.clone(),
+                                )
+                            });
+                        }
+                    }
                     this.open_preview_surface(
                         context_key.clone(),
                         root.clone(),
@@ -1979,6 +2163,11 @@ impl Shell {
             worker_terminal_seq: 0,
             trajectory_tabs: std::collections::HashMap::new(),
             trajectory_seq: 0,
+            browsers: std::collections::HashMap::new(),
+            browser_subs: std::collections::HashMap::new(),
+            browser_seq: 0,
+            browser_context: crate::browser::BrowserContext::default(),
+            browser_profile: None,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1993,6 +2182,7 @@ impl Shell {
             },
             workers_model,
             workers_reveal_generation,
+            workers_settings_open,
             workers_sidebar,
             workers_content,
             nav,
@@ -2020,8 +2210,8 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
+            compaction_seen_at: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
-            sidebar_notice: None,
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -2031,6 +2221,7 @@ impl Shell {
             runtime_change_error: None,
             import_task: None,
             import_current: None,
+            toasts: Vec::new(),
             boot,
             data_dir,
             settings,
@@ -2059,13 +2250,17 @@ impl Shell {
             button_layout_sub: None,
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
+            render_time: None,
             splash: SplashPhase::Visible,
             splash_task: None,
             focus_sub: None,
+            shortcut_focus: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             activation_sub: None,
             _ticker: ticker,
             _state_observation: observation,
             _workers_observation: workers_observation,
+            _workers_sidebar_events: workers_sidebar_events,
             _composer_events: composer_events,
             _transcript_events: transcript_events,
         }
@@ -2075,7 +2270,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(SidebarNotice::failure(notice));
+            self.push_toast(crate::toast::Toast::error(notice), cx);
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -2195,48 +2390,23 @@ impl Shell {
                 }
             });
         }
-        // Session chimes (herdr semantics, `sound::sound_for_transition`): a
-        // question rings whenever a session flips to AwaitingInput, a
-        // completion rings on the Working→Idle edge — for ANY session on any
-        // device. A row's first appearance only seeds the baseline, so boot
-        // (restored rows) and fresh sends stay silent. Desktop banners
-        // (`notify::post`) ride the SAME edges and gates behind their own
-        // settings flag — one detector, two outputs, so the banner can never
-        // fire where the chime wouldn't.
-        //
-        // STALENESS-GATED like the dot (`effective_indicator`), for the same
-        // reason: raw row statuses include the past. A dead turn's Working row
-        // (host killed mid-run, Idle write lost to a wedged room) seeded
-        // prev=Working here, and the moment the old Idle finally synced in —
-        // typically piggybacked on the round-trip of a fresh send — the chime
-        // heard a phantom Working→Idle and rang "done" on send (user report
-        // 2026-07-31). The dot never showed that ghost; the chime must judge
-        // by the identical clock.
-        //
-        // SEND-PENDING-GATED too (`AppState::send_pending`): a send whose
-        // queued command the host hasn't executed yet can still surface a
-        // phantom Working→Idle (a stale Working row crossing the 45s gate on
-        // the send's own re-render, or a late old Idle row) — the done-chime
-        // stays quiet for that chat until the host acks, while the baseline
-        // keeps tracking silently so the ghost edge never fires later. The
-        // question chime is NOT gated: an instant AwaitingInput ack should
-        // still ring.
+        // A shared completion marker drives banners and chimes. First appearance,
+        // pending sends and stale updates seed the baseline without replaying sound.
         {
             let now = Utc::now();
-            type Ping = (String, zeron_proto::SessionStatus, bool, Option<String>);
+            type Ping = (
+                String,
+                crate::sound::SessionNotificationState,
+                bool,
+                Option<String>,
+            );
             let sessions: Vec<Ping> = {
                 let state = state.read(cx);
                 state
                     .sessions
                     .iter()
                     .map(|s| {
-                        use zeron_proto::view::Indicator;
-                        let status = match zeron_proto::view::effective_indicator(Some(s), now) {
-                            Indicator::Working => zeron_proto::SessionStatus::Working,
-                            Indicator::AwaitingInput => zeron_proto::SessionStatus::AwaitingInput,
-                            Indicator::Errored => zeron_proto::SessionStatus::Errored,
-                            Indicator::None => zeron_proto::SessionStatus::Idle,
-                        };
+                        let status = crate::sound::SessionNotificationState::new(s, now);
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let title = state
                             .chats
@@ -2253,10 +2423,27 @@ impl Shell {
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
             for (chat_id, status, send_pending, title) in sessions {
-                let prev = self.sound_prev.insert(chat_id, status);
+                let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
+                // A `/compact` in flight ends on the same edge the chime uses.
+                // Any exit from Working clears the "Compacting…" label — a run
+                // that errored or stopped to ask something must not leave it
+                // spinning — but only a finished one earns the marker.
+                if prev
+                    .as_ref()
+                    .is_some_and(|p| p.indicator == zeron_proto::view::Indicator::Working)
+                    && status.indicator != zeron_proto::view::Indicator::Working
+                {
+                    self.finish_compaction(
+                        &chat_id,
+                        status.last_completed_turn.is_some()
+                            && prev.as_ref().is_some_and(|p| {
+                                p.last_completed_turn != status.last_completed_turn
+                            }),
+                        cx,
+                    );
+                }
                 if let Some(prev) = prev
-                    && let Some(sound) = crate::sound::sound_for_transition(prev, status)
-                    && !(send_pending && sound == crate::sound::Sound::Done)
+                    && let Some(sound) = status.sound_since(&prev, send_pending)
                 {
                     if self.settings.sound_enabled {
                         crate::sound::play(sound);
@@ -2274,6 +2461,7 @@ impl Shell {
                 }
             }
         }
+        self.sweep_stuck_compactions(cx);
         // Boot: restore the last selected space once the first spaces frame
         // lands (a still-existing row wins over the auto-selected first one;
         // the boot-auto-selected chat's own space wins over both — selecting a
@@ -2404,6 +2592,9 @@ impl Shell {
 
     fn worker_panel_context(&self, cx: &App) -> Option<WorkersPanelContext> {
         let model = self.workers_model.read(cx);
+        if matches!(model.route, WorkersRoute::Settings(_)) {
+            return None;
+        }
         let session = model.selected_session();
         let project = session
             .and_then(|session| {
@@ -2511,6 +2702,9 @@ impl Shell {
             }
             SidebarMode::Workers => {
                 let model = self.workers_model.read(cx);
+                if matches!(model.route, WorkersRoute::Settings(_)) {
+                    return None;
+                }
                 context_for_worker(model.selected_project(), model.selected_session())
             }
         }
@@ -2571,15 +2765,30 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let viewport = f32::from(window.viewport_size().width);
-        let width = viewport - f32::from(event.event.position.x);
-        self.settings.details_sidebar_width = width.clamp(DETAILS_SIDEBAR_MIN, DETAILS_SIDEBAR_MAX);
+        let sidebar = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let right = self.eval_tween(self.right_tween, self.right_target(cx));
+        self.settings.details_sidebar_width = details_sidebar_drag_width(
+            viewport,
+            sidebar,
+            f32::from(event.event.position.x),
+            right,
+            self.right_pane_expanded,
+        );
+        // Rebase the neighbor onto what is actually painted, not its larger
+        // persisted preference from before responsive compression.
+        if right > 0.0 && !self.right_pane_expanded {
+            self.settings.right_pane_width = right;
+        }
         self.details_tween = None;
+        self.right_tween = None;
+        self.right_takeover_content_tween = None;
+        self.main_takeover_tween = None;
         self.schedule_save(cx);
         cx.notify();
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        let from = self.sidebar_target();
+        let from = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
@@ -2593,7 +2802,7 @@ impl Shell {
         if !self.space_git_detected(cx) {
             return;
         }
-        let from = self.right_target(cx);
+        let from = self.eval_tween(self.right_tween, self.right_target(cx));
         let key = self.panel_key(cx);
         self.panels.show(&key);
         match self
@@ -2615,11 +2824,14 @@ impl Shell {
     }
 
     fn toggle_right_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.eval_tween(self.right_tween, self.right_target(cx));
+        let key = self.panel_key(cx);
         if self.right_pane_open(cx) {
-            let from = self.right_target(cx);
-            let key = self.panel_key(cx);
             self.panels.hide(&key);
             self.right_pane_expanded = false;
+            self.finish_right_transition(from, cx);
+        } else if self.resolved_right_active(cx) != RightSurface::Picker {
+            self.panels.show(&key);
             self.finish_right_transition(from, cx);
         } else {
             self.show_changes(window, cx);
@@ -2689,6 +2901,10 @@ impl Shell {
                     .trajectory_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone())),
+                RightSurface::Browser(id) => self
+                    .browsers
+                    .get(id)
+                    .map(|browser| (*surface, browser.read(cx).title())),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2756,6 +2972,9 @@ impl Shell {
         match surface {
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
+                self.composer
+                    .update(cx, |composer, _| composer.focus_pending = false);
+                panel.update(cx, |panel, cx| panel.request_focus(cx));
                 let key = self.panel_key(cx);
                 if self.sidebar_mode == SidebarMode::Workers {
                     panel.update(cx, |panel, cx| {
@@ -2779,7 +2998,7 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
-            RightSurface::Subagent(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
             RightSurface::Worker(id) => {
                 if let Some(tab) = self.worker_terminal_tabs.get(&id) {
                     tab.view
@@ -2797,6 +3016,70 @@ impl Shell {
         cx.notify();
     }
 
+    /// Browser tabs are independent instances owned by the current session.
+    fn add_browser_surface(
+        &mut self,
+        url: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        let key = self.panel_key(cx);
+        let from = self.eval_tween(self.right_tween, self.right_target(cx));
+        self.panels.show(&key);
+        let remote = {
+            let state = self.state.read(cx);
+            state.selected_chat_row().is_some_and(|chat| {
+                Some(chat.device_id.as_str()) != state.local_device_id.as_deref()
+            })
+        };
+        self.browser_seq += 1;
+        let id = self.browser_seq;
+        let browser = cx.new(|cx| {
+            crate::browser::BrowserSurface::new(self.browser_context.clone(), remote, window, cx)
+        });
+        if let Some(handle) = self.state.read(cx).engine().cloned() {
+            let chat_id = self.active_chat.clone();
+            browser.update(cx, |browser, cx| {
+                browser.watch_previews(handle, chat_id, cx)
+            });
+        }
+        let owner = key.clone();
+        let sub = cx.subscribe_in(&browser, window, move |this, _, event, window, cx| {
+            match event {
+                crate::browser::BrowserEvent::Changed => cx.notify(),
+                crate::browser::BrowserEvent::NewTab(url) => {
+                    // A background page cannot open a tab in the wrong session.
+                    if this.panel_key(cx) == owner
+                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
+                    {
+                        this.add_browser_surface(url.clone(), window, cx);
+                    }
+                }
+                crate::browser::BrowserEvent::Close => {
+                    this.close_right_surface(RightSurface::Browser(id), window, cx)
+                }
+            }
+        });
+        self.browsers.insert(id, browser.clone());
+        self.browser_subs.insert(id, sub);
+        self.right_tabs
+            .entry(key)
+            .or_default()
+            .push(RightSurface::Browser(id));
+        self.set_right_active(RightSurface::Browser(id), cx);
+        self.finish_right_transition(from, cx);
+        browser.update(cx, |browser, cx| {
+            if let Some(url) = url {
+                browser.navigate(&url, window, cx);
+            } else {
+                browser.focus_address(window, cx);
+            }
+        });
+    }
+
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
@@ -2812,6 +3095,21 @@ impl Shell {
         self.register_diff_surface(changes, cx);
     }
 
+    /// The dedicated History surface. Keeping it as its own tab preserves its
+    /// graph/search state while Diff tabs retain their ordinary scope picker.
+    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
+        let from = self.eval_tween(self.right_tween, self.right_target(cx));
+        let key = self.panel_key(cx);
+        self.panels.show(&key);
+        let cwd = (self.sidebar_mode == SidebarMode::Workers)
+            .then(|| self.worker_panel_context(cx))
+            .flatten()
+            .map(|context| context.cwd);
+        let history = cx.new(|cx| Changes::for_history(self.state.clone(), cwd, cx));
+        self.register_diff_surface(history, cx);
+        self.finish_right_transition(from, cx);
+    }
+
     /// A History row click: the commit opens as its own pinned diff tab
     /// (user request).
     fn add_commit_diff_surface(
@@ -2819,7 +3117,11 @@ impl Shell {
         commit: zeron_proto::GitHistoryCommit,
         cx: &mut Context<Self>,
     ) {
-        let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
+        let cwd = (self.sidebar_mode == SidebarMode::Workers)
+            .then(|| self.worker_panel_context(cx))
+            .flatten()
+            .map(|context| context.cwd);
+        let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cwd, cx));
         self.register_diff_surface(changes, cx);
     }
 
@@ -2865,12 +3167,14 @@ impl Shell {
         }
         // Opening a file must OPEN the pane, not just record the surface: the
         // column stays at width 0 while `visible` is false, so the click
-        // looked dead.
+        // looked dead. The width tween is the shared `finish_right_transition`
+        // guard — a file opened into an already-open column must not hold
+        // `motion_active` for 200ms while WebKit is coming up.
         self.panels.show(&key);
         self.panels.update(&key, |panels| {
             panels.right_active = surface;
         });
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        self.finish_right_transition(from, cx);
         self.set_right_active(surface, cx);
     }
 
@@ -3175,6 +3479,15 @@ impl Shell {
             .map(|tabs| remove_right_surface(tabs, surface))
             .unwrap_or(RightSurface::Picker);
         match surface {
+            RightSurface::Browser(id) => {
+                if let Some(browser) = self.browsers.remove(&id) {
+                    browser.update(cx, |browser, cx| browser.close(cx));
+                }
+                self.browser_subs.remove(&id);
+                if was_active {
+                    window.focus(&self.composer.focus_handle(cx), cx);
+                }
+            }
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
@@ -3322,16 +3635,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let viewport = f32::from(window.viewport_size().width);
-        let width = viewport - f32::from(event.event.position.x);
-        // No arbitrary percentage or pixel ceiling: persist the requested
-        // width, while the responsive target arbitrates the live main/details
-        // column budget.
-        let max = right_pane_max_width(viewport, self.sidebar_target());
-        self.settings.right_pane_width = if max >= RIGHT_PANE_MIN {
-            width.clamp(RIGHT_PANE_MIN, max)
-        } else {
-            max
-        };
+        let sidebar = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let details = self.eval_tween(self.details_tween, self.details_target(cx));
+        self.settings.right_pane_width = right_pane_drag_width(
+            viewport,
+            sidebar,
+            f32::from(event.event.position.x),
+            details,
+        );
+        if details > 0.0 {
+            self.settings.details_sidebar_width = details;
+        }
+        self.details_tween = None;
         self.right_tween = None;
         self.right_takeover_content_tween = None;
         self.main_takeover_tween = None;
@@ -3388,10 +3703,11 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some(SidebarNotice::success("Zeron conversation link copied"));
         } else {
-            self.sidebar_notice =
-                Some(SidebarNotice::failure("Conversation link is not ready yet"));
+            self.push_toast(
+                crate::toast::Toast::error("Conversation link is not ready yet"),
+                cx,
+            );
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3407,7 +3723,6 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
-            self.sidebar_notice = Some(SidebarNotice::success(format!("{} copied", link.label)));
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3423,7 +3738,6 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
-            self.sidebar_notice = Some(SidebarNotice::success("Harness session ID copied"));
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3444,7 +3758,41 @@ impl Shell {
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        self.workers_model.update(cx, |model, cx| {
+            if matches!(model.route, WorkersRoute::Settings(_)) {
+                model.close_settings(cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn select_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        if self.sidebar_mode == mode {
+            return;
+        }
+        let workers_route = self.workers_model.read(cx).route;
+        let in_settings = settings_layer_open(self.route, workers_route);
+        self.sidebar_mode = mode;
+        if let Some(catalog) =
+            sidebar_mode_switch_catalog(in_settings, mode, self.route, workers_route)
+        {
+            match catalog {
+                SettingsCatalog::Orchestrator(section) => {
+                    if !matches!(self.route, Route::Settings(current) if current == section) {
+                        self.open_settings(section, cx);
+                    }
+                }
+                SettingsCatalog::Workers(tab) => {
+                    if !matches!(workers_route, WorkersRoute::Settings(current) if current == tab) {
+                        self.workers_model.update(cx, |model, cx| {
+                            model.open_settings(tab, cx);
+                        });
+                    }
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -3469,6 +3817,7 @@ impl Shell {
         match entry {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
+                self.focus_composer(cx);
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
@@ -3743,22 +4092,243 @@ impl Shell {
     }
 
     fn report_export(&mut self, outcome: ExportOutcome, cx: &mut Context<Self>) {
-        self.sidebar_notice = Some(export_notice(&outcome));
+        if let Some(toast) = export_toast(&outcome) {
+            self.push_toast(toast, cx);
+        }
+    }
+
+    pub fn push_toast(&mut self, toast: crate::toast::Toast, cx: &mut Context<Self>) {
+        let toast_id = toast.id;
+        let duration = toast.duration;
+        self.toasts.push(toast);
         cx.notify();
+
+        if let Some(duration) = duration {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                this.update(cx, |shell, cx| {
+                    shell.dismiss_toast(toast_id, cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.toasts.retain(|t| t.id != id);
+        cx.notify();
+    }
+
+    pub fn handle_toast_action(
+        &mut self,
+        action: crate::toast::ToastAction,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            crate::toast::ToastAction::ReviewWorkerUpdates => {
+                self.sidebar_mode = SidebarMode::Workers;
+                self.workers_model.update(cx, |model, cx| {
+                    model.open_settings(crate::workers::model::WorkersSettingsTab::Presets, cx);
+                });
+                self.toasts
+                    .retain(|t| !matches!(t.kind, crate::toast::ToastKind::ProviderUpdate { .. }));
+                cx.notify();
+            }
+            crate::toast::ToastAction::UpdateAllWorkerClis => {
+                self.run_update_all_worker_clis(cx);
+            }
+        }
+    }
+
+    pub fn run_update_all_worker_clis(&mut self, cx: &mut Context<Self>) {
+        let updatable: Vec<(String, String)> = self
+            .workers_model
+            .read(cx)
+            .advisories
+            .iter()
+            .filter(|adv| {
+                adv.can_update
+                    && adv.status == zeron_workers_unpeel::RuntimeUpdateStatus::BehindLatest
+            })
+            .map(|adv| (adv.cli_id.clone(), adv.binary_name.clone()))
+            .collect();
+
+        if updatable.is_empty() {
+            self.toasts
+                .retain(|t| !matches!(t.kind, crate::toast::ToastKind::ProviderUpdate { .. }));
+            cx.notify();
+            return;
+        }
+
+        let total = updatable.len();
+        let (_, first_name) = updatable[0].clone();
+
+        self.toasts
+            .retain(|t| !matches!(t.kind, crate::toast::ToastKind::ProviderUpdate { .. }));
+        let progress_toast = crate::toast::Toast::updating_progress(1, total, &first_name);
+        let progress_id = progress_toast.id;
+        self.toasts.push(progress_toast);
+        cx.notify();
+
+        let workers_model = self.workers_model.clone();
+        cx.spawn(async move |this, cx| {
+            let mut succeeded = 0;
+            let mut failed = 0;
+
+            for (idx, (cli_id, cli_name)) in updatable.into_iter().enumerate() {
+                let _ = this.update(cx, |shell, cx| {
+                    if let Some(t) = shell.toasts.iter_mut().find(|t| t.id == progress_id) {
+                        t.title = format!("Updating {}/{} ({})…", idx + 1, total, cli_name).into();
+                    }
+                    cx.notify();
+                });
+
+                let result = cx
+                    .background_executor()
+                    .spawn({
+                        let cli_id = cli_id.clone();
+                        async move { zeron_workers_unpeel::run_runtime_update_blocking(&cli_id) }
+                    })
+                    .await;
+                if result.status == zeron_workers_unpeel::UpdateOutcomeStatus::Succeeded {
+                    succeeded += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+
+            let _ = workers_model.update(cx, |model, cx| {
+                model.refresh_advisories(cx);
+                model.refresh_settings(cx);
+                cx.notify();
+            });
+
+            let _ = this.update(cx, |shell, cx| {
+                shell.toasts.retain(|t| t.id != progress_id);
+                let completion_toast = crate::toast::Toast::update_complete(succeeded, failed);
+                shell.push_toast(completion_toast, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Second, unconditional way out of `AppState::compacting`.
+    ///
+    /// The flag is set by the composer and cleared by exactly one edge: a run's
+    /// Working→non-Working transition seen over `state.sessions` in
+    /// [`Shell::on_state_changed`]. That edge never arrives when the session row
+    /// disappears (remote device drops, chat archived) or when the run never
+    /// reports Working at all — and the flag then stays true for the rest of the
+    /// process, pinning the composer's "Compacting…" label and suppressing that
+    /// chat's idle recap. Expire it on a deadline, and drop it outright once the
+    /// chat it belonged to is no longer on the roster.
+    fn sweep_stuck_compactions(&mut self, cx: &mut Context<Self>) {
+        /// Long enough for a slow compaction turn, short enough that a missed
+        /// edge is a pause instead of a permanent state.
+        const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+        let now = std::time::Instant::now();
+        let (roster_known, in_flight) = {
+            let state = self.state.read(cx);
+            let in_flight: Vec<String> = state
+                .chats
+                .iter()
+                .map(|chat| chat.id.clone())
+                .filter(|chat_id| state.is_compacting(chat_id))
+                .collect();
+            (!state.chats.is_empty(), in_flight)
+        };
+        for chat_id in &in_flight {
+            self.compaction_seen_at
+                .entry(chat_id.clone())
+                .or_insert(now);
+        }
+        let stuck: Vec<String> = self
+            .compaction_seen_at
+            .iter()
+            .filter(|&(chat_id, seen_at)| {
+                // An empty roster is a reconnect frame, not evidence the chat
+                // is gone — only the deadline may sweep across one.
+                (roster_known && !in_flight.contains(chat_id))
+                    || now.duration_since(*seen_at) >= STUCK_AFTER
+            })
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect();
+        for chat_id in stuck {
+            self.compaction_seen_at.remove(&chat_id);
+            // `completed: false`: a swept run earns no transcript marker, and
+            // the call is a no-op when the normal edge already cleared it.
+            self.finish_compaction(&chat_id, false, cx);
+        }
+    }
+
+    /// The compaction run ended: drop the composer's "Compacting…" label and,
+    /// when the run actually finished, leave a marker in the transcript with
+    /// the before→after context size. Fire-and-forget like the model-switch
+    /// marker — a failed note never blocks anything.
+    fn finish_compaction(&mut self, chat_id: &str, completed: bool, cx: &mut Context<Self>) {
+        let Some(before) = self
+            .state
+            .update(cx, |state, cx| {
+                let taken = state.take_compaction(chat_id);
+                if taken.is_some() {
+                    cx.notify();
+                }
+                taken
+            })
+            .filter(|_| completed)
+        else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let chat_id = chat_id.to_string();
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            // The post-compaction usage rides the settling turn, a beat behind
+            // the Idle edge — reading it immediately would name the old size.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(800))
+                .await;
+            let after = state.read_with(cx, |state, _| {
+                state
+                    .session_for(&chat_id)
+                    .and_then(|session| session.context_usage)
+                    .map(|usage| usage.tokens)
+            });
+            let text = match after.filter(|after| before > 0 && *after < before) {
+                Some(after) => format!(
+                    "Context compacted · {} → {}",
+                    crate::composer::compact_token_count(before),
+                    crate::composer::compact_token_count(after)
+                ),
+                None => "Context compacted.".to_string(),
+            };
+            let params = serde_json::json!({
+                "op": "noteMarker",
+                "chatId": chat_id,
+                "text": text,
+            });
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                tracing::warn!(error = %err, "noteMarker mutate failed");
+            }
+        })
+        .detach();
     }
 
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some(SidebarNotice::failure("Engine not connected"));
-            cx.notify();
+            self.push_toast(crate::toast::Toast::error("Engine not connected"), cx);
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
-                    cx.notify();
+                    shell.push_toast(crate::toast::Toast::error(format!("{err}")), cx);
                 })
                 .ok();
             }
@@ -3877,6 +4447,16 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
+        if let Some(tabs) = self.right_tabs.get(&chat_id) {
+            for surface in tabs {
+                if let RightSurface::Browser(id) = surface {
+                    if let Some(browser) = self.browsers.remove(id) {
+                        browser.update(cx, |browser, cx| browser.close(cx));
+                    }
+                    self.browser_subs.remove(id);
+                }
+            }
+        }
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
@@ -3994,9 +4574,10 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice = Some(SidebarNotice::failure(format!(
-                            "Could not cancel sign-in: {err}"
-                        )));
+                        shell.push_toast(
+                            crate::toast::Toast::error(format!("Could not cancel sign-in: {err}")),
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -4318,9 +4899,10 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice =
-                        Some(SidebarNotice::failure(format!("Sign in failed: {err}")));
-                    cx.notify();
+                    shell.push_toast(
+                        crate::toast::Toast::error(format!("Sign in failed: {err}")),
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -4444,7 +5026,13 @@ impl Shell {
 
     // ---- render pieces ----
 
-    /// Evaluate a width tween at "now" (manual drive — see [`WidthTween`]).
+    fn tween_elapsed(&self, started: std::time::Instant) -> Duration {
+        self.render_time
+            .unwrap_or_else(std::time::Instant::now)
+            .saturating_duration_since(started)
+    }
+
+    /// Evaluate a width tween at the frame time (see [`WidthTween`]).
     /// Mid-flight: eased 200ms lerp, and `motion_active` is flagged so render
     /// schedules the next animation frame. Finished, stale, absent, or under
     /// reduced motion: exactly `target`. Honors `ZERON_MOTION_SCALE`.
@@ -4456,7 +5044,7 @@ impl Shell {
             return target;
         }
         let total = RESIZE.total().mul_f32(motion::speed_scale());
-        let raw = started.elapsed().as_secs_f32() / total.as_secs_f32();
+        let raw = self.tween_elapsed(started).as_secs_f32() / total.as_secs_f32();
         if raw >= 1.0 {
             return target;
         }
@@ -4467,7 +5055,7 @@ impl Shell {
     fn tween_active(&self, tween: Option<WidthTween>) -> bool {
         tween.is_some_and(|tween| {
             !self.reduced_motion
-                && tween.started.elapsed() < RESIZE.total().mul_f32(motion::speed_scale())
+                && self.tween_elapsed(tween.started) < RESIZE.total().mul_f32(motion::speed_scale())
         })
     }
 
@@ -4475,7 +5063,8 @@ impl Shell {
         tween
             .filter(|transition| {
                 !self.reduced_motion
-                    && transition.started.elapsed() < RESIZE.total().mul_f32(motion::speed_scale())
+                    && self.tween_elapsed(transition.started)
+                        < RESIZE.total().mul_f32(motion::speed_scale())
             })
             .map(|transition| (transition.from, transition.to))
     }
@@ -4571,22 +5160,23 @@ impl Shell {
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.sidebar_mode == SidebarMode::Workers {
+            if matches!(self.workers_model.read(cx).route, WorkersRoute::Settings(_)) {
+                let inner = div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pl(px(self.title_bar_content_start()))
+                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+                return self
+                    .titlebar_drag_region("workers-settings-header-titlebar", bar, cx)
+                    .into_any_element();
+            }
             let theme = Theme::of(cx).clone();
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            let (
-                workspace_path,
-                gallery_session_id,
-                gallery_pulsing,
-                show_session_gallery,
-                titlebar,
-            ) = {
+            let (gallery_session_id, gallery_pulsing, show_session_gallery, titlebar) = {
                 let model = self.workers_model.read(cx);
-                let workspace_path = model
-                    .launcher_project()
-                    .or_else(|| model.selected_project())
-                    .or_else(|| model.projects().iter().find(|project| !project.is_group))
-                    .or_else(|| model.projects().first())
-                    .map(|project| project.path.clone());
                 let project = model.selected_session().and_then(|session| {
                     model
                         .projects()
@@ -4611,7 +5201,6 @@ impl Shell {
                     model.gallery_pulse_session_id.as_ref() == Some(session_id)
                 });
                 (
-                    workspace_path,
                     gallery_session_id,
                     gallery_pulsing,
                     model.appearance_settings().show_session_gallery
@@ -4727,14 +5316,6 @@ impl Shell {
             } else {
                 10.0
             };
-            let workspace_action = workspace_path.map(|path| {
-                div()
-                    .absolute()
-                    .top(px(6.0))
-                    .right(px(action_right))
-                    .occlude()
-                    .child(self.render_workers_workspace_open_button(path, &theme, cx))
-            });
             let gallery_action =
                 gallery_session_id
                     .filter(|_| show_session_gallery)
@@ -4742,11 +5323,7 @@ impl Shell {
                         div()
                             .absolute()
                             .top(px(6.0))
-                            .right(px(if workspace_action.is_some() {
-                                action_right + 67.0
-                            } else {
-                                action_right
-                            }))
+                            .right(px(action_right))
                             .occlude()
                             .child(self.render_workers_session_gallery_button(
                                 session_id,
@@ -4763,8 +5340,7 @@ impl Shell {
             .right_pane
                 && !right_open)
                 .then(|| {
-                    let preceding = usize::from(workspace_action.is_some())
-                        + usize::from(gallery_action.is_some());
+                    let preceding = usize::from(gallery_action.is_some());
                     div()
                         .absolute()
                         .top(px(6.0))
@@ -4773,9 +5349,8 @@ impl Shell {
                         .child(self.render_workers_right_pane_button(&theme, cx))
                 });
             let details_action = (!details_open && self.details_context(cx).is_some()).then(|| {
-                let preceding = usize::from(workspace_action.is_some())
-                    + usize::from(gallery_action.is_some())
-                    + usize::from(panel_action.is_some());
+                let preceding =
+                    usize::from(gallery_action.is_some()) + usize::from(panel_action.is_some());
                 div()
                     .absolute()
                     .top(px(6.0))
@@ -4832,7 +5407,6 @@ impl Shell {
                 // Paint interactive chrome after the drag surface so its
                 // hitbox and pixels win inside the native titlebar.
                 .children(gallery_action)
-                .children(workspace_action)
                 .children(panel_action)
                 .children(details_action)
                 .children(panel_header);
@@ -4853,107 +5427,6 @@ impl Shell {
                     .into_any_element()
             }
         }
-    }
-
-    fn open_workers_workspace_menu(&mut self, path: String, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        {
-            let selection = native_workspace_open_menu::show_async();
-            cx.spawn(async move |this, cx| {
-                let Ok(Some(target)) = selection.await else {
-                    return;
-                };
-                this.update(cx, |this, cx| {
-                    this.workers_model.update(cx, |model, cx| {
-                        if target == WorkspaceOpenTarget::Finder {
-                            model.reveal_project(path, cx);
-                        } else {
-                            model.open_project_with_application(
-                                path,
-                                target
-                                    .bundle_ids()
-                                    .iter()
-                                    .map(|id| (*id).to_owned())
-                                    .collect(),
-                                target
-                                    .app_names()
-                                    .iter()
-                                    .map(|name| (*name).to_owned())
-                                    .collect(),
-                                cx,
-                            );
-                        }
-                    });
-                })
-                .ok();
-            })
-            .detach();
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (path, cx);
-        }
-    }
-
-    fn render_workers_workspace_open_button(
-        &mut self,
-        path: String,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let preferred_path = path.clone();
-        div()
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.text.opacity(0.08))
-            .bg(theme.surface_raised.opacity(0.92))
-            .overflow_hidden()
-            .child(
-                div()
-                    .id("workers-open-workspace-preferred")
-                    .w(px(32.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.workers_model.update(cx, |model, cx| {
-                            model.open_project_in_editor(preferred_path.clone(), cx)
-                        });
-                    }))
-                    .child(
-                        icon(icons::WORKER_OPEN_CODE)
-                            .size(px(18.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.text.opacity(0.10)))
-            .child(
-                div()
-                    .id("workers-open-workspace-menu")
-                    .w(px(25.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.element_hover.opacity(0.45)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_workers_workspace_menu(path.clone(), cx)
-                    }))
-                    .child(
-                        icon(icons::ALT_ARROW_DOWN)
-                            .size(px(9.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn render_orchestrator_trajectory_button(
@@ -4990,10 +5463,9 @@ impl Shell {
             .h(px(26.0))
             .flex()
             .items_center()
+            // Flat like the neighboring titlebar icon buttons (no pill fill or
+            // border); the split segments keep their own rounded hover.
             .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.text.opacity(0.08))
-            .bg(theme.surface_raised.opacity(0.92))
             .overflow_hidden()
             .child(
                 div()
@@ -5108,10 +5580,9 @@ impl Shell {
             .h(px(28.0))
             .flex()
             .items_center()
+            // Flat like the neighboring titlebar icon buttons (no pill fill or
+            // border); the split segments keep their own rounded hover.
             .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.text.opacity(0.08))
-            .bg(theme.surface_raised.opacity(0.92))
             .overflow_hidden()
             .child(
                 div()
@@ -5375,16 +5846,15 @@ impl Shell {
             })
             .cursor_pointer()
             .when(selected, |el| {
-                el.bg(theme.bg)
+                // Translucent active plate (was opaque theme.bg): active over
+                // the glass without a solid black slab.
+                el.bg(theme.bg.opacity(0.6))
                     .border_1()
-                    .border_color(theme.border.opacity(0.7))
+                    .border_color(theme.border.opacity(0.5))
             })
             .hover(move |el| el.bg(hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if this.sidebar_mode != mode {
-                    this.sidebar_mode = mode;
-                    cx.notify();
-                }
+                this.select_sidebar_mode(mode, cx);
             }))
             .child(SharedString::from(label))
             .into_any_element()
@@ -5421,7 +5891,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .rounded(px(SIDEBAR_MODE_SWITCHER_RADIUS))
-            .bg(theme.surface_raised.opacity(0.55))
+            .bg(theme.surface_raised.opacity(0.35))
             .child(orchestrator)
             .child(workers)
             .into_any_element()
@@ -5704,6 +6174,75 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_chat_delete_confirm(
+        &self,
+        id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let confirm_id = id.to_string();
+        div()
+            .id(SharedString::from(format!("chat-delete-confirm-{id}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .min_h(px(45.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .bg(crate::theme::ink(0.10))
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .child(SharedString::from("Delete session?"))
+            .child(div().flex_1().min_w(px(4.0)))
+            .child(
+                div()
+                    .id(SharedString::from(format!("chat-delete-cancel-{id}")))
+                    .h(px(20.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .bg(crate::theme::ink(0.06))
+                    .hover(|el| el.bg(crate::theme::ink(0.10)).text_color(theme.text))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_confirm = None;
+                        cx.notify();
+                    }))
+                    .child("Cancel"),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-delete-confirm-button-{id}"
+                    )))
+                    .h(px(20.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.danger)
+                    .bg(theme.danger.opacity(0.15))
+                    .hover(|el| el.bg(theme.danger.opacity(0.25)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_chat(confirm_id.clone(), cx);
+                    }))
+                    .child("Delete"),
+            )
+            .into_any_element()
+    }
+
     /// One session row: context + status on line one, harness + title on line
     /// two, and source metadata below. Working uses the live thread glyph in
     /// the status corner. Click selects; right-click opens the context menu.
@@ -5728,6 +6267,9 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.delete_confirm.as_deref() == Some(id.as_str()) {
+            return self.render_chat_delete_confirm(&id, theme, cx);
+        }
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
@@ -6304,33 +6846,6 @@ impl Shell {
             // appearing IS the signal.
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
-            })
-            // Inline notice: mutation failures and export outcomes.
-            .when_some(self.sidebar_notice.clone(), |el, notice| {
-                let ink = if notice.ok {
-                    theme.text_muted
-                } else {
-                    theme.danger
-                };
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(ink)
-                        .text_size(px(11.0))
-                        .text_color(ink)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_notice = None;
-                            cx.notify();
-                        }))
-                        .child(notice.text),
-                )
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
@@ -7160,52 +7675,21 @@ impl Shell {
             overlays.push(overlay);
         }
 
-        if let Some(chat_id) = self.delete_confirm.clone() {
-            let title = transcript::single_line(
-                &self
-                    .state
-                    .read(cx)
-                    .chats
-                    .iter()
-                    .find(|c| c.id == chat_id)
-                    .and_then(|c| c.title.clone())
-                    .unwrap_or_else(|| "New session".into()),
-            );
-            let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Delete session?"))
-                .child(div().mt(px(6.0)).child(popover::dialog_body(
-                    &theme,
-                    format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
-                )))
-                .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel")
-                                .id("delete-chat-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_confirm = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            popover::btn_danger(&theme, "Delete")
-                                .id("delete-chat-confirm")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_chat(chat_id.clone(), cx)
-                                })),
-                        ),
-                )
-                .into_any_element();
-            overlays.push(popover::modal("delete-chat-dialog", viewport, card));
-        }
-
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
             overlays.push(sync);
+        }
+        if let Some(toast_overlay) = crate::toast::render_toast_overlay(
+            &self.toasts,
+            &theme,
+            |shell, action, window, cx| {
+                shell.handle_toast_action(action, window, cx);
+            },
+            |shell, id, _, cx| {
+                shell.dismiss_toast(id, cx);
+            },
+            cx,
+        ) {
+            overlays.push(toast_overlay);
         }
 
         overlays
@@ -7234,8 +7718,9 @@ impl Shell {
             .absolute()
             .top(px(PANE_RESIZE_HITBOX_TOP))
             .bottom_0()
-            .w(px(12.0))
+            .w(px(PANE_RESIZE_HITBOX_HALF_WIDTH * 2.0))
             .flex_none()
+            .occlude()
             .cursor_col_resize()
             .on_hover(motion::hover_listener(fade_key))
             // Codex-style seam feedback: the existing 1px panel border stays
@@ -7418,6 +7903,7 @@ impl Shell {
                             .band_top(Theme::TRANSCRIPT_FADE_BAND)
                             .band_bottom(bottom_band),
                         )
+                        .children(self.render_transcript_stall_notice(cx))
                         .children(self.render_jump_to_bottom(stack_h, cx))
                 },
             )
@@ -7467,6 +7953,62 @@ impl Shell {
                     })),
             )
             .into_any_element()
+    }
+
+    /// The transcript is not arriving and the watch is still retrying: say so
+    /// where the messages would be.
+    ///
+    /// An empty canvas is indistinguishable from "this chat has no messages",
+    /// which is how a second app instance on the same profile presented
+    /// itself — every `WatchDocMessages` answered `connection closed`, the log
+    /// filled up, and the surface said nothing.
+    fn render_transcript_stall_notice(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let chat_id = state.selected_chat.clone()?;
+        let reason = state.transcript_stall(&chat_id)?.to_owned();
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .absolute()
+                .top(px(Theme::TITLEBAR_HEIGHT + Theme::SPACE_MD))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(520.0))
+                        .px(px(Theme::SPACE_MD))
+                        .py(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .bg(theme.ink(0.85))
+                        .border_1()
+                        .border_color(theme.warning.opacity(0.5))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.warning)
+                                .child("Transcript not arriving — retrying"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(reason)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child("Another zeron instance on this profile owns the engine; close it and this heals."),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The "↓ Scroll to bottom" pill (round-9 §3): a LABELED rounded-full
@@ -7582,6 +8124,10 @@ impl Shell {
     fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
+        let view = cx.entity_id();
+        let working = self.transcript.update(cx, |transcript, cx| {
+            transcript.render_working_trailer(view, false, cx)
+        });
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
@@ -7595,35 +8141,20 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(Theme::SPACE_SM))
-            .px(px(Theme::SPACE_LG + 8.0))
+            .px(px(Theme::SPACE_LG))
             .text_size(px(11.0));
 
         let Some(chat_id) = state.selected_chat.clone() else {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
-        // Timer base: the freshest of the session row's turn start and the
-        // in-flight send. During the send→ack window the row (if any) still
-        // carries the PREVIOUS turn's start, and using it opened the timer at
-        // the old turn's elapsed instead of 0:00.
-        let started = state
-            .session_for(&chat_id)
-            .and_then(|s| s.started_at)
-            .into_iter()
-            .chain(state.pending_send_started(&chat_id, now))
-            .max();
-        let elapsed_secs = started
-            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-            .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
-
-        // Unused here since the Working loader moved into the transcript
-        // (its trailer computes its own elapsed).
-        let _ = elapsed_secs;
+        if let Some(working) = working {
+            return strip.child(working).into_any_element();
+        }
         match indicator {
-            // The working loader lives in the TRANSCRIPT now, under the
-            // streaming reply (user request) — the strip stays empty (its
-            // reserved height still steadies the composer).
+            // The shared presenter above owns active timing and delivery
+            // states. Keep the reserved strip when it has nothing to show.
             Indicator::Working => strip.into_any_element(),
             // No label: the QuestionPanel right below IS the awaiting-input
             // surface — a strip caption above it was redundant (user request).
@@ -7676,6 +8207,24 @@ impl Shell {
 
         popover::popover_card(&theme)
             .id(menu_id)
+            .child(
+                popover::menu_row(&theme, false, "utility-browser")
+                    .id("utility-browser-row")
+                    .when(!terminal_available, |el| el.opacity(0.35).cursor_default())
+                    .when(terminal_available, |el| {
+                        el.on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.utility_add_menu_open = false;
+                            this.add_browser_surface(None, window, cx);
+                        }))
+                    })
+                    .child(
+                        icon(icons::GLOBE)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Browser"),
+            )
             .w(px(170.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.utility_add_menu_open = false;
@@ -7720,6 +8269,26 @@ impl Shell {
                     )
                     .child("Changes"),
             )
+            .child(
+                popover::menu_row(&theme, false, "utility-history")
+                    .id("utility-history-row")
+                    .role(gpui::Role::Button)
+                    .aria_label("Open Git history")
+                    .when(!git_detected, |el| el.opacity(0.35).cursor_default())
+                    .when(git_detected, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.utility_add_menu_open = false;
+                            this.add_history_surface(cx);
+                        }))
+                    })
+                    .child(
+                        icon(icons::GIT_BRANCH)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("History"),
+            )
             .into_any_element()
     }
 
@@ -7729,10 +8298,6 @@ impl Shell {
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let surface = self.resolved_right_active(cx);
-        let tab_strip = match surface {
-            RightSurface::Picker => gpui::Empty.into_any_element(),
-            _ => self.render_right_tab_strip(cx),
-        };
         let content: AnyElement = match surface {
             RightSurface::Diff(id) => self
                 .diffs
@@ -7742,6 +8307,12 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                     changes.into_any_element()
                 })
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
+            RightSurface::Browser(id) => self
+                .browsers
+                .get(&id)
+                .cloned()
+                .map(|browser| browser.into_any_element())
                 .unwrap_or_else(|| gpui::Empty.into_any_element()),
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
@@ -7802,7 +8373,8 @@ impl Shell {
             RightSurface::Picker => gpui::Empty.into_any_element(),
         };
         // Flush panel (user request — the inset card is gone): full window
-        // height with a left hairline, glass-friendly for either utility
+        // height with matching hairlines toward the main column and Details,
+        // glass-friendly for either utility
         // (translucent over the frost; solid otherwise). The resize grabber
         // lives on the root seam, outside this clipped width container.
         let panel_bg = if theme.is_glass() {
@@ -7821,12 +8393,16 @@ impl Shell {
             .when(!self.right_pane_expanded, |el| {
                 el.border_l_1().border_color(theme.border)
             })
+            .when(self.details_target(cx) > 0.0, |el| {
+                el.border_r_1().border_color(theme.border)
+            })
             .bg(panel_bg)
             .overflow_hidden()
             // The titlebar is a glass overlay over the full-height content
-            // row; utility chrome starts below it.
+            // row, and the surface tabs ride INSIDE it (the header overlays in
+            // `render_session_title_bar` / the Workers bar). So this padding is
+            // the tab band itself, not dead space above one.
             .pt(px(Theme::TITLEBAR_HEIGHT))
-            .child(tab_strip)
             .child(div().flex_1().min_h_0().overflow_hidden().child(content));
         let target = self.right_target(cx);
         self.right_pane_container(
@@ -7983,10 +8559,20 @@ impl Shell {
         for (ix, (surface, title)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let surface_icon: AnyElement = match surface {
-                RightSurface::Diff(_) => icon(icons::GIT_BRANCH)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
+                RightSurface::Diff(id) => icon(
+                    if self
+                        .diffs
+                        .get(&id)
+                        .is_some_and(|changes| changes.read(cx).is_history())
+                    {
+                        icons::GIT_BRANCH
+                    } else {
+                        icons::LIST
+                    },
+                )
+                .size(px(12.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
                 RightSurface::Terminal(_) => icon(icons::TERMINAL)
                     .size(px(12.0))
                     .text_color(theme.text_muted)
@@ -8017,10 +8603,20 @@ impl Shell {
                             .text_color(theme.text_muted)
                             .into_any_element()
                     }),
-                RightSurface::Subagent(_) => icon(icons::BOT)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
+                RightSurface::Subagent(id) => self
+                    .subagent_tabs
+                    .get(&id)
+                    .map(|tab| {
+                        img(
+                            crate::details_sidebar::subagent_avatars::blobatar_subagent_avatar_path(
+                                &tab.doc_id,
+                            ),
+                        )
+                        .size(px(18.0))
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element()
+                    })
+                    .unwrap_or_else(|| gpui::Empty.into_any_element()),
                 RightSurface::Worker(_) => icon(icons::TERMINAL)
                     .size(px(12.0))
                     .text_color(theme.text_muted)
@@ -8029,13 +8625,25 @@ impl Shell {
                     .size(px(12.0))
                     .text_color(theme.text_muted)
                     .into_any_element(),
+                RightSurface::Browser(id) => self
+                    .browsers
+                    .get(&id)
+                    .and_then(|b| b.read(cx).favicon.clone())
+                    .map(|favicon| gpui::img(favicon).size(px(12.0)).into_any_element())
+                    .unwrap_or_else(|| {
+                        icon(icons::GLOBE)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .into_any_element()
+                    }),
                 RightSurface::Picker => gpui::Empty.into_any_element(),
             };
-            // A live subagent tab swaps its icon for the mini working
-            // spinner (the history fetch button's in-flight recipe) — the
-            // doc's streaming tail entry IS the run's liveness, so the swap
-            // settles by itself when the subagent finishes.
+            // Keep the doc-keyed avatar visible; activity has its own trailing slot.
             let subagent_running = match surface {
+                RightSurface::Browser(id) => self
+                    .browsers
+                    .get(&id)
+                    .is_some_and(|b| b.read(cx).page.loading),
                 RightSurface::Subagent(id) => self.subagent_tabs.get(&id).is_some_and(|tab| {
                     self.state
                         .read(cx)
@@ -8124,33 +8732,7 @@ impl Shell {
                                 .items_center()
                                 .justify_center()
                                 .group_hover(group.clone(), |s| s.opacity(0.0))
-                                .child(if subagent_running {
-                                    loaders::mini_glyph_spinner(
-                                        format!("subagent-tab-{ix}"),
-                                        2.0,
-                                        theme.glyph,
-                                        cx.entity_id(),
-                                        cx,
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    surface_icon
-                                }),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(0.0)
-                                .group_hover(group.clone(), |s| s.opacity(1.0))
-                                .child(
-                                    icon(icons::CLOSE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
+                                .child(surface_icon),
                         ),
                 )
                 .child(
@@ -8164,7 +8746,16 @@ impl Shell {
                             theme.text_muted
                         })
                         .child(title),
-                );
+                )
+                .when(subagent_running, |chip| {
+                    chip.child(loaders::mini_glyph_spinner(
+                        format!("subagent-tab-{ix}"),
+                        2.0,
+                        theme.glyph,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                });
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -8192,7 +8783,7 @@ impl Shell {
             };
             strip = strip.child(wrapped);
         }
-        // The `+` — a small menu offering the two surfaces (t3 "Add panel
+        // The `+` — a small menu offering the available surfaces (t3 "Add panel
         // surface"); mirrors the picker cards.
         let plus_open = self.right_plus.get().is_some();
         let plus_fade = "right-surface-add-fade";
@@ -8244,6 +8835,22 @@ impl Shell {
                         .flex_col()
                         .gap(px(2.0))
                         .child(
+                            popover::menu_row(&theme, false, "right-plus-browser")
+                                .id("right-plus-browser-row")
+                                .role(gpui::Role::Button)
+                                .aria_label("Open browser")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_browser_surface(None, window, cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::GLOBE)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Browser")),
+                        )
+                        .child(
                             popover::menu_row(&theme, false, "right-plus-terminal")
                                 .id("right-plus-terminal-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -8266,14 +8873,27 @@ impl Shell {
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
+                                        icon(icons::LIST)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(SharedString::from("Diffs")),
+                            )
+                            .child(
+                                popover::menu_row(&theme, false, "right-plus-history")
+                                    .id("right-plus-history-row")
+                                    .role(gpui::Role::Button)
+                                    .aria_label("Open Git history")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_history_surface(cx);
+                                        this.close_right_plus(cx);
+                                    }))
+                                    .child(
                                         icon(icons::GIT_BRANCH)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )
-                                    // "Git", not "Git diff" — the surface hosts
-                                    // history and per-commit views too (user
-                                    // request; matches the picker card).
-                                    .child(SharedString::from("Git")),
+                                    .child(SharedString::from("History")),
                             )
                         }),
                 )
@@ -9141,6 +9761,7 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_time = Some(std::time::Instant::now());
         self.viewport_width = f32::from(window.viewport_size().width);
         let theme = Theme::of(cx);
         // The shell tone (zeron `.frost`): the surface the sidebar sits on and
@@ -9159,6 +9780,56 @@ impl Render for Shell {
             .debug_gate
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
+
+        let browser_profile = {
+            let state = self.state.read(cx);
+            crate::links::workspace_locator(
+                state.workspace_scope,
+                state.auth.as_ref(),
+                state.local_device_id.as_deref(),
+            )
+        };
+        if browser_profile.is_some() && browser_profile != self.browser_profile {
+            if self.browser_profile.is_some() {
+                for browser in self.browsers.values() {
+                    browser.update(cx, |browser, cx| browser.close(cx));
+                }
+                self.browsers.clear();
+                self.browser_subs.clear();
+                self.browser_context = crate::browser::BrowserContext::default();
+            }
+            self.browser_profile = browser_profile;
+        }
+        let browser_active = matches!(gate, GatePhase::Ready)
+            && !restart_required
+            && matches!(self.route, Route::Chat)
+            && (self.right_pane_open(cx) || self.tween_active(self.right_tween));
+        // Native clipping follows the animated GPUI mask. Drags only transfer
+        // pointer ownership; the browser continues rendering and reflowing.
+        let browser_dragging = cx.has_active_drag();
+        #[cfg(target_os = "macos")]
+        let browser_resize_inset = if self.right_pane_open(cx)
+            && !self.right_pane_expanded
+            && !self.tween_active(self.right_tween)
+        {
+            // The browser starts inside the panel's one-point left border.
+            px(PANE_RESIZE_HITBOX_HALF_WIDTH - 1.0)
+        } else {
+            px(0.0)
+        };
+        let selected_surface = self.resolved_right_active(cx);
+        for (id, browser) in &self.browsers {
+            let presentation = crate::browser::model::presentation(
+                browser_active && selected_surface == RightSurface::Browser(*id),
+                browser_dragging,
+            );
+            browser.update(cx, |browser, cx| {
+                #[cfg(target_os = "macos")]
+                browser.set_resize_inset(browser_resize_inset, cx);
+                browser.set_shortcuts(&self.settings.keymap);
+                browser.set_presentation(presentation, cx);
+            });
+        }
 
         // Fullscreen hides the macOS traffic lights — reflow the control
         // cluster with a 200ms ease-out tween (§1.1). A fullscreen transition
@@ -9196,32 +9867,31 @@ impl Render for Shell {
             ));
         }
 
-        // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
-        // chain — with nothing focused they go dead. Land initial focus on the
-        // composer, and whenever focus is lost with no successor (e.g. the
-        // focused element unmounted), route it back there.
+        // Recover only after the mounted focus tree has settled. A retained
+        // handle from a closed preview is not a keyboard destination.
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
-                match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                    // No composer here — clear the stale handle so `focused()`
-                    // reads None (the render hook below re-lands focus when the
-                    // route returns to Chat; a lingering unmounted handle would
-                    // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
-                }
+                let root = this.shortcut_focus.clone();
+                let unfocused = this.unfocused.clone();
+                let preferred = this.composer.focus_handle(cx);
+                window.on_next_frame(move |window, cx| {
+                    restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
+                });
+                cx.notify();
             }));
         }
-        if !restart_required
-            && matches!(gate, GatePhase::Ready)
-            && matches!(self.route, Route::Chat)
-            && window.focused(cx).is_none()
-        {
-            window.focus(&self.composer.focus_handle(cx), cx);
-        }
+        let shortcut_focus = self.shortcut_focus.clone();
+        let unfocused = self.unfocused.clone();
+        let preferred_focus = self.composer.focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
+        });
 
         let root = div()
             .id("shell-root")
+            .role(gpui::accesskit::Role::Group)
+            .track_focus(&self.shortcut_focus)
+            .child(div().track_focus(&self.unfocused))
             .relative()
             .flex()
             .flex_row()
@@ -9282,6 +9952,39 @@ impl Render for Shell {
                     this.archive_selected_chat(cx)
                 }
             }))
+            // ⌘W closes what is on screen: with a Worker session in the viewer
+            // that means archiving it, and only when there is nothing to close
+            // does the keystroke fall through to the window itself. The action
+            // is `CloseWindow` because AppKit owns ⌘W as the key equivalent of
+            // the Window ▸ Close item and dispatches THAT action — binding a
+            // second action to the same combo would never be reached.
+            //
+            // Gated on the surface actually painted, NOT on `self.route`:
+            // `render_main` returns the Workers content whenever the sidebar
+            // mode is Workers, before it ever looks at the route, so opening
+            // app Settings and then switching to Workers leaves
+            // `route == Settings` under a visible Workers workspace. The
+            // Workers route still matters: its own Settings/Recent pages have
+            // no session to archive.
+            .on_action(
+                cx.listener(|this, _: &crate::app_menus::CloseWindow, _, cx| {
+                    if !worker_archive_shortcut_enabled(
+                        this.sidebar_mode,
+                        this.workers_model.read(cx).route,
+                        this.overlay_owns_keyboard(cx),
+                    ) {
+                        return;
+                    }
+                    let archived = this
+                        .workers_model
+                        .update(cx, |model, cx| model.archive_selected_session(cx));
+                    if archived {
+                        // Nothing else may see this keystroke, or the window
+                        // would close on top of the archive.
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             // A jump routes back to chat itself, so Settings is not a dead
             // spot — the same call a click on that sidebar row makes. But an
             // open picker/palette owns the keyboard: no jumping underneath
@@ -9388,7 +10091,9 @@ impl Render for Shell {
                 // The right utility surface is chat-scoped chrome: the Settings
                 // route never renders it — the per-session open flags stay
                 // intact for the return trip.
-                let on_chat = matches!(self.route, Route::Chat);
+                let in_settings =
+                    settings_layer_open(self.route, self.workers_model.read(cx).route);
+                let on_chat = !in_settings;
                 let right_open = on_chat && self.right_pane_open(cx);
                 // Takeover mode derives its width from the viewport, so a
                 // manual drag handle would fight the expanded target.
@@ -9404,7 +10109,7 @@ impl Render for Shell {
                     )
                     // A forgiving transparent hit target centered on the
                     // seam; the panel's 1px border remains the visual divider.
-                    .left(px(-6.0))
+                    .left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
                 });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
@@ -9464,7 +10169,9 @@ impl Render for Shell {
                         .w(px(0.0))
                         .h_full()
                         .flex_none()
-                        .relative()
+                        .absolute()
+                        .left_0()
+                        .top_0()
                         .child(handle)
                         .into_any_element()
                 } else {
@@ -9504,8 +10211,14 @@ impl Render for Shell {
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
-                            .child(right_seam)
-                            .child(right)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .flex_none()
+                                    .relative()
+                                    .child(right)
+                                    .child(right_seam),
+                            )
                             .child(details),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
@@ -9586,8 +10299,11 @@ impl Render for Shell {
                 ),
             )
         };
-        root.children(self.render_windows_caption_controls(window, cx))
-            .children(self.render_linux_caption_controls(window, cx))
+        let root = root
+            .children(self.render_windows_caption_controls(window, cx))
+            .children(self.render_linux_caption_controls(window, cx));
+        self.render_time = None;
+        root
     }
 }
 
@@ -9608,27 +10324,19 @@ mod tests {
     /// Every outcome is visible and says which one it was — success names the
     /// file or the clipboard, failure names the reason. Nothing is silent.
     #[test]
-    fn export_notice_states_the_outcome_and_its_tone() {
-        let downloaded = export_notice(&ExportOutcome::Downloaded(
-            "Fix_the_thing-a1b2c3d4.md".into(),
-        ));
-        assert_eq!(
-            downloaded,
-            SidebarNotice::success("Exported to Downloads: Fix_the_thing-a1b2c3d4.md")
-        );
-        assert!(downloaded.ok);
-
-        assert_eq!(
-            export_notice(&ExportOutcome::Copied),
-            SidebarNotice::success("Chat copied to clipboard")
+    fn export_toast_states_the_outcome_and_its_tone() {
+        assert!(
+            export_toast(&ExportOutcome::Downloaded(
+                "Fix_the_thing-a1b2c3d4.md".into(),
+            ))
+            .is_none()
         );
 
-        let failed = export_notice(&ExportOutcome::Failed("permission denied".into()));
-        assert_eq!(
-            failed,
-            SidebarNotice::failure("Export failed: permission denied")
-        );
-        assert!(!failed.ok);
+        assert!(export_toast(&ExportOutcome::Copied).is_none());
+
+        let failed = export_toast(&ExportOutcome::Failed("permission denied".into())).unwrap();
+        assert_eq!(failed.title.as_ref(), "Export failed: permission denied");
+        assert_eq!(failed.kind, crate::toast::ToastKind::Error);
     }
 
     /// A broken workers join delivers a file that reads as complete. The
@@ -9640,17 +10348,17 @@ mod tests {
             ExportOutcome::Downloaded("Fix_the_thing-a1b2c3d4.md".into()),
             Some("parse app-state.json: expected value".into()),
         );
-        let notice = export_notice(&incomplete);
-        assert!(!notice.ok);
-        assert!(notice.text.contains("Fix_the_thing-a1b2c3d4.md"));
-        assert!(notice.text.contains("parse app-state.json"));
+        let toast = export_toast(&incomplete).unwrap();
+        assert_eq!(toast.kind, crate::toast::ToastKind::Error);
+        assert!(toast.title.contains("Fix_the_thing-a1b2c3d4.md"));
+        assert!(toast.title.contains("parse app-state.json"));
 
-        let copied = export_notice(&export_outcome_with_worker_loss(
+        let copied = export_toast(&export_outcome_with_worker_loss(
             ExportOutcome::Copied,
             Some("boom".into()),
-        ));
-        assert!(!copied.ok);
-
+        ))
+        .unwrap();
+        assert_eq!(copied.kind, crate::toast::ToastKind::Error);
         // A healthy join leaves the outcome untouched.
         assert_eq!(
             export_outcome_with_worker_loss(ExportOutcome::Copied, None),
@@ -9712,13 +10420,94 @@ mod tests {
     }
 
     #[test]
+    fn switcher_outside_settings_does_not_open_a_catalog() {
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                false,
+                SidebarMode::Workers,
+                Route::Chat,
+                WorkersRoute::Workspace,
+            ),
+            None
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                false,
+                SidebarMode::Orchestrator,
+                Route::Chat,
+                WorkersRoute::Workspace,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn switcher_in_settings_picks_the_other_catalog_and_restores_the_last_page() {
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Workers,
+                Route::Settings(SettingsSection::Agents),
+                WorkersRoute::Workspace,
+            ),
+            Some(SettingsCatalog::Workers(WorkersSettingsTab::Presets))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Orchestrator,
+                Route::Chat,
+                WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Orchestrator(SettingsSection::Devices))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Workers,
+                Route::Settings(SettingsSection::Agents),
+                WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Workers(WorkersSettingsTab::Resources))
+        );
+        assert_eq!(
+            sidebar_mode_switch_catalog(
+                true,
+                SidebarMode::Orchestrator,
+                Route::Settings(SettingsSection::Agents),
+                WorkersRoute::Settings(WorkersSettingsTab::Resources),
+            ),
+            Some(SettingsCatalog::Orchestrator(SettingsSection::Agents))
+        );
+    }
+
+    #[test]
+    fn settings_layer_is_open_from_either_catalog() {
+        assert!(!settings_layer_open(Route::Chat, WorkersRoute::Workspace));
+        assert!(settings_layer_open(
+            Route::Settings(SettingsSection::Devices),
+            WorkersRoute::Workspace,
+        ));
+        assert!(settings_layer_open(
+            Route::Chat,
+            WorkersRoute::Settings(WorkersSettingsTab::Presets),
+        ));
+    }
+
+    #[test]
     fn right_pane_ceiling_preserves_the_chat_floor() {
-        assert_eq!(right_pane_max_width(1200.0, 256.0), 644.0);
-        assert_eq!(1200.0 - 256.0 - 644.0, CHAT_PANEL_MIN);
+        assert_eq!(right_pane_max_width(1200.0, 256.0), 614.0);
+        assert_eq!(
+            1200.0 - 256.0 - 614.0,
+            RESPONSIVE_MAIN_PANE_MIN + RESPONSIVE_COLUMN_GUTTER
+        );
         // The chat floor wins over the right pane's preferred 360px minimum
         // when the whole window is unusually narrow.
-        assert_eq!(right_pane_max_width(800.0, 256.0), 244.0);
-        assert_eq!(800.0 - 256.0 - 244.0, CHAT_PANEL_MIN);
+        assert_eq!(right_pane_max_width(800.0, 256.0), 214.0);
+        assert_eq!(
+            800.0 - 256.0 - 214.0,
+            RESPONSIVE_MAIN_PANE_MIN + RESPONSIVE_COLUMN_GUTTER
+        );
     }
 
     #[test]
@@ -10167,6 +10956,57 @@ mod tests {
     }
 
     #[test]
+    fn cmd_w_archives_a_worker_regardless_of_the_shell_route() {
+        use crate::workers::model::{WorkersRoute, WorkersSettingsTab};
+
+        // The case that was dead: app Settings was opened once, then the user
+        // switched to Workers. `render_main` paints the Workers workspace
+        // regardless, so the shortcut has to fire even though `Shell::route`
+        // still says Settings.
+        assert!(worker_archive_shortcut_enabled(
+            SidebarMode::Workers,
+            WorkersRoute::Workspace,
+            false
+        ));
+        // Orchestrator has its own archive verb on its own combo.
+        assert!(!worker_archive_shortcut_enabled(
+            SidebarMode::Orchestrator,
+            WorkersRoute::Workspace,
+            false
+        ));
+        // Workers' own pages have no session on screen to archive.
+        for route in [
+            WorkersRoute::Recent,
+            WorkersRoute::Settings(WorkersSettingsTab::Presets),
+        ] {
+            assert!(!worker_archive_shortcut_enabled(
+                SidebarMode::Workers,
+                route,
+                false
+            ));
+        }
+        // An open picker or palette owns the keyboard.
+        assert!(!worker_archive_shortcut_enabled(
+            SidebarMode::Workers,
+            WorkersRoute::Workspace,
+            true
+        ));
+    }
+
+    #[test]
+    fn workers_settings_route_suppresses_right_and_details_chrome() {
+        assert!(!settings_layer_open(Route::Chat, WorkersRoute::Workspace));
+        assert!(settings_layer_open(
+            Route::Chat,
+            WorkersRoute::Settings(WorkersSettingsTab::Presets),
+        ));
+        assert!(settings_layer_open(
+            Route::Settings(SettingsSection::Devices),
+            WorkersRoute::Workspace,
+        ));
+    }
+
+    #[test]
     fn windows_caption_controls_reserve_titlebar_space() {
         assert_eq!(titlebar_right_padding(true, 0, 16.0), 124.0);
         assert_eq!(titlebar_right_padding(false, 0, 16.0), 16.0);
@@ -10436,6 +11276,57 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn pane_divider_drag_excludes_details_and_tracks_the_pointer() {
+        let viewport = 1800.0;
+        let sidebar = 260.0;
+        let (right, details) =
+            responsive_right_column_widths(viewport, sidebar, true, 520.0, true, 360.0);
+        let seam = viewport - right - details;
+        for delta in [-50.0, 0.0, 50.0] {
+            let width = right_pane_drag_width(viewport, sidebar, seam + delta, details);
+            let (painted_right, painted_details) =
+                responsive_right_column_widths(viewport, sidebar, true, width, true, details);
+            assert_eq!(painted_details, details);
+            assert_eq!(painted_right, right - delta);
+            assert_eq!(viewport - painted_right - painted_details, seam + delta);
+        }
+    }
+
+    #[test]
+    fn pane_divider_drag_reverses_immediately_at_compressed_limit() {
+        let viewport = 1300.0;
+        let sidebar = 260.0;
+        let (right, details) =
+            responsive_right_column_widths(viewport, sidebar, true, 900.0, true, 500.0);
+        let seam = viewport - right - details;
+        let pinned = right_pane_drag_width(viewport, sidebar, seam - 100.0, details);
+        assert!((pinned - right).abs() < 0.001);
+        let reversed = right_pane_drag_width(viewport, sidebar, seam + 10.0, details);
+        assert!((reversed - (right - 10.0)).abs() < 0.001);
+        let (painted_right, painted_details) =
+            responsive_right_column_widths(viewport, sidebar, true, reversed, true, details);
+        assert!((painted_right - reversed).abs() < 0.001);
+        assert!((painted_details - details).abs() < 0.001);
+    }
+
+    #[test]
+    fn pane_divider_drag_details_clamps_without_stealing_utility_width() {
+        let viewport = 1400.0;
+        let sidebar = 260.0;
+        let (right, details) =
+            responsive_right_column_widths(viewport, sidebar, true, 900.0, true, 500.0);
+        let seam = viewport - details;
+        let enlarged = details_sidebar_drag_width(viewport, sidebar, seam - 100.0, right, false);
+        assert!((enlarged - details).abs() < 0.001);
+        let smaller = details_sidebar_drag_width(viewport, sidebar, seam + 10.0, right, false);
+        assert!((smaller - (details - 10.0)).abs() < 0.001);
+        assert_eq!(
+            responsive_right_column_widths(viewport, sidebar, true, right, true, smaller),
+            (right, smaller)
+        );
     }
 
     #[test]
@@ -10828,5 +11719,265 @@ mod tests {
         tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
         assert_eq!(tween.current(), 0.0);
         assert!(!tween.animating());
+    }
+}
+
+// Regression fixtures adapted from upstream #285.
+#[cfg(test)]
+mod shortcut_focus_regressions {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    struct ShortcutHost {
+        root: FocusHandle,
+        unfocused: FocusHandle,
+        editor: FocusHandle,
+        show_editor: bool,
+        jumps: usize,
+    }
+
+    impl Render for ShortcutHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let root = self.root.clone();
+            let unfocused = self.unfocused.clone();
+            let preferred = self.editor.clone();
+            window.defer(cx, move |window, cx| {
+                restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
+            });
+            div()
+                .size_full()
+                .id("focus-test-root")
+                .role(gpui::accesskit::Role::Group)
+                .track_focus(&self.root)
+                .child(div().track_focus(&self.unfocused))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        // Exercise mouse focus handoffs, hiding a focused pane,
+                        // and clicking a control that explicitly clears focus.
+                        this.show_editor = event.position.x < px(100.0);
+                        if event.position.x < px(200.0) {
+                            window.focus(&this.editor, cx);
+                        } else {
+                            window.blur();
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &JumpSession, _, _| this.jumps += 1))
+                .when(self.show_editor, |el| {
+                    el.child(
+                        div()
+                            .id("focus-test-editor")
+                            .role(gpui::accesskit::Role::TextInput)
+                            .track_focus(&self.editor),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn explicit_blur_does_not_refocus_a_mounted_input(cx: &mut TestAppContext) {
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        cx.run_until_parked();
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        host.update(cx, |host, window, cx| {
+            window.focus(&host.editor, cx);
+            window.blur();
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+            // Subsequent renders must keep the neutral shortcut focus too.
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn shortcuts_recover_from_retained_editor_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                &platform_combo("mod-2"),
+                JumpSession(1),
+                None,
+            )]);
+        });
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        for show_editor in [true, false, true, false] {
+            host.update(cx, |host, window, cx| {
+                host.show_editor = show_editor;
+                // Keep the editor handle alive and focused even when hidden.
+                window.focus(&host.editor, cx);
+                cx.notify();
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            host.update(cx, |host, window, cx| {
+                restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+                assert!(host.root.contains_focused(window, cx));
+                assert_eq!(host.editor.is_focused(window), show_editor);
+            })
+            .unwrap();
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-2"));
+        }
+        host.update(cx, |host, window, cx| {
+            assert_eq!(host.jumps, 4);
+            window.blur();
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn shortcuts_work_after_mouse_focus_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                &platform_combo("mod-2"),
+                JumpSession(1),
+                None,
+            )]);
+        });
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        for (index, x) in [50.0, 150.0, 250.0, 50.0, 150.0, 250.0]
+            .into_iter()
+            .enumerate()
+        {
+            cx.update_window(host.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        position: gpui::point(px(x), px(20.0)),
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            // Dispatch immediately after the mouse event; no manual recovery.
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-2"));
+            host.update(cx, |host, window, cx| {
+                assert_eq!(
+                    host.jumps,
+                    index + 1,
+                    "shortcut failed after mouse click at {x}"
+                );
+                assert!(host.root.contains_focused(window, cx));
+                assert_eq!(host.editor.is_focused(window), x < 100.0);
+            })
+            .unwrap();
+        }
+    }
+}
+
+// Adapted from upstream #285; native WebKit responder restoration stays in
+// native_document.rs. This restores the GPUI dispatch tree only.
+fn restore_mounted_focus(
+    root: &FocusHandle,
+    preferred: &FocusHandle,
+    unfocused: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let preferred_mounted = root.contains(preferred, window);
+    if !root.contains_focused(window, cx) || (root.is_focused(window) && preferred_mounted) {
+        // Explicit blur keeps shortcuts active without returning the caret to
+        // an input. The root remains the temporary fallback for stale handles.
+        let target = if window.focused(cx).is_none() {
+            unfocused
+        } else if preferred_mounted {
+            preferred
+        } else {
+            root
+        };
+        window.focus(target, cx);
+    }
+}
+
+/// Native browser regression fixture hooks are excluded from shipped builds.
+#[cfg(feature = "browser-fixture")]
+impl Shell {
+    pub fn fixture_open_browser(
+        &mut self,
+        url: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (u64, Entity<crate::browser::BrowserSurface>) {
+        // Hosted Macs can expose only a 1024px desktop. Use the app's
+        // normal collapsed-sidebar layout to keep both conversation and
+        // preview readable in that real window.
+        if f32::from(window.viewport_size().width) < 1200.0 {
+            self.settings.sidebar_collapsed = true;
+        }
+        self.add_browser_surface(url, window, cx);
+        (self.browser_seq, self.browsers[&self.browser_seq].clone())
+    }
+    pub fn fixture_open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if f32::from(window.viewport_size().width) < 1200.0 {
+            self.settings.sidebar_collapsed = true;
+        }
+        self.add_history_surface(cx);
+    }
+    pub fn fixture_select_browser(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.set_right_active(RightSurface::Browser(id), cx);
+    }
+    pub fn fixture_close_browser(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_right_surface(RightSurface::Browser(id), window, cx);
+    }
+    pub fn fixture_browser_menu(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.right_plus.open(());
+            cx.notify();
+        } else {
+            self.close_right_plus(cx);
+        }
+    }
+    pub fn fixture_expand_browser(&mut self, cx: &mut Context<Self>) {
+        self.toggle_right_pane_expand(cx);
+    }
+    pub fn fixture_blur_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.route = Route::Settings(SettingsSection::Devices);
+        window.blur();
+        cx.notify();
+    }
+    pub fn fixture_toggle_sidebar(
+        &mut self,
+        right: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if right {
+            self.toggle_right_pane(window, cx);
+        } else {
+            self.toggle_sidebar(cx);
+        }
+    }
+    pub fn fixture_resize_browser(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.settings.right_pane_width = width;
+        cx.notify();
     }
 }

@@ -84,6 +84,7 @@ mod failure_text_tests {
 
     fn errored(reason: Option<&str>) -> Session {
         Session {
+            last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "dev-1".into(),
             status: SessionStatus::Errored,
@@ -477,17 +478,140 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             let done = items.iter().filter(|i| i.done).count();
             ("Todo", format!("{done}/{} done", items.len()))
         }
-        ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => {
+            if tool == "workers" || server == "comet-workers" {
+                (
+                    "Workers",
+                    workers_chip_detail(input.as_ref()).unwrap_or_else(|| tool.clone()),
+                )
+            } else {
+                ("MCP", format!("{server} · {tool}"))
+            }
+        }
         // Subagent spawns decode as Unknown named "Agent[: <description>]"
         // (every native driver's convention): label them "Agent" with the
         // description as the detail — "Tool · Agent: scan repo" read as two
         // labels fighting.
-        ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
+        ToolCall::Unknown { name, input } => match name.strip_prefix("Agent: ") {
             Some(description) => ("Agent", description.to_owned()),
             None if name == "Agent" => ("Agent", String::new()),
+            None if name == "hub" => {
+                let detail = hub_chip_detail(input.as_ref()).unwrap_or_else(|| "hub".to_owned());
+                ("Hub", detail)
+            }
+            None if name == "eval" => {
+                let detail = eval_chip_detail(input.as_ref()).unwrap_or_else(|| "eval".to_owned());
+                ("Eval", detail)
+            }
             None => ("Tool", name.clone()),
         },
     }
+}
+
+fn hub_chip_detail(input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let op = input.get("op").and_then(serde_json::Value::as_str)?;
+    let target = input
+        .get("name")
+        .or_else(|| input.get("to"))
+        .or_else(|| input.get("from"))
+        .or_else(|| input.get("application"))
+        .and_then(serde_json::Value::as_str);
+
+    match op {
+        "send" => {
+            if let Some(target) = target {
+                Some(format!("send → {target}"))
+            } else {
+                Some("send".to_owned())
+            }
+        }
+        "wait" => {
+            if let Some(target) = target {
+                Some(format!("wait {target}"))
+            } else if let Some(ids) = input.get("ids").and_then(serde_json::Value::as_array) {
+                Some(format!("wait {} jobs", ids.len()))
+            } else {
+                Some("wait".to_owned())
+            }
+        }
+        "start" => {
+            if let Some(target) = target {
+                Some(format!("start {target}"))
+            } else {
+                Some("start".to_owned())
+            }
+        }
+        "logs" => {
+            if let Some(target) = target {
+                Some(format!("logs {target}"))
+            } else {
+                Some("logs".to_owned())
+            }
+        }
+        other => {
+            if let Some(target) = target {
+                Some(format!("{other} {target}"))
+            } else {
+                Some(other.to_owned())
+            }
+        }
+    }
+}
+
+fn eval_chip_detail(input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let language = input
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|language| !language.is_empty());
+    let title = input
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let code_snippet = input
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|c| c.lines().find(|l| !l.trim().is_empty()))
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+
+    match (language, title, code_snippet) {
+        (Some(lang), Some(title), _) => Some(format!("{lang} · {title}")),
+        (None, Some(title), _) => Some(title.to_owned()),
+        (Some(lang), None, Some(code)) => Some(format!("{lang} · {code}")),
+        (Some(lang), None, None) => Some(format!("eval ({lang})")),
+        (None, None, Some(code)) => Some(code.to_owned()),
+        (None, None, None) => None,
+    }
+}
+
+fn workers_chip_detail(input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let action = input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())?;
+    let target = ["session_id", "project_id", "name", "project"]
+        .into_iter()
+        .find_map(|key| {
+            input
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    Some(match target {
+        Some(target) => format!("{action} {target}"),
+        None => action.to_owned(),
+    })
 }
 
 /// Runtime-neutral lifecycle state for one transcript tool call.
@@ -539,6 +663,16 @@ pub fn tool_presentation(
         (ToolCall::WebSearch { .. }, true) => "Searched web",
         (ToolCall::Todo { .. }, false) => "Updating todos",
         (ToolCall::Todo { .. }, true) => "Updated todos",
+        (ToolCall::Mcp { tool, server, .. }, false)
+            if tool == "workers" || server == "comet-workers" =>
+        {
+            "Calling workers"
+        }
+        (ToolCall::Mcp { tool, server, .. }, true)
+            if tool == "workers" || server == "comet-workers" =>
+        {
+            "Called workers"
+        }
         (ToolCall::Mcp { .. }, false) => "Calling tool",
         (ToolCall::Mcp { .. }, true) => "Called tool",
         (ToolCall::Unknown { name, .. }, false)
@@ -551,6 +685,10 @@ pub fn tool_presentation(
         {
             "Agent completed"
         }
+        (ToolCall::Unknown { name, .. }, false) if name == "hub" => "Running hub",
+        (ToolCall::Unknown { name, .. }, true) if name == "hub" => "Ran hub",
+        (ToolCall::Unknown { name, .. }, false) if name == "eval" => "Evaluating",
+        (ToolCall::Unknown { name, .. }, true) if name == "eval" => "Evaluated",
         (ToolCall::Unknown { .. }, false) => "Running tool",
         (ToolCall::Unknown { .. }, true) => "Ran tool",
     };
@@ -709,6 +847,87 @@ mod tool_presentation_tests {
             assert!(!settled.show_outcome_label);
         }
     }
+
+    #[test]
+    fn hub_and_eval_unknown_tools_have_informative_chips_and_verbs() {
+        let hub_start = ToolCall::Unknown {
+            name: "hub".into(),
+            input: Some(serde_json::json!({
+                "op": "start",
+                "name": "omp-parity-probe",
+            })),
+        };
+        let hub_active = tool_presentation(&hub_start, false, false);
+        assert_eq!(hub_active.label, "Running hub");
+        assert_eq!(hub_active.detail, "start omp-parity-probe");
+        let hub_done = tool_presentation(&hub_start, true, false);
+        assert_eq!(hub_done.label, "Ran hub");
+        assert_eq!(hub_done.detail, "start omp-parity-probe");
+
+        let hub_wait = ToolCall::Unknown {
+            name: "hub".into(),
+            input: Some(serde_json::json!({
+                "op": "wait",
+                "ids": ["job1", "job2"],
+            })),
+        };
+        assert_eq!(tool_chip_content(&hub_wait), ("Hub", "wait 2 jobs".into()));
+
+        let eval_titled = ToolCall::Unknown {
+            name: "eval".into(),
+            input: Some(serde_json::json!({
+                "language": "js",
+                "title": "Checking logs",
+                "code": "console.log(1);",
+            })),
+        };
+        let eval_active = tool_presentation(&eval_titled, false, false);
+        assert_eq!(eval_active.label, "Evaluating");
+        assert_eq!(eval_active.detail, "js · Checking logs");
+
+        let eval_untitled = ToolCall::Unknown {
+            name: "eval".into(),
+            input: Some(serde_json::json!({
+                "language": "py",
+                "code": "import sys\nprint(sys.version)",
+            })),
+        };
+        assert_eq!(
+            tool_chip_content(&eval_untitled),
+            ("Eval", "py · import sys".into())
+        );
+
+        let workers = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(serde_json::json!({
+                "action": "wait_for_status",
+                "session_id": "worker-1",
+            })),
+        };
+        let workers_active = tool_presentation(&workers, false, false);
+        assert_eq!(workers_active.label, "Calling workers");
+        assert_eq!(workers_active.detail, "wait_for_status worker-1");
+        let workers_done = tool_presentation(&workers, true, false);
+        assert_eq!(workers_done.label, "Called workers");
+        assert_eq!(
+            tool_chip_content(&workers),
+            ("Workers", "wait_for_status worker-1".into())
+        );
+
+        let launch = ToolCall::Mcp {
+            server: "comet-workers".into(),
+            tool: "workers".into(),
+            input: Some(serde_json::json!({
+                "action": "launch_worker",
+                "project_id": "comet",
+            })),
+        };
+        assert_eq!(
+            tool_chip_content(&launch),
+            ("Workers", "launch_worker comet".into())
+        );
+    }
 }
 
 /// The status-dot palette, as oklch triples (L, C, H°).
@@ -801,6 +1020,8 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: None,
+            is_remote: None,
+            is_default: None,
         }
     }
 
@@ -809,6 +1030,8 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: Some(path.into()),
+            is_remote: None,
+            is_default: None,
         }
     }
 

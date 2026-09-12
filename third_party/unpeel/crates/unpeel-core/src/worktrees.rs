@@ -229,12 +229,18 @@ pub fn create(path: &str, branch: &str, base_ref: Option<&str>) -> Result<Worktr
     })
 }
 
+/// Whether this checkout lives under the worktrees root, i.e. Unpeel created
+/// it and may delete it. Callers that need to ASK before removing use this so
+/// they ask exactly what `remove` will answer.
+pub fn is_managed(path: &Path) -> bool {
+    canonical_or_self(path).starts_with(canonical_or_self(&app_paths::worktrees_root()))
+}
+
 /// Remove a managed worktree. Refuses anything outside the worktrees root so
 /// a stray call can't delete the user's main checkout.
 pub fn remove(path: &str, force: bool) -> Result<(), String> {
-    let managed_root = canonical_or_self(&app_paths::worktrees_root());
     let target = canonical_or_self(Path::new(path));
-    if !target.starts_with(&managed_root) {
+    if !is_managed(&target) {
         return Err("refusing to remove a worktree Unpeel does not manage".into());
     }
     let toplevel = repo_toplevel(path)?;

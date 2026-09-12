@@ -4,7 +4,9 @@
 //! pull-request metadata is host-local, short-lived capability state and is
 //! deliberately never written back into a synced document.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
 use zeron_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
@@ -111,6 +113,7 @@ impl Render for ChangeRequestTooltip {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChangeRequestBadgeSurface {
     Sidebar,
+    SidebarIcon,
     Composer,
 }
 
@@ -125,6 +128,7 @@ pub(crate) fn pull_request_badge(
     let url = summary.url.clone();
     let tooltip_summary = summary;
     let composer = surface == ChangeRequestBadgeSurface::Composer;
+    let icon_only = surface == ChangeRequestBadgeSurface::SidebarIcon;
 
     div()
         .id(id)
@@ -151,7 +155,7 @@ pub(crate) fn pull_request_badge(
                 .into()
         })
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .when(composer, |element| {
+        .when(composer || icon_only, |element| {
             element.child(
                 crate::icons::icon(crate::icons::PULL_REQUEST)
                     .size(px(11.0))
@@ -160,11 +164,13 @@ pub(crate) fn pull_request_badge(
             )
         })
         // Monospace digits give the badge a stable tabular width as PR numbers change.
-        .child(
-            div()
-                .font_family(theme.font_mono.clone())
-                .child(model.number),
-        )
+        .when(!icon_only, |element| {
+            element.child(
+                div()
+                    .font_family(theme.font_mono.clone())
+                    .child(model.number),
+            )
+        })
         .into_any_element()
 }
 
@@ -232,6 +238,76 @@ impl ChangeRequestClientState {
     ) -> Option<&'a ChangeRequestSummary> {
         change_request_for_chat(chat, spaces, self.snapshots.values())
     }
+
+    /// The PR resolved for a device-local checkout. A Workers project carries
+    /// no chat identity to re-verify, so the checkout IS the identity — and
+    /// both halves must match: a snapshot left over from the branch this
+    /// worktree used to be on would otherwise name the wrong pull request.
+    ///
+    /// Known hole: `snapshots` is multi-device and this lookup has no device to
+    /// filter by, so two devices sharing an absolute path *and* a branch name
+    /// collide. Closing it means threading the local device id down from
+    /// `AppState` (which owns `local_device_id`) into both callers.
+    pub fn change_request_for_checkout(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Option<&ChangeRequestSummary> {
+        change_request_for_checkout(cwd, branch, self.snapshots.values())
+    }
+}
+
+pub(crate) fn change_request_for_checkout<'a>(
+    cwd: &str,
+    branch: &str,
+    snapshots: impl IntoIterator<Item = &'a CheckoutChangeRequestStatus>,
+) -> Option<&'a ChangeRequestSummary> {
+    let branch = branch.trim();
+    if branch.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    let canonical_cwd = OnceCell::new();
+    snapshots
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.branch == branch && same_checkout(&snapshot.cwd, cwd, &canonical_cwd)
+        })
+        .and_then(|snapshot| snapshot.change_request.as_ref())
+}
+
+/// Two checkout paths that name the same directory.
+///
+/// The host reports `git rev-parse --show-toplevel`, which resolves symlinks
+/// (`/private/var/...` on macOS), while an adopted worktree keeps the path as
+/// the user gave it (`/var/...`). Raw equality is tried first, so an exact
+/// match costs no syscall, and a path that no longer exists simply fails to
+/// match instead of erroring.
+///
+/// A raw miss is NOT free: it canonicalizes `cwd` once per call through the
+/// shared cell (and short-circuits every later snapshot when that fails), then
+/// `snapshot_cwd` for each snapshot that still reaches this point. Both are
+/// blocking `realpath` calls, so every caller tests its cheap scalar fields —
+/// device, branch, checkout — *before* this one. That ordering, not the cell,
+/// is what keeps the syscall out of the render loop.
+fn same_checkout(snapshot_cwd: &str, cwd: &str, canonical_cwd: &OnceCell<Option<PathBuf>>) -> bool {
+    snapshot_cwd == cwd
+        || canonical_cwd
+            .get_or_init(|| canonical_path(cwd))
+            .as_deref()
+            .is_some_and(|canonical| canonical_path(snapshot_cwd).as_deref() == Some(canonical))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `canonical_path` calls on this thread, so a test can prove the render
+    /// path made none.
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn canonical_path(path: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    std::fs::canonicalize(path).ok()
 }
 
 /// Active, fully identified checkouts that need host-side PR resolution.
@@ -259,6 +335,29 @@ pub(crate) fn desired_watch_targets(
                 cwd: cwd.to_owned(),
                 branch: branch.to_owned(),
                 checkout_id,
+            })
+        })
+        .collect()
+}
+
+/// Current branches of local checkouts and worktrees supplied by the Workers
+/// working set. The same branch resolver drives their visible context labels.
+pub(crate) fn workers_change_request_targets(
+    projects: &[zeron_workers_unpeel::WorkersProject],
+    local_device_id: &str,
+) -> HashSet<ChangeRequestWatchKey> {
+    projects
+        .iter()
+        .filter_map(|project| {
+            let branch = project.change_request_branch()?.trim();
+            if branch.is_empty() || project.path.trim().is_empty() {
+                return None;
+            }
+            Some(ChangeRequestWatchKey {
+                device_id: local_device_id.to_owned(),
+                cwd: project.path.clone(),
+                branch: branch.to_owned(),
+                checkout_id: None,
             })
         })
         .collect()
@@ -304,15 +403,18 @@ pub fn change_request_for_chat<'a>(
         .map(|source| source.checkout_id.as_str())
         .or(chat.checkout_id.as_deref());
 
+    let canonical_cwd = OnceCell::new();
     snapshots
         .into_iter()
         .find(|snapshot| {
+            // Every cheap scalar first: `same_checkout` can hit the filesystem,
+            // and this runs per row per frame.
             snapshot.device_id == chat.device_id
-                && snapshot.cwd == cwd
                 && snapshot.branch == branch
                 && checkout_id.is_none_or(|checkout_id| {
                     !snapshot.checkout_id.is_empty() && snapshot.checkout_id == checkout_id
                 })
+                && same_checkout(&snapshot.cwd, cwd, &canonical_cwd)
         })
         .and_then(|snapshot| snapshot.change_request.as_ref())
 }
@@ -398,6 +500,125 @@ mod tests {
             observed_at: Utc.timestamp_opt(2, 0).unwrap(),
         });
         chat
+    }
+
+    fn workers_project(id: &str, branch: Option<&str>) -> zeron_workers_unpeel::WorkersProject {
+        zeron_workers_unpeel::WorkersProject {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/repos/{id}"),
+            folder_id: None,
+            parent_project_id: None,
+            is_group: false,
+            worktree_branch: branch.map(str::to_owned),
+            git_branch: Some("fix/renamed".into()),
+            archived_session_count: 0,
+            folder_color_id: None,
+            session_sort: zeron_workers_unpeel::WorkersSessionSort::Custom,
+        }
+    }
+
+    #[test]
+    fn workers_change_request_targets_include_local_checkouts_and_skip_groups() {
+        let mut group = workers_project("group", None);
+        group.is_group = true;
+        let mut unknown = workers_project("unknown", None);
+        unknown.git_branch = None;
+        let projects = [
+            workers_project("plain", None),
+            workers_project("wt", Some("old")),
+            group,
+            unknown,
+        ];
+        let targets = workers_change_request_targets(&projects, "local");
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.cwd == "/repos/plain" && target.branch == "fix/renamed")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.cwd == "/repos/wt" && target.branch == "fix/renamed")
+        );
+    }
+
+    #[test]
+    fn change_request_for_checkout_requires_cwd_and_branch() {
+        let stored = snapshot("local", "/repos/wt", "checkout");
+        assert_eq!(
+            change_request_for_checkout("/repos/wt", "feature/pr", [&stored]).map(|pr| pr.number),
+            Some(90)
+        );
+        // The worktree moved to another branch: the snapshot left behind names
+        // the PR of the branch it USED to be on.
+        assert!(change_request_for_checkout("/repos/wt", "fix/other", [&stored]).is_none());
+        assert!(change_request_for_checkout("/repos/other", "feature/pr", [&stored]).is_none());
+        assert!(change_request_for_checkout("/repos/wt", "  ", [&stored]).is_none());
+    }
+
+    /// The host reports the symlink-resolved toplevel (`/private/var/...`),
+    /// an adopted worktree keeps the path the user gave (`/var/...`).
+    #[cfg(unix)]
+    #[test]
+    fn change_request_for_checkout_matches_across_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = temp.path().join("private/wt");
+        std::fs::create_dir_all(&resolved).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("private"), temp.path().join("var")).unwrap();
+        let linked = temp.path().join("var/wt");
+
+        let stored = snapshot("local", resolved.to_str().unwrap(), "checkout");
+        assert_eq!(
+            change_request_for_checkout(linked.to_str().unwrap(), "feature/pr", [&stored])
+                .map(|pr| pr.number),
+            Some(90)
+        );
+        // A different directory under the same symlinked parent still misses.
+        // It has to EXIST, or the miss proves nothing: canonicalization of a
+        // missing path fails and the comparison never runs.
+        std::fs::create_dir_all(temp.path().join("private/other")).unwrap();
+        assert!(
+            change_request_for_checkout(
+                temp.path().join("var/other").to_str().unwrap(),
+                "feature/pr",
+                [&stored]
+            )
+            .is_none()
+        );
+    }
+
+    /// The lookup runs per row per frame, so the blocking `realpath` must stay
+    /// behind the cheap scalar tests — and behind the shared cell.
+    #[test]
+    fn chat_lookup_keeps_canonicalization_off_the_render_path() {
+        let chat = with_source(
+            chat("chat", "local", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
+        let mut other_branch = snapshot("local", "/elsewhere", "checkout");
+        other_branch.branch = "feature/other".into();
+        let mut other_checkout = snapshot("local", "/elsewhere", "other-checkout");
+        other_checkout.branch = "feature/pr".into();
+        let other_device = snapshot("remote", "/elsewhere", "checkout");
+
+        // Device, branch and checkout each reject on their own: no syscall.
+        CANONICALIZE_CALLS.with(|calls| calls.set(0));
+        assert!(
+            change_request_for_chat(&chat, &[], [&other_branch, &other_checkout, &other_device])
+                .is_none()
+        );
+        assert_eq!(CANONICALIZE_CALLS.with(|calls| calls.get()), 0);
+
+        // Snapshots that do survive the cheap tests canonicalize `cwd` once,
+        // not once per snapshot — and `/repo` not existing ends it there.
+        let first = snapshot("local", "/a", "checkout");
+        let second = snapshot("local", "/b", "checkout");
+        let third = snapshot("local", "/c", "checkout");
+        CANONICALIZE_CALLS.with(|calls| calls.set(0));
+        assert!(change_request_for_chat(&chat, &[], [&first, &second, &third]).is_none());
+        assert_eq!(CANONICALIZE_CALLS.with(|calls| calls.get()), 1);
     }
 
     #[test]

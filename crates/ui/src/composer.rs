@@ -26,13 +26,13 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, LiveVoiceAvailability, RunRequest, SandboxLevel, SlashCommand,
-    UserInputAnswer, UserInputQuestion,
+    FileSearchMatch, HarnessId, LiveVoiceAvailability, LiveVoiceUnavailableReason, RunRequest,
+    SandboxLevel, SlashCommand, UserInputAnswer, UserInputQuestion,
 };
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
-use crate::live_voice::{LiveVoiceTooltip, LiveVoiceViewModel};
+use crate::live_voice::{self, LiveVoiceTooltip, LiveVoiceViewModel};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
 use crate::state::{AppState, Indicator};
@@ -97,7 +97,7 @@ struct ContextIndicatorState {
     level: ContextIndicatorLevel,
 }
 
-fn compact_token_count(tokens: u64) -> String {
+pub fn compact_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         let value = tokens as f64 / 1_000_000.0;
         if tokens.is_multiple_of(1_000_000) {
@@ -118,7 +118,7 @@ fn context_indicator_state(usage: Option<zeron_proto::ContextUsage>) -> ContextI
             used_fraction: 0.0,
             used_percent: None,
             remaining_percent: None,
-            detail: "Aguardando primeiro turno".into(),
+            detail: "Waiting for the first turn".into(),
             level: ContextIndicatorLevel::Neutral,
         };
     };
@@ -195,6 +195,25 @@ fn draft_live_voice_available(
 ) -> bool {
     let local_target = target_device_id.is_none_or(|target| local_device_id == Some(target));
     engine_connected && local_target && harness == Some(HarnessId::Omp)
+}
+
+fn draft_live_voice_probe_cwd(plan: &NewChatLiveCheckout) -> &str {
+    match plan {
+        NewChatLiveCheckout::Ready { cwd, .. } => cwd,
+        NewChatLiveCheckout::CreateWorktree { repo_path, .. } => repo_path,
+    }
+}
+
+fn draft_live_voice_ready(availability: Option<&LiveVoiceAvailability>) -> bool {
+    availability.is_some_and(|availability| availability.available)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DraftLiveVoiceProbeKey {
+    cwd: String,
+    target_device_id: Option<String>,
+    local_device_id: Option<String>,
+    harness: Option<HarnessId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1037,6 +1056,10 @@ const MENTION_SIDE_PAD: &str = "\u{00A0}";
 /// A private URI scheme keeps file mentions distinguishable from ordinary
 /// Markdown links pasted into the composer.
 const FILE_MENTION_SCHEME: &str = "zeron-file:";
+/// Project mentions ride the same chip machinery under their own scheme: the
+/// path is absolute (a known project on its owning device, not a workspace
+/// entry) and the label is the project's name, not the folder basename.
+const PROJECT_MENTION_SCHEME: &str = "zeron-project:";
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -1110,6 +1133,39 @@ fn local_file_link(path: &str, is_dir: bool) -> String {
     )
 }
 
+fn unescape_mention_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut escaped = false;
+    for ch in label.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn project_mention_link(name: &str, path: &str) -> String {
+    let path = path.trim_end_matches('/');
+    format!(
+        "[{}]({}{})",
+        escape_mention_label(name),
+        PROJECT_MENTION_SCHEME,
+        percent_encode_path(&format!("{path}/"))
+    )
+}
+
+/// A project path is absolute by nature (the folder on its owning device), so
+/// [`local_path_is_safe`]'s workspace-relative rule applies to everything but
+/// the leading separator.
+fn project_path_is_safe(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(local_path_is_safe)
+}
+
 fn local_path_is_safe(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -1150,23 +1206,42 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         };
         let end = target_start + relative_end + 1;
         let label = &text[start + 1..label_end];
-        let Some(encoded) = text[target_start..end - 1].strip_prefix(FILE_MENTION_SCHEME) else {
+        let target = &text[target_start..end - 1];
+        // A project link labels itself (the project's name); a file link's
+        // label must still be its own basename.
+        let parsed = if let Some(encoded) = target.strip_prefix(PROJECT_MENTION_SCHEME) {
+            percent_decode_path(encoded).and_then(|target| {
+                let path = target.strip_suffix('/').unwrap_or(&target);
+                let name = unescape_mention_label(label);
+                (project_path_is_safe(path)
+                    && percent_encode_path(&target) == encoded
+                    && !name.is_empty()
+                    && escape_mention_label(&name) == label)
+                    .then(|| (name, path.to_string(), true))
+            })
+        } else if let Some(encoded) = target.strip_prefix(FILE_MENTION_SCHEME) {
+            percent_decode_path(encoded).and_then(|target| {
+                let is_dir = target.ends_with('/');
+                let path = target.strip_suffix('/').unwrap_or(&target);
+                (local_path_is_safe(path)
+                    && percent_encode_path(&target) == encoded
+                    && path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|basename| escape_mention_label(basename) == label))
+                .then(|| {
+                    (
+                        path.rsplit('/').next().unwrap_or_default().to_string(),
+                        path.to_string(),
+                        is_dir,
+                    )
+                })
+            })
+        } else {
             search = end;
             continue;
         };
-        let parsed = percent_decode_path(encoded).and_then(|target| {
-            let is_dir = target.ends_with('/');
-            let path = target.strip_suffix('/').unwrap_or(&target);
-            (local_path_is_safe(path)
-                && percent_encode_path(&target) == encoded
-                && path
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|basename| escape_mention_label(basename) == label))
-            .then(|| (path.to_string(), is_dir))
-        });
-        if let Some((path, is_dir)) = parsed {
-            let basename = path.rsplit('/').next().unwrap_or_default().to_string();
+        if let Some((basename, path, is_dir)) = parsed {
             links.push(FileMentionLink {
                 range: start..end,
                 basename,
@@ -1583,7 +1658,7 @@ pub struct SentMentionSpan {
 /// substring probe keeps ordinary prompts on the zero-allocation path, so this
 /// is safe to call for every user row.
 pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
-    if !raw.contains(FILE_MENTION_SCHEME) {
+    if !raw.contains(FILE_MENTION_SCHEME) && !raw.contains(PROJECT_MENTION_SCHEME) {
         return None;
     }
     let projection = TextProjection::new(raw);
@@ -1781,6 +1856,25 @@ pub struct PastedLongText(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PasteNoticeEvent(pub PasteNotice);
 
+// Adapted from upstream #271. All paint/shaping inputs, excluding caret,
+// selection and scrolling. Text is compared separately without cloning per frame.
+#[derive(PartialEq)]
+struct InputLayoutKey {
+    width: Pixels,
+    font: gpui::Font,
+    font_size: Pixels,
+    color: gpui::Hsla,
+    mono: SharedString,
+    code_text: gpui::Hsla,
+    code_wash: gpui::Hsla,
+    text_faint: gpui::Hsla,
+    text_muted: gpui::Hsla,
+    accent: gpui::Hsla,
+    marked_range: Option<Range<usize>>,
+    placeholder: SharedString,
+    mentions_enabled: bool,
+}
+
 /// Multiline input entity: content + selection + IME marked text + measured
 /// layout (wrapped lines) for mouse mapping and auto-grow.
 pub struct ComposerInput {
@@ -1802,8 +1896,17 @@ pub struct ComposerInput {
     /// Normally keeps the caret visible through edits and rewraps. Manual
     /// wheel scrolling pauses it until the next caret move or edit.
     follow_cursor: bool,
+    text_size: f32,
+    configured_line_height: f32,
+    single_line: bool,
+    scroll_left: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
+    last_layout_key: Option<InputLayoutKey>,
+    last_layout_content: String,
+    last_notified_layout: Option<(f32, f32, f32)>,
+    #[cfg(test)]
+    layout_rebuilds: usize,
     line_starts: Vec<usize>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
@@ -1880,6 +1983,15 @@ impl ComposerInput {
             scroll_top: 0.0,
             follow_cursor: true,
             last_lines: Vec::new(),
+            last_layout_key: None,
+            last_layout_content: String::new(),
+            last_notified_layout: None,
+            #[cfg(test)]
+            layout_rebuilds: 0,
+            text_size: INPUT_TEXT_SIZE,
+            configured_line_height: INPUT_LINE_HEIGHT,
+            single_line: false,
+            scroll_left: 0.0,
             line_starts: vec![0],
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
@@ -1905,6 +2017,22 @@ impl ComposerInput {
             mention_tooltip_task: None,
             mention_tooltip_view: None,
         }
+    }
+
+    /// Override the text metrics for compact one-line surfaces such as
+    /// toolbar searches without changing the main composer typography.
+    pub fn with_text_metrics(mut self, text_size: f32, line_height: f32) -> Self {
+        self.text_size = text_size;
+        self.configured_line_height = line_height;
+        self.line_height = px(line_height);
+        self.content_height = line_height;
+        self
+    }
+
+    /// Keep compact fields on one row and reveal the caret horizontally.
+    pub fn with_single_line(mut self) -> Self {
+        self.single_line = true;
+        self
     }
 
     /// Reset the caret blink phase (solid again) — called on every edit and
@@ -1979,8 +2107,18 @@ impl ComposerInput {
         is_dir: bool,
         cx: &mut Context<Self>,
     ) {
+        self.replace_mention_link(range, &local_file_link(path, is_dir), cx);
+    }
+
+    /// Insert an already-formed mention link (file or project) over `range`.
+    pub fn replace_mention_link(
+        &mut self,
+        range: Range<usize>,
+        link: &str,
+        cx: &mut Context<Self>,
+    ) {
         self.invalidate_mention_tooltip();
-        let path = local_file_link(path, is_dir);
+        let path = link.to_string();
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
         let inserted = if existing_separator.is_some() {
@@ -2075,12 +2213,16 @@ impl ComposerInput {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.invalidate_mention_tooltip();
         self.content = text.into();
+        if self.single_line {
+            self.content = self.content.replace(['\r', '\n'], " ");
+        }
         self.refresh_projection();
         let end = self.content.len();
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_top = 0.0;
+        self.scroll_left = 0.0;
         self.follow_cursor = true;
         // Programmatic replacement (draft load, clear-on-submit) is a new
         // document, not an edit — undo must not reach back past it.
@@ -2808,7 +2950,7 @@ impl ComposerInput {
             return 0;
         };
         let local = point(
-            position.x - bounds.left(),
+            position.x - bounds.left() + px(self.scroll_left),
             position.y - bounds.top() + px(self.scroll_top),
         );
         self.index_for_point(local)
@@ -3013,6 +3155,31 @@ impl ComposerInput {
         window: &mut Window,
         cx: &App,
     ) -> f32 {
+        let theme = Theme::of(cx);
+        let key = InputLayoutKey {
+            width,
+            font: style.font(),
+            font_size: style.font_size.to_pixels(window.rem_size()),
+            color: style.color,
+            mono: theme.font_mono.clone(),
+            code_text: theme.code_text,
+            code_wash: theme.code_wash,
+            text_faint: theme.text_faint,
+            text_muted: theme.text_muted,
+            accent: theme.accent,
+            marked_range: self.marked_range.clone(),
+            placeholder: self.placeholder.clone(),
+            mentions_enabled: self.mentions_enabled,
+        };
+        if self.last_layout_content == self.content && self.last_layout_key.as_ref() == Some(&key) {
+            // A measurement still completes for compact/expanded hysteresis.
+            self.layout_epoch += 1;
+            return self.content_height;
+        }
+        #[cfg(test)]
+        {
+            self.layout_rebuilds += 1;
+        }
         // Rebuild this even for an empty draft. Otherwise deleting the final
         // mention can leave its previous paint geometry alive while the
         // placeholder is already being shaped, tinting "Do anything" for a
@@ -3024,7 +3191,7 @@ impl ComposerInput {
             (SharedString::from(self.projection.display.clone()), false)
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        self.line_height = px(INPUT_LINE_HEIGHT);
+        self.line_height = px(self.configured_line_height);
 
         let plans = if is_placeholder {
             vec![ComposerRunPlan {
@@ -3112,9 +3279,10 @@ impl ComposerInput {
         // Shape the undecorated projection separately. These metrics alone
         // drive compact↔expanded hysteresis, so heading glyph size and bold/
         // mono widths cannot cause decorate→measure→flip feedback.
+        let wrap_width = (!self.single_line).then_some(width);
         let base_lines = window
             .text_system()
-            .shape_text(display.clone(), font_size, &base_runs, Some(width), None)
+            .shape_text(display.clone(), font_size, &base_runs, wrap_width, None)
             .map(|small| small.into_vec())
             .unwrap_or_default();
         let has_sized_heading = plans.iter().any(|plan| plan.decor.heading.is_some());
@@ -3131,7 +3299,7 @@ impl ComposerInput {
                     SharedString::from(line.to_owned()),
                     px(line_size),
                     &line_runs,
-                    Some(width),
+                    wrap_width,
                     None,
                 ) {
                     shaped.extend(line);
@@ -3142,7 +3310,7 @@ impl ComposerInput {
         } else {
             window
                 .text_system()
-                .shape_text(display.clone(), font_size, &runs, Some(width), None)
+                .shape_text(display.clone(), font_size, &runs, wrap_width, None)
                 .map(|small| small.into_vec())
                 .unwrap_or_default()
         };
@@ -3184,6 +3352,8 @@ impl ComposerInput {
             },
         );
 
+        self.last_layout_key = Some(key);
+        self.last_layout_content.clone_from(&self.content);
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
@@ -3200,6 +3370,17 @@ impl ComposerInput {
 
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
+        if self.single_line {
+            let previous = self.scroll_left;
+            let width = (self.last_width - 2.0).max(1.0);
+            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
+                let x = f32::from(cursor.x);
+                self.scroll_left = self.scroll_left.min(x).max(x - width).max(0.0);
+            }
+            self.scroll_left = self.scroll_left.min((self.max_line_width - width).max(0.0));
+            self.scroll_top = 0.0;
+            return self.scroll_left != previous;
+        }
         let previous = self.scroll_top;
         if self.follow_cursor {
             if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
@@ -3274,6 +3455,13 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let single_line_text;
+        let new_text = if self.single_line {
+            single_line_text = new_text.replace(['\r', '\n'], " ");
+            single_line_text.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -3307,6 +3495,13 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let single_line_text;
+        let new_text = if self.single_line {
+            single_line_text = new_text.replace(['\r', '\n'], " ");
+            single_line_text.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -3355,7 +3550,7 @@ impl EntityInputHandler for ComposerInput {
             .normalize_range(self.range_from_utf16(&range_utf16));
         let start = self.point_for_index(range.start)?;
         let origin = point(
-            bounds.left() + start.x,
+            bounds.left() + start.x - px(self.scroll_left),
             bounds.top() + start.y - px(self.scroll_top),
         );
         Some(Bounds::new(origin, size(px(2.0), self.line_height)))
@@ -3388,51 +3583,67 @@ struct MentionPathTooltip {
 
 struct ContextUsageTooltip {
     state: ContextIndicatorState,
+    /// Whether clicking the ring will run `/compact` right now.
+    compactable: bool,
 }
 
 impl Render for ContextUsageTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
-            .w(px(220.0))
-            .px(px(14.0))
-            .py(px(12.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(3.0))
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_center()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child("Janela de contexto"),
-            )
-            .when_some(
-                self.state.used_percent.zip(self.state.remaining_percent),
-                |el, (used, remaining)| {
+        crate::frost::frosted(
+            10.0,
+            16.0,
+            div()
+                .w(px(220.0))
+                .px(px(14.0))
+                .py(px(12.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(3.0))
+                .rounded(px(10.0))
+                .border_1()
+                // Same tokens as the composer pill / user bubble: the shared
+                // glass fill and hairline, shadow only off frost.
+                .border_color(theme.border)
+                .bg(theme.composer_glass_bg())
+                .when(!theme.is_frost(), |el| el.shadow_md())
+                .text_center()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Context window"),
+                )
+                .when_some(
+                    self.state.used_percent.zip(self.state.remaining_percent),
+                    |el, (used, remaining)| {
+                        el.child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(format!(
+                                    "{used}% used ({remaining}% left)"
+                                ))),
+                        )
+                    },
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted.opacity(0.82))
+                        .child(self.state.detail.clone()),
+                )
+                .when(self.compactable, |el| {
                     el.child(
                         div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(format!(
-                                "{used}% usado ({remaining}% restante)"
-                            ))),
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child("Click to compact"),
                     )
-                },
-            )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(theme.text_muted.opacity(0.82))
-                    .child(self.state.detail.clone()),
-            )
+                }),
+        )
     }
 }
 
@@ -3524,16 +3735,23 @@ impl gpui::Element for ComposerTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let style = window.text_style();
         self.input.update(cx, |input, cx| {
+            // The layout engine may probe provisional widths. Publish only the
+            // final width/metrics to prevent a measure-notify feedback loop.
+            input.layout_text(bounds.size.width, &style, window, cx);
+            let layout = (input.last_width, input.max_line_width, input.content_height);
+            let changed = input.last_notified_layout != Some(layout);
+            input.last_notified_layout = Some(layout);
             let scrolled = input.clamp_scroll(f32::from(bounds.size.height));
             input.last_bounds = Some(bounds);
-            if scrolled {
+            if scrolled || changed {
                 cx.emit(ComposerInputEvent::ViewportChanged);
             }
         });
         let input = self.input.read(cx);
         let scroll = px(input.scroll_top);
-        let origin = point(bounds.left(), bounds.top() - scroll);
+        let origin = point(bounds.left() - px(input.scroll_left), bounds.top() - scroll);
         let selection_color = Theme::of(cx).selection;
         let caret_color = Theme::of(cx).caret;
         // The inline-code recipe: chips wash violet like `code` spans do.
@@ -3713,11 +3931,12 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, line_height, scroll) = self.input.update(cx, |input, _| {
+        let (lines, line_height, scroll, scroll_left) = self.input.update(cx, |input, _| {
             (
                 std::mem::take(&mut input.last_lines),
                 input.line_height,
                 input.scroll_top,
+                input.scroll_left,
             )
         });
 
@@ -3726,7 +3945,7 @@ impl gpui::Element for ComposerTextElement {
             for line in &lines {
                 let height = line.size(line_height).height;
                 let _ = line.paint_background(
-                    point(bounds.left(), y),
+                    point(bounds.left() - px(scroll_left), y),
                     line_height,
                     gpui::TextAlign::Left,
                     Some(bounds),
@@ -3745,7 +3964,7 @@ impl gpui::Element for ComposerTextElement {
             for line in &lines {
                 let height = line.size(line_height).height;
                 let _ = line.paint(
-                    point(bounds.left(), y),
+                    point(bounds.left() - px(scroll_left), y),
                     line_height,
                     gpui::TextAlign::Left,
                     Some(bounds),
@@ -3808,7 +4027,9 @@ impl Render for ComposerInput {
             // whole window instead of the field (gpui logs it every focus
             // change) — an id + role is what puts it in the AccessKit tree.
             .id(("composer-input", cx.entity_id()))
-            .role(if self.key_context == "PaletteSearch" {
+            .role(if self.single_line {
+                gpui::Role::TextInput
+            } else if self.key_context == "PaletteSearch" {
                 gpui::Role::SearchInput
             } else {
                 gpui::Role::MultilineTextInput
@@ -3856,12 +4077,17 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, window, _| {
+                if event.button == MouseButton::Left && this.focus_handle.is_focused(window) {
+                    window.blur();
+                }
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
-            .text_size(px(INPUT_TEXT_SIZE))
-            .line_height(px(INPUT_LINE_HEIGHT))
+            .text_size(px(self.text_size))
+            .line_height(px(self.configured_line_height))
             .text_color(text_color)
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {
@@ -3925,6 +4151,14 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// Is this prompt the compaction command? One detector for both entry points
+/// — the context ring's click and a hand-typed `/compact [instructions]` —
+/// so the transcript marker never depends on which one fired it.
+fn is_compact_command(text: &str) -> bool {
+    let text = text.trim();
+    text == "/compact" || text.starts_with("/compact ")
+}
+
 /// Restart a popup's row stack at the top (fresh open / query / result set).
 fn reset_scroll_offset(scroll: &gpui::ScrollHandle) {
     scroll.set_offset(gpui::Point::new(px(0.0), px(0.0)));
@@ -3972,10 +4206,68 @@ struct SlashState {
     dismissed: Option<(Range<usize>, String)>,
 }
 
+/// One row of the popup's Projects section: a known project, referenced by
+/// name with its absolute path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectMention {
+    name: String,
+    path: String,
+}
+
+/// Projects matching the `@` query by name or path (case-insensitive); an
+/// empty query lists them all. Pure — filtering the ledger snapshot the
+/// composer already holds, so no IO per keystroke.
+fn filter_project_mentions(projects: &[ProjectMention], query: &str) -> Vec<ProjectMention> {
+    let needle = query.to_lowercase();
+    projects
+        .iter()
+        .filter(|project| {
+            needle.is_empty()
+                || project.name.to_lowercase().contains(&needle)
+                || project.path.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The project ledger — the same list Settings → Projects shows: every folder
+/// the app has ever seen, most recently active first. Read straight from
+/// `app-state.json` (no Workers daemon round-trip): mentioning a project must
+/// work whether or not the local Workers host is up.
+fn read_project_ledger() -> Vec<ProjectMention> {
+    let mut rows = match zeron_workers_unpeel::project_ledger::read() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "project ledger read failed");
+            return Vec::new();
+        }
+    };
+    rows.sort_by(|a, b| b.last_seen_at_unix_ms.cmp(&a.last_seen_at_unix_ms));
+    rows.into_iter()
+        .map(|row| ProjectMention {
+            name: row.name,
+            path: row.path,
+        })
+        .collect()
+}
+
+/// Which level of the `@` menu is showing: the root (a Projects entry over the
+/// file results) or the project list it opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum MentionLevel {
+    #[default]
+    Root,
+    Projects,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
     results: Vec<FileSearchMatch>,
+    /// Known projects matching the query — only shown (and only navigable)
+    /// once the root menu's Projects entry is opened.
+    projects: Vec<ProjectMention>,
+    level: MentionLevel,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3987,6 +4279,27 @@ struct FileMentionState {
     /// Full token text, not just the cursor-relative query: moving within a
     /// dismissed token keeps it closed, while any edit re-enables completion.
     dismissed: Option<(Range<usize>, String)>,
+}
+
+impl FileMentionState {
+    /// Rows the popup offers — the keyboard cursor's space. At the root that
+    /// is the Projects entry plus the file results; inside it, the projects.
+    fn row_count(&self) -> usize {
+        match self.level {
+            MentionLevel::Root => 1 + self.results.len(),
+            MentionLevel::Projects => self.projects.len(),
+        }
+    }
+
+    /// Where the active row sits in the rendered stack: the root's separator
+    /// takes a position of its own, so the keyboard cursor's index is not the
+    /// child index `scroll_to_item` wants.
+    fn scroll_index(&self, active: usize) -> usize {
+        match self.level {
+            MentionLevel::Root => active + usize::from(active > 0),
+            MentionLevel::Projects => active + 1,
+        }
+    }
 }
 
 fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
@@ -4046,6 +4359,10 @@ pub struct Composer {
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
+    /// Settings → Projects' ledger, snapshotted when the `@` menu opens; the
+    /// Projects level filters this, never disk.
+    project_ledger: Vec<ProjectMention>,
+    project_ledger_task: Option<Task<()>>,
     slash_task: Option<Task<()>>,
     slash: SlashState,
     /// Advertised commands per harness (one `ListCommands` per harness per
@@ -4080,6 +4397,9 @@ pub struct Composer {
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
     live_start_task: Option<Task<()>>,
+    draft_live_availability: Option<LiveVoiceAvailability>,
+    draft_live_probe_key: Option<DraftLiveVoiceProbeKey>,
+    draft_live_probe_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -4117,6 +4437,8 @@ pub struct Composer {
     escape_armed: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
+    _picker_focus: Subscription,
+    pub(crate) focus_pending: bool,
     _input_events: Subscription,
     _long_paste_events: Subscription,
     _paste_notice_events: Subscription,
@@ -4155,6 +4477,13 @@ impl Composer {
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
         let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let picker_focus = cx.subscribe(
+            &pickers,
+            |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
+                this.focus_pending = true;
+                cx.notify();
+            },
+        );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -4223,6 +4552,8 @@ impl Composer {
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
+            project_ledger: Vec::new(),
+            project_ledger_task: None,
             slash_task: None,
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
@@ -4239,6 +4570,9 @@ impl Composer {
             advance_task: None,
             send_task: None,
             live_start_task: None,
+            draft_live_availability: None,
+            draft_live_probe_key: None,
+            draft_live_probe_task: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -4255,6 +4589,8 @@ impl Composer {
             slash_scroll: gpui::ScrollHandle::new(),
             _observe: observe,
             _pickers_observe: pickers_observe,
+            _picker_focus: picker_focus,
+            focus_pending: true,
             _input_events: input_events,
             _long_paste_events: long_paste_events,
             _paste_notice_events: paste_notice_events,
@@ -4308,6 +4644,13 @@ impl Composer {
         self.sending
     }
 
+    /// True while the input of the chat the composer is SHOWING holds text
+    /// that has not been sent (whitespace-only counts as empty); staged
+    /// attachments and drafts saved for other chats do not count.
+    pub fn has_draft(&self, cx: &App) -> bool {
+        !self.input.read(cx).text().trim().is_empty()
+    }
+
     // ---- attachment staging (use-attachments.ts) ----
 
     /// Staged attachments for the chat the composer is showing.
@@ -4326,6 +4669,7 @@ impl Composer {
             .entry(self.current_key.clone())
             .or_default()
             .extend(staged);
+        self.focus_pending = true;
         cx.notify();
     }
 
@@ -4431,6 +4775,8 @@ impl Composer {
             return None;
         }
         let mut strip = div()
+            .w_full()
+            .flex_none()
             .flex()
             .flex_row()
             .flex_wrap()
@@ -4475,6 +4821,7 @@ impl Composer {
                 };
                 div()
                     .group(group.clone())
+                    .flex_none()
                     .relative()
                     .child(
                         div()
@@ -4588,10 +4935,16 @@ impl Composer {
             prompt: Some("Attach".into()),
         });
         self.picker_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                this.update(cx, |composer, cx| composer.add_paths(paths, cx))
-                    .ok();
-            }
+            let result = rx.await;
+            this.update(cx, |composer, cx| {
+                if let Ok(Ok(Some(paths))) = result {
+                    composer.add_paths(paths, cx);
+                }
+                // Both Attach and Cancel return to the draft.
+                composer.focus_pending = true;
+                cx.notify();
+            })
+            .ok();
         }));
     }
 
@@ -4665,14 +5018,31 @@ impl Composer {
         // skeleton (and a different height) on every keystroke.
         let refining = self.mention.token.is_some() && token.is_some();
         self.mention.token = token.clone();
+        // The project list filters locally on every keystroke — no debounce,
+        // no waiting for the file search.
+        self.mention.projects = match &token {
+            Some(token) => filter_project_mentions(&self.project_ledger, &token.query),
+            None => Vec::new(),
+        };
         if !refining {
             self.mention.results.clear();
             self.mention.active = None;
-            // Fresh open: the row stack restarts at the top.
+            self.mention.level = MentionLevel::Root;
+            // Fresh open: the row stack restarts at the top, and the ledger is
+            // re-read once (a project added since the last `@` shows up).
             reset_scroll_offset(&self.mention_scroll);
+            if token.is_some() {
+                self.load_project_ledger(cx);
+            }
         }
         self.mention.error = None;
         self.mention.loading = token.is_some();
+        // A project row is selectable before the file search answers (and
+        // when it never does: no engine, no target device).
+        self.mention.active = match self.mention.active {
+            Some(active) if active < self.mention.row_count() => Some(active),
+            _ => (self.mention.row_count() > 0).then_some(0),
+        };
         self.sync_mention_controls(cx);
         let Some(token) = token else {
             cx.notify();
@@ -4743,8 +5113,9 @@ impl Composer {
                     Ok(value) => match serde_json::from_value::<Vec<FileSearchMatch>>(value) {
                         Ok(results) => {
                             composer.mention.error = None;
-                            composer.mention.active = (!results.is_empty()).then_some(0);
                             composer.mention.results = results;
+                            composer.mention.active =
+                                (composer.mention.row_count() > 0).then_some(0);
                             // New result set: the row stack restarts at the top.
                             reset_scroll_offset(&composer.mention_scroll);
                         }
@@ -4753,7 +5124,7 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(%err, "file mention search failed");
                         composer.mention.results.clear();
-                        composer.mention.active = None;
+                        composer.mention.active = (composer.mention.row_count() > 0).then_some(0);
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
@@ -4765,18 +5136,49 @@ impl Composer {
         cx.notify();
     }
 
+    /// Snapshot the project ledger off the UI thread. Cheap (one JSON read),
+    /// so it re-runs per `@` open instead of caching for the session.
+    fn load_project_ledger(&mut self, cx: &mut Context<Self>) {
+        self.project_ledger_task = Some(cx.spawn(async move |this, cx| {
+            let projects = cx
+                .background_executor()
+                .spawn(async move { read_project_ledger() })
+                .await;
+            this.update(cx, |composer, cx| {
+                composer.project_ledger = projects;
+                if let Some(token) = composer.mention.token.clone() {
+                    composer.mention.projects =
+                        filter_project_mentions(&composer.project_ledger, &token.query);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
-            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+            crate::popover::menu_step(self.mention.active, self.mention.row_count(), delta);
         if let Some(active) = self.mention.active {
             // Keep the keyboard cursor visible in the scrolled row stack.
-            self.mention_scroll.scroll_to_item(active);
+            self.mention_scroll
+                .scroll_to_item(self.mention.scroll_index(active));
         }
         self.sync_mention_controls(cx);
         cx.notify();
     }
 
     fn dismiss_mention(&mut self, cx: &mut Context<Self>) {
+        // Inside the project list, Escape walks back to the root menu — the
+        // whole popup closes only from there.
+        if self.mention.level == MentionLevel::Projects {
+            self.mention.level = MentionLevel::Root;
+            self.mention.active = Some(0);
+            reset_scroll_offset(&self.mention_scroll);
+            self.sync_mention_controls(cx);
+            cx.notify();
+            return;
+        }
         let dismissed = self.mention.token.as_ref().and_then(|token| {
             self.input
                 .read(cx)
@@ -4792,16 +5194,30 @@ impl Composer {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
-        let Some((path, is_dir)) = self
-            .mention
-            .active
-            .and_then(|active| self.mention.results.get(active))
-            .map(|result| (result.path.clone(), result.is_dir))
-        else {
+        let Some(active) = self.mention.active else {
             return;
         };
+        let link = match self.mention.level {
+            // Row 0 is the Projects entry: opening it is the whole action.
+            MentionLevel::Root if active == 0 => {
+                self.mention.level = MentionLevel::Projects;
+                self.mention.active = (!self.mention.projects.is_empty()).then_some(0);
+                reset_scroll_offset(&self.mention_scroll);
+                self.sync_mention_controls(cx);
+                cx.notify();
+                return;
+            }
+            MentionLevel::Root => match self.mention.results.get(active - 1) {
+                Some(result) => local_file_link(&result.path, result.is_dir),
+                None => return,
+            },
+            MentionLevel::Projects => match self.mention.projects.get(active) {
+                Some(project) => project_mention_link(&project.name, &project.path),
+                None => return,
+            },
+        };
         self.input.update(cx, |input, cx| {
-            input.replace_mention(token.range, &path, is_dir, cx)
+            input.replace_mention_link(token.range, &link, cx)
         });
         self.reset_mention(None, cx);
         cx.notify();
@@ -4817,44 +5233,94 @@ impl Composer {
             .w_full()
             .max_h(px(320.0))
             .overflow_hidden()
+            // Completion choices belong to the input. Keep it focused until
+            // mouse-up can accept a choice (or while dragging the scrollbar).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             // GPUI dispatches this captured stream while the thumb is
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
-        if self.mention.loading && self.mention.results.is_empty() {
-            card = card.child(crate::popover::skeleton_rows(
-                "file-mention-loading",
-                theme,
-                3,
-                cx.entity_id(),
-                cx,
-            ));
-        } else if let Some(error) = self.mention.error.clone() {
-            card = card.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(10.0))
-                    .text_size(px(SLASH_DESCRIPTION_SIZE))
-                    .text_color(theme.danger_muted)
-                    .child(error),
-            );
-        } else if self.mention.results.is_empty() {
-            card = card.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(10.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .child(if token.query.is_empty() {
-                        "No files available"
-                    } else {
-                        "No matching files"
-                    }),
-            );
-        } else {
-            let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.mention.results.len());
+        let rows: Vec<gpui::AnyElement> = match self.mention.level {
+            MentionLevel::Projects => self.render_project_mention_rows(theme, cx),
+            MentionLevel::Root => self.render_root_mention_rows(token, theme, cx),
+        };
+        // Overflowing rows wheel-scroll inside a bounded viewport; the
+        // floating rail mirrors the model-list scrollbar treatment.
+        card = card.child(
+            div()
+                .id("mention-scroll-host")
+                .relative()
+                .on_hover(cx.listener(Self::on_popup_list_hover))
+                .child(
+                    div()
+                        .id("mention-list")
+                        .max_h(px(312.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.mention_scroll)
+                        .children(rows),
+                )
+                .children(self.popup_scrollbar(
+                    "mention-scrollbar",
+                    &self.mention_scroll,
+                    theme,
+                    cx,
+                )),
+        );
+        Some(crate::popover::full_width_menu_above(
+            "file-mention-popup",
+            card.into_any_element(),
+            None,
+        ))
+    }
+
+    /// The root level: the Projects entry over the file results.
+    fn render_root_mention_rows(
+        &self,
+        token: &MentionToken,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.mention.results.len() + 2);
+        rows.push(
+            crate::popover::menu_row(theme, self.mention.active == Some(0), "mention-projects")
+                .id("mention-projects")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.mention.active = Some(0);
+                    this.accept_mention(cx);
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::FOLDER)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child("Projects"),
+                )
+                .child(
+                    crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .into_any_element(),
+        );
+        rows.push(crate::popover::menu_separator().into_any_element());
+        if !self.mention.results.is_empty() {
             for (ix, result) in self.mention.results.iter().enumerate() {
-                let selected = self.mention.active == Some(ix);
+                let row_ix = ix + 1;
+                let selected = self.mention.active == Some(row_ix);
                 let (directory, name) = match result.path.rsplit_once('/') {
                     Some((directory, name)) => (directory.to_string(), name.to_string()),
                     None => (String::new(), result.path.clone()),
@@ -4863,7 +5329,7 @@ impl Composer {
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mention.active = Some(ix);
+                            this.mention.active = Some(row_ix);
                             this.accept_mention(cx);
                         }))
                         .child(
@@ -4906,36 +5372,106 @@ impl Composer {
                         .into_any_element(),
                 );
             }
-            // Overflowing rows wheel-scroll inside a bounded viewport; the
-            // floating rail mirrors the model-list scrollbar treatment.
-            card = card.child(
+        } else if self.mention.loading {
+            rows.push(crate::popover::skeleton_rows(
+                "file-mention-loading",
+                theme,
+                3,
+                cx.entity_id(),
+                cx,
+            ));
+        } else if let Some(error) = self.mention.error.clone() {
+            rows.push(
                 div()
-                    .id("mention-scroll-host")
-                    .relative()
-                    .on_hover(cx.listener(Self::on_popup_list_hover))
-                    .child(
-                        div()
-                            .id("mention-list")
-                            .max_h(px(312.0))
-                            .flex()
-                            .flex_col()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.mention_scroll)
-                            .children(rows),
-                    )
-                    .children(self.popup_scrollbar(
-                        "mention-scrollbar",
-                        &self.mention_scroll,
-                        theme,
-                        cx,
-                    )),
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(SLASH_DESCRIPTION_SIZE))
+                    .text_color(theme.danger_muted)
+                    .child(error)
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(if token.query.is_empty() {
+                        "No files available"
+                    } else {
+                        "No matching files"
+                    })
+                    .into_any_element(),
             );
         }
-        Some(crate::popover::full_width_menu_above(
-            "file-mention-popup",
-            card.into_any_element(),
-            None,
-        ))
+        rows
+    }
+
+    /// The Projects level: every project the app knows, filtered by the query.
+    fn render_project_mention_rows(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> =
+            vec![crate::popover::menu_heading(theme, "Projects").into_any_element()];
+        if self.mention.projects.is_empty() {
+            rows.push(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("No matching projects")
+                    .into_any_element(),
+            );
+            return rows;
+        }
+        for (ix, project) in self.mention.projects.iter().enumerate() {
+            let selected = self.mention.active == Some(ix);
+            rows.push(
+                crate::popover::menu_row(theme, selected, format!("project-mention-{ix}"))
+                    .id(("project-mention", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mention.active = Some(ix);
+                        this.accept_mention(cx);
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                crate::icons::icon(crate::icons::FOLDER)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(13.0))
+                                    .text_color(theme.text)
+                                    .child(project.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.text_muted)
+                                    .child(project.path.clone()),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 
     fn render_input_with_completion(&self) -> gpui::Div {
@@ -5134,6 +5670,12 @@ impl Composer {
             .w_full()
             .max_h(px(320.0))
             .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             // GPUI dispatches this captured stream while the thumb is
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
@@ -5582,6 +6124,15 @@ impl Composer {
             taken
         });
         let typed = text.clone();
+        // Pre-compaction size, captured before the run that shrinks it. New
+        // chats are skipped: there is nothing to compact yet.
+        let compaction_before = (!is_new && is_compact_command(&typed)).then(|| {
+            self.state
+                .read(cx)
+                .session_for(&chat_id)
+                .and_then(|session| session.context_usage)
+                .map_or(0, |usage| usage.tokens)
+        });
         let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -5698,6 +6249,9 @@ impl Composer {
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
+            }
+            if let Some(before) = compaction_before {
+                s.begin_compaction(&chat_id, before);
             }
             s.push_echo(&chat_id, echo);
             // Working overlay until the host executes the queued command —
@@ -6426,7 +6980,7 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(theme.composer_glass_bg())
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
@@ -6617,6 +7171,25 @@ impl Composer {
         }
     }
 
+    /// `/compact` needs a live chat and a quiet run — mid-run it would land as
+    /// a steer, which is not what clicking a usage ring means.
+    fn can_compact(&self, cx: &App) -> bool {
+        self.state.read(cx).selected_chat.is_some() && !self.run_live(cx)
+    }
+
+    fn compact_now(&mut self, cx: &mut Context<Self>) {
+        if !self.can_compact(cx) {
+            return;
+        }
+        // `send` clears the input; the half-typed prompt is not part of this
+        // gesture, so it goes straight back after the command is queued.
+        let draft = self.input.read(cx).text().to_string();
+        self.send("/compact".into(), false, cx);
+        if !draft.is_empty() {
+            self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        }
+    }
+
     fn render_context_indicator(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let usage = {
             let state = self.state.read(cx);
@@ -6633,7 +7206,42 @@ impl Composer {
             ContextIndicatorLevel::Warning => theme.warning.opacity(0.9),
             ContextIndicatorLevel::Critical => theme.danger.opacity(0.9),
         };
+        // While the command runs the ring has nothing true to show (the usage
+        // it plots is the pre-compaction one), so the slot says what is
+        // happening instead.
+        if self
+            .state
+            .read(cx)
+            .selected_chat
+            .as_deref()
+            .is_some_and(|chat_id| self.state.read(cx).is_compacting(chat_id))
+        {
+            return div()
+                .id("composer-compacting")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .pl(px(4.0))
+                .child(crate::loaders::mini_mono_spinner(
+                    "composer-compacting-spinner",
+                    3.0,
+                    theme.text_muted.opacity(0.82),
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .child("Compacting…"),
+                )
+                .into_any_element();
+        }
         let tooltip = indicator.clone();
+        // The ring IS the /compact affordance: one click runs the command on
+        // the selected chat, so nobody has to type it into the input.
+        let compactable = self.can_compact(cx);
         div()
             .id("composer-context-window")
             .size(px(28.0))
@@ -6641,9 +7249,14 @@ impl Composer {
             .flex()
             .items_center()
             .justify_center()
+            .when(compactable, |el| {
+                el.cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.compact_now(cx)))
+            })
             .tooltip(move |_, cx| {
                 cx.new(|_| ContextUsageTooltip {
                     state: tooltip.clone(),
+                    compactable,
                 })
                 .into()
             })
@@ -6682,7 +7295,8 @@ impl Composer {
             target_device_id.as_deref(),
             local_device_id.as_deref(),
             resolved.harness,
-        ) {
+        ) || !draft_live_voice_ready(self.draft_live_availability.as_ref())
+        {
             return;
         }
         let Some(engine) = engine else {
@@ -6692,6 +7306,7 @@ impl Composer {
             &self.pickers.read(cx).checkout_plan(),
             space.as_ref().map(|space| space.path.as_str()),
         );
+        let probe_cwd = draft_live_voice_probe_cwd(&plan).to_owned();
         let chat_config = resolved
             .chat_config()
             .expect("an OMP draft always resolves a Chat config");
@@ -6706,7 +7321,32 @@ impl Composer {
         self.live_start_task = Some(cx.spawn(async move |this, cx| {
             let mut created_worktree: Option<(String, String)> = None;
             let mut live_started = false;
+            let mut chat_created = false;
+            let mut probed_availability: Option<LiveVoiceAvailability> = None;
             let result: Result<(), String> = async {
+                let availability = match engine
+                    .client()
+                    .call_as::<LiveVoiceAvailability>(
+                        methods::PROBE_LIVE_VOICE,
+                        serde_json::json!({ "cwd": probe_cwd }),
+                    )
+                    .await
+                {
+                    Ok(availability) => availability,
+                    Err(RpcError::UnknownMethod(_)) => LiveVoiceAvailability {
+                        available: false,
+                        reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
+                    },
+                    Err(error) => return Err(error.to_string()),
+                };
+                probed_availability = Some(availability);
+                if !availability.available {
+                    return Err(availability
+                        .reason
+                        .map(live_voice::unavailable_message)
+                        .unwrap_or("Live Voice is unavailable")
+                        .to_owned());
+                }
                 let (cwd, branch) = match plan {
                     NewChatLiveCheckout::Ready { cwd, branch } => (cwd, branch),
                     NewChatLiveCheckout::CreateWorktree { repo_path, base } => {
@@ -6750,6 +7390,7 @@ impl Composer {
                     Duration::from_secs(30),
                 )
                 .await?;
+                chat_created = true;
                 engine
                     .client()
                     .call(
@@ -6790,14 +7431,16 @@ impl Composer {
                     )
                     .await;
                 }
-                let _ = attachments::call_with_timeout(
-                    &engine,
-                    cx.background_executor(),
-                    methods::MUTATE,
-                    serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
-                    Duration::from_secs(5),
-                )
-                .await;
+                if chat_created {
+                    let _ = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                }
                 if let Some((repo_path, worktree_path)) = created_worktree {
                     let _ = attachments::call_with_timeout(
                         &engine,
@@ -6815,6 +7458,9 @@ impl Composer {
 
             this.update(cx, |composer, cx| {
                 composer.live_start_task = None;
+                if let Some(availability) = probed_availability {
+                    composer.draft_live_availability = Some(availability);
+                }
                 match result {
                     Ok(()) => {
                         composer.failure = None;
@@ -6832,28 +7478,99 @@ impl Composer {
         cx.notify();
     }
 
-    fn live_voice_model(&self, cx: &App) -> LiveVoiceViewModel {
+    fn refresh_draft_live_voice_availability(&mut self, cx: &mut Context<Self>) {
+        let (is_draft, engine, target_device_id, local_device_id, space_path) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_chat.is_none(),
+                state.engine().cloned(),
+                state.effective_device_id(),
+                state.local_device_id.clone(),
+                state.selected_space_row().map(|space| space.path.clone()),
+            )
+        };
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let eligible = draft_live_voice_available(
+            engine.is_some(),
+            target_device_id.as_deref(),
+            local_device_id.as_deref(),
+            harness,
+        );
+        let key = if is_draft && eligible {
+            let plan = new_chat_live_checkout(
+                &self.pickers.read(cx).checkout_plan(),
+                space_path.as_deref(),
+            );
+            Some(DraftLiveVoiceProbeKey {
+                cwd: draft_live_voice_probe_cwd(&plan).to_owned(),
+                target_device_id,
+                local_device_id,
+                harness,
+            })
+        } else {
+            None
+        };
+        if self.draft_live_probe_key == key {
+            return;
+        }
+        self.draft_live_probe_key = key.clone();
+        self.draft_live_availability = None;
+        self.draft_live_probe_task = None;
+        let (Some(key), Some(engine)) = (key, engine) else {
+            return;
+        };
+        self.draft_live_probe_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<LiveVoiceAvailability>(
+                    methods::PROBE_LIVE_VOICE,
+                    serde_json::json!({ "cwd": key.cwd }),
+                )
+                .await;
+            let availability = match result {
+                Ok(availability) => Some(availability),
+                Err(RpcError::UnknownMethod(_)) => Some(LiveVoiceAvailability {
+                    available: false,
+                    reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
+                }),
+                Err(error) => {
+                    tracing::debug!(%error, "draft Live Voice probe failed");
+                    None
+                }
+            };
+            let _ = this.update(cx, |composer, cx| {
+                if composer.draft_live_probe_key.as_ref() == Some(&key) {
+                    composer.draft_live_availability = availability;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn live_voice_model(&mut self, cx: &mut Context<Self>) -> LiveVoiceViewModel {
+        self.refresh_draft_live_voice_availability(cx);
         let state = self.state.read(cx);
         let is_draft = state.selected_chat.is_none();
-        let draft_availability = (is_draft
+        let eligible = is_draft
             && draft_live_voice_available(
                 state.engine().is_some(),
                 state.effective_device_id().as_deref(),
                 state.local_device_id.as_deref(),
                 self.pickers.read(cx).resolved(cx).harness,
-            ))
-        .then(|| LiveVoiceAvailability {
-            available: true,
-            reason: None,
-        });
-        let mut model = LiveVoiceViewModel::derive(
-            state.selected_chat.as_deref(),
-            state
-                .live_voice_availability
-                .as_ref()
-                .or(draft_availability.as_ref()),
-            &state.live_voice,
-        );
+            );
+        let mut model = if is_draft {
+            LiveVoiceViewModel::derive_draft(
+                self.draft_live_availability.as_ref(),
+                &state.live_voice,
+                eligible,
+            )
+        } else {
+            LiveVoiceViewModel::derive(
+                state.selected_chat.as_deref(),
+                state.live_voice_availability.as_ref(),
+                &state.live_voice,
+            )
+        };
         if is_draft && self.live_start_task.is_some() {
             model.microphone_enabled = false;
             model.microphone_tooltip = "Starting Live Voice…".to_owned();
@@ -7113,7 +7830,7 @@ impl Composer {
             .rounded(px(COMPOSER_CORNER_RADIUS))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(theme.composer_glass_bg())
             .px(px(12.0))
             .py(px(10.0))
             .flex()
@@ -7133,6 +7850,9 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.focus_pending) {
+            window.focus(&self.input.focus_handle(cx), cx);
+        }
         let theme = Theme::of(cx).clone();
         let live_voice = self.live_voice_model(cx);
         let wizard_active = self.wizard.is_some();
@@ -7486,11 +8206,22 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Attach and the
         // send circle live inside; model/effort now belong to the footer.
-        let pill_bg = theme.input_glass_bg();
+        // Shared with the sent user-message bubble (theme.composer_glass_bg):
+        // thinned to ~half the theme fill so the pill reads as a transparent,
+        // hairline-outlined input rather than a solid grey plate (user request).
+        let pill_bg = theme.composer_glass_bg();
         // No drop shadow on glass: it paints BEHIND the translucent fill and
         // shows through as an inner glow (theme.rs's card_selected_shadows
         // lesson; user report).
         let pill = div()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if !this.pickers.read(cx).is_open() {
+                        window.focus(&this.input.focus_handle(cx), cx);
+                    }
+                }),
+            )
             .rounded(px(COMPOSER_CORNER_RADIUS))
             .bg(pill_bg)
             .border_1()
@@ -7548,7 +8279,6 @@ impl Render for Composer {
                         .pt(px(4.0))
                         .pb(px(10.0))
                         .child(div().flex_1().min_w_0())
-                        .child(context_indicator)
                         .children(self.render_live_voice_button(&live_voice, &theme, cx))
                         .child(attach)
                         .child(send_button),
@@ -7601,7 +8331,6 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(context_indicator)
                                 .children(self.render_live_voice_button(&live_voice, &theme, cx))
                                 .child(attach)
                                 .child(send_button),
@@ -7629,7 +8358,7 @@ impl Render for Composer {
             div()
                 .relative()
                 .child(crate::frost::frosted(
-                    26.0,
+                    COMPOSER_CORNER_RADIUS,
                     16.0,
                     motion::fade_quick("composer-input", body),
                 ))
@@ -7641,9 +8370,9 @@ impl Render for Composer {
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
-        let footer = self
-            .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(window, cx));
+        let footer = self.pickers.update(cx, |pickers, cx| {
+            pickers.render_footer(window, Some(context_indicator), cx)
+        });
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,
@@ -7677,7 +8406,421 @@ impl Render for Composer {
 
 #[cfg(test)]
 mod tests {
+
+    fn composer_focus_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (tempfile::TempDir, gpui::WindowHandle<Composer>) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Composer::new(state, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        (dir, window)
+    }
+
+    #[gpui::test]
+    fn composer_padding_and_file_prompt_restore_focus(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let image_path = dir.path().join("attachment.png");
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF1cAAAAASUVORK5CYII=").unwrap();
+        std::fs::write(&image_path, png).unwrap();
+        let input = handle
+            .read_with(cx, |composer, _| composer.input.clone())
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.blur();
+            window.draw(cx).clear();
+            let bounds = input.read(cx).last_bounds.unwrap();
+            // Click padding immediately left of the actual editor.
+            let position = point(bounds.left() - px(4.0), bounds.center().y);
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(input.read(cx).focus_handle.is_focused(window));
+            window.dispatch_event(
+                gpui::PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        for accepted in [false, true] {
+            handle
+                .update(cx, |composer, window, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text("Keep this draft", cx));
+                    window.blur();
+                    composer.open_file_picker(cx);
+                })
+                .unwrap();
+            assert!(cx.did_prompt_for_paths());
+            let path = image_path.clone();
+            cx.simulate_path_prompt_response(move |_| accepted.then(|| vec![path]));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert!(input.read(cx).focus_handle.is_focused(window));
+                assert_eq!(input.read(cx).text(), "Keep this draft");
+            })
+            .unwrap();
+            assert_eq!(
+                handle
+                    .read_with(cx, |composer, _| composer.staged().len())
+                    .unwrap(),
+                usize::from(accepted)
+            );
+        }
+        // The same staging path handles external file drops.
+        handle
+            .update(cx, |composer, window, cx| {
+                window.blur();
+                composer.add_paths(vec![image_path], cx);
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            assert!(input.read(cx).focus_handle.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn composer_picker_escape_restores_focus_but_click_away_does_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let input = handle
+            .read_with(cx, |composer, _| composer.input.clone())
+            .unwrap();
+        for escape in [true, false] {
+            handle
+                .update(cx, |composer, window, cx| {
+                    composer
+                        .pickers
+                        .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert!(!input.read(cx).focus_handle.is_focused(window));
+            })
+            .unwrap();
+            if escape {
+                cx.simulate_keystrokes(handle.into(), "escape");
+            } else {
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: point(px(5.0), window.viewport_size().height - px(1.0)),
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+            }
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert_eq!(input.read(cx).focus_handle.is_focused(window), escape);
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn inputs_release_focus_on_click_away(cx: &mut gpui::TestAppContext) {
+        struct Inputs(Vec<Entity<ComposerInput>>);
+        impl Render for Inputs {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().flex().flex_col().children(
+                    self.0
+                        .iter()
+                        .map(|input| div().w(px(200.0)).child(input.clone())),
+                )
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let host = cx.add_window(|_, cx| {
+            Inputs(vec![
+                cx.new(|cx| ComposerInput::new("Composer", cx)),
+                cx.new(|cx| ComposerInput::new("URL", cx).with_single_line()),
+            ])
+        });
+        cx.run_until_parked();
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let inputs = host.read_with(cx, |host, _| host.0.clone()).unwrap();
+        // Visit both fields and return to the first: click-away capture must
+        // never clear focus acquired by the clicked input during bubbling.
+        for index in [0, 1, 0] {
+            let position =
+                inputs[index].read_with(cx, |input, _| input.last_bounds.unwrap().center());
+            cx.update_window(host.into(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                assert!(inputs[index].read(cx).focus_handle.is_focused(window));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        }
+        cx.update_window(host.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(400.0), px(300.0)),
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(window.focused(cx).is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn single_line_layout_keeps_plain_and_heading_text_unwrapped(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (input, cx) = cx.add_window_view(|_, cx| {
+            ComposerInput::new("Address", cx)
+                .with_single_line()
+                .with_text_metrics(11.0, 16.0)
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                let style = window.text_style();
+                for text in [
+                    "http://device.a-very-long-project-name.localhost:7331/path",
+                    "# A very long heading that must stay on a single line",
+                ] {
+                    input.set_text(text, cx);
+                    let unwrapped_height = input.layout_text(px(2000.0), &style, window, cx);
+                    assert_eq!(
+                        input.layout_text(px(100.0), &style, window, cx),
+                        unwrapped_height
+                    );
+                    input.clamp_scroll(16.0);
+                    assert!(input.scroll_left > 0.0);
+                }
+            });
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_line_address_reveals_caret_and_maps_scrolled_pointer() {
+        gpui_platform::headless().run(|cx| {
+            cx.set_global(Theme::dark());
+            let handle = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|cx| {
+                        ComposerInput::new("Address", cx)
+                            .with_single_line()
+                            .with_text_metrics(11.0, 16.0)
+                    })
+                })
+                .unwrap();
+            handle
+                .update(cx, |input, window, cx| {
+                    let style = window.text_style();
+                    input.set_text(
+                        "http://device.a-very-long-project-name.localhost:7331/path",
+                        cx,
+                    );
+                    let unwrapped_height = input.layout_text(px(2000.0), &style, window, cx);
+                    assert_eq!(
+                        input.layout_text(px(100.0), &style, window, cx),
+                        unwrapped_height,
+                        "long hostnames must not wrap"
+                    );
+                    input.clamp_scroll(16.0);
+                    assert!(input.scroll_left > 0.0);
+                    let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(100.0), px(16.0)));
+                    input.last_bounds = Some(bounds);
+                    let caret = input
+                        .bounds_for_range(
+                            input.content.len()..input.content.len(),
+                            bounds,
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    assert!(caret.left() >= bounds.left() && caret.right() <= bounds.right());
+                    assert_eq!(
+                        input.index_for_mouse_position(caret.origin),
+                        input.content.len()
+                    );
+                    input.selected_range = 0..0;
+                    input.clamp_scroll(16.0);
+                    assert_eq!(input.scroll_left, 0.0, "Home must reveal the URL start");
+                    input.replace_text_in_range(None, "one\r\ntwo", window, cx);
+                    assert!(!input.content.contains(['\r', '\n']));
+                    input.set_text("short", cx);
+                    input.layout_text(px(100.0), &style, window, cx);
+                    input.clamp_scroll(16.0);
+                    assert_eq!(
+                        input.scroll_left, 0.0,
+                        "short replacement must reset scrolling"
+                    );
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    }
+
     use super::*;
+
+    #[gpui::test]
+    fn resolved_input_geometry_does_not_notify_on_unchanged_frames(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            cx.set_global(Theme::dark());
+        });
+        let (input, cx) = cx.add_window_view(|_, cx| ComposerInput::new("Draft", cx));
+        let changes = Rc::new(std::cell::Cell::new(0));
+        let count = changes.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event, _| {
+                if matches!(event, ComposerInputEvent::ViewportChanged) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_text(
+                    "Text whose wrapping changes between provisional and resolved widths.\n"
+                        .repeat(20),
+                    cx,
+                );
+                input.last_notified_layout = None;
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let settled = changes.get();
+        assert!(settled > 0, "resolved layout must be published");
+        for _ in 0..30 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+        }
+        assert_eq!(
+            changes.get(),
+            settled,
+            "stable geometry must not schedule another layout"
+        );
+    }
+
+    #[gpui::test]
+    fn unchanged_input_reuses_shaping_and_edits_invalidate(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::typography::register_fonts(cx);
+            cx.set_global(Theme::dark());
+        });
+        let (input, cx) = cx.add_window_view(|_, cx| ComposerInput::new("Draft", cx));
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                let mut style = window.text_style();
+                input.enable_mentions();
+                input.set_text(
+                    "# Heading **bold**\nUnicode ação 中文 and `code` with a long paragraph.\n"
+                        .repeat(20),
+                    cx,
+                );
+                input.layout_text(px(400.0), &style, window, cx);
+                let first = input.layout_rebuilds;
+                let height = input.content_height;
+                for frame in 0..120 {
+                    input.scroll_top = frame as f32;
+                    input.selected_range = 2..8;
+                    assert_eq!(input.layout_text(px(400.0), &style, window, cx), height);
+                }
+                assert_eq!(
+                    input.layout_rebuilds, first,
+                    "caret/selection/scroll frames must reuse shaping"
+                );
+                input.set_text("Edited draft", cx);
+                input.layout_text(px(400.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 1);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 2, "width must rewrap");
+                style.font_size = px(18.0).into();
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 3);
+                input.marked_range = Some(0..2);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 4, "IME marks must repaint");
+                input.unmark_text(window, cx);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 5);
+                input.set_text("", cx);
+                input.layout_text(px(200.0), &style, window, cx);
+                input.set_placeholder("New placeholder", cx);
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 7);
+                assert!(input.projection.mentions.is_empty());
+                style.color = gpui::rgb(0xff0000).into();
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 8);
+                input.mentions_enabled = false;
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(input.layout_rebuilds, first + 9);
+                cx.set_global(Theme::light());
+                input.layout_text(px(200.0), &style, window, cx);
+                assert_eq!(
+                    input.layout_rebuilds,
+                    first + 10,
+                    "theme decoration must invalidate"
+                );
+            })
+        });
+    }
 
     fn planned_run_at(runs: &[ComposerRunPlan], offset: usize) -> &ComposerRunPlan {
         let mut at = 0;
@@ -7710,6 +8853,40 @@ mod tests {
             Some("local-device"),
             Some(HarnessId::Codex),
         ));
+        assert!(!draft_live_voice_ready(None));
+        assert!(!draft_live_voice_ready(Some(&LiveVoiceAvailability {
+            available: false,
+            reason: Some(LiveVoiceUnavailableReason::UnsupportedOmp),
+        })));
+        assert!(draft_live_voice_ready(Some(&LiveVoiceAvailability {
+            available: true,
+            reason: None,
+        })));
+    }
+
+    #[test]
+    fn live_voice_new_chat_probes_checkout_or_repo_path() {
+        assert_eq!(
+            draft_live_voice_probe_cwd(&NewChatLiveCheckout::Ready {
+                cwd: "/repo".into(),
+                branch: Some("main".into()),
+            }),
+            "/repo"
+        );
+        assert_eq!(
+            draft_live_voice_probe_cwd(&NewChatLiveCheckout::CreateWorktree {
+                repo_path: "/repo".into(),
+                base: "HEAD".into(),
+            }),
+            "/repo"
+        );
+        assert_eq!(
+            draft_live_voice_probe_cwd(&NewChatLiveCheckout::Ready {
+                cwd: "~".into(),
+                branch: None,
+            }),
+            "~"
+        );
     }
 
     #[test]
@@ -7936,7 +9113,7 @@ mod tests {
         let neutral = context_indicator_state(None);
         assert_eq!(neutral.level, ContextIndicatorLevel::Neutral);
         assert_eq!(neutral.used_fraction, 0.0);
-        assert_eq!(neutral.detail.as_ref(), "Aguardando primeiro turno");
+        assert_eq!(neutral.detail.as_ref(), "Waiting for the first turn");
 
         let ready = context_indicator_state(Some(zeron_proto::ContextUsage {
             tokens: 392_000,
@@ -7946,6 +9123,15 @@ mod tests {
         assert_eq!(ready.used_percent, Some(47));
         assert_eq!(ready.remaining_percent, Some(53));
         assert_eq!(ready.detail.as_ref(), "392k / 828k tokens");
+    }
+
+    #[test]
+    fn compact_command_matches_bare_and_argument_forms() {
+        assert!(is_compact_command("/compact"));
+        assert!(is_compact_command("  /compact  "));
+        assert!(is_compact_command("/compact keep the repro steps"));
+        assert!(!is_compact_command("/compacted"));
+        assert!(!is_compact_command("rode /compact pra mim"));
     }
 
     #[test]
@@ -8173,6 +9359,89 @@ mod tests {
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
+    }
+
+    #[test]
+    fn project_mentions_carry_the_name_and_the_absolute_path() {
+        let raw = project_mention_link("Orchestrator", "/Users/x/.orchestrator");
+        assert_eq!(raw, "[Orchestrator](zeron-project:/Users/x/.orchestrator/)");
+        let links = file_mention_links(&raw);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].path, "/Users/x/.orchestrator");
+        assert_eq!(links[0].basename, "Orchestrator");
+        assert!(links[0].is_dir);
+        // The chip shows the project name, not the folder basename.
+        assert!(TextProjection::new(&raw).display.contains("@Orchestrator"));
+        // A sent message projects the same chip.
+        let (display, spans) = sent_mention_display(&raw).expect("project mention");
+        assert!(display.contains("@Orchestrator"));
+        assert_eq!(spans[0].path.as_ref(), "/Users/x/.orchestrator/");
+    }
+
+    #[test]
+    fn project_mentions_reject_relative_or_unsafe_paths() {
+        assert!(file_mention_links("[P](zeron-project:relative/path/)").is_empty());
+        assert!(file_mention_links("[P](zeron-project:/a/../b/)").is_empty());
+        assert!(file_mention_links("[P](zeron-project://a/)").is_empty());
+        assert!(file_mention_links("[](zeron-project:/a/)").is_empty());
+        assert!(file_mention_links("[P](zeron-project:/a%0A/)").is_empty());
+    }
+
+    #[test]
+    fn project_mentions_filter_by_name_or_path() {
+        let ledger = vec![
+            ProjectMention {
+                name: ".orchestrator".into(),
+                path: "/Users/x/.orchestrator".into(),
+            },
+            ProjectMention {
+                name: "comet".into(),
+                path: "/Users/x/Projects/comet".into(),
+            },
+        ];
+        assert_eq!(filter_project_mentions(&ledger, "").len(), 2);
+
+        let by_name = filter_project_mentions(&ledger, "orch");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].path, "/Users/x/.orchestrator");
+
+        // Path-only match: no project is named "Projects".
+        let by_path = filter_project_mentions(&ledger, "projects/");
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].name, "comet");
+
+        assert!(filter_project_mentions(&ledger, "nothing").is_empty());
+    }
+
+    #[test]
+    fn mention_menu_navigates_root_then_projects() {
+        let mut state = FileMentionState {
+            projects: vec![ProjectMention {
+                name: ".orchestrator".into(),
+                path: "/Users/x/.orchestrator".into(),
+            }],
+            results: vec![
+                FileSearchMatch {
+                    path: "src/main.rs".into(),
+                    is_dir: false,
+                },
+                FileSearchMatch {
+                    path: "src/lib.rs".into(),
+                    is_dir: false,
+                },
+            ],
+            ..FileMentionState::default()
+        };
+        // Root: the Projects entry plus the files — projects are not rows here.
+        assert_eq!(state.row_count(), 3);
+        // The separator sits between the entry and the first file.
+        assert_eq!(state.scroll_index(0), 0);
+        assert_eq!(state.scroll_index(1), 2);
+
+        state.level = MentionLevel::Projects;
+        assert_eq!(state.row_count(), 1);
+        // The "Projects" heading is the stack's first child.
+        assert_eq!(state.scroll_index(0), 1);
     }
 
     #[test]
@@ -8850,6 +10119,7 @@ mod tests {
             id: "in-r1".into(),
             request_id: "r1".into(),
             questions: vec![question("q", &["a"], false)],
+            answers: None,
             resolved: false,
         };
         let entry = |status: Option<MessageStatus>, parts: Vec<MessagePart>| SessionMessageEntry {
@@ -8906,6 +10176,7 @@ mod tests {
             id: "in-r1".into(),
             request_id: "r1".into(),
             questions: vec![],
+            answers: None,
             resolved: true,
         };
         let t = vec![entry(

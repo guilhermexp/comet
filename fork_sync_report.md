@@ -1,5 +1,17 @@
 # Fork Sync Report
 
+## 2026-09-10 — Adoção seletiva P1–P9
+
+- Referência congelada: `upstream/main@a1adfde2` (v0.2.59). Base local `b2e41d4c`. Esta entrega adapta o conjunto discutido; não é um merge integral nem muda o último checkpoint de ancestralidade abaixo.
+- P1/P3: caches de gramática/Markdown/transcript, composer, seleção e foco; P2: zui, presença sem repintura redundante e allocator macOS; P4: recuperação causal; P5: lifecycle ACP; P6: Files RPC e reconciliação; P7: browser/preview HTTP + HMR/RTC; P8: histórico Git com busca/grafo/colunas; P9: streaming, teclado, composer e disclosure no iOS.
+- Preservados: OMP/Live Voice/steering, Workers, ferramentas/perguntas/subagentes, temas/Gray, quebra de linha sem scroll horizontal e documentos nativos com caminhos absolutos. Não importados: editor gpui-component, fila obrigatória do upstream, browser Linux, versão ou workflows de publicação.
+- Proveniência detalhada: [comparação](openspec/changes/adopt-discussed-upstream-improvements/upstream-comparison.md). Resultados e limites: [validação](openspec/changes/adopt-discussed-upstream-improvements/validation.md).
+- Validação: 2.688 testes Rust passaram na confirmação completa; 54 testes Edge + typecheck aplicam-se ao mesmo source; build nativo, BCU e integração local Worker/peers com 4 MiB passaram. A primeira suíte teve um timeout STUN intermitente; o relatório registra a falha e os reruns sem alteração de código/prazo.
+- iOS foi portado; parse Swift passou. Xcode/XCTest/simulador continuam pendentes por indisponibilidade do SDK nesta máquina. A change fica aberta por esse gate.
+- Somente integração e commits locais. Sem push, tag, deploy, release, assinatura ou instalação do app.
+
+## Registro anterior — v0.2.29
+
 ## Final Reconciliation
 
 - Target ancestry: `upstream/main@b3fa5187`; release marker reviewed: `v0.2.29@2ebe6ed0`.

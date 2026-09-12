@@ -258,13 +258,15 @@ The engine is authoritative. Hiding or disabling a UI control is not a security 
 
 ### New-Chat draft
 
-Before a Chat row exists, the composer can safely decide only the draft-local conditions:
+Before a Chat row exists, the composer can decide the draft-local conditions:
 
 - engine connected;
 - target device is the current device;
 - resolved harness is OMP.
 
-The microphone is shown for that eligible draft. Capability probing and all other authoritative checks occur after the normal Chat has been materialized.
+Those conditions only show the microphone. They do **not** make it startable. The composer then calls `ProbeLiveVoice` with the checkout cwd (or the repository path, when the plan is still "create a worktree") and uses that result as the gate. The engine expands `~` and reports the installed OMP's ready-frame `liveVoice` capability, or `anotherLiveCall` if a call is already active.
+
+If the probe says the OMP has no Live Voice capability, the microphone stays visible and disabled with that reason. Clicking it must not create a Chat.
 
 If another harness is selected, or the target is remote, the microphone remains absent by design.
 
@@ -274,9 +276,9 @@ This is the path added after the initial Live implementation.
 
 ### 1. Derive the draft action
 
-`Composer::live_voice_model` resolves the draft harness only when no Chat is selected. It synthesizes an available draft result for a local OMP target and feeds that result through the same `LiveVoiceViewModel` used by existing Chats.
+`Composer::live_voice_model` resolves the draft harness only when no Chat is selected. It probes the installed OMP and feeds that result through `LiveVoiceViewModel::derive_draft`. While the probe is in flight the microphone is visible and disabled with `Checking Live Voice availability…`. It never synthesizes `available: true`.
 
-While startup is in flight, the button remains visible but disabled with `Starting Live Voice…`. Repeated clicks cannot create duplicate Chats.
+While startup is in flight, the button remains visible but disabled with `Starting Live Voice…`. Repeated clicks cannot create duplicate Chats. Start is a no-op unless the last probe reported available, and the spawn re-probes before `CreateWorktree` or `createChat`.
 
 ### 2. Snapshot the normal Chat inputs
 
@@ -302,7 +304,9 @@ The composer handles all existing Checkout modes:
 
 The client waits 150 seconds for `CreateWorktree`, above the engine's 120-second forwarding deadline. It captures raw `repoPath` and `path` before strict response deserialization so cleanup remains possible if a response shape is malformed.
 
-### 4. Materialize the ordinary Chat
+### 4. Re-probe, then materialize the ordinary Chat
+
+The spawn calls `ProbeLiveVoice` with the planned cwd **before** creating a worktree or Chat. An unavailable or failed probe leaves the draft untouched and surfaces the reason on the composer.
 
 The shared `create_chat_mutation` builder emits the normal workspace mutation:
 
@@ -550,6 +554,14 @@ launchctl unsetenv OMP_EXECUTABLE
 
 `OMP_EXECUTABLE` must not remain globally set after the smoke test.
 
+`scripts/omp-dev` only hands the app the sibling checkout when that checkout has
+its dependencies installed (`node_modules/@oh-my-pi/pi-natives` present);
+otherwise it warns on stderr and execs the installed `omp`. Without that guard
+an uninstalled checkout dies inside its own module parse, before the RPC
+handshake, and every launch reported `OMP RPC exited before ready: SyntaxError`
+with no hint that a dev override was in play. The override exists to add a
+capability, never to take the agent away.
+
 ## Verification inventory
 
 ### OMP
@@ -608,6 +620,7 @@ UI tests cover:
 
 - existing and draft microphone visibility;
 - local OMP draft eligibility;
+- draft probe cwd (checkout vs repo) and start only after a successful capability probe;
 - current checkout, existing worktree, and new worktree planning;
 - shared `createChat` mutation shape;
 - Live phase/caption/level derivation;

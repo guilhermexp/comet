@@ -101,3 +101,9 @@ the desktop sources cited in each file header.
   host writes all transcript entries and command outcomes.
 - After queuing a command it POSTs `/device/{host}/nudge` so a cold host
   opens the doc and drains — delivery stays durable in the doc regardless.
+
+### Transcript and composer regressions
+
+The native transcript table preserves scroll position during streaming and keyboard transitions. Local submissions have their own send runway; remote user entries do not pull the reader. Long user messages remember disclosure in the warm SessionStore. Tool-group disclosure animates within the hosted cell. The UIKit composer commits marked text before sending and immediately applies the resulting draft.
+
+`TranscriptFollowTests`, `TranscriptLayoutTests`, `TranscriptPresentationTests`, `ComposerEditorTests`, and `ZeronUITests/MobilePolishTests` exercise these behaviors in Xcode. Command Line Tools alone cannot build UIKit or run simulator tests. Signing and release settings are unchanged.

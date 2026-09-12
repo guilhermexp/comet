@@ -1413,7 +1413,7 @@ mod tests {
             request: LiveVoiceRequest,
         ) -> Result<LiveVoiceHandle, HarnessError> {
             if !self.supported.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(HarnessError::Unsupported("update OMP".into()));
+                return Err(HarnessError::Unsupported("no Live Voice capability".into()));
             }
             lock(&self.live_requests).push(request);
             let (control_tx, mut control_rx) = mpsc::channel::<LiveVoiceControl>(16);
@@ -1676,6 +1676,10 @@ mod tests {
             core.sessions.session_status("active").unwrap().status,
             SessionStatus::Working
         );
+        // Base capability present, operational-context capability gone, run in
+        // flight: that is `ActiveRun`, not `UnsupportedOmp`. Collapsing the two
+        // is what made the tooltip say "update OMP" for a Live Voice that works
+        // fine the moment the run settles.
         harness.set_session_context_supported(false);
         assert_eq!(
             core.sessions
@@ -1683,7 +1687,7 @@ mod tests {
                 .await
                 .unwrap()
                 .reason,
-            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
+            Some(LiveVoiceUnavailableReason::ActiveRun)
         );
         core.sessions.interrupt("active").await.unwrap();
         assert!(
@@ -1783,6 +1787,36 @@ mod tests {
                 LiveVoiceControl::SetMuted(true),
                 LiveVoiceControl::Stop,
             ]
+        );
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_voice_cwd_probe_follows_the_installed_omp_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = Arc::new(FakeLiveHarness::supported());
+        let registry = crate::registry::HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            crate::EngineCore::assemble(temp.path(), Arc::new(registry), HarnessId::Omp, None)
+                .unwrap();
+
+        assert!(
+            core.sessions
+                .probe_live_voice_at_cwd("/tmp")
+                .await
+                .unwrap()
+                .available
+        );
+
+        harness.set_supported(false);
+        assert_eq!(
+            core.sessions
+                .probe_live_voice_at_cwd("/tmp")
+                .await
+                .unwrap()
+                .reason,
+            Some(LiveVoiceUnavailableReason::UnsupportedOmp)
         );
         core.sessions.shutdown().await;
     }

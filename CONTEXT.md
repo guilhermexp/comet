@@ -12,6 +12,11 @@ _Avoid_: API usage, token billing, synced usage
 Moonshot AI's managed coding subscription served from the Kimi Code platform. It is distinct from the Moonshot Open Platform API.
 _Avoid_: Moonshot API, Kimi API billing
 
+
+**Grok CLI**:
+xAI's grok.com coding subscription authenticated by `grok login` into `$GROK_HOME/auth.json`. It is distinct from a console.x.ai API key in `user-settings.json`.
+_Avoid_: Grok API billing, xAI API key, Moonshot-style Open Platform key
+
 **Antigravity Account Pool**:
 The set of usable Antigravity credentials discovered from CLIProxyAPI's device-local credential directory. Every credential is independently visible with its own Managed Provider Usage; none is the singular active account because CLIProxyAPI owns routing across the pool.
 _Avoid_: active Antigravity account, switchable Antigravity slot, Comet-owned login

@@ -1147,6 +1147,9 @@ fn push_user_transcript_entry(entries: &mut Vec<TranscriptEntry>, text: &str) {
 
 fn sanitize_transcript_user_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
+    if let Some(query) = inner_xml_tag(trimmed, "user_query") {
+        return sanitize_transcript_user_text(query);
+    }
     let command_wrapper = (trimmed.contains("<command-name>")
         && trimmed.contains("</command-name>"))
         || (trimmed.contains("<command-message>") && trimmed.contains("</command-message>"))
@@ -1157,11 +1160,23 @@ fn sanitize_transcript_user_text(text: &str) -> Option<String> {
         || trimmed.starts_with("<local-command-")
         || trimmed.starts_with("# AGENTS.md instructions for ")
         || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<system-reminder>")
+        || trimmed.starts_with("<user_info>")
+        || trimmed.starts_with("<user_query>")
         || command_wrapper
     {
         return None;
     }
     Some(strip_origin_tag_lines(trimmed))
+}
+
+fn inner_xml_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    let inner = text[start..end].trim();
+    (!inner.is_empty()).then_some(inner)
 }
 
 fn strip_origin_tag_lines(text: &str) -> String {

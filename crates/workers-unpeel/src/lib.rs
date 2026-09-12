@@ -3,6 +3,7 @@
 mod activity_bridge;
 mod controller_mcp;
 mod hook_migration;
+pub mod maintenance;
 mod parent_notifications;
 pub mod project_git;
 pub mod project_ledger;
@@ -16,6 +17,11 @@ pub use controller_mcp::{
 };
 #[doc(hidden)]
 pub use hook_migration::remove_legacy_hook_root_at;
+pub use maintenance::{
+    RuntimeInstallSource, RuntimeUpdateResult, RuntimeUpdateStatus, RuntimeVersionAdvisory,
+    UpdateOutcomeStatus, get_all_advisories, get_all_advisories_blocking, run_runtime_update,
+    run_runtime_update_blocking,
+};
 pub use parent_notifications::{
     WorkerCompletionEvidence, WorkerParentLink, WorkerParentNotification,
     WorkerParentNotificationKind, ack_worker_parent_notification,
@@ -23,6 +29,7 @@ pub use parent_notifications::{
     activate_worker_parent_task, activate_worker_parent_task_at, begin_worker_parent_task,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task, cancel_worker_parent_task_at, confirm_worker_parent_task_submission,
+    current_episode_completed, current_episode_completed_with_evidence_at,
     pending_worker_parent_notifications, pending_worker_parent_notifications_at,
     pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
     prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
@@ -161,6 +168,7 @@ pub fn controller_mcp_handle_request(request: Value) -> Option<Value> {
 #[doc(hidden)]
 pub use controller_mcp::{
     WAIT_TIMED_OUT_NEXT, serve as controller_mcp_serve, wait_until as controller_mcp_wait_until,
+    wait_until_matching as controller_mcp_wait_until_matching,
 };
 
 #[doc(hidden)]
@@ -355,6 +363,34 @@ pub struct WorkersProject {
     pub session_sort: WorkersSessionSort,
 }
 
+impl WorkersProject {
+    /// Current checkout branch shared by context labels and PR lookup.
+    /// Group rows are organizational aliases, not additional checkouts.
+    pub fn change_request_branch(&self) -> Option<&str> {
+        if self.is_group {
+            return None;
+        }
+        self.git_branch
+            .as_deref()
+            .or(self.worktree_branch.as_deref())
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+    }
+
+    /// Whether the app may tear this checkout down — the question the removal
+    /// route has to ask, and the one `worktree_branch` cannot answer.
+    ///
+    /// The projection publishes `worktreeBranch` for a worktree the user added
+    /// by hand in a terminal too, and `remove_worktree` refuses that one
+    /// because deleting the row deletes every session under it. Ownership is
+    /// the path: `worktrees::create` only ever builds under the worktrees
+    /// root, which is also the only place `worktrees::remove` accepts. A row
+    /// this returns `false` for is removed as a project.
+    pub fn owns_worktree_checkout(&self) -> bool {
+        self.worktree_branch.is_some() && unpeel_core::worktrees::is_managed(Path::new(&self.path))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkersSessionSort {
     #[default]
@@ -403,9 +439,9 @@ fn ensure_setup_succeeded(worktree: &WorkersWorktreeResult) -> Result<(), Worker
     let reason = worktree
         .setup_failed_reason
         .as_deref()
-        .unwrap_or("motivo não informado");
+        .unwrap_or("no reason reported");
     Err(WorkersError::State(format!(
-        "worktree criado, mas o setup falhou em `{command}`: {reason}"
+        "worktree created, but setup failed at `{command}`: {reason}"
     )))
 }
 
@@ -607,6 +643,20 @@ impl Default for WorkersTranscriptSettings {
         }
     }
 }
+impl WorkersTranscriptSettings {
+    /// Clamps `max_entries` to the nearest valid value accepted by the API and UI
+    /// (`0, 20, 50, 100`). Legacy or migrated configurations stored in `app-state.json`
+    /// might contain arbitrary numbers, which would otherwise leave all range buttons
+    /// unselected and cause any subsequent setting toggle to fail validation on save.
+    pub fn clamped_for_load(mut self) -> Self {
+        const VALID_ENTRIES: [usize; 4] = [0, 20, 50, 100];
+        self.max_entries = VALID_ENTRIES
+            .into_iter()
+            .min_by_key(|&candidate| candidate.abs_diff(self.max_entries))
+            .unwrap_or(20);
+        self
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkersNotificationSettings {
@@ -675,6 +725,22 @@ impl Default for WorkersResourceSettings {
 }
 
 impl WorkersResourceSettings {
+    /// Sanitizes resource settings when loaded from storage.
+    ///
+    /// Unlike `validated()` which rejects out-of-range thresholds (returning an `Err`
+    /// that previously caused `unwrap_or_default()` to wipe out unrelated valid
+    /// settings like hibernation preferences), this method clamps each numeric field
+    /// independently to keep valid user configuration intact.
+    pub fn clamped_for_load(mut self) -> Self {
+        self.per_worker_warning_gib = self.per_worker_warning_gib.clamp(1, 1_024);
+        self.per_worker_critical_gib = self
+            .per_worker_critical_gib
+            .clamp(self.per_worker_warning_gib, 1_024);
+        self.hibernate_after_idle_minutes = self.hibernate_after_idle_minutes.clamp(1, 10_080);
+        self.max_live_idle_workers = self.max_live_idle_workers.clamp(1, 256);
+        self
+    }
+
     fn validated(mut self) -> Result<Self, WorkersError> {
         if self.per_worker_warning_gib == 0 {
             return Err(WorkersError::State(
@@ -1057,6 +1123,79 @@ fn live_projects_for_ledger(bootstrap: &WorkersBootstrap) -> Vec<LiveProject> {
         .collect()
 }
 
+/// Espelha no ledger um projeto que acabou de entrar no working set, DENTRO
+/// do mesmo `app_state::edit` que o registrou: mesmo flock, mesmo rename
+/// atomico, entao nao existe janela em que `projects[]` tenha uma pasta que o
+/// ledger nunca viu. Sem isto, a chave `comet_projects` so nascia quando
+/// alguem abria Settings > Projects — e o menu `@` do composer, que le so o
+/// ledger, ficava vazio.
+///
+/// Delega para `reconcile`, a mesma funcao pura de Settings: normalizacao de
+/// path, "a primeira vista fixa o `added_at`" e a preservacao das entradas
+/// orfas continuam definidas em UM lugar. Grupos nao passam por aqui de
+/// proposito (ver [`live_projects_for_ledger`]).
+fn record_in_ledger(
+    state: &mut serde_json::Map<String, Value>,
+    project_id: &str,
+    path: &str,
+    name: &str,
+) -> Result<(), String> {
+    let ledger: Vec<LedgerProject> = state
+        .get(project_ledger::LEDGER_KEY)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let live = [LiveProject {
+        id: project_id.to_owned(),
+        path: path.to_owned(),
+        name: name.to_owned(),
+        last_activity_unix_ms: None,
+    }];
+    let outcome = project_ledger::reconcile(&ledger, &live, now_unix_ms());
+    if outcome.dirty {
+        state.insert(
+            project_ledger::LEDGER_KEY.to_owned(),
+            serde_json::to_value(&outcome.ledger).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
+/// Mirror the WHOLE working set into the ledger, once per process.
+///
+/// `record_in_ledger` only covers projects registered from here on, so an
+/// install that already had projects before the ledger existed would keep an
+/// empty `comet_projects` — and an empty `@` menu — until someone happened to
+/// open Settings > Projects, the only other route that reconciles everything.
+/// Once per process because `reconcile` goes dirty whenever activity moves and
+/// `bootstrap` is polled; a failure here must never fail the bootstrap.
+fn backfill_ledger_once(bootstrap: &WorkersBootstrap) {
+    static BACKFILL: std::sync::Once = std::sync::Once::new();
+    BACKFILL.call_once(|| {
+        backfill_ledger_at(&unpeel_core::app_paths::app_state_path(), bootstrap);
+    });
+}
+
+/// [`backfill_ledger_once`] against an explicit state file — the seam the test
+/// uses so it never touches this machine's registry. The `_at` variants also
+/// resolve the path once and skip the cross-frontend broadcast `save()` does:
+/// no other frontend renders this key live, Settings reads it when it opens.
+fn backfill_ledger_at(state_path: &Path, bootstrap: &WorkersBootstrap) {
+    let Ok(ledger) = project_ledger::read_at(state_path) else {
+        return;
+    };
+    let outcome =
+        project_ledger::reconcile(&ledger, &live_projects_for_ledger(bootstrap), now_unix_ms());
+    if outcome.dirty {
+        let _ = project_ledger::write_at(state_path, &outcome.ledger);
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalWorkersClient {
     next_request_id: Arc<AtomicU64>,
@@ -1206,6 +1345,7 @@ impl LocalWorkersClient {
         apply_runtime_capabilities(&mut bootstrap.sessions);
         apply_notify_when_done_overlay(&mut bootstrap.sessions);
         self.activity.enrich(&mut bootstrap.sessions);
+        backfill_ledger_once(&bootstrap);
         Ok(bootstrap)
     }
 
@@ -1342,7 +1482,8 @@ impl LocalWorkersClient {
             .cloned()
             .map(serde_json::from_value::<WorkersTranscriptSettings>)
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .clamped_for_load();
         let notifications = raw
             .get("comet_workers_notifications")
             .cloned()
@@ -1361,8 +1502,7 @@ impl LocalWorkersClient {
             .map(serde_json::from_value::<WorkersResourceSettings>)
             .transpose()?
             .unwrap_or_default()
-            .validated()
-            .unwrap_or_default();
+            .clamped_for_load();
         let runtimes = runtime_catalog_snapshot();
         let presets = preset_settings(presets, &runtimes);
         Ok(WorkersSettingsSnapshot {
@@ -1622,21 +1762,29 @@ impl LocalWorkersClient {
             let projects = projects_value
                 .as_array_mut()
                 .ok_or_else(|| "projects must be an array".to_string())?;
-            if let Some(id) = projects.iter().find_map(|project| {
+            let existing = projects.iter().find_map(|project| {
                 (project.get("path").and_then(Value::as_str) == Some(canonical_string.as_str()))
                     .then(|| project.get("id")?.as_str().map(str::to_owned))
                     .flatten()
-            }) {
-                return Ok(id);
-            }
-            let id = format!("comet-{}", uuid::Uuid::new_v4().simple());
-            projects.push(json!({
-                "id": id,
-                "name": name,
-                "path": canonical_string,
-                "workspace_id": "personal",
-                "sort_order": projects.len() as u32,
-            }));
+            });
+            // Readicionar uma pasta ja registrada tambem passa pelo ledger: e
+            // como um registro anterior ao ledger (ou um `forget`) se cura,
+            // sem rota de leitura nenhuma escrever no arquivo.
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = format!("comet-{}", uuid::Uuid::new_v4().simple());
+                    projects.push(json!({
+                        "id": id,
+                        "name": name,
+                        "path": canonical_string,
+                        "workspace_id": "personal",
+                        "sort_order": projects.len() as u32,
+                    }));
+                    id
+                }
+            };
+            record_in_ledger(state, &id, &canonical_string, &name)?;
             Ok(id)
         })
         .map_err(WorkersError::State)
@@ -1717,9 +1865,22 @@ impl LocalWorkersClient {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| WorkersError::State("parent project path is missing".into()))?;
+        // `worktrees::create` ADOPTS a checkout that is already there instead
+        // of failing (`worktrees.rs`, "Already there? Adopt it rather than
+        // failing"), and the `Worktree` it hands back carries no mark of who
+        // made it — `managed` only says "lives under the worktrees root".
+        // Asking git BEFORE is the only way to tell the two apart, and the
+        // rollback below force-removes, which on an adopted checkout would
+        // take the user's uncommitted work with it.
+        let known_before: Vec<String> = unpeel_core::worktrees::list(parent_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|worktree| worktree.path)
+            .collect();
         let worktree =
             unpeel_core::worktrees::create(parent_path, branch, request.base_ref.as_deref())
                 .map_err(WorkersError::State)?;
+        let adopted = known_before.contains(&worktree.path);
         let project_id = format!("comet-worktree-{}", uuid::Uuid::new_v4().simple());
         let display_name = request
             .name
@@ -1744,10 +1905,15 @@ impl LocalWorkersClient {
                 "is_folder": true,
                 "worktree_branch": branch,
             }));
-            Ok(())
+            record_in_ledger(state, &project_id, &path, &display_name)
         });
         if let Err(error) = register {
-            let _ = unpeel_core::worktrees::remove(&worktree.path, true);
+            // Only undo what THIS call created. An adopted checkout predates
+            // us: it may hold months of uncommitted work, and rolling back a
+            // failed registration is no licence to delete it.
+            if !adopted {
+                let _ = unpeel_core::worktrees::remove(&worktree.path, true);
+            }
             return Err(WorkersError::State(error));
         }
         // O setup do projeto roda AQUI, depois do registro: um worktree que
@@ -1787,10 +1953,11 @@ impl LocalWorkersClient {
                 path: worktree.path,
                 branch: worktree.branch,
             }),
-            Err(error) => {
-                let _ = self.remove_worktree(&worktree.project_id, true);
-                Err(error)
-            }
+            // Falha de launch NAO desfaz o worktree, pela mesma razao que
+            // falha de setup nao desfaz (ver `create_worktree` acima): o
+            // checkout ja existe, ja foi registrado, e apaga-lo com `force`
+            // por causa de um preset invalido perde trabalho do usuario.
+            Err(error) => Err(error),
         }
     }
 
@@ -1818,15 +1985,15 @@ impl LocalWorkersClient {
             if display_name.is_empty() {
                 return Err(WorkersError::State("project name is required".into()));
             }
-            let is_worktree = project
-                .get("worktree_branch")
-                .and_then(Value::as_str)
-                .is_some();
-            if is_worktree {
-                rename_project_record(project_id, display_name)?;
-            } else {
+            // Pergunta o predicado de GRUPO, nao o complemento dele:
+            // `rename_group_project` exige pasta+pai+sem-branch, e um worktree
+            // adotado (sem branch no registro, mas tambem sem `is_folder`) caia no
+            // ramo errado e morria em "only plain groups can be renamed here".
+            if is_plain_group(project) {
                 unpeel_core::session_ops::rename_group_project(project_id, display_name)
                     .map_err(WorkersError::State)?;
+            } else {
+                rename_project_record(project_id, display_name)?;
             }
         }
         if let Some(folder_color_id) = patch.folder_color_id {
@@ -1903,19 +2070,35 @@ impl LocalWorkersClient {
                     .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
             })
             .ok_or_else(|| WorkersError::State(format!("unknown worktree id: {project_id}")))?;
-        if project
-            .get("worktree_branch")
-            .and_then(Value::as_str)
-            .is_none()
-        {
-            return Err(WorkersError::State("project is not a worktree".into()));
-        }
         let path = project
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| WorkersError::State("worktree path is missing".into()))?
             .to_owned();
-        unpeel_core::worktrees::remove(&path, force).map_err(WorkersError::State)?;
+        // The registry is what makes this OURS to tear down. The projection
+        // also derives `worktreeBranch` from disk, for a worktree the user
+        // added by hand in a terminal, and the menu offers "Remove worktree"
+        // off that projected value — but this call deletes every session under
+        // the project (transcripts and the runtime's managed storage), so when
+        // the two disagree it must refuse instead of quietly wiping months of
+        // history behind a label that promised to remove a checkout. Removing
+        // such a row is `remove_project`, and the caller has to say so.
+        if project
+            .get("worktree_branch")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(WorkersError::State(
+                "project is not a worktree this app created; remove it as a project".into(),
+            ));
+        }
+        // The checkout only goes when it still lives under the worktrees root —
+        // the same predicate `worktrees::remove` refuses on. A record whose
+        // checkout was moved or deleted by hand stays removable from the
+        // sidebar instead of erroring forever on a git call that cannot work.
+        if unpeel_core::worktrees::is_managed(Path::new(&path)) {
+            unpeel_core::worktrees::remove(&path, force).map_err(WorkersError::State)?;
+        }
         let removed = project_tree_ids(project_id)?;
         self.remove_sessions_in_projects(&removed)?;
         remove_project_tree(project_id)
@@ -1932,16 +2115,7 @@ impl LocalWorkersClient {
                     .find(|project| project.get("id").and_then(Value::as_str) == Some(project_id))
             })
             .ok_or_else(|| WorkersError::State(format!("unknown group id: {project_id}")))?;
-        let is_group = project.get("is_folder").and_then(Value::as_bool) == Some(true)
-            && project
-                .get("worktree_branch")
-                .and_then(Value::as_str)
-                .is_none()
-            && project
-                .get("parent_project_id")
-                .and_then(Value::as_str)
-                .is_some();
-        if !is_group {
+        if !is_plain_group(project) {
             return Err(WorkersError::State("project is not a group".into()));
         }
         let parent_id = project
@@ -2325,16 +2499,56 @@ impl LocalWorkersClient {
         if response.status == 200 {
             return Ok(response.body);
         }
-        let message = response
-            .body
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown upstream error")
-            .to_owned();
+        let message = extract_upstream_error_message(&response.body);
         Err(WorkersError::Upstream {
             status: response.status,
             message,
         })
+    }
+}
+pub(crate) fn extract_upstream_error_message(body: &Value) -> String {
+    const MAX_ERROR_LEN: usize = 300;
+    // The host answers with `error`; gateways in front of it answer with
+    // `message` or `detail`, and a dead proxy answers with a bare string or
+    // HTML. Every one of those used to reach the user as "unknown upstream
+    // error", which diagnoses nothing.
+    const KEYS: [&str; 3] = ["error", "message", "detail"];
+
+    let candidate = match body {
+        Value::Object(map) => KEYS
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .map(|value| match value {
+                Value::String(text) => text.trim().to_owned(),
+                structured => structured.to_string(),
+            })
+            .find(|text| !text.is_empty())
+            .unwrap_or_else(|| {
+                // A blank value under an error key means the host said nothing:
+                // serializing the envelope around it just shows the user a
+                // quoted run of spaces.
+                if KEYS.iter().any(|key| map.contains_key(*key)) {
+                    String::new()
+                } else {
+                    body.to_string()
+                }
+            }),
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return "unknown upstream error".to_owned();
+    }
+
+    if trimmed.chars().count() > MAX_ERROR_LEN {
+        let mut truncated: String = trimmed.chars().take(MAX_ERROR_LEN).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -2488,9 +2702,9 @@ struct SessionWire {
     terminal_background_hex: Option<String>,
     #[serde(default)]
     worktree_branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "created_at", alias = "createdAt")]
     created_at_unix_ms: u64,
-    #[serde(default)]
+    #[serde(default, alias = "updated_at", alias = "updatedAt")]
     updated_at_unix_ms: u64,
     #[serde(default)]
     total_tokens: Option<u64>,
@@ -2612,6 +2826,28 @@ fn set_project_folder_color(project_id: &str, color_id: Option<&str>) -> Result<
         Ok(())
     })
     .map_err(WorkersError::State)
+}
+
+/// O predicado canonico de organizacao, lido do REGISTRO (`Models.swift:43`):
+/// pasta, com pai, sem branch. Mesma regra que a projecao usa para publicar
+/// `isGroup`, e a unica que `session_ops::rename_group_project` /
+/// `remove_group` aceitam. Um worktree ADOTADO tem pai PROJETADO do disco, e
+/// por isso a pergunta nao pode ser `parent_project_id.is_some()`.
+///
+/// Keys are snake_case, one spelling only: `unpeel_core::state::Project` is
+/// the on-disk shape and derives serde with no aliases, every writer here
+/// spells it that way, and `session_ops` reads it that way. The camelCase
+/// fallbacks in the projection's own parser answer no file anyone writes.
+fn is_plain_group(project: &Value) -> bool {
+    project.get("is_folder").and_then(Value::as_bool) == Some(true)
+        && project
+            .get("parent_project_id")
+            .and_then(Value::as_str)
+            .is_some()
+        && project
+            .get("worktree_branch")
+            .and_then(Value::as_str)
+            .is_none()
 }
 
 fn rename_project_record(project_id: &str, name: &str) -> Result<(), WorkersError> {
@@ -3531,26 +3767,34 @@ mod project_ledger_projection_tests {
         }
     }
 
-    /// Remover o filtro de `is_group` volta a produzir duas linhas com o path
-    /// do pai; remover worktrees do filtro apaga um projeto de filesystem real.
-    #[test]
-    fn ledger_projection_keeps_projects_and_worktrees_but_not_groups() {
-        let bootstrap = WorkersBootstrap {
+    fn bootstrap_with(projects: Vec<WorkersProject>) -> WorkersBootstrap {
+        WorkersBootstrap {
             mac_name: "Mac".into(),
             protocol: WorkersProtocol {
                 major_version: 1,
                 minor_version: 0,
                 capabilities: Vec::new(),
             },
-            projects: vec![
-                project("project", "/tmp/repo", false, None),
-                project("group", "/tmp/repo", true, None),
-                project("worktree", "/tmp/repo-wt", false, Some("change/fix")),
-            ],
+            projects,
             presets: Vec::new(),
             sessions: Vec::new(),
             activity_log: Vec::new(),
-        };
+        }
+    }
+
+    fn working_set() -> WorkersBootstrap {
+        bootstrap_with(vec![
+            project("project", "/tmp/repo", false, None),
+            project("group", "/tmp/repo", true, None),
+            project("worktree", "/tmp/repo-wt", false, Some("change/fix")),
+        ])
+    }
+
+    /// Remover o filtro de `is_group` volta a produzir duas linhas com o path
+    /// do pai; remover worktrees do filtro apaga um projeto de filesystem real.
+    #[test]
+    fn ledger_projection_keeps_projects_and_worktrees_but_not_groups() {
+        let bootstrap = working_set();
 
         let live = live_projects_for_ledger(&bootstrap);
         let ids = live
@@ -3558,6 +3802,109 @@ mod project_ledger_projection_tests {
             .map(|project| project.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["project", "worktree"]);
+    }
+
+    /// Local checkouts and worktrees both follow the current branch; group
+    /// aliases do not create duplicate pull-request subscriptions.
+    #[test]
+    fn change_request_branch_uses_current_checkout_including_local_branches() {
+        let mut worktree = project("worktree", "/tmp/wt", false, Some("fix/correios"));
+        assert_eq!(worktree.change_request_branch(), Some("fix/correios"));
+        worktree.git_branch = Some("fix/renamed".into());
+        assert_eq!(worktree.change_request_branch(), Some("fix/renamed"));
+
+        let mut plain = project("project", "/tmp/repo", false, None);
+        plain.git_branch = Some("main".into());
+        assert_eq!(plain.change_request_branch(), Some("main"));
+        plain.git_branch = Some(" fix/local ".into());
+        assert_eq!(plain.change_request_branch(), Some("fix/local"));
+        plain.is_group = true;
+        assert_eq!(plain.change_request_branch(), None);
+
+        let blank = project("blank", "/tmp/wt", false, Some("   "));
+        assert_eq!(blank.change_request_branch(), None);
+    }
+
+    /// A semantica pura do espelho: readicionar a mesma pasta nao reescreve o
+    /// `added_at` nem perde as outras entradas.
+    ///
+    /// Que os CALLSITES chamam isto e outro teste: `create_worktree_at` esta
+    /// coberto em `worktree_setup_wiring_tests`; `add_project` escreve no
+    /// `app-state.json` real da maquina e so da para provar de `tests/`, com
+    /// o sandbox de `UNPEEL_HOME`.
+    #[test]
+    fn re_recording_the_same_path_keeps_the_original_added_at() {
+        let mut state = serde_json::Map::new();
+        state.insert(
+            project_ledger::LEDGER_KEY.to_owned(),
+            json!([{
+                "path": "/tmp/other",
+                "name": "other",
+                "added_at_unix_ms": 7u64,
+                "last_seen_at_unix_ms": 9u64,
+            }]),
+        );
+
+        record_in_ledger(&mut state, "comet-1", "/tmp/repo", "repo").unwrap();
+        let after_first: Vec<LedgerProject> =
+            serde_json::from_value(state[project_ledger::LEDGER_KEY].clone()).unwrap();
+        let added_at = after_first
+            .iter()
+            .find(|entry| entry.path == "/tmp/repo")
+            .expect("o projeto novo entrou no ledger")
+            .added_at_unix_ms;
+        assert_eq!(after_first.len(), 2, "a entrada antiga sobrevive");
+
+        record_in_ledger(&mut state, "comet-2", "/tmp/repo", "repo").unwrap();
+        let after_second: Vec<LedgerProject> =
+            serde_json::from_value(state[project_ledger::LEDGER_KEY].clone()).unwrap();
+        assert_eq!(after_second.len(), 2, "o mesmo path nao duplica");
+        assert_eq!(
+            after_second
+                .iter()
+                .find(|entry| entry.path == "/tmp/repo")
+                .unwrap()
+                .added_at_unix_ms,
+            added_at,
+            "readicionar nao reescreve a data de entrada"
+        );
+    }
+
+    /// O backfill: uma instalacao que ja tinha projetos ANTES do ledger existir
+    /// ganha as linhas na primeira `bootstrap`, nao so quando alguem abre
+    /// Settings > Projects — que era a unica rota que varria o working set
+    /// inteiro. Grupos continuam de fora (reutilizam o path do pai).
+    #[test]
+    fn the_backfill_mirrors_the_whole_working_set() {
+        let state_path =
+            std::env::temp_dir().join(format!("comet-backfill-{}.json", uuid::Uuid::new_v4()));
+
+        backfill_ledger_at(&state_path, &working_set());
+
+        let ledger = project_ledger::read_at(&state_path).expect("o ledger escrito");
+        let _ = std::fs::remove_file(&state_path);
+        let paths = ledger
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/tmp/repo", "/tmp/repo-wt"]);
+    }
+
+    /// Um worktree ADOTADO ganha pai da projecao, entao `parent_project_id`
+    /// nao responde "isto e organizacao" — so o predicado do registro responde,
+    /// e e ele que `rename_group_project` e `remove_group` exigem.
+    #[test]
+    fn plain_group_predicate_separates_groups_from_adopted_worktrees() {
+        assert!(is_plain_group(&json!({
+            "is_folder": true,
+            "parent_project_id": "root",
+        })));
+        assert!(!is_plain_group(&json!({ "parent_project_id": "root" })));
+        assert!(!is_plain_group(&json!({
+            "is_folder": true,
+            "parent_project_id": "root",
+            "worktree_branch": "change/fix",
+        })));
     }
 }
 
@@ -3752,6 +4099,27 @@ mod worktree_setup_wiring_tests {
         assert_eq!(
             registered.get("parent_project_id").and_then(Value::as_str),
             Some("comet-parent")
+        );
+    }
+
+    /// O ledger nasce COM o worktree, no MESMO arquivo e na mesma edicao que
+    /// o registrou — e disso que o menu `@` do composer vive. Chama o callsite
+    /// de verdade: apagar `record_in_ledger` de `create_worktree_at` derruba
+    /// este teste, coisa que exercitar a funcao direto nao faz.
+    #[test]
+    fn creating_a_worktree_records_it_in_the_ledger() {
+        let fixture = Fixture::new(None);
+        let created = fixture.create().unwrap();
+
+        let state = unpeel_core::app_state::load_for_edit_at(&fixture.state()).unwrap();
+        let ledger: Vec<LedgerProject> = state
+            .get(project_ledger::LEDGER_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        assert!(
+            ledger.iter().any(|entry| entry.path == created.path),
+            "o worktree criado tem que entrar no ledger: {ledger:?}"
         );
     }
 }
@@ -4008,5 +4376,159 @@ mod hibernation_tests {
             ids(&sessions, None),
             vec!["worker-00".to_owned(), "worker-01".to_owned()]
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_settings_clamping_tests {
+    use super::WorkersResourceSettings;
+
+    #[test]
+    fn clamped_for_load_clamps_thresholds_without_wiping_other_fields() {
+        let invalid = WorkersResourceSettings {
+            monitoring_enabled: false,
+            per_worker_warning_gib: 0,
+            per_worker_critical_gib: 0,
+            notifications_enabled: false,
+            hibernation_enabled: true,
+            hibernate_after_idle_minutes: 45,
+            max_live_idle_workers: 8,
+        };
+
+        let loaded = invalid.clamped_for_load();
+
+        // Numeric thresholds clamped to valid range
+        assert_eq!(loaded.per_worker_warning_gib, 1);
+        assert_eq!(loaded.per_worker_critical_gib, 1);
+
+        // Other settings preserved
+        assert!(!loaded.monitoring_enabled);
+        assert!(!loaded.notifications_enabled);
+        assert!(loaded.hibernation_enabled);
+        assert_eq!(loaded.hibernate_after_idle_minutes, 45);
+        assert_eq!(loaded.max_live_idle_workers, 8);
+    }
+
+    #[test]
+    fn clamped_for_load_ensures_critical_is_at_least_warning() {
+        let inverted = WorkersResourceSettings {
+            per_worker_warning_gib: 10,
+            per_worker_critical_gib: 5,
+            ..WorkersResourceSettings::default()
+        };
+
+        let loaded = inverted.clamped_for_load();
+        assert_eq!(loaded.per_worker_warning_gib, 10);
+        assert_eq!(loaded.per_worker_critical_gib, 10);
+    }
+}
+
+#[cfg(test)]
+mod transcript_settings_clamping_tests {
+    use super::WorkersTranscriptSettings;
+
+    #[test]
+    fn clamped_for_load_maps_to_nearest_valid_range() {
+        let cases = [
+            (0, 0),
+            (5, 0),
+            (10, 0),
+            (11, 20),
+            (20, 20),
+            (30, 20),
+            (35, 20),
+            (36, 50),
+            (50, 50),
+            (60, 50),
+            (75, 50),
+            (76, 100),
+            (100, 100),
+            (250, 100),
+        ];
+
+        for (input, expected) in cases {
+            let settings = WorkersTranscriptSettings {
+                max_entries: input,
+                ..WorkersTranscriptSettings::default()
+            };
+            assert_eq!(
+                settings.clamped_for_load().max_entries,
+                expected,
+                "input {input} should clamp to {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod upstream_error_message_tests {
+    use super::extract_upstream_error_message;
+    use serde_json::json;
+
+    #[test]
+    fn falls_back_through_error_message_detail_and_serialized() {
+        // "error" key present
+        let error_obj = json!({"error": "upstream daemon failed"});
+        assert_eq!(
+            extract_upstream_error_message(&error_obj),
+            "upstream daemon failed"
+        );
+
+        // "message" key fallback when "error" is absent
+        let message_obj = json!({"message": "gateway timeout"});
+        assert_eq!(
+            extract_upstream_error_message(&message_obj),
+            "gateway timeout"
+        );
+
+        // "detail" key fallback when "error" and "message" are absent
+        let detail_obj = json!({"detail": "session closed"});
+        assert_eq!(
+            extract_upstream_error_message(&detail_obj),
+            "session closed"
+        );
+
+        // Fallback when "error" is blank/whitespace
+        let blank_error = json!({"error": "   ", "message": "actual error"});
+        assert_eq!(extract_upstream_error_message(&blank_error), "actual error");
+
+        // Structured detail object fallback
+        let structured_detail = json!({"detail": {"code": 404, "reason": "not found"}});
+        let extracted_detail = extract_upstream_error_message(&structured_detail);
+        assert!(extracted_detail.contains("404"));
+        assert!(extracted_detail.contains("not found"));
+
+        // Serialized body fallback for other objects
+        let arbitrary_obj = json!({"status": "unhealthy", "code": 503});
+        let extracted_arbitrary = extract_upstream_error_message(&arbitrary_obj);
+        assert!(extracted_arbitrary.contains("503"));
+        assert!(extracted_arbitrary.contains("unhealthy"));
+
+        // String body fallback
+        let string_body = json!("502 Bad Gateway from reverse proxy");
+        assert_eq!(
+            extract_upstream_error_message(&string_body),
+            "502 Bad Gateway from reverse proxy"
+        );
+
+        // Null and empty fall back to unknown
+        assert_eq!(
+            extract_upstream_error_message(&serde_json::Value::Null),
+            "unknown upstream error"
+        );
+        let empty_obj = json!({"error": "   "});
+        assert_eq!(
+            extract_upstream_error_message(&empty_obj),
+            "unknown upstream error"
+        );
+    }
+
+    #[test]
+    fn truncates_overly_long_error_messages() {
+        let long_html = format!("<html><body>{}</body></html>", "A".repeat(500));
+        let body = json!(long_html);
+        let extracted = extract_upstream_error_message(&body);
+        assert!(extracted.ends_with("..."));
+        assert!(extracted.chars().count() <= 303);
     }
 }

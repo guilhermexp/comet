@@ -1154,12 +1154,25 @@ impl RegistryDoc {
     /// Upsert a session-status row (writer discipline: each device writes only
     /// its own runs' rows). Staleness is checked client-side via `updatedAt`.
     pub fn upsert_session(&mut self, session: &Session) -> Result<(), DocError> {
+        // Context-window usage must persist so the composer gauge shows the real
+        // session context after an app restart (a null clears it per-field, the
+        // same LWW delete the legacy WorkspaceDoc row used).
+        let (context_tokens, context_window) = match session.context_usage {
+            Some(usage) => (
+                json!(i64::try_from(usage.tokens).unwrap_or(i64::MAX)),
+                json!(i64::try_from(usage.context_window).unwrap_or(i64::MAX)),
+            ),
+            None => (Value::Null, Value::Null),
+        };
         let set = fields([
             ("chatId", json!(session.chat_id)),
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
+            ("lastCompletedTurn", json!(session.last_completed_turn)),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
+            ("contextTokens", context_tokens),
+            ("contextWindow", context_window),
         ]);
         self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1292,6 +1305,7 @@ impl RegistryDoc {
                     ("chatId", json!(session.chat_id)),
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
+                    ("lastCompletedTurn", json!(session.last_completed_turn)),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),
